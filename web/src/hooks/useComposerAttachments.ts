@@ -1,10 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  attachmentAccept,
-  attachmentFilename,
-  clipboardFiles,
-  validateAttachments,
-} from "@/lib/attachments";
+import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { nameAttachmentFile } from "@/lib/composerMentions";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { insertPastedText } from "@/lib/composerText";
@@ -35,10 +30,10 @@ export interface UseComposerAttachmentsOptions {
    */
   onPasteChips?: (files: File[], target: ComposerTextTarget, trayFiles: File[]) => File[];
   /**
-   * The tag tokens of the draft, live and released. An accepted file takes a name none of them
-   * uses, so the tray never names a file the same as a chip.
+   * The pasted-chip tokens, live and released. A picked file that clashes with one is renamed, so
+   * its name stays the chip's own; other tray files keep the names they were given.
    */
-  tagTokens?: () => readonly string[];
+  chipTokens?: () => readonly string[];
 }
 
 export interface ComposerAttachmentsApi {
@@ -84,7 +79,7 @@ export function useComposerAttachments({
   onAccepted,
   onRemoved,
   onPasteChips,
-  tagTokens,
+  chipTokens,
 }: UseComposerAttachmentsOptions = {}): ComposerAttachmentsApi {
   const [files, setFiles] = useState<File[]>(() => initialFiles ?? []);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -96,8 +91,8 @@ export function useComposerAttachments({
   onRemovedRef.current = onRemoved;
   const onPasteChipsRef = useRef(onPasteChips);
   onPasteChipsRef.current = onPasteChips;
-  const tagTokensRef = useRef(tagTokens);
-  tagTokensRef.current = tagTokens;
+  const chipTokensRef = useRef(chipTokens);
+  chipTokensRef.current = chipTokens;
   // The server's filesystem attachment policy, read through a ref for the same reason.
   const info = useServerInfo();
   const policy = info === "loading" ? null : (info.filesystem_attachments ?? null);
@@ -126,26 +121,20 @@ export function useComposerAttachments({
     return accepted;
   }, []);
 
-  // Accepted files take names free in the draft: no tag's, and no earlier tray file's. Chips
-  // keep theirs, so a tray file is the one renamed.
-  const nameIncoming = useCallback((incoming: File[], tray: File[]): File[] => {
-    const named: File[] = [];
-    for (const file of incoming) {
-      named.push(
-        nameAttachmentFile(file, {
-          tokens: tagTokensRef.current?.() ?? [],
-          trayNames: [...tray, ...named].map(attachmentFilename),
-        }),
-      );
-    }
-    return named;
+  // A picked file keeps its name unless a pasted chip already uses it, in which case it is the file
+  // renamed. Files that clash only with each other keep their names, as they do with no chips.
+  const nameIncoming = useCallback((incoming: File[]): File[] => {
+    const tokens = chipTokensRef.current?.() ?? [];
+    // No chips: the files pass through untouched, as before chips existed.
+    if (tokens.length === 0) return incoming;
+    return incoming.map((file) => nameAttachmentFile(file, { tokens, trayNames: [] }));
   }, []);
 
   const addFiles = useCallback(
     (incoming: File[]) => {
       const accepted = validateIncoming(incoming);
       if (accepted.length === 0) return;
-      const named = nameIncoming(accepted, filesRef.current);
+      const named = nameIncoming(accepted);
       setFiles((prev) => [...prev, ...named]);
       onAcceptedRef.current?.(named);
     },
@@ -159,7 +148,7 @@ export function useComposerAttachments({
   }, []);
 
   const replaceFiles = useCallback(
-    (incoming: File[]) => setFiles(nameIncoming(validateIncoming(incoming), [])),
+    (incoming: File[]) => setFiles(nameIncoming(validateIncoming(incoming))),
     [validateIncoming, nameIncoming],
   );
 

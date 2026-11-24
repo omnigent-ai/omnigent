@@ -1317,6 +1317,52 @@ describe.each(["textarea", "codemirror"] as const)(
   },
 );
 
+// With the CodeMirror flag off, the textarea composer must behave exactly as on main.
+describe("Composer on the textarea engine, as on main", () => {
+  beforeEach(() => {
+    resetWorkspaceMock();
+    declaredMentions.harnesses = new Set();
+    localStorage.clear();
+    useChatStore.setState({
+      conversationId: `conv_textarea_parity_${Math.random()}`,
+      sessionHarness: "claude-native",
+      pendingComposerAttachments: [],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps two picked files with the same name under both names", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    const picker = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(picker, {
+      target: { files: [new File(["1"], "image.png", { type: "image/png" })] },
+    });
+    fireEvent.change(picker, {
+      target: { files: [new File(["2"], "image.png", { type: "image/png" })] },
+    });
+    fireEvent.submit(textarea().closest("form")!);
+    const sent = onSend.mock.calls[0]![1] as File[];
+    expect(sent.map((file) => file.name)).toEqual(["image.png", "image.png"]);
+  });
+
+  it("expands a literal @Plan.png beside a session tagged @Plan, as main does", () => {
+    sessions.loaded = [sessionRow("s_plan", "Plan")];
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("Ask @Pl");
+    fireEvent.click(screen.getByTitle("Tag session Plan"));
+    append("and @Plan.png");
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      `Ask [Session: "Plan" id=s_plan subagent=no] and [Session: "Plan" id=s_plan subagent=no].png\n\n${SESSION_MENTION_HINT}`,
+    );
+  });
+});
+
 describe("Composer pasted chips", () => {
   const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
   let convSeq = 0;
@@ -1635,9 +1681,9 @@ describe("Composer pasted chips", () => {
       { text: "look @a.png @a (2).png", names: ["a.png", "a (2).png"] },
     ],
     [
-      "a name a chip left as a tray file is kept when a later pick repeats it",
+      "a chip left as a tray file does not rename a later pick, as on main",
       [{ type: "look " }, { paste: "a.png" }, { remount: true }, { pick: "a.png" }],
-      { text: "look @a.png", names: ["a.png", "a (2).png"] },
+      { text: "look @a.png", names: ["a.png", "a.png"] },
     ],
     [
       "a deleted first chip leaves the second chip's name as it was",
@@ -1646,12 +1692,8 @@ describe("Composer pasted chips", () => {
     ],
   ];
 
-  function assertUniqueNames(names: string[]) {
-    expect(new Set(names).size).toBe(names.length);
-  }
-
   it.each(attachmentSequences)(
-    "keeps attachment names unique across %s",
+    "names pasted chips and picks as the rules say, across %s",
     async (_, steps, want) => {
       const onSend = await renderCodeMirrorComposer();
       for (const step of steps) {
@@ -1679,7 +1721,6 @@ describe("Composer pasted chips", () => {
       const sent = onSend.mock.calls.at(-1)!;
       const files = (sent[1] as File[] | undefined) ?? [];
       const names = files.map((file) => file.name);
-      assertUniqueNames(names);
       expect(names).toEqual(want.names);
       expect(sent[0]).toBe(want.text);
     },

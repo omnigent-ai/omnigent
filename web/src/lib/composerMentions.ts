@@ -269,22 +269,8 @@ export function composerInlineMentions(
   ];
 }
 
-// Characters that end a token. Only "." also needs what follows it: it is part of a filename.
+// A token must start a word and end at whitespace, punctuation or the text end.
 const TOKEN_END_RE = /[\s.,;:!?)\]}'"]/;
-
-/**
- * Whether a token ending at ``end`` is complete. A "." ends it only when whitespace, the text
- * end or more punctuation follows, so ``@Plan`` is not ``@Plan.png``. Other end characters
- * (``@Plan's``, ``@Plan:``, ``@Plan,x``) end it as they always have.
- */
-function endsToken(text: string, end: number): boolean {
-  const next = text[end];
-  if (next === undefined) return true;
-  if (!TOKEN_END_RE.test(next)) return false;
-  if (next !== ".") return true;
-  const after = text[end + 1];
-  return after === undefined || TOKEN_END_RE.test(after);
-}
 
 /** Where a known token sits in composer text. */
 export interface MentionTokenRange {
@@ -304,7 +290,7 @@ export function findMentionTokens(text: string, tokens: readonly string[]): Ment
     for (let at = text.indexOf(token); at >= 0; at = text.indexOf(token, at + 1)) {
       const end = at + token.length;
       if (at > 0 && !/\s/.test(text[at - 1])) continue;
-      if (!endsToken(text, end)) continue;
+      if (end < text.length && !TOKEN_END_RE.test(text[end])) continue;
       if (ranges.some((r) => at < r.end && end > r.start)) continue;
       ranges.push({ start: at, end, token });
     }

@@ -1,12 +1,5 @@
 import { useSyncExternalStore } from "react";
-import {
-  mergeTaggedDrafts,
-  nameAttachmentFile,
-  readTaggedMentions,
-  tagTokensOf,
-  type TaggedMentions,
-} from "./composerMentions";
-import { attachmentFilename } from "./attachments";
+import { mergeTaggedDrafts, readTaggedMentions, type TaggedMentions } from "./composerMentions";
 import { readComposerDraft, type ComposerDraft } from "./replyDraft";
 import type { Comment } from "@/hooks/useComments";
 import { isLocalReviewComment } from "./localReviewComments";
@@ -74,10 +67,9 @@ function saveDraftsToStorage(): void {
     const entries: Record<string, StoredDraft> = {};
     for (const [id, draft] of sessionDrafts) {
       if (!draft.text && !draft.reviewComments?.length) continue;
-      // Pasted chips hold Files, which JSON can't store; persist only file/session tags.
       const tagged =
         draft.mentions && (draft.mentions.files.length > 0 || draft.mentions.sessions.length > 0)
-          ? { files: draft.mentions.files, sessions: draft.mentions.sessions }
+          ? draft.mentions
           : undefined;
       entries[id] =
         draft.replyDraft || tagged || draft.reviewComments?.length
@@ -163,32 +155,13 @@ export function recoverFailedSessionDraft<
   // The two composers allocate tokens independently; reconcile them so a shared
   // token can't make one draft's tag expand to the other's target.
   const merged = mergeTaggedDrafts(originalDraft.mentions, temporaryDraft);
-  // The temporary draft's tray files are the incoming ones: each takes a name no tag or earlier
-  // tray file uses.
-  // Every incoming name is reserved before any is chosen, so a rename never takes a name a later
-  // incoming file keeps. The typed text is never edited.
-  // shortcut: literal @name text in a recovered draft is not updated when its tray file is renamed; upgrade if recovery collisions turn out to matter in practice.
-  const incomingNames = temporaryDraft.files.map(attachmentFilename);
-  const tokens = tagTokensOf(merged.mentions);
-  const finalNames: string[] = [];
-  const incoming: File[] = [];
-  temporaryDraft.files.forEach((file, index) => {
-    const others = incomingNames.filter((_, other) => other !== index);
-    const named = nameAttachmentFile(file, {
-      tokens,
-      trayNames: [...originalDraft.files.map(attachmentFilename), ...finalNames, ...others],
-    });
-    finalNames.push(named.name);
-    incoming.push(named);
-  });
-  const mergedText = merged.text;
-  const message = [originalDraft.message, mergedText]
+  const message = [originalDraft.message, merged.text]
     .filter((part) => part.trim() !== "")
     .join("\n\n");
   return {
     ...originalDraft,
     message,
-    files: [...originalDraft.files, ...incoming],
+    files: [...originalDraft.files, ...temporaryDraft.files],
     ...(merged.mentions ? { mentions: merged.mentions } : {}),
   };
 }

@@ -2801,7 +2801,7 @@ function ComposerImpl(
   const attachPastedFilesRef = useRef<
     (files: File[], target: ComposerTextTarget, trayFiles: File[]) => File[]
   >(() => []);
-  const tagTokensRef = useRef<() => readonly string[]>(() => []);
+  const chipTokensRef = useRef<() => readonly string[]>(() => []);
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the
   // callbacks so the hook never learns about sessions or focus.
@@ -2831,7 +2831,7 @@ function ComposerImpl(
       composerEngine === "codemirror"
         ? (pasted, target, trayFiles) => attachPastedFilesRef.current(pasted, target, trayFiles)
         : undefined,
-    tagTokens: () => tagTokensRef.current(),
+    chipTokens: () => chipTokensRef.current(),
   });
   const filesRef = useRef(files);
   filesRef.current = files;
@@ -3156,6 +3156,7 @@ function ComposerImpl(
     mentionTokens,
     tagFiles,
     ownedMentionTokens,
+    ownedChipTokens,
     resetMentions,
     noteTextChange: noteMentionTextChange,
     handleTokenBackspace,
@@ -3192,7 +3193,7 @@ function ComposerImpl(
   );
   const hasMentions = liveMentions.length > 0;
   attachPastedFilesRef.current = attachPastedFiles;
-  tagTokensRef.current = ownedMentionTokens;
+  chipTokensRef.current = ownedChipTokens;
   // Pasted chips send their files with the tray's; a chip's file goes only while its token is in the draft.
   // Chips are read from the same live scan as liveMentions, so an overlapping longer token counts once.
   const liveTokens = new Set(liveMentions.map((liveMention) => liveMention.token));

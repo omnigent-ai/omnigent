@@ -179,10 +179,9 @@ describe("session drafts", () => {
     expect(sessionDraftRevision("conversation")).toBe(0);
   });
 
-  // Failed-draft recovery merges two drafts' tags and tray files. A pasted chip has already left
-  // its composer as a tray file, so it is one here. Recovery never edits typed text: each row's
-  // message is what the drafts typed. Each row checks unique filenames in send order (tray files, in
-  // order), and that every tagged token in the message still expands to its own target.
+  // Failed-draft recovery joins the two drafts: their tray files in order, and their tags merged.
+  // It never edits typed text, so each row's message is what the drafts typed, and every tagged
+  // token in the message still expands to its own target.
   interface Side {
     message: string;
     files: File[];
@@ -191,63 +190,41 @@ describe("session drafts", () => {
   }
   const recoveryRows: [string, Side, Side, { message: string; names: string[] }][] = [
     [
-      "a tray file that repeats a file's name is renamed",
+      "tray files join in order and keep their names",
       { message: "", files: [new File(["a"], "a.png")] },
-      { message: "see @a.png", files: [new File(["b"], "a.png")] },
-      { message: "see @a.png", names: ["a.png", "a (2).png"] },
+      { message: "see @b.png", files: [new File(["b"], "b.png")] },
+      { message: "see @b.png", names: ["a.png", "b.png"] },
     ],
     [
-      "a tray file from each draft that repeats a name is renamed, and the typed text stays as typed",
-      { message: "use @image (2).png", files: [new File(["a"], "image.png")] },
-      { message: "look @image.png", files: [new File(["b"], "image.png")] },
-      { message: "use @image (2).png\n\nlook @image.png", names: ["image.png", "image (2).png"] },
+      "a repeated tray filename is kept as each draft gave it",
+      { message: "use @a.png", files: [new File(["a"], "a.png")] },
+      { message: "look @a.png", files: [new File(["b"], "a.png")] },
+      { message: "use @a.png\n\nlook @a.png", names: ["a.png", "a.png"] },
     ],
     [
-      "two incoming files collide: the incoming one is renamed, and the typed text stays as typed",
-      { message: "", files: [new File(["a"], "a.png")] },
-      {
-        message: "First @a.png then second @a (2).png",
-        files: [new File(["b"], "a.png"), new File(["c"], "a (2).png")],
-      },
-      {
-        message: "First @a.png then second @a (2).png",
-        names: ["a.png", "a (3).png", "a (2).png"],
-      },
-    ],
-    [
-      "a renamed tray file leaves a workspace tag with the same name in place",
+      "a workspace tag beside a repeated tray filename is kept",
       { message: "", files: [new File(["a"], "README.md")] },
       {
         message: "Open @README.md",
         files: [new File(["b"], "README.md")],
         fileTags: [{ token: "@README.md", path: "README.md" }],
       },
-      { message: "Open @README.md", names: ["README.md", "README (2).md"] },
+      { message: "Open @README.md", names: ["README.md", "README.md"] },
     ],
     [
-      "a renamed tray file leaves a longer session tag that contains its name as typed",
+      "a session tag with a longer name beside a repeated tray filename is kept",
       { message: "", files: [new File(["a"], "a.png")] },
       {
         message: "Use @a.png and @a (2).png plan",
         files: [new File(["b"], "a.png")],
         sessions: [{ token: "@a (2).png plan", id: "s_plan", title: "a (2).png plan" }],
       },
-      { message: "Use @a.png and @a (2).png plan", names: ["a.png", "a (2).png"] },
-    ],
-    [
-      "a session tag that is a prefix of a renamed file's name is left as typed",
-      { message: "", files: [new File(["a"], "a.png")] },
-      {
-        message: "Check @a and @a.png",
-        files: [new File(["b"], "a.png")],
-        sessions: [{ token: "@a", id: "s_a", title: "a" }],
-      },
-      { message: "Check @a and @a.png", names: ["a.png", "a (2).png"] },
+      { message: "Use @a.png and @a (2).png plan", names: ["a.png", "a.png"] },
     ],
   ];
 
   it.each(recoveryRows)(
-    "recovers a failed draft with unique names: %s",
+    "recovers a failed draft as main does: %s",
     async (_, original, temp, want) => {
       const { recoverFailedSessionDraft, setSessionDraft } = await import("./sessionDrafts");
       const { attachmentFilename } = await import("./attachments");
@@ -267,9 +244,7 @@ describe("session drafts", () => {
         { message: original.message, files: original.files, mentions: mentionsOf(original) },
         "temp:rows",
       );
-      const names = recovered.files.map(attachmentFilename);
-      expect(new Set(names).size).toBe(names.length);
-      expect(names).toEqual(want.names);
+      expect(recovered.files.map(attachmentFilename)).toEqual(want.names);
       expect(recovered.message).toBe(want.message);
       // Every tagged token still in the message expands to its own target.
       const inline = composerInlineMentions(

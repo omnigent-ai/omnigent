@@ -183,6 +183,8 @@ export interface MentionBrowser {
   tagFiles: (files: readonly MentionItem[]) => string[];
   /** Every token a tag owns, active or released, for scanning text the way the hook does. */
   ownedMentionTokens: () => string[];
+  /** The pasted-chip tokens, live and released. */
+  ownedChipTokens: () => string[];
   /** Replace the draft's tags, forgetting released ones: a send, recall or new draft. */
   resetMentions: (mentions?: TaggedMentions) => void;
   /**
@@ -320,6 +322,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   });
 
   // Every token a tag owns, active or released; new tags take none of them.
+  // The pasted-chip tokens, live and released: the names a picked file must not take.
+  const ownedChipTokens = () =>
+    [...attachmentsOf(activeRef.current), ...attachmentsOf(releasedRef.current)].map(
+      (attachment) => attachment.token,
+    );
+
   const ownedMentionTokens = () => [
     ...tagTokens(activeRef.current),
     ...tagTokens(releasedRef.current),
@@ -433,12 +441,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     // Every reset goes through here: a live chip leaves as a tray file, so its File is kept.
     if (mentionedAttachments.length > 0) {
       onDemoteChips?.(mentionedAttachments.map((attachment) => attachment.file));
+      setMentionedAttachments([]);
     }
     releasedRef.current = NO_TAGS;
     restorePointsRef.current.clear();
     setMentionedItems(mentions?.files ?? []);
     setMentionedSessions(mentions?.sessions ?? []);
-    setMentionedAttachments([]);
   };
 
   const placeCaret = (caret: number) =>
@@ -712,6 +720,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     mentionTokens,
     tagFiles,
     ownedMentionTokens,
+    ownedChipTokens,
     resetMentions,
     noteTextChange,
     handleTokenBackspace,

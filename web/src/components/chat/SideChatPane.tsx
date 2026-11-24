@@ -86,12 +86,7 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
-import {
-  attachmentAccept,
-  attachmentFilename,
-  clipboardFiles,
-  validateAttachments,
-} from "@/lib/attachments";
+import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -141,12 +136,10 @@ import {
   detectMentionAt,
   harnessSupportsFileMentions,
   mergeTaggedDrafts,
-  nameAttachmentFile,
   presentTaggedMentions,
   recallFileMentions,
   recallSessionMentions,
   type MentionState,
-  tagTokensOf,
   type TaggedMentions,
 } from "@/lib/composerMentions";
 import { clearLocalReviewContexts } from "@/lib/localReviewContext";
@@ -1161,16 +1154,15 @@ function SideChatComposer({
     document.addEventListener("focusin", cancelOnOtherInput);
     return () => document.removeEventListener("focusin", cancelOnOtherInput);
   }, [autoFocus, ready, dropFocusRequest]);
+  const canSend =
+    serializeReplyDraft({ quotes, text }).trim().length > 0 ||
+    (!pending && files.length > 0) ||
+    reviewComments.length > 0;
   // The tags and review comments a send carries. A grid cell's come from its session draft.
   const sharedTags = presentTaggedMentions(sessionMentions, [
     text,
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
-  const attachedFiles = files;
-  const canSend =
-    serializeReplyDraft({ quotes, text }).trim().length > 0 ||
-    (!pending && attachedFiles.length > 0) ||
-    reviewComments.length > 0;
   const sendContext: ComposerSendContext = {
     mentions: composerInlineMentions(sharedTags ?? { files: [], sessions: [] }, harness ?? null),
     reviewComments,
@@ -1178,20 +1170,7 @@ function SideChatComposer({
   const addFiles = (incoming: File[]) => {
     const { accepted, errors } = validateAttachments(incoming, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
-    if (!accepted.length) return;
-    // Rename accepted files to avoid clashing with draft tags or earlier tray files.
-    setFiles((current) => {
-      const named: File[] = [];
-      for (const file of accepted) {
-        named.push(
-          nameAttachmentFile(file, {
-            tokens: tagTokensOf(sharedTags),
-            trayNames: [...current, ...named].map(attachmentFilename),
-          }),
-        );
-      }
-      return [...current, ...named];
-    });
+    if (accepted.length) setFiles((current) => [...current, ...accepted]);
   };
   const onPaste = (event: ComposerPasteEvent) => {
     const pasted = clipboardFiles(event.clipboardData);
@@ -1323,7 +1302,7 @@ function SideChatComposer({
       !pending &&
       !nativeSession &&
       !mentionMenuOpen &&
-      !carriesMessageContext({ quotes, text }, attachedFiles, sendContext),
+      !carriesMessageContext({ quotes, text }, files, sendContext),
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
     clearText: () => setText(""),
@@ -1343,9 +1322,9 @@ function SideChatComposer({
   const highlight = useComposerHighlight({
     value: text,
     commandNames: menuCommandNames,
-    enabled: quotes.length === 0 && attachedFiles.length === 0,
+    enabled: quotes.length === 0 && files.length === 0,
     // Files go out as separate blocks, so the message is no longer a lone `!` text.
-    shellEnabled: attachedFiles.length === 0,
+    shellEnabled: files.length === 0,
     nativeShell,
     refusedNativeShell:
       pending || !session ? null : ownerOnlyShellHarness(harness, session.permissionLevel ?? null),
@@ -1391,7 +1370,7 @@ function SideChatComposer({
     // (claude-native, codex-native) read the text themselves, and a quote, attachment,
     // tag or review comment is always an ordinary message.
     const routeLocally =
-      !nativeSession && !carriesMessageContext({ quotes, text }, attachedFiles, sendContext);
+      !nativeSession && !carriesMessageContext({ quotes, text }, files, sendContext);
     // A lone command token with skill discovery in flight has nothing to run
     // yet; only hold when the submission would route locally.
     if (routeLocally && slashCompletion.pendingCompletion) return;
@@ -1424,7 +1403,7 @@ function SideChatComposer({
       runSkill(skill);
       return;
     }
-    const outgoing = attachedFiles.length > 0 ? attachedFiles : undefined;
+    const outgoing = files.length > 0 ? files : undefined;
     // A grid cell sends what the full-screen composer sends: tags expanded, review comments kept.
     const composed = gridCell
       ? buildOutgoingMessage({ quotes, text }, trimmed, sendContext)
@@ -1576,7 +1555,7 @@ function SideChatComposer({
         draftKey={childId}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
-        hasContent={!pending && attachedFiles.length > 0}
+        hasContent={!pending && files.length > 0}
         data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         className={highlight.cardClassName}
