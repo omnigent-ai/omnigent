@@ -7,7 +7,15 @@ export function projectOrchestratorPath(
   search = new URLSearchParams(),
 ): string {
   const next = new URLSearchParams(search);
-  for (const key of ["ticket", "session", "view", "orchestrator", "agent"]) next.delete(key);
+  for (const key of [
+    "ticket",
+    "session",
+    "view",
+    "orchestrator",
+    "agent",
+    PROJECT_PANEL_PERSONA_PARAM,
+  ])
+    next.delete(key);
   return `${projectHomePath(projectName)}/orchestrator${next.size ? `?${next}` : ""}`;
 }
 
@@ -23,6 +31,29 @@ export const TICKET_ASK_PARAM = "ask";
 
 /** The project home's query parameter naming the session in its side panel. */
 export const PROJECT_PANEL_SESSION_PARAM = "session";
+
+/** The project home's query parameter naming a persona's session open in the side chat. */
+export const PROJECT_PANEL_PERSONA_PARAM = "persona";
+
+/** The board with a persona's session open in the side chat, like the Lead's. */
+export function personaPanelPath(
+  projectName: string,
+  sessionId: string,
+  search = new URLSearchParams(),
+): string {
+  const next = new URLSearchParams(search);
+  for (const key of [
+    "ticket",
+    TICKET_ASK_PARAM,
+    PROJECT_PANEL_SESSION_PARAM,
+    "view",
+    "orchestrator",
+    "agent",
+  ])
+    next.delete(key);
+  next.set(PROJECT_PANEL_PERSONA_PARAM, sessionId);
+  return `${projectHomePath(projectName)}?${next}`;
+}
 
 export function ticketSelectionIds(search: URLSearchParams): string[] {
   return [...new Set((search.get("tickets") ?? "").split(",").filter(Boolean))];
@@ -40,6 +71,7 @@ export function ticketPanelSearch(ticketId: string, search = new URLSearchParams
   // A scroll target belongs to the ticket it was opened for.
   next.delete(TICKET_ASK_PARAM);
   next.delete(PROJECT_PANEL_SESSION_PARAM);
+  next.delete(PROJECT_PANEL_PERSONA_PARAM);
   next.delete("orchestrator");
   next.delete("agent");
   return `?${next}`;

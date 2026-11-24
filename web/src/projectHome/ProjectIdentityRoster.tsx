@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { MessageSquareIcon, UsersIcon } from "lucide-react";
+import { UsersIcon } from "lucide-react";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { RunningDot } from "@/components/RunningDot";
 import { Button } from "@/components/ui/button";
@@ -14,7 +14,8 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { openProjectIdentitySession, type ProjectIdentity } from "@/lib/projectsApi";
-import { useNavigate } from "@/lib/routing";
+import { useNavigate, useSearchParams } from "@/lib/routing";
+import { personaPanelPath } from "./projectHomeNavigation";
 import { ProjectTeamDialog } from "./ProjectTeamDialog";
 import { projectIdentitiesKey, useProjectIdentities } from "./useProjectIdentities";
 
@@ -37,6 +38,7 @@ export function ProjectIdentityRoster({
 }) {
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
+  const [search] = useSearchParams();
   const client = useQueryClient();
   const [editing, setEditing] = useState(false);
   const identities = useProjectIdentities(projectId);
@@ -45,12 +47,14 @@ export function ProjectIdentityRoster({
       openProjectIdentitySession(projectId as string, identity.id, identity.active_session_id),
     onSuccess: ({ session_id }) => {
       void client.invalidateQueries({ queryKey: projectIdentitiesKey(projectId) });
-      navigate(`/c/${encodeURIComponent(session_id)}`);
+      // Open beside the board, like the Lead, rather than leaving the project.
+      navigate(personaPanelPath(projectName, session_id, search));
     },
     onError: () => void client.invalidateQueries({ queryKey: projectIdentitiesKey(projectId) }),
   });
   if (projectId === null) return null;
   const roles = (identities.data ?? []).filter((identity) => !identity.builtin);
+  const leadName = identities.data?.find((identity) => identity.builtin)?.name;
   // Keep working personas in view; otherwise the team's own order.
   const ordered = [
     ...roles.filter((identity) => identity.active_session_state === "busy"),
@@ -78,8 +82,8 @@ export function ProjectIdentityRoster({
           <DropdownMenuContent align="end">
             {leadPath !== undefined && (
               <DropdownMenuItem className="gap-2" onSelect={() => navigate(leadPath)}>
-                <MessageSquareIcon className="size-4" />
-                Lead
+                <PersonaAvatar name={leadName ?? "Lead"} size="xs" />
+                {leadName ?? "Lead"}
               </DropdownMenuItem>
             )}
             {ordered.map((identity) => (

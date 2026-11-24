@@ -159,6 +159,42 @@ export function ProjectOrchestrator({
   );
 }
 
+/** A persona's session in the project's side chat, framed like the Lead's. */
+export function ProjectPersonaChat({
+  sessionId,
+  name,
+  onClose,
+}: {
+  sessionId: string;
+  name: string;
+  onClose: () => void;
+}) {
+  return (
+    <section
+      aria-label={`${name} chat`}
+      data-project-session-panel
+      className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-[16px] border bg-background"
+    >
+      <header className="flex h-11 shrink-0 items-center gap-1 border-b border-border/60 pr-1.5 pl-4">
+        <h2 className="min-w-0 flex-1 truncate text-ui font-medium">{name}</h2>
+        <Button variant="ghost" size="icon-sm" asChild>
+          <Link
+            to={`/c/${encodeURIComponent(sessionId)}`}
+            aria-label={`Open ${name} in full session`}
+            title="Open full session"
+          >
+            <Maximize2Icon />
+          </Link>
+        </Button>
+        <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label={`Close ${name}`}>
+          <XIcon />
+        </Button>
+      </header>
+      <OrchestratorChat key={sessionId} sessionId={sessionId} />
+    </section>
+  );
+}
+
 function OrchestratorChat({ sessionId }: { sessionId: string }) {
   const agent = useSessionAgent(sessionId);
   const presentation = useAgentChatPresentation(agent.isError ? undefined : agent.data);

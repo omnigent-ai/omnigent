@@ -1,4 +1,5 @@
-import { MessageSquareIcon, PlusIcon } from "lucide-react";
+import { PlusIcon } from "lucide-react";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { Button } from "@/components/ui/button";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useSearchParams } from "@/lib/routing";
@@ -7,6 +8,7 @@ import { ProjectIdentityRoster } from "./ProjectIdentityRoster";
 import { ProjectTicketSources } from "./ProjectTicketSources";
 import { projectOrchestratorPath, ticketPanelSearch } from "./projectHomeNavigation";
 import { useProjectRecord } from "./useProjectAgentSession";
+import { useProjectIdentities } from "./useProjectIdentities";
 import { useTicketProject } from "./useProjectTickets";
 
 export function ProjectBoardActions({ projectName }: { projectName: string }) {
@@ -15,6 +17,9 @@ export function ProjectBoardActions({ projectName }: { projectName: string }) {
   const { projectId, projects } = useTicketProject(projectName);
   const leadRemoved = useProjectRecord(projectId).data?.lead_removed;
   const rosterReady = !projects.isLoading && !projects.isError && projectId !== null;
+  // The Lead is drawn like every other persona, by its own name.
+  const leadName =
+    useProjectIdentities(projectId).data?.find((identity) => identity.builtin)?.name ?? "Lead";
   return (
     <div
       className="flex shrink-0 items-center gap-1 md:gap-2"
@@ -24,8 +29,8 @@ export function ProjectBoardActions({ projectName }: { projectName: string }) {
       {!leadRemoved && !(isMobile && rosterReady) && (
         <Button asChild variant="ghost" size={isMobile ? "icon" : "sm"}>
           <Link to={projectOrchestratorPath(projectName, search)} aria-label="Lead">
-            <MessageSquareIcon />
-            {!isMobile && <span className="max-xl:hidden">Lead</span>}
+            <PersonaAvatar name={leadName} size="xs" />
+            {!isMobile && <span className="max-w-28 truncate max-xl:hidden">{leadName}</span>}
           </Link>
         </Button>
       )}

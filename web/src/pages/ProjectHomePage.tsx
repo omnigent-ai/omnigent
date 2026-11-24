@@ -10,6 +10,7 @@ import {
   useProjectComposerStore,
 } from "@/projectHome/ProjectHomeHeader";
 import {
+  PROJECT_PANEL_PERSONA_PARAM,
   PROJECT_PANEL_SESSION_PARAM,
   isLegacyOrchestratorLink,
   projectHomePath,
@@ -21,7 +22,8 @@ import { ProjectSessionPanel } from "@/projectHome/ProjectSessionPanel";
 import { ProjectTicketBoard } from "@/projectHome/ProjectTicketBoard";
 import { useMarkProjectTicketsSeen } from "@/projectHome/projectTicketsSeen";
 import { ProjectTicketPanel } from "@/projectHome/ProjectTicketPanel";
-import { ProjectOrchestrator } from "@/projectHome/ProjectOrchestrator";
+import { ProjectOrchestrator, ProjectPersonaChat } from "@/projectHome/ProjectOrchestrator";
+import { useProjectIdentities } from "@/projectHome/useProjectIdentities";
 import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
 import { useProjectTicketsEnabled, useTicketProject } from "@/projectHome/useProjectTickets";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -50,18 +52,32 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
   const panelSessionId = searchParams.get(PROJECT_PANEL_SESSION_PARAM);
   const panelTicketId = tickets ? searchParams.get("ticket") : null;
   const orchestratorOpen = tickets && orchestrator && panelTicketId === null;
-  const hasPanel = panelSessionId !== null || panelTicketId !== null || orchestratorOpen;
+  // A persona's session opened from the header shares the Lead's side chat.
+  const personaSessionId =
+    tickets && !orchestratorOpen && panelTicketId === null
+      ? searchParams.get(PROJECT_PANEL_PERSONA_PARAM)
+      : null;
+  const hasPanel =
+    panelSessionId !== null ||
+    panelTicketId !== null ||
+    orchestratorOpen ||
+    personaSessionId !== null;
   const [ticketExpanded, setTicketExpanded] = useState(false);
   const ticketFillsPage = panelTicketId !== null && ticketExpanded && !isMobile;
   const hideBoard = (isMobile && hasPanel) || ticketFillsPage;
   useEffect(() => setTicketExpanded(false), [projectName, panelTicketId]);
   const replaceSearchParams = useReplaceSearchParams();
   const { projectId } = useTicketProject(projectName);
+  const personaName =
+    useProjectIdentities(personaSessionId ? projectId : null).data?.find(
+      (identity) => identity.active_session_id === personaSessionId,
+    )?.name ?? "Persona";
   useMarkProjectTicketsSeen(projectId, tickets && !hideBoard);
   const closePanel = useCallback(() => {
     setTicketExpanded(false);
     const next = new URLSearchParams(searchParams);
     next.delete(PROJECT_PANEL_SESSION_PARAM);
+    next.delete(PROJECT_PANEL_PERSONA_PARAM);
     next.delete("ticket");
     next.delete("orchestrator");
     next.delete("agent");
@@ -146,7 +162,13 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
           )}
           {hasPanel && (
             <aside
-              aria-label={orchestratorOpen ? "Lead side chat" : "Ticket details"}
+              aria-label={
+                orchestratorOpen
+                  ? "Lead side chat"
+                  : personaSessionId
+                    ? `${personaName} side chat`
+                    : "Ticket details"
+              }
               // It closes on Escape, so page-wide Escape shortcuts leave keys inside it alone.
               data-escape-owner=""
               className={cn(
@@ -168,6 +190,13 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
                 <ProjectOrchestrator
                   key={projectName}
                   projectName={projectName}
+                  onClose={closePanel}
+                />
+              ) : personaSessionId ? (
+                <ProjectPersonaChat
+                  key={personaSessionId}
+                  sessionId={personaSessionId}
+                  name={personaName}
                   onClose={closePanel}
                 />
               ) : (

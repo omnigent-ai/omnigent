@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type * as ProjectsApi from "@/lib/projectsApi";
 import type { ProjectIdentity } from "@/lib/projectsApi";
 import { ProjectIdentityRoster, VISIBLE_ROSTER_LIMIT } from "./ProjectIdentityRoster";
 
@@ -21,6 +22,16 @@ const identities: ProjectIdentity[] = names.map((name, index) => ({
   // The last persona is working, so it is kept in view.
   active_session_state: index === names.length - 1 ? "busy" : "idle",
 }));
+
+vi.mock("@/lib/projectsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProjectsApi>()),
+  openProjectIdentitySession: vi.fn(async () => ({ session_id: "s-reviewer" })),
+}));
+
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="location">{location.pathname + location.search}</output>;
+}
 
 vi.mock("./useProjectIdentities", () => ({
   projectIdentitiesKey: (projectId: string | null) => ["project-identities", projectId],
@@ -81,5 +92,22 @@ describe("ProjectIdentityRoster on phones", () => {
     expect(items[0]).toHaveTextContent("Lead");
     expect(items.at(-1)).toHaveTextContent("Edit team");
     mobile.mockRestore();
+  });
+});
+
+describe("ProjectIdentityRoster side chat", () => {
+  it("opens a persona in the project's side chat instead of leaving the board", async () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/projects/P?tickets=a"]}>
+          <TooltipProvider>
+            <ProjectIdentityRoster projectId="p1" projectName="P" />
+          </TooltipProvider>
+          <LocationProbe />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Talk to Reviewer" }));
+    expect(await screen.findByText("/projects/P?tickets=a&persona=s-reviewer")).toBeInTheDocument();
   });
 });

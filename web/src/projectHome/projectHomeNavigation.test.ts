@@ -4,6 +4,7 @@ import {
   PROJECT_PANEL_SESSION_PARAM,
   TICKET_ASK_PARAM,
   projectHomePath,
+  personaPanelPath,
   projectOrchestratorPath,
   projectNameFromHomePath,
   ticketPanelSearch,
@@ -67,6 +68,21 @@ describe("project home navigation", () => {
     expect(back.get("ticket")).toBe("two");
     expect(back.has("session")).toBe(false);
     expect(ticketSelectionIds(back)).toEqual(["one", "two"]);
+  });
+});
+
+describe("persona side chat links", () => {
+  it("opens a persona's session beside the board and drops other panels", () => {
+    const search = new URLSearchParams("ticket=t1&ask=4&tickets=a,b&orchestrator=1");
+    expect(personaPanelPath("My Project", "s1", search)).toBe(
+      "/projects/My%20Project?tickets=a%2Cb&persona=s1",
+    );
+  });
+
+  it("leaves the persona chat when opening the Lead", () => {
+    expect(projectOrchestratorPath("P", new URLSearchParams("persona=s1"))).toBe(
+      "/projects/P/orchestrator",
+    );
   });
 });
 
