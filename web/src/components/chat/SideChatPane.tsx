@@ -86,7 +86,13 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
-import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import {
+  attachmentAccept,
+  attachmentFilename,
+  clipboardFiles,
+  validateAttachments,
+} from "@/lib/attachments";
+import { uniqueAttachmentName } from "@/lib/pastedAttachments";
 import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -1160,8 +1166,16 @@ function SideChatComposer({
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
   // A pasted chip the shared draft still shows sends its file with the tray's.
+  // A tray file that shares a chip's name is renamed for the send, since the cell's tray is local.
+  const chipTokens = (sharedTags?.attachments ?? []).map((attachment) => attachment.token);
   const attachedFiles = [
-    ...files,
+    ...files.map((file) => {
+      const name = attachmentFilename(file);
+      const unique = uniqueAttachmentName(name, (candidate) =>
+        chipTokens.includes(`@${candidate}`),
+      );
+      return unique === file.name ? file : new File([file], unique, { type: file.type });
+    }),
     ...(sharedTags?.attachments ?? []).map((attachment) => attachment.file),
   ];
   const canSend =

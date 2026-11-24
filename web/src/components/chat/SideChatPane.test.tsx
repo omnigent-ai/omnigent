@@ -1777,6 +1777,20 @@ describe("grid cell composer shares its session's draft", () => {
     );
   });
 
+  it("renames a cell's tray file that shares a pasted chip's name, so both send with distinct names", () => {
+    const trayShot = new File(["t"], "image.png", { type: "image/png" });
+    const chipShot = new File(["c"], "image.png", { type: "image/png" });
+    bridgedCell({
+      text: "Compare @image.png",
+      files: [trayShot],
+      mentions: { files: [], sessions: [], attachments: [{ token: "@image.png", file: chipShot }] },
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const sent = send.mock.calls[0]![2] as File[];
+    expect(sent.map((file) => file.name)).toEqual(["image (2).png", "image.png"]);
+    expect(sent[1]).toBe(chipShot);
+  });
+
   it("sends a tagged skill command as an ordinary message, not as a local command", () => {
     conversationRegistry
       .acquire(childId)

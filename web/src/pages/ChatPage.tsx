@@ -2797,14 +2797,13 @@ function ComposerImpl(
     if (!isMobileRef.current) textareaRef.current?.focus({ preventScroll: true });
   });
 
-  // Attachments — same hook as the landing composer; the live composer's
-  // own side effects (dirty tracking, desktop refocus) stay in the
-  // callbacks so the hook never learns about sessions or focus.
-
   // Filled in once useMentionBrowser is set up below.
   const attachPastedFilesRef = useRef<
     (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void
   >(() => {});
+  // Attachments — same hook as the landing composer; the live composer's
+  // own side effects (dirty tracking, desktop refocus) stay in the
+  // callbacks so the hook never learns about sessions or focus.
   const {
     files,
     attachmentError,

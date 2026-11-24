@@ -509,8 +509,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const trayNames = trayFiles.map(attachmentFilename);
     const added: PastedAttachment[] = [];
     for (const file of files) {
-      // A name is taken by a tag, a spelling already typed or pasted as text, or a tray file.
-      // Each new chip is checked against the text as it grows, so names stay apart.
+      // Taken: an owned tag, a tray file, a chip from this paste, or a spelling already in the text.
       const isTaken = (candidate: string) =>
         owned.includes(`@${candidate}`) ||
         trayNames.includes(candidate) ||

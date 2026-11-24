@@ -152,6 +152,7 @@ export function useComposerAttachments({
           return;
         }
         e.preventDefault();
+        setAttachmentError(null);
         insertChips([largeText], e.currentTarget, filesRef.current);
         return;
       }
