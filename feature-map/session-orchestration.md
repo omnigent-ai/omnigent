@@ -47,6 +47,17 @@ MCP independent creation.
   and workspace apply unless given. A session whose message the server refused is
   still printed, with a non-zero exit (`tests/cli/test_session_create.py`,
   `tests/e2e/test_session_create_cli_e2e.py`).
+- `cli-messaging`: `omnigent session send <id>` queues a message like a web composer
+  send. With `--wait` it returns once the session is idle, no input still waits for
+  its terminal, and an assistant message follows the newest user message, so an idle
+  read before the turn starts doesn't end the wait. It prints the final reply
+  (`--json` adds every message after the sent one) and stops early, with the status
+  shown, when the turn fails (exit 1) or a prompt waits for a person.
+  `omnigent session get <id>` prints the fields `sys_session_get_info` returns plus
+  the URL, with cost and tokens under `--usage`. `omnigent session read <id>` prints
+  the newest messages oldest first, without tool calls (`--last N`, `--after <message
+  id>`). Each request goes to the replica holding the session's host
+  (`tests/cli/test_session_messaging.py`, `tests/e2e/test_session_create_cli_e2e.py`).
 - `created-by`: independent workers record their creating session. The session
   header does not show it. The worker's sidebar card looks the creator up through
   an access-checked read each time it opens: its "Created by" row names the
