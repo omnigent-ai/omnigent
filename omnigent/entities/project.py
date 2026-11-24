@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from omnigent.errors import ErrorCode, OmnigentError
+
 
 @dataclass
 class Project:
@@ -96,6 +98,21 @@ MANDATE_PROPOSAL_MAX_BYTES = 2_000
 MANDATE_PROPOSALS_MAX_PENDING = 5
 # Most UTF-8 bytes a project description (its charter for people) may hold.
 PROJECT_DESCRIPTION_MAX_BYTES = 8_000
+
+
+def normalize_project_description(description: str) -> str:
+    """Trim a project description and bound its UTF-8 size; blank clears it.
+
+    :raises OmnigentError: ``INVALID_INPUT`` above :data:`PROJECT_DESCRIPTION_MAX_BYTES`.
+    """
+    trimmed = description.strip()
+    size = len(trimmed.encode("utf-8"))
+    if size > PROJECT_DESCRIPTION_MAX_BYTES:
+        raise OmnigentError(
+            f"project description too large ({size} bytes; max {PROJECT_DESCRIPTION_MAX_BYTES})",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return trimmed
 
 
 # Most UTF-8 bytes an identity's persona may hold; added to its sessions' instructions.

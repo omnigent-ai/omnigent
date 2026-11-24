@@ -25,15 +25,20 @@ from typing import Any
 from fastapi import APIRouter, Query, Request
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.entities import Conversation, Project
+from omnigent.entities import Project
 from omnigent.entities.project import (
     PROJECT_IDENTITY_LABEL_KEY,
     MandateProposal,
     ProjectIdentity,
     ProjectShare,
+    normalize_project_description,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.persona_mentions import Mention, PersonaMentionTargets
@@ -217,12 +222,30 @@ def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
         )
 
 
-def _is_lead_session(project: Project, session: Conversation | None) -> bool:
-    """Whether *session* (or the root it runs under) is the project's Lead."""
-    if session is None:
+def _bound_lead_session(
+    request: Request, project: Project, conversation_store: ConversationStore | None
+) -> bool:
+    """Whether the calling agent is proven to run in the project's current Lead session.
+
+    The source header only names a session. The proof is the runner tunnel token,
+    a per-runner secret the server issued: it must derive the runner bound to the
+    named session, and that session (or the root it runs under) must be the
+    project's current Lead, as with an agent rolling itself over.
+    """
+    source_id = normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
+    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+    if not source_id or not token or conversation_store is None or not project.main_session_id:
         return False
-    root_id = session.root_conversation_id or session.id
-    return root_id == project.main_session_id or root_id in project.retired_main_session_ids
+    session = conversation_store.get_conversation(source_id)
+    if session is None or session.archived:
+        return False
+    root = session
+    if session.root_conversation_id and session.root_conversation_id != session.id:
+        root = conversation_store.get_conversation(session.root_conversation_id)
+    if root is None or root.id != project.main_session_id or root.archived:
+        return False
+    runner_id = token_bound_runner_id(token)
+    return runner_id in {session.runner_id, root.runner_id}
 
 
 def _refuse_description_write(
@@ -235,30 +258,32 @@ def _refuse_description_write(
 ) -> None:
     """Keep the description the owner's or the Lead's: members and other agents only read it.
 
+    A call made by an agent's runner (it carries a source or runner token header)
+    passes only when the server can bind it to the current Lead session; an
+    agent that omits its source header is refused rather than treated as the owner.
+
     :param project: The stored project, or ``None`` on create (agents may not set it then).
     :param description: The requested description, or ``None`` when unchanged.
-    :raises OmnigentError: 403 for a shared member or an agent outside the Lead's session.
+    :raises OmnigentError: 403 for a shared member or an agent outside the Lead's session,
+        400 for an oversized description.
     """
     if description is None:
         return
-    source_id = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
-    if source_id is not None:
-        session = None
-        if conversation_store is not None and project is not None:
-            with contextlib.suppress(InvalidUuidError, ValueError):
-                session = conversation_store.get_conversation(
-                    normalize_uuid(source_id) or source_id
-                )
-        if project is None or not _is_lead_session(project, session):
-            raise OmnigentError(
-                "Only the project owner or its Lead can change the project description",
-                code=ErrorCode.FORBIDDEN,
-            )
+    normalize_project_description(description)
+    refused = OmnigentError(
+        "Only the project owner or its Lead can change the project description",
+        code=ErrorCode.FORBIDDEN,
+    )
+    agent_call = (
+        ORCHESTRATION_SOURCE_HEADER in request.headers
+        or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+    )
+    if agent_call and (
+        project is None or not _bound_lead_session(request, project, conversation_store)
+    ):
+        raise refused
     if project is not None and project.user_id != user_id:
-        raise OmnigentError(
-            "Only the project owner or its Lead can change the project description",
-            code=ErrorCode.FORBIDDEN,
-        )
+        raise refused
 
 
 def create_projects_router(

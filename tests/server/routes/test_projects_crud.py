@@ -35,7 +35,11 @@ from omnigent.entities.project import (
     MANDATE_PROPOSALS_MAX_PENDING,
     PROJECT_MANDATE_MAX_BYTES,
 )
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.runtime import user_session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import _ensure_default_native_agents, create_app
@@ -1357,10 +1361,16 @@ async def test_only_the_owner_picks_the_agent_of_sessions_that_run_as_them(
     assert allowed.status_code == 200, allowed.text
 
 
+def _bind_runner(db_uri: str, session_id: str, secret: str) -> dict[str, str]:
+    """Bind *session_id* to the runner a tunnel *secret* derives; return that runner's headers."""
+    SqlAlchemyConversationStore(db_uri).set_runner_id(session_id, token_bound_runner_id(secret))
+    return {ORCHESTRATION_SOURCE_HEADER: session_id, RUNNER_TUNNEL_TOKEN_HEADER: secret}
+
+
 async def test_the_description_is_written_by_the_owner_or_the_lead_only(
-    project_client: httpx.AsyncClient,
+    project_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """The charter round-trips trimmed; among agents only the Lead's session edits it."""
+    """The charter round-trips trimmed; among agents only the Lead's own runner edits it."""
     created = (
         await project_client.post(
             "/v1/projects", json={"name": "P", "description": "  Ship it.  "}
@@ -1368,7 +1378,8 @@ async def test_the_description_is_written_by_the_owner_or_the_lead_only(
     ).json()
     assert (created["description"], created["mandate"]) == ("Ship it.", None)
     path = f"/v1/projects/{created['id']}"
-    lead = {ORCHESTRATION_SOURCE_HEADER: created["main_session_id"]}
+    lead_id = created["main_session_id"]
+    lead = _bind_runner(db_uri, lead_id, "lead-secret")
     written = await project_client.patch(
         path, json={"description": "Mission: docs.\nOut of scope: code."}, headers=lead
     )
@@ -1381,17 +1392,54 @@ async def test_the_description_is_written_by_the_owner_or_the_lead_only(
     persona = (
         await project_client.post(f"{path}/identities", json={"name": "PM", "instructions": "y"})
     ).json()
-    worker = {ORCHESTRATION_SOURCE_HEADER: persona["active_session_id"]}
-    refused = await project_client.patch(path, json={"description": "Mine."}, headers=worker)
-    assert refused.status_code == 403
+    worker = _bind_runner(db_uri, persona["active_session_id"], "worker-secret")
+    spoofs = {
+        "own session": worker,
+        # Names the Lead but presents its own runner's token.
+        "Lead header, own token": {**worker, ORCHESTRATION_SOURCE_HEADER: lead_id},
+        "Lead header, no token": {ORCHESTRATION_SOURCE_HEADER: lead_id},
+        # A runner call that leaves out its source header isn't the owner.
+        "token, no source": {RUNNER_TUNNEL_TOKEN_HEADER: "worker-secret"},
+    }
+    for label, headers in spoofs.items():
+        refused = await project_client.patch(path, json={"description": "Mine."}, headers=headers)
+        assert refused.status_code == 403, label
     refused = await project_client.post(
         "/v1/projects", json={"name": "Q", "description": "x"}, headers=lead
     )
     assert refused.status_code == 403
-    too_large = await project_client.patch(path, json={"description": "x" * 8_001})
+    # An oversized description is refused before any other field is written.
+    too_large = await project_client.patch(
+        path, json={"name": "Renamed", "description": "x" * 8_001}
+    )
     assert too_large.status_code == 400
+    after = (await project_client.get(path)).json()
+    assert (after["name"], after["description"]) == ("P", "Mission: docs.\nOut of scope: code.")
     cleared = await project_client.patch(path, json={"description": " "})
     assert cleared.json()["description"] is None
+
+
+async def test_the_description_follows_the_lead_across_a_rollover(
+    project_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """After the Lead hands over, its old session can no longer edit; the new one can."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    path = f"/v1/projects/{created['id']}"
+    old = _bind_runner(db_uri, created["main_session_id"], "old-lead-secret")
+    successor = await project_client.post("/v1/sessions", json={"agent_id": PROJECT_AGENT_ID})
+    assert successor.status_code == 201, successor.text
+    new_id = successor.json()["id"]
+    await project_client.patch(f"/v1/sessions/{new_id}", json={"project_id": created["id"]})
+    moved = await project_client.patch(
+        path,
+        json={"main_session_id": new_id, "expected_main_session_id": created["main_session_id"]},
+    )
+    assert moved.status_code == 200, moved.text
+    stale = await project_client.patch(path, json={"description": "Old."}, headers=old)
+    assert stale.status_code == 403
+    new = _bind_runner(db_uri, new_id, "new-lead-secret")
+    fresh = await project_client.patch(path, json={"description": "New."}, headers=new)
+    assert fresh.json()["description"] == "New."
 
 
 async def test_shared_members_read_the_description_but_cannot_edit_it(

@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode, encode
-from omnigent.db.envelope import seal_text
 from omnigent.db.db_models import (
     SqlPreference,
     SqlProject,
@@ -27,6 +26,7 @@ from omnigent.db.db_models import (
     SqlProjectTicketSession,
     current_workspace_id,
 )
+from omnigent.db.envelope import seal_text
 from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -38,7 +38,6 @@ from omnigent.entities import Project
 from omnigent.entities.project import (
     MANDATE_PROPOSAL_MAX_BYTES,
     MANDATE_PROPOSALS_MAX_PENDING,
-    PROJECT_DESCRIPTION_MAX_BYTES,
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
     PROJECT_IDENTITY_MAX_COUNT,
     PROJECT_MANDATE_MAX_BYTES,
@@ -46,6 +45,7 @@ from omnigent.entities.project import (
     MandateProposal,
     ProjectIdentity,
     ProjectShare,
+    normalize_project_description,
 )
 from omnigent.entities.project_routing import choose_router
 from omnigent.errors import ErrorCode, OmnigentError
@@ -118,18 +118,6 @@ def _lead_charter(raw: str | None) -> str | None:
 def _description(raw: str | None) -> str | None:
     value = _decode_config(raw).get(DESCRIPTION_CONFIG_KEY)
     return value if isinstance(value, str) and value else None
-
-
-def _normalize_description(description: str) -> str:
-    """Trim a project description and bound its UTF-8 size; blank clears it."""
-    trimmed = description.strip()
-    size = len(trimmed.encode("utf-8"))
-    if size > PROJECT_DESCRIPTION_MAX_BYTES:
-        raise OmnigentError(
-            f"project description too large ({size} bytes; max {PROJECT_DESCRIPTION_MAX_BYTES})",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return trimmed
 
 
 def _router_identity_id(raw: str | None) -> str | None:
@@ -450,7 +438,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         ``SqlProject.__table_args__`` for why that is acceptable.
         """
         created_at = now_epoch()
-        stored_description = _normalize_description(description or "")
+        stored_description = normalize_project_description(description or "")
         encoded_config = _encode_config(
             {**_client_config(config), DESCRIPTION_CONFIG_KEY: stored_description}
             if stored_description
@@ -814,7 +802,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         :raises OmnigentError: ``NOT_FOUND`` for an unknown project, ``FORBIDDEN``
             for a shared member, ``INVALID_INPUT`` for oversized text.
         """
-        stored = _normalize_description(description)
+        stored = normalize_project_description(description)
         updated_at = now_epoch()
 
         def write(session: Session) -> Project:
