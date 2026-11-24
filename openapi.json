@@ -22994,6 +22994,18 @@
               "title": "Include Guidance",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Only tickets the caller requested.",
+            "in": "query",
+            "name": "mine",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Only tickets the caller requested.",
+              "title": "Mine",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

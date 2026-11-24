@@ -940,6 +940,33 @@ def test_stage_pages_paginate_once_with_the_last_stage_newest_first_and_move_tog
         assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "queued"
 
 
+def test_requester_filter_pages_only_that_requesters_tickets(board):
+    tickets, _, project = board
+    actor = TicketActor("alice")
+    mine = [
+        tickets.create(project.id, CreateTicket(title=f"mine {index}"), actor)["id"]
+        for index in range(3)
+    ]
+    tickets.create(project.id, CreateTicket(title="theirs"), actor, requested_by="bob")
+
+    first = tickets.list(project.id, user_id="alice", stage_id="open", limit=2, requested_by="alice")
+    rest = tickets.list(
+        project.id,
+        user_id="alice",
+        stage_id="open",
+        limit=2,
+        after=first["last_id"],
+        requested_by="alice",
+    )
+    paged = [ticket["id"] for ticket in first["data"] + rest["data"]]
+    assert first["has_more"] and not rest["has_more"]
+    # Same-second creations order by random id, so compare membership, not order.
+    assert len(paged) == len(set(paged)) == 3 and set(paged) == set(mine)
+    bobs = tickets.list(project.id, user_id="alice", requested_by="bob")["data"]
+    assert [ticket["title"] for ticket in bobs] == ["theirs"]
+    assert len(tickets.list(project.id, user_id="alice")["data"]) == 4
+
+
 def test_project_delete_with_tickets_removes_ticket_history_only_when_asked(board, db_uri):
     tickets, projects, project = board
     actor = TicketActor("alice")

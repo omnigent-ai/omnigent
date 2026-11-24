@@ -525,6 +525,43 @@ describe("Project ticket board", () => {
     },
   );
 
+  it("filters to the viewer's tickets on request and remembers it per project", async () => {
+    vi.mocked(api.listTickets).mockImplementation(async (_projectId, options) => ({
+      data:
+        options?.stage_id === ticket.stage_id
+          ? options?.mine
+            ? [{ ...ticket, id: "mine", title: "Mine only" }]
+            : [ticket]
+          : [],
+      has_more: false,
+      last_id: null,
+    }));
+    const board = renderBoard(
+      <ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />,
+    );
+    await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+    expect(screen.getByRole("button", { name: "All tickets" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Your tickets" }));
+
+    await screen.findByRole("link", { name: "Open ticket: Mine only" });
+    expect(screen.queryByRole("link", { name: "Open ticket: Ship the board" })).toBeNull();
+    expect(api.listTickets).toHaveBeenCalledWith(
+      "project",
+      expect.objectContaining({ stage_id: "open", mine: true }),
+    );
+    board.unmount();
+    renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+    await screen.findByRole("link", { name: "Open ticket: Mine only" });
+    expect(screen.getByRole("button", { name: "Your tickets" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
   it("renders configured lane order, instructions and the first starting lane", async () => {
     ticket.stage_id = "investigating";
     vi.mocked(api.getTicketStages).mockResolvedValue({

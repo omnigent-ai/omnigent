@@ -74,15 +74,28 @@ export function useTicketProject(projectName: string) {
   return { projectId, projects, ensure };
 }
 
-export function useTickets(projectId: string | null, stageId?: string, enabled = true) {
+export function useTickets(
+  projectId: string | null,
+  stageId?: string,
+  enabled = true,
+  mine = false,
+) {
   const supported = useTicketStagesEnabled();
   return useInfiniteQuery({
-    queryKey: ["project-tickets", projectId, "board", stageId, supported],
+    queryKey: [
+      "project-tickets",
+      projectId,
+      "board",
+      stageId,
+      supported,
+      ...(mine ? ["mine"] : []),
+    ],
     queryFn: ({ pageParam }) =>
       listTickets(projectId!, {
         stage_id: stageId,
         after: pageParam,
         ...(!supported ? { legacy: true } : {}),
+        ...(mine ? { mine: true } : {}),
       }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (page) => (page.has_more ? (page.last_id ?? undefined) : undefined),

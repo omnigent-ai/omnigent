@@ -161,11 +161,19 @@ async function request<T>(url: string, method = "GET", body?: unknown): Promise<
 
 export function listTickets(
   projectId: string,
-  options: { stage_id?: string; after?: string; limit?: number; legacy?: boolean } = {},
+  options: {
+    stage_id?: string;
+    after?: string;
+    limit?: number;
+    legacy?: boolean;
+    /** Only tickets the viewer requested. */
+    mine?: boolean;
+  } = {},
 ) {
   const params = new URLSearchParams({ limit: String(options.limit ?? 50) });
   if (options.stage_id) params.set(options.legacy ? "status" : "stage_id", options.stage_id);
   if (options.after) params.set("after", options.after);
+  if (options.mine) params.set("mine", "true");
   return request<TicketPage<ProjectTicket>>(`${path(projectId)}?${params}`).then((page) => ({
     ...page,
     data: page.data.map(normalizeTicket),

@@ -614,6 +614,7 @@ def create_project_tickets_router(
         after: str | None = None,
         limit: int = Query(50, ge=1, le=100),
         include_guidance: bool = False,
+        mine: bool = Query(False, description="Only tickets the caller requested."),
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
         page = await asyncio.to_thread(
@@ -623,6 +624,7 @@ def create_project_tickets_router(
             stage_id=stage_id,
             after=after,
             limit=limit,
+            requested_by=who.user_id if mine else None,
         )
         # Project sessions already carry this guidance in their instructions.
         if include_guidance and who.session_id is not None:

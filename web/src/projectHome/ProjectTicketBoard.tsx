@@ -28,6 +28,7 @@ import { cn } from "@/lib/utils";
 import { TicketError, TicketLabels } from "./TicketControls";
 import { TicketStageBadge } from "./TicketStageAppearance";
 import { TicketAgentIcons } from "./TicketAgentIcons";
+import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoardRequesterFilter";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import {
   useRelatedTickets,
@@ -124,6 +125,7 @@ function TicketBoard({
   const selectionPending = selected.some((query) => query.isPending);
   const unfilteredSearch = new URLSearchParams(search);
   unfilteredSearch.delete("tickets");
+  const [mine, setMine] = useBoardRequesterFilter(projectId);
   const [dragged, setDragged] = useState<ProjectTicket | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [focusedId, setFocusedId] = useState<string | null>(null);
@@ -169,6 +171,11 @@ function TicketBoard({
               Load more
             </Button>
           )}
+        </div>
+      )}
+      {ticketIds.length === 0 && (
+        <div className="flex shrink-0 items-center px-4 pb-2">
+          <TicketBoardRequesterFilter mine={mine} onChange={setMine} />
         </div>
       )}
       <TicketError error={update.error} />
@@ -222,6 +229,7 @@ function TicketBoard({
                   : undefined
               }
               selectionPending={selectionPending}
+              mine={mine}
             />
           ))}
         </div>
@@ -254,6 +262,7 @@ function TicketColumn({
   onFocus,
   filteredTickets,
   selectionPending,
+  mine,
 }: {
   projectId: string | null;
   stage: TicketStage;
@@ -268,9 +277,11 @@ function TicketColumn({
   onFocus: (id: string | null) => void;
   filteredTickets?: ProjectTicket[];
   selectionPending: boolean;
+  /** Only the viewer's tickets. */
+  mine: boolean;
 }) {
   const [search] = useSearchParams();
-  const query = useTickets(projectId, stage.id, filteredTickets === undefined);
+  const query = useTickets(projectId, stage.id, filteredTickets === undefined, mine);
   const tickets = filteredTickets ?? query.data?.pages.flatMap((page) => page.data) ?? [];
   const hasNextPage = filteredTickets === undefined && query.hasNextPage;
   const { setNodeRef, isOver } = useDroppable({ id: stage.id, disabled });
@@ -499,7 +510,11 @@ function TicketRequester({ ticket }: { ticket: ProjectTicket }) {
   if (!ticket.requested_by || ticket.requested_by === viewer) return null;
   const label = requesterLabel(ticket.requested_by, viewer);
   return (
-    <span className="min-w-0 truncate" title={`Requested by ${label}`} data-testid="ticket-requester">
+    <span
+      className="min-w-0 truncate"
+      title={`Requested by ${label}`}
+      data-testid="ticket-requester"
+    >
       by {label}
     </span>
   );

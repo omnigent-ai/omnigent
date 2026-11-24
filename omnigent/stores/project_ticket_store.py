@@ -574,7 +574,9 @@ class ProjectTicketStore:
         stage_id: str | None = None,
         after: str | None = None,
         limit: int = 50,
+        requested_by: str | None = None,
     ) -> dict[str, Any]:
+        """List a page of tickets, optionally only one stage or one requester's."""
         limit = max(1, min(limit, TICKET_PAGE_MAX))
         with self._session("list_tickets") as session:
             project = self._project(session, project_id, user_id)
@@ -587,6 +589,7 @@ class ProjectTicketStore:
                 stage_id,
                 after=self._row(session, project_id, after) if after is not None else None,
                 limit=limit + 1,
+                requested_by=requested_by,
             )
             return {
                 **configuration.model_dump(),
@@ -878,6 +881,7 @@ class ProjectTicketStore:
         limit: int,
         after: SqlProjectTicket | None = None,
         write: bool = False,
+        requested_by: str | None = None,
     ) -> builtins.list[SqlProjectTicket]:
         # The completed stage only grows, so it lists the most recently created first.
         descending = stage_id is not None and _stages(project).stages[-1].id == stage_id
@@ -885,6 +889,8 @@ class ProjectTicketStore:
             SqlProjectTicket.workspace_id == project.workspace_id,
             SqlProjectTicket.project_id == project.id,
         )
+        if requested_by is not None:
+            stmt = stmt.where(SqlProjectTicket.requested_by == requested_by)
         if after is not None:
             stmt = stmt.where(
                 keyset_after(
