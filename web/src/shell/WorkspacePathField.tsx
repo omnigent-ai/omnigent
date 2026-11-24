@@ -100,6 +100,11 @@ interface WorkspacePathFieldProps {
   recent: string[];
   /** Suppress the dropdown (e.g. while the tree browser is open). */
   dropdownDisabled?: boolean;
+  /** DOM id for the path input, so a form can focus it. */
+  inputId?: string;
+  placeholder?: string;
+  /** Marks the input invalid (red border, `aria-invalid`). */
+  invalid?: boolean;
 }
 
 /**
@@ -127,6 +132,9 @@ export function WorkspacePathField({
   onCommit,
   recent,
   dropdownDisabled = false,
+  inputId,
+  placeholder = "/Users/you/projects/app",
+  invalid = false,
 }: WorkspacePathFieldProps) {
   const [open, setOpen] = useState(false);
   // Index into the combined [recent..., matches...] list, or -1 for
@@ -253,6 +261,7 @@ export function WorkspacePathField({
     <div ref={containerRef} className="relative">
       <div className="flex items-center gap-2">
         <input
+          id={inputId}
           type="text"
           value={value}
           onChange={(e) => {
@@ -262,7 +271,7 @@ export function WorkspacePathField({
           }}
           onFocus={() => setOpen(true)}
           onKeyDown={onKeyDown}
-          placeholder="/Users/you/projects/app"
+          placeholder={placeholder}
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
@@ -272,7 +281,8 @@ export function WorkspacePathField({
           aria-expanded={dropdownOpen}
           aria-controls="workspace-path-listbox"
           aria-activedescendant={dropdownOpen ? activeDescendantId : undefined}
-          className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+          aria-invalid={invalid || undefined}
+          className="flex-1 rounded-md border border-input aria-invalid:border-destructive bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
           data-testid="workspace-path-input"
         />
         <button

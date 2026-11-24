@@ -9,28 +9,37 @@
 //    hidden ("Read 2 files", rendered by `ToolGroupSummary`). While
 //    the run is the live activity, the trailing `STREAMING_TAIL`
 //    tools stay visible as individual rows so the user can watch
-//    recent steps. Still-in-progress spinners and durable
-//    routing/fan-out cards never fold regardless of position.
+//    recent steps. Still-in-progress spinners, durable routing/fan-out
+//    cards and messages to other sessions never fold regardless of position.
 //
 // 2. Turn folding: once settled, each work run collapses behind a
-//    "Worked" row. Assistant messages remain visible in order;
-//    pending elicitations and routing cards stay visible too.
+//    "Worked" row, sub-agent notices included. Pending elicitations,
+//    routing cards, messages to other sessions, task markers, the newest
+//    notices and assistant messages stay visible; opt-in `foldNarration`
+//    folds narration too (Codex commentary, else all but the last message).
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import { formatDuration } from "@/lib/relativeTime";
 import type { RenderItem } from "@/lib/renderItems";
+import { outboundSessionMessage } from "@/lib/sessionMessageOrigin";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
+import { OutboundSessionMessageCard } from "./SessionMessageCard";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
+import { readTaskActivity, showsTaskActivity } from "@/lib/taskActivity";
+import { ActivityNotice } from "./TaskActivityMessage";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
@@ -106,6 +115,8 @@ interface BlockRendererProps {
   showsWorking?: boolean;
   /** Start a fold containing a mid-turn user interjection open. */
   defaultExpanded?: boolean;
+  /** Opt-in: fold progress narration (see `narrationFolds`) with the work. */
+  foldNarration?: boolean;
 }
 
 /** The subset of {@link BlockRendererProps} the fold decision reads. */
@@ -119,7 +130,11 @@ type FoldInputs = Pick<
   | "hasPendingElicitation"
   | "showsWorking"
   | "defaultExpanded"
->;
+  | "foldNarration"
+> & {
+  /** The server's workflows feature, which plan-task markers need to show. */
+  workflowsEnabled?: boolean;
+};
 
 /**
  * How live a turn is, from the bubble's own lifecycle and the session's.
@@ -136,7 +151,7 @@ function turnLiveness({
   isLastAssistant = false,
   hasPendingElicitation = false,
   showsWorking = false,
-}: Omit<FoldInputs, "items" | "continued">): {
+}: Omit<FoldInputs, "items" | "continued" | "foldNarration">): {
   isOwnTurnLive: boolean;
   possiblyLive: boolean;
   isTurnLive: boolean;
@@ -148,21 +163,38 @@ function turnLiveness({
   return { isOwnTurnLive, possiblyLive, isTurnLive: isOwnTurnLive || possiblyLive };
 }
 
+function isFailureItem(item: RenderItem | undefined): boolean {
+  return item?.kind === "error" || item?.kind === "retry" || item?.kind === "policy_denied";
+}
+
+/**
+ * Narration folds only in a turn that finished cleanly; otherwise it explains the outcome.
+ * Codex labels its messages, so its commentary folds without the opt-in.
+ */
+function foldsNarration({
+  items,
+  turnLifecycle,
+  foldNarration = false,
+}: Pick<FoldInputs, "items" | "turnLifecycle" | "foldNarration">): boolean {
+  return (
+    (foldNarration || items.some(hasMessagePhase)) &&
+    (turnLifecycle === undefined || turnLifecycle === "completed") &&
+    // A retry that later succeeded stays in the transcript; a trailing one blocks any fold.
+    !items.some((item) => item.kind === "error" || item.kind === "policy_denied")
+  );
+}
+
 /** Work folds after an assistant message or in a tool-bearing continuation. */
 function hasFoldableShape(
   items: RenderItem[],
-  { segments }: TurnPartition,
+  { segments, latest }: TurnPartition,
   continued = false,
 ): boolean {
-  const lastItem = items.findLast((item) => !isTrailingWrapup(item));
+  const lastItem = items
+    .slice(0, latest?.startIndex)
+    .findLast((item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity");
   // A terminal failure or denial must stay visible beside the assistant text.
-  if (
-    lastItem?.kind === "error" ||
-    lastItem?.kind === "retry" ||
-    lastItem?.kind === "policy_denied"
-  ) {
-    return false;
-  }
+  if (isFailureItem(lastItem)) return false;
   return (
     !isProvisionalTrace(items) &&
     segments.some((segment) => segment.kind === "work") &&
@@ -177,10 +209,16 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
-  const partition = partitionTurn(inputs.items);
+  const partition = partitionTurn(
+    inputs.items,
+    foldsNarration(inputs),
+    inputs.continued,
+    inputs.workflowsEnabled,
+  );
   return (
     hasFoldableShape(inputs.items, partition, inputs.continued) &&
-    partition.segments.every((segment) => segment.kind === "work")
+    partition.segments.every((segment) => segment.kind === "work") &&
+    partition.latest === null
   );
 }
 
@@ -206,6 +244,7 @@ export function BlockRenderer({
   lastActivityAtS,
   showsWorking = false,
   defaultExpanded = false,
+  foldNarration = false,
   onRetryError,
 }: BlockRendererProps) {
   const { isOwnTurnLive, possiblyLive, isTurnLive } = turnLiveness({
@@ -216,10 +255,15 @@ export function BlockRenderer({
     showsWorking,
   });
 
-  // A native assistant message has no reliable final-answer marker.
-  // Keep each message visible even when a later tool call follows it.
-  const partition = partitionTurn(items);
-  const workRunCount = partition.segments.filter((segment) => segment.kind === "work").length;
+  const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
+  // Keep each message visible even when a later tool call follows it,
+  // unless the user opted into folding narration.
+  const partition = partitionTurn(
+    items,
+    foldsNarration({ items, turnLifecycle, foldNarration }),
+    continued,
+    workflowsEnabled,
+  );
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
   // firing) flips the session to running — Working shimmer included —
@@ -284,6 +328,7 @@ export function BlockRenderer({
 
   if (showFold) {
     const rendered: ReactNode[] = [];
+    const durations = workRunDurations(partition.segments, workedForS);
     for (const segment of partition.segments) {
       if (segment.kind === "text") {
         rendered.push(
@@ -295,17 +340,16 @@ export function BlockRenderer({
         );
         continue;
       }
-      if (segment.kind === "exempt") {
+      if (segment.kind === "exempt" || segment.kind === "marker") {
         rendered.push(
           renderItem(segment.item, segment.index, false, false, false, false, onRetryError),
         );
         continue;
       }
-      // The available duration spans the entire turn, not each work run.
       rendered.push(
         <TurnWorkedFold
           key={`worked:${segment.startIndex}`}
-          workedForS={workRunCount === 1 ? workedForS : undefined}
+          workedForS={durations.get(segment)}
           animateCollapse={animateCollapse}
           defaultOpen={defaultExpanded}
         >
@@ -315,6 +359,18 @@ export function BlockRenderer({
             onRetryError,
           })}
         </TurnWorkedFold>,
+      );
+    }
+    // A woken lead's output streams here, after the fold that has shown,
+    // until committed work moves it into the new response's own bubble.
+    if (partition.latest) {
+      rendered.push(
+        ...renderSequence(partition.latest.items, {
+          liveEdge: isTurnLive,
+          suppressReasoningDuration: showsWorking,
+          indexBase: partition.latest.startIndex,
+          onRetryError,
+        }),
       );
     }
     return rendered;
@@ -345,7 +401,7 @@ function renderSequence(
   // reasoning is the very last item in the bubble. Mirrors the
   // `streamingRunStart` rule for tool runs: the trailing live edge stays
   // expanded; once anything else lands after it, it collapses.
-  const lastIdx = items.length - 1;
+  const lastIdx = lastWorkIndex(items);
   const reasoningStreamingIdx =
     liveEdge && lastIdx >= 0 && items[lastIdx]!.kind === "reasoning" ? lastIdx : -1;
 
@@ -418,11 +474,17 @@ interface TurnSequenceOptions {
 
 interface TurnPartition {
   segments: TurnSegment[];
+  /** The turn's latest news, shown after the fold (see `latestNewsStart`). */
+  latest: { items: RenderItem[]; startIndex: number } | null;
 }
+
+type TaskMarkerItem = Extract<RenderItem, { kind: "subagent_activity" }>;
 
 type TurnSegment =
   | { kind: "work" | "text"; items: RenderItem[]; startIndex: number }
-  | { kind: "exempt"; item: RenderItem; index: number };
+  | { kind: "exempt"; item: RenderItem; index: number }
+  // A task marker outlines the turn: it stays in view, and the work on either side folds apart.
+  | { kind: "marker"; item: TaskMarkerItem; index: number };
 
 // A trailing `turn_diff` belongs with earlier work, after the last message.
 const TRAILING_WRAPUP_TOOLS = new Set(["turn_diff"]);
@@ -433,39 +495,177 @@ function isTrailingWrapup(item: RenderItem): boolean {
   return item.kind === "tool" && TRAILING_WRAPUP_TOOLS.has(item.execution.name);
 }
 
+/** A task's start or end, or a plan change, that the chat shows (sub-agent notices aren't). */
+function isShownTaskMarker(item: RenderItem, workflowsEnabled: boolean): item is TaskMarkerItem {
+  if (item.kind !== "subagent_activity") return false;
+  const activity = readTaskActivity(item.data);
+  return activity !== null && showsTaskActivity(activity, workflowsEnabled);
+}
+
 /**
- * Split work from assistant text while preserving order. Text lacks a
- * reliable final-answer marker, so every completed message stays visible.
+ * Split work from assistant text while preserving order. Every completed
+ * message stays visible unless `foldNarration` asks to fold narration.
  */
-function partitionTurn(items: RenderItem[]): TurnPartition {
-  let end = items.length;
+function partitionTurn(
+  items: RenderItem[],
+  foldNarration = false,
+  continued = false,
+  workflowsEnabled = false,
+): TurnPartition {
+  const latestStart = continued ? items.length : latestNewsStart(items);
+  const settled = items.slice(0, latestStart);
+  let end = settled.length;
   const wrapup: RenderItem[] = [];
-  while (end > 0 && isTrailingWrapup(items[end - 1]!)) {
-    wrapup.unshift(items[end - 1]!);
+  while (end > 0 && isTrailingWrapup(settled[end - 1]!)) {
+    wrapup.unshift(settled[end - 1]!);
     end -= 1;
   }
-  const segments: TurnSegment[] = [];
+  const foldsText = foldNarration ? narrationFolds(settled) : () => false;
+  const built: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
-    const item = items[i]!;
-    if (isPendingElicitation(item) || isPersistentToolCard(item) || isInProgressTool(item)) {
-      segments.push({ kind: "exempt", item, index: i });
+    const item = settled[i]!;
+    if (
+      isPendingElicitation(item) ||
+      isPersistentToolCard(item) ||
+      isInProgressTool(item) ||
+      isSlashCommandCard(item)
+    ) {
+      built.push({ kind: "exempt", item, index: i });
       continue;
     }
-    const kind = item.kind === "text" ? "text" : "work";
-    const previous = segments[segments.length - 1];
+    if (isShownTaskMarker(item, workflowsEnabled)) {
+      built.push({ kind: "marker", item, index: i });
+      continue;
+    }
+    const kind = item.kind === "text" && !foldsText(item, i) ? "text" : "work";
+    const previous = built[built.length - 1];
     if (previous?.kind === kind) previous.items.push(item);
-    else segments.push({ kind, items: [item], startIndex: i });
+    else built.push({ kind, items: [item], startIndex: i });
   }
+  const segments = foldNoticeRuns(built);
   if (wrapup.length > 0) {
     const lastWork = segments.findLast((segment) => segment.kind === "work");
     if (lastWork?.kind === "work") lastWork.items.push(...wrapup);
     else segments.push({ kind: "work", items: wrapup, startIndex: end });
   }
-  return { segments };
+  const latest =
+    latestStart < items.length
+      ? { items: items.slice(latestStart), startIndex: latestStart }
+      : null;
+  return { segments, latest };
+}
+
+/**
+ * Each work run's "Worked for" seconds. Task markers split the turn's time into
+ * stretches; a run alone in its stretch reads that stretch's time, from the marker
+ * before it (or the turn's start) to the next (or the turn's end). Runs that share
+ * a stretch can't be timed apart, so they read "Worked".
+ */
+function workRunDurations(
+  segments: TurnSegment[],
+  workedForS: number | undefined,
+): Map<TurnSegment, number> {
+  const durations = new Map<TurnSegment, number>();
+  let runs: TurnSegment[] = [];
+  let startS: number | undefined = 0;
+  const endStretch = (endS: number | undefined) => {
+    const [run, ...others] = runs;
+    if (
+      run &&
+      others.length === 0 &&
+      startS !== undefined &&
+      endS !== undefined &&
+      endS >= startS
+    ) {
+      durations.set(run, endS - startS);
+    }
+    runs = [];
+    startS = endS;
+  };
+  for (const segment of segments) {
+    if (segment.kind === "work") runs.push(segment);
+    else if (segment.kind === "marker") endStretch(segment.item.turnElapsedS);
+  }
+  endStretch(workedForS);
+  return durations;
+}
+
+/**
+ * Where the turn's latest news starts: trailing sub-agent notices and the
+ * uncommitted output after them, which may belong to a response not named
+ * yet. It stays visible after the fold until committed output follows.
+ */
+function latestNewsStart(items: RenderItem[]): number {
+  let start = items.length;
+  while (start > 0 && isNoticeOrUncommitted(items[start - 1]!)) start -= 1;
+  const notice = items.findIndex((item, i) => i >= start && item.kind === "subagent_activity");
+  return notice < 0 ? items.length : notice;
+}
+
+function isNoticeOrUncommitted(item: RenderItem): boolean {
+  return item.kind === "subagent_activity" || (!isFailureItem(item) && isProvisionalItem(item));
+}
+
+/**
+ * A run of only notices folds with the nearest work between the same task
+ * markers, earlier first. With no work there to fold into, the notices stay
+ * visible where they landed.
+ */
+function foldNoticeRuns(segments: TurnSegment[]): TurnSegment[] {
+  const isNoticeRun = (segment: TurnSegment): boolean =>
+    segment.kind === "work" && segment.items.every((item) => item.kind === "subagent_activity");
+  let markersSoFar = 0;
+  const stretchOf = segments.map((segment) => {
+    if (segment.kind === "marker") markersSoFar += 1;
+    return markersSoFar;
+  });
+  const workRuns = segments.flatMap((segment, index) =>
+    segment.kind === "work" && !isNoticeRun(segment) ? [{ segment, index }] : [],
+  );
+  return segments.flatMap((segment, index): TurnSegment[] => {
+    if (segment.kind !== "work" || !isNoticeRun(segment)) return [segment];
+    const sameStretch = workRuns.filter((run) => stretchOf[run.index] === stretchOf[index]);
+    const earlier = sameStretch.findLast((run) => run.index < index)?.segment;
+    const target = earlier ?? sameStretch[0]?.segment;
+    if (target?.kind !== "work") {
+      return segment.items.map((item, k) => ({
+        kind: "exempt",
+        item,
+        index: segment.startIndex + k,
+      }));
+    }
+    if (earlier) target.items.push(...segment.items);
+    else target.items.unshift(...segment.items);
+    return [];
+  });
+}
+
+/**
+ * Which messages `foldNarration` folds, decided per bubble. One with a harness
+ * answer phase (Codex) folds only commentary; otherwise all but its last message.
+ */
+function narrationFolds(items: RenderItem[]): (item: RenderItem, index: number) => boolean {
+  const hasAnswerPhase = items.some((item) => hasMessagePhase(item) && item.phase !== "commentary");
+  if (hasAnswerPhase) return (item) => item.kind === "text" && item.phase === "commentary";
+  // Keep the last non-blank message visible, even in a continued bubble; blank
+  // text after it stays with it rather than opening a second fold.
+  const answerIndex = items.findLastIndex(
+    (item) => item.kind === "text" && item.text.trim() !== "",
+  );
+  return (_item, index) => index < answerIndex;
+}
+
+function hasMessagePhase(item: RenderItem): item is Extract<RenderItem, { kind: "text" }> {
+  return item.kind === "text" && item.phase !== undefined;
 }
 
 function isPendingElicitation(item: RenderItem): boolean {
   return item.kind === "elicitation" && item.status === "pending";
+}
+
+/** A slash-command receipt is a durable record of the user's invocation. */
+function isSlashCommandCard(item: RenderItem): boolean {
+  return item.kind === "slash_command";
 }
 
 /**
@@ -479,10 +679,14 @@ function isPendingElicitation(item: RenderItem): boolean {
  * That is what made the fold flicker on codex: a reasoning burst plus a
  * narration preview folded mid-turn, then the fold vanished when the
  * preview merged into the real bubble. A genuine turn always carries at
- * least one server-assigned item id.
+ * least one server-assigned item id; a sub-agent notice is not turn work.
  */
 function isProvisionalTrace(items: RenderItem[]): boolean {
-  return items.every((item) => item.itemId === null || item.itemId.startsWith(LIVE_ITEM_PREFIX));
+  return items.every((item) => item.kind === "subagent_activity" || isProvisionalItem(item));
+}
+
+function isProvisionalItem(item: RenderItem): boolean {
+  return item.itemId === null || item.itemId.startsWith(LIVE_ITEM_PREFIX);
 }
 
 /**
@@ -512,19 +716,26 @@ function TurnWorkedFold({
   defaultOpen: boolean;
   children: ReactNode;
 }) {
-  const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
+  const label = workedForS !== undefined ? `Worked for ${formatDuration(workedForS)}` : "Worked";
   const [open, setOpen] = useState(animateCollapse || defaultOpen);
+  // Closing over the trace it replaces, the fold keeps that trace laid out as it was on
+  // screen, so only its height changes; an opened fold indents it under the row.
+  const [inPlace, setInPlace] = useState(animateCollapse && !defaultOpen);
   const userChangedOpenRef = useRef(false);
   useLayoutEffect(() => {
     // History hydration can identify an interjection after this fold mounted.
     // Honor that late default unless the user has already made their own choice.
-    if (defaultOpen && !userChangedOpenRef.current) setOpen(true);
+    if (defaultOpen && !userChangedOpenRef.current) {
+      setInPlace(false);
+      setOpen(true);
+    }
   }, [defaultOpen]);
   useEffect(() => {
-    if (!animateCollapse || defaultOpen) return;
+    // Keyed to state, not the one-render prop: a re-render before the frame must not cancel it.
+    if (!inPlace || !open) return;
     const frame = requestAnimationFrame(() => setOpen(false));
     return () => cancelAnimationFrame(frame);
-  }, [animateCollapse, defaultOpen]);
+  }, [inPlace, open]);
 
   // A USER-initiated expand (never the animateCollapse mount-close)
   // opens INSTANTLY — no height animation — and snaps the fold row to
@@ -545,6 +756,7 @@ function TurnWorkedFold({
     userChangedOpenRef.current = true;
     scrollOnOpenRef.current = next;
     setUserOpened(next);
+    setInPlace(false);
     setOpen(next);
   };
   useLayoutEffect(() => {
@@ -586,11 +798,21 @@ function TurnWorkedFold({
       className="group/turn-fold not-prose w-full"
       data-testid="turn-worked-fold"
     >
-      <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-chat outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-          <span className="shrink-0">{label}</span>
-          <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
-        </CollapsibleTrigger>
+      <div
+        ref={rowRef}
+        className={cn("turn-fold-row", inPlace && "turn-fold-row-enter")}
+        // The grown row stops clipping, so the trigger's focus ring shows.
+        onAnimationEnd={(event) => {
+          if (event.animationName === "turn-fold-row-in") setInPlace(false);
+        }}
+      >
+        {/* The grow-in collapses this wrapper; the trigger's padding would floor it. */}
+        <div>
+          <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-ui outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+            <span className="shrink-0">{label}</span>
+            <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
+          </CollapsibleTrigger>
+        </div>
       </div>
       {/* Height animation lives in index.css (it needs Radix's measured
           --radix-collapsible-content-height) and is disabled under
@@ -601,12 +823,14 @@ function TurnWorkedFold({
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
       >
-        <div className="relative flex flex-col gap-1 pt-2 pl-4">
-          <span
-            aria-hidden
-            className="absolute top-2 bottom-0 left-1 w-px bg-border"
-            data-testid="turn-worked-fold-pin-line"
-          />
+        <div className={cn("relative flex flex-col", inPlace ? "gap-1.5" : "gap-1 pt-2 pl-4")}>
+          {!inPlace && (
+            <span
+              aria-hidden
+              className="absolute top-2 bottom-0 left-1 w-px bg-border"
+              data-testid="turn-worked-fold-pin-line"
+            />
+          )}
           {children}
         </div>
       </CollapsibleContent>
@@ -621,18 +845,6 @@ function nearestScrollContainer(el: HTMLElement): HTMLElement | null {
     if (overflowY === "auto" || overflowY === "scroll") return p;
   }
   return null;
-}
-
-/** "8s", "1m 46s", "1h 2m" — matches the native CLIs' worked-for stamps. */
-function formatWorkedFor(seconds: number): string {
-  const s = Math.max(1, Math.round(seconds));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
 }
 
 /**
@@ -687,7 +899,9 @@ const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_sess
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
+    (ADVISE_MODELS_NAMES.has(item.execution.name) ||
+      SESSION_SEND_NAMES.has(item.execution.name) ||
+      outboundSessionMessage(item) !== null)
   );
 }
 
@@ -696,18 +910,22 @@ function isToolItem(item: RenderItem): boolean {
 }
 
 /**
- * If the transcript ends in a contiguous tool run, return its start
- * index — that run is the live activity and should keep its
- * streaming tail. Otherwise return -1: the agent has spoken (or
- * reasoned) after the most recent tools, so they're no longer
- * "current".
+ * If the transcript ends in a contiguous tool run (trailing sub-agent
+ * notices aside), return its start index: that run is the live
+ * activity and should keep its streaming tail. Otherwise return -1:
+ * the agent has spoken (or reasoned) after the most recent tools, so
+ * they're no longer "current".
  */
 function findStreamingRunStart(items: RenderItem[]): number {
-  if (items.length === 0) return -1;
-  if (!isToolItem(items[items.length - 1]!)) return -1;
-  let i = items.length - 1;
+  let i = lastWorkIndex(items);
+  if (i < 0 || !isToolItem(items[i]!)) return -1;
   while (i > 0 && isToolItem(items[i - 1]!)) i -= 1;
   return i;
+}
+
+/** The live edge: a sub-agent notice landing after it doesn't end it. */
+function lastWorkIndex(items: RenderItem[]): number {
+  return items.findLastIndex((item) => item.kind !== "subagent_activity");
 }
 
 /**
@@ -738,8 +956,12 @@ function renderItem(
           className={cn("min-w-0", followsText && "mt-2")}
         >
           <FilePathAwareMessageResponse
-            className="chat-markdown"
-            mode={isTextStreaming ? "streaming" : "static"}
+            className="chat-markdown text-message"
+            allowWorkspaceImages
+            allowShellCommands
+            mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
+            isStreaming={isTextStreaming}
+            linkPullRequestRefs
           >
             {item.text}
           </FilePathAwareMessageResponse>
@@ -764,9 +986,9 @@ function renderItem(
           duration={suppressReasoningDuration ? undefined : item.duration}
         />
       );
-    case "tool":
+    case "tool": {
       // Intelligent routing's fan-out sizing gets a structured plan card
-      // instead of the generic name(json) row + raw-JSON expansion.
+      // instead of the generic tool row.
       if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
         return (
           <SmartRoutingCard
@@ -777,11 +999,22 @@ function renderItem(
           />
         );
       }
+      // A message to another session reads "To @recipient", once, in place of its call.
+      const outbound = outboundSessionMessage(item);
+      if (outbound !== null) {
+        return (
+          <OutboundSessionMessageCard
+            key={key}
+            message={outbound}
+            startedAt={item.startedAt}
+            duration={item.duration}
+          />
+        );
+      }
       return (
         <ToolCard
           key={key}
           name={item.execution.name}
-          argsSummary={item.execution.argsSummary}
           arguments={item.execution.arguments}
           output={item.output}
           state={item.state}
@@ -789,6 +1022,7 @@ function renderItem(
           duration={item.duration}
         />
       );
+    }
     case "native_tool":
       // Reuse the same tool card. Native tools are server-side
       // (provider-managed) so they're always "completed" by the
@@ -862,16 +1096,65 @@ function renderItem(
       );
     case "elicitation":
       return <ElicitationCard key={key} item={item} />;
+    case "subagent_activity":
+      return <ActivityNotice key={key} data={item.data} />;
   }
 }
 
+// Any indent: a list item's continuation lines carry its content indent. A caret
+// followed by more label text is a footnote; a bare `[^]` is an ordinary label.
+const REFERENCE_DEFINITION = /^\s*\[(?!\^[^\]])(?:[^[\]\\]|\\.)+\]:/;
+// A label opened on this line and still open at its end (where a backslash may end
+// it), then the rest of one.
+const LABEL_OPEN = /^\s*\[(?!\^[^\]])((?:[^[\]\\]|\\.)*\\?)$/;
+const LABEL_REST = /^((?:[^[\]\\]|\\.)*\\?)(\]:)?/;
+const LINE_ENDING = /\r\n?|\n/;
+const MAX_LABEL_LENGTH = 999;
+// Blockquote and list markers at any indent, so nested containers are read too.
+const CONTAINER_PREFIX = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)]))+/;
+
 /**
- * Stable key for each render item. Prefer the server-assigned item id;
- * fall back to call_id for tools (unique within a response) or to
- * position for pre-finalization fragments that don't carry an item id
- * yet (text/reasoning chunks emitted before their `output_item.done`).
+ * Conservatively detects a reference link definition, which resolves only when
+ * static mode renders the whole document. It reads past blockquote and list markers
+ * and doesn't exclude code, so it can match where markdown wouldn't but shouldn't
+ * miss a definition. One pass over the lines, so long or pathological text stays linear.
+ */
+export function mayDefineReferenceLink(text: string): boolean {
+  // Length of a label left open by earlier lines, or -1.
+  let openLabel = -1;
+  for (const line of text.split(LINE_ENDING)) {
+    const content = line.replace(CONTAINER_PREFIX, "");
+    if (openLabel >= 0) {
+      // A label continues over non-blank lines of label characters, up to 999 of them.
+      const [matched = "", chars = "", closed] = LABEL_REST.exec(content) ?? [];
+      openLabel += chars.length + 1;
+      if (closed && openLabel <= MAX_LABEL_LENGTH) return true;
+      const continues = matched === content && content.trim() !== "";
+      openLabel = continues && openLabel <= MAX_LABEL_LENGTH ? openLabel : -1;
+      if (openLabel >= 0) continue;
+    }
+    if (REFERENCE_DEFINITION.test(content)) return true;
+    openLabel = LABEL_OPEN.exec(content)?.[1]?.length ?? -1;
+  }
+  return false;
+}
+
+/**
+ * Streamed text stays in streaming mode once it settles: static mode renders a
+ * different tree, so switching would remount every block of the reply.
+ */
+function keepsStreamingMode(item: Extract<RenderItem, { kind: "text" }>): boolean {
+  return item.streamKey !== undefined && !mayDefineReferenceLink(item.text);
+}
+
+/**
+ * Stable key for each render item. Text that streamed into this page keeps
+ * its `streamKey` while its item id commits; otherwise prefer the
+ * server-assigned item id, then call_id for tools (unique within a
+ * response), then position for fragments that don't carry an item id yet.
  */
 function keyFor(item: RenderItem, index: number): string {
+  if (item.kind === "text" && item.streamKey) return item.streamKey;
   if (item.itemId) return `${item.kind}:${item.itemId}`;
   if (item.kind === "tool") return `tool:${item.execution.callId}`;
   if (item.kind === "elicitation") return `elicitation:${item.elicitationId}`;

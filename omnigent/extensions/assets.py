@@ -227,7 +227,7 @@ def build_asset_index(
                 root_override=override,
                 max_bytes=max_bytes,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             errors[manifest.id] = str(exc)
             _logger.warning(
                 "could not resolve browser bundle for extension %s (%s)",

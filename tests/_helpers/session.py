@@ -40,6 +40,20 @@ def post_session_bundle(
     )
 
 
+def create_sub_agent_sessions(
+    client: httpx.Client, *, agent_id: str, parent_id: str, count: int
+) -> list[str]:
+    """Create *count* sub-agent sessions of *agent_id* under *parent_id*; return their ids."""
+    session_ids = []
+    for _ in range(count):
+        response = client.post(
+            "/v1/sessions", json={"agent_id": agent_id, "parent_session_id": parent_id}
+        )
+        assert response.status_code == 201, response.text
+        session_ids.append(response.json()["id"])
+    return session_ids
+
+
 def bind_session_runner(
     patch: Callable[..., httpx.Response],
     base_url: str,
@@ -54,3 +68,24 @@ def bind_session_runner(
         **request_options,
     )
     response.raise_for_status()
+
+
+def send_user_text(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    text: str,
+) -> None:
+    """Post text through the session events API using the caller's client."""
+    resp = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        },
+        timeout=30.0,
+    )
+    resp.raise_for_status()

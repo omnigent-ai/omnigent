@@ -24,6 +24,10 @@ scaffold, not every test whose name contains "harness". A filename containing
 
 ## Shared setup
 
+Read the [primitive catalog](_helpers/README.md) before writing new setup. It
+maps session, server, runner, host and browser operations to existing APIs and
+examples, including ownership and configuration limits.
+
 - `tests/_helpers/` holds reusable operations such as session upload and local
   server lifecycle. Keep caller-specific inputs, assertions and cleanup visible.
 - `tests/helpers/` currently holds UI configuration, recording and timing support.

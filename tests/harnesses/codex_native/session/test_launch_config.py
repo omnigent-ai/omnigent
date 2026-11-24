@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import tomllib
 import yaml
 
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
@@ -15,7 +15,6 @@ from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
 # adds when no explicit approval/sandbox/reviewer/profile choice is present.
-_AUTO_REVIEW_ARGS = ["-c", 'approvals_reviewer="auto_review"']
 
 
 @pytest.mark.parametrize(
@@ -107,7 +106,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "unix:///tmp/app-server.sock",
-            [*_AUTO_REVIEW_ARGS, "--remote", "unix:///tmp/app-server.sock"],
+            ["--remote", "unix:///tmp/app-server.sock"],
         ),
         # Resume an existing thread over a Unix socket (local reattach).
         (
@@ -126,7 +125,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "ws://127.0.0.1:9876",
-            [*_AUTO_REVIEW_ARGS, "--remote", "ws://127.0.0.1:9876"],
+            ["--remote", "ws://127.0.0.1:9876"],
         ),
         # Resume over the host-spawned runner's ws:// endpoint; hardcoding
         # unix:// would prevent the terminal from attaching to its server.
@@ -148,6 +147,19 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
                 "--remote",
                 "ws://127.0.0.1:9876",
                 "thread_x",
+            ],
+        ),
+        # A fresh thread still submits the positional launch prompt once.
+        (
+            ("--model", "gpt-5.4-mini", "Reply with INITIAL_ONCE"),
+            None,
+            "ws://127.0.0.1:9876",
+            [
+                "--model",
+                "gpt-5.4-mini",
+                "Reply with INITIAL_ONCE",
+                "--remote",
+                "ws://127.0.0.1:9876",
             ],
         ),
     ],
@@ -190,7 +202,6 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
-                *_AUTO_REVIEW_ARGS,
                 "--remote",
                 "ws://127.0.0.1:9876",
             ],
@@ -243,6 +254,44 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
         )
         == expected
     )
+
+
+# Pre- and post-0.154 remote resume keep or strip permission flags differently;
+# the positional launch prompt must be dropped on both paths.
+@pytest.mark.parametrize("codex_cli_version", [None, (0, 150, 0), (0, 154, 0), (0, 159, 2)])
+@pytest.mark.parametrize("bypass_sandbox", [False, True])
+def test_build_codex_remote_args_resume_omits_positional_launch_prompt(
+    codex_cli_version: tuple[int, int, int] | None,
+    bypass_sandbox: bool,
+) -> None:
+    """Resuming forwards the launch configuration but not the persisted positional prompt."""
+    launch_prompt = "Reply with INITIAL_ONCE"
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(
+            "--model",
+            "gpt-5.4-mini",
+            "--remote-auth-token-env",
+            "CODEX_REMOTE_TOKEN",
+            launch_prompt,
+            "--sandbox",
+            "read-only",
+        ),
+        thread_id="thread_existing",
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=('model_provider="omnigent"',),
+        codex_cli_version=codex_cli_version,
+        bypass_sandbox=bypass_sandbox,
+    )
+    assert args[-4:] == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_existing"], args
+    assert launch_prompt not in args, (
+        "cold resume resubmits the original launch prompt instead of only the "
+        f"new input (argv={args})"
+    )
+    assert args[args.index("--model") + 1] == "gpt-5.4-mini", args
+    assert args[args.index("-c") + 1] == 'model_provider="omnigent"', args
+    # The auth-token env-var name is the option's value: it must survive so
+    # ``resume`` stays the subcommand rather than being swallowed as the value.
+    assert args[args.index("--remote-auth-token-env") + 1] == "CODEX_REMOTE_TOKEN", args
 
 
 @pytest.mark.parametrize(
@@ -300,7 +349,7 @@ def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> Non
     Default (``bypass_sandbox=False``) emits NO bypass flag and preserves the
     approval/sandbox flags the approval-mode presets pass through.
 
-    The web "Full access" / "Read only" presets are sent as
+    The web "Full Access" / "Read Only" presets are sent as
     ``--sandbox`` / ``--ask-for-approval`` pairs inside ``codex_args``. With
     bypass off those must reach the TUI verbatim and the dangerous bypass
     flag must never appear — a regression here would either drop a user's

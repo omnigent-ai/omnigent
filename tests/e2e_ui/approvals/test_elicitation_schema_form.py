@@ -20,11 +20,12 @@ rule that a keyboard shortcut cannot accept a prompt that still needs fields.
 from __future__ import annotations
 
 import logging
-import time
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
 
 _log = logging.getLogger(__name__)
 
@@ -75,17 +76,7 @@ def _parked(base_url: str, session_id: str, elicitation_id: str) -> bool:
 
 def _wait_for_parked(base_url: str, session_id: str, elicitation_id: str) -> None:
     """Block until the prompt is in the snapshot the SPA is about to read."""
-    _wait_for(lambda: _parked(base_url, session_id, elicitation_id))
-
-
-def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
+    poll_until(lambda: _parked(base_url, session_id, elicitation_id))
 
 
 def _open_session(page: Page, base_url: str, session_id: str) -> None:
@@ -168,4 +159,4 @@ def test_a_schema_that_names_fields_renders_a_form_and_submits(
 
     responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
     expect(responded).to_be_visible(timeout=_RENDER_TIMEOUT_MS)
-    _wait_for(lambda: not _parked(base_url, session_id, eid))
+    poll_until(lambda: not _parked(base_url, session_id, eid))

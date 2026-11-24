@@ -13,6 +13,7 @@ from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.session import bind_session_runner
 from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.sessions._sidebar_helpers import wait_for_sidebar_collapse
 from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
 from tests.e2e_ui.sessions.test_canvas_workspace import canvas_project as canvas_project
 
@@ -31,6 +32,7 @@ def test_canvas_uses_standard_sidebar_navigation(
     page.get_by_role("button", name="Close sidebar", exact=True).click()
     toggle = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(toggle).to_be_visible()
+    wait_for_sidebar_collapse(page)
     ordinary_icon = toggle.locator("svg").inner_html()
     ordinary_bounds = toggle.bounding_box()
     assert ordinary_bounds is not None
@@ -189,6 +191,13 @@ def test_canvas_plus_creates_session_on_the_selected_board(
             body = {
                 key: payload[key] for key in ("agent_id", "project_id", "labels") if key in payload
             }
+            # This synthetic create publishes an unbound row. Let the HTTP
+            # response resolve the draft only after the fixture binds it.
+            body["labels"] = {
+                key: value
+                for key, value in payload.get("labels", {}).items()
+                if key != "omnigent.client_create_token"
+            }
             assert payload.get("agent_id") == agent_id, (
                 "Canvas creation must use the fixture agent"
             )
@@ -197,7 +206,11 @@ def test_canvas_plus_creates_session_on_the_selected_board(
             created = response.json()
             created_ids.append(created["id"])
             bind_session_runner(
-                httpx.patch, base_url, created["id"], source["runner_id"], timeout=10
+                httpx.patch,
+                base_url,
+                created["id"],
+                source["runner_id"],
+                timeout=httpx.Timeout(10.0, read=30.0),
             )
             route.fulfill(status=response.status_code, json=created)
         except Exception as error:

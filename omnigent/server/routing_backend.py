@@ -162,7 +162,7 @@ async def route_with_fallback(
         )
     try:
         result = await choice.client.route(message, available_models)
-    except Exception:  # noqa: BLE001 — the judge is the fallback for any failure
+    except Exception:  # the judge is the fallback for any failure
         _logger.warning(
             "routing: the external router raised; falling back to the built-in judge",
             exc_info=True,
@@ -288,12 +288,21 @@ def routing_sources(caps: Any) -> dict[str, bool]:  # type: ignore[explicit-any]
 def routing_available(caps: Any) -> bool:  # type: ignore[explicit-any]  # RuntimeCaps-shaped
     """Whether this deployment can route at all, from ANY source.
 
-    The single "is routing configured" gate. It is exactly "some source can
-    answer", so it can never disagree with :func:`routing_sources` — the drift
-    that let a deployment configuring only ``routing_backends`` report routing
-    off while the server routed anyway.
+    The single "is routing configured" gate. For a process that owns backends
+    it is exactly "some source can answer", so it can never disagree with
+    :func:`routing_sources` — the drift that let a deployment configuring only
+    ``routing_backends`` report routing off while the server routed anyway.
+
+    A runner holds no backends of its own (they live in the server process), so
+    it reads its server's answer off ``remote_routing_available`` instead. That
+    flag is ignored by a process that owns backends, so a stale remote answer
+    cannot mask a router that has stopped answering.
 
     :param caps: A ``RuntimeCaps`` (or structural equivalent), or ``None``.
     :returns: ``True`` when at least one router can answer.
     """
-    return any(routing_sources(caps).values())
+    if any(routing_sources(caps).values()):
+        return True
+    return backends_from_caps(caps) == RoutingBackends() and bool(
+        getattr(caps, "remote_routing_available", False)
+    )

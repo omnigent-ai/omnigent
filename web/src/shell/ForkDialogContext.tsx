@@ -8,6 +8,8 @@
 import { createContext, useContext } from "react";
 
 export interface ForkDialogContextValue {
+  /** Session described by canFork and disabledReason; scoped sources resolve their own checks. */
+  currentSessionId?: string | null;
   /**
    * Whether the current session can be forked at all — mirrors the
    * header Fork menu's read-access gating.
@@ -22,7 +24,11 @@ export interface ForkDialogContextValue {
    * a full clone (the session-menu behavior).
    * `sourceSessionId` overrides the URL session as the fork source.
    */
-  openForkDialog: (opts?: { sourceSessionId?: string; upToResponseId?: string }) => void;
+  openForkDialog: (opts?: {
+    sourceSessionId?: string;
+    upToResponseId?: string;
+    workspaceRecovery?: boolean;
+  }) => void;
 }
 
 const ForkDialogContext = createContext<ForkDialogContextValue | null>(null);

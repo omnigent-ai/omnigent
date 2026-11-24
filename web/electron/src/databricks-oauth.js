@@ -24,10 +24,13 @@
 
 "use strict";
 
+const { diagnostics } = require("./diagnostics");
+
 const crypto = require("node:crypto");
 const { shell } = require("electron");
 const { base64url, makePkce, runLoopbackAuthorization } = require("./loopback-oauth");
 const { createTokenStore } = require("./token_store");
+const { isIpAclRefusal, IP_ACL_BLOCKED } = require("./databricks-auth");
 
 // The loopback redirect every published client registers. Not configurable: the
 // port is ephemeral per RFC 8252 (Databricks ignores it), and pinning a host,
@@ -160,10 +163,19 @@ async function postToken(tokenUrl, body, { signal } = {}) {
     /* Never include an unstructured token response in diagnostics. */
   }
   const code = json?.error_code ?? json?.error;
-  const errorCode =
+  let errorCode =
     typeof code === "string" && /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(code) ? code : undefined;
+  if (isIpAclRefusal(resp.status, text)) errorCode = IP_ACL_BLOCKED;
   const id = resp.headers?.get("x-databricks-request-id") ?? resp.headers?.get("x-request-id");
   const requestId = typeof id === "string" && /^[a-zA-Z0-9._:-]{1,128}$/.test(id) ? id : undefined;
+  diagnostics.record("databricks_token", {
+    origin: endpoint.origin,
+    phase: body.get("grant_type"),
+    status: resp.status,
+    code: errorCode,
+    requestId,
+    outcome: resp.ok ? "accepted" : "rejected",
+  });
   console.log("[omnigent] databricks oauth: token response", {
     origin: endpoint.origin,
     status: resp.status,

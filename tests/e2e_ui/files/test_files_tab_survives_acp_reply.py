@@ -35,49 +35,11 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.acp_agent import FAKE_ACP_AGENT_REPLY, FAKE_ACP_AGENT_SCRIPT
 from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.conftest import _ensure_runner_online
 
 _ACP_SLUG = "fake-agent"
-_ACP_REPLY_TEXT = "ACP agent reply: hello from fake-agent"
-
-# A minimal ACP agent speaking the Agent Client Protocol over stdio, mirroring
-# the hermetic fake in tests/inner/test_acp_executor.py but without the
-# permission round-trip: initialize -> session/new -> session/prompt streams
-# one deterministic agent_message_chunk and completes the turn. Stdlib only,
-# so any Python interpreter on the runner host can run it.
-_FAKE_ACP_AGENT = r"""
-import sys, json
-
-def send(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    msg = json.loads(line)
-    mid, method = msg.get("id"), msg.get("method")
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": 1,
-            "agentCapabilities": {"promptCapabilities": {"image": False}},
-        }})
-    elif method == "session/new":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "fake-acp-session-1"}})
-    elif method == "session/prompt":
-        sid = msg["params"]["sessionId"]
-        send({"jsonrpc": "2.0", "method": "session/update",
-              "params": {"sessionId": sid, "update": {
-                  "sessionUpdate": "agent_message_chunk",
-                  "content": {"type": "text",
-                              "text": "ACP agent reply: hello from fake-agent"}}}})
-        send({"jsonrpc": "2.0", "id": mid, "result": {
-            "stopReason": "end_turn",
-            "usage": {"inputTokens": 3, "outputTokens": 5, "totalTokens": 8},
-        }})
-"""
 
 
 def _acp_launcher_bundle(agent_command: str) -> bytes:
@@ -136,7 +98,7 @@ def acp_launcher_session(
     :returns: ``(base_url, session_id)``.
     """
     agent_script = tmp_path / "fake_acp_agent.py"
-    agent_script.write_text(_FAKE_ACP_AGENT)
+    agent_script.write_text(FAKE_ACP_AGENT_SCRIPT)
     command = shlex.join([sys.executable, str(agent_script)])
 
     create_resp = post_session_bundle(
@@ -195,7 +157,7 @@ def test_files_tab_survives_generic_acp_agent_reply(
     # agent has "started responding", the moment the disappearance was pinned
     # to (the runner is now serving the session's resources, so the
     # environment availability query has resolved).
-    expect(page.get_by_text(_ACP_REPLY_TEXT)).to_be_visible(timeout=90_000)
+    expect(page.get_by_text(FAKE_ACP_AGENT_REPLY)).to_be_visible(timeout=90_000)
 
     # The launched agent ran from a real working directory, so workspace
     # browsing must survive the reply. A launcher without os_env makes the

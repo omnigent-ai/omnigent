@@ -20,7 +20,9 @@ capture.
 from __future__ import annotations
 
 import asyncio
+import shlex
 import shutil
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -206,13 +208,22 @@ async def test_ctrl_c_interrupts_running_command(
     the foreground job's own output proves it is executing (not still at an
     empty prompt), the sleep is long enough that an ineffective C-c leaves
     the recovery echo queued behind it past the poll budget, and the job's
-    post-sleep marker must be absent — so a no-op C-c fails the test.
+    post-sleep marker must be absent. Exit status 130 confirms SIGINT termination.
     """
     instance = await reg.launch("conv_a", "bash", "s1", _bash_spec(tmp_path))
 
-    running = _echo_only_on_run("FOREGROUND_RUNNING")
-    not_interrupted = _echo_only_on_run("SLEEP_FINISHED_NOT_INTERRUPTED")
-    await instance.send(text=f"{running} && sleep 120 && {not_interrupted}", keys="Enter")
+    # A shell echo before sleep races the child's foreground process-group setup.
+    # Emit readiness from the waiting process, not from its parent shell.
+    foreground = tmp_path / "foreground.py"
+    foreground.write_text(
+        "import signal\n"
+        "import time\n"
+        "signal.signal(signal.SIGINT, signal.SIG_DFL)\n"
+        "print('FOREGROUND_RUNNING', flush=True)\n"
+        "time.sleep(120)\n"
+        "print('SLEEP_FINISHED_NOT_INTERRUPTED', flush=True)\n"
+    )
+    await instance.send(text=shlex.join([sys.executable, str(foreground)]), keys="Enter")
 
     started = await _read_until(instance, "FOREGROUND_RUNNING")
     assert "FOREGROUND_RUNNING" in started, (
@@ -223,15 +234,21 @@ async def test_ctrl_c_interrupts_running_command(
     interrupt = await instance.send(text=None, keys="C-c")
     assert interrupt.get("status") == "sent", f"C-c send failed: {interrupt!r}"
 
-    await instance.send(text=_echo_only_on_run("INTERRUPT_RECOVERED_OK"), keys="Enter")
+    await instance.send(
+        text=f"echo INTERRUPT_STATUS_$?; {_echo_only_on_run('INTERRUPT_RECOVERED_OK')}",
+        keys="Enter",
+    )
     screen = await _read_until(instance, "INTERRUPT_RECOVERED_OK")
     assert "INTERRUPT_RECOVERED_OK" in screen, (
-        "recovery echo never ran, so the foreground `sleep` was not interrupted "
+        "recovery echo never ran, so the foreground process was not interrupted "
         f"and still holds the shell. Last pane:\n{screen!r}"
+    )
+    assert "INTERRUPT_STATUS_130" in screen, (
+        f"foreground process did not exit on SIGINT: {screen!r}"
     )
     assert "SLEEP_FINISHED_NOT_INTERRUPTED" not in screen, (
         "the sleep ran to completion, so C-c did not interrupt the foreground "
-        f"command list. Last pane:\n{screen!r}"
+        f"process. Last pane:\n{screen!r}"
     )
 
 

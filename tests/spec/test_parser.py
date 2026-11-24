@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ntpath
+import re
 from functools import partialmethod
 from pathlib import Path
 from types import SimpleNamespace
@@ -3479,6 +3480,143 @@ def test_parse_timers_true_sets_flag(tmp_path: Path) -> None:
     assert spec.timers is True
 
 
+# ─── Top-level ``tool_groups:`` block (framework tool opt-out) ─
+
+
+def test_parse_tool_groups_default_every_group_but_files_on(agent_dir: Path) -> None:
+    """
+    Without a ``tool_groups:`` block every framework-owned group but ``files``
+    stays registered, so specs authored before the key keep their tool surface.
+    """
+    spec = parse(agent_dir)
+    assert spec.tool_groups.browser is True
+    assert spec.tool_groups.scheduled_tasks is True
+    assert spec.tool_groups.comments is True
+    assert spec.tool_groups.policies is True
+    assert spec.tool_groups.agent_discovery is True
+    assert spec.tool_groups.files is False
+
+
+def test_parse_tool_groups_files_true_turns_the_file_tools_on(tmp_path: Path) -> None:
+    """The file tools are opt-in: ``files: true`` turns them on."""
+    config = {"spec_version": 1, "name": "file-sharer", "tool_groups": {"files": True}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    assert parse(tmp_path).tool_groups.files is True
+
+
+def test_parse_tool_groups_false_disables_named_groups_only(tmp_path: Path) -> None:
+    """A ``false`` entry turns off that group; unnamed groups stay on."""
+    config = {
+        "spec_version": 1,
+        "name": "trimmed-agent",
+        "tool_groups": {"browser": False, "scheduled_tasks": False},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.tool_groups.browser is False
+    assert spec.tool_groups.scheduled_tasks is False
+    assert spec.tool_groups.comments is True
+    assert spec.tool_groups.policies is True
+    assert spec.tool_groups.agent_discovery is True
+
+
+def test_parse_tool_groups_rejects_unknown_group(tmp_path: Path) -> None:
+    """
+    A misspelled group must fail the load: the block exists to remove
+    tools, and a silently ignored typo would leave every group registered.
+    """
+    config = {"spec_version": 1, "name": "typo", "tool_groups": {"scheduled-tasks": False}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"unknown group\(s\) \['scheduled-tasks'\]") as exc:
+        parse(tmp_path)
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_parse_tool_groups_rejects_non_boolean_value(tmp_path: Path) -> None:
+    """``browser: "no"`` is truthy under ``bool()`` — refuse it outright."""
+    config = {"spec_version": 1, "name": "stringy", "tool_groups": {"browser": "no"}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(
+        OmnigentError, match=r"tool_groups\.browser must be a boolean, got str"
+    ) as exc:
+        parse(tmp_path)
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_parse_tool_groups_rejects_non_mapping(tmp_path: Path) -> None:
+    """The block is a mapping of group name to boolean, never a list."""
+    config = {"spec_version": 1, "name": "listy", "tool_groups": ["browser"]}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match="tool_groups must be a YAML mapping, got list"):
+        parse(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("extra", "dependent"),
+    [
+        (
+            {"spawn": True, "tool_groups": {"agent_discovery": False, "scheduled_tasks": False}},
+            "spawn: true",
+        ),
+        ({"tool_groups": {"agent_discovery": False}}, "tool_groups.scheduled_tasks"),
+    ],
+)
+def test_parse_tool_groups_rejects_discovery_off_with_agent_id_consumer(
+    tmp_path: Path, extra: dict[str, object], dependent: str
+) -> None:
+    """
+    ``sys_session_create`` and ``sys_scheduled_task_create`` send the model
+    to ``sys_agent_list`` for an ``agent_id``; dropping discovery under
+    either would point it at a tool the runner refuses.
+    """
+    config = {"spec_version": 1, "name": "orphaned", **extra}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=re.escape(dependent)) as exc:
+        parse(tmp_path)
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_parse_tool_groups_discovery_off_once_its_consumers_are_off(tmp_path: Path) -> None:
+    """With no spawn grant and no scheduled tasks, discovery can go too."""
+    config = {
+        "spec_version": 1,
+        "name": "headless",
+        "tool_groups": {"agent_discovery": False, "scheduled_tasks": False},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.tool_groups.agent_discovery is False
+    assert spec.tool_groups.scheduled_tasks is False
+
+
+@pytest.mark.parametrize("removed", ["upload_file", "list_files", "download_file"])
+def test_parse_removed_file_tool_names_keep_the_file_tools_off(
+    tmp_path: Path, removed: str
+) -> None:
+    """
+    A spec that still lists a removed file tool gets none of the ``sys_`` file
+    tools, since a policy written for the old name would not match them.
+    """
+    config = {"spec_version": 1, "name": "legacy-files", "tools": {"builtins": [removed]}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    assert parse(tmp_path).tool_groups.files is False
+
+
+def test_parse_files_true_alongside_a_removed_file_tool_name_is_rejected(tmp_path: Path) -> None:
+    """``files: true`` cannot turn the tools back on while an old name is still listed."""
+    config = {
+        "spec_version": 1,
+        "name": "legacy-files",
+        "tools": {"builtins": ["upload_file"]},
+        "tool_groups": {"files": True},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match="conflicts with the removed upload_file") as exc:
+        parse(tmp_path)
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+
+
 # ─── Top-level ``spawn:`` flag (spawn-write opt-in) ───────────
 
 
@@ -4239,8 +4377,8 @@ def test_parse_credential_proxy_databricks_cli(tmp_path: Path) -> None:
         [
             {
                 "type": "databricks_cli",
-                "profiles": ["dbc-adb7b1a3-9097", "oss"],
-                "default": "dbc-adb7b1a3-9097",
+                "profiles": ["dbc-87654321-dcba", "oss"],
+                "default": "dbc-87654321-dcba",
             }
         ]
     )
@@ -4250,8 +4388,8 @@ def test_parse_credential_proxy_databricks_cli(tmp_path: Path) -> None:
     assert proxy is not None
     assert proxy.entries == []
     assert proxy.databricks is not None
-    assert [b.profile for b in proxy.databricks.profiles] == ["dbc-adb7b1a3-9097", "oss"]
-    assert proxy.databricks.default == "dbc-adb7b1a3-9097"
+    assert [b.profile for b in proxy.databricks.profiles] == ["dbc-87654321-dcba", "oss"]
+    assert proxy.databricks.default == "dbc-87654321-dcba"
 
 
 @pytest.mark.parametrize(

@@ -262,7 +262,7 @@ user-facing messages, shared by the session-startup and mid-turn paths:
 Each Slack user authenticates as their own Omnigent identity — no Omnigent
 credential passes through Slack. The bot auto-detects the server's auth mode
 (unauthenticated `GET /v1/me`) and drives `accounts`-mode device grant (RFC 8628)
-or `oidc` cli-login inside the `/omnigent` modal; `header`/proxy mode is
+or `oidc` PKCE-bound cli-login inside the `/omnigent` modal; `header`/proxy mode is
 unsupported. Tokens are encrypted at rest when
 `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY` is set, else in-memory only. The 401-retry
 path refreshes a delegated token once mid-request. See `README.md#authentication`

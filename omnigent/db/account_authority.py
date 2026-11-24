@@ -47,6 +47,11 @@ def account_checks_scope(enabled: bool) -> Iterator[None]:
         _account_checks_enabled.reset(token)
 
 
+def account_checks_enabled() -> bool:
+    """Whether the current app enforces built-in account generations."""
+    return _account_checks_enabled.get()
+
+
 def bind_account_authority(user_id: str, generation: str) -> None:
     """Capture the identity authenticated by this request or durable job."""
     _authority.set(AccountAuthority(user_id, generation, current_workspace_id()))
@@ -146,7 +151,7 @@ def require_active_account(
     session: Session,
     user_id: str | None,
     *,
-    generation: str | None | _GenerationDefault = _GenerationDefault.CONTEXT,
+    generation: str | _GenerationDefault | None = _GenerationDefault.CONTEXT,
     related_accounts: Mapping[str, str | None] | None = None,
 ) -> str | None:
     """Validate the captured generation under the writer's account lock.

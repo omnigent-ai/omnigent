@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import logging
 import re
 from pathlib import Path
@@ -13,18 +14,23 @@ import pytest
 
 from omnigent.inner.native_attachments import (
     ATTACHMENT_MARKER_STRIP_PATTERN,
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
+    CAP_FILESYSTEM_ATTACHMENTS,
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
     attachment_cache_dir,
     attachment_reference_line,
     codex_resize_metadata_path,
+    filesystem_attachment_capability,
     has_unresolved_file_id,
+    inline_filesystem_attachment_name,
     materialize_attachment,
     parse_data_uri,
     requires_filesystem,
     resize_notice,
     resolve_file_id_block,
     unresolved_attachment_marker,
+    uses_filesystem_delivery,
 )
 
 # A 1x1 transparent PNG, base64-encoded — small but a real decodable image.
@@ -447,10 +453,11 @@ def test_attachment_cache_defaults_to_omnigent_folder(
 
 
 @pytest.mark.parametrize(
-    "filename", ["archive.zip", "report.docx", "sheet.xlsx", "deck.pptx", "app.sqlite3"]
+    "filename",
+    ["archive.zip", "report.docx", "sheet.xlsx", "deck.pptx", "app.sqlite3", "clip.MP4"],
 )
 def test_requires_filesystem_allowed(filename: str) -> None:
-    """Archives, office documents, and databases are filesystem."""
+    """Default binary formats are delivered through filesystem tools."""
     assert requires_filesystem(filename)
 
 
@@ -489,18 +496,186 @@ async def test_re_resolution_takes_the_filename_from_stored_metadata() -> None:
     assert not requires_filesystem(str(resolved["filename"]))
 
 
+@pytest.mark.parametrize(
+    "key", ["pi", "cursor", "kiro", "goose", "antigravity", "qwen", "kimi", "hermes", "devin"]
+)
+async def test_native_file_delivery(key: str, tmp_path: Path) -> None:
+    """File-path adapters expose uploaded MP4 bytes through the existing renderer."""
+    from omnigent.inner.native_attachments import (
+        FILESYSTEM_ATTACHMENT_UPLOAD_HARNESSES,
+    )
+
+    assert f"{key}-native" in FILESYSTEM_ATTACHMENT_UPLOAD_HARNESSES
+    render = importlib.import_module(f"omnigent.inner.{key}_native_executor")._content_to_text
+    bridge = tmp_path / key
+    body = b"synthetic video bytes"
+    client = _FakeFileClient(
+        {
+            "name": "clip.mp4",
+            "content_type": "video/mp4",
+            "metadata": {"source_metadata": {"delivery": "filesystem"}},
+        },
+        body=body,
+    )
+    block = {"type": "input_file", "file_id": "video-file"}
+    resolved = await resolve_file_id_block(block, session_id="session-example", client=client)
+    assert resolved is not None
+    path = attachment_cache_dir(bridge) / "clip.mp4"
+    assert str(path) in render([resolved[0]], bridge)
+    assert path.read_bytes() == body
+    assert path.stat().st_mode & 0o111 == 0
+
+
+@pytest.mark.parametrize(
+    ("filename", "metadata", "expected"),
+    [
+        ("trace.gz", {"delivery": "filesystem"}, True),
+        ("bundle.zip", {"delivery": "inline"}, False),
+        # Records from before the decision was stored follow the default extensions.
+        ("bundle.zip", None, True),
+        ("bundle.zip", {"width": 3, "height": 2}, True),
+        ("trace.gz", None, False),
+        ("trace.gz", {"delivery": "elsewhere"}, False),
+    ],
+)
+def test_uses_filesystem_delivery(filename: str, metadata: object, expected: bool) -> None:
+    """A recorded decision wins; without one the default extensions decide."""
+    assert uses_filesystem_delivery(filename, metadata) is expected
+
+
+@pytest.mark.parametrize(
+    ("filenames", "capability"),
+    [
+        (["a.zip", "b.docx"], CAP_FILESYSTEM_ATTACHMENTS),
+        (["a.zip", "trace.gz"], CAP_FILESYSTEM_ATTACHMENT_DELIVERY),
+        (["clip.MP4"], CAP_FILESYSTEM_ATTACHMENT_DELIVERY),
+    ],
+)
+def test_filesystem_attachment_capability(filenames: list[str], capability: str) -> None:
+    """Formats beyond the original extensions need recorded-delivery support."""
+    assert filesystem_attachment_capability(filenames) == capability
+
+
+def test_inline_bytes_are_refused_for_deployment_file_types() -> None:
+    """A deployment check sees each inline block's name and data-URI MIME type."""
+    seen: list[tuple[str, str | None]] = []
+
+    def requires(name: str, mime: str | None) -> bool:
+        seen.append((name, mime))
+        return name.endswith(".gz")
+
+    content = [
+        {
+            "type": "input_file",
+            "filename": "notes.txt",
+            "file_data": "data:text/plain;base64,aGk=",
+        },
+        {
+            "type": "input_file",
+            "filename": "trace.gz",
+            "file_data": "data:application/gzip;base64,H4s=",
+        },
+    ]
+
+    assert inline_filesystem_attachment_name(content) is None
+    assert inline_filesystem_attachment_name(content, requires) == "trace.gz"
+    assert seen == [("notes.txt", "text/plain"), ("trace.gz", "application/gzip")]
+
+
+def test_unnamed_inline_bytes_are_classified_by_mime() -> None:
+    """A block without a filename is checked by its data-URI MIME type."""
+    seen: list[tuple[str, str | None]] = []
+
+    def requires(name: str, mime: str | None) -> bool:
+        seen.append((name, mime))
+        return mime == "application/gzip"
+
+    content = [
+        # A remote URL has no MIME to check.
+        {"type": "input_image", "image_url": "https://example.com/a.png"},
+        {"type": "input_file", "file_data": "data:application/gzip;base64,H4s="},
+    ]
+
+    assert inline_filesystem_attachment_name(content) is None
+    assert inline_filesystem_attachment_name(content, requires) == "application/gzip"
+    assert seen == [("attachment.gz", "application/gzip")]
+    # The default extensions apply to unnamed bytes too.
+    unnamed_zip = [{"type": "input_file", "file_data": "data:application/zip;base64,UEs="}]
+    assert inline_filesystem_attachment_name(unnamed_zip) == "application/zip"
+
+
+@pytest.mark.parametrize(
+    ("mime", "name"),
+    [
+        # Types mimetypes.guess_extension can't name.
+        ("application/x-bzip2", "attachment.bz2"),
+        ("application/x-gzip", "attachment.gz"),
+        ("application/x-compress", "attachment.Z"),
+        ("application/x-unknown-thing", "attachment"),
+    ],
+)
+def test_unnamed_inline_bytes_get_a_name_for_their_mime(mime: str, name: str) -> None:
+    """An unnamed block is checked under a name carrying its MIME type's extension."""
+    block = {"type": "input_file", "file_data": f"data:{mime};base64,QlpoOQ=="}
+
+    def requires(candidate: str, _mime: str | None) -> bool:
+        return candidate == name
+
+    assert inline_filesystem_attachment_name([block], requires) == mime
+
+
+@pytest.mark.parametrize("mime", ["application/vnd.sqlite3", "application/x-sqlite3"])
+def test_unnamed_sqlite_bytes_are_refused_by_default(mime: str) -> None:
+    """SQLite is a default filesystem type, though mimetypes has no extension for it."""
+    block = {"type": "input_file", "file_data": f"data:{mime};base64,U1FM"}
+    assert inline_filesystem_attachment_name([block]) == mime
+
+
+@pytest.mark.parametrize(
+    ("source_metadata", "client_delivery", "expected"),
+    [
+        ({"delivery": "filesystem"}, None, "filesystem"),
+        # The client's block cannot choose delivery for a stored file.
+        (None, "filesystem", None),
+    ],
+)
+async def test_re_resolution_carries_the_recorded_delivery(
+    source_metadata: dict[str, str] | None,
+    client_delivery: str | None,
+    expected: str | None,
+) -> None:
+    """The runner copies the stored delivery decision onto the rebuilt block."""
+    client = _FakeFileClient(
+        {
+            "name": "trace.gz",
+            "content_type": "application/gzip",
+            "metadata": {"source_metadata": source_metadata},
+        },
+        body=b"\x1f\x8b",
+    )
+    block: dict[str, Any] = {"type": "input_file", "file_id": "file_gz"}
+    if client_delivery is not None:
+        block["delivery"] = client_delivery
+
+    result = await resolve_file_id_block(block, session_id="conv_1", client=client)
+
+    assert result is not None
+    resolved, _notice = result
+    assert resolved.get("delivery") == expected
+
+
 def test_client_server_filesystem_extension_parity() -> None:
-    """Client and server accept the same filesystem attachment extensions."""
-    from omnigent.inner.native_attachments import _FILESYSTEM_ATTACHMENT_EXTENSIONS
+    """Client and server default to the same filesystem attachment extensions."""
+    from omnigent.inner.native_attachments import DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS
 
     ts_path = Path(__file__).resolve().parents[2] / "web" / "src" / "lib" / "attachments.ts"
     if not ts_path.exists():
         pytest.skip("web/src/lib/attachments.ts not present (server-only checkout)")
-    block = ts_path.read_text().split("FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([")[1]
+    block = ts_path.read_text().split("DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([")[1]
     client_exts = set(re.findall(r'"(\.[a-z0-9]+)"', block.split("]")[0]))
 
-    assert client_exts, "could not parse client FILESYSTEM_ATTACHMENT_EXTENSIONS"
-    assert client_exts == set(_FILESYSTEM_ATTACHMENT_EXTENSIONS)
+    assert client_exts, "could not parse client DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS"
+    assert client_exts == set(DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS)
 
 
 # ── resize notice ────────────────────────────────────────────────────

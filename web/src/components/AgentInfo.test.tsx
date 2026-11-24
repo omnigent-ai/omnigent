@@ -1,3 +1,4 @@
+import { registryRequest } from "@/lib/mcpRegistry";
 import type * as IdentityModule from "@/lib/identity";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -7,6 +8,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { useChatStore } from "@/store/chatStore";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 // Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
 // render deterministically without network. The add/delete mutations expose
@@ -61,19 +63,30 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 // AgentInfoContent for codex sessions; stub its routing + fork deps so it
 // renders without a Router/network in jsdom.
 vi.mock("@/lib/routing", () => ({ useNavigate: () => vi.fn() }));
-vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  forkSession: vi.fn(),
+}));
 
 // The version footer reads the server version (capabilities probe) and the
 // per-session host version (health poll). Mock both hooks so the footer
 // renders deterministically without those providers; `versionEnv` lets each
 // case dial the values. Defaults (server null / host undefined) keep the
 // footer hidden, so the unrelated cases above are unaffected.
+vi.mock("@/lib/mcpRegistry", () => ({ registryRequest: vi.fn() }));
+
 const versionEnv = vi.hoisted(() => ({
+  enabledConnections: [] as string[],
   serverVersion: null as string | null,
   hostVersion: undefined as string | null | undefined,
+  features: {} as Record<string, boolean>,
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ server_version: versionEnv.serverVersion }),
+  useServerInfo: () => ({
+    server_version: versionEnv.serverVersion,
+    enabled_connections: versionEnv.enabledConnections,
+    features: versionEnv.features,
+  }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionHostVersion: () => versionEnv.hostVersion,
@@ -89,6 +102,8 @@ import {
 
 afterEach(() => {
   cleanup();
+  versionEnv.enabledConnections = [];
+  versionEnv.features = {};
   copyTextMock.mockClear();
   createMcpMutate.mockClear();
   updateMcpMutate.mockClear();
@@ -223,7 +238,15 @@ describe("AgentInfoButton hover behavior", () => {
     mousePointerEnter(screen.getByTestId("agent-info-trigger"));
 
     // The panel is now open — the agent name proves the content mounted.
-    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+    // The height cap + overflow keep a tall panel (many models in the usage
+    // breakdown) scrollable instead of clipped past the viewport bottom.
+    expect(screen.getByTestId("agent-info-panel")).toHaveClass(
+      "menu-surface",
+      "max-h-[var(--radix-popover-content-available-height)]",
+      "overflow-y-auto",
+      "rounded-[12px]",
+      "ring-0",
+    );
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
   });
 
@@ -242,10 +265,14 @@ describe("AgentInfoButton hover behavior", () => {
   });
 
   it("closes after the delay once the pointer leaves both the icon and panel", () => {
+    render(<input aria-label="Search file contents" />);
+    const search = screen.getByRole("textbox", { name: "Search file contents" });
+    search.focus();
     renderButton(AGENT_WITH_BOTH);
     const trigger = screen.getByTestId("agent-info-trigger");
     mousePointerEnter(trigger);
     const panel = screen.getByTestId("agent-info-panel");
+    expect(search).toHaveFocus();
 
     mousePointerEnter(panel);
     mousePointerLeave(panel);
@@ -255,6 +282,25 @@ describe("AgentInfoButton hover behavior", () => {
     // ...then closes once it elapses.
     act(() => vi.advanceTimersByTime(2));
     expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+    act(() => vi.runOnlyPendingTimers());
+    expect(search).toHaveFocus();
+  });
+
+  it("keeps an interacted hover preview open and restores focus on dismissal", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+    mousePointerEnter(trigger);
+    const panel = screen.getByTestId("agent-info-panel");
+    mousePointerLeave(trigger);
+    act(() => panel.focus());
+    mousePointerLeave(panel);
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
+    expect(panel).toHaveFocus();
+    expect(panel).toBeInTheDocument();
+    fireEvent.keyDown(panel, { key: "Escape" });
+    act(() => vi.runOnlyPendingTimers());
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+    expect(trigger).toHaveFocus();
   });
 
   it("re-entering the icon during the close delay keeps the panel open", () => {
@@ -280,6 +326,8 @@ describe("AgentInfoButton hover behavior", () => {
 
     fireEvent.click(trigger);
     expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+    act(() => vi.runOnlyPendingTimers());
+    expect(trigger).toHaveFocus();
   });
 
   it("keeps the MCP restart warning after the popover closes and reopens", () => {
@@ -374,7 +422,7 @@ describe("AgentInfoButton session cost row", () => {
   // composer status line). It reads from the shared chat store, so reset
   // the field between cases to keep them independent.
   beforeEach(() => {
-    useChatStore.setState({ sessionCostUsd: null });
+    useChatStore.setState({ sessionCostUsd: null, sessionUsageByModel: null });
   });
 
   it("shows the formatted session cost in the popover when priced", () => {
@@ -404,6 +452,33 @@ describe("AgentInfoButton session cost row", () => {
     // The rest of the popover still renders (agent name proves it opened).
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
+  });
+
+  it("leaves desktop cost to the session overview but keeps it in the mobile dialog", () => {
+    versionEnv.features = { session_overview: true };
+    useChatStore.setState({
+      sessionCostUsd: 1.234,
+      sessionUsageByModel: {
+        "model-a": {
+          inputTokens: 1,
+          outputTokens: null,
+          totalTokens: 1,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 1.234,
+        },
+      },
+    });
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_cost");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
+    expect(screen.queryByTestId("agent-info-usage-by-model")).toBeNull();
+    cleanup();
+
+    renderContent("conv_cost");
+    expect(screen.getByTestId("agent-info-session-cost")).toHaveTextContent("$1.23");
+    expect(screen.getByTestId("agent-info-usage-by-model")).toBeInTheDocument();
   });
 });
 
@@ -924,7 +999,16 @@ describe("McpServersSection", () => {
   });
 
   it.each([1, 2, 3])("keeps MCP servers read-only at permission level %s", (permissionLevel) => {
-    renderButtonWithSession(AGENT_WITH_BOTH, "conv_mcp", permissionLevel);
+    versionEnv.enabledConnections = ["mcp"];
+    renderButtonWithSession(
+      {
+        ...AGENT_WITH_BOTH,
+        mcp_registry_editable: true,
+        mcp_servers: [...AGENT_WITH_BOTH.mcp_servers!, { name: "tracker", transport: "registry" }],
+      },
+      "conv_mcp",
+      permissionLevel,
+    );
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
 
     expect(screen.getByText("slack")).toBeInTheDocument();
@@ -932,6 +1016,8 @@ describe("McpServersSection", () => {
     expect(screen.queryByRole("button", { name: "Manage MCP servers" })).toBeNull();
     expect(screen.queryByRole("button", { name: "slack" })).toBeNull();
     expect(screen.queryByRole("button", { name: "jira" })).toBeNull();
+    expect(screen.getByText("tracker")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "tracker" })).toBeNull();
   });
 
   it("preserves MCP management when permissions are disabled", () => {
@@ -939,6 +1025,111 @@ describe("McpServersSection", () => {
 
     expect(screen.getByRole("button", { name: "Manage MCP servers" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "slack" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["custom", true, undefined],
+    ["builtin", false, true],
+  ] as const)(
+    "allows managed selection for a %s agent and gates custom configuration",
+    async (_kind, customEditable, registryEditable) => {
+      versionEnv.enabledConnections = ["mcp"];
+      vi.mocked(registryRequest).mockResolvedValue({
+        data: [
+          {
+            id: "tracker",
+            title: "Work tracker",
+            description: "Read tickets",
+            connected: true,
+            auth: "oauth",
+          },
+        ],
+      });
+      renderButtonWithSession(
+        {
+          ...AGENT_WITH_BOTH,
+          mcp_servers_editable: customEditable,
+          mcp_registry_editable: registryEditable,
+        },
+        "conv_mcp",
+      );
+      fireEvent.click(screen.getByTestId("agent-info-trigger"));
+      expect(screen.queryByRole("button", { name: "slack" }) !== null).toBe(customEditable);
+      fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+      const checkbox = await screen.findByRole("switch", { name: "Work tracker" });
+      expect(screen.queryByLabelText("URL")).toBeNull();
+      fireEvent.click(checkbox);
+      expect(createMcpMutate).toHaveBeenCalledWith(
+        { name: "tracker", transport: "registry" },
+        expect.anything(),
+      );
+      if (customEditable) {
+        fireEvent.click(screen.getByRole("button", { name: /Advanced: custom MCP servers/ }));
+        expect(screen.getByLabelText("URL")).toBeInTheDocument();
+      } else {
+        expect(screen.queryByRole("button", { name: /Advanced: custom MCP servers/ })).toBeNull();
+      }
+    },
+  );
+
+  it.each([
+    ["custom", true, undefined],
+    ["builtin", false, true],
+  ] as const)(
+    "keeps unavailable registry references removable for a %s agent when MCP capability is disabled",
+    (_kind, customEditable, registryEditable) => {
+      vi.mocked(registryRequest).mockClear();
+      renderButtonWithSession(
+        {
+          ...AGENT_WITH_BOTH,
+          mcp_servers_editable: customEditable,
+          mcp_registry_editable: registryEditable,
+          mcp_servers: [
+            ...AGENT_WITH_BOTH.mcp_servers!,
+            { name: "tracker", transport: "registry" },
+          ],
+        },
+        "conv_mcp",
+      );
+      fireEvent.click(screen.getByTestId("agent-info-trigger"));
+      fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+      const dialog = within(screen.getByRole("dialog"));
+      expect(dialog.getByText("No longer available")).toBeVisible();
+      expect(dialog.getByRole("button", { name: /^tracker/ })).toBeDisabled();
+      expect(dialog.getByRole("button", { name: "Edit tracker" })).toBeDisabled();
+      expect(dialog.getByRole("button", { name: "Edit slack" }).hasAttribute("disabled")).toBe(
+        !customEditable,
+      );
+      expect(dialog.getByRole("button", { name: "Delete slack" }).hasAttribute("disabled")).toBe(
+        !customEditable,
+      );
+      expect(registryRequest).not.toHaveBeenCalled();
+
+      fireEvent.click(dialog.getByRole("button", { name: "Delete tracker" }));
+      expect(deleteMcpMutate).toHaveBeenCalledWith("tracker", expect.anything());
+    },
+  );
+
+  it("honors disabled managed editing without restricting custom servers", async () => {
+    versionEnv.enabledConnections = ["mcp"];
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [{ id: "tracker", title: "Work tracker", connected: true, auth: "none" }],
+    });
+    renderButtonWithSession(
+      {
+        ...AGENT_WITH_BOTH,
+        mcp_registry_editable: false,
+        mcp_servers: [...AGENT_WITH_BOTH.mcp_servers!, { name: "tracker", transport: "registry" }],
+      },
+      "conv_mcp",
+    );
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    expect(screen.queryByRole("button", { name: "tracker" })).toBeNull();
+    expect(screen.getByRole("button", { name: "slack" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    expect(await screen.findByRole("switch", { name: "Work tracker" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /Advanced: custom MCP servers/ }));
+    expect(screen.getByRole("button", { name: "Edit slack" })).toBeEnabled();
   });
 
   it("creates an HTTP MCP server from the manager dialog", () => {

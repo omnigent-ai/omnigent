@@ -7,6 +7,7 @@ Header/OIDC identities leave the accounts-specific columns unset.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from collections.abc import Callable
@@ -30,12 +31,14 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlDeviceGrant,
     SqlHost,
+    SqlInboxItem,
     SqlPreference,
     SqlProject,
     SqlScheduledTask,
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
+    SqlWorkflow,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import (
@@ -44,13 +47,25 @@ from omnigent.db.enum_codecs import (
     encode_device_grant_status,
     encode_scheduled_task_state,
 )
+from omnigent.db.keyset import keyset_after
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
     run_write_transaction,
 )
 from omnigent.entities import Account, AccountToken
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.stores.permission_store.sqlalchemy_store import (
+    delete_deleted_account_grants,
+    delete_deleted_account_workflow_grants,
+    delete_deleted_task_grants,
+    delete_grants_on_workflows,
+    holds_scheduled_task_grants,
+    holds_workflow_grants,
+)
+
+_logger = logging.getLogger(__name__)
 
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 
@@ -118,7 +133,7 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
             SqlScheduledTask.user_id == user_id,
             SqlScheduledTask.state != encode_scheduled_task_state("deleted"),
         )
-        .values(state=encode_scheduled_task_state("deleted"), updated_at=now)
+        .values(state=encode_scheduled_task_state("deleted"), next_run_at=None, updated_at=now)
     )
     session.execute(
         update(SqlDeviceGrant)
@@ -152,6 +167,35 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
         delete_host_in_session(session, host)
 
 
+def _carry_registration_work(session: Session, user_id: str, *, old: str, new: str) -> None:
+    """Move *user_id*'s scheduled tasks and hosts from generation *old* to *new*.
+
+    Runs under the account lock when the generation rotates. Tasks and hosts belong
+    to the registration, so they keep working; grants and magic links stay revoked.
+    Like :func:`_revoke_durable_authority`, this updates every row the user owns in
+    one transaction, which only accounts mode does, and only on a password change.
+    """
+    workspace_id = current_workspace_id()
+    session.execute(
+        update(SqlScheduledTask)
+        .where(
+            SqlScheduledTask.workspace_id == workspace_id,
+            SqlScheduledTask.user_id == user_id,
+            SqlScheduledTask.account_generation == old,
+        )
+        .values(account_generation=new)
+    )
+    session.execute(
+        update(SqlHost)
+        .where(
+            SqlHost.workspace_id == workspace_id,
+            SqlHost.user_id == user_id,
+            SqlHost.account_generation == old,
+        )
+        .values(account_generation=new)
+    )
+
+
 def _to_account_token(row: SqlAccountToken) -> AccountToken:
     """Convert a :class:`SqlAccountToken` row to a domain entity."""
     return AccountToken(
@@ -178,6 +222,9 @@ class SqlAlchemyAccountStore:
         ``"sqlite:///omnigent.db"``. Shares the connection pool
         with PermissionStore via :func:`get_or_create_engine`.
     """
+
+    # Owned resources deleted per transaction, and tasks read per page.
+    _cleanup_batch_size = 100
 
     def __init__(self, storage_location: str) -> None:
         self.storage_location = storage_location
@@ -225,13 +272,45 @@ class SqlAlchemyAccountStore:
             the first-boot admin bootstrap passes True.
         :returns: The created :class:`Account`.
         :raises ValueError: If a user with this id already exists.
+        :raises OmnigentError: ``CONFLICT`` while a deleted account's automation or
+            workflow grants, workflows or Inbox items under this name remain;
+            retrying can succeed.
         """
         now = int(time.time())
+        # Finish any held-grant cleanup a deletion left, so the name inherits nothing.
+        delete_deleted_account_grants(
+            self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+        )
+        delete_deleted_account_workflow_grants(
+            self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+        )
+        self._delete_deleted_workflows(user_id)
+        self._delete_deleted_inbox_items(user_id)
 
         def write(session: Session) -> Account:
             existing = lock_account(session, user_id)
             if existing is not None and existing.deleted_at is None:
                 raise ValueError(f"user {user_id!r} already exists")
+            if holds_scheduled_task_grants(session, user_id):
+                raise OmnigentError(
+                    "A deleted account's automation grants are still being removed. Try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+            if holds_workflow_grants(session, user_id):
+                raise OmnigentError(
+                    "A deleted account's workflow grants are still being removed. Try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+            if existing is not None and self._owned_workflow_ids(session, user_id, limit=1):
+                raise OmnigentError(
+                    "A deleted account's workflows are still being removed. Try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+            if existing is not None and self._owned_inbox_item_ids(session, user_id, limit=1):
+                raise OmnigentError(
+                    "A deleted account's Inbox items are still being removed. Try again.",
+                    code=ErrorCode.CONFLICT,
+                )
             row = existing or SqlUser(id=user_id)
             row.is_admin = is_admin
             row.password_hash = password_hash
@@ -438,7 +517,11 @@ class SqlAlchemyAccountStore:
         can be minted), and deletes or tombstones their hosts (so an
         unattended run has nowhere to land). Because everything shares
         one transaction, a partial failure rolls back the whole delete
-        rather than leaving authority behind.
+        rather than leaving authority behind. After it commits, the
+        scheduled task grants the user held, those on their tasks, saved
+        workflows and Inbox items are deleted in bounded batches.
+        Re-registration finishes any interrupted workflow or Inbox cleanup
+        before reusing the username.
 
         The admin-invariant check and the delete run in the same locked
         transaction (see :meth:`_locked_admin_ids`), so this is atomic
@@ -492,7 +575,167 @@ class SqlAlchemyAccountStore:
             )
             return True
 
-        return run_write_transaction(self._session_immediate, "delete_user", write)
+        deleted = run_write_transaction(self._session_immediate, "delete_user", write)
+        if deleted:
+            self._delete_scheduled_task_grants(user_id)
+            try:
+                # Held grants first, as a re-registered name must not inherit them.
+                delete_deleted_account_workflow_grants(
+                    self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+                )
+            except Exception:
+                _logger.exception("Workflow grant cleanup deferred for a deleted account")
+            try:
+                self._delete_deleted_workflows(user_id)
+            except Exception:
+                _logger.exception("Workflow cleanup deferred for a deleted account")
+            try:
+                self._delete_deleted_inbox_items(user_id)
+            except Exception:
+                _logger.exception("Inbox cleanup deferred for a deleted account")
+        return deleted
+
+    def _owned_workflow_ids(
+        self, session: Session, user_id: str, *, limit: int, lock: bool = False
+    ) -> list[str]:
+        """Read a bounded page through the unique owner-and-name index.
+
+        :param lock: Lock the rows, as a grant does, so no grant lands on one meanwhile.
+        """
+        stmt = (
+            select(SqlWorkflow.id)
+            .where(
+                SqlWorkflow.workspace_id == current_workspace_id(),
+                SqlWorkflow.user_id == user_id,
+            )
+            .order_by(SqlWorkflow.name)
+            .limit(limit)
+            .with_hint(SqlWorkflow, "FORCE INDEX (uq_workflows_user_id_name)", "mysql")
+        )
+        return list(session.scalars(stmt.with_for_update() if lock else stmt))
+
+    def _delete_deleted_workflows(self, user_id: str) -> None:
+        """Finish bounded cleanup before a tombstoned username can be registered again.
+
+        Each transaction deletes one bounded batch: grants on the account's workflows
+        while any remain, so none outlives its workflow, then the workflows.
+        """
+
+        def delete_batch(session: Session) -> bool:
+            """Delete one batch; ``True`` while more may remain."""
+            account = lock_account(session, user_id)
+            if account is None or account.deleted_at is None:
+                return False
+            # Locked before their grants are read, the order a grant takes, so a grant
+            # already in flight commits first and is deleted here, or finds no workflow.
+            ids = self._owned_workflow_ids(
+                session, user_id, limit=self._cleanup_batch_size, lock=True
+            )
+            if not ids:
+                return False
+            if delete_grants_on_workflows(session, ids, batch_size=self._cleanup_batch_size):
+                return True
+            session.execute(
+                delete(SqlWorkflow).where(
+                    SqlWorkflow.workspace_id == current_workspace_id(),
+                    SqlWorkflow.id.in_(sorted(ids)),
+                )
+            )
+            return len(ids) == self._cleanup_batch_size
+
+        while run_write_transaction(
+            self._session_immediate, "delete_deleted_account_workflow_batch", delete_batch
+        ):
+            pass
+
+    def _owned_inbox_item_ids(self, session: Session, user_id: str, *, limit: int) -> list[str]:
+        """Read a bounded page through the owner's ``ix_inbox_items_user_created`` index."""
+        return list(
+            session.scalars(
+                select(SqlInboxItem.id)
+                .where(
+                    SqlInboxItem.workspace_id == current_workspace_id(),
+                    SqlInboxItem.user_id == user_id,
+                )
+                .order_by(SqlInboxItem.created_at, SqlInboxItem.id)
+                .limit(limit)
+                .with_hint(SqlInboxItem, "FORCE INDEX (ix_inbox_items_user_created)", "mysql")
+            )
+        )
+
+    def _delete_deleted_inbox_items(self, user_id: str) -> None:
+        """Delete a tombstoned account's Inbox items, one bounded batch per transaction.
+
+        Each batch re-checks the tombstone under the account lock, so cleanup
+        that runs late never deletes a re-registered account's new items.
+        """
+
+        def delete_batch(session: Session) -> int:
+            account = lock_account(session, user_id)
+            if account is None or account.deleted_at is None:
+                return 0
+            ids = self._owned_inbox_item_ids(session, user_id, limit=self._cleanup_batch_size)
+            if ids:
+                session.execute(
+                    delete(SqlInboxItem).where(
+                        SqlInboxItem.workspace_id == current_workspace_id(),
+                        SqlInboxItem.id.in_(sorted(ids)),
+                    )
+                )
+            return len(ids)
+
+        while (
+            run_write_transaction(
+                self._session_immediate, "delete_deleted_account_inbox_batch", delete_batch
+            )
+            == self._cleanup_batch_size
+        ):
+            pass
+
+    def _delete_scheduled_task_grants(self, user_id: str) -> None:
+        """Delete a deleted account's automation grants once its deletion has committed.
+
+        Each bounded batch commits on its own. Held grants go first, as a re-registered
+        name must not inherit them; grants on its tombstoned tasks are already inert. The
+        owner's tasks are found by name, so only deleted ones are touched: a replacement
+        account's live tasks keep their grants. A failure is logged, and registration
+        finishes the held grants before reusing the name.
+        """
+        try:
+            delete_deleted_account_grants(
+                self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+            )
+            after: tuple[int, str] | None = None
+            while True:
+                task_keys = self._owned_task_keys(user_id, after=after)
+                for _, task_id in task_keys:
+                    delete_deleted_task_grants(
+                        self._session_immediate, task_id, batch_size=self._cleanup_batch_size
+                    )
+                if len(task_keys) < self._cleanup_batch_size:
+                    return
+                after = task_keys[-1]
+        except Exception:
+            _logger.exception("Automation grant cleanup deferred for a deleted account")
+
+    def _owned_task_keys(
+        self, user_id: str, *, after: tuple[int, str] | None
+    ) -> list[tuple[int, str]]:
+        """Page an owner's tasks, deleted ones too, along ``ix_scheduled_tasks_user_scope``."""
+        columns = (SqlScheduledTask.created_at, SqlScheduledTask.id)
+        stmt = (
+            select(*columns)
+            .where(
+                SqlScheduledTask.workspace_id == current_workspace_id(),
+                SqlScheduledTask.user_id == user_id,
+            )
+            .order_by(*columns)
+            .limit(self._cleanup_batch_size)
+        )
+        if after is not None:
+            stmt = stmt.where(keyset_after(self._engine.dialect.name, columns, after))
+        with self._session("list_deleted_account_tasks") as session:
+            return [(created_at, task_id) for created_at, task_id in session.execute(stmt)]
 
     def login_snapshot(self, user_id: str) -> tuple[str | None, str | None]:
         """Read the password and generation together before password verification."""
@@ -522,30 +765,47 @@ class SqlAlchemyAccountStore:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row.password_hash if row is not None and row.deleted_at is None else None
 
-    def update_password(self, user_id: str, password_hash: str) -> None:
+    def update_password(
+        self, user_id: str, password_hash: str, *, revoke_sessions: bool = False
+    ) -> str | None:
         """Replace a user's stored password hash.
 
-        Used by self-serve ``/auth/users/me/password`` and
-        admin-initiated reset. Provision a generation when a passwordless
-        sharing identity first receives credentials. Existing generations stay
-        unchanged. No-op if the user does not exist (the route should 404 first).
+        Used by self-serve ``/auth/users/me/password``, admin-initiated
+        reset, and the login-time rehash. Provision a generation when a
+        passwordless sharing identity first receives credentials. With
+        *revoke_sessions*, an existing generation is rotated: session and
+        runner JWTs, refresh and device grants, and magic links carry the
+        generation they were issued under, so the per-request check rejects
+        them afterwards on every replica, while the user's scheduled tasks
+        and hosts move to the new generation. Otherwise the generation stays
+        unchanged. No-op if the user does not exist (the route should 404
+        first).
+
+        :returns: The account generation after the write, or ``None`` when
+            the user does not exist.
         """
 
-        def write(session: Session) -> None:
+        def write(session: Session) -> str | None:
             generation = require_active_account(session, user_id)
-            session.execute(
-                update(SqlUser)
-                .where(
-                    SqlUser.workspace_id == current_workspace_id(),
-                    SqlUser.id == user_id,
-                )
-                .values(
-                    password_hash=password_hash,
-                    account_generation=generation or uuid.uuid4().hex,
-                )
+            new_generation = generation
+            if generation is None or revoke_sessions:
+                new_generation = uuid.uuid4().hex
+                if generation is not None:
+                    _carry_registration_work(session, user_id, old=generation, new=new_generation)
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlUser)
+                    .where(
+                        SqlUser.workspace_id == current_workspace_id(),
+                        SqlUser.id == user_id,
+                    )
+                    .values(password_hash=password_hash, account_generation=new_generation)
+                ),
             )
+            return new_generation if result.rowcount == 1 else None
 
-        run_write_transaction(self._session_immediate, "update_password", write)
+        return run_write_transaction(self._session_immediate, "update_password", write)
 
     def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
         """Bump ``last_login_at`` on every successful login.

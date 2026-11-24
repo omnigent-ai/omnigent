@@ -43,6 +43,7 @@ import shlex
 import shutil
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -184,7 +185,13 @@ class _Stack:
 
 
 @contextlib.contextmanager
-def _native_stack(tmp_path: Path, claude_stub_script: str, *, fail_tmux_launch: bool = False):
+def _native_stack(
+    tmp_path: Path,
+    claude_stub_script: str,
+    *,
+    fail_tmux_launch: bool = False,
+    runner_env: Mapping[str, str | None] | None = None,
+):
     """Spawn server + runner-for-a-parent-session with the debug-log sink live.
 
     Mirrors production wiring: the parent session exists first, the runner is
@@ -231,6 +238,7 @@ def _native_stack(tmp_path: Path, claude_stub_script: str, *, fail_tmux_launch: 
                 "OMNIGENT_DEBUG_LOG_WORKSPACE_URL": capture.base_url,
                 "OMNIGENT_DEBUG_LOG_ENDPOINT": capture.insert_url,
                 "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                **(runner_env or {}),
             }
         )
         _http.patch(

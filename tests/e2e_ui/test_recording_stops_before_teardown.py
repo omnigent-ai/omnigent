@@ -21,8 +21,6 @@ _REAL_HOME = Path.home()
 _PLAYWRIGHT_PLUGINS = (
     "-p",
     "pytest_playwright.pytest_playwright",
-    "-p",
-    "pytest_base_url.plugin",
 )
 
 _LATER_FIXTURE_JOURNEY = """
@@ -83,8 +81,20 @@ def search_sessions(page):
 
 
 def test_journey(page, search_sessions):
-    page.set_content("<body style='background:#1d4ed8'><ul>" +
+    # The video films only paints after its screencast attaches: a static page painted
+    # first records as blank, so a spinner repaints until frames reach the screencast.
+    page.set_content("<style>@keyframes spin{to{transform:rotate(1turn)}}</style>"
+                     "<body style='background:#1d4ed8'>"
+                     "<i style='display:block;width:8px;height:8px;background:#fff;"
+                     "animation:spin 1s linear infinite'></i><ul>" +
                      "".join(f"<li>{row}</li>" for row in search_sessions) + "</ul></body>")
+    frames = []
+    page.screencast.start(on_frame=lambda frame: frames.append(frame))
+    for _ in range(200):
+        if len(frames) >= 2:
+            break
+        page.wait_for_timeout(50)
+    page.screencast.stop()
     page.wait_for_timeout(1_000)"""
 
 
@@ -193,12 +203,23 @@ def test_video_option_is_finalized_before_a_page_dependent_fixture_cleans_up(
     assert list(output.rglob("video.webm")), "pytest-playwright did not save its video"
 
 
-@pytest.mark.parametrize("fails", [False, True], ids=["passing", "failing"])
+@pytest.mark.parametrize(
+    "failure_phase", [None, "call", "teardown"], ids=["passing", "failing", "teardown-failing"]
+)
 def test_early_close_preserves_failure_artifact_policy(
-    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fails: bool
+    pytester: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_phase: str | None,
 ) -> None:
     report = _configure(pytester, monkeypatch, tmp_path, record_dir=None)
-    pytester.makepyfile(_PAGE_DEPENDENT_CLEANUP_JOURNEY + f"\n    assert not {fails!r}\n")
+    journey = _PAGE_DEPENDENT_CLEANUP_JOURNEY + f"\n    assert {failure_phase != 'call'!r}\n"
+    if failure_phase == "teardown":
+        journey = journey.replace(
+            "        RESULTS.clear()",
+            '        RESULTS.clear()\n        raise RuntimeError("cleanup failed")',
+        )
+    pytester.makepyfile(journey)
     output = tmp_path / "pw-output"
 
     result = pytester.runpytest_subprocess(
@@ -214,11 +235,15 @@ def test_early_close_preserves_failure_artifact_policy(
         str(output),
     )
 
-    result.assert_outcomes(passed=int(not fails), failed=int(fails))
+    result.assert_outcomes(
+        passed=int(failure_phase != "call"),
+        failed=int(failure_phase == "call"),
+        errors=int(failure_phase == "teardown"),
+    )
     assert json.loads(report.read_text())["page_closed"]
     for pattern in ("video.webm", "trace.zip", "test-failed-*.png"):
         artifacts = list(output.rglob(pattern))
-        assert bool(artifacts) is fails, (pattern, artifacts)
+        assert bool(artifacts) is (failure_phase is not None), (pattern, artifacts)
         assert all(path.stat().st_size > 0 for path in artifacts)
 
 

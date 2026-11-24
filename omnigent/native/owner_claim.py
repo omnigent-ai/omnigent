@@ -39,19 +39,19 @@ def current_boot_id() -> str | None:
         return None
 
 
-def write_owner_claim(directory: Path) -> None:
+def write_owner_claim(directory: Path, *, filename: str = OWNER_PID_FILENAME) -> None:
     """Record the current owner; older integer-only readers skip this format."""
     lines = [str(os.getpid()), f"pid_ns={current_pid_namespace() or ''}"]
     boot_id = current_boot_id()
     if boot_id is not None:
         lines.append(f"boot={boot_id}")
-    (directory / OWNER_PID_FILENAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (directory / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def read_owner_claim(directory: Path) -> OwnerClaim | None:
+def read_owner_claim(directory: Path, *, filename: str = OWNER_PID_FILENAME) -> OwnerClaim | None:
     """Read qualified ownership, conservatively skipping unknown or legacy claims."""
     try:
-        raw = (directory / OWNER_PID_FILENAME).read_text(encoding="utf-8")
+        raw = (directory / filename).read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return None
     lines = [line.strip() for line in raw.splitlines() if line.strip()]

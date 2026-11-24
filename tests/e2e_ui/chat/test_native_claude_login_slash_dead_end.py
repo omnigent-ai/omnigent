@@ -5,7 +5,7 @@ turn answers ``Login expired · Please run /login`` — and typing ``/login``
 in the composer cannot fix it, because ``/login`` is in
 ``_CLAUDE_CLI_DROPPED_COMMANDS`` (``omnigent/harnesses/claude_native/bridge.py``) and
 not in ``_CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS``, so
-``_escape_unsupported_slash_command`` prefixes it with U+FEFF and Claude
+``_escape_unsupported_slash_command`` prefixes it with a space and Claude
 Code receives it as ordinary prose. The CLI then answers it like any other
 prompt — on an expired login, with the very same "Please run /login" line —
 silently spending a model turn on the exact command the error told the user
@@ -19,9 +19,9 @@ silently forwarded to the model as escaped prose. Today both observable
 halves of the bug fire and the test FAILS:
 
 - the canonical transcript records the composer's ``/login`` as the
-  FEFF-escaped user message ``"﻿/login"``, and
+  escaped user message ``" /login"``, and
 - the model receives a request whose user text carries that escaped
-  ``"﻿/login"`` (the silently-spent turn).
+  ``" /login"`` (the silently-spent turn).
 
 A fix that intercepts ``/login``/``/logout`` before injection — e.g.
 answering with what actually re-authenticates (``omni setup`` on the host,
@@ -55,9 +55,9 @@ _CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 _LOGIN_EXPIRED_LINE = "Login expired · Please run /login"
 
 # What _escape_unsupported_slash_command turns the composer's /login into
-# before the bridge injects it into Claude Code's TUI: a zero-width
-# no-break space (U+FEFF) prefixed to defeat command parsing.
-_ESCAPED_LOGIN = "﻿/login"
+# before the bridge injects it into Claude Code's TUI: a space prefixed to
+# defeat command parsing.
+_ESCAPED_LOGIN = " /login"
 
 # claude-native auto-launch + first-run pre-accept + first mock turn.
 _FIRST_TURN_TIMEOUT_MS = 180_000
@@ -145,11 +145,11 @@ def test_login_slash_is_not_silently_spent_on_the_model(
     native_claude_mock_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """``/login`` from the composer must not be FEFF-escaped into a model turn.
+    """``/login`` from the composer must not be escaped into a model turn.
 
     Journey: with the Claude Code login expired, send any
     message → the assistant answers "Login expired · Please run /login";
-    type ``/login`` → today the bridge escapes it to ``"﻿/login"``,
+    type ``/login`` → today the bridge escapes it to ``" /login"``,
     Claude Code answers it as prose with the same dead-end line, and a
     model turn is silently spent. The session can never be recovered from
     the web UI, because the remedy the error names is exactly the command
@@ -196,7 +196,7 @@ def test_login_slash_is_not_silently_spent_on_the_model(
     expect(page.locator(_USER, has_text="/login").first).to_be_visible(timeout=60_000)
 
     # Watch for either observable half of the bug: the transcript records
-    # the FEFF-escaped user message, or the model receives it. On a fixed
+    # the escaped user message, or the model receives it. On a fixed
     # build neither ever arrives and the watch expires cleanly.
     escaped_in_transcript = False
     escaped_at_model = False
@@ -205,7 +205,8 @@ def test_login_slash_is_not_silently_spent_on_the_model(
         if any(text == _ESCAPED_LOGIN for text in _user_item_texts(base_url, session_id)):
             escaped_in_transcript = True
             break
-        if _ESCAPED_LOGIN in _captured_request_blob(mock_llm_server_url):
+        # Match the whole JSON string: "Please run /login" also contains " /login".
+        if json.dumps(_ESCAPED_LOGIN) in _captured_request_blob(mock_llm_server_url):
             escaped_at_model = True
             break
         time.sleep(2.0)
@@ -213,7 +214,7 @@ def test_login_slash_is_not_silently_spent_on_the_model(
     if escaped_in_transcript or escaped_at_model:
         where = (
             "the canonical transcript recorded the composer's /login as the "
-            f"FEFF-escaped prose message {_ESCAPED_LOGIN!r}"
+            f"escaped prose message {_ESCAPED_LOGIN!r}"
             if escaped_in_transcript
             else f"the model received a request carrying {_ESCAPED_LOGIN!r}"
         )

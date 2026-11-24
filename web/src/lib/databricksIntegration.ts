@@ -41,9 +41,13 @@ export async function fetchDatabricksStatus(): Promise<DatabricksConnectionStatu
  * multi-workspace, so the user supplies their workspace URL (host or full
  * ``https://…``). ``returnTo`` is where the callback lands afterwards.
  */
-export function beginDatabricksConnect(workspace: string, returnTo: string): void {
+export function databricksConnectUrl(workspace: string, returnTo: string): string {
   const params = new URLSearchParams({ workspace, return_to: returnTo });
-  window.location.href = withBasePath(`/v1/connections/databricks/connect?${params.toString()}`);
+  return withBasePath(`/v1/connections/databricks/connect?${params.toString()}`);
+}
+
+export function beginDatabricksConnect(workspace: string, returnTo: string): void {
+  window.location.href = databricksConnectUrl(workspace, returnTo);
 }
 
 /** Disconnect the current user's Databricks workspace. */

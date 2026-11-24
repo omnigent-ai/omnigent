@@ -16,26 +16,32 @@
 // id list is NEVER trusted from the client for authorization — the server
 // access-checks every watched id against the connection's user.
 
-import { isHostRoutingEnabled, resolveWebSocketUrl } from "@/lib/host";
-import { modalHostId } from "@/lib/sessionHost";
+import { getCachedServerInfo, isFeatureEnabled, resolveServerInfo } from "@/lib/capabilities";
+import { getOmnigentServerIdentity, isHostRoutingEnabled, resolveWebSocketUrl } from "@/lib/host";
+import { getCurrentUserId } from "@/lib/identity";
+import { randomUUID } from "@/lib/randomUUID";
+import { isPageHidden, nextReconnectDelay } from "@/lib/reconnectBackoff";
+import { updatesRoutingKey } from "@/lib/sessionHost";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
+import {
+  SharedSessionUpdates,
+  type SharedUpdatesEnvironment,
+  type TabChannel,
+  type UpdatesTransport,
+} from "@/lib/sharedSessionUpdates";
 
 /** A frame pushed by the server over the updates stream. */
 export type SessionUpdatesFrame =
   | { type: "snapshot"; items: SessionListWireItem[] }
   | { type: "changed"; items: SessionListWireItem[] }
   | { type: "removed"; ids: string[] }
+  // A watched session was newly shared with the viewer; its row may be unchanged.
+  | { type: "access_changed"; ids: string[] }
   | { type: "hosts_changed" }
   | { type: "projects_changed" }
   | { type: "heartbeat" };
 
 type FrameListener = (frame: SessionUpdatesFrame) => void;
-
-// Reconnect backoff — mirrors the chat stream pump (chatStore.ts): 250 ms
-// base, doubling, capped at 5 s, with ±50% jitter so many tabs reconnecting
-// after a server blip don't synchronize into a thundering herd.
-const RECONNECT_BASE_MS = 250;
-const RECONNECT_MAX_MS = 5_000;
 
 // The server pushes a heartbeat every 30 s when a watch-set is idle (see
 // `_SESSION_UPDATES_HEARTBEAT_INTERVAL_S`). If we go appreciably longer than
@@ -50,10 +56,10 @@ const RECONNECT_MAX_MS = 5_000;
 // threshold rather than hard-coding the literal.
 export const HEARTBEAT_WATCHDOG_MS = 70_000;
 
-function nextReconnectDelay(failedAttempts: number): number {
-  const base = Math.min(RECONNECT_BASE_MS * 2 ** (failedAttempts - 1), RECONNECT_MAX_MS);
-  return base / 2 + Math.random() * (base / 2);
-}
+// A socket must stay open this long before its close resets the backoff ramp
+// (and, while hidden, earns the fast retry), so a server that accepts and then
+// drops every socket still backs off.
+export const HEALTHY_CONNECTION_MS = 5_000;
 
 /**
  * Build the `ws(s)://` URL for the session-updates endpoint.
@@ -63,39 +69,35 @@ function nextReconnectDelay(failedAttempts: number): number {
  * (whether served by the Omnigent server directly or through the Vite dev proxy),
  * and an embedding host rebases it onto its proxied WS surface.
  *
- * When host routing is enabled, append `?omnigent_slice_key=<frozen modal
- * host>`. A browser WebSocket handshake can't set request headers, so the
- * routing key rides the query string (the same seam the terminal-attach WS
- * uses). This WS watches sessions across MANY hosts, so no single key is
- * "correct" — it's a NICE-TO-HAVE load/perf lever: keying by the modal host
- * (the one backing most of the user's sessions) lands the standing rescan on
- * the replica most likely holding their sessions' tunnels, so the per-session
- * status read hits that replica's warm relay cache instead of the cross-replica
- * fallback, and spreads the standing connections finer than per-tenant.
- * Correctness is unaffected (the rescan reads are replica-safe).
+ * When host routing is enabled, append `?omnigent_slice_key=` (a browser
+ * WebSocket handshake can't set request headers). The key is
+ * {@link updatesRoutingKey}: the modal host (the one backing most of the user's
+ * sessions), or the client's stored key when there is none. Discovery events
+ * (`hosts_changed`, `projects_changed`, `session_added`) reach only streams on
+ * the replica that published them, so the user's streams and the writes that publish them
+ * share that replica, which also holds most of their sessions' tunnels.
  *
- * The key comes from {@link modalHostId}, which is resolved once and never
- * changes for the page — so every auto-reconnect rebuilds the identical URL and
- * never re-keys (no connection churn). The provider only calls `start()` once
- * the modal host is resolved (see `isModalHostResolved`), so this reads a
- * settled value. Omitted on an unsharded server and when no host was picked.
+ * The modal host is resolved once and never changes for the page, so every
+ * auto-reconnect rebuilds the identical URL (no connection churn). The provider
+ * only calls `start()` once the modal host is resolved (see
+ * `isModalHostResolved`), so this reads a settled value.
  *
  * @returns The fully-qualified WebSocket URL.
  */
 function buildUpdatesUrl(): string {
   const path = "/v1/sessions/updates";
   if (!isHostRoutingEnabled()) return resolveWebSocketUrl(path);
-  const sliceKey = modalHostId();
   return resolveWebSocketUrl(
-    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
+    `${path}?omnigent_slice_key=${encodeURIComponent(updatesRoutingKey())}`,
   );
 }
 
 /**
- * Singleton transport for the session-updates WebSocket. One instance per
- * tab; {@link SessionUpdatesProvider} starts it once at app mount.
+ * The session-updates WebSocket itself. One instance per tab; it runs while
+ * the tab is on its own or holds the socket its other tabs share (see
+ * `sharedSessionUpdates.ts`).
  */
-class SessionUpdatesSocket {
+export class SessionUpdatesSocket implements UpdatesTransport {
   private ws: WebSocket | null = null;
   private watched: string[] = [];
   private watchedKey = "";
@@ -104,24 +106,42 @@ class SessionUpdatesSocket {
   private connected = false;
   private failedAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // When the current socket opened; null until its handshake completes.
+  private openedAt: number | null = null;
+  // Set when the pending reconnect timer was scheduled on the hidden cadence.
+  private hiddenRetryPending = false;
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
+  // Watch-sets sent on this connection that the server hasn't answered yet, oldest first.
+  private unansweredWatches: string[][] = [];
+  // The watch-set behind the server's latest snapshot on this connection.
+  private serverWatched: ReadonlySet<string> = new Set();
 
   /** Open the connection (idempotent). */
   start(): void {
     if (this.started) return;
     this.started = true;
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+    }
     this.connect();
   }
 
   /** Close the connection and stop reconnecting. */
   stop(): void {
     this.started = false;
+    // A later start() ramps from the base again instead of inheriting a
+    // saturated delay from an outage that may be long over.
+    this.failedAttempts = 0;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    }
     this.clearWatchdog();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.hiddenRetryPending = false;
     const ws = this.ws;
     this.ws = null;
     if (ws) {
@@ -169,13 +189,26 @@ class SessionUpdatesSocket {
    * so callers can recompute and push freely without churning the server.
    *
    * @param ids - Conversation ids currently displayed.
+   * @param options - `force` re-sends an unchanged set, which makes the server
+   *   restate it in a snapshot.
    */
-  setWatched(ids: string[]): void {
+  setWatched(ids: string[], options?: { force?: boolean }): void {
     const key = [...ids].sort().join(",");
-    if (key === this.watchedKey) return;
+    if (key === this.watchedKey && options?.force !== true) return;
     this.watchedKey = key;
     this.watched = ids;
     this.sendWatch();
+  }
+
+  /**
+   * Whether the server was watching `id` when it sent the frame now being
+   * delivered to subscribers.
+   *
+   * The server answers every watch request with exactly one snapshot, in
+   * order, so the latest snapshot says which request it has reached.
+   */
+  isWatching(id: string): boolean {
+    return this.serverWatched.has(id);
   }
 
   /**
@@ -201,8 +234,12 @@ class SessionUpdatesSocket {
       return;
     }
     this.ws = ws;
+    this.openedAt = null;
+    // A new connection starts with the server watching nothing.
+    this.unansweredWatches = [];
+    this.serverWatched = new Set();
     ws.onopen = () => {
-      this.failedAttempts = 0;
+      this.openedAt = Date.now();
       this.setConnected(true);
       // Start the silence watchdog: from here we expect at least a
       // heartbeat within the window or we treat the link as dead.
@@ -214,10 +251,15 @@ class SessionUpdatesSocket {
       // `onerror` is always followed by `onclose`; let close drive retry.
     };
     ws.onclose = () => {
+      const wasHealthy =
+        this.openedAt !== null && Date.now() - this.openedAt >= HEALTHY_CONNECTION_MS;
       this.ws = null;
       this.clearWatchdog();
       this.setConnected(false);
-      if (this.started) this.scheduleReconnect();
+      // Only a connection that stayed up restarts the ramp; one dropped right
+      // after opening keeps backing off instead of redialing every 250 ms.
+      if (wasHealthy) this.failedAttempts = 0;
+      if (this.started) this.scheduleReconnect(wasHealthy);
     };
   }
 
@@ -255,12 +297,36 @@ class SessionUpdatesSocket {
     this.ws.close();
   }
 
-  private scheduleReconnect(): void {
+  /**
+   * When the page becomes visible, skip the long wait only for a retry
+   * scheduled on the hidden cadence (see reconnectBackoff.ts); a retry
+   * scheduled while visible keeps its short ramp, so a hide/show flap can't
+   * bypass the backoff.
+   */
+  private readonly onVisibilityChange = (): void => {
+    if (document.hidden || !this.started) return;
+    if (this.reconnectTimer !== null && this.ws === null && this.hiddenRetryPending) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.hiddenRetryPending = false;
+      this.connect();
+    }
+  };
+
+  /**
+   * @param afterHealthyConnection - The closed socket stayed open for
+   *   {@link HEALTHY_CONNECTION_MS}. Its retry keeps the visible ramp even while
+   *   hidden: the socket is a hidden tab's only feed for notifications.
+   */
+  private scheduleReconnect(afterHealthyConnection = false): void {
     if (!this.started || this.reconnectTimer !== null) return;
     this.failedAttempts += 1;
-    const delay = nextReconnectDelay(this.failedAttempts);
+    const hidden = !afterHealthyConnection && isPageHidden();
+    this.hiddenRetryPending = hidden;
+    const delay = nextReconnectDelay(this.failedAttempts, hidden);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
+      this.hiddenRetryPending = false;
       if (this.started) this.connect();
     }, delay);
   }
@@ -268,6 +334,7 @@ class SessionUpdatesSocket {
   private sendWatch(): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "watch", session_ids: this.watched }));
+      this.unansweredWatches.push(this.watched);
     }
   }
 
@@ -282,12 +349,48 @@ class SessionUpdatesSocket {
     } catch {
       return;
     }
+    if (frame.type === "snapshot") {
+      const answered = this.unansweredWatches.shift();
+      if (answered !== undefined) this.serverWatched = new Set(answered);
+    }
     for (const listener of this.listeners) listener(frame);
   }
 }
 
-/** Shared transport instance for the current tab. */
-export const sessionUpdatesSocket = new SessionUpdatesSocket();
+/**
+ * What this tab needs to share a socket with the browser's other tabs, or
+ * null to keep its own: the release flag is off, the browser lacks Web Locks
+ * or BroadcastChannel, or the server or the user isn't known.
+ */
+function sharedUpdatesEnvironment(): SharedUpdatesEnvironment | null {
+  if (!isFeatureEnabled(getCachedServerInfo() ?? "loading", "shared_session_updates_socket")) {
+    return null;
+  }
+  if (typeof navigator === "undefined" || typeof navigator.locks?.request !== "function") {
+    return null;
+  }
+  if (typeof BroadcastChannel === "undefined") return null;
+  // An embedding host can proxy several servers behind one origin, and one
+  // browser can hold several users' tabs. Only tabs that would open the same
+  // socket as the same user may share one.
+  const server = getOmnigentServerIdentity();
+  const user = getCurrentUserId();
+  if (server === null || user === null) return null;
+  return {
+    locks: navigator.locks,
+    openChannel: (name) => new BroadcastChannel(name) as TabChannel,
+    scope: JSON.stringify([server, buildUpdatesUrl(), user]),
+    tabId: randomUUID(),
+  };
+}
+
+/** The current tab's session-updates connection: its own socket, or a share of another tab's. */
+export const sessionUpdatesSocket = new SharedSessionUpdates(
+  new SessionUpdatesSocket(),
+  sharedUpdatesEnvironment,
+  // The app renders before the server's features have loaded, so the flag may not be readable yet.
+  () => (getCachedServerInfo() === null ? resolveServerInfo() : null),
+);
 
 /**
  * Resolve with the first pushed session row matching `match`.

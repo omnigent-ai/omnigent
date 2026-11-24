@@ -24,19 +24,27 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.native.owner_claim import current_pid_namespace, read_owner_claim, write_owner_claim
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 from omnigent.runtime.harnesses.process_manager import (
@@ -45,8 +53,10 @@ from omnigent.runtime.harnesses.process_manager import (
     HarnessProcessManager,
     NoLiveHarnessError,
     _default_tmp_parent,
+    _HarnessHttpClient,
     _kill_orphan_runners,
     _model_env_key,
+    _os_env_key,
     _pid_alive,
     _pids_holding_socket,
     _SubprocessEntry,
@@ -145,6 +155,46 @@ async def test_get_client_before_start_raises(
         await manager.get_client("conv_x", _TEST_HARNESS_NAME)
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["Привет 🐍", "Привет 🐍 recording-\udcff.txt \ud800", r"literal \udcff"],
+    ids=["unicode", "surrogates", "literal-escape"],
+)
+async def test_harness_client_preserves_json_text(text: str) -> None:
+    """Escaping surrogate code points preserves text, header overrides and strict JSON."""
+    async with _HarnessHttpClient(
+        headers={"Content-Type": "application/vnd.harness+json"}
+    ) as client:
+        event = {"content": [{"text": text}], text: "nested key"}
+        request = client.build_request("POST", "http://harness/events", json=event)
+        assert json.loads(request.content) == event
+        assert request.headers["content-type"] == "application/vnd.harness+json"
+        assert text.split()[0] in request.content.decode("utf-8")
+        with pytest.raises(ValueError, match="Out of range float"):
+            client.build_request(
+                "POST", "http://harness/events", json={"text": text, "n": float("nan")}
+            )
+
+
+async def test_harness_client_delivers_json_with_surrogate_text(
+    manager: HarnessProcessManager,
+) -> None:
+    """Surrogates in retained content cannot crash HTTPX before harness delivery."""
+    event = {"type": "interrupt", "content": "Привет 🐍 recording-\udcff.txt \ud800"}
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_unicode", _TEST_HARNESS_NAME)
+        async with client.stream(
+            "POST", "/v1/sessions/conv_unicode/events", json=event
+        ) as response:
+            assert response.status_code == 204
+        assert response.request.headers["content-type"] == "application/json"
+        assert json.loads(response.request.content) == event
+        assert "Привет 🐍" in response.request.content.decode("utf-8")
+    finally:
+        await manager.shutdown()
+
+
 async def test_start_creates_instance_dir_with_sentinel(
     manager: HarnessProcessManager,
 ) -> None:
@@ -158,9 +208,12 @@ async def test_start_creates_instance_dir_with_sentinel(
         assert manager.instance_dir.is_dir()
         sentinel = manager.instance_dir / _AP_PID_FILE
         assert sentinel.exists()
-        # The recorded PID is this process — proves the sweep on
-        # a sibling Omnigent boot would correctly identify us as alive.
-        assert sentinel.read_text(encoding="utf-8").strip() == str(os.getpid())
+        # The recorded owner is this process in this PID namespace — proves the
+        # sweep on a sibling Omnigent boot would correctly identify us as alive.
+        claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+        assert claim is not None
+        assert claim.pid == os.getpid()
+        assert claim.pid_ns == current_pid_namespace()
     finally:
         await manager.shutdown()
 
@@ -296,8 +349,10 @@ async def _ping_health(client) -> None:  # type: ignore[no-untyped-def]
     assert response.json() == {"status": "ok"}
 
 
+@pytest.mark.parametrize("removed_directory", [None, "instance", "root"])
 async def test_get_client_spawns_and_serves(
     manager: HarnessProcessManager,
+    removed_directory: str | None,
 ) -> None:
     """First get_client spawns the runner; /health round-trips.
 
@@ -309,8 +364,19 @@ async def test_get_client_spawns_and_serves(
     """
     await manager.start()
     try:
+        if removed_directory is not None:
+            shutil.rmtree(
+                manager.instance_dir
+                if removed_directory == "instance"
+                else manager.instance_dir.parent
+            )
         client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         await _ping_health(client)
+        claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+        assert claim is not None and claim.pid == os.getpid()
+        if removed_directory is not None and os.name == "posix":
+            assert manager.instance_dir.stat().st_mode & 0o777 == 0o700
+            assert manager.socket_path("conv_a").stat().st_mode & 0o777 == 0o600
         # The runner stashed the conversation id on app.state per
         # the contract; verify the round-trip works.
         cid_resp = await client.get("/conversation-id")
@@ -428,6 +494,55 @@ async def test_release_terminates_subprocess(
                 break
             await asyncio.sleep(0.05)
         assert not _pid_alive(pid)
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "change", ["replacement", "late_registration", "ownership", "activity", None]
+)
+async def test_conditional_release_rechecks_ownership_after_spawn_lock(
+    manager: HarnessProcessManager, change: str | None
+) -> None:
+    """A delayed release retires only its original registration and ownership."""
+    await manager.start()
+    try:
+        session_id = "conditional-release"
+        assert manager.registered_client(session_id) is None
+        original = await manager.get_client(session_id, _TEST_HARNESS_NAME)
+        assert manager.registered_client(session_id) is original
+        original_epoch = 1
+        current_epoch = original_epoch
+        spawn_lock = await manager._get_spawn_lock(session_id)
+        async with spawn_lock:
+            closing = asyncio.create_task(
+                manager.release(
+                    session_id,
+                    expected_client=None if change == "late_registration" else original,
+                    can_release=lambda: current_epoch == original_epoch,
+                )
+            )
+            await asyncio.sleep(0)
+            assert not closing.done()
+            if change == "replacement":
+                replacement = httpx.AsyncClient()
+                manager._entries[session_id].client = replacement
+            elif change == "ownership":
+                current_epoch += 1
+            elif change == "activity":
+                manager.note_activity(session_id)
+            manager.mark_in_flight(session_id, "live-response")
+        await closing
+        if change in {"replacement", "late_registration", "ownership"}:
+            assert manager.has_session(session_id)
+            assert manager.has_active_turn(session_id)
+            assert not original.is_closed
+            assert session_id not in manager._release_generations
+        else:
+            assert not manager.has_session(session_id)
+            assert not manager.has_active_turn(session_id)
+            assert original.is_closed
+        await original.aclose()
     finally:
         await manager.shutdown()
 
@@ -558,9 +673,11 @@ async def test_release_reaps_term_resistant_process_when_graceful_wait_is_cancel
 
 
 @pytest.mark.parametrize("cancel_stage", ["force_wait", "client_close"])
-async def test_release_reaps_process_when_teardown_is_cancelled(
+@pytest.mark.parametrize("operation", ["release", "policy_replacement"])
+async def test_teardown_cancellation_reaps_process_and_releases_state(
     monkeypatch: pytest.MonkeyPatch,
     cancel_stage: str,
+    operation: str,
 ) -> None:
     """Cancellation during force wait or client close still cleans up."""
     from omnigent.runtime.harnesses import process_manager as process_manager_module
@@ -596,6 +713,8 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
                 await asyncio.Event().wait()
 
     class _Endpoint:
+        socket_path = None
+
         def __init__(self) -> None:
             self.cleaned = False
 
@@ -622,21 +741,35 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
         "close_subprocess_transport",
         lambda process: transport_closes.append(process),
     )
-    manager = object.__new__(HarnessProcessManager)
-    manager._entries = {}
-    manager._spawn_locks = {"conv_a": asyncio.Lock()}
-    manager._registry_lock = asyncio.Lock()
-    manager._release_generations = {}
-    manager._in_flight_response_ids = {}
+    manager = HarnessProcessManager()
+    manager._started = True
     entry = process_manager_module._SubprocessEntry(
         process,
         client,
         endpoint,
         "test",
+        os_env_config='{"sandbox":{"type":"none"}}',
     )
     manager._entries["conv_a"] = entry
+    manager._in_flight_response_ids["conv_a"] = "resp_retired"
+    notifications: list[tuple[str, str, str]] = []
 
-    closing = asyncio.create_task(manager.release("conv_a"))
+    async def notify(conv_id: str, reason: str, response_id: str) -> None:
+        async with asyncio.timeout(1):
+            with pytest.raises(NoLiveHarnessError):
+                await manager.get_client(conv_id, "any")
+        notifications.append((conv_id, reason, response_id))
+
+    manager.set_respawn_hook(notify)
+    spawn = AsyncMock()
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    env = {"HARNESS_TEST_OS_ENV": '{"sandbox":{"type":"linux_bwrap"}}'}
+
+    closing = asyncio.create_task(
+        manager.release("conv_a")
+        if operation == "release"
+        else manager.get_client("conv_a", "test", env=env)
+    )
     if cancel_stage == "client_close":
         await asyncio.wait_for(client.aclose_started.wait(), timeout=1.0)
     else:
@@ -654,6 +787,23 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
     assert process.wait_calls == (2 if cancel_stage == "force_wait" else 1)
     assert transport_closes == [process]
     assert endpoint.cleaned
+    assert not manager.has_active_turn("conv_a")
+    assert not (await manager._get_spawn_lock("conv_a")).locked()
+    spawn.assert_not_awaited()
+    if operation == "policy_replacement":
+        assert notifications == [("conv_a", "harness_respawn_policy_change", "resp_retired")]
+        replacement = _SubprocessEntry(
+            process=Mock(returncode=None),
+            client=object(),  # type: ignore[arg-type]
+            endpoint=None,  # type: ignore[arg-type]
+            harness="test",
+            os_env_config=env["HARNESS_TEST_OS_ENV"],
+        )
+        spawn.return_value = replacement
+        assert await manager.get_client("conv_a", "test", env=env) is replacement.client
+        assert len(notifications) == 1
+    else:
+        assert notifications == []
 
 
 @pytest.mark.parametrize("response_id", [None, "resp_crashed"])
@@ -705,6 +855,81 @@ async def test_get_client_respawns_after_crash(
             "harness": _TEST_HARNESS_NAME,
             "pid": original_pid,
             "returncode": -signal.SIGKILL,
+            "tracked_response_id": response_id,
+        }
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("response_id", [None, "resp_socket_lost"])
+@pytest.mark.parametrize("removed_path", ["socket", "instance", "root"])
+async def test_get_client_respawns_when_socket_pathname_vanishes(
+    manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+    response_id: str | None,
+    removed_path: str,
+) -> None:
+    """A live harness whose socket file was removed is replaced on the next turn.
+
+    The subprocess never exits, so ``returncode`` stays ``None``; only the
+    bound Unix socket pathname disappears (a ``/tmp`` cleaner). Once the
+    pooled keepalive connection expires, a cached client can no longer
+    connect, so ``get_client`` must retire the stale entry and hand back a
+    client for a fresh harness. A turn in flight on the retired process is
+    reported through the respawn hook so the runner can resync it.
+    """
+    hook_calls: list[tuple[str, str, str]] = []
+
+    async def record_respawn(conv_id: str, reason: str, replaced: str) -> None:
+        hook_calls.append((conv_id, reason, replaced))
+
+    manager.set_respawn_hook(record_respawn)
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        original_pid = (await client.get("/pid")).json()["pid"]
+        if response_id is not None:
+            manager.mark_in_flight("conv_a", response_id)
+        socket_path = manager.socket_path("conv_a")
+        assert socket_path.exists()
+        if removed_path == "socket":
+            socket_path.unlink()
+        else:
+            shutil.rmtree(
+                manager.instance_dir if removed_path == "instance" else manager.instance_dir.parent
+            )
+        assert _pid_alive(original_pid)
+
+        await asyncio.sleep(httpx.Limits().keepalive_expiry + 1.0)
+        assert _pid_alive(original_pid), "fixture harness exited during the keepalive wait"
+
+        # Control callers never trigger recovery and keep the live turn's client.
+        assert await manager.get_client("conv_a", "any") is client
+        assert _pid_alive(original_pid)
+
+        new_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        new_pid = (await new_client.get("/pid")).json()["pid"]
+        assert new_pid != original_pid
+        assert _pid_alive(new_pid)
+        assert socket_path.exists()
+        claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+        assert claim is not None and claim.pid == os.getpid()
+        assert not _pid_alive(original_pid)
+        assert not manager.has_active_turn("conv_a")
+        if response_id is None:
+            assert hook_calls == []
+        else:
+            assert hook_calls == [("conv_a", "harness_respawn_socket_missing", response_id)]
+        lost = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "harness_socket_missing"
+        ]
+        assert len(lost) == 1
+        assert lost[0].session_id == "conv_a"
+        assert lost[0].attributes == {
+            "harness": _TEST_HARNESS_NAME,
+            "pid": original_pid,
+            "socket_path": str(socket_path),
             "tracked_response_id": response_id,
         }
     finally:
@@ -821,6 +1046,148 @@ async def test_get_client_respawns_on_model_change(
         assert not _pid_alive(pid_first)
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("harness", "key"),
+    [
+        ("acp", "HARNESS_ACP_OS_ENV"),
+        ("acp:example-agent", "HARNESS_ACP_OS_ENV"),
+        ("claude-sdk", "HARNESS_CLAUDE_SDK_OS_ENV"),
+        ("claude", "HARNESS_CLAUDE_SDK_OS_ENV"),
+        ("codex", "HARNESS_CODEX_OS_ENV"),
+        ("goose", "HARNESS_GOOSE_OS_ENV"),
+        ("kimi", "HARNESS_KIMI_OS_ENV"),
+        ("pi", "HARNESS_PI_OS_ENV"),
+        ("qwen", "HARNESS_QWEN_OS_ENV"),
+        ("antigravity", "HARNESS_ANTIGRAVITY_OS_ENV"),
+        ("cursor", "HARNESS_CURSOR_OS_ENV"),
+        ("copilot", "HARNESS_COPILOT_OS_ENV"),
+        ("github-copilot", "HARNESS_COPILOT_OS_ENV"),
+        ("grok-build", "HARNESS_ACP_OS_ENV"),
+        ("hermes", "HARNESS_HERMES_OS_ENV"),
+        *((name, "HARNESS_ACP_OS_ENV") for name in ACP_CLI_HARNESSES),
+    ],
+)
+def test_os_env_key_uses_harness_policy_variable(harness: str, key: str) -> None:
+    assert _os_env_key(harness) == key
+
+
+@pytest.mark.parametrize(
+    ("harness", "key"),
+    [("codex", "HARNESS_CODEX_OS_ENV"), ("acp", "HARNESS_ACP_OS_ENV")],
+)
+async def test_get_client_replaces_only_changed_os_policy(
+    monkeypatch: pytest.MonkeyPatch, harness: str, key: str
+) -> None:
+    """Policy edits replace workers; control lookups and unchanged policies reuse them."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.runtime.harnesses.process_manager import _acp_startup_config
+
+    original = '{"sandbox":{"type":"none"}}'
+    changed = '{"sandbox":{"type":"linux_bwrap","write_paths":[]}}'
+    monkeypatch.setenv(key, original)
+    manager = HarnessProcessManager()
+    manager._started = True
+    session_id = "conv_policy_switch"
+
+    async def spawn(conv_id: str, harness: str, env: dict[str, str]) -> _SubprocessEntry:
+        return _SubprocessEntry(
+            process=SimpleNamespace(returncode=None, pid=1),
+            client=object(),  # type: ignore[arg-type]
+            endpoint=None,  # type: ignore[arg-type]
+            harness=harness,
+            os_env_config=env.get(key, os.environ.get(key)),
+            acp_config=_acp_startup_config(env) if harness == "acp" else {},
+        )
+
+    initial = await spawn(session_id, harness, {})
+    manager._entries[session_id] = initial
+
+    close = AsyncMock()
+    spawn_entry = AsyncMock(side_effect=spawn)
+    hook = AsyncMock()
+    manager.set_respawn_hook(hook)
+    monkeypatch.setattr(manager, "_close_entry", close)
+    monkeypatch.setattr(manager, "_spawn_entry", spawn_entry)
+
+    assert await manager.get_client(session_id, harness, env={}) is initial.client
+    assert await manager.get_client(session_id, "any", env={key: changed}) is initial.client
+    assert await manager.get_client(session_id, harness) is initial.client
+    spawn_entry.assert_not_called()
+    manager._in_flight_response_ids[session_id] = "resp_original"
+    updated = await manager.get_client(session_id, harness, env={key: changed})
+    assert updated is not initial.client
+    close.assert_awaited_once_with(initial)
+    hook.assert_awaited_once_with(session_id, "harness_respawn_policy_change", "resp_original")
+    assert session_id not in manager._in_flight_response_ids
+    assert await manager.get_client(session_id, harness, env={key: changed}) is updated
+    assert await manager.get_client(session_id, harness) is updated
+    assert spawn_entry.await_count == 1
+    assert await manager.get_client(session_id, harness, env={}) is not updated
+    assert spawn_entry.await_count == 2
+    monkeypatch.delenv(key)
+    await manager.get_client(session_id, harness, env={})
+    assert manager._entries[session_id].os_env_config is None
+    assert spawn_entry.await_count == 3
+    added = await manager.get_client(session_id, harness, env={key: changed})
+    assert manager._entries[session_id].os_env_config == changed
+    assert spawn_entry.await_count == 4
+    assert await manager.get_client(session_id, harness, env={key: changed}) is added
+    assert await manager.get_client(session_id, harness) is added
+    assert spawn_entry.await_count == 4
+    hook.assert_awaited_once()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("startup failed"), asyncio.CancelledError()])
+async def test_policy_replacement_failure_retires_worker_and_notifies_turn(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    """A failed replacement releases its registration and notifies outside the spawn lock."""
+    manager = HarnessProcessManager()
+    manager._started = True
+    session_id = "conv_policy_failure"
+    initial = _SubprocessEntry(
+        process=SimpleNamespace(returncode=None, pid=1),
+        client=object(),  # type: ignore[arg-type]
+        endpoint=None,  # type: ignore[arg-type]
+        harness="codex",
+        os_env_config='{"sandbox":{"type":"none"}}',
+    )
+    manager._entries[session_id] = initial
+    manager._in_flight_response_ids[session_id] = "resp_retired"
+    notifications: list[tuple[str, str, str]] = []
+
+    async def notify(conv_id: str, reason: str, response_id: str) -> None:
+        async with asyncio.timeout(1):
+            with pytest.raises(NoLiveHarnessError):
+                await manager.get_client(conv_id, "any")
+        notifications.append((conv_id, reason, response_id))
+
+    manager.set_respawn_hook(notify)
+    close = AsyncMock()
+    spawn = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(manager, "_close_entry", close)
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    env = {"HARNESS_CODEX_OS_ENV": '{"sandbox":{"type":"linux_bwrap"}}'}
+    with pytest.raises(type(failure)):
+        await manager.get_client(session_id, "codex", env=env)
+    assert manager.registered_client(session_id) is None
+    assert session_id not in manager._in_flight_response_ids
+    close.assert_awaited_once_with(initial)
+    assert notifications == [(session_id, "harness_respawn_policy_change", "resp_retired")]
+    replacement = _SubprocessEntry(
+        process=Mock(returncode=None),
+        client=object(),  # type: ignore[arg-type]
+        endpoint=None,  # type: ignore[arg-type]
+        harness="codex",
+        os_env_config=env["HARNESS_CODEX_OS_ENV"],
+    )
+    spawn.side_effect = None
+    spawn.return_value = replacement
+    assert await manager.get_client(session_id, "codex", env=env) is replacement.client
+    assert len(notifications) == 1
 
 
 async def test_get_client_any_harness_sentinel_reuses_subprocess(
@@ -1290,6 +1657,27 @@ async def test_orphan_sweep_removes_dead_omnigent_dirs(
         await fresh.shutdown()
 
 
+@pytest.mark.parametrize("owner_namespace", ["ours", "foreign"])
+async def test_orphan_sweep_judges_a_dead_looking_owner_only_from_its_namespace(
+    short_tmp_parent: Path,
+    owner_namespace: str,
+) -> None:
+    """Only a sweeper in the owner's PID namespace may conclude the owner is gone."""
+    claimed_dir = short_tmp_parent / "ap-claimed"
+    claimed_dir.mkdir(mode=0o700)
+    write_owner_claim(claimed_dir, filename=_AP_PID_FILE)
+    sentinel = claimed_dir / _AP_PID_FILE
+    lines = ["99999999", *sentinel.read_text(encoding="utf-8").splitlines()[1:]]
+    if owner_namespace == "foreign":
+        # How a live owner looks to a sweeper inside an agent sandbox.
+        lines = ["pid_ns=pid:[1]" if line.startswith("pid_ns=") else line for line in lines]
+    sentinel.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    await sweep_orphaned_harness_processes(tmp_parent=short_tmp_parent)
+
+    assert claimed_dir.exists() is (owner_namespace == "foreign")
+
+
 async def test_orphan_sweep_preserves_live_omnigent_dirs(
     short_tmp_parent: Path,
 ) -> None:
@@ -1315,6 +1703,79 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
         assert (sibling_dir / _AP_PID_FILE).exists()
     finally:
         await fresh.shutdown()
+
+
+def _unshare_pid_namespace_available() -> bool:
+    """Whether this host allows an unprivileged user + PID namespace."""
+    if sys.platform != "linux" or shutil.which("unshare") is None:
+        return False
+    import subprocess
+
+    probe = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "true"],
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+async def test_orphan_sweep_from_another_pid_namespace_keeps_a_live_harness(
+    manager: HarnessProcessManager,
+) -> None:
+    """A sweep that cannot see our PID must not delete a live session's socket.
+
+    Agent sandboxes (e.g. Codex's Linux sandbox) run commands in their own PID
+    namespace with ``/tmp`` writable. A server or test booted there sweeps the
+    shared harness root, sees every live ``AP_PID`` as dead, and deletes each
+    session's socket while its runner and harness keep running.
+    """
+    import subprocess
+
+    if not _unshare_pid_namespace_available():
+        pytest.skip("needs Linux with unprivileged user + PID namespaces")
+    await manager.start()
+    try:
+        conversation_id = "conv-live-in-host-ns"
+        client = await manager.get_client(conversation_id, _TEST_HARNESS_NAME)
+        harness_pid = (await client.get("/pid")).json()["pid"]
+
+        sweep = (
+            "import asyncio, pathlib, sys\n"
+            "from omnigent.runtime.harnesses.process_manager import "
+            "sweep_orphaned_harness_processes\n"
+            "asyncio.run(sweep_orphaned_harness_processes(tmp_parent=pathlib.Path(sys.argv[1])))\n"
+        )
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "unshare",
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+                sys.executable,
+                "-c",
+                sweep,
+                str(manager.instance_dir.parent),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+        socket_path = manager.socket_path(conversation_id)
+        assert socket_path.exists()
+        # Fresh connection: the cached client's keepalive could otherwise
+        # reuse a socket opened before the sweep ran.
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=str(socket_path)),
+            base_url="http://harness.local",
+        ) as fresh:
+            assert (await fresh.get("/pid")).json()["pid"] == harness_pid
+    finally:
+        await manager.shutdown()
 
 
 @pytest.mark.posix_only
@@ -1495,8 +1956,16 @@ async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
 # ── Per-spawn env override ─────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("inherit_policy", "change_policy_during_spawn"),
+    [(False, False), (False, True), (True, False)],
+    ids=["no-policy", "ambient-changes-during-spawn", "inherited-policy"],
+)
 async def test_get_client_env_override_propagates_to_subprocess(
     manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    inherit_policy: bool,
+    change_policy_during_spawn: bool,
 ) -> None:
     """``get_client(env=...)`` threads env vars into the spawned subprocess.
 
@@ -1506,6 +1975,22 @@ async def test_get_client_env_override_propagates_to_subprocess(
     Omnigent would have to mutate its own ``os.environ`` (which races
     across concurrent conversations with different specs).
     """
+    from omnigent.runtime.harnesses import process_manager as process_manager_module
+
+    policy_key = "HARNESS_TEST_OS_ENV"
+    policy = '{"sandbox":{"type":"linux_bwrap","write_paths":[]}}'
+    if inherit_policy:
+        monkeypatch.setenv(policy_key, policy)
+    else:
+        monkeypatch.delenv(policy_key, raising=False)
+    wait_for_bind = process_manager_module._wait_for_bind
+
+    async def change_ambient_policy(*args: Any, **kwargs: Any) -> None:
+        monkeypatch.setenv(policy_key, policy)
+        await wait_for_bind(*args, **kwargs)
+
+    if change_policy_during_spawn:
+        monkeypatch.setattr(process_manager_module, "_wait_for_bind", change_ambient_policy)
     await manager.start()
     try:
         client = await manager.get_client(
@@ -1516,6 +2001,21 @@ async def test_get_client_env_override_propagates_to_subprocess(
         # Subprocess saw the override in its env.
         resp = await client.get("/env/HARNESS_TEST_CUSTOM")
         assert resp.json() == {"value": "marker_alpha"}
+        expected_policy = policy if inherit_policy else None
+        assert (await client.get(f"/env/{policy_key}")).json() == {"value": expected_policy}
+        entry = manager._entries["conv_env"]
+        assert entry.os_env_config == expected_policy
+        if not change_policy_during_spawn:
+            assert await manager.get_client("conv_env", _TEST_HARNESS_NAME, env={}) is client
+        if change_policy_during_spawn:
+            monkeypatch.setattr(process_manager_module, "_wait_for_bind", wait_for_bind)
+            replacement = await manager.get_client(
+                "conv_env", _TEST_HARNESS_NAME, env={policy_key: policy}
+            )
+            assert replacement is not client
+            assert entry.process.returncode is not None
+            assert (await replacement.get(f"/env/{policy_key}")).json() == {"value": policy}
+            assert manager._entries["conv_env"].os_env_config == policy
     finally:
         await manager.shutdown()
 
@@ -1870,6 +2370,74 @@ async def _cancel_pending(*tasks: asyncio.Task[object] | None) -> None:
                 # as a dead statement (teardown only cares that the task settles).
                 _settled = await task
                 del _settled
+
+
+@pytest.mark.parametrize("outcome", ["ready", "cancelled", "write_error"])
+async def test_slow_owner_claim_preserves_loop_progress_and_spawn_ownership(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """Slow spawn preparation keeps the loop live and drains before shutdown."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from tests._helpers.polling import poll_until_async
+
+    await manager.start()
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_write = pm_mod.write_owner_claim
+
+    def slow_write(directory: Path, *, filename: str) -> None:
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(timeout=5.0)
+        try:
+            if outcome == "write_error":
+                raise OSError("owner claim could not be written")
+            original_write(directory, filename=filename)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(pm_mod, "write_owner_claim", slow_write)
+    spawn_process = AsyncMock(wraps=manager._spawn_harness_process)
+    monkeypatch.setattr(manager, "_spawn_harness_process", spawn_process)
+    spawn = asyncio.create_task(manager.get_client("conv_slow_owner", _TEST_HARNESS_NAME))
+    shutdown: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10.0)
+        assert not finished.is_set(), "owner-file I/O blocked the event loop"
+        if outcome == "cancelled":
+            spawn.cancel()
+            await asyncio.sleep(0)
+            spawn.cancel()
+            await asyncio.sleep(0)
+            assert not spawn.done(), "cancellation abandoned the file writer"
+            shutdown = asyncio.create_task(manager.shutdown())
+            await poll_until_async(lambda: manager._shutting_down, timeout_s=5.0)
+            assert not shutdown.done(), "shutdown raced the pending file writer"
+        release.set()
+        if outcome == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await spawn
+            assert shutdown is not None
+            await shutdown
+        elif outcome == "write_error":
+            with pytest.raises(OSError, match="owner claim could not be written"):
+                await spawn
+        else:
+            await _ping_health(await spawn)
+            claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+            assert claim is not None and claim.pid == os.getpid()
+        assert finished.is_set()
+        assert spawn_process.await_count == (1 if outcome == "ready" else 0)
+    finally:
+        release.set()
+        await _cancel_pending(spawn, shutdown)
+        if spawn.done() and not spawn.cancelled():
+            spawn.exception()
+        await manager.shutdown()
+    assert not manager.instance_dir.exists()
 
 
 async def test_release_during_spawn_leaves_no_live_process(

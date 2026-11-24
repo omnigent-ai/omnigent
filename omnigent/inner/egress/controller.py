@@ -4,7 +4,7 @@ Encapsulates the asyncio thread / MITM proxy / Unix socket /
 random relay port / optional Proxy-Authorization token setup that
 sits BEHIND every sandbox spec carrying ``egress_rules``.
 
-Two callers:
+Three callers:
 
 1. :class:`omnigent.inner.os_env._HelperProcessClient` — sandboxed
    helper subprocess that handles ``sys_os_*`` tool calls. Uses the
@@ -23,11 +23,16 @@ Two callers:
    per-terminal scratch tmpdir for the socket, default-deny on
    private destinations) still hold.
 
+3. :func:`omnigent.inner.claude_sdk_executor.prepare_claude_cli_path` —
+   contained Claude CLI. Requires authentication and loads the proxy URL
+   from private explicit settings after CLI exec. CLI descendants inherit
+   that scoped URL, as helper descendants inherit the helper's proxy URL.
+
 The controller does NOT own the scratch tmpdir — callers create
 and pass one in (``tmpdir``) so they can manage its lifecycle
 together with their other sandbox state. The controller writes
 the CA bundle into the tmpdir and creates the Unix socket inside
-it, so the tmpdir must outlive :meth:`EgressProxyController.stop`.
+it, so the tmpdir must outlive :meth:`EgressProxyHandle.stop`.
 """
 
 from __future__ import annotations
@@ -40,12 +45,16 @@ import threading
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.inner.credential_proxy import CredentialRewriteRule
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
-from omnigent.inner.egress.proxy import EgressProxy
+from omnigent.inner.egress.proxy import EgressProxy, RequestBodyTransform
 from omnigent.inner.egress.rules import parse_rules
+
+if TYPE_CHECKING:
+    from omnigent.inner.claude_model_access import ClaudeModelAccess
 
 _EGRESS_SOCKET_NAME = ".egress.sock"
 _CA_ENV_KEYS = (
@@ -129,6 +138,8 @@ def start_egress_proxy(
     allow_private_destinations: bool,
     require_auth: bool,
     credential_rewrites: Sequence[CredentialRewriteRule] | None = None,
+    request_body_transform: RequestBodyTransform | None = None,
+    model_access: ClaudeModelAccess | None = None,
 ) -> EgressProxyHandle:
     """Start the parent-side MITM egress proxy.
 
@@ -149,17 +160,21 @@ def start_egress_proxy(
         returned on the handle for the caller to deliver out of
         band (NOT via the spawn env, which leaks to ``ps -E``).
         When ``False``, the proxy accepts any unauthenticated
-        request — used by the terminal path where there's no
-        out-of-band channel through tmux.
+        request — used by the terminal path without credential rewrites,
+        where there's no out-of-band channel through tmux.
     :param credential_rewrites: Optional host-scoped real-credential
         rules the proxy applies for exact-host matches — swap-on-access
         injection by default, plus synthetic-placeholder swap for entries
         that opted into ``inject_env`` (secretless ``credential_proxy``
-        support).
+        support). Requires ``require_auth=True`` when non-empty.
+    :param request_body_transform: Trusted compatibility patch applied only
+        after the request passes egress policy checks.
     :returns: A live :class:`EgressProxyHandle`. Caller must invoke
         :meth:`EgressProxyHandle.stop` on cleanup.
-    :raises OSError: On Windows, where the L7 egress proxy (a Unix-socket
-        MITM listener) is unavailable.
+    :raises OSError: If the listener cannot start, or on Windows, where the
+        L7 egress proxy (a Unix-socket MITM listener) is unavailable.
+    :raises TimeoutError: If the listener does not become ready in time.
+    :raises ValueError: If credential rewrites are configured without authentication.
     """
     if IS_WINDOWS:
         raise OSError(
@@ -167,6 +182,8 @@ def start_egress_proxy(
             "on Windows: the egress proxy relies on a Unix-domain socket. Remove "
             "the egress rules to run this agent on Windows, or run it on Linux/macOS."
         )
+    if credential_rewrites and not require_auth:
+        raise ValueError("credential rewrites require proxy authentication")
     parsed_rules = parse_rules(list(rules))
     ca_cert_path, ca_key_path = ensure_ca()
     bundle_path = ensure_ca_bundle(ca_cert_path)
@@ -190,7 +207,8 @@ def start_egress_proxy(
         # it slots into Basic-auth base64 without further escaping.
         auth_token = secrets.token_urlsafe(32)
 
-    proxy = EgressProxy(
+    proxy_factory = EgressProxy if model_access is None else model_access.create_proxy
+    proxy = proxy_factory(
         parsed_rules,
         ca_cert_path,
         ca_key_path,
@@ -213,20 +231,60 @@ def start_egress_proxy(
         # it (no out-of-band channel through tmux).
         auth_token=auth_token,
         credential_rewrites=list(credential_rewrites or []),
+        request_body_transform=request_body_transform,
     )
 
     loop = asyncio.new_event_loop()
     started = threading.Event()
+    timeout_requested = threading.Event()
+    serving = threading.Event()
+    startup_task = loop.create_task(proxy.start_unix(str(socket_path)))
+
+    startup_errors: list[BaseException] = []
 
     def _run_proxy() -> None:
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(proxy.start_unix(str(socket_path)))
-        started.set()
-        loop.run_forever()
+        try:
+            loop.run_until_complete(startup_task)
+        except BaseException as exc:  # noqa: BLE001 — propagate thread startup failures to the caller
+            startup_errors.append(exc)
+        finally:
+            started.set()
+        if not startup_errors and not timeout_requested.is_set():
+            serving.set()
+            try:
+                if not timeout_requested.is_set():
+                    loop.run_forever()
+            finally:
+                serving.clear()
+        # A readiness timeout stops the loop before listener startup finishes.
+        if not startup_task.done():
+            startup_task.cancel()
+            loop.run_until_complete(asyncio.gather(startup_task, return_exceptions=True))
+        loop.run_until_complete(proxy.stop())
+        loop.close()
 
     thread = threading.Thread(target=_run_proxy, name="egress-proxy", daemon=True)
     thread.start()
-    started.wait(timeout=10)
+    if not started.wait(timeout=10):
+        timeout_requested.set()
+
+        def stop_startup_or_serving() -> None:
+            if serving.is_set():
+                loop.stop()
+            elif not startup_task.done():
+                startup_task.cancel()
+
+        try:
+            loop.call_soon_threadsafe(stop_startup_or_serving)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
+        thread.join(timeout=3)
+        raise TimeoutError("egress proxy did not become ready")
+    if startup_errors:
+        thread.join(timeout=3)
+        raise OSError("egress proxy could not start") from startup_errors[0]
 
     # Pick a random ephemeral port. Bind+close-immediately to ask
     # the kernel for a free port; a same-host attacker racing to
@@ -274,9 +332,8 @@ def apply_egress_env(
     spawn env and IS visible via ``ps -E`` / ``KERN_PROCARGS2`` /
     ``/proc/<pid>/environ`` to any same-UID process. The helper
     path avoids this by passing ``auth_token=None`` here and
-    re-injecting the token in-process after exec; only the terminal
-    path embeds the token (currently it doesn't — terminals use
-    ``require_auth=False`` so ``auth_token`` is ``None``).
+    re-injecting the token in-process after exec. The Claude CLI loads
+    its authenticated URL from private explicit settings after exec.
 
     :param env: Mutable mapping to mutate (typically ``dict(os.environ)``
         for a soon-to-be-spawned child).

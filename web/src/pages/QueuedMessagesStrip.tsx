@@ -4,6 +4,7 @@ import {
   type CollisionDetection,
   type DragEndEvent,
   KeyboardSensor,
+  type Modifier,
   MouseSensor,
   pointerWithin,
   TouchSensor,
@@ -22,6 +23,7 @@ import {
   XIcon,
 } from "lucide-react";
 
+import { ARROW_UP_KEY, KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -34,6 +36,26 @@ const ACTION_BUTTON_CLASS =
   "shrink-0 text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground max-md:size-11";
 
 const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
+
+/**
+ * Keep the dragged row vertical and inside the scrolling list, which would
+ * otherwise clip it. A fixed-position overlay is avoided on purpose: Mobile
+ * Safari draws it offset from the finger once the page has shifted for the
+ * keyboard.
+ */
+export const restrictToQueuedList: Modifier = ({
+  transform,
+  draggingNodeRect,
+  scrollableAncestorRects,
+}) => {
+  const list = scrollableAncestorRects[0];
+  if (!draggingNodeRect || !list) return { ...transform, x: 0 };
+  const y = Math.min(
+    Math.max(transform.y, list.top - draggingNodeRect.top),
+    list.bottom - draggingNodeRect.bottom,
+  );
+  return { ...transform, x: 0, y };
+};
 
 export const queuedMessageCollisionDetection: CollisionDetection = (args) =>
   args.pointerCoordinates ? pointerWithin(args) : closestCenter(args);
@@ -57,6 +79,11 @@ interface QueuedMessagesStripProps {
    */
   onReorder?: (queueId: string, beforeQueueId: string | null) => void;
   /**
+   * The row an empty composer's ↑ recalls (the queue tail). Its edit button
+   * shows the ↑ hint; omit when the composer holds text, since ↑ then edits nothing.
+   */
+  arrowUpRecallQueueId?: string;
+  /**
    * Layout class aligning the strip with the composer surface it docks
    * onto (its tuck only hides behind a surface at least as wide, so match
    * that surface's width — e.g. the workspace bar's inset).
@@ -70,28 +97,41 @@ function QueuedRow({
   onDelete,
   onEdit,
   onSteer,
+  steerBlocked,
   reorderable,
+  recallsOnArrowUp,
 }: {
   message: QueuedMessage;
   onDelete: (queueId: string) => void;
   onEdit: (queueId: string) => void;
   onSteer?: (queueId: string) => void;
+  /** The conversation waits for its host, so nothing can be sent now. */
+  steerBlocked: boolean;
   reorderable: boolean;
+  /** Whether an empty composer's ↑ edits this row. */
+  recallsOnArrowUp: boolean;
 }) {
+  // The whole row drags (via its grip) and is the drop target, so the row
+  // follows the finger and dropping anywhere on another row reorders.
   const {
     attributes,
     listeners,
     setNodeRef: setDragRef,
+    setActivatorNodeRef,
+    transform,
     isDragging,
   } = useDraggable({
     id: message.queueId,
     disabled: !reorderable,
   });
-  // The whole row is the drop target so dropping anywhere on it reorders.
   const { setNodeRef: setDropRef, isOver } = useDroppable({
     id: message.queueId,
     disabled: !reorderable,
   });
+  const setRowRef = (node: HTMLDivElement | null) => {
+    setDragRef(node);
+    setDropRef(node);
+  };
   const hasText = message.text.trim().length > 0;
   const files = message.files ?? [];
   const attachmentNames = files.map(attachmentFilename);
@@ -101,19 +141,22 @@ function QueuedRow({
 
   return (
     <div
-      ref={setDropRef}
+      ref={setRowRef}
       role="listitem"
+      style={transform ? { transform: `translate3d(0, ${transform.y}px, 0)` } : undefined}
       className={cn(
-        "relative flex min-w-0 items-center gap-1 py-0.5 text-sm text-foreground",
-        isDragging && "opacity-40",
+        // WebKit's long-press text selection and callout cancel the touch
+        // gesture dnd-kit's TouchSensor relies on, so suppress them on the row.
+        "relative flex min-w-0 items-center gap-1 py-0.5 text-sm text-foreground select-none [-webkit-touch-callout:none]",
+        isDragging && "z-10 rounded-md bg-background shadow-md ring-1 ring-border ring-inset",
         isOver &&
           !isDragging &&
-          "after:absolute after:inset-x-0 after:-bottom-0.5 after:h-px after:bg-muted-foreground/50",
+          "after:absolute after:inset-x-0 after:-bottom-0.5 after:h-0.5 after:rounded-full after:bg-muted-foreground/60",
       )}
     >
       {reorderable ? (
         <Button
-          ref={setDragRef}
+          ref={setActivatorNodeRef}
           type="button"
           variant="ghost"
           size="icon-xs"
@@ -168,19 +211,27 @@ function QueuedRow({
       {message.requiresRetry && (
         <span className="shrink-0 text-xs text-destructive">Send failed</span>
       )}
+      {message.waitingForHost && !message.requiresRetry && (
+        <span className="shrink-0 text-xs text-muted-foreground">Waiting for host</span>
+      )}
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
       <span className="flex shrink-0 items-center gap-0">
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label="Edit queued message"
-          className={ACTION_BUTTON_CLASS}
-          onClick={() => onEdit(message.queueId)}
+        <KeyboardShortcutTooltip
+          label="Edit queued message"
+          keys={recallsOnArrowUp ? [ARROW_UP_KEY] : undefined}
         >
-          <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
-        </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Edit queued message"
+            className={ACTION_BUTTON_CLASS}
+            onClick={() => onEdit(message.queueId)}
+          >
+            <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
+          </Button>
+        </KeyboardShortcutTooltip>
         {onSteer ? (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -192,6 +243,7 @@ function QueuedRow({
                   message.requiresRetry ? "Retry queued message" : "Send queued message now"
                 }
                 className={ACTION_BUTTON_CLASS}
+                disabled={steerBlocked}
                 onClick={() => onSteer(message.queueId)}
               >
                 <ArrowUpIcon className="size-4 max-md:size-4" aria-hidden="true" />
@@ -233,6 +285,7 @@ export function QueuedMessagesStrip({
   onEdit,
   onSteer,
   onReorder,
+  arrowUpRecallQueueId,
   widthClassName,
 }: QueuedMessagesStripProps) {
   // Pointer sensors use activation constraints so pressing the grip does not
@@ -259,6 +312,7 @@ export function QueuedMessagesStrip({
     onReorder(String(active.id), beforeQueueId);
   };
 
+  const steerBlocked = messages.some((m) => m.waitingForHost);
   const rows = messages.map((message) => (
     <QueuedRow
       key={message.queueId}
@@ -266,7 +320,9 @@ export function QueuedMessagesStrip({
       onDelete={onDelete}
       onEdit={onEdit}
       onSteer={onSteer}
+      steerBlocked={steerBlocked}
       reorderable={onReorder !== undefined}
+      recallsOnArrowUp={message.queueId === arrowUpRecallQueueId}
     />
   ));
 
@@ -294,6 +350,7 @@ export function QueuedMessagesStrip({
           <DndContext
             sensors={sensors}
             collisionDetection={queuedMessageCollisionDetection}
+            modifiers={[restrictToQueuedList]}
             onDragEnd={handleDragEnd}
           >
             {rows}

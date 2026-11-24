@@ -10,9 +10,9 @@ clickable, opening the reconnect instructions. That one shape is the point: the
 badge must not swap the host's name for generic "Host is offline" copy in some
 disconnect states and keep it in others, which is what it used to do depending
 on whether the runner happened to outlive the host (see the reconnect tests
-below). A dormant *resumable* managed host is the deliberate exception: its
-offline is idle dormancy the next message wakes, so it gets no reconnect
-affordance.
+below). A dormant *resumable* managed host reads offline too, but its tooltip
+says it's asleep, and its Reconnect host has the server wake it (see
+``test_host_asleep_composer.py``).
 
 Clicking a badge that has nothing to reconnect opens ``SwitchHostDialog``
 instead, which moves the session to another machine — covered at the bottom of
@@ -201,22 +201,24 @@ def test_host_badge_shows_host_name_when_online(
     badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
     expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
-    # The dot is decorative; status is conveyed by the title (mouse hover) and an
-    # sr-only word. Online == reachable host. The title also advertises the
-    # switch affordance the badge carries for any non-sandbox host.
-    expect(badge).to_have_attribute("title", "Host e2e-host, online", timeout=15_000)
+    # The dot is decorative; status is conveyed by the accessible name and the
+    # hover tooltip. Online == reachable host.
+    expect(badge).to_have_attribute("aria-label", "Host e2e-host, online", timeout=15_000)
+    badge.hover()
+    tooltip = page.get_by_test_id("composer-host-tooltip")
+    expect(tooltip).to_contain_text("Host: e2e-host")
+    expect(tooltip).to_contain_text("Status: Connected")
 
 
 def test_host_badge_shows_offline_when_host_unreachable(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A dormant resumable managed host shows offline, and stays passive.
+    """A dormant resumable managed host shows offline and reads as asleep.
 
-    ``host_resumable`` is the one offline host with no reconnect affordance: the
-    sandbox is idle-stopped and the next message wakes it, so ``omnigent host``
-    would be the wrong instruction. Every other offline host is clickable (see
-    the reconnect tests below).
+    The sandbox is idle-stopped and the next message wakes it, so the tooltip
+    says it's asleep rather than disconnected. Its Reconnect host is covered in
+    ``test_host_asleep_composer.py``.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -231,17 +233,29 @@ def test_host_badge_shows_offline_when_host_unreachable(
         host_online=False,
         host_resumable=True,
     )
+    # Opening the session presses Reconnect host after a second; failing that wake
+    # keeps the badge asleep (the wake itself is in test_host_asleep_composer.py).
+    page.route(
+        re.compile(rf"/v1/sessions/{re.escape(session_id)}/events(\?|$)"),
+        lambda route: (
+            route.fulfill(status=503, json={"error": {"message": "Sandbox is asleep."}})
+            if "retry_session" in (route.request.post_data or "")
+            else route.continue_()
+        ),
+    )
 
     page.goto(f"{base_url}/c/{session_id}")
 
     badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
     expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
-    # No reconnect copy: `omnigent host` is the wrong instruction for a dormant
-    # sandbox. The badge is still clickable — that click switches hosts — so the
-    # absence of the reconnect affordance is what this pins.
-    expect(badge).to_have_attribute("title", "Host e2e-host, offline", timeout=15_000)
+    # The label keeps the plain offline status; the tooltip says why.
+    expect(badge).to_have_attribute("aria-label", "Host e2e-host, offline", timeout=15_000)
     expect(badge).not_to_have_attribute("aria-label", re.compile(re.escape("click to reconnect")))
+    badge.hover()
+    expect(page.get_by_test_id("composer-host-tooltip")).to_contain_text(
+        "Status: Asleep — wakes on next message"
+    )
 
 
 def test_host_badge_offline_host_keeps_name_while_runner_outlives_it(
@@ -274,8 +288,10 @@ def test_host_badge_offline_host_keeps_name_while_runner_outlives_it(
     badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
     expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
-    expect(badge).to_have_attribute("title", "Host e2e-host, offline", timeout=15_000)
+    expect(badge).to_have_attribute("aria-label", "Host e2e-host, offline", timeout=15_000)
     assert badge.evaluate("el => el.tagName") == "BUTTON"
+    badge.hover()
+    expect(page.get_by_test_id("composer-host-tooltip")).to_contain_text("Status: Disconnected")
     # The runner is alive, so the session itself is still usable — the offline
     # host must not block the composer here.
     expect(page.get_by_label("Message the agent")).not_to_be_disabled()
@@ -285,12 +301,14 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A fully unreachable session names its dropped host instead of generic copy.
+    """A fully unreachable session names its dropped host and offers Reconnect.
 
     This is the ``host_offline`` liveness state, which used to replace the host
     name with "Host is offline". The name is what tells the
-    user WHICH machine to go restart, so it stays; the separate band below the
-    composer stays suppressed.
+    user WHICH machine to go restart, so it stays in the icon-only trigger's
+    label. The disabled composer says "reconnect below", so a visible "Offline ·
+    Reconnect" sits beside that trigger, under the text box, and opens the host
+    reconnect instructions; the separate band below the composer stays suppressed.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -312,10 +330,29 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
     badge = page.get_by_test_id("composer-host-select")
     expect(badge).to_be_visible(timeout=15_000)
     expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
-    expect(badge).to_have_attribute("title", "Host e2e-host, offline", timeout=15_000)
+    expect(badge).to_have_attribute("aria-label", "Host e2e-host, offline", timeout=15_000)
     assert badge.evaluate("el => el.tagName") == "BUTTON"
+
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_disabled(timeout=15_000)
+    expect(composer).to_have_attribute("placeholder", re.compile("reconnect below"))
+    offline = page.get_by_test_id("composer-host-offline")
+    expect(offline).to_be_visible()
+    expect(offline).to_have_text(re.compile(r"^Offline\s*·\s*Reconnect$"))
+    offline_box, composer_box = offline.bounding_box(), composer.bounding_box()
+    assert offline_box is not None and composer_box is not None, (offline_box, composer_box)
+    assert offline_box["y"] >= composer_box["y"] + composer_box["height"], (
+        offline_box,
+        composer_box,
+    )
     # The badge owns the affordance; the old band below the composer stays away.
     expect(page.get_by_test_id("disconnected-indicator")).to_have_count(0)
+
+    offline.get_by_role("button", name="Reconnect host", exact=True).click()
+    dialog = page.get_by_test_id("reconnect-session-dialog")
+    expect(dialog).to_be_visible(timeout=15_000)
+    page.get_by_test_id("reconnect-session-tab-reconnect").click()
+    expect(page.get_by_test_id("reconnect-session-command")).to_contain_text("omnigent host")
 
 
 def test_host_badge_click_shows_host_reconnect_instructions(

@@ -22,6 +22,10 @@ Two surfaces:
 
 from __future__ import annotations
 
+import logging
+import os
+
+from omnigent.errors import OmnigentError
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
 from omnigent.onboarding.configure_models import (
     build_cli_config_provider_entry,
@@ -36,6 +40,7 @@ from omnigent.onboarding.provider_config import (
     LOCAL_KIND,
     OPENAI_FAMILY,
     SUBSCRIPTION_KIND,
+    ProviderEntry,
     get_default_provider,
     load_providers,
     provider_families,
@@ -43,6 +48,7 @@ from omnigent.onboarding.provider_config import (
 )
 from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
+_logger = logging.getLogger(__name__)
 # The families auto-default resolution walks, in a stable order. ``gemini``
 # is included so a detected-only GEMINI_API_KEY (the antigravity-sdk harness's
 # credential) auto-becomes the gemini-family default in the read-time merge,
@@ -196,6 +202,22 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
                 env_model = getenv_nonempty_with_omnigent_prefix("ANTHROPIC_MODEL")
                 if env_model is not None:
                     default_model = env_model[1]
+        if det.family == GEMINI_FAMILY:
+            from omnigent.onboarding.gemini_gateway import (
+                GEMINI_BASE_URL_ENV,
+                validate_gemini_base_url,
+            )
+
+            endpoint = getenv_nonempty_with_omnigent_prefix(GEMINI_BASE_URL_ENV)
+            if endpoint is not None:
+                # Keep a gateway token paired with its endpoint when adopting it.
+                try:
+                    base_url = validate_gemini_base_url(endpoint[1])
+                except OmnigentError:
+                    _logger.debug(
+                        "Skipping detected Gemini key: GOOGLE_GEMINI_BASE_URL is invalid"
+                    )
+                    return None
         return build_key_provider_entry(
             det.family, base_url, api_key_ref, default_model, wire_api=wire_api
         )
@@ -347,6 +369,37 @@ def effective_config_with_detected(
                 break
 
     return {**config, "providers": merged}
+
+
+def resolve_named_provider(name: str, explicit_config: dict[str, object]) -> ProviderEntry | None:
+    """Return the provider an ``executor.auth: {type: provider}`` names.
+
+    Explicit config wins, then ambient detections, then the local config
+    when the managed-sandbox overlay replaced the providers block. Launch
+    (``omnigent.runtime.workflow``) and the cost paths share this, so a
+    session is priced by the entry it was launched with. Detection runs only
+    when the name is not explicitly configured, which keeps the per-usage
+    pricing lookup free of ambient probes for ordinary named providers.
+
+    :param name: The provider name from ``executor.auth.name``, e.g.
+        ``"expensive-named"``.
+    :param explicit_config: The runtime-overlaid config mapping, i.e.
+        :func:`~omnigent.inference_config.load_runtime_inference_config`
+        output, so the lookup matches the launch resolver.
+    :returns: The named :class:`ProviderEntry`, or ``None`` when no explicit
+        or detected provider has that name.
+    """
+    entry = load_providers(explicit_config).get(name)
+    if entry is not None:
+        return entry
+    entry = load_providers(effective_config_with_detected(explicit_config)).get(name)
+    if entry is None and os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
+        # The managed-sandbox overlay replaces the local providers block, so an
+        # explicitly named provider from ~/.omnigent/config.yaml would vanish.
+        from omnigent.onboarding.provider_config import _load_config
+
+        entry = load_providers(effective_config_with_detected(_load_config())).get(name)
+    return entry
 
 
 def providers_to_adopt(

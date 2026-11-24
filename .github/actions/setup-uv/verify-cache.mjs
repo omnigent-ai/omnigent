@@ -2,16 +2,16 @@ import { createHash } from "node:crypto";
 import { appendFile, lstat, readdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 
-// Extracted from uv 0.12.15 archives verified against upstream release hashes.
+// Extracted from uv 0.13.4 archives verified against upstream release hashes.
 const expectedByPlatform = {
   "Linux-X64": {
-    uv: "5d59bc45431db192c0a49a01c517041c3bd8778adb3fbc5195aaa025eec19e23",
-    uvx: "c9faf31836f0a99906793db2192fb40fc3f3c8b5ec545a99a5ff3ce6acdc031e",
+    uv: "5b2a2df4ef04c5d778d50702d6e1d1ff22909fc883086b4ef406a4f115e3c4fb",
+    uvx: "2044b4dd5a37d593c0d6ab279777dfec833f4d4e81c0aa74b05098f595a849c7",
   },
   "Windows-X64": {
-    "uv.exe": "b0131eb55f112aee1836951ba96abec9c897b7bedd3f2fdebb19d710cfb636cd",
-    "uvw.exe": "78593a0cb43be2e31de4a573c3624c7ef62f9b3dfd3f7abc9dab5b75ec814541",
-    "uvx.exe": "12fa21b9a137b045d5c093ada895e2eda8494741d658ab174bd28e082fd3200c",
+    "uv.exe": "b9d9656370ee1812e53e985d8bbb81870038106df98ef34cb45bcf4e0fe0df17",
+    "uvw.exe": "2bd2d2c9beeac5014a951b3f037f0dce5877d56831949b74a6c22031532c0ea7",
+    "uvx.exe": "3f63d672f7d6b841e22a595ef473a023917bff3c82de2d40e4e02f9288709517",
   },
 };
 

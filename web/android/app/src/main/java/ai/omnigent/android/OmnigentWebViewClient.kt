@@ -7,13 +7,16 @@ import android.os.Handler
 import android.os.Looper
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import java.net.URI
 
 /**
  * Signals [onPageReady] once a pinned-origin page finishes loading and decides
- * where the login flow runs: inline for servers matching [usesInWebViewAuth],
- * otherwise handed to the system browser via [onLoginRequired]. A landing on a
+ * where the login flow runs: inline for server strategies whose
+ * [ServerAuthentication.usesInWebViewAuth] is true, otherwise handed to the
+ * system browser via [onLoginRequired]. A landing on a
  * bare Databricks workspace root is bounced to the workspace's `/omnigent`
  * mount (see [workspaceRootTarget]).
  *
@@ -28,13 +31,22 @@ import android.webkit.WebViewClient
  * [onRendererGone], so the host can rebuild the WebView instead of letting
  * Android kill the whole app.
  */
-class OmnigentWebViewClient(
+internal class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
     private val onRendererGone: (view: WebView, didCrash: Boolean) -> Unit,
     private val onNavigationStarted: () -> Unit = {},
+    private val onMainFrameHttpError: (statusCode: Int) -> Unit = {},
+    private val workspaceSession: () -> DatabricksWebSession? = { null },
+    private val onWorkspaceSessionInvalid: (status: Int?) -> Unit = {},
+    private val onWorkspaceSignOut: () -> Unit = {},
+    private val bridgeScript: () -> String = { NativeBridgeScript.source },
+    /** True when the shell took over a pinned-origin page load (a native OIDC auth route). */
+    private val handlesNavigation: (url: String?) -> Boolean = { false },
+    /** Every main-frame URL the page reaches, including in-page `pushState` navigations. */
+    private val onHistoryUpdated: (url: String?) -> Unit = {},
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -52,6 +64,28 @@ class OmnigentWebViewClient(
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
         val pinned = pinnedOrigin()
+        val session = workspaceSession()
+        if (session != null && isHttpScheme(scheme)) {
+            val parsed = runCatching { url?.let(::URI) }.getOrNull()
+            if (parsed != null && session.isSignOutUri(parsed)) {
+                view.stopLoading()
+                onWorkspaceSignOut()
+                return
+            }
+            val accepted = runCatching { parsed?.let(session::navigationUri) }.getOrNull()
+            if (accepted == null) {
+                view.stopLoading()
+                onWorkspaceSessionInvalid(null)
+                return
+            }
+        }
+
+        // A native OIDC session handles its own auth routes; loads the shell starts
+        // itself skip shouldOverrideUrlLoading, so they are caught here too.
+        if (isHttpScheme(scheme) && origin == pinned && handlesNavigation(url)) {
+            view.stopLoading()
+            return
+        }
 
         // A real http(s) navigation to a foreign origin means the server bounced
         // us to the IdP and shouldOverrideUrlLoading didn't catch the redirect.
@@ -64,7 +98,13 @@ class OmnigentWebViewClient(
         // load of the pinned server (e.g. it's offline), NOT an IdP redirect —
         // don't misread it as a bounce and pop the browser. Mirror the http(s)
         // gate in shouldOverrideUrlLoading.
-        if (isHttpScheme(scheme) && origin != pinned && !usesInWebViewAuth(pinned)) {
+        // A native workspace session already vetted this URL above, including its aliases.
+        if (
+            session == null &&
+            isHttpScheme(scheme) &&
+            origin != pinned &&
+            !serverAuthentication(pinned).usesInWebViewAuth
+        ) {
             // Log origin only, never the full URL (carries OAuth state/PKCE).
             authLog("off-origin landing $origin -> login")
             view.stopLoading()
@@ -99,6 +139,12 @@ class OmnigentWebViewClient(
         isReload: Boolean,
     ) {
         super.doUpdateVisitedHistory(view, url, isReload)
+        val parsed = runCatching { url?.let(::URI) }.getOrNull()
+        if (parsed != null && workspaceSession()?.isSignOutUri(parsed) == true) {
+            onWorkspaceSignOut()
+            return
+        }
+        onHistoryUpdated(url)
         if (originOf(url) != pinnedOrigin()) return
         val target = workspaceRootTarget(url) ?: return
         bounce(view, target)
@@ -124,7 +170,7 @@ class OmnigentWebViewClient(
             view.evaluateJavascript(WorkspaceChromeScript.source, null)
         }
         if (onPinnedOrigin && shouldInjectBridgeAtPageReady()) {
-            view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
+            view.evaluateJavascript(bridgeScript()) { onPageReady(url) }
             return
         }
         onPageReady(url)
@@ -147,11 +193,33 @@ class OmnigentWebViewClient(
             return true
         }
 
+        val session = workspaceSession()
+        if (session != null) {
+            // Android's Uri allows characters java.net.URI rejects, such as `|`; those fail closed.
+            val parsed = runCatching { URI(url.toString()) }.getOrNull()
+            if (parsed != null && session.isSignOutUri(parsed)) {
+                onWorkspaceSignOut()
+                return true
+            }
+            val accepted = parsed?.let { runCatching { session.navigationUri(it) }.getOrNull() }
+            if (accepted != null) return false
+            // A workspace login page signs in again natively, in this profile, not in a browser.
+            val signIn =
+                parsed?.let { runCatching { session.isAuthenticationUri(it) }.getOrNull() } == true
+            if (!signIn && request.hasGesture() && isCurrentWorkspacePage(view.url, session)) {
+                runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+            } else {
+                onWorkspaceSessionInvalid(null)
+            }
+            return true
+        }
+
         // Same-origin app pages load in the WebView, except a landing on the bare
         // workspace root, which belongs to Databricks rather than the app.
         val origin = originOf(url.toString())
         val pinned = pinnedOrigin()
         if (origin == pinned) {
+            if (handlesNavigation(url.toString())) return true
             val target = workspaceRootTarget(url.toString()) ?: return false
             bounce(view, target)
             return true
@@ -165,7 +233,7 @@ class OmnigentWebViewClient(
         // an external link; once we're on the IdP's own pages its navigations
         // (sign-in buttons, form posts, tenant hops) are all gesture-driven and
         // must stay inline or the flow ejects to the browser mid-login.
-        if (usesInWebViewAuth(pinned)) {
+        if (serverAuthentication(pinned).usesInWebViewAuth) {
             if (originOf(view.url) == pinned && request.hasGesture()) {
                 runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
                 return true
@@ -182,6 +250,28 @@ class OmnigentWebViewClient(
         }
         return true
     }
+
+    override fun onReceivedHttpError(
+        view: WebView,
+        request: WebResourceRequest,
+        errorResponse: WebResourceResponse,
+    ) {
+        super.onReceivedHttpError(view, request, errorResponse)
+        if (!request.isForMainFrame) return
+        // A native workspace session renews itself when the workspace rejects it.
+        if (workspaceSession() != null && errorResponse.statusCode in setOf(401, 403)) {
+            view.stopLoading()
+            onWorkspaceSessionInvalid(errorResponse.statusCode)
+            return
+        }
+        if (originOf(request.url.toString()) != pinnedOrigin()) return
+        onMainFrameHttpError(errorResponse.statusCode)
+    }
+
+    private fun isCurrentWorkspacePage(
+        url: String?,
+        session: DatabricksWebSession,
+    ): Boolean = runCatching { url?.let(::URI)?.let(session::navigationUri) }.getOrNull() != null
 
     /**
      * The renderer process died — crashed, or reclaimed by the system under

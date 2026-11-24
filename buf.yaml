@@ -1,0 +1,11 @@
+# Protobuf API schemas live under omnigent/api/, with directories matching
+# their `package` lines. Code generation is scripts/gen_protobuf.py; buf only
+# lints here (the `buf-lint` pre-commit hook).
+version: v2
+modules:
+  - path: .
+    includes:
+      - omnigent/api
+lint:
+  use:
+    - STANDARD

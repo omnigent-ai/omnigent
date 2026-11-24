@@ -23,6 +23,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.native_session import create_native_session
 from tests.e2e_ui.conftest import _server_state, seed_committed_turn
 
 
@@ -371,6 +372,48 @@ def test_databricks_rate_limit_is_retryable_live_and_after_reload(
     expect(
         page.locator('[data-testid="message-bubble"][data-role="user"]').filter(has_text=prompt)
     ).to_have_count(1)
+
+
+def test_codex_model_rejection_shows_recovery_hint_live_and_after_reload(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Raw Codex failure flows through the real API, stream, saved state, and card."""
+    created = create_native_session(httpx, live_server, harness="codex")
+    session_id = created["session_id"]
+    try:
+        message = (
+            "The 'system.ai.gpt-6-1-sol' model is not supported when using Codex "
+            "with a ChatGPT account."
+        )
+        page.goto(f"{live_server}/c/{session_id}")
+        expect(page.get_by_test_id("view-mode-chat")).to_be_visible(timeout=15_000)
+        page.get_by_test_id("view-mode-chat").click()
+        expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible()
+        _publish_native_status(live_server, session_id, "running", response_id="rejected_model")
+        _publish_native_status(
+            live_server, session_id, "failed", response_id="rejected_model", output=message
+        )
+
+        pill = page.get_by_test_id("error-pill")
+        headline = "Model unavailable with ChatGPT login"
+        for reload in (False, True):
+            if reload:
+                page.reload()
+            expect(pill, f"reload={reload}").to_contain_text(headline, timeout=15_000)
+            pill.locator('button[aria-expanded="false"]').click()
+            expect(pill).to_contain_text("model picker or /model")
+            expect(pill).to_contain_text("another provider, configure it for Codex")
+            expect(pill).to_contain_text("on the host, then start a new session")
+            expect(pill.get_by_test_id("error-message-content")).to_contain_text(message)
+            expect(pill.get_by_role("button", name="Retry", exact=True)).to_have_count(0)
+            expect(pill.get_by_role("button", name="Resume session", exact=True)).to_have_count(0)
+
+        if screenshot_dir := os.environ.get("E2E_SCREENSHOT_DIR"):
+            Path(screenshot_dir).mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(Path(screenshot_dir) / "codex-model-rejection.png"))
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0).raise_for_status()
 
 
 def test_failed_turn_surfaces_error_as_pill_not_raw_text(

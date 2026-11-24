@@ -1,7 +1,9 @@
 """Real native web turns survive an unlinked runner cwd with a live workspace.
 
 Only Anthropic responses are scripted. The server, runner, Claude CLI, tmux,
-hooks, MCP relay, and workspace file read all run normally.
+hooks, MCP relay, and workspace file read all run normally. The read uses
+Claude's own Read tool: the relay offers Claude no ``sys_os_*`` tools, because
+its own file tools already pass the policy hook.
 """
 
 from __future__ import annotations
@@ -27,9 +29,12 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
 )
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.terminals.program_status import ProgramStatusReader
 from tests._helpers.session import bundle_files, post_session_bundle
+from tests.e2e._claude_host_support import (
+    _send_user_message,
+)
 from tests.e2e.test_host_claude_native_e2e import _poll_for_assistant_marker
-from tests.e2e.test_host_claude_native_fork_e2e import _send_user_message
 from tests.server.integration.mock_llm_server import (
     anthropic_sse_text_response,
     anthropic_sse_tool_call_response,
@@ -71,17 +76,12 @@ class _Gateway:
             self.results = reads
         if self.read_path is None or reads:
             return anthropic_sse_text_response(self.reply, model=model)
-        searched = any(result.get("tool_use_id") == "toolu_cwd_search" for result in results)
         return anthropic_sse_tool_call_response(
             [
                 {
-                    "call_id": _READ_ID if searched else "toolu_cwd_search",
-                    "name": "mcp__omnigent__sys_os_read" if searched else "ToolSearch",
-                    "arguments": json.dumps(
-                        {"path": self.read_path}
-                        if searched
-                        else {"query": "select:mcp__omnigent__sys_os_read", "max_results": 1}
-                    ),
+                    "call_id": _READ_ID,
+                    "name": "Read",
+                    "arguments": json.dumps({"file_path": self.read_path}),
                 }
             ],
             model=model,
@@ -168,9 +168,7 @@ def test_claude_web_turn_survives_deleted_runner_cwd(
             }
         )
     )
-    (config_dir / "settings.json").write_text(
-        json.dumps({"permissions": {"allow": ["mcp__omnigent__sys_os_read"]}})
-    )
+    (config_dir / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
     token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(token)
     env = {
@@ -306,13 +304,18 @@ os_env:
                 send_direct(baseline)
             wait_reply(baseline)
             print("Baseline native reply received", flush=True)
-            claude_pid = int(
+            pane_pid = int(
                 subprocess.check_output(
                     [*tmux, "display-message", "-p", "-t", target, "#{pane_pid}"],
                     text=True,
                     timeout=5,
                 )
             )
+            # With OSC status enabled, the relay owns the pane and Claude is its child.
+            status_reader = ProgramStatusReader(
+                Path(pane["socket_path"]).parent / "program-status.json"
+            )
+            claude_pid = status_reader.child_pid or pane_pid
             assert Path(f"/proc/{claude_pid}/comm").read_text().strip() == "claude"
             assert os.readlink(f"/proc/{claude_pid}/cwd") == str(workspace)
             assert os.readlink(f"/proc/{runner.pid}/cwd") == str(runner_cwd)
@@ -341,7 +344,7 @@ os_env:
             assert sentinel in json.dumps(results), results
             assert os.readlink(f"/proc/{runner.pid}/cwd").endswith(" (deleted)")
             assert os.readlink(f"/proc/{claude_pid}/cwd") == str(workspace)
-            print("Post-unlink web reply and real MCP sentinel read verified", flush=True)
+            print("Post-unlink web reply and workspace sentinel read verified", flush=True)
         finally:
             if tmux is not None:
                 screen = subprocess.run(

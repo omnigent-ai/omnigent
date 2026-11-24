@@ -16,6 +16,7 @@
 // did / didn't fire after unmount. Only the write is a controllable deferred.
 
 import { StrictMode } from "react";
+import { Schema, type Node } from "@tiptap/pm/model";
 import { act, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,7 +28,7 @@ interface FakeEditor {
   off: (evt: string, h: () => void) => void;
   commands: { setContent: (c: string) => void };
   setEditable: () => void;
-  state: { selection: { empty: boolean; from: number; to: number } };
+  state: { doc: Node; selection: { empty: boolean; from: number; to: number } };
   emit: (evt: string) => void;
   setMarkdown: (m: string) => void;
   isFocused: boolean;
@@ -38,9 +39,14 @@ interface FakeEditor {
   latestOnUpdate: ((p: { editor: FakeEditor }) => void) | null;
 }
 
+const schema = new Schema({ nodes: { doc: { content: "text*" }, text: {} } });
+const documentFor = (text: string) =>
+  schema.node("doc", null, text ? schema.text(text) : undefined);
+
 function makeFakeEditor(initial: string): FakeEditor {
   const handlers: Record<string, Set<() => void>> = {};
   let markdown = initial;
+  const state = { doc: documentFor(initial), selection: { empty: true, from: 0, to: 0 } };
   return {
     isDestroyed: false,
     getMarkdown: () => markdown,
@@ -53,15 +59,17 @@ function makeFakeEditor(initial: string): FakeEditor {
     commands: {
       setContent: (c: string) => {
         markdown = c;
+        state.doc = documentFor(c);
       },
     },
     setEditable: () => {},
-    state: { selection: { empty: true, from: 0, to: 0 } },
+    state,
     emit: (evt) => {
       handlers[evt]?.forEach((h) => h());
     },
     setMarkdown: (m) => {
       markdown = m;
+      state.doc = documentFor(m);
     },
     // Default focused: these tests simulate USER edits, which only fire 'update'
     // while the editor has focus (a pre-focus normalisation update re-baselines).
@@ -110,12 +118,19 @@ vi.mock("@tiptap/extension-table", () => ({
   TableCell: {},
   TableHeader: {},
 }));
+vi.mock("./tiptapBoundedTokenizers", () => ({
+  BoundedTaskList: {},
+  BoundedTable: { configure: vi.fn().mockReturnValue({}) },
+}));
 vi.mock("./TipTapGitHubAlert", () => ({ GitHubAlertBlockquote: {} }));
 vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
 vi.mock("./tiptapMarkdownPatches", () => ({
   installMarkdownSerializerPatch: vi.fn(),
   installMarkdownParserPatch: vi.fn(),
+  // The fake editor has no source blocks, so a save serialises everything.
+  markdownKeepingSource: (editor: { getMarkdown: () => string }) => editor.getMarkdown(),
 }));
+vi.mock("./markdownSourceBlocks", () => ({ rememberSourceBlocks: vi.fn() }));
 vi.mock("./TipTapWorkspaceImage", () => ({
   createWorkspaceImageExtension: vi.fn().mockReturnValue({}),
   ImageAwareLink: { configure: vi.fn().mockReturnValue({}) },
@@ -128,6 +143,11 @@ vi.mock("./MarkdownCommentPlugin", () => ({ MarkdownCommentPlugin: () => null })
 vi.mock("./MarkdownEditorToolbar", () => ({ ToolbarPlugin: () => null }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
+// The pre-write conflict check GETs the live file before every save.
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileContentModule>()),
+  fetchFileContent: vi.fn(),
+}));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
@@ -139,6 +159,8 @@ import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
 import * as syncHook from "./useMarkdownEditorSync";
+import { fetchFileContent } from "@/hooks/useFileContent";
+import type * as FileContentModule from "@/hooks/useFileContent";
 
 const PATH = "/doc.md";
 const INITIAL = "# Doc\n\ninitial body\n";
@@ -149,7 +171,7 @@ const EDITED = "# Doc\n\nedited body\n";
 let setDirty: ReturnType<typeof vi.fn>;
 let markSaved: ReturnType<typeof vi.fn>;
 let dismissExternalUpdate: ReturnType<typeof vi.fn>;
-let reconcileServerContent: ReturnType<typeof vi.fn>;
+let beginServerCheck: ReturnType<typeof vi.fn>;
 
 // Controllable in-flight write.
 let resolveWrite: () => void;
@@ -177,7 +199,15 @@ beforeEach(() => {
   setDirty = vi.fn();
   markSaved = vi.fn();
   dismissExternalUpdate = vi.fn();
-  reconcileServerContent = vi.fn().mockReturnValue(false);
+  beginServerCheck = vi.fn(() => () => "write");
+  vi.mocked(fetchFileContent).mockResolvedValue({
+    object: "session.environment.filesystem.file_content",
+    path: PATH,
+    content_type: null,
+    encoding: "utf-8",
+    content: INITIAL,
+    bytes: INITIAL.length,
+  });
   vi.mocked(syncHook.useMarkdownEditorSync).mockReturnValue({
     editorKey: 1,
     isDirty: false,
@@ -186,7 +216,7 @@ beforeEach(() => {
     discardAndApplyExternal: vi.fn(),
     dismissExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
   } as unknown as ReturnType<typeof syncHook.useMarkdownEditorSync>);
 
   writePromise = new Promise<void>((r) => {

@@ -300,6 +300,27 @@ describe("itemsToBlocks — flat shape", () => {
     expect(td?.interrupted).toBe(true);
   });
 
+  it.each([
+    ["commentary", "commentary"],
+    ["summary", undefined],
+  ] as const)("assistant phase %s reaches TextDone as %s", (stored, expected) => {
+    // The server stores phases this client may not know yet; only known ones apply.
+    const items: ConversationItem[] = [
+      {
+        id: "msg_commentary",
+        response_id: "codex_turn_123",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        model: "codex-native-ui",
+        phase: stored,
+        content: [{ type: "output_text", text: "Checking the tests." }],
+      },
+    ];
+    const td = itemsToBlocks(items).find((b): b is TextDone => b.type === "text_done");
+    expect(td?.phase).toBe(expected);
+  });
+
   it("error items carry an info level through to the block only when set", () => {
     const base = {
       response_id: "resp_notice",
@@ -629,6 +650,45 @@ describe("itemsToBlocks — answered question and plan cards", () => {
     });
   });
 
+  it("keeps a tagged answer whole, including its session marker's quotes", () => {
+    const tagged =
+      'Base it on the fix from [Session: "Fix CI" id=s_ci subagent=no]\n\n' +
+      "[Tagged sessions: read with sys_session_get_history]";
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "Pick for me"),
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1", "claude-native-ui"),
+      functionCallOutput(
+        "resp_1",
+        "c1",
+        `Your questions have been answered: "Which library should we use?"="${tagged}", ` +
+          '"Ship the "fast path" too?"="Yes". You can now continue with these answers in mind.',
+      ),
+    ];
+    const card = itemsToBlocks(items)[1] as ElicitationBlock;
+    expect(card.response?.content).toEqual({
+      "Which library should we use?": tagged,
+      'Ship the "fast path" too?': "Yes",
+    });
+  });
+
+  it("keeps an answer with several quotes, when it is the last one", () => {
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "Pick for me"),
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1", "claude-native-ui"),
+      functionCallOutput(
+        "resp_1",
+        "c1",
+        'Your questions have been answered: "Which library should we use?"="date-fns", ' +
+          '"Ship the "fast path" too?"="Say "yes", then "ship" it". You can now continue.',
+      ),
+    ];
+    const card = itemsToBlocks(items)[1] as ElicitationBlock;
+    expect(card.response?.content).toEqual({
+      "Which library should we use?": "date-fns",
+      'Ship the "fast path" too?': 'Say "yes", then "ship" it',
+    });
+  });
+
   it("leaves an unanswered question as a plain tool row", () => {
     // No output yet (still parked, or the pair split across history pages):
     // the live snapshot owns the pending card, and a rebuilt one would have
@@ -917,5 +977,58 @@ describe("itemsToBlocks — edge cases", () => {
     expect(texts).toContain("hello");
     expect(texts).toContain("what next?");
     expect(texts.some((t) => t.includes("continued from a previous conversation"))).toBe(false);
+  });
+});
+
+describe("task markers", () => {
+  it("become chat notices, placed and folded like sub-agent markers", () => {
+    const marker = {
+      id: "item_marker",
+      type: "resource_event",
+      response_id: "journal_abc",
+      event_type: "session.journal.task",
+      resource_type: "journal",
+      resource_id: "deploy",
+      resource: {
+        name: "Deploy the swap",
+        status: "started",
+        text: null,
+        entry_id: "e1",
+        native: false,
+      },
+    } as unknown as ConversationItem;
+    expect(itemsToBlocks([marker])).toMatchObject([
+      { type: "native_tool", toolType: "subagent_activity", data: { resource_id: "deploy" } },
+    ]);
+  });
+});
+
+describe("itemsToBlocks — Claude sub-agent handback", () => {
+  it("shows the handed-back report as the answer and hides the delivery receipt", () => {
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "Audit the tests"),
+      functionCall("resp_1", "c1", "Bash", { command: "ls" }),
+      functionCallOutput("resp_1", "c1", "tests"),
+      functionCall("resp_1", "c2", "SubagentHandback", { message: "**Audit** done." }, "fc_c2"),
+      functionCallOutput("resp_1", "c2", '{"success":true,"message":"Report delivered."}'),
+    ];
+    const blocks = itemsToBlocks(items);
+    expect(blocks.map((b) => b.type)).toEqual([
+      "user_message",
+      "tool_group",
+      "tool_result",
+      "text_done",
+    ]);
+    const answer = blocks[3] as TextDone;
+    expect(answer.fullText).toBe("**Audit** done.");
+    expect(answer.ctx.itemId).toBe("fc_c2");
+  });
+
+  it("keeps a handback with no report as an ordinary tool row", () => {
+    const items: ConversationItem[] = [
+      functionCall("resp_1", "c1", "SubagentHandback", { message: "  " }),
+      functionCallOutput("resp_1", "c1", "ok"),
+    ];
+    expect(itemsToBlocks(items).map((b) => b.type)).toEqual(["tool_group", "tool_result"]);
   });
 });

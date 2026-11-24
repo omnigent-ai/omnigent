@@ -228,12 +228,14 @@ async def test_antigravity_native_child_dispatch_preserves_catalog_model_overrid
 
     discovery = Mock(side_effect=AssertionError("explicit models must bypass discovery"))
     monkeypatch.setattr(models, "list_agy_cli_model_options", discovery)
+    # Session ids allow only letters, digits, underscores and hyphens.
+    conv_id = f"conv_antigravity_child_{model.replace('.', '_')}"
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker("antigravity-native"),
-        conv_id=f"conv_antigravity_child_{model}",
+        conv_id=conv_id,
         parent_snapshot={
-            "id": f"conv_antigravity_child_{model}",
+            "id": conv_id,
             "agent_id": "ag_parent",
             "model_override": "gemini-3.1-pro-high",
             "llm_model": None,

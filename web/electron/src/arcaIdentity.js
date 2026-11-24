@@ -1,23 +1,13 @@
 "use strict";
 
-const { normalizeSavedServerUrl, databricksWorkspaceUiUrl } = require("./url");
+const { normalizedServerTarget, daemonServesTarget } = require("./hostStatusIdentity");
 
 const IDENTITY_START = "__OMNIGENT_ARCA_IDENTITY_START__";
 const IDENTITY_END = "__OMNIGENT_ARCA_IDENTITY_END__";
 
 /** Canonical selected target, preserving mount and workspace selector. */
 function arcaTarget(raw) {
-  try {
-    const saved = normalizeSavedServerUrl(raw);
-    const url = new URL(databricksWorkspaceUiUrl(saved) ?? saved);
-    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
-    url.hash = "";
-    url.pathname = url.pathname.replace(/\/+$/, "") || "/";
-    url.searchParams.sort();
-    return url.href;
-  } catch {
-    return null;
-  }
+  return normalizedServerTarget(raw);
 }
 
 /** Read only the bounded, machine-readable status from the Arca connect run. */
@@ -37,17 +27,12 @@ function readArcaIdentity(output, serverUrl, onUnavailable = () => {}) {
       return unavailable("status must contain exactly one daemon");
     }
     const daemon = body.daemons[0];
-    // CLI status normalizes the UI mount to the API mount and drops ?o=.
-    // The selected workspace remains bound by the command's --server argument.
-    const expected = new URL(target);
-    expected.search = "";
     if (
       daemon.mode !== "server" ||
       daemon.process !== "online" ||
       daemon.host_status !== "online" ||
       daemon.error != null ||
-      arcaTarget(daemon.target) !== expected.href ||
-      arcaTarget(daemon.server_url) !== expected.href ||
+      !daemonServesTarget(daemon, target) ||
       typeof daemon.host_id !== "string" ||
       !/^[a-f0-9]{32}$/i.test(daemon.host_id)
     ) {

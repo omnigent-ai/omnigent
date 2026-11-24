@@ -208,7 +208,9 @@ def _assert_hidden_output(
         Image.open(io.BytesIO(before)).convert("RGB"),
         Image.open(io.BytesIO(after)).convert("RGB"),
     )
-    assert diff.getbbox() is None, (
+    # Compositing can shift antialiased edges by one channel level out of 255.
+    visible_diff = diff.point(lambda channel: 0 if channel <= 1 else channel)
+    assert visible_diff.getbbox() is None, (
         f"Hidden terminal output changed visible pixels during {phase}; "
         f"compare {artifacts / f'{phase}-before.png'} and {artifacts / f'{phase}-after.png'}"
     )

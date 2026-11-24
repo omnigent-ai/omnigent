@@ -39,8 +39,10 @@ import {
   slashCommandEchoText,
   structuredErrorFields,
 } from "./blocks";
+import type { AssistantMessagePhase } from "./conversationItems";
 import type { StreamEvent } from "./events";
 import { routingExtras } from "./routingDecision";
+import { subagentHandbackReport } from "./subagentHandback";
 import type { Response } from "./types";
 
 const DEFAULT_FLUSH_THRESHOLD = 30;
@@ -259,9 +261,13 @@ function* closeReasoning(state: ReducerState): Generator<AnyBlock> {
  * `TextDone.ctx.itemId` so renderers can correlate the streamed text
  * back to its persisted item. `null` when the closure is fired by a
  * non-message boundary (tool call, terminal event without a preceding
- * message_done).
+ * message_done). `phase` is that message's harness label, when present.
  */
-function* closeText(state: ReducerState, itemId: string | null = null): Generator<AnyBlock> {
+function* closeText(
+  state: ReducerState,
+  itemId: string | null = null,
+  phase?: AssistantMessagePhase,
+): Generator<AnyBlock> {
   if (!state.inText) return;
   if (state.accumulated) {
     yield {
@@ -276,6 +282,7 @@ function* closeText(state: ReducerState, itemId: string | null = null): Generato
     ctx: ctx(state, itemId),
     fullText: state.fullText,
     hasCodeBlocks: state.fullText.includes("```"),
+    ...(phase !== undefined ? { phase } : {}),
   } satisfies TextDone;
   state.inText = false;
   state.fullText = "";
@@ -524,6 +531,22 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       //
       // Non-MCP paths emit exactly one ToolCall per callId, so the
       // second-arrival branch never fires for them.
+      const handbackReport = subagentHandbackReport(event.name, event.arguments);
+      if (handbackReport !== null) {
+        // The handback's result only confirms delivery, so drop it like a repeat.
+        state.seenResultCallIds.add(`${event.responseId || state.responseId}:${event.callId}`);
+        if (state.seenCallIds.has(event.callId)) return;
+        state.seenCallIds.add(event.callId);
+        yield* closeReasoning(state);
+        yield* closeText(state);
+        yield {
+          type: "text_done",
+          ctx: ctx(state, event.itemId || null, event.responseId || null),
+          fullText: handbackReport,
+          hasCodeBlocks: handbackReport.includes("```"),
+        } satisfies TextDone;
+        return;
+      }
       if (state.seenCallIds.has(event.callId)) {
         // Already rendered the call line for this callId. Re-register
         // in pendingTools so the eventual `ToolResult` can pair by
@@ -706,13 +729,21 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // either empty or carries the previous turn's id, so isResponseSwitch
       // spuriously fires for an in-fact same-response message_done.
       const accumulatedFromDeltas = state.fullText;
+      const text = outputTextFromMessageContent(event.content);
+      // A switch whose content equals the closing deltas is that same message
+      // (see the dedup below), so it keeps the event's item id and phase.
+      const closesSameMessage = !isResponseSwitch || text === accumulatedFromDeltas;
 
       // Close prior blocks under the OLD responseId before stamping the new one.
       yield* closeReasoning(state);
       if (hadOpenText) {
-        // On a response switch, event.itemId belongs to the new message — don't
-        // attach it to the old text block being closed.
-        yield* closeText(state, isResponseSwitch ? null : event.itemId || null);
+        // On a genuine response switch, event.itemId belongs to the new message —
+        // don't attach it to the old text block being closed.
+        yield* closeText(
+          state,
+          closesSameMessage ? event.itemId || null : null,
+          closesSameMessage ? event.phase : undefined,
+        );
       }
 
       // A message_done with a new id is a genuine turn transition (the
@@ -732,8 +763,6 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // avoid duplication. Response-switch: emit event.content as the new body.
       if (hadOpenText && !isResponseSwitch) return;
 
-      const text = outputTextFromMessageContent(event.content);
-
       // Race-safe dedup: even on a perceived response switch, if the deltas
       // that just closed accumulated EXACTLY the text in ``event.content``,
       // both belong to the same response and emitting a second ``text_done``
@@ -748,6 +777,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           ctx: ctx(state, event.itemId || null),
           fullText: text,
           hasCodeBlocks: text.includes("```"),
+          ...(event.phase !== undefined ? { phase: event.phase } : {}),
         } satisfies TextDone;
       }
       return;
@@ -913,6 +943,8 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
             ? ctx(state, null, `${ELICITATION_RESPONSE_PREFIX}${event.elicitationId}`)
             : ctx(state),
         elicitationId: event.elicitationId,
+        ...(event.nativeDelivery ? { nativeDelivery: event.nativeDelivery } : {}),
+        ...(event.isBlocking === false ? { isBlocking: false as const } : {}),
         targetSessionId: event.targetSessionId,
         message: event.message,
         phase: event.phase,
@@ -923,12 +955,16 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         status: "pending",
         response: null,
         askUserQuestion: event.askUserQuestion,
+        ...(event.journalStep ? { journalStep: event.journalStep } : {}),
         exitPlanMode: event.exitPlanMode,
+        fileEdit: event.fileEdit,
         codexCommand: event.codexCommand,
         allowAllEdits: event.allowAllEdits,
         allowAutoMode: event.allowAutoMode,
+        permissionDirectories: event.permissionDirectories,
         rememberScope: event.rememberScope,
         codexPersistModes: event.codexPersistModes,
+        agyPermission: event.agyPermission,
       } satisfies ElicitationBlock;
       return;
     }

@@ -99,7 +99,8 @@ def test_postgres_retry_rebuilds_only_its_own_invalid_index() -> None:
             conn.execute(sa.text("CREATE TABLE other.t (x int)"))
             conn.execute(sa.text(f"CREATE INDEX {_INDEX} ON other.t (x)"))
             conn.execute(sa.text(invalidate), {"i": f"other.{_INDEX}"})
-        _run_migrations(sa.create_engine(uri), uri)
+        # Stop at the index migration so the replay below does not re-add later columns.
+        command.upgrade(_build_alembic_config(uri), "mm1a2b3c4d5e")
         with setup.connect() as conn:
             conn.execute(sa.text(invalidate), {"i": f"public.{_INDEX}"})
             conn.execute(sa.text("UPDATE alembic_version SET version_num = 'll1a2b3c4d5e'"))

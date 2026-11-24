@@ -67,6 +67,13 @@ interface MonacoDiffViewerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** In-progress comment body; clicking away won't clear an active draft. */
   pendingBodyRef?: React.RefObject<string>;
+  /** Whether the session's agent opens an attached workspace path. */
+  attachToAgent?: boolean;
+  /**
+   * Whether the after side is the working copy, which comments and attachments refer to.
+   * Defaults to true; a committed snapshot shows no comments and offers neither.
+   */
+  commentable?: boolean;
   /**
    * Toolbar / Cmd+F "Find in file" toggle. The diff mirrors Monaco's native
    * find widget (on the modified side) to it: true opens find, false closes it.
@@ -76,11 +83,24 @@ interface MonacoDiffViewerProps {
    */
   searchOpen?: boolean;
   /**
+   * Bumped on every Cmd+F. Re-running Monaco's find action while the widget is
+   * already open refocuses its input, which `searchOpen` alone can't trigger.
+   */
+  searchFocusNonce?: number;
+  /**
    * Called when the find widget is closed from within Monaco (Escape or the
    * widget's ✕) so the owning toggle resets and the next Cmd+F re-opens it.
    */
   onSearchHandled?: () => void;
 }
+
+/** Warm the shared themes and grammar without mounting an editor or starting a diff. */
+export function prepareDiffEditor(lang: ReturnType<typeof detectLang>) {
+  return Promise.all([ensureMonacoReady(), ensureLanguage(lang)]);
+}
+
+/** A committed snapshot's diff shows none of the working copy's comments. */
+const NO_COMMENTS: Comment[] = [];
 
 /**
  * Render a file's before/after diff in Monaco, with the comment layer on the
@@ -103,7 +123,10 @@ export function MonacoDiffViewer({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
+  attachToAgent,
+  commentable = true,
   searchOpen,
+  searchFocusNonce,
   onSearchHandled,
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
@@ -121,7 +144,7 @@ export function MonacoDiffViewer({
     // not-yet-registered grammar/theme — independent of any remount key.
     setReady(false);
     setLoadError(false);
-    void Promise.all([ensureMonacoReady(), ensureLanguage(lang)]).then(
+    void prepareDiffEditor(lang).then(
       () => {
         if (!cancelled) setReady(true);
       },
@@ -222,11 +245,9 @@ export function MonacoDiffViewer({
     [],
   );
 
-  // Mirror the "Find in file" toggle to Monaco's native find widget on the
-  // modified side. Gated on `mounted` so a Cmd+F pressed while the lazy chunk
-  // was still loading isn't dropped. `searchOpen` true opens find; false closes
-  // it. The controller drives the close directly so re-toggling is a real close,
-  // not a second open.
+  // Mirror the find toggle to Monaco's find widget on the modified side once
+  // `mounted` (so a Cmd+F during the lazy load isn't dropped): `searchOpen`
+  // opens/closes it via the controller; a bumped `searchFocusNonce` refocuses it.
   useEffect(() => {
     if (!mounted) return;
     const editor = modifiedEditorRef.current;
@@ -237,7 +258,7 @@ export function MonacoDiffViewer({
       const controller = editor.getContribution<FindController>(FIND_CONTROLLER_ID);
       if (controller?.getState().isRevealed) controller.closeFindWidget();
     }
-  }, [mounted, searchOpen]);
+  }, [mounted, searchOpen, searchFocusNonce]);
 
   // Reflect a find close initiated inside Monaco (Escape or the widget's ✕) back
   // to the owning toggle, so its state matches the visible widget and the next
@@ -272,12 +293,13 @@ export function MonacoDiffViewer({
   const commentButton = useMonacoCommentLayer({
     editorRef: modifiedEditorRef,
     mounted,
-    comments,
-    activeSelection,
+    comments: commentable ? comments : NO_COMMENTS,
+    activeSelection: commentable ? activeSelection : null,
     onSetActiveSelection,
-    canComment: canEdit,
+    canComment: canEdit && commentable,
     pendingBodyRef,
     path,
+    attachToAgent: commentable && attachToAgent,
   });
 
   const options = useMemo<DiffEditorProps["options"]>(() => {

@@ -1,5 +1,12 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  type SessionWorkspaceState,
+  readSessionWorkspaceState,
+  resetSessionWorkspaceTabSelections,
+  saveSessionWorkspaceState,
+  unpinSessionWorkspaceTabs,
+  writeSessionWorkspaceState,
+} from "./sessionWorkspaceState";
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
 // Mirrors MAX_SESSIONS in the source; the pruning tests below seed exactly this
@@ -7,6 +14,7 @@ const STORAGE_KEY = "omnigent:session-workspace-state";
 const MAX_SESSIONS = 100;
 
 afterEach(() => {
+  vi.restoreAllMocks();
   localStorage.clear();
 });
 
@@ -33,6 +41,71 @@ describe("sessionWorkspaceState", () => {
   it("remembers a selected GitHub tab", () => {
     writeSessionWorkspaceState("conv_github", { rightRailTab: "github" });
     expect(readSessionWorkspaceState("conv_github").rightRailTab).toBe("github");
+  });
+
+  it("remembers opened built-in pages and an empty selection", () => {
+    writeSessionWorkspaceState("conv_panels", {
+      rightRailTab: null,
+      openPanels: ["changes", "github"],
+    });
+    expect(readSessionWorkspaceState("conv_panels")).toEqual({
+      rightRailTab: null,
+      openPanels: ["changes", "github"],
+    });
+
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "conv_panels",
+          state: { openPanels: ["changes", "browser", "sidechat", "changes", null, "bad"] },
+        },
+      ]),
+    );
+    expect(readSessionWorkspaceState("conv_panels").openPanels).toEqual(["changes"]);
+  });
+
+  it("preserves opened pages for a default change", () => {
+    writeSessionWorkspaceState("conv_panels", { rightRailTab: "changes", openPanels: ["changes"] });
+    resetSessionWorkspaceTabSelections();
+    expect(readSessionWorkspaceState("conv_panels")).toEqual({ openPanels: ["changes"] });
+  });
+
+  it("forgets only newly unpinned pages while preserving other tabs and selections", () => {
+    const fileState = {
+      open: true,
+      widthPx: 480,
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    };
+    writeSessionWorkspaceState("conv_files", {
+      ...fileState,
+      rightRailTab: "changes",
+      openPanels: ["changes", "github"],
+    });
+    const otherSessions = {
+      shell: {
+        rightRailTab: "github",
+        openPanels: ["github"],
+        selectedTerminalKey: "terminal:one",
+      },
+      browser: {
+        rightRailTab: "browser",
+        openBrowsers: ["browser:one"],
+        selectedBrowserId: "browser:one",
+      },
+      sidechat: { rightRailTab: "sidechat", openSideChats: ["child"], selectedSideChatId: "child" },
+    } satisfies Record<string, SessionWorkspaceState>;
+    for (const [id, state] of Object.entries(otherSessions)) writeSessionWorkspaceState(id, state);
+
+    unpinSessionWorkspaceTabs(["changes"]);
+
+    expect(readSessionWorkspaceState("conv_files")).toEqual({
+      ...fileState,
+      openPanels: ["github"],
+    });
+    for (const [id, state] of Object.entries(otherSessions))
+      expect(readSessionWorkspaceState(id)).toEqual(state);
   });
 
   it("keeps sessions isolated by id", () => {
@@ -88,6 +161,65 @@ describe("sessionWorkspaceState", () => {
     expect(stored).toEqual(Array.from({ length: 20 }, (_, i) => `browser:b${i + 5}`));
   });
 
+  it("caps the persisted sub-agent tabs at 20, keeping the most recent", () => {
+    const tabs = Array.from({ length: 25 }, (_, i) => `subagent:conv_${i}`);
+    writeSessionWorkspaceState("conv_parent", { openSubagentTabs: tabs });
+
+    expect(readSessionWorkspaceState("conv_parent").openSubagentTabs).toEqual(tabs.slice(5));
+  });
+
+  it("reports whether storage accepted a save", () => {
+    expect(saveSessionWorkspaceState("conv_a", { open: true })).toBe(true);
+
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    expect(saveSessionWorkspaceState("conv_a", { open: false })).toBe(false);
+    expect(() => writeSessionWorkspaceState("conv_a", { open: false })).not.toThrow();
+    expect(readSessionWorkspaceState("conv_a")).toEqual({ open: true });
+  });
+
+  it("discards saved pages when they prevent workspace settings from persisting", () => {
+    for (const id of ["conv_a", "conv_b"]) {
+      writeSessionWorkspaceState(id, {
+        open: true,
+        openBrowsers: ["tab"],
+        browserPages: { tab: { url: "https://docs.example/", owner: "user-a" } },
+      });
+    }
+    const setItem = Storage.prototype.setItem;
+    // Simulate a quota that fits the workspace settings, but not the page metadata.
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key, value) {
+      if (value.length > 200) throw new DOMException("Quota exceeded", "QuotaExceededError");
+      setItem.call(this, key, value);
+    });
+
+    expect(saveSessionWorkspaceState("conv_a", { widthPx: 480 })).toBe(true);
+    expect(readSessionWorkspaceState("conv_a")).toEqual({
+      open: true,
+      openBrowsers: ["tab"],
+      widthPx: 480,
+    });
+    expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true, openBrowsers: ["tab"] });
+  });
+
+  it.each(["QuotaExceededError", "SecurityError"])(
+    "preserves stored pages when saving still fails with %s",
+    (name) => {
+      const state = {
+        open: true,
+        browserPages: { tab: { url: "https://docs.example/", owner: "user-a" } },
+      };
+      writeSessionWorkspaceState("conv_a", state);
+      vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new DOMException("Storage unavailable", name);
+      });
+
+      expect(saveSessionWorkspaceState("conv_a", { open: false })).toBe(false);
+      expect(readSessionWorkspaceState("conv_a")).toEqual(state);
+    },
+  );
+
   it("prunes the least-recently-touched session past the cap (numeric ids)", () => {
     // Seed exactly MAX_SESSIONS sessions with purely numeric ids ("1".."100").
     // Numeric-string keys are the case a plain object store gets wrong: V8
@@ -129,5 +261,42 @@ describe("sessionWorkspaceState", () => {
       JSON.stringify([{ id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } }]),
     );
     expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true });
+
+    // Tab id lists keep each non-empty string once, in order.
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "conv_c",
+          state: { openSubagentTabs: ["subagent:a", "", 7, "subagent:a", "subagent:b"] },
+        },
+      ]),
+    );
+    expect(readSessionWorkspaceState("conv_c")).toEqual({
+      openSubagentTabs: ["subagent:a", "subagent:b"],
+    });
+
+    // Stored browser pages are validated again when read.
+    localStorage.setItem(
+      STORAGE_KEY,
+      `[{"id":"conv_d","state":{"browserPages":{
+        "tab-1":{"url":"https://docs.example/#/guide?section=2","title":7,"owner":"user-a"},
+        "tab-2":{"url":"javascript:alert(1)","owner":"user-a"},
+        "tab-3":"https://bare.example/",
+        "tab-4":{"url":"https://unowned.example/"},
+        "tab-5":{"url":"https://app.example/?PHPSESSID=synthetic","owner":"user-a"},
+        "tab-6":{"url":"https://app.example/report;jsessionid=synthetic","owner":"user-a"},
+        "tab-7":{"url":"https://app.example/#/callback;code=synthetic","owner":"user-a"},
+        "tab-8":{"url":"https://app.example/?sid=synthetic","owner":"user-a"},
+        "tab-9":{"url":"https://app.example/report;sid=synthetic","owner":"user-a"},
+        "__proto__":{"url":"https://proto.example/","owner":"user-a"}
+      }}}]`,
+    );
+    const pages = readSessionWorkspaceState("conv_d").browserPages;
+    expect(Object.entries(pages ?? {})).toEqual([
+      ["tab-1", { url: "https://docs.example/#/guide?section=2", owner: "user-a" }],
+      ["__proto__", { url: "https://proto.example/", owner: "user-a" }],
+    ]);
+    expect(pages?.url).toBeUndefined();
   });
 });

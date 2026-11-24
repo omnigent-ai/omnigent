@@ -59,12 +59,15 @@ _CURSOR_AUTO_APPROVE_TOOLS = [
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_project_list",
+    "sys_project_update",
     "sys_session_close",
     "sys_session_create",
     "sys_session_get_history",
     "sys_session_get_info",
     "sys_session_list",
     "sys_session_send",
+    "sys_session_update",
     "sys_terminal_close",
     "sys_terminal_launch",
     "sys_terminal_list",
@@ -946,8 +949,12 @@ def _live_cursor_model_options() -> list[CursorModelOption]:
 
 
 def _picker_highlighted_row(pane: str) -> str | None:
-    """Return the text of Cursor's currently highlighted picker row."""
-    for line in pane.splitlines():
+    """Return Cursor's highlighted picker row, skipping the ``→ /model <id>`` composer line."""
+    lines = pane.splitlines()
+    header_indexes = [index for index, line in enumerate(lines) if _PICKER_MATCH_MARKER in line]
+    if not header_indexes:
+        return None
+    for line in lines[header_indexes[-1] + 1 :]:
         stripped = line.strip()
         if stripped.startswith("→"):
             return stripped.removeprefix("→").strip()

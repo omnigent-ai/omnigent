@@ -7,7 +7,7 @@ The stepper (``UiFontSizeControl`` in ``pages/SettingsPage.tsx``) writes the
 choice to ``localStorage["omnigent:ui-font-size"]`` and sets
 ``--desktop-ui-font-size`` on ``<html>`` (``lib/uiFontPreferences.ts``). In
 ``index.css`` the typography mapping that reads that variable is gated
-``@media (width >= 48rem)``; without a fix the ``@media (width < 48rem)``
+``@media (width >= 73.8125rem)``; without a fix the ``@media (width < 73.8125rem)``
 branch hard-codes ``--mobile-ui-font-size: 14px`` and never references the
 preference, so on mobile the write is a dead store: the value round-trips
 through Settings but the rendered text stays at 14px.
@@ -28,30 +28,18 @@ from playwright.sync_api import Page, ViewportSize, expect
 STORAGE_KEY = "omnigent:ui-font-size"
 GROUP_NAME = "Interface font size"
 
-# Phone-sized viewport: comfortably below the 48rem (768px) breakpoint where
+# Phone-sized viewport: comfortably below the 73.8125rem (1181px) breakpoint where
 # index.css switches to the mobile typography branch.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 
 
 def _open_appearance(page: Page, base_url: str) -> None:
-    """Navigate to Settings > Appearance the way a phone user does.
-
-    On mobile the settings nav is a full-screen sidebar overlay that is pinned
-    open on entering ``/settings`` and sits over the section content, so the
-    journey must tap the Appearance nav row (which closes the overlay) before
-    the stepper is reachable — a direct ``goto`` alone leaves the overlay
-    intercepting every click.
-    """
+    """Open Appearance directly without a menu overlay covering its controls."""
     page.goto(f"{base_url}/settings/appearance")
-    _dismiss_settings_nav_overlay(page)
     expect(page.get_by_role("group", name=GROUP_NAME, exact=True)).to_be_visible(timeout=30_000)
-
-
-def _dismiss_settings_nav_overlay(page: Page) -> None:
-    """Tap the Appearance nav row so the mobile settings overlay closes."""
-    nav_item = page.get_by_test_id("settings-nav-appearance")
-    expect(nav_item).to_be_visible(timeout=30_000)
-    nav_item.click()
+    expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
+        "aria-hidden", "true"
+    )
 
 
 def _rendered_ui_text_px(page: Page) -> float:
@@ -87,9 +75,9 @@ def test_mobile_ui_font_size_applies_not_just_saves(page: Page, live_server: str
     value = page.get_by_test_id("ui-font-size-input")
     increase = page.get_by_test_id("ui-font-size-inc")
 
-    # Fresh context: mobile defaults to 14px. Capture that rendered baseline
+    # Fresh context: mobile defaults to 15px. Capture that rendered baseline
     # before touching anything.
-    expect(value).to_have_value("14")
+    expect(value).to_have_value("15")
     baseline_px = _rendered_ui_text_px(page)
 
     # Step to the 18px maximum — a "significant" increase per the report.
@@ -112,11 +100,12 @@ def test_mobile_ui_font_size_applies_not_just_saves(page: Page, live_server: str
     )
 
     # Leave Settings and return (the reporter's step 4-6): the value is still
-    # saved AND still applied after a reload at the phone viewport. The reload
-    # re-pins the settings nav overlay, so dismiss it again first.
+    # saved AND still applied after a reload at the phone viewport.
     page.reload()
-    _dismiss_settings_nav_overlay(page)
     expect(page.get_by_role("group", name=GROUP_NAME, exact=True)).to_be_visible(timeout=30_000)
+    expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
+        "aria-hidden", "true"
+    )
     expect(page.get_by_test_id("ui-font-size-input")).to_have_value("18")
     assert _stored_size(page) == "18"
     reload_px = _rendered_ui_text_px(page)

@@ -206,7 +206,7 @@ def test_external_status_change_clears_open_tab_without_reload(
     # (updated_at not bumped, or the timestamp dropped from the frame).
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer).to_contain_text("No open comments.", timeout=_PUSH_TIMEOUT_MS)
-    # The card moved tabs rather than vanishing: the Addressed tab now
-    # counts 1. (Tab label renders as "Addressed" + a count badge.)
-    addressed_tab = file_viewer.get_by_role("button", name=re.compile("Addressed"))
+    # The card moved tabs rather than vanishing: the Sent tab now
+    # counts 1. (Tab label renders as "Sent" + a count badge.)
+    addressed_tab = file_viewer.get_by_role("button", name=re.compile("Sent"))
     expect(addressed_tab).to_contain_text("1")

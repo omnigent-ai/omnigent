@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
 use crate::browser;
+use crate::install::PYTHON_VERSION;
 use crate::omnigent_cmd;
 use crate::pod::Pod;
 use crate::process::ProcSpec;
@@ -333,9 +334,10 @@ impl Supervisor {
             .pod
             .repo_root
             .join("dev/omnidev/fixtures/seed_sidebar_metadata.py");
-        // Pure stdlib sqlite3 — no omnigent package or uv project env needed.
-        let mut command = Command::new("python3");
+        // Use the managed interpreter; this stdlib-only script needs no project environment.
+        let mut command = Command::new("uv");
         command
+            .args(["run", "--no-project", "--python", PYTHON_VERSION, "python"])
             .arg(&script)
             .arg(self.pod.chat_db())
             .args(session_ids)

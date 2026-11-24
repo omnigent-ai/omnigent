@@ -14,8 +14,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from omnigent.inner._proc import kill_tree
-
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.sandbox import SandboxPolicy
@@ -130,6 +128,7 @@ class CopyOnWriteEnvironment:
                     "--",
                     sys.executable,
                     "-u",
+                    "-P",
                     "-m",
                     "omnigent.sandbox.copy_on_write",
                     "--keeper",
@@ -179,6 +178,8 @@ class CopyOnWriteEnvironment:
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            from omnigent.inner._proc import kill_tree
+
             kill_tree(process)
             process.wait()
         if process.stdout is not None:
@@ -200,6 +201,7 @@ def wrap_shared_namespace(argv: list[str], policy: SandboxPolicy) -> list[str]:
         raise RuntimeError("copy_on_write requires an owned, prepared OS environment")
     return [
         sys.executable,
+        "-P",
         "-m",
         "omnigent.sandbox.copy_on_write",
         json.dumps(namespace),

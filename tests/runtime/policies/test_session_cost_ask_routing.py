@@ -80,7 +80,7 @@ def test_session_cost_ask_approval_routes_to_root_for_subagent(
     )
     engine = _engine_on(conversation_store, child.id, parent.id)
 
-    engine.apply_state_updates([_set_approved(0.05)])
+    engine.apply_state_updates([_set_approved(0.05)], approved=True)
 
     # Lands on the ROOT so the parent + sibling sub-agents inherit it. If this
     # is None, the approval was written to the sub-agent's own state and the
@@ -102,7 +102,7 @@ def test_session_cost_ask_approval_writes_own_state_for_top_level(
     root = conversation_store.create_conversation()
     engine = _engine_on(conversation_store, root.id, root.id)
 
-    engine.apply_state_updates([_set_approved(0.05)])
+    engine.apply_state_updates([_set_approved(0.05)], approved=True)
 
     after = conversation_store.get_conversation(root.id)
     assert after.session_state.get(SESSION_COST_ASK_APPROVED_STATE_KEY) == 0.05
@@ -183,7 +183,7 @@ async def test_subagent_approval_visible_to_same_engine_no_reask(
     # First call asks (over threshold, unapproved).
     assert await _evaluate_bash(engine) == PolicyAction.ASK
     # The approval the user grants in response to that ASK.
-    engine.apply_state_updates([_set_approved(0.05)])
+    engine.apply_state_updates([_set_approved(0.05)], approved=True)
     # The same engine's next call must NOT re-ASK — the in-memory state now
     # carries the approval even though it was persisted to the root.
     assert await _evaluate_bash(engine) == PolicyAction.ALLOW

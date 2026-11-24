@@ -19,22 +19,15 @@ RUNNER_TUNNEL_MAX_MESSAGE_BYTES = 100 * 1024 * 1024
 # liveness loop the server runs (``_ping_loop``: ``PING_INTERVAL_S=30`` x
 # ``PING_MISS_THRESHOLD=3`` = 90 s before a peer is declared dead).
 #
-# It MUST NOT be tighter than that 90 s app-level budget. Left unset, the library
-# default is 20 s/20 s — 4.5x stricter — so a *healthy* tunnel is dropped with
-# ``1011 keepalive ping timeout`` the instant its event loop is stalled for ~20 s
-# (a synchronous/CPU-bound dispatch), pre-empting the deliberate 90 s policy and
-# triggering reconnect churn + relay-subscribe timeouts. See issue #1116.
-#
-# A PING every 30 s keeps the connection warm and is the runner's ONLY detector
-# of a silently-dead server (the app-level ``_ping_loop`` only runs server->client),
-# while the 90 s PONG timeout tolerates loop stalls up to the same window the
-# app-level loop already allows. A peer that dies right after a successful PONG is
-# detected at worst ~120 s later (30 s interval before the next PING + 90 s waiting
-# for its PONG) — the deliberate tradeoff for not false-dropping a busy-but-healthy
-# tunnel. ``test_tunnel_limits.py`` asserts the >= invariant so a future tightening
-# below the app-level budget fails CI.
+# Protocol PING/PONG budget: must not be tighter than the server's app-level
+# liveness window (PING_INTERVAL_S * PING_MISS_THRESHOLD = 90 s), or healthy-but-busy
+# tunnels get dropped mid-stall. test_tunnel_limits.py enforces the >= invariant.
 TUNNEL_KEEPALIVE_PING_INTERVAL_S = 30.0
 TUNNEL_KEEPALIVE_PING_TIMEOUT_S = 90.0
+
+# Two missed application heartbeats recover idle/subscription-only tunnels
+# within an old server's 90-second grace. Request-owned work keeps its tolerance.
+RUNNER_TUNNEL_SILENCE_TIMEOUT_S = 2 * TUNNEL_KEEPALIVE_PING_INTERVAL_S
 
 
 class UvicornTunnelKwargs(TypedDict):

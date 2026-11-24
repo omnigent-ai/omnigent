@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { validateHeaderName, validateHeaderValue } from "node:http";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
@@ -6,6 +7,7 @@ import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
 import { shikiManualChunk } from "./vite.shiki";
 import { streamdownManualChunk } from "./vite.streamdown";
+import { devServerWorkerExports, workerBuildOptions } from "./vite.workerExports";
 
 // Databricks workspace-hosted omnigent is mounted behind the api-proxy at this
 // path; a local / self-hosted server mounts at the root. Mirrors the Python
@@ -99,26 +101,45 @@ function configureProxy(target: string, useAuth: boolean): NonNullable<ProxyOpti
 function createProxyConfig(target: string, useAuth: boolean): Record<string, ProxyOptions> {
   const origin = new URL(target).origin;
   const configure = configureProxy(target, useAuth);
+  const byOrigin = JSON.parse(process.env.OMNIGENT_PROXY_HEADERS || "{}");
+  if (!byOrigin || typeof byOrigin !== "object" || Array.isArray(byOrigin)) {
+    throw new Error("OMNIGENT_PROXY_HEADERS must be a JSON object keyed by server origin");
+  }
+  const headers = byOrigin[origin] === undefined ? {} : byOrigin[origin];
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    throw new Error("OMNIGENT_PROXY_HEADERS entries must be header objects");
+  }
+  for (const [name, value] of Object.entries(headers)) {
+    validateHeaderName(name);
+    if (typeof value !== "string") {
+      throw new Error("OMNIGENT_PROXY_HEADERS header values must be strings");
+    }
+    validateHeaderValue(name, value);
+  }
 
   return {
     "/v1": {
       target: origin,
+      headers,
       changeOrigin: true,
       ws: true,
       configure,
     },
     "/api": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
     "/auth": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
     "/health": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
@@ -129,6 +150,7 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
     // "pre-manifest", making the capability invisible in local development.
     "/.well-known": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
@@ -149,24 +171,31 @@ const useAuth = !!process.env.OMNIGENT_AUTH_TOKEN || isWorkspaceHost(parsed.host
 const isDatabricksWorkspaceEnv = parsed.pathname.replace(/\/$/, "") === WORKSPACE_API_PATH;
 if (isDatabricksWorkspaceEnv) process.env.VITE_DATABRICKS_WORKSPACE = "true";
 
-if (useAuth) {
-  const token = resolveToken(parsed.origin);
-  if (token) {
-    console.log(
-      `[dev-proxy] target=${OMNIGENT_URL} (authenticated${isDatabricksWorkspaceEnv ? ", databricks-workspace" : ""})`,
-    );
-  } else {
-    console.error(
-      `\n[dev-proxy] ERROR: No auth token for ${parsed.origin}.\n` +
-        `  Set OMNIGENT_AUTH_TOKEN or run:  databricks auth login --host ${parsed.origin}\n`,
-    );
-    process.exit(1);
-  }
-} else {
-  console.log(`[dev-proxy] target=${OMNIGENT_URL}`);
+// Only serving uses the proxy, so a build never reads credentials or stops for a missing token.
+function devProxyAuth(): Plugin {
+  return {
+    name: "dev-proxy-auth",
+    apply: "serve",
+    config() {
+      if (!useAuth) {
+        console.log(`[dev-proxy] target=${OMNIGENT_URL}`);
+        return;
+      }
+      const token = resolveToken(parsed.origin);
+      if (token) {
+        console.log(
+          `[dev-proxy] target=${OMNIGENT_URL} (authenticated${isDatabricksWorkspaceEnv ? ", databricks-workspace" : ""})`,
+        );
+        return;
+      }
+      console.error(
+        `\n[dev-proxy] ERROR: No auth token for ${parsed.origin}.\n` +
+          `  Set OMNIGENT_AUTH_TOKEN or run:  databricks auth login --host ${parsed.origin}\n`,
+      );
+      process.exit(1);
+    },
+  };
 }
-
-const proxyConfig = createProxyConfig(OMNIGENT_URL, useAuth);
 
 // Safari < 16.4 cannot parse regex lookbehind; these dependency regexes would
 // otherwise throw there, at module scope during boot or on the first rendered
@@ -217,7 +246,7 @@ function safariLookbehindWorkarounds(): Plugin {
   };
 }
 
-export default defineConfig(({ command }) => ({
+export default defineConfig(({ command, mode }) => ({
   // Relative asset base for production builds so the SPA can be served under
   // any path prefix (e.g. code-server's `/proxy/6767/`), decided purely at
   // server runtime via OMNIGENT_WEB_BASE_PATH — no separate build needed per
@@ -227,7 +256,16 @@ export default defineConfig(({ command }) => ({
   // `{base}/assets/...` at serve time (see `_rewrite_web_ui_index` in
   // omnigent/server/app.py). Dev (`vite serve`) stays at root.
   base: command === "build" ? "./" : "/",
-  plugins: [safariLookbehindWorkarounds(), react(), tailwindcss()],
+  plugins: [
+    devProxyAuth(),
+    safariLookbehindWorkarounds(),
+    react(),
+    tailwindcss(),
+    ...devServerWorkerExports(command, mode).plugins,
+  ],
+  // Workers have no DOM, so they take a package's worker entry over its browser one.
+  worker: workerBuildOptions,
+  optimizeDeps: devServerWorkerExports(command, mode).optimizeDeps,
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -273,7 +311,7 @@ export default defineConfig(({ command }) => ({
     },
   },
   server: {
-    proxy: proxyConfig,
+    proxy: createProxyConfig(OMNIGENT_URL, useAuth),
   },
   build: {
     // default baseline is Safari 16.4+; iPadOS 15 can't parse dep regex lookbehinds (#1978)
