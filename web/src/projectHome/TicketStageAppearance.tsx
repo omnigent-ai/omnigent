@@ -113,9 +113,11 @@ export function TicketStageIcon({
 export function TicketStageBadge({
   stage,
   showInstructionsOnHover = false,
+  className,
 }: {
   stage: TicketStage;
   showInstructionsOnHover?: boolean;
+  className?: string;
 }) {
   const { color } = appearance(stage);
   const descriptionId = useId();
@@ -127,6 +129,7 @@ export function TicketStageBadge({
         color.text,
         color.tint,
         hasInstructions && "cursor-help",
+        className,
       )}
       title={hasInstructions ? undefined : stage.name}
       tabIndex={hasInstructions ? 0 : undefined}

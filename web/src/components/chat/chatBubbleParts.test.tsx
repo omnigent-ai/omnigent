@@ -1418,7 +1418,7 @@ describe("automatic ticket updates", () => {
     `- ${ticketId} "Board overflow": agent note — latest: Rebased onto the tip.`,
   ].join("\n");
 
-  it("shows a ticket card and keeps the raw text one click away", () => {
+  it("shows a ticket card without a raw-text toggle", () => {
     render(
       <BubbleView
         bubble={{ kind: "user", itemId: "ticket_update", content: [{ type: "input_text", text }] }}
@@ -1428,7 +1428,6 @@ describe("automatic ticket updates", () => {
     expect(card).toHaveTextContent("Board overflow");
     expect(card).toHaveTextContent("Rebased onto the tip.");
     expect(screen.queryByTestId("message-bubble")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Show raw" }));
-    expect(screen.getByTestId("ticket-update-raw")).toHaveTextContent(`- ${ticketId}`);
+    expect(screen.queryByRole("button", { name: "Show raw" })).toBeNull();
   });
 });

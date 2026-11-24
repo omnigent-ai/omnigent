@@ -1144,16 +1144,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
     if (parsed) return <SystemMessageView message={parsed} />;
     // The server's automatic ticket notifications read as ticket cards.
     if (!isShellCommand && !bubble.pending) {
-      const rawText = stripAutomationContext(joinTextBlocks(bubble.content));
-      const ticketUpdate = parseTicketUpdateMessage(rawText);
+      const ticketUpdate = parseTicketUpdateMessage(
+        stripAutomationContext(joinTextBlocks(bubble.content)),
+      );
       if (ticketUpdate)
         return (
           <div data-message-id={bubble.itemId} className="flex w-full">
-            <TicketUpdateCards
-              message={ticketUpdate}
-              rawText={rawText}
-              createdAtS={bubble.createdAtS}
-            />
+            <TicketUpdateCards message={ticketUpdate} />
           </div>
         );
     }
