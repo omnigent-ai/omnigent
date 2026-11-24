@@ -2,7 +2,7 @@
 // fork, automation, stop, archive, delete, leave), shared by the sidebar row and
 // the project board's cards so both menus confirm and act the same way.
 
-import { useState, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { GitBranchIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { PermissionsModal } from "@/components/PermissionsModal";
@@ -80,6 +80,11 @@ export function useSessionActions({
   const archive = useArchiveConversation();
   const archivePrompt = useArchivePrompt();
   const leave = useLeaveSession();
+  // A Leave that settles late runs the callback the row last rendered with, not the click's.
+  const latestOnLeave = useRef(onLeave);
+  useLayoutEffect(() => {
+    latestOnLeave.current = onLeave;
+  });
   // The user-facing "Stop session" action. Archiving does NOT go through here —
   // the server stops the session itself once the archived flag commits, so a
   // hidden session never keeps a runner alive.
@@ -177,7 +182,7 @@ export function useSessionActions({
       // The session 404s for this user now, so don't leave them staring at it, unless they've
       // already opened another one.
       () => {
-        if (!leftFromItsView || isOpenSession(conversation.id)) onLeave?.();
+        if (!leftFromItsView || isOpenSession(conversation.id)) latestOnLeave.current?.();
       },
       (err: unknown) => {
         const detail = err instanceof Error && err.message ? `: ${err.message}` : "";

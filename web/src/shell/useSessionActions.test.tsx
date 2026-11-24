@@ -51,11 +51,15 @@ function Row({ onLeave }: { onLeave?: () => void }) {
 
 let goTo: (path: string) => void = () => {};
 let dropRow: () => void = () => {};
+let withdrawCallback: () => void = () => {};
 /** The row, until the test drops it from the list as a successful Leave does. */
 function ListedRow({ onLeave }: { onLeave: () => void }) {
   const [listed, setListed] = useState(true);
+  const [callback, setCallback] = useState<(() => void) | undefined>(() => onLeave);
   dropRow = () => setListed(false);
-  return listed ? <Row onLeave={onLeave} /> : null;
+  // As a board withdraws its card's callback once another card's quick view opens.
+  withdrawCallback = () => setCallback(undefined);
+  return listed ? <Row onLeave={callback} /> : null;
 }
 
 /** Publishes the routed session as the app shell does, and lets a test navigate. */
@@ -120,5 +124,15 @@ describe("useSessionActions Leave", () => {
     fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
     await act(async () => finishLeave());
     expect(closeQuickView).toHaveBeenCalledOnce();
+  });
+
+  it("runs the callback the row last had, so one withdrawn before the Leave succeeds doesn't run", async () => {
+    const closeQuickView = vi.fn();
+    renderAt("/", closeQuickView);
+    fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
+    act(() => withdrawCallback());
+    act(() => dropRow());
+    await act(async () => finishLeave());
+    expect(closeQuickView).not.toHaveBeenCalled();
   });
 });
