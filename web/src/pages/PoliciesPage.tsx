@@ -486,11 +486,12 @@ export function PoliciesPage() {
     data: policies = [],
     refetch,
     error,
+    isFetching,
   } = useDefaultPolicies(isSingleUser || meIsAdmin === true);
   // The backend may restrict listing global policies (HTTP 403). Treat that
   // like the non-admin case and hide the section rather than surfacing a raw
   // fetch error.
-  const policiesForbidden = error instanceof PoliciesForbiddenError;
+  const policiesForbidden = error instanceof PoliciesForbiddenError && !isFetching;
   const { data: registry = [] } = usePolicyRegistry();
   const updatePolicy = useUpdateDefaultPolicy();
   const deletePolicy = useDeleteDefaultPolicy();
