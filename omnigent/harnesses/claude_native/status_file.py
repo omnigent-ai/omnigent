@@ -389,12 +389,9 @@ def _is_recorded_process(pid: int, proc_start: object) -> bool:
     return len(fields) <= 19 or fields[19] == proc_start
 
 
-# Attempts to resolve the file, counted once the first hook has reported the
-# session id, before giving up and leaving the PTY watcher authoritative for
-# the session's lifetime. At the claude-native poll cadence (~0.2s) this is a
-# few seconds — long enough for a running Claude to write its file, short
-# enough that an old Claude (pre-v2.1.139, no file) or a broken config dir
-# falls back promptly without scanning forever.
+# Resolve attempts (counted once the session id is known) before retiring to the
+# PTY watcher: ~8s at the ~0.2s poll cadence, enough for Claude to write its file
+# while an old Claude (pre-v2.1.139) or a broken config dir falls back promptly.
 _MAX_RESOLVE_ATTEMPTS = 40
 
 
