@@ -7,9 +7,13 @@ Several instances can run side by side.
 
 ## 1. Start the server
 
+Always pass your own worktree's path to `up`, or run it from inside your own
+worktree. An instance belongs to the worktree it was started from, and that
+worktree's `down --all` stops it.
+
 ```bash
 dev/branch-server.sh up                # this worktree
-dev/branch-server.sh up ../other-tree  # another worktree
+dev/branch-server.sh up ~/path/to/your-worktree  # by path
 dev/branch-server.sh up --with-host    # also start a host, to run agent sessions
 ```
 

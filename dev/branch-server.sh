@@ -183,11 +183,16 @@ cmd_down() {
   [[ -n $target ]] || die "usage: down RUN_DIR|--all [--keep]"
   if [[ $target == --all ]]; then
     # Only this worktree's instances: other workers' servers share $RUN_ROOT.
-    local d wt
+    local d wt matches=()
     wt=$(git rev-parse --show-toplevel 2>/dev/null) || wt=$(cd "$SCRIPT_DIR/.." && pwd)
     for d in "$RUN_ROOT/$RUN_PREFIX"*/; do
-      [[ -f $d/state ]] && grep -qxF "WORKTREE=$wt" "$d/state" && down_one "$d" "$keep"
+      [[ -f $d/state ]] && grep -qxF "WORKTREE=$wt" "$d/state" && matches+=("$d")
     done
+    echo "down --all: stopping ${#matches[@]} instance(s) started from $wt" >&2
+    for d in "${matches[@]}"; do
+      echo "  $(grep -m1 '^URL=' "$d/state" | cut -d= -f2-)  ${d%/}" >&2
+    done
+    for d in "${matches[@]}"; do down_one "$d" "$keep"; done
     return 0
   fi
   down_one "$target" "$keep"
