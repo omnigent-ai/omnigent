@@ -39,7 +39,8 @@ export function WorkspaceTabsHost({
   // after the toggle's. Leaving inert stays immediate, so what an expand focuses can take focus.
   const inertNow = panelProps.inert ?? false;
   const inertLater = useValueAfterDeferredRender(inertNow);
-  const deleteTerminal = useDeleteTerminal(conversationId);
+  // The sidebar names the shells a close couldn't end in one message of its own.
+  const deleteTerminal = useDeleteTerminal(conversationId, { reportsFailure: false });
   const { mutateAsync: deleteTerminalAsync } = deleteTerminal;
   const shellClose = useTabsShellClose({ terminals, deleteTerminal: deleteTerminalAsync });
 
