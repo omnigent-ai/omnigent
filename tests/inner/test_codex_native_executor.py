@@ -4000,8 +4000,9 @@ def test_run_turn_holds_the_message_while_codex_is_still_starting(
     notice, *waits, outcome = events
     assert isinstance(notice, TextChunk)
     assert "your message will be sent once it's ready" in notice.text.lower()
-    # A keep-alive per check, and one as the hold ends, refresh only the idle watchdog.
-    assert [type(event) for event in waits] == [ExecutorWait, ExecutorWait, ExecutorWait]
+    # A keep-alive per check, and one more before a submission, refresh only the idle watchdog.
+    submitted = expected_error_code is None
+    assert [type(event) for event in waits] == [ExecutorWait] * (3 if submitted else 2)
     assert hold_polls == [0.25, 0.25]
     if expected_error_code is None:
         assert isinstance(outcome, TurnComplete)
@@ -4511,6 +4512,51 @@ def test_bridge_state_polling_backs_off_after_fast_window(
     assert all(delay == 0.05 for delay in sleep_delays[:-1])
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+def test_run_turn_waits_for_the_state_when_the_record_clears_first(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A held message keeps waiting when its record clears before the bridge state appears.
+
+    A sign-in can be recorded and finished between two polls of the hold; the
+    runner clears that record before Plan setup and publishes the bridge state
+    after it. The message then waits for the state as it would at launch, and
+    is sent once, with no error in between.
+    """
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    polls: list[float] = []
+
+    async def _clear_then_publish(seconds: float) -> None:
+        polls.append(seconds)
+        if len(polls) == 1:
+            clear_bridge_startup_error(tmp_path)
+        elif len(polls) == 3:
+            _start_state(tmp_path)
+
+    monkeypatch.setattr(asyncio, "sleep", _clear_then_publish)
+    write_bridge_startup_error(
+        tmp_path, "Codex is still starting.", code=CODEX_STARTUP_PENDING_CODE
+    )
+    write_bridge_startup_timeout(tmp_path, 120.0)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert [type(event) for event in events] == [
+        TextChunk,
+        ExecutorWait,
+        ExecutorWait,
+        TurnComplete,
+    ]
+    # One hold poll, then the bounded wait's fast polls until the state appears.
+    assert polls == [0.25, 0.05, 0.05]
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
 
 
 def test_stop_as_codex_finishes_starting_submits_nothing(

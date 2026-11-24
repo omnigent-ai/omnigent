@@ -259,8 +259,7 @@ async def _wait_out_codex_startup(
     :param session_id: Omnigent session the message belongs to, for logging.
     :param announce: Whether to tell the chat why the message waits, once per turn.
     :returns: Async iterator yielding the wait notice when *announce* is set,
-        then :class:`ExecutorWait` after each check and once more as the hold ends,
-        so the consumer can stop the turn before anything is submitted.
+        then :class:`ExecutorWait` after each check.
     """
     held_at = asyncio.get_running_loop().time()
     _logger.info(
@@ -272,8 +271,6 @@ async def _wait_out_codex_startup(
     while read_bridge_state(bridge_dir) is None and _codex_startup_pending(bridge_dir):
         yield ExecutorWait()
         await asyncio.sleep(_BRIDGE_STATE_SLOW_POLL_SECONDS)
-    # A Stop during the last poll is seen here, before the message is submitted.
-    yield ExecutorWait()
     _logger.info(
         "Codex startup hold ended",
         extra=with_input_attributes(
@@ -1234,7 +1231,9 @@ class CodexNativeExecutor(Executor):
             by this bridge.
         :returns: Async iterator yielding one terminal event. While the runner
             records Codex as still starting, it first yields a wait notice and
-            keep-alives (see :func:`_wait_out_codex_startup`).
+            keep-alives (see :func:`_wait_out_codex_startup`); after any wait for
+            Codex, one more :class:`ExecutorWait` precedes the submission so the
+            adapter can honor a Stop that arrived meanwhile.
         """
         del tools, system_prompt
         settings_overrides = _model_effort_overrides(config)
@@ -1299,8 +1298,10 @@ class CodexNativeExecutor(Executor):
         preserve_session = False
         native_acceptance: NativeTurnAcceptance | None = None
         startup_wait_announced = False
+        waited_for_codex = False
         while True:
             if state is None:
+                waited_for_codex = True
                 (
                     state,
                     waited_seconds,
@@ -1321,6 +1322,15 @@ class CodexNativeExecutor(Executor):
                     yield wait_event
                 startup_wait_announced = True
                 state = read_bridge_state(self._bridge_dir)
+                if state is None and read_bridge_startup_error(self._bridge_dir) is None:
+                    # The record cleared ahead of the bridge state (a sign-in finished
+                    # just then): wait for the state with a fresh budget, as at launch.
+                    waited_seconds = 0.0
+                    max_wait_seconds = _bridge_state_wait_seconds(self._bridge_dir)
+                    continue
+            if waited_for_codex and state is not None:
+                # Stop is seen only between events: let the adapter look before submitting.
+                yield ExecutorWait()
 
             # No client-side wait for Codex MCP startup: the app-server accepts
             # ``turn/start`` mid-startup and defers execution until the round
