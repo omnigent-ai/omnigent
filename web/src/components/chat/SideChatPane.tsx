@@ -374,6 +374,7 @@ export function SideChatPane({
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -504,12 +505,14 @@ export function SideChatPane({
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
+      failedUploads,
     );
   }, [
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,

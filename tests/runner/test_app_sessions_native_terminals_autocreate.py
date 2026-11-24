@@ -6037,8 +6037,15 @@ class _RecordingCodexRegistry:
 
     terminal_registry = None
 
-    def __init__(self, captured: dict[str, Any]) -> None:
+    def __init__(self, captured: dict[str, Any], launch_error: Exception | None = None) -> None:
         self.captured = captured
+        self.captured["calls"] = []
+        self.launch_error = launch_error
+
+    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+        """Record the close and report the terminal closed."""
+        self.captured["calls"].append(("close", session_id, terminal_id))
+        return True
 
     async def launch_auxiliary_terminal(
         self,
@@ -6052,10 +6059,44 @@ class _RecordingCodexRegistry:
     ) -> SessionResourceView:
         """Record the spec and return a terminal resource view."""
         del terminal_name, session_key, resource_role, parent_os_env
+        self.captured["calls"].append(("launch", session_id))
         self.captured["spec"] = spec
+        if self.launch_error is not None:
+            raise self.launch_error
         return SessionResourceView(
             id="terminal_codex_main", type="terminal", session_id=session_id, name="codex:main"
         )
+
+
+def _recorded_codex_launch_inputs(
+    tmp_path: Path,
+    *,
+    workspace: Path,
+    codex_cli_version: tuple[int, int, int] | None,
+    terminal_launch_args: list[str] | None = None,
+) -> tuple[Any, Any]:
+    from omnigent.runner.native.orchestration import _CodexNativeLaunchConfig
+
+    app_server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=[],
+        codex_cli_version=codex_cli_version,
+        codex_path="/opt/codex/bin/codex",
+        codex_home=tmp_path / "codex-home",
+        env={},
+    )
+    launch_config = _CodexNativeLaunchConfig(
+        workspace=workspace,
+        policy_server_url="http://127.0.0.1:8000",
+        terminal_launch_args=terminal_launch_args,
+        model_override=None,
+        external_session_id=None,
+        fork_source_id=None,
+        fork_source_external_id=None,
+        fork_carry_history=False,
+        bypass_sandbox=False,
+    )
+    return app_server, launch_config
 
 
 async def _launch_recorded_codex_tui(
@@ -6066,41 +6107,120 @@ async def _launch_recorded_codex_tui(
     codex_cli_version: tuple[int, int, int] | None,
     terminal_launch_args: list[str] | None = None,
 ) -> Any:
-    from omnigent.runner.native.orchestration import (
-        _CodexNativeLaunchConfig,
-        _launch_codex_native_tui,
-    )
+    from omnigent.runner.native.orchestration import _launch_codex_native_tui
 
     captured: dict[str, Any] = {}
-    app_server = SimpleNamespace(
-        listen_url="ws://127.0.0.1:9876",
-        config_overrides=[],
+    app_server, launch_config = _recorded_codex_launch_inputs(
+        tmp_path,
+        workspace=workspace,
         codex_cli_version=codex_cli_version,
-        codex_path="/opt/codex/bin/codex",
-        codex_home=tmp_path / "codex-home",
-        env={},
+        terminal_launch_args=terminal_launch_args,
     )
     await _launch_codex_native_tui(
         "conv_codex_launch",
         _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
         lambda _sid, _evt: None,
-        app_server=app_server,  # type: ignore[arg-type]
-        launch_config=_CodexNativeLaunchConfig(
-            workspace=workspace,
-            policy_server_url="http://127.0.0.1:8000",
-            terminal_launch_args=terminal_launch_args,
-            model_override=None,
-            external_session_id=None,
-            fork_source_id=None,
-            fork_source_external_id=None,
-            fork_carry_history=False,
-            bypass_sandbox=False,
-        ),
+        app_server=app_server,
+        launch_config=launch_config,
         bridge_dir=tmp_path / "bridge",
         thread_id=thread_id,
         agent_spec=None,
     )
     return captured["spec"]
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_relaunch_on_thread_replaces_the_pane_on_its_app_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving a session's TUI to another thread retracts its pane, then resumes that thread."""
+    from omnigent.runner.native.orchestration import _relaunch_codex_native_tui_on_thread
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (tmp_path / "config-home").mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    app_server, launch_config = _recorded_codex_launch_inputs(
+        tmp_path, workspace=workspace, codex_cli_version=None
+    )
+    captured: dict[str, Any] = {}
+    published: list[tuple[str, str]] = []
+
+    await _relaunch_codex_native_tui_on_thread(
+        "conv_new",
+        "thread_fresh",
+        resource_registry=_RecordingCodexRegistry(captured),  # type: ignore[arg-type]
+        publish_event=lambda session_id, event: published.append((session_id, event["type"])),
+        app_server=app_server,
+        launch_config=launch_config,
+        bridge_dir=tmp_path / "bridge",
+        agent_spec=None,
+    )
+
+    assert captured["calls"] == [
+        ("close", "conv_new", "terminal_codex_main"),
+        ("launch", "conv_new"),
+    ]
+    assert captured["spec"].args[-4:] == [
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_fresh",
+    ]
+    assert published == [
+        ("conv_new", "session.resource.deleted"),
+        ("conv_new", "session.resource.created"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_relaunch_failure_retracts_the_closed_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed replacement launch re-raises with the closed pane already retracted."""
+    from omnigent.runner.native.orchestration import _relaunch_codex_native_tui_on_thread
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (tmp_path / "config-home").mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    app_server, launch_config = _recorded_codex_launch_inputs(
+        tmp_path, workspace=workspace, codex_cli_version=None
+    )
+    captured: dict[str, Any] = {}
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    with pytest.raises(RuntimeError, match="tmux spawn failed"):
+        await _relaunch_codex_native_tui_on_thread(
+            "conv_new",
+            "thread_fresh",
+            resource_registry=_RecordingCodexRegistry(  # type: ignore[arg-type]
+                captured, launch_error=RuntimeError("tmux spawn failed")
+            ),
+            publish_event=lambda session_id, event: published.append((session_id, event)),
+            app_server=app_server,
+            launch_config=launch_config,
+            bridge_dir=tmp_path / "bridge",
+            agent_spec=None,
+        )
+
+    assert captured["calls"] == [
+        ("close", "conv_new", "terminal_codex_main"),
+        ("launch", "conv_new"),
+    ]
+    assert published == [
+        (
+            "conv_new",
+            {
+                "type": "session.resource.deleted",
+                "resource_id": "terminal_codex_main",
+                "resource_type": "terminal",
+                "session_id": "conv_new",
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

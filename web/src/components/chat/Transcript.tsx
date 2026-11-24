@@ -176,6 +176,7 @@ function TranscriptImpl({
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
+  const failedUploads = useChatStore((s) => s.failedUploads);
   const failedInputs = useChatStore((s) => s.failedInputs);
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
@@ -222,12 +223,14 @@ function TranscriptImpl({
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
+      failedUploads,
     );
   }, [
     blocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,

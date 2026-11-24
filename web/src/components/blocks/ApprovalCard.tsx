@@ -33,7 +33,7 @@
 //   3. rolls back to "pending" on network error.
 
 import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
-import { type ComponentProps, useContext, useMemo } from "react";
+import { type ComponentProps, type ReactNode, useContext, useMemo } from "react";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -63,6 +63,7 @@ import {
   exitPlanModePlan,
 } from "@/lib/askUserQuestion";
 import { askUserQuestionSignature } from "@/lib/askUserQuestionDrafts";
+import { splitSentSessionMentions } from "@/lib/composerMentions";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
@@ -89,6 +90,7 @@ import {
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
 import { FileEditDiffView } from "./FileEditBody";
 import { ToolValueView } from "./ToolValueView";
+import { SessionMentionPill } from "./ChatMarkdown";
 
 const AUTO_RESOLVED_DETAIL =
   "This request was answered outside this view, for example in the " +
@@ -104,6 +106,30 @@ const QUESTION_TITLES = [
 
 // A workflow question comes from whichever harness runs the workflow; its
 // message names the task waiting on it.
+/**
+ * A submitted answer's text. Session tags show as the composer's session pills; every other
+ * character stays as typed. Multi-select answers are each split, then joined.
+ */
+function SubmittedAnswer({ answer }: { answer: unknown }): ReactNode {
+  const answers = Array.isArray(answer) ? answer : [answer];
+  const nodes: ReactNode[] = [];
+  for (const part of answers) {
+    if (nodes.length > 0) nodes.push(", ");
+    for (const piece of splitSentSessionMentions(String(part))) {
+      nodes.push(
+        typeof piece === "string" ? (
+          piece
+        ) : (
+          <SessionMentionPill key={nodes.length} id={piece.id} isSubagent={piece.isSubagent}>
+            {`@${piece.title}`}
+          </SessionMentionPill>
+        ),
+      );
+    }
+  }
+  return nodes;
+}
+
 function questionPromptTitle(policyName: string, phase: string, message: string): string {
   if (phase === WORKFLOW_QUESTION_PHASE && message) return message;
   const match = QUESTION_TITLES.find(
@@ -955,7 +981,7 @@ export function ApprovalCard({
                   <li key={q} className="flex flex-wrap items-baseline gap-x-1.5">
                     <span className="text-muted-foreground">{q}</span>
                     <span className="font-medium">
-                      {Array.isArray(ans) ? ans.join(", ") : String(ans)}
+                      <SubmittedAnswer answer={ans} />
                     </span>
                   </li>
                 ))}

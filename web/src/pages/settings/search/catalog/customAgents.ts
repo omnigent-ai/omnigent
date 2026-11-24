@@ -30,10 +30,7 @@ export const CUSTOM_AGENTS_LIST_ENTRY = settingsEntry({
   focus: "search",
 });
 
-/**
- * The create page, reached from the list's Create. Its fields and buttons are the form's own,
- * which the shell's dialog shares; the MCP server rows are not parts yet.
- */
+/** The create page, reached from the list's Create; the shell's create dialog shares its form. */
 export const CUSTOM_AGENT_CREATE_ENTRY = settingsEntry({
   id: "custom-agent-create",
   section: "custom-agents",
@@ -49,15 +46,45 @@ export const CUSTOM_AGENT_CREATE_ENTRY = settingsEntry({
     model: "Model",
     instructions: "System instructions",
     addServer: "Add server",
+    serverName: "Server name",
+    serverTransport: "Transport",
+    removeServer: "Remove server",
+    command: "Command",
+    arguments: "Arguments",
+    environment: "Environment variables",
+    url: "Server URL",
+    headers: "HTTP headers",
     cancel: "Cancel",
     submit: "Save agent",
   },
+  // Every server shows the same fields, so each is named after its server, or its place in the
+  // list for its own name; only the static names are searchable.
   nameTemplates: {
     back: BACK_TO_LIST,
+    serverName: { before: "Name for server " },
+    serverTransport: { before: "Transport for " },
+    removeServer: { before: "Remove " },
+    command: { before: "Command for " },
+    arguments: { before: "Arguments for " },
+    environment: { before: "Environment variables for " },
+    url: { before: "URL for " },
+    headers: { before: "HTTP headers for " },
+  },
+  partChoices: { serverTransport: ["stdio", "http"] },
+  presence: {
+    serverName: { states: ["has servers"] },
+    serverTransport: { states: ["has servers"] },
+    removeServer: { states: ["has servers"] },
+    command: { states: ["stdio server"] },
+    arguments: { states: ["stdio server"] },
+    environment: { states: ["stdio server"] },
+    url: { states: ["http server"] },
+    headers: { states: ["http server"] },
   },
   overlays: {
     // The harnesses the server knows, named by their labels.
     harness: { runtimeChoices: {} },
+    serverTransport: { captured: true },
   },
   focus: "name",
   revealedBy: "custom-agents-list",
