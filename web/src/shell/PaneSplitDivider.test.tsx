@@ -64,6 +64,26 @@ describe("PaneSplitDivider drags", () => {
     expect(onAbort).not.toHaveBeenCalled();
   });
 
+  // The window can lose focus either side of the handle losing its capture.
+  it.each([
+    ["before its capture ends", ["blur", "lostPointerCapture"]],
+    ["after its capture ends", ["lostPointerCapture", "blur"]],
+    ["while it holds its capture", ["blur"]],
+  ] as const)("drops its sizes once when the window blurs %s", (_case, steps) => {
+    const { element, onCommit, onAbort } = renderDivider();
+    fireEvent.pointerDown(element, { pointerId: 1 });
+    for (const step of steps) {
+      if (step === "blur") fireEvent.blur(window);
+      else fireEvent.lostPointerCapture(element, { pointerId: 1 });
+    }
+    fireEvent.pointerUp(document.body, { pointerId: 1 });
+    fireEvent.pointerUp(element, { pointerId: 1 });
+    fireEvent.blur(window);
+    expect(onAbort).toHaveBeenCalledExactlyOnceWith("pointer-lost");
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(paneDividerDrag.dragging()).toBe(false);
+  });
+
   describe("after its capture ends before the release, as the macOS app can end it", () => {
     function pressAndLose() {
       const rendered = renderDivider();
