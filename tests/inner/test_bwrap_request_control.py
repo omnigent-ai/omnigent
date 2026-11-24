@@ -235,6 +235,7 @@ def test_descriptor_close_failure_cannot_make_later_cancellation_signal_a_reused
     monkeypatch.setattr(request_control.os, "close", close)
     with pytest.raises(OSError, match="Descriptor close failed"):
         case.owner.run(deadline=1.0)
+    assert case.owner.done.is_set()
     assert ("close", _INIT_FD) in case.events
     case.control.close.assert_called_once()
     events = list(case.events)

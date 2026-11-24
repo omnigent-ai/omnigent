@@ -254,8 +254,11 @@ class BwrapRequestControl:
         # Serialize descriptor retirement with cancellation to prevent fd reuse races.
         with self._lock:
             self._owned_pidfds = None
-            with contextlib.ExitStack() as cleanup:
-                cleanup.callback(self._control.close)
-                cleanup.callback(os.close, self._launcher_pidfd)
-                cleanup.callback(os.close, self._init_pidfd)
-            self.done.set()
+            try:
+                with contextlib.ExitStack() as cleanup:
+                    cleanup.callback(self._control.close)
+                    cleanup.callback(os.close, self._launcher_pidfd)
+                    cleanup.callback(os.close, self._init_pidfd)
+            finally:
+                # A close error must not strand an already settled request.
+                self.done.set()
