@@ -187,6 +187,18 @@ resolves them or consolidates the remaining human question instead of sending
 the user to each worker. With the `sibling_sessions` feature on, these sessions
 are grouped with the session that started them.
 
+To hear when a step runs long, give it a time limit: ask the workflow page's
+planning chat ("tell me if opening the PRs takes over 2 hours", or "if any
+step does") and save the plan, or ask in a run's request. The agent writes it
+into the step's description, such as `**Time limit:** 2 hours`, so it shows on
+the step and carries into later runs. A limit never stops the step. When a
+step with a limit starts, the agent sets a timer for it with `sys_timer_set`,
+or a background timer of its own without one, and cancels it when the step
+finishes. If the step is still going when the timer fires, the agent checks
+what it waits on and tells you once: with a question from
+`sys_workflow_request_input`, which marks the step Waiting for you, or, in an
+unattended run, with an Inbox item from `sys_user_inbox_post`.
+
 ## Saving and reusing a workflow
 
 To keep a workflow that worked, open the **⋯** menu at the right of the plan's
