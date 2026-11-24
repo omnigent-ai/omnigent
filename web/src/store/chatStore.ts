@@ -147,7 +147,7 @@ import {
 import {
   forgetUnsentSend,
   peekQueuedSends,
-  peekUnsentSend,
+  peekUnsentSends,
   rememberQueuedSends,
   rememberUnsentSend,
 } from "@/lib/unsentSends";
@@ -8696,33 +8696,32 @@ function unsentSendToRestore(
   conversationId: string,
   items: readonly { id: string }[],
 ): ConversationState["failedSendDraft"] {
-  const unsent = peekUnsentSend(conversationId);
-  // A send still open in this tab settles on its own.
-  if (unsent !== null && inFlightSends.has(unsent.stableId)) return null;
-  // A parked upload on this conversation owns its record until the user acts on it.
+  // A send still open in this tab, or a message parked on its bubble, owns its own record.
   const parkedHere = conversationRegistry.peek(conversationId)?.getState().failedUploads ?? [];
-  if (unsent !== null && parkedHere.some((p) => p.uploadFailure?.stableId === unsent.stableId)) {
-    return null;
-  }
+  const unsent = peekUnsentSends(conversationId).filter(
+    (record) =>
+      !inFlightSends.has(record.stableId) &&
+      !parkedHere.some((p) => p.uploadFailure?.stableId === record.stableId),
+  );
   // Messages this page still queues aren't lost; only a reload empties the queue.
   const queuedHere = new Set(useChatStore.getState().queuedMessages.map((m) => m.stableId));
   const stored = peekQueuedSends(conversationId);
   const queued = stored.filter((send) => !queuedHere.has(send.stableId));
-  if (unsent === null && queued.length === 0) return null;
+  if (unsent.length === 0 && queued.length === 0) return null;
   const viewerId = getCurrentUserId();
   // The viewer can't be checked before identity resolves; try again once it does.
   if (viewerId === null) {
     restoreUnsentSendOnceIdentified(conversationId, items);
     return null;
   }
-  if (unsent !== null) forgetUnsentSend(conversationId, unsent.stableId);
+  for (const record of unsent) forgetUnsentSend(conversationId, record.stableId);
   if (queued.length > 0) {
     rememberQueuedSends(
       conversationId,
       stored.filter((send) => queuedHere.has(send.stableId)),
     );
   }
-  const sends = [...(unsent === null ? [] : [unsent]), ...queued].filter(
+  const sends = [...unsent, ...queued].filter(
     // Another account may have signed in to this tab since.
     (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
   );
