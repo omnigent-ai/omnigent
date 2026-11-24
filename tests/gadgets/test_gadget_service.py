@@ -22,7 +22,7 @@ from omnigent.stores.gadget_store import (
     NotFound,
 )
 from omnigent.stores.gadget_store.local import LocalGadgetFiles
-from tests.gadgets.conftest import DATA_EDIT, EDIT, READ, Fixture, person
+from tests.gadgets.conftest import DATA_EDIT, EDIT, READ, Fixture, HookedFiles, person
 
 CARDS = {
     "cards": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}
@@ -551,6 +551,66 @@ def test_a_rule_added_later_keeps_data_that_already_breaks_it_editable(gadgets: 
     assert card(service, app, "e", "doing")["id"] == "e"
 
 
+def test_a_unique_rule_added_over_duplicates_keeps_them_editable_and_the_value_taken(
+    gadgets: Fixture,
+) -> None:
+    service = gadgets.service()
+    app = publish_ruled_board(service, [])
+    a = rpc(
+        service,
+        app,
+        "create",
+        id="a",
+        value={"title": "Ship", "column": "todo"},
+        operation_id="c-a",
+    )
+    b = rpc(
+        service,
+        app,
+        "create",
+        id="b",
+        value={"title": "Ship", "column": "todo"},
+        operation_id="c-b",
+    )
+    rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    revision = ruled_revision(service, app["id"], [rule])
+    app = service.publish(app["id"], {"revision_id": revision, "if_version": app["version"]})
+    # Both records that already shared the title stay editable while they keep it.
+    b = move(service, app, b, "doing", "m-b")
+    a = move(service, app, a, "doing", "m-a")
+    # Deleting one leaves the title held by the other: a third record still can't take it.
+    rpc(service, app, "delete", id="a", if_version=a["version"], operation_id="d-a")
+    with pytest.raises(ConstraintViolation):
+        rpc(
+            service,
+            app,
+            "create",
+            id="c",
+            value={"title": "Ship", "column": "todo"},
+            operation_id="c-c",
+        )
+    # Once the last holder moves off it, the title is free.
+    renamed = rpc(
+        service,
+        app,
+        "replace",
+        id="b",
+        value={"title": "Shipped", "column": "doing"},
+        if_version=b["version"],
+        operation_id="r-b",
+    )
+    assert renamed["value"]["title"] == "Shipped"
+    created = rpc(
+        service,
+        app,
+        "create",
+        id="c",
+        value={"title": "Ship", "column": "todo"},
+        operation_id="c-c2",
+    )
+    assert created["id"] == "c"
+
+
 def test_a_unique_rule_refuses_duplicates_and_frees_a_deleted_value(gadgets: Fixture) -> None:
     service = gadgets.service()
     rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
@@ -818,6 +878,98 @@ def test_deleting_a_referenced_record_reads_only_the_records_that_name_it(
         rpc(service, app, "delete", id="busy", if_version=busy["version"], operation_id="d-b")
 
 
+_RUN_CARD_RESTRICT = {
+    "name": "run_card",
+    "kind": "reference",
+    "collection": "runs",
+    "field": "cardId",
+    "target": "cards",
+    "on_delete": "restrict",
+}
+
+
+def _runs_naming(service: GadgetService, app: dict, card_id: str, count: int) -> list[dict]:
+    return [
+        rpc(
+            service,
+            app,
+            "create",
+            collection="runs",
+            id=f"r{index}",
+            value={"cardId": card_id, "state": "done"},
+            operation_id=f"run-{index}",
+        )
+        for index in range(count)
+    ]
+
+
+def _rename_runs(service: GadgetService, app: dict, runs: list[dict], card_id: str) -> None:
+    for run in runs:
+        rpc(
+            service,
+            app,
+            "replace",
+            collection="runs",
+            id=run["id"],
+            value={**run["value"], "cardId": card_id},
+            if_version=run["version"],
+            operation_id=f"move-{run['id']}",
+        )
+
+
+def test_references_written_without_rules_leave_no_index_entries_to_read(
+    gadgets: Fixture,
+) -> None:
+    """Runs that moved to another card while no rule applied leave entries under the old
+    card; publishing the rule again rebuilds the index into a new generation, so deleting the
+    old card reads none of them."""
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_RUN_CARD_RESTRICT])
+    old = card(service, app, "old", "todo")
+    card(service, app, "new", "todo")
+    runs = _runs_naming(service, app, "old", 6)
+    revision = ruled_revision(service, app["id"], [])
+    app = service.publish(app["id"], {"revision_id": revision, "if_version": app["version"]})
+    _rename_runs(service, app, runs, "new")
+    revision = ruled_revision(service, app["id"], [_RUN_CARD_RESTRICT])
+    app = service.publish(app["id"], {"revision_id": revision, "if_version": app["version"]})
+    card(service, app, "warm", "todo")  # Finishes the rebuild before the delete is measured.
+
+    examined: list[str] = []
+    gadgets.store.after_list = lambda path, entries: examined.extend(
+        f"{path}/{entry}" for entry in entries if "/refs/" in path and path.endswith("/old")
+    )
+    rpc(service, app, "delete", id="old", if_version=old["version"], operation_id="d-old")
+    assert rpc(service, app, "get", id="old") is None
+    assert examined == []
+
+
+def test_a_lookup_over_too_many_left_behind_entries_rebuilds_the_index(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store that can't delete keeps every entry a change left behind; a delete that would
+    read more than its budget has the index rebuilt, then reads only live references."""
+    monkeypatch.setattr(constraints_module, "MAX_STALE_INDEX_ENTRIES", 3)
+    monkeypatch.setattr(HookedFiles, "supports_delete", property(lambda self: False))
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_RUN_CARD_RESTRICT])
+    old = card(service, app, "old", "todo")
+    new = card(service, app, "new", "todo")
+    _rename_runs(service, app, _runs_naming(service, app, "old", 6), "new")
+
+    examined: list[str] = []
+    gadgets.store.after_list = lambda path, entries: examined.extend(
+        entries if "/refs/" in path and path.endswith("/old") else []
+    )
+    rpc(service, app, "delete", id="old", if_version=old["version"], operation_id="d-old")
+    assert rpc(service, app, "get", id="old") is None
+    # One lookup gave up after its budget; the one after the rebuild read nothing.
+    assert len(examined) <= 6
+    # The runs still name a live card, so its delete is still refused.
+    with pytest.raises(ConstraintViolation):
+        rpc(service, app, "delete", id="new", if_version=new["version"], operation_id="d-new")
+
+
 @pytest.mark.parametrize(
     ("second", "deleted"),
     [("restrict", False), ("unset", True), ("cascade", True)],
@@ -1005,6 +1157,24 @@ def test_the_rule_state_rotates_without_losing_counts(
         {"name": "Bad name", "kind": "unique", "collection": "cards", "fields": ["title"]},
         {"name": "bad", "kind": "trigger", "collection": "cards"},
         {"name": "bad", "kind": "unique", "collection": "cards", "fields": ["title"], "sql": "x"},
+        # Values of the wrong JSON type are refused, not raised as server errors.
+        {"name": "bad", "kind": "unique", "collection": [], "fields": ["title"]},
+        {"name": "bad", "kind": "unique", "collection": "cards", "fields": [{}]},
+        {
+            "name": "bad",
+            "kind": "reference",
+            "collection": "runs",
+            "field": "cardId",
+            "target": [],
+        },
+        {
+            "name": "bad",
+            "kind": "reference",
+            "collection": "runs",
+            "field": "cardId",
+            "target": "cards",
+            "on_delete": [],
+        },
     ],
 )
 def test_rules_that_do_not_match_the_revision_are_refused_at_upload(

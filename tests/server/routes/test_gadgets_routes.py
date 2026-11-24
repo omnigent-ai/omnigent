@@ -149,6 +149,40 @@ async def test_a_disabled_server_hides_every_route_before_reading_the_body(
     assert not list((stores.root / "gadgets").glob("*"))
 
 
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        {"name": "bad", "kind": "unique", "collection": [], "fields": ["title"]},
+        {"name": "bad", "kind": "unique", "collection": "cards", "fields": [{}]},
+        {
+            "name": "bad",
+            "kind": "reference",
+            "collection": "cards",
+            "field": "title",
+            "target": [],
+        },
+    ],
+    ids=["collection", "fields", "target"],
+)
+async def test_rules_of_the_wrong_type_get_the_gadget_error_shape(
+    client: httpx.AsyncClient, constraint: dict
+) -> None:
+    created = await client.post("/v1/gadgets", json={"name": "Board"}, headers=_as(ALICE))
+    response = await client.post(
+        f"/v1/gadgets/{created.json()['id']}/revisions",
+        json={
+            "html": "<main>Board</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read"],
+            "collections": _CARDS,
+            "constraints": [constraint],
+        },
+        headers=_as(ALICE),
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+
 async def test_requests_need_an_identity_and_a_json_body(client: httpx.AsyncClient) -> None:
     assert (await client.get("/v1/gadgets")).status_code == 401
     form = await client.post(
@@ -493,6 +527,30 @@ async def test_grantee_ids_are_trimmed_and_one_person_keeps_one_grant(
     assert upper.json()["user_id"] == BOB and upper.json()["level"] == 2
     grants, _ = stores.permissions.list_for_gadget(gadget["id"])
     assert [(grant.user_id, grant.level) for grant in grants] == [(BOB, 2)]
+
+
+async def test_a_re_share_in_another_case_updates_a_non_ascii_grantees_grant(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    grantee = "Ömer@Example.com"
+    stores.permissions.ensure_user(grantee)
+    gadget = await _published(client)
+    base = f"/v1/gadgets/{gadget['id']}"
+    first = await client.put(
+        f"{base}/permissions", json={"user_id": grantee, "level": 2}, headers=_as(ALICE)
+    )
+    assert first.status_code == 200, first.text
+    lower = await client.put(
+        f"{base}/permissions",
+        json={"user_id": "ömer@example.com", "level": 1},
+        headers=_as(ALICE),
+    )
+    assert lower.status_code == 200, lower.text
+    assert lower.json()["user_id"] == grantee
+    grants, _ = stores.permissions.list_for_gadget(gadget["id"])
+    assert [(grant.user_id, grant.level) for grant in grants] == [(grantee, 1)]
+    # The lower level is what the grantee now holds; no second grant keeps the old one.
+    assert stores.permissions.resolve_gadget_access([grantee], gadget["id"]) == 1
 
 
 async def test_a_grant_finds_an_existing_spelling_without_reading_the_grant_list(

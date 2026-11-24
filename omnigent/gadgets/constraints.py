@@ -28,12 +28,19 @@ must fit in ``MAX_GUARD_BYTES``: each unique key costs its digest plus the holdi
 record's ID, so how many records a ``unique`` rule allows depends on their IDs and on
 the size of the record being written, not only on the collection's record limit.
 
+A ``unique`` value that data from before the rule already repeats keeps every record
+holding it, so those records stay editable as long as they keep that value, and the value
+is not free for another record until all of them have moved off it.
+
 Each ``reference`` rule keeps an index of the records naming each target
-(``refs/<rule>/<target>/<record>``), written as part of every guarded change, so
-deleting a target reads only the records that name it. Entries a change left behind
-are checked against the record and dropped. When the rules change, or a write fails
-half-way, the derived state is rebuilt a page at a time, with its progress saved in
-the guard, so each step costs bounded work and a stopped rebuild resumes.
+(``refs/<rule>/g<generation>/<target>/<record>``), written as part of every guarded
+change, so deleting a target reads only the records that name it. Entries a change left
+behind are checked against the record and dropped. A lookup reads at most
+``MAX_STALE_INDEX_ENTRIES`` of those: one that would read more has the index rebuilt.
+When the rules change, the index needs rebuilding, or a write fails half-way, the derived
+state is rebuilt a page at a time into a new index generation, with its progress saved in
+the guard, so each step costs bounded work and a stopped rebuild resumes; the generations
+it replaces are then removed.
 """
 
 from __future__ import annotations
@@ -69,6 +76,9 @@ MAX_UNIQUE_FIELDS = 3
 MAX_RECORDS_LIMIT = 10_000
 # Records one change may touch, including cascades.
 MAX_PLAN_OPERATIONS = 50
+# Left-behind reference-index entries one lookup reads before it gives up and has the index
+# rebuilt; with the live ones it stops at, a lookup reads a bounded number of entries.
+MAX_STALE_INDEX_ENTRIES = 3 * (MAX_PLAN_OPERATIONS + 1)
 # Guard state, including an in-flight change, must fit in one store document.
 MAX_GUARD_BYTES = 30 * 1024
 EPOCH_WRITES = 100
@@ -88,8 +98,13 @@ GUARD_LIMITS: StoreLimits = DEFAULT_LIMITS
 # Records one rebuild step reads, and the steps one write may take before giving up as busy.
 REBUILD_PAGE = 200
 REBUILD_STEPS_PER_WRITE = 64
-# Bumped when the derived state gains something a rebuild must fill in (the reference index).
-_STATE_FORMAT = 2
+# Bumped when the derived state gains something a rebuild must fill in (the reference index,
+# its generations, every holder of a repeated unique value).
+_STATE_FORMAT = 3
+
+
+class _IndexNeedsRebuild(Exception):
+    """A reference lookup found more left-behind entries than one request may read."""
 
 
 class ConstraintViolation(Conflict):
@@ -154,7 +169,7 @@ def validate_constraints(value: Any, collections: dict) -> list[dict]:
         if not isinstance(name, str) or _IDENTIFIER.fullmatch(name) is None or name in names:
             raise InvalidInput("Each constraint needs a unique name like wip_limit")
         names.add(name)
-        if collection not in collections:
+        if not isinstance(collection, str) or collection not in collections:
             raise InvalidInput(
                 f"Constraint {name} names a collection the revision does not declare"
             )
@@ -206,6 +221,7 @@ def validate_constraints(value: Any, collections: dict) -> list[dict]:
             if (
                 not isinstance(fields, list)
                 or not 0 < len(fields) <= MAX_UNIQUE_FIELDS
+                or not all(isinstance(field_name, str) for field_name in fields)
                 or len(set(fields)) != len(fields)
             ):
                 raise InvalidInput(
@@ -219,12 +235,12 @@ def validate_constraints(value: Any, collections: dict) -> list[dict]:
             allowed = {"name", "kind", "collection", "field", "target", "on_delete", "message"}
             reference_field = declared(item.get("field"))
             target = item.get("target")
-            if target not in collections:
+            if not isinstance(target, str) or target not in collections:
                 raise InvalidInput(
                     f"Constraint {name} references a collection the revision does not declare"
                 )
             on_delete = item.get("on_delete", "restrict")
-            if on_delete not in _ON_DELETE:
+            if not isinstance(on_delete, str) or on_delete not in _ON_DELETE:
                 raise InvalidInput(
                     f"Constraint {name} on_delete must be one of {', '.join(_ON_DELETE)}"
                 )
@@ -239,6 +255,22 @@ def validate_constraints(value: Any, collections: dict) -> list[dict]:
         rule["message"] = message or default
         rules.append(rule)
     return rules
+
+
+def _holders(entry: Any) -> list[str]:
+    """The records holding a unique value: one ID, or a list when earlier data repeats it."""
+    if isinstance(entry, str):
+        return [entry]
+    if isinstance(entry, list):
+        return [holder for holder in entry if isinstance(holder, str)]
+    return []
+
+
+def _set_holders(keys: dict, key: str, holders: list[str]) -> None:
+    if not holders:
+        keys.pop(key, None)
+    else:
+        keys[key] = holders[0] if len(holders) == 1 else holders
 
 
 @dataclass
@@ -321,7 +353,13 @@ class ConstraintGuard:
             }
             if method != "delete":
                 primary["value"] = value
-            plan = self._plan(primary, current)
+            try:
+                plan = self._plan(primary, current)
+            except _IndexNeedsRebuild:
+                # Rebuilding writes a new index generation without the entries left behind;
+                # this write then helps with it like any other.
+                self.mark_stale()
+                continue
             if plan is None:
                 # A retry of an applied write or a stale precondition: the store answers it
                 # without changing any record, so the derived state stays as it is.
@@ -367,6 +405,7 @@ class ConstraintGuard:
                 return None
             before = existing.value
         after = primary.get("value") if primary["kind"] != "delete" else None
+        generation = int(state.get("ref_generation", 0))
         plan = _Plan(
             counts=dict(state.get("counts", {})),
             unique={name: dict(keys) for name, keys in state.get("unique", {}).items()},
@@ -391,7 +430,7 @@ class ConstraintGuard:
             for rule in self.rules:
                 if rule["kind"] != "reference" or rule["target"] != changed_collection:
                     continue
-                for dependent in self._dependents(rule, changed_id):
+                for dependent in self._dependents(rule, changed_id, generation):
                     key = (rule["collection"], dependent.id)
                     effects.setdefault(key, (dependent, []))[1].append(rule)
             for key, (dependent, rules) in effects.items():
@@ -427,10 +466,12 @@ class ConstraintGuard:
                     raise CapacityExceeded(
                         f"This change would update more than {MAX_PLAN_OPERATIONS} records"
                     )
-        plan.operations.extend(self._index_operations(changes))
+        plan.operations.extend(self._index_operations(changes, generation))
         return plan
 
-    def _index_operations(self, changes: list[tuple[str, str, Any, Any]]) -> list[dict]:
+    def _index_operations(
+        self, changes: list[tuple[str, str, Any, Any]], generation: int
+    ) -> list[dict]:
         """The reference index entries a change adds and drops, after its record writes."""
         operations: list[dict] = []
         for changed_collection, changed_id, old, new in changes:
@@ -444,7 +485,10 @@ class ConstraintGuard:
                 for kind, target in (("ref_remove", before), ("ref_add", after)):
                     if target is not None:
                         operations.append(
-                            {"kind": kind, "path": self._index_path(rule, target, changed_id)}
+                            {
+                                "kind": kind,
+                                "path": self._index_path(rule, generation, target, changed_id),
+                            }
                         )
         return operations
 
@@ -453,11 +497,14 @@ class ConstraintGuard:
         target = value.get(rule["field"]) if isinstance(value, dict) else None
         return target if isinstance(target, str) and _IDENTIFIER.fullmatch(target) else None
 
-    def _index_directory(self, rule: dict, target_id: str) -> str:
-        return f"{self.guard_root}/refs/{_digest(rule, 16)}/{target_id}"
+    def _index_root(self) -> str:
+        return f"{self.guard_root}/refs"
 
-    def _index_path(self, rule: dict, target_id: str, record_id: str) -> str:
-        return f"{self._index_directory(rule, target_id)}/{record_id}"
+    def _index_directory(self, rule: dict, generation: int, target_id: str) -> str:
+        return f"{self._index_root()}/{_digest(rule, 16)}/g{generation}/{target_id}"
+
+    def _index_path(self, rule: dict, generation: int, target_id: str, record_id: str) -> str:
+        return f"{self._index_directory(rule, generation, target_id)}/{record_id}"
 
     def _check(self, rule: dict, plan: _Plan, record_id: str, old: Any, new: Any) -> None:
         kind = rule["kind"]
@@ -470,13 +517,22 @@ class ConstraintGuard:
         elif kind == "unique":
             keys = plan.unique.setdefault(rule["name"], {})
             old_key, new_key = self._unique_key(rule, old), self._unique_key(rule, new)
-            if old_key is not None and keys.get(old_key) == record_id:
-                del keys[old_key]
+            # Keeping its value: allowed even for a value earlier data already repeats.
+            if (
+                new_key is not None
+                and old_key == new_key
+                and record_id in _holders(keys.get(new_key))
+            ):
+                return
+            if old_key is not None:
+                _set_holders(
+                    keys, old_key, [h for h in _holders(keys.get(old_key)) if h != record_id]
+                )
             if new_key is not None:
-                holder = keys.get(new_key)
-                if holder is not None and holder != record_id:
+                holders = _holders(keys.get(new_key))
+                if any(holder != record_id for holder in holders):
                     raise ConstraintViolation(rule)
-                keys[new_key] = record_id
+                _set_holders(keys, new_key, [record_id])
         elif kind == "reference" and isinstance(new, dict):
             target_id = new.get(rule["field"])
             if target_id is None or (
@@ -503,15 +559,18 @@ class ConstraintGuard:
             return None
         return _digest([value[name] for name in rule["fields"]], 24)
 
-    def _dependents(self, rule: dict, target_id: str) -> list[Document]:
+    def _dependents(self, rule: dict, target_id: str, generation: int) -> list[Document]:
         """The live records whose *rule* field names *target_id*, read from the rule's index.
 
         Stops after one more than a change may touch, which is enough to refuse or cap the
-        change. Entries for records that no longer name the target are dropped as found.
+        change. Entries for records that no longer name the target are dropped as found. A
+        lookup that meets more than ``MAX_STALE_INDEX_ENTRIES`` of those raises
+        ``_IndexNeedsRebuild`` rather than guess from part of the index.
         """
-        directory = self._index_directory(rule, target_id)
+        directory = self._index_directory(rule, generation, target_id)
         found: list[Document] = []
         after: str | None = None
+        stale = 0
         while len(found) <= MAX_PLAN_OPERATIONS:
             try:
                 names, more = self.files.list_page(
@@ -528,7 +587,11 @@ class ConstraintGuard:
                 )
                 if record is not None and record.value.get(rule["field"]) == target_id:
                     found.append(record)
-                elif self.files.supports_delete:
+                    continue
+                stale += 1
+                if stale > MAX_STALE_INDEX_ENTRIES:
+                    raise _IndexNeedsRebuild()
+                if self.files.supports_delete:
                     with contextlib.suppress(NotFound):
                         self.files.delete_tree(f"{directory}/{name}")
             if not more:
@@ -670,6 +733,7 @@ class ConstraintGuard:
         if not isinstance(progress, dict) or progress.get("digest") != self.digest:
             progress = {
                 "digest": self.digest,
+                "generation": int(value.get("ref_generation", 0)) + 1,
                 "todo": sorted({rule["collection"] for rule in self.rules}),
                 "cursor": None,
                 "counts": {r["name"]: 0 for r in self.rules if r["kind"] == "max_records"},
@@ -696,6 +760,8 @@ class ConstraintGuard:
                     progress["todo"].pop(0)
                     progress["cursor"] = None
         writes = value.get("writes", 0) + 1
+        generation = progress["generation"]
+        assert isinstance(generation, int)
         if progress["todo"]:
             updated = {**value, "rebuild": progress, "writes": writes}
         else:
@@ -704,6 +770,7 @@ class ConstraintGuard:
                 "rules": self.digest,
                 "counts": progress["counts"],
                 "unique": progress["unique"],
+                "ref_generation": progress["generation"],
                 "rebuild": None,
                 "pending": None,
                 "writes": writes,
@@ -719,6 +786,33 @@ class ConstraintGuard:
                 self._guard_operation(state, "rebuild"),
                 self.actor,
             )
+            if not progress["todo"]:
+                self._retire_index_generations(generation)
+
+    def _retire_index_generations(self, current: int) -> None:
+        """Remove the index generations and old rules' indexes the finished rebuild replaced.
+
+        Each removal is one ``delete_tree`` of a directory, which the store does in bounded
+        work; a store that cannot delete keeps them, and lookups never read them again.
+        """
+        if not self.files.supports_delete:
+            return
+        live = {_digest(rule, 16) for rule in self.rules if rule["kind"] == "reference"}
+        root = self._index_root()
+        with contextlib.suppress(NotFound):
+            names, _more = self.files.list_page(root, after=None, limit=MAX_CONSTRAINTS * 4)
+            for name in names:
+                if name not in live:
+                    with contextlib.suppress(NotFound):
+                        self.files.delete_tree(f"{root}/{name}")
+                    continue
+                generations, _ = self.files.list_page(
+                    f"{root}/{name}", after=None, limit=MAX_CONSTRAINTS * 4
+                )
+                for generation in generations:
+                    if generation != f"g{current}":
+                        with contextlib.suppress(NotFound):
+                            self.files.delete_tree(f"{root}/{name}/{generation}")
 
     def _rebuild_record(self, progress: dict, collection: str, record: Document) -> None:
         for rule in self.rules:
@@ -729,13 +823,16 @@ class ConstraintGuard:
             elif rule["kind"] == "unique":
                 key = self._unique_key(rule, record.value)
                 if key is not None:
-                    progress["unique"][rule["name"]].setdefault(key, record.id)
+                    keys = progress["unique"][rule["name"]]
+                    # Every holder of a value earlier data repeats, so none of them frees it.
+                    holders = _holders(keys.get(key))
+                    if record.id not in holders:
+                        _set_holders(keys, key, [*holders, record.id])
             elif rule["kind"] == "reference":
                 target = self._reference_of(rule, record.value)
                 if target is not None:
-                    self._apply(
-                        {"kind": "ref_add", "path": self._index_path(rule, target, record.id)}
-                    )
+                    path = self._index_path(rule, int(progress["generation"]), target, record.id)
+                    self._apply({"kind": "ref_add", "path": path})
 
     def _epochs(self) -> list[str]:
         try:
