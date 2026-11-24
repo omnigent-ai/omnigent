@@ -83,10 +83,15 @@ def check_approval_change(
 
 
 def superseding_sha(text: str | None, approved: str | None) -> str | None:
-    """A commit SHA in a worker's text that differs from the approved one, if any."""
+    """The branch head a worker's text reports, when it differs from the approved SHA.
+
+    The first full SHA is the head; later ones are usually the base or history,
+    and restating the approved SHA keeps the approval. Landing still checks the tip.
+    """
     if not text or not approved:
         return None
-    return next((sha for sha in _SHA.findall(text) if sha != approved), None)
+    match = _SHA.search(text)
+    return match.group(0) if match and match.group(0) != approved else None
 
 
 class RouteLimiter:
@@ -163,6 +168,6 @@ def to_worker_message(ticket: dict[str, Any], text: str) -> str:
         f'The Reviewer commented on your ticket "{ticket["title"]}" (`{ticket["id"]}`), in '
         f"Review:\n\n{_quote(text)}\n\n"
         "Fix blocking findings, or answer with a reason, and rebase to a fast-forward on the "
-        "tip. Then post one ticket comment with the new full SHA and what changed. A new SHA "
-        f"clears any earlier approval. {_ROUTING_NOTE}"
+        "tip. Then post one ticket comment that starts with the new full SHA and says what "
+        f"changed; a new head SHA clears any earlier approval. {_ROUTING_NOTE}"
     )

@@ -41,6 +41,8 @@ def test_reviewer_is_found_by_name_and_session_label() -> None:
 def test_a_different_sha_supersedes_the_approval_and_round_three_escalates() -> None:
     assert superseding_sha(f"rebased to {SHA_B}", SHA_A) == SHA_B
     assert superseding_sha(f"still {SHA_A}", SHA_A) is None
+    # Restating the approved head with its base doesn't clear the approval.
+    assert superseding_sha(f"still at {SHA_A}, on base {'c' * 40}", SHA_A) is None
     assert superseding_sha(f"new {SHA_B}", None) is None
     ticket = {"id": "t", "title": "T"}
     assert "escalate" not in to_reviewer_message(ticket, "fixed", "w", rounds=2)

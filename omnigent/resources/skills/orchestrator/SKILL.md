@@ -236,8 +236,8 @@ When the project has a **Reviewer** identity and a Review stage (id
   as ticket turns. Workers and the Reviewer reply with `sys_ticket_comment`.
   They never use `sys_session_message` for this, and you stay out of the loop.
 - Only the Reviewer's session can set `approved` = `<full sha>`. A comment from
-  anyone else that names a different 40-character SHA clears it. Land only
-  the exact approved SHA.
+  anyone else whose first 40-character SHA differs from it clears it, so workers
+  lead with the new head SHA. Land only the exact approved SHA.
 - `risk` = `<area>` (migrations, auth or permissions, deletion, the Mandate or
   review rules) needs the owner's OK before landing.
 - After 3 rounds without agreement, the Reviewer escalates to you with a

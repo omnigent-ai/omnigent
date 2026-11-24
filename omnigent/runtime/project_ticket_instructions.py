@@ -63,7 +63,7 @@ PROJECT_TICKET_WORK_INSTRUCTION = (
     "If the project has a Review stage, finish by rebasing to a fast-forward on the tip and "
     "moving the ticket to Review with a comment giving the branch, full SHA, base and targeted "
     "tests; the Reviewer's findings then arrive as ticket turns, and you answer each with "
-    "sys_ticket_comment, including the new full SHA after any fix, not sys_session_message. "
+    "sys_ticket_comment, leading with the new full SHA after any fix, not sys_session_message. "
     "To hand work to one of the project's identities, such as a PM, set the label "
     "assignee: <name> and open its one session with sys_project_identity_session rather "
     "than creating a new session. Agents may create identities when useful with "
