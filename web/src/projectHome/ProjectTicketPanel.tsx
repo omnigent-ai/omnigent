@@ -62,7 +62,7 @@ import { usePersonaForSession, useProjectPersonaLookup } from "./usePersonaSessi
 import { payloadMentions } from "./personaMentions";
 import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketFileLinks } from "./TicketFileLinks";
-import { TicketMarkdown, useTicketImageUpload } from "./ticketImages";
+import { TicketImageAttachButton, TicketMarkdown, useTicketImageUpload } from "./ticketImages";
 import { TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
@@ -329,6 +329,8 @@ function TicketEditor({
       <TicketError error={images.error} />
       <TicketError error={error} />
       <div className="flex justify-end gap-2">
+        <TicketImageAttachButton onFiles={images.attach} disabled={pending} />
+        <span className="flex-1" />
         {onCancel && (
           <Button type="button" variant="ghost" disabled={pending} onClick={onCancel}>
             Cancel
@@ -646,18 +648,21 @@ function TicketCommentComposer({
           </div>
         )}
         <div className="flex items-center justify-between gap-2 p-2 pt-0">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="text-muted-foreground"
-            aria-expanded={attaching}
-            disabled={comment.isPending || attaching}
-            onClick={() => setAttaching(true)}
-          >
-            <LinkIcon aria-hidden />
-            Attach link
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground"
+              aria-expanded={attaching}
+              disabled={comment.isPending || attaching}
+              onClick={() => setAttaching(true)}
+            >
+              <LinkIcon aria-hidden />
+              Attach link
+            </Button>
+            <TicketImageAttachButton onFiles={images.attach} disabled={comment.isPending} />
+          </div>
           <Button
             type="submit"
             size="sm"
@@ -844,7 +849,10 @@ function TicketArtifactImage({ output, className }: { output: TicketOutput; clas
   if (output.type !== "artifact" || !type || !PREVIEW_IMAGE_TYPES.has(type)) return null;
   return (
     <div className={cn("w-fit max-w-full", className)}>
-      <SessionImage path={output.url} alt={file.data?.title || file.data?.filename || "Screenshot"} />
+      <SessionImage
+        path={output.url}
+        alt={file.data?.title || file.data?.filename || "Screenshot"}
+      />
     </div>
   );
 }

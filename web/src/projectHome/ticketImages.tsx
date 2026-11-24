@@ -1,6 +1,8 @@
 import { useRef, useState, type ClipboardEvent, type DragEvent, type ReactNode } from "react";
+import { PaperclipIcon } from "lucide-react";
 import { ProseMarkdown } from "@/components/blocks/ChatMarkdown";
 import { SessionImage } from "@/components/SessionImage";
+import { Button } from "@/components/ui/button";
 import { clipboardFiles } from "@/lib/attachments";
 import { uploadTicketImage } from "@/lib/projectTicketsApi";
 
@@ -10,8 +12,7 @@ const TICKET_IMAGE_PATTERN =
   /!\[([^\]\n]*)\]\((\/v1\/projects\/[0-9a-f]{32}\/ticket-attachments\/[0-9a-f]{32}\/content)\)/g;
 
 export type TicketBodySegment =
-  | { kind: "markdown"; text: string }
-  | { kind: "image"; alt: string; path: string };
+  { kind: "markdown"; text: string } | { kind: "image"; alt: string; path: string };
 
 /** Split ticket markdown around uploaded-image references, keeping their order. */
 export function splitTicketImages(body: string): TicketBodySegment[] {
@@ -40,15 +41,14 @@ export function TicketMarkdown({ children, className }: { children: string; clas
     return <ProseMarkdown className={className}>{children}</ProseMarkdown>;
   return (
     <div className="space-y-2">
-      {segments.map(
-        (segment, index): ReactNode =>
-          segment.kind === "markdown" ? (
-            <ProseMarkdown key={index} className={className}>
-              {segment.text}
-            </ProseMarkdown>
-          ) : (
-            <SessionImage key={index} path={segment.path} alt={segment.alt} />
-          ),
+      {segments.map((segment, index): ReactNode =>
+        segment.kind === "markdown" ? (
+          <ProseMarkdown key={index} className={className}>
+            {segment.text}
+          </ProseMarkdown>
+        ) : (
+          <SessionImage key={index} path={segment.path} alt={segment.alt} />
+        ),
       )}
     </div>
   );
@@ -71,8 +71,9 @@ export function useTicketImageUpload(
   const resolveRef = useRef(resolveProjectId);
   resolveRef.current = resolveProjectId;
 
-  const upload = (files: File[], target: HTMLTextAreaElement) => {
-    const caret = target.selectionEnd ?? target.value.length;
+  // Without a target (the attach button), images go at the end of the text.
+  const upload = (files: File[], target?: HTMLTextAreaElement) => {
+    const caret = target ? (target.selectionEnd ?? target.value.length) : Number.MAX_SAFE_INTEGER;
     setError(null);
     setUploading((count) => count + files.length);
     void (async () => {
@@ -104,6 +105,10 @@ export function useTicketImageUpload(
   return {
     uploading: uploading > 0,
     error,
+    attach: (files: File[]) => {
+      const accepted = imageFiles(files);
+      if (accepted.length) upload(accepted);
+    },
     onPaste: (event: ClipboardEvent<HTMLTextAreaElement>) => {
       const files = imageFiles(clipboardFiles(event.clipboardData));
       if (!files.length) return;
@@ -121,4 +126,44 @@ export function useTicketImageUpload(
       upload(files, event.currentTarget);
     },
   };
+}
+
+/** Picks images from disk for {@link useTicketImageUpload}, beside paste and drop. */
+export function TicketImageAttachButton({
+  onFiles,
+  disabled,
+}: {
+  onFiles: (files: File[]) => void;
+  disabled?: boolean;
+}) {
+  const input = useRef<HTMLInputElement>(null);
+  return (
+    <>
+      <input
+        ref={input}
+        type="file"
+        accept={[...TICKET_IMAGE_TYPES].join(",")}
+        multiple
+        hidden
+        aria-hidden
+        tabIndex={-1}
+        onChange={(event) => {
+          onFiles([...(event.target.files ?? [])]);
+          event.target.value = "";
+        }}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="text-muted-foreground"
+        disabled={disabled}
+        title="Attach images. You can also paste or drop them into the text."
+        onClick={() => input.current?.click()}
+      >
+        <PaperclipIcon aria-hidden />
+        Attach image
+      </Button>
+    </>
+  );
 }
