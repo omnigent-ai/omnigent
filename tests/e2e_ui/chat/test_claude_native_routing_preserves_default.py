@@ -14,7 +14,6 @@ from playwright.sync_api import Page, expect
 
 from tests._helpers.host import isolated_host
 from tests._helpers.live_server import isolated_local_server
-from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests.e2e.conftest import get_mock_requests
 from tests.e2e.routing._helpers import claude_settings_snapshot, decisions
@@ -148,15 +147,24 @@ def test_claude_routing_preserves_default_and_delivers_once(
     nonce = uuid.uuid4().hex[:8]
     turns = [(f"route-user-{index}-{nonce}", f"route-reply-{index}-{nonce}") for index in (1, 2)]
     first_prompt = _turn_prompt(1, *turns[0])
-    metadata = {
+    agents = client.get("/v1/agents")
+    agents.raise_for_status()
+    agent_id = next(
+        (row["id"] for row in agents.json()["data"] if row["name"] == "claude-native-ui"),
+        None,
+    )
+    assert agent_id is not None, "The server did not register its native Claude wrapper"
+    create_body = {
+        "agent_id": agent_id,
         "host_id": host_id,
         "workspace": str(workspace),
         "cost_control_mode_override": "on",
     }
     if entry == "create":
-        metadata["smart_routing_message"] = first_prompt
-    created = create_native_session(client, base_url, harness="claude", metadata=metadata)
-    session_id = str(created["session_id"])
+        create_body["smart_routing_message"] = first_prompt
+    created = client.post("/v1/sessions", json=create_body, timeout=120)
+    created.raise_for_status()
+    session_id = str(created.json()["id"])
     try:
         page.set_viewport_size({"width": 1800, "height": 900})
         page.goto(f"{base_url}/c/{session_id}")
