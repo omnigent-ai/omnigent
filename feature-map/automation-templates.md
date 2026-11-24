@@ -220,6 +220,10 @@ to customize.
   directory pin is cleared. Selecting
   another repository unlocks model/permission settings for a new session;
   restoring the saved selection locks them again.
+- **Slack thread follow-ups:** after a Slack **Message posted in a channel** trigger
+  answers a message in its thread, reply in that thread. At the next poll the
+  session that handled the message receives the reply and answers there if the
+  reply asks something; no session starts for the reply.
 - **Mobile web:** use the same tabs and creation paths after opening Automations.
 - **Managed embedded:** open Automations through the host navigation; tabs,
   gallery, and modal use the same components under the host's mount path.
@@ -251,6 +255,12 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   turning it on blocks saving until the interval reaches sixty.
   Repeat through the row menu and detail page. Without sub-hour support, the
   editor keeps the hourly minimum and displays saved minute rules without rewriting them.
+- `web/src/components/scheduled/triggerTemplates.test.ts` (`Slack thread replies`)
+  pins the thread-following prompt rules. To check them live, run a Slack channel
+  trigger on a host whose agent has a Slack MCP, post a top-level message, and
+  after its worker answers, reply in the thread: the worker's history gains a
+  `Slack … replies through …` message from the polling session, and the sessions
+  list gains no new session.
 - `web/src/pages/TasksPage.test.tsx` covers populated and empty lists, search and
   filter preservation, deep links with an embedded mount prefix, load failures,
   capability gating, and both creation buttons' paths.
