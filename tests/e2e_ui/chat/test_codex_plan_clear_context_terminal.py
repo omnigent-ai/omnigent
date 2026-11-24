@@ -152,6 +152,9 @@ def test_plan_clear_context_terminal_follows_new_session(
         page.reload()
         _open_terminal_view(page)
         _wait_terminal_connected(page)
+        expect(page.locator('[data-testid="terminal-view"]').last).to_have_attribute(
+            "data-terminal-id", terminal_id
+        )
         reloaded_pane = _settled_pane(base_url, new_session_id, terminal_id, implemented)
 
         new_session = httpx.get(f"{base_url}/v1/sessions/{new_session_id}", timeout=10.0).json()
