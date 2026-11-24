@@ -333,7 +333,8 @@ function TicketColumn({
     >
       <h2 className="flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground">
         <TicketStageBadge stage={stage} showInstructionsOnHover />
-        <span className="flex items-center gap-1 tabular-nums">
+        {/* Pinned to the badge's height so a complete stage's collapse button can't lower its row. */}
+        <span className="flex h-5 items-center gap-1 tabular-nums">
           {tickets.length}
           {hasNextPage ? "+" : ""}
           {stage.is_complete && (
