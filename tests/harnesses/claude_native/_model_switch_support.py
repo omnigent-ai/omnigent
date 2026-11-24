@@ -155,6 +155,8 @@ class _EditableComposer:
             ]
         first, *rest = lines
         rows = [f"❯ {first}", *(f"  {row}" for row in rest)]
+        if not join_wrapped:
+            rows = [row.rstrip(" ") for row in rows]
         if self._visible_rows is not None and len(rows) >= self._visible_rows:
             # The rows take every line the pane has: no closing rule.
             clipped = "\n".join(rows[: self._visible_rows])
@@ -235,7 +237,7 @@ class _SessionModelComposer(_EditableComposer):
         self.prompt_separator = prompt_separator
         self.sends: list[tuple[str, ...]] = []
         self.status_queries = 0
-        self.show_current_selection = False
+        self.show_current_selection = True
         self.session = "native-session"
         self.version = "2.1.323"
         self.cache_cost_label = cache_cost_label

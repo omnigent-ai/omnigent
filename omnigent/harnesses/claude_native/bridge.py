@@ -5897,13 +5897,32 @@ def _legacy_model_pane(bridge_dir: Path) -> ClaudeLegacyModelPane | None:
         advertised = (bridge_dir / _TMUX_FILE).stat()
     except OSError:
         return None
+    raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+    version = raw.get("version")
     return ClaudeLegacyModelPane(
         info["socket_path"],
         info["tmux_target"],
         read_active_session_id(bridge_dir),
         read_claude_session_id(bridge_dir),
         (advertised.st_ino, advertised.st_mtime_ns),
+        version if isinstance(version, str) else None,
     )
+
+
+@_serialize_model_injection
+def legacy_model_request_is_current(
+    bridge_dir: Path, *, receipt: ClaudeLegacyModelSwitchResult
+) -> bool:
+    """Reuse an accepted legacy command only within its original pane generation."""
+    origin = receipt.pane
+    if (
+        origin is None
+        or supports_session_only_model_switch(origin.version)
+        or _legacy_model_pane(bridge_dir) != origin
+    ):
+        return False
+    state = _claude_pane_state(origin.socket_path, origin.tmux_target)
+    return not state.exited and _legacy_model_pane(bridge_dir) == origin
 
 
 @_serialize_model_injection

@@ -56,6 +56,7 @@ class ClaudeLegacyModelPane:
     active_session_id: str | None
     session_id: str | None
     advertisement: tuple[int, int]
+    version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -746,18 +747,42 @@ class SessionOnlyModelSwitch:
         ):
             return False
         current = [row for row in picker.rows if _row_is_current(row)]
-        if current != [picker.selected] or sum(self.row_matches(row) for row in picker.rows) != 1:
+        if (
+            len(current) != 1
+            or not self.row_matches(current[0])
+            or sum(self.row_matches(row) for row in picker.rows) != 1
+        ):
             return False
-        identities = re.findall(r"\(([^()\r\n]+)\)", picker.selected.text)
+        identities = re.findall(r"\(([^()\r\n]+)\)", current[0].text)
         if any(self.status_matches(identity, exact_context=True) for identity in identities):
             return True
-        caption = _row_label(picker.selected)
+        caption = _row_label(current[0])
         return bool(
             self.choice.structured
             and public_claude_model_id(self.choice.model)
             and self.choice.label == caption
             and re.search(r"\(1M context\)$", caption, re.IGNORECASE)
         )
+
+    def observe_current_context(self) -> bool:
+        """Read the active picker row without committing another selection."""
+        self.phase = "picker"
+        self.command("/model")
+        pane = self.wait(
+            lambda text: _picker(text) is not None, seconds=_IMMEDIATE_PICKER_TIMEOUT_S
+        )
+        picker = _picker(pane)
+        assert picker is not None
+        self.command_draft = None
+        self.owned_picker = picker
+        confirmed = self.current_picker_confirms_context(picker)
+        if _picker(self.pane()) != picker:
+            raise self.refuse("Claude's model picker changed before context could be confirmed.")
+        self.send("Escape")
+        self.wait(lambda text: _draft(text) == "" and _picker(text) is None, seconds=1.0)
+        self.owned_picker = None
+        self.phase = "status"
+        return confirmed
 
     def run(self) -> ClaudeModelSwitchResult:
         try:
@@ -863,12 +888,11 @@ class SessionOnlyModelSwitch:
                     "An unrelated draft occupies Claude's input box. Finish it, then retry."
                 )
             self.clear_owned_draft(self.owned_draft)
-        before_selection: str | None = None
-        if hinted_current or claude_picker_model_key(self.choice.model).endswith("[1m]"):
-            current = self.local_status()
-            before_selection = current
-            if hinted_current and self.status_matches(current, exact_context=True):
-                return self.result(current, already_selected=True)
+        before_selection = self.local_status()
+        plain_context = not claude_picker_model_key(self.choice.model).endswith("[1m]")
+        if hinted_current and self.status_matches(before_selection, exact_context=True):
+            if not plain_context or (self.choice.status_only and self.observe_current_context()):
+                return self.result(before_selection, already_selected=True)
         if self.choice.status_only:
             raise self.refuse(
                 f"Claude's fresh status did not confirm the current model {self.model}. "
@@ -929,15 +953,15 @@ class SessionOnlyModelSwitch:
             )
         self.finish_commit()
         current = self.local_status()
-        ambiguous_context = (
-            claude_picker_model_key(self.choice.model).endswith("[1m]")
-            and not self.status_matches(current, exact_context=True)
-            and not context_was_active
-            and (
-                before_selection is None
-                or self.status_matches(before_selection, exact_context=False)
+        ambiguous_context = not context_was_active and (
+            plain_context
+            or (
+                not self.status_matches(current, exact_context=True)
+                and self.status_matches(before_selection, exact_context=False)
             )
         )
+        if ambiguous_context and self.status_matches(current, exact_context=False):
+            ambiguous_context = not self.observe_current_context()
         if ambiguous_context or not self.status_matches(current, exact_context=False):
             raise self.refuse(
                 f"Claude's fresh status reports {current}, so the switch to {self.model} "

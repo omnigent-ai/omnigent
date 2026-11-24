@@ -13642,6 +13642,16 @@ def test_model_command_clears_only_the_exact_owned_blocked_draft(
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
 
+    if prompt.endswith(" ") and wrap_columns is None:
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+            claude_native_bridge.inject_model_command(
+                bridge_dir, model="private-glm[1m]", owned_draft=prompt
+            )
+        assert composer.sends == []
+        assert composer.submitted == []
+        assert composer.text == prompt
+        return
+
     if clear_result == "refused-attempt":
         attempts: list[int] = []
         box = claude_native_bridge._composer_box(composer._capture_pane("", ""))
@@ -13782,7 +13792,7 @@ def test_model_command_keeps_the_captured_application_wrapped_replacement(
         nonlocal captures
         if not join_wrapped:
             captures += 1
-            if captures == 3 and replace_after_first_observation:
+            if captures == 2 and replace_after_first_observation:
                 composer.text = captured["input"]
         if composer.text == captured["input"]:
             return captured["joined" if join_wrapped else "raw"]
@@ -13855,7 +13865,7 @@ def test_managed_model_status_check_preserves_exact_context_identity(
     [
         (True, True, True, 1, "picker"),
         (True, False, False, 2, "picker"),
-        (False, True, False, 2, "picker"),
+        (False, True, True, 2, "picker"),
         (True, True, True, 1, "observed-default"),
         (True, True, True, 1, "configured-default"),
         (True, False, None, 1, "observed-default"),
@@ -13990,10 +14000,17 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
         assert [args[-1] for args in composer.sends] == (
             ([_CLEAR_ONE_ROW_COMPOSER] if owned_draft else [])
             + (["/status", "Enter", "Escape"] if status_queries else [])
+            + (
+                ["/model", "Enter", "Escape"]
+                if already_selected and not target.lower().endswith("[1m]")
+                else []
+            )
         )
     else:
         assert composer.submitted[-1] == "/status"
-        assert [args[-1] for args in composer.sends].count("s") == (0 if already_selected else 1)
+        assert [args[-1] for args in composer.sends].count("s") == (
+            0 if raw_target and already_selected else 1
+        )
 
 
 @pytest.mark.parametrize(
@@ -14192,8 +14209,16 @@ def test_model_command_requires_exact_fresh_status_for_a_descriptorless_current_
             "opus",
             "opus (system.ai.claude-opus-4-8)",
         ),
+        ("private-glm", "private-glm", "private-glm"),
+        ("system.ai.claude-opus-4-8", "opus", "opus (system.ai.claude-opus-4-8)"),
     ],
-    ids=["bare-private", "wrapped-public", "wrapped-public-uppercase"],
+    ids=[
+        "bare-private",
+        "wrapped-public",
+        "wrapped-public-uppercase",
+        "plain-private",
+        "plain-public",
+    ],
 )
 @pytest.mark.parametrize("initial_model", ["marked", "plain", "different"])
 @pytest.mark.parametrize("selection_applied", [False, True])
@@ -14212,9 +14237,17 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     composer.show_current_selection = current_marker
     composer.options[-1] = model
     bare_model = model.removesuffix("[1m]").removesuffix("[1M]")
+    plain_request = bare_model == model
+    marked_model = model + "[1m]" if plain_request else model
+    composer.options.append(marked_model if plain_request else bare_model)
     if initial_model != "different":
-        composer.model = model if initial_model == "marked" else bare_model
+        composer.model = marked_model if initial_model == "marked" else bare_model
     bridge_dir = _session_model_bridge(tmp_path, composer)
+    if plain_request and initial_model != "different":
+        raw_path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
+        raw = json.loads(raw_path.read_text())
+        raw["model"] = {"id": reported}
+        raw_path.write_text(json.dumps(raw))
     claude_native_bridge.record_model_vocabulary(
         bridge_dir,
         launch_env=None,
@@ -14234,7 +14267,7 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
 
     def capture(socket_path: str, target: str) -> str:
         pane = composer._capture_pane(socket_path, target)
-        if composer.overlay == "status" and composer.model in {model, bare_model}:
+        if composer.overlay == "status" and composer.model in {marked_model, bare_model}:
             return pane.replace(f"Model: {composer.model}", f"Model: {reported}")
         return pane
 
@@ -14250,8 +14283,15 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     if not selection_applied:
         monkeypatch.setattr(claude_native_bridge, "_run_tmux", close_without_applying)
 
-    context_was_active = initial_model == "marked" and current_marker
-    if (initial_model == "different" and selection_applied) or context_was_active:
+    context_was_active = (
+        initial_model == ("plain" if plain_request else "marked") and current_marker
+    )
+    confirmed = (
+        context_was_active
+        or (selection_applied and current_marker)
+        or (not plain_request and initial_model == "different" and selection_applied)
+    )
+    if confirmed:
         result = claude_native_bridge.inject_model_command(bridge_dir, model=model)
         assert result.already_selected is context_was_active
         assert result.resolved_model == model
@@ -14262,7 +14302,12 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
         assert caught.value.phase == "status"
         assert caught.value.model_may_have_changed
 
-    assert composer.submitted == ["/status", "/model", "/status"]
+    requires_context_proof = (plain_request or initial_model != "different") and (
+        initial_model != "different" or selection_applied
+    )
+    assert composer.submitted == ["/status", "/model", "/status"] + (
+        ["/model"] if requires_context_proof and not context_was_active else []
+    )
     assert [args[-1] for args in composer.sends].count("s") == 1
 
 

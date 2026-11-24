@@ -146,14 +146,14 @@ async def test_an_unanswered_report_gives_way_to_the_newest_value(
             stalled_writes.append(
                 asyncio.create_task(store_later(data["running"], data["reported_at"]))
             )
-            # Queue the newer value before the unanswered request can time out.
-            reporter.report("conv_1", False)
             await asyncio.Event().wait()
         store(data["running"], data["reported_at"])
         return _response(202)
 
     reporter = BackgroundWorkReporter(post)
     reporter.report("conv_1", True)
+    await _settle()
+    reporter.report("conv_1", False)
     await poll_until_async(lambda: sent == [True, False], timeout_s=5)
     stalled_write_resumes.set()
     await asyncio.gather(*stalled_writes)

@@ -1380,6 +1380,8 @@ async def test_run_turn_passes_the_exact_required_model_to_the_shared_picker(
         "context-public-not-applied",
         "context-private-not-applied",
         "context-already-active",
+        "context-plain-not-applied",
+        "context-plain-applied",
     ],
 )
 async def test_run_turn_requires_a_matching_model_selection_result(
@@ -1403,14 +1405,24 @@ async def test_run_turn_requires_a_matching_model_selection_result(
             composer.model = (
                 target if receipt_kind == "context-already-active" else target.removesuffix("[1m]")
             )
+            if receipt_kind.startswith("context-plain-"):
+                target = "claude-opus-4-8"
+                composer.model = target + "[1m]"
+                composer.options.append(composer.model)
             composer.show_current_selection = True
         else:
             target = "system.ai.claude-sonnet-4-6"
-        composer.options[-1] = target
+        composer.options[1] = target
         if receipt_kind == "older-cli-confirmed" or receipt_kind.startswith("undiscovered-"):
             composer.model = composer.options[-1]
         initial_default = composer.saved_default
+        initial_model = composer.model
         bridge_dir = _session_model_bridge(tmp_path, composer)
+        if receipt_kind.startswith("context-plain-"):
+            raw_path = bridge_dir / claude_bridge.CONTEXT_RAW_FILE
+            raw = json.loads(raw_path.read_text())
+            raw["model"] = {"id": target}
+            raw_path.write_text(json.dumps(raw))
         if receipt_kind.startswith("undiscovered-"):
             config_path = bridge_dir / claude_bridge._CONFIG_FILE
             config = json.loads(config_path.read_text())
@@ -1441,7 +1453,8 @@ async def test_run_turn_requires_a_matching_model_selection_result(
                 else:
                     composer._run_tmux(socket_path, *args)
 
-            monkeypatch.setattr(claude_bridge, "_run_tmux", close_without_applying)
+            if receipt_kind != "context-plain-applied":
+                monkeypatch.setattr(claude_bridge, "_run_tmux", close_without_applying)
     else:
         bridge_dir = tmp_path / "bridge"
         receipt = (
@@ -1485,6 +1498,7 @@ async def test_run_turn_requires_a_matching_model_selection_result(
     accepted = receipt_kind.startswith("older-cli-") or receipt_kind in {
         "undiscovered-current",
         "context-already-active",
+        "context-plain-applied",
     }
     if accepted:
         assert events == [TurnComplete(response=None)] * attempts
@@ -1506,12 +1520,88 @@ async def test_run_turn_requires_a_matching_model_selection_result(
     elif receipt_kind.startswith("undiscovered-"):
         assert composer.status_queries == 1
         assert composer.saved_default == initial_default
-        assert [command for command in composer.submitted if command] == ["/status"]
+        assert [command for command in composer.submitted if command] == ["/status"] + (
+            ["/model"] if accepted else []
+        )
+        assert [args[-1] for args in composer.sends].count("s") == 0
     elif receipt_kind.startswith("context-"):
-        assert composer.model == (target if accepted else target.removesuffix("[1m]"))
+        assert composer.model == (target if accepted else initial_model)
         assert composer.saved_default == initial_default
-        assert composer.submitted == ["/status", "/model", "/status"] * attempts
+        commands = ["/status", "/model", "/status"]
+        if receipt_kind != "context-already-active":
+            commands.append("/model")
+        assert composer.submitted == commands * attempts
         assert [args[-1] for args in composer.sends].count("s") == attempts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "replacement", ["unchanged", "pane", "session", "version", "missing-session"]
+)
+async def test_consecutive_legacy_turns_do_not_repeat_an_unchanged_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, replacement: str
+) -> None:
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "web-session")
+    composer = _SessionModelComposer()
+    composer.version = "2.1.322"
+    composer.options[-1] = "opus"
+    composer.resolved_models["opus"] = "claude-opus-4-8"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    raw_path = bridge_dir / claude_bridge.CONTEXT_RAW_FILE
+    if replacement == "missing-session":
+        (bridge_dir / "state.json").unlink()
+        raw = json.loads(raw_path.read_text())
+        raw.pop("session_id")
+        raw_path.write_text(json.dumps(raw))
+    composer.install(monkeypatch)
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda _bridge, *, content, timeout_s=30.0: delivered.append(content),
+    )
+    executor = ClaudeNativeExecutor(bridge_dir)
+    for attempt in range(3):
+        if attempt == 1:
+            composer.saved_default = "another-terminal-default"
+        elif attempt == 2:
+            if replacement == "pane":
+                tmux_path = bridge_dir / claude_bridge._TMUX_FILE
+                info = json.loads(tmux_path.read_text())
+                info["tmux_target"] = "replacement:0.0"
+                tmux_path.write_text(json.dumps(info))
+            elif replacement == "session":
+                composer.session = "replacement-native-session"
+                (bridge_dir / "state.json").write_text(
+                    json.dumps({"claude_session_id": composer.session})
+                )
+                raw = json.loads(raw_path.read_text())
+                raw["session_id"] = composer.session
+                raw_path.write_text(json.dumps(raw))
+            elif replacement == "version":
+                composer.version = "2.1.321"
+                raw = json.loads(raw_path.read_text())
+                raw["version"] = composer.version
+                raw_path.write_text(json.dumps(raw))
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": f"hello {attempt}"}],
+                tools=[],
+                system_prompt="",
+                config=ExecutorConfig(model="opus"),
+            )
+        ]
+        assert events == [TurnComplete(response=None)]
+        commands = 2 if attempt == 2 and replacement in {"pane", "session", "version"} else 1
+        assert composer.submitted == ["/model opus"] * commands
+        assert composer.saved_default == (
+            "claude-opus-4-8" if attempt == 0 or commands == 2 else "another-terminal-default"
+        )
+    assert delivered == ["hello 0", "hello 1", "hello 2"]
+    assert composer.status_queries == 0
 
 
 @pytest.mark.asyncio

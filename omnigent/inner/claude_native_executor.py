@@ -38,6 +38,7 @@ from omnigent.harnesses.claude_native.bridge import (
     input_box_reads_clear,
     is_auth_slash_command,
     kill_session,
+    legacy_model_request_is_current,
     read_active_session_id,
     read_transcript_path,
     terminal_dialog_pending,
@@ -132,6 +133,7 @@ class ClaudeNativeExecutor(Executor):
         self._inject_lock = asyncio.Lock()
         # Set while ``run_turn`` holds a refused message (see ``_hold_message``).
         self._holding_message = False
+        self._legacy_model_selection: ClaudeLegacyModelSwitchResult | None = None
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""
@@ -186,11 +188,25 @@ class ClaudeNativeExecutor(Executor):
             self._require_active_session()
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
             context_path.unlink(missing_ok=True)
+            previous = self._legacy_model_selection
+            self._legacy_model_selection = None
             if wanted_model:
-                receipt = await self._inject(
-                    partial(inject_model_command, self._bridge_dir, model=wanted_model),
-                    preserve_session_on_cancel=True,
-                )
+                if (
+                    previous is not None
+                    and previous.requested_model == wanted_model
+                    and await self._inject(
+                        partial(
+                            legacy_model_request_is_current, self._bridge_dir, receipt=previous
+                        ),
+                        preserve_session_on_cancel=True,
+                    )
+                ):
+                    receipt = previous
+                else:
+                    receipt = await self._inject(
+                        partial(inject_model_command, self._bridge_dir, model=wanted_model),
+                        preserve_session_on_cancel=True,
+                    )
                 if (
                     not isinstance(
                         receipt, ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult
@@ -201,6 +217,8 @@ class ClaudeNativeExecutor(Executor):
                         "Claude did not return a matching model-selection result; "
                         "the prompt was not sent."
                     )
+                if isinstance(receipt, ClaudeLegacyModelSwitchResult):
+                    self._legacy_model_selection = receipt
             await self._inject_prompt(text, notices)
 
     async def _hold_message(self, refusal: RuntimeError, deadline: float) -> bool:
