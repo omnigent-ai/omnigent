@@ -69,6 +69,8 @@ export interface ScheduledTask {
   permissionMode: string | null;
   /** Per-run cost limit in USD; null/absent adds no automation-specific cap. */
   maxCostUsd?: number | null;
+  /** Whether new run sessions, and sessions runs launch, notify the owner; false mutes them. */
+  notifications?: boolean;
   /** MCP services every session the automation creates starts with. */
   mcpServices: string[];
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
@@ -189,6 +191,8 @@ export interface CreateScheduledTaskInput {
   permissionMode?: string | null;
   /** Optional per-run cost limit in USD; omit for no automation-specific cap. */
   maxCostUsd?: number | null;
+  /** False mutes the sessions runs start for the owner; omit to keep notifications on. */
+  notifications?: boolean;
   /** MCP services every run starts with; omit for none. */
   mcpServices?: string[];
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
@@ -237,6 +241,8 @@ export interface UpdateScheduledTaskInput {
   permissionMode?: string | null;
   /** Omit to preserve the cost limit; null removes it for future runs. */
   maxCostUsd?: number | null;
+  /** Applies to new sessions and the continued session; other sessions keep their mute. */
+  notifications?: boolean;
   /** Replaces the MCP services; `[]` clears them. */
   mcpServices?: string[];
   sessionMode?: ScheduledTaskSessionMode;
@@ -272,6 +278,8 @@ interface ScheduledTaskWire {
   reasoning_effort: string | null;
   permission_mode: string | null;
   max_cost_usd?: number | null;
+  // Absent on servers that predate the automation notifications setting.
+  notifications?: boolean;
   mcp_services?: string[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
@@ -368,6 +376,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
     maxCostUsd: wire.max_cost_usd ?? null,
+    notifications: wire.notifications !== false,
     mcpServices: wire.mcp_services ?? [],
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
@@ -590,6 +599,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.maxCostUsd != null) body.max_cost_usd = input.maxCostUsd;
+  if (input.notifications === false) body.notifications = false;
   if (input.mcpServices?.length) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
@@ -659,6 +669,7 @@ export async function updateScheduledTask(
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
   if (input.maxCostUsd !== undefined) body.max_cost_usd = input.maxCostUsd;
+  if (input.notifications !== undefined) body.notifications = input.notifications;
   if (input.mcpServices !== undefined) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;

@@ -210,6 +210,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         permission_mode=row.permission_mode,
         mcp_services=decode_mcp_services(row.mcp_services),
         max_cost_usd=row.max_cost_usd,
+        notifications=row.notifications,
         session_mode=decode_scheduled_task_session_mode(row.session_mode),
         kind=decode_scheduled_task_kind(row.kind),
         session_id=row.session_id,
@@ -241,6 +242,7 @@ _SESSION_CREATION_FIELDS = (
     "reasoning_effort",
     "permission_mode",
     "mcp_services",
+    "notifications",
     "project_id",
     "updated_at",
 )
@@ -324,6 +326,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         permission_mode: str | None = None,
         mcp_services: tuple[str, ...] = (),
         max_cost_usd: float | None = None,
+        notifications: bool = True,
         session_mode: str = "new",
         session_id: str | None = None,
         source_session_id: str | None = None,
@@ -378,6 +381,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 permission_mode=permission_mode,
                 mcp_services=encode_mcp_services(mcp_services),
                 max_cost_usd=max_cost_usd,
+                notifications=notifications,
                 session_mode=encode_scheduled_task_session_mode(session_mode),
                 kind=encoded_kind,
                 session_id=session_id,
@@ -554,6 +558,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         permission_mode: str | None = _UNSET,
         mcp_services: tuple[str, ...] | None = None,
         max_cost_usd: float | None = _UNSET,
+        notifications: bool | None = None,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
@@ -666,6 +671,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     changed = True
             if max_cost_usd is not _UNSET and row.max_cost_usd != max_cost_usd:
                 row.max_cost_usd = max_cost_usd
+                changed = True
+            if notifications is not None and row.notifications != notifications:
+                row.notifications = notifications
                 changed = True
             if session_mode is not None:
                 encoded_mode = encode_scheduled_task_session_mode(session_mode)

@@ -149,6 +149,7 @@ class ScheduledTaskStore(ABC):
         permission_mode: str | None = None,
         mcp_services: tuple[str, ...] = (),
         max_cost_usd: float | None = None,
+        notifications: bool = True,
         session_mode: str = "new",
         session_id: str | None = None,
         source_session_id: str | None = None,
@@ -182,6 +183,8 @@ class ScheduledTaskStore(ABC):
             (Claude Code), e.g. ``"acceptEdits"``.
         :param mcp_services: MCP service names every fired session starts with.
         :param max_cost_usd: Optional per-firing cost budget in USD.
+        :param notifications: Whether the sessions the task's runs start notify
+            ``user_id``; ``False`` starts them muted.
         :param session_mode: ``"new"`` (default) starts a new session per
             firing; ``"continue"`` sends each firing's prompt into one session.
         :param session_id: The existing session a ``"continue"`` task sends
@@ -333,6 +336,7 @@ class ScheduledTaskStore(ABC):
         permission_mode: str | None = _UNSET,
         mcp_services: tuple[str, ...] | None = None,
         max_cost_usd: float | None = _UNSET,
+        notifications: bool | None = None,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,

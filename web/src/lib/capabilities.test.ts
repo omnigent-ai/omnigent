@@ -614,14 +614,15 @@ describe("picker curation", () => {
   });
 });
 
-describe("resolveServerInfo scheduled_task_worktrees", () => {
-  it.each([
-    [true, true],
-    [undefined, false],
-    ["true", false],
-  ])("requires explicit support (%s)", async (advertised, expected) => {
-    expect((await probe({ scheduled_task_worktrees: advertised })).scheduled_task_worktrees).toBe(
-      expected,
-    );
-  });
-});
+describe.each(["scheduled_task_worktrees", "scheduled_task_notifications"] as const)(
+  "resolveServerInfo %s",
+  (flag) => {
+    it.each([
+      [true, true],
+      [undefined, false],
+      ["true", false],
+    ])("requires explicit support (%s)", async (advertised, expected) => {
+      expect((await probe({ [flag]: advertised }))[flag]).toBe(expected);
+    });
+  },
+);

@@ -318,6 +318,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
     assert created["max_cost_usd"] == 2.5
     assert created["base_branch"] is None
+    assert created["notifications"] is True
     assert created["execution_target"] == "connected_host"
     task_id = created["id"]
 
@@ -1751,12 +1752,13 @@ async def test_update_changes_fields_and_validates_rrule(
     # Valid partial update.
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
-        json={"name": "renamed", "state": "paused"},
+        json={"name": "renamed", "state": "paused", "notifications": False},
         headers=_headers(),
     )
     assert patched.status_code == 200, patched.text
     assert patched.json()["name"] == "renamed"
     assert patched.json()["state"] == "paused"
+    assert patched.json()["notifications"] is False
 
     # Invalid rrule on update is a 400.
     bad = await auth_client.patch(
@@ -3852,6 +3854,49 @@ async def test_session_mode_round_trips_and_a_null_session_starts_a_new_one(
         f"/v1/scheduled-tasks/{task_id}", json={"session_mode": "new"}, headers=_headers()
     )
     assert (to_new.json()["session_mode"], to_new.json()["session_id"]) == ("new", None)
+
+
+async def test_notifications_follow_the_session_an_automation_continues(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Only a change to the setting or the session touches it, so a hand mute or unmute sticks."""
+    from omnigent.stores.conversation_store import muted_label_key
+
+    first, second = _owned_session(db_uri), _owned_session(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_mode="continue", session_id=first, notifications=False),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    conversations = SqlAlchemyConversationStore(db_uri)
+    mute_key = muted_label_key("alice@example.com")
+
+    def muted(session_id: str) -> bool:
+        return mute_key in conversations.get_conversation(session_id).labels
+
+    async def patch(body: dict[str, object]) -> None:
+        resp = await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json=body, headers=_headers()
+        )
+        assert resp.status_code == 200, resp.text
+
+    assert muted(first)
+    conversations.delete_label(first, mute_key)
+    await patch({"name": "renamed"})
+    assert not muted(first)
+    await patch({"session_id": second})
+    assert muted(second)
+    await patch({"notifications": True})
+    assert not muted(second)
+    conversations.set_labels(second, {mute_key: "1"})
+    await patch({"notifications": True, "name": "renamed again"})
+    assert muted(second)
+    await patch({"notifications": False})
+    assert muted(second)
+    await patch({"notifications": True})
+    assert not muted(second) and not muted(first)
 
 
 async def test_create_can_continue_a_session_the_owner_picked(
@@ -7111,6 +7156,7 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
             model_override="databricks-claude-sonnet-4-6",
             reasoning_effort="high",
             base_branch="HEAD",
+            notifications=False,
             project_id=project_id,
         ),
         headers=_headers(),
@@ -7144,6 +7190,7 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
         "model_override",
         "reasoning_effort",
         "base_branch",
+        "notifications",
         "project_id",
         "mcp_services",
         "session_mode",
@@ -7157,6 +7204,7 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
         "model_override": "databricks-claude-sonnet-4-6",
         "reasoning_effort": "high",
         "base_branch": "HEAD",
+        "notifications": False,
         "project_id": project_id,
     }
     assert {key: clone[key] for key in seeded} == seeded

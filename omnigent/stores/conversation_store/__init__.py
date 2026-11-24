@@ -194,6 +194,16 @@ def muted_label_key(user_id: str | None) -> str:
     return _scoped_pin_key(MUTED_LABEL_KEY + ".", user_id)
 
 
+def muted_labels(user_id: str | None) -> dict[str, str]:
+    """
+    The label that mutes a new session for ``user_id``, valued as the web client writes it.
+
+    :param user_id: The user to mute it for, as in :func:`muted_label_key`.
+    :returns: ``{"omnigent.muted.<suffix>": "1"}``.
+    """
+    return {muted_label_key(user_id): "1"}
+
+
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
 # unarchive. A label rather than a ``conversations`` column, so ageing out old
 # archived sessions needs no schema migration; readers fall back to

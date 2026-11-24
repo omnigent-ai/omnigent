@@ -381,6 +381,16 @@ describe("createScheduledTask", () => {
     expect(bodies[1]).not.toHaveProperty("project_id");
   });
 
+  it("sends notifications only when they are off", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
+    await createScheduledTask({ ...base, notifications: false });
+    await createScheduledTask({ ...base, notifications: true });
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(bodies[0].notifications).toBe(false);
+    expect(bodies[1]).not.toHaveProperty("notifications");
+  });
+
   it("sends picked MCP services and omits an empty pick", async () => {
     fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
     const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
@@ -649,6 +659,20 @@ describe("random worktree setting", () => {
     const task = await updateScheduledTask("st_1", { baseBranch });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ base_branch: baseBranch });
     expect(task.baseBranch).toBe(baseBranch);
+  });
+});
+
+describe("notifications setting", () => {
+  it.each([false, true])("round trips an explicit %s update", async (notifications) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, notifications }));
+    const task = await updateScheduledTask("st_1", { notifications });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ notifications });
+    expect(task.notifications).toBe(notifications);
+  });
+
+  it("reads a server that omits the field as notifications on", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    expect((await updateScheduledTask("st_1", {})).notifications).toBe(true);
   });
 });
 

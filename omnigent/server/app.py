@@ -323,6 +323,8 @@ class ServerInfoResponse(BaseModel):
     dictation_available: bool
     # Scheduled tasks accept the optional random-worktree base ref.
     scheduled_task_worktrees: bool = True
+    # Scheduled tasks accept ``notifications``; older servers reject the field.
+    scheduled_task_notifications: bool = True
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
@@ -4186,6 +4188,7 @@ def create_app(
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "scheduled_task_worktrees": True,
+                "scheduled_task_notifications": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_mute": True,

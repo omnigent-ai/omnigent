@@ -106,7 +106,11 @@ from omnigent.server.session_mcp_selection import (
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    muted_label_key,
+    muted_labels,
+)
 from omnigent.stores.permission_store import MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
@@ -173,6 +177,8 @@ class CreateScheduledTaskRequest(BaseModel):
     # deployment's service names; validated against the owner's connections.
     mcp_services: list[str] = Field(default_factory=list, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)
+    # False starts the sessions runs start, and those they launch, muted for the owner.
+    notifications: bool = True
     # "continue" sends every run's prompt into one session: ``session_id`` when
     # given, else the session the first run creates. A prompt that runs a saved
     # workflow needs "new" (see ``workflow_session_reuse_error``).
@@ -246,6 +252,9 @@ class UpdateScheduledTaskRequest(BaseModel):
     # Replaces the task's MCP services; [] clears them.
     mcp_services: list[str] | None = Field(default=None, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
+    # Applies to later sessions and to the session the task continues; other
+    # existing sessions keep their mute.
+    notifications: bool | None = None
     session_mode: Literal["new", "continue"] | None = None
     # Null makes a continue-mode task's next run start a new session.
     session_id: str | None = Field(default=None, min_length=1)
@@ -348,6 +357,7 @@ def _to_response(
         "permission_mode": task.permission_mode,
         "mcp_services": list(task.mcp_services),
         "max_cost_usd": task.max_cost_usd,
+        "notifications": task.notifications,
         "session_mode": task.session_mode,
         "session_id": task.session_id,
         "source_session_id": task.source_session_id,
@@ -545,6 +555,52 @@ _TASK_NAME_MAX_CHARS = 256
 _CLONE_NAME_SUFFIX = " (copy)"
 
 
+async def _sync_continued_session_mute(
+    store: ScheduledTaskStore,
+    conversation_store: ConversationStore,
+    scheduled_task_id: str,
+    *,
+    unmute: bool,
+) -> None:
+    """Mute the session the task continues while its notifications are off, for its owner.
+
+    ``unmute`` also clears that mute while they are on. Callers run this only when the
+    setting or the continued session changes, so a hand mute or unmute sticks. Reads the
+    task as stored, so overlapping edits settle on the latest setting, and finishes even if
+    the request is cancelled. Best-effort: the task is already saved.
+    """
+
+    async def sync() -> None:
+        try:
+            task = await asyncio.to_thread(store.get, scheduled_task_id)
+            if task is None or task.state == "deleted" or not task.continues_session:
+                return
+            assert task.session_id is not None
+            if not task.notifications:
+                await asyncio.to_thread(
+                    conversation_store.set_labels, task.session_id, muted_labels(task.user_id)
+                )
+            elif unmute:
+                await asyncio.to_thread(
+                    conversation_store.delete_label,
+                    task.session_id,
+                    muted_label_key(task.user_id),
+                )
+        except Exception:
+            _logger.warning(
+                "could not update the mute of the session task %s continues",
+                scheduled_task_id,
+                exc_info=True,
+            )
+
+    syncing = asyncio.create_task(sync())
+    try:
+        await asyncio.shield(syncing)
+    except asyncio.CancelledError:
+        await await_cleanup_task(syncing)
+        raise
+
+
 def _clone_name(name: str) -> str:
     """*name* with the copy suffix, shortened to fit the name column."""
     return name[: _TASK_NAME_MAX_CHARS - len(_CLONE_NAME_SUFFIX)] + _CLONE_NAME_SUFFIX
@@ -563,6 +619,7 @@ def _clone_request(task: ScheduledTask) -> CreateScheduledTaskRequest:
         permission_mode=task.permission_mode,
         mcp_services=list(task.mcp_services),
         max_cost_usd=task.max_cost_usd,
+        notifications=task.notifications,
         session_mode="continue" if task.session_mode == "continue" else "new",
         workspace=task.workspace,
         base_branch=task.base_branch,
@@ -1366,6 +1423,7 @@ def create_scheduled_tasks_router(
                     permission_mode=permission_mode,
                     mcp_services=mcp_services,
                     max_cost_usd=body.max_cost_usd,
+                    notifications=body.notifications,
                     session_mode=body.session_mode,
                     session_id=body.session_id,
                     source_session_id=source_copy.id if source_copy is not None else None,
@@ -1428,6 +1486,8 @@ def create_scheduled_tasks_router(
             request.app.state, "scheduled_task_dispatch_enabled", False
         ):
             scheduler.add(task)
+        if task.continues_session and not task.notifications:
+            await _sync_continued_session_mute(store, conversation_store, task.id, unmute=False)
         # A freshly created task has no runs (last_run_status is None); its
         # next_run_at comes from the legacy timer or the persisted schedule.
         return _to_response(
@@ -2216,6 +2276,11 @@ def create_scheduled_tasks_router(
             request.app.state, "scheduled_task_dispatch_enabled", False
         ):
             scheduler.update(updated)
+        notifications_changed = updated.notifications != existing.notifications
+        if notifications_changed or updated.session_id not in (None, existing.session_id):
+            await _sync_continued_session_mute(
+                store, conversation_store, updated.id, unmute=notifications_changed
+            )
         if cancellation is not None:
             raise cancellation
         latest_status = store.list_latest_run_status_for_tasks([updated.id])

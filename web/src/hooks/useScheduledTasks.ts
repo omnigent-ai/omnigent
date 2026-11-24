@@ -19,6 +19,7 @@ import {
 import { useEffect, useRef } from "react";
 import { invalidateSessionGrants } from "@/hooks/usePermissions";
 import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
+import { beginMuteSave, settleMuteSave } from "@/lib/sessionMute";
 import {
   cloneScheduledTask,
   createScheduledTask,
@@ -383,7 +384,7 @@ export function useUpdateScheduledTask() {
   return useMutation({
     mutationFn: ({ id, input }: { id: string; input: UpdateScheduledTaskInput }) =>
       updateScheduledTask(id, input),
-    onSuccess: (updated) => {
+    onSuccess: (updated, { input }) => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
       // Refresh the detail query so the /tasks/:id page reflects the edit.
       void queryClient.invalidateQueries({ queryKey: scheduledTaskKey(updated.id) });
@@ -392,13 +393,21 @@ export function useUpdateScheduledTask() {
       void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(updated.id) });
       // Switching to new sessions stops it managing its session's sharing.
       invalidateSessionGrants(queryClient);
+      // The server mutes or unmutes the continued session to match. Record that here
+      // too, so a mute this tab saved moments ago can't keep showing the old state.
+      if (input.notifications !== undefined && updated.sessionId) {
+        const muted = updated.notifications === false;
+        if (beginMuteSave(updated.sessionId, muted)) settleMuteSave(updated.sessionId, muted);
+        refreshAutomationSourceSession(queryClient, updated.sessionId);
+      }
     },
   });
 }
 
 /**
  * Refresh the cached session lists, and the sessions' own entries when known,
- * after an automation adds the session its runs start from or clears its label.
+ * after an automation changes a session's labels, e.g. adding the session its
+ * runs start from or muting the session it continues.
  */
 export function refreshAutomationSourceSession(
   queryClient: QueryClient,

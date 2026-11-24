@@ -73,6 +73,10 @@ class ScheduledTask:
         blocks all models once cumulative spend reaches this limit. ``None``
         means no per-firing cost cap (the session runs unconstrained unless the
         agent spec or server-wide defaults impose one).
+    :param notifications: Whether the sessions its runs start, and the sessions
+        those runs launch, notify ``user_id``. ``False`` starts them muted and
+        mutes a session picked for the task to continue. Changing it also mutes
+        or unmutes the continued session; other sessions keep their own mute.
     :param session_mode: ``"new"`` (default) starts a new session per firing;
         ``"continue"`` sends each firing's prompt into ``session_id``.
     :param session_id: The session a ``"continue"`` task sends its prompt to.
@@ -118,6 +122,7 @@ class ScheduledTask:
     permission_mode: str | None = None
     mcp_services: tuple[str, ...] = ()
     max_cost_usd: float | None = None
+    notifications: bool = True
     session_mode: str = "new"
     kind: str = "automation"
     session_id: str | None = None

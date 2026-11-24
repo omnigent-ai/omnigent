@@ -62,6 +62,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         reasoning_effort="high",
         permission_mode="acceptEdits",
         mcp_services=("github", "linear"),
+        notifications=False,
         session_mode="continue",
         session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
@@ -82,6 +83,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.reasoning_effort == "high"
     assert task.permission_mode == "acceptEdits"
     assert task.mcp_services == ("github", "linear")
+    assert task.notifications is False
     assert task.session_mode == "continue"
     assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
@@ -113,6 +115,7 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.model_override is None
     assert task.reasoning_effort is None
     assert task.permission_mode is None
+    assert task.notifications is True
     assert task.session_mode == "new"
     assert task.session_id is None
     assert task.workspace is None
@@ -593,11 +596,13 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
         state="paused",
         last_run_at=1700000000,
         last_run_conversation_id=_uid("conv_x"),
+        notifications=False,
     )
     assert updated is not None
     assert updated.name == "after"
     assert updated.rrule == "FREQ=DAILY;BYHOUR=0;BYMINUTE=0"
     assert updated.base_branch is None
+    assert updated.notifications is False
     assert updated.state == "paused"
     assert updated.last_run_at == 1700000000
     assert updated.last_run_conversation_id == _uid("conv_x")

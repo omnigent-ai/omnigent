@@ -2568,6 +2568,11 @@
             "title": "Name",
             "type": "string"
           },
+          "notifications": {
+            "default": true,
+            "title": "Notifications",
+            "type": "boolean"
+          },
           "permission_mode": {
             "anyOf": [
               {
@@ -8221,6 +8226,11 @@
           "scheduled_task_mcp_services": {
             "default": true,
             "title": "Scheduled Task Mcp Services",
+            "type": "boolean"
+          },
+          "scheduled_task_notifications": {
+            "default": true,
+            "title": "Scheduled Task Notifications",
             "type": "boolean"
           },
           "scheduled_task_one_time": {
@@ -15892,6 +15902,17 @@
               }
             ],
             "title": "Name"
+          },
+          "notifications": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notifications"
           },
           "permission_mode": {
             "anyOf": [

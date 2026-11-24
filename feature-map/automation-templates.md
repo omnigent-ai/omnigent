@@ -102,6 +102,13 @@ to customize.
 - `default-project`: new automations select Omnigent Automation. Saving reuses or
   creates that project; canceling creates nothing. The project picker can choose
   another project or remove the default. Editing preserves the saved project.
+- `notifications`: Advanced settings has a Notifications switch, on by default and
+  hidden from older servers. When off, every session a run starts, and every session
+  a run launches, starts muted for the owner; viewers it is shared with keep their
+  own choice. Changing it applies to later sessions and mutes or unmutes the session
+  the automation continues, such as a trigger's polling session. Picking a session
+  to continue while Notifications is off mutes it too; other existing sessions keep
+  their own mute.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
   browsing again; saved paths and sandbox setup are preserved. When the default
@@ -282,6 +289,10 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   with **Start each run in a new session** on and check that the sessions have distinct
   worktree paths. Disable the option and run again: the new session uses the selected
   directory. With **Start each run in a new session** off, later runs reuse its worktree.
+- Create an automation with Notifications off and click Run now: the run's session is
+  dimmed in the sidebar, shows Unmute in its menu, and raises no notification or unread
+  dot when it finishes. Turn Notifications back on: a continued session (such as a
+  trigger's polling session) is unmuted, and the next new session notifies.
 - In any integration template, fill in the scope, a condition and session instructions,
   save, then choose Edit: the trigger form reopens with the same values and no
   rendered prompt. Toggle the link checkbox below the trigger, save, and check through
