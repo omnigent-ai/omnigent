@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { validateHeaderName, validateHeaderValue } from "node:http";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
@@ -48,35 +48,50 @@ const { target: OMNIGENT_URL, orgId: ORG_ID } = resolveTarget(
 // Mint tokens from this Databricks CLI profile instead of matching by host.
 const DATABRICKS_PROFILE = process.env.OMNIGENT_DATABRICKS_PROFILE || undefined;
 
-let cachedToken: { value: string | null; expiresAt: number; refreshAt: number } | undefined;
+let cliToken: { value: string | null; expiresAt: number } = { value: null, expiresAt: 0 };
+let refreshAt = 0;
+let refreshing: Promise<void> | undefined;
+
+// Mints a CLI token in the background; requests keep the current one until it
+// expires. A failed refresh keeps it and is retried after 10s.
+function refreshToken(host: string): Promise<void> {
+  refreshing ??= new Promise((resolve) => {
+    const selector = DATABRICKS_PROFILE ? ["--profile", DATABRICKS_PROFILE] : ["--host", host];
+    const args = ["auth", "token", ...selector, "--output", "json"];
+    // The CLI's own timeout allows for a browser login; the dev server shouldn't wait that long.
+    const child = execFile(
+      "databricks",
+      args,
+      { encoding: "utf8", timeout: 30_000 },
+      (error, stdout) => {
+        const now = Date.now();
+        refreshAt = now + 10_000;
+        try {
+          if (error) throw error;
+          const tokenResponse = JSON.parse(stdout) as { access_token?: string; expiry?: string };
+          if (!tokenResponse.access_token)
+            throw new Error("databricks auth token returned no token");
+          // CLI OAuth tokens last about an hour; one without a parseable expiry is re-read in minutes.
+          const expiresAt = Date.parse(tokenResponse.expiry ?? "") || now + 5 * 60_000;
+          cliToken = { value: tokenResponse.access_token, expiresAt };
+          refreshAt = Math.max(refreshAt, expiresAt - 60_000);
+        } catch {
+          // Failed refresh: keep the current token, e.g. until the user logs in again.
+        }
+        refreshing = undefined;
+        resolve();
+      },
+    );
+    child.stdin?.end();
+  });
+  return refreshing;
+}
 
 function resolveToken(host: string): string | null {
   if (process.env.OMNIGENT_AUTH_TOKEN) return process.env.OMNIGENT_AUTH_TOKEN;
   const now = Date.now();
-  if (cachedToken && now < cachedToken.refreshAt) return cachedToken.value;
-
-  try {
-    const selector = DATABRICKS_PROFILE ? ["--profile", DATABRICKS_PROFILE] : ["--host", host];
-    // Bounded: this blocks the dev server, and the CLI's own timeout allows a browser login.
-    const output = execFileSync("databricks", ["auth", "token", ...selector, "--output", "json"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 30_000,
-    });
-    const tokenResponse = JSON.parse(output) as { access_token?: string; expiry?: string };
-    if (!tokenResponse.access_token) throw new Error("databricks auth token returned no token");
-    // CLI OAuth tokens last about an hour; one without a parseable expiry is re-read in minutes.
-    const expiresAt = Date.parse(tokenResponse.expiry ?? "") || now + 5 * 60_000;
-    // Re-mint a minute before expiry, at most every 10s.
-    const refreshAt = Math.max(now + 10_000, expiresAt - 60_000);
-    cachedToken = { value: tokenResponse.access_token, expiresAt, refreshAt };
-  } catch {
-    // Keep a still-valid token through a failed refresh; retry in 10s, e.g. after a new login.
-    const expiresAt = cachedToken?.expiresAt ?? 0;
-    const value = now < expiresAt ? (cachedToken?.value ?? null) : null;
-    cachedToken = { value, expiresAt, refreshAt: now + 10_000 };
-  }
-  return cachedToken.value;
+  if (now >= refreshAt) void refreshToken(host);
+  return now < cliToken.expiresAt ? cliToken.value : null;
 }
 
 function configureProxy(target: string, useAuth: boolean): NonNullable<ProxyOptions["configure"]> {
@@ -88,6 +103,9 @@ function configureProxy(target: string, useAuth: boolean): NonNullable<ProxyOpti
   const basePath = parsed.pathname.replace(/\/$/, "");
 
   return (proxy) => {
+    // Start minting at server start too; `vite preview` skips the startup check.
+    if (useAuth) resolveToken(host);
+
     proxy.on("proxyReq", (proxyReq) => {
       if (basePath) proxyReq.path = `${basePath}${proxyReq.path}`;
       if (useAuth) {
@@ -195,11 +213,13 @@ function devProxyAuth(): Plugin {
   return {
     name: "dev-proxy-auth",
     apply: "serve",
-    config() {
+    async config() {
       if (!useAuth) {
         console.log(`[dev-proxy] target=${OMNIGENT_URL}`);
         return;
       }
+      // Serve only once a token is ready, so the first requests are authenticated.
+      if (!process.env.OMNIGENT_AUTH_TOKEN) await refreshToken(parsed.origin);
       const token = resolveToken(parsed.origin);
       if (token) {
         console.log(

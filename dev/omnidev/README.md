@@ -206,7 +206,7 @@ omnidev ui --server 'https://<workspace-host>/?o=<org-id>' --databricks-profile 
   or the history file.
 - The picker lists the last 10 servers, most recent first, and always ends with
   "Enter a new URL…". With no history it asks for a URL. Each server keeps the
-  profile last used with it. The list is stored in
+  profile last used with it (`--databricks-profile ""` clears it). The list is stored in
   `${XDG_CACHE_HOME:-~/.cache}/omnidev/recent-servers.json`.
 - Vite runs in the foreground with `--open`, so its own shortcuts work (`h`
   lists them). It runs `pnpm install` first when web deps are missing or stale.

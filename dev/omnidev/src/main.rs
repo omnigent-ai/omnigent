@@ -105,7 +105,7 @@ enum Command {
         #[arg(long)]
         server: Option<String>,
         /// Databricks CLI profile for the proxy's token (default: match by host).
-        /// Remembered with the server.
+        /// Remembered with the server; pass "" to clear it.
         #[arg(long)]
         databricks_profile: Option<String>,
     },

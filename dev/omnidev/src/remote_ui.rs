@@ -42,13 +42,14 @@ pub fn run(server_url: Option<String>, databricks_profile: Option<String>) -> Re
         return Ok(());
     };
     check_url(&url)?;
-    // Reuse the profile last paired with this URL unless one is given.
-    let databricks_profile = databricks_profile.or_else(|| {
-        recent
+    // Reuse the profile last paired with this URL unless one is given; "" clears it.
+    let databricks_profile = match databricks_profile {
+        Some(profile) => Some(profile).filter(|profile| !profile.is_empty()),
+        None => recent
             .iter()
             .find(|known| known.url == url)
-            .and_then(|known| known.databricks_profile.clone())
-    });
+            .and_then(|known| known.databricks_profile.clone()),
+    };
     let server = Server {
         url,
         databricks_profile,
