@@ -12,7 +12,7 @@ import { ProjectTeamDialog } from "./ProjectTeamDialog";
 import { projectIdentitiesKey, useProjectIdentities } from "./useProjectIdentities";
 
 /**
- * The project's owner-defined identities beside the Orchestrator button. Each
+ * The project's owner-defined identities beside the Lead button. Each
  * opens its one active session (single-tracked) or starts it when it has none.
  */
 export function ProjectIdentityRoster({
@@ -71,6 +71,7 @@ export function ProjectIdentityRoster({
                 : identity.active_session_id
                   ? `Open ${identity.name}'s session`
                   : `Start a session with ${identity.name}`}
+              {identity.router && ". It receives ticket events and escalations."}
             </TooltipContent>
           </Tooltip>
         );

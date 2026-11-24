@@ -2713,6 +2713,9 @@ class SessionResponse(BaseModel):
     # The identity this session works for, when it is that identity's active
     # session: ``{"id", "name"}``, plus ``instructions`` for runner requests.
     project_identity: dict[str, str] | None = None
+    # Whether this session is the project's router (the Lead by default), which
+    # receives routed ticket events and coordinates the board.
+    project_router: bool = False
 
 
 class UpdateSessionRequest(BaseModel):
@@ -6444,6 +6447,13 @@ class ProposeMandateRequest(BaseModel):
     text: str
 
 
+class ProjectRouterObject(BaseModel):
+    """The persona that receives a project's ticket events, digests and escalations."""
+
+    identity_id: str
+    name: str
+
+
 class ProjectObject(BaseModel):
     """
     A first-class project (see ``designs/PROJECTS_PRD.md``).
@@ -6481,6 +6491,26 @@ class ProjectObject(BaseModel):
     shared: bool = False
     # Deprecated response alias; remove in 0.25.0.
     orchestrator_session_id: str | None = None
+    # The owner's chosen router persona (``"orchestrator"`` is the Lead), or None.
+    router_identity_id: str | None = None
+    # Whether the owner removed the built-in Lead persona.
+    lead_removed: bool = False
+    # Who receives routed events now, after fallbacks: ``{"identity_id", "name"}``.
+    router: ProjectRouterObject | None = None
+
+
+class ProjectRoutingRequest(BaseModel):
+    """Owner-only routing settings, ``PUT /v1/projects/{project_id}/routing``.
+
+    :param router_identity_id: Persona id to route to, ``"orchestrator"`` for the
+        Lead, or ``None`` for the default (the Lead, else the first persona).
+    :param lead_removed: Remove (``True``) or restore (``False``) the built-in Lead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    router_identity_id: str | None = None
+    lead_removed: bool = False
 
 
 class ProjectShareObject(BaseModel):

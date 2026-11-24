@@ -206,7 +206,7 @@ describe("ProjectHomeTitle", () => {
     expect(screen.queryByLabelText(/needs? a response/)).toBeNull();
     expect(ticketsApi.getTicketSummary).not.toHaveBeenCalled();
     const actions = within(header).getByRole("group", { name: "Project actions" });
-    expect(within(actions).getByRole("link", { name: "Orchestrator" })).toHaveAttribute(
+    expect(within(actions).getByRole("link", { name: "Lead" })).toHaveAttribute(
       "href",
       "/projects/Billing%20%26%20Payments/orchestrator",
     );
@@ -220,7 +220,7 @@ describe("ProjectHomeTitle", () => {
     renderNavigation();
     const header = screen.getByRole("banner");
     expect(screen.queryByRole("tablist")).toBeNull();
-    expect(within(header).getByRole("link", { name: "Orchestrator" })).toBeVisible();
+    expect(within(header).getByRole("link", { name: "Lead" })).toBeVisible();
     expect(within(header).getByRole("button", { name: "New session" })).toBeVisible();
     expect(within(header).getByRole("link", { name: "New ticket" })).toBeVisible();
     expect(
@@ -356,7 +356,7 @@ describe("ProjectBoardSearch", () => {
 describe("ProjectNewSessionButton", () => {
   it("keeps ticket actions simple and sends New session to the full project composer", () => {
     renderNavigation();
-    expect(screen.getByRole("link", { name: "Orchestrator" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Lead" })).toHaveAttribute(
       "href",
       "/projects/Billing%20%26%20Payments/orchestrator",
     );

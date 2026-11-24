@@ -1534,7 +1534,7 @@ def register_core_routes(
                     code=exc.code if isinstance(exc, OmnigentError) else "session_launch_failed",
                     message=str(exc)
                     if isinstance(exc, OmnigentError)
-                    else "Orchestrator was saved, but could not start. Retry from the session.",
+                    else "The Lead was saved, but could not start. Retry from the session.",
                 )
                 await _persist_session_status_error_labels(bound_id, error, conversation_store)
                 await asyncio.to_thread(
@@ -1565,7 +1565,7 @@ def register_core_routes(
                     return await _main_creation_response(request, creation.session_id)
                 if isinstance(exc, (IntegrityError, ConversationAlreadyExistsError)):
                     raise OmnigentError(
-                        "Orchestrator creation is in progress; retry this submission",
+                        "Lead creation is in progress; retry this submission",
                         code=ErrorCode.CONFLICT,
                     ) from exc
             raise
@@ -1621,7 +1621,7 @@ def register_core_routes(
             or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
         )
         if body.title is None:
-            body.title = "Orchestrator"
+            body.title = "Lead"
         return creation
 
     async def _bind_main(
@@ -2770,6 +2770,20 @@ def register_core_routes(
                     if include_project_mandate:
                         # Runners compose the persona with the mandate.
                         snapshot.project_identity["instructions"] = identity.instructions
+            if project is not None and (
+                snapshot.project_main_session or snapshot.project_identity
+            ):
+                from omnigent.server.project_router import choose_router
+
+                identities = await asyncio.to_thread(
+                    project_store.list_identities, project.id, user_id=project.user_id
+                )
+                router = choose_router(project, identities)
+                snapshot.project_router = (
+                    snapshot.project_main_session
+                    if router.is_lead
+                    else (snapshot.project_identity or {}).get("id") == router.identity_id
+                )
         return snapshot
 
     @router.get(

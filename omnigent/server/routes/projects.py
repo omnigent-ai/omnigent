@@ -55,6 +55,12 @@ from omnigent.server.project_main_session import (
     project_session_payload,
     validate_main_assignment,
 )
+from omnigent.server.project_router import (
+    LEAD_IDENTITY_ID,
+    LEAD_NAME,
+    choose_router,
+    lead_present,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
@@ -63,6 +69,7 @@ from omnigent.server.schemas import (
     ProjectIdentitySessionRequest,
     ProjectOrderRequest,
     ProjectOrderResponse,
+    ProjectRoutingRequest,
     ProposeMandateRequest,
     ShareProjectRequest,
     UpdateProjectRequest,
@@ -100,6 +107,8 @@ def _to_response(project: Project) -> dict[str, Any]:
         "owner_user_id": project.user_id,
         # Deprecated response alias; remove in 0.25.0.
         "orchestrator_session_id": project.main_session_id,
+        "router_identity_id": project.router_identity_id,
+        "lead_removed": project.lead_removed,
     }
 
 
@@ -193,8 +202,13 @@ def create_projects_router(
     router = APIRouter()
 
     async def response(project: Project, viewer: str | None) -> dict[str, Any]:
+        identities = await asyncio.to_thread(
+            project_store.list_identities, project.id, user_id=project.user_id
+        )
+        router_choice = choose_router(project, identities)
         return {
             **_to_response(project),
+            "router": {"identity_id": router_choice.identity_id, "name": router_choice.name},
             "shared": project.user_id != viewer,
             "main_session_state": await main_session_state(
                 project, conversation_store, permission_store
@@ -498,7 +512,7 @@ def create_projects_router(
         """
         return await resolve_proposal(request, project_id, proposal_id, accept=False)
 
-    # -- Identities: the built-in Orchestrator plus owner-defined roles --
+    # -- Identities: the built-in Lead plus owner-defined roles --
 
     def _refuse_agent_identity_delete(request: Request) -> None:
         """Agents may create and edit identities, but only the project owner removes them."""
@@ -528,7 +542,10 @@ def create_projects_router(
 
     @router.get("/projects/{project_id}/identities")
     async def list_identities(request: Request, project_id: str) -> dict[str, Any]:
-        """List the project's identities, the built-in Orchestrator first."""
+        """List the project's identities, the built-in Lead first unless it was removed.
+
+        Each entry's ``router`` marks the one that receives routed events.
+        """
         user_id = require_user(request, auth_provider)
         project = await _owned_project(project_id, user_id)
         identities = await asyncio.to_thread(
@@ -537,13 +554,48 @@ def create_projects_router(
         # Every identity keeps one live session; this listing is what the board polls.
         project = await heal_main_session(request, project)
         identities = await heal_identity_sessions(request, project, identities)
-        orchestrator = orchestrator_identity_response(
-            project, await main_session_state(project, conversation_store, permission_store)
-        )
-        data = [orchestrator] + [
-            await _identity_payload(project, identity) for identity in identities
-        ]
+        data = [await _identity_payload(project, identity) for identity in identities]
+        if lead_present(project, identities):
+            lead = orchestrator_identity_response(
+                project, await main_session_state(project, conversation_store, permission_store)
+            )
+            data.insert(0, lead)
+        router_id = choose_router(project, identities).identity_id
+        for entry in data:
+            entry["router"] = entry["id"] == router_id
         return {"object": "list", "data": data}
+
+    @router.put("/projects/{project_id}/routing")
+    async def set_project_routing(
+        request: Request, project_id: str, body: ProjectRoutingRequest
+    ) -> dict[str, Any]:
+        """Choose the router persona and remove or restore the Lead. Owner-only, never agents.
+
+        The router receives ticket events, digests and escalations. Without a
+        choice it is the Lead, or the first persona once the Lead is removed.
+        """
+        user_id = require_user(request, auth_provider)
+        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+            raise OmnigentError(
+                "Only the project owner can change who receives its routed events",
+                code=ErrorCode.FORBIDDEN,
+            )
+        router_id = body.router_identity_id
+        if router_id is not None and router_id != LEAD_IDENTITY_ID:
+            router_id = _identity_id(router_id)
+        if router_id == LEAD_IDENTITY_ID and body.lead_removed:
+            raise OmnigentError(
+                "Choose another router before removing the Lead", code=ErrorCode.INVALID_INPUT
+            )
+        project = await asyncio.to_thread(
+            project_store.set_routing,
+            project_id,
+            user_id=user_id,
+            router_identity_id=router_id,
+            lead_removed=body.lead_removed,
+        )
+        announce_projects_changed(user_id)
+        return await response(project, user_id)
 
     def _source_session(request: Request) -> str | None:
         source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
@@ -747,11 +799,28 @@ def create_projects_router(
             healed.append(identity)
         return healed
 
+    retitled_leads: set[str] = set()
+
+    async def _retitle_legacy_lead(project: Project) -> None:
+        """Give a Lead session still titled with the old default name the new one."""
+        session_id = project.main_session_id
+        if session_id is None or session_id in retitled_leads or conversation_store is None:
+            return
+        retitled_leads.add(session_id)
+        renamed = await asyncio.to_thread(
+            conversation_store.rename_conversation_if_title_matches,
+            session_id,
+            "Orchestrator",
+            LEAD_NAME,
+        )
+        if renamed is not None:
+            announce_projects_changed(project.user_id)
+
     main_heal_locks: dict[str, asyncio.Lock] = {}
     main_heal_not_before: dict[str, float] = {}
 
     async def heal_main_session(request: Request, project: Project) -> Project:
-        """Start a fresh Orchestrator when the project's one is deleted or was never made.
+        """Start a fresh Lead when the project's one is deleted or was never made.
 
         An archived main is left alone (a rollover keeps the pointer on its archived
         predecessor until the switch), and so is any project mid-rollover.
@@ -772,8 +841,16 @@ def create_projects_router(
                 main_heal_not_before.get(current.id, 0.0)
             ):
                 return current
+            if current.lead_removed:
+                identities = await asyncio.to_thread(
+                    project_store.list_identities, current.id, user_id=current.user_id
+                )
+                # A removed Lead stays removed while another persona can route.
+                if not lead_present(current, identities):
+                    return current
             state = await main_session_state(current, conversation_store, permission_store)
             if state not in ("absent", "missing"):
+                await _retitle_legacy_lead(current)
                 return current
             try:
                 await start_fresh_main_session(
@@ -817,7 +894,7 @@ def create_projects_router(
         project = await _owned_project(project_id, user_id)
         if identity_id == ORCHESTRATOR_IDENTITY_ID:
             raise OmnigentError(
-                "Open the Orchestrator from the project header", code=ErrorCode.INVALID_INPUT
+                "Open the Lead from the project header", code=ErrorCode.INVALID_INPUT
             )
         # ``body.expected_session_id`` is accepted for older clients; the lock makes it moot.
         del body
@@ -943,9 +1020,10 @@ def create_projects_router(
         identities = await asyncio.to_thread(
             project_store.list_identities, project.id, user_id=project.user_id
         )
-        return [Mention(ORCHESTRATOR_IDENTITY_ID, "Orchestrator")] + [
-            Mention(identity.id, identity.name) for identity in identities
-        ]
+        personas = [Mention(identity.id, identity.name) for identity in identities]
+        if lead_present(project, identities):
+            personas.insert(0, Mention(LEAD_IDENTITY_ID, LEAD_NAME))
+        return personas
 
     async def open_mention_session(
         request: Request, project: Project, mention: Mention

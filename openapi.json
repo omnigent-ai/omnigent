@@ -6904,6 +6904,32 @@
         "title": "ProjectOrderResponse",
         "type": "object"
       },
+      "ProjectRoutingRequest": {
+        "additionalProperties": false,
+        "description": "Owner-only routing settings, `PUT /v1/projects/{project_id}/routing`.",
+        "properties": {
+          "lead_removed": {
+            "default": false,
+            "description": "Remove (`True`) or restore (`False`) the built-in Lead.",
+            "title": "Lead Removed",
+            "type": "boolean"
+          },
+          "router_identity_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Persona id to route to, `\"orchestrator\"` for the Lead, or `None` for the default (the Lead, else the first persona).",
+            "title": "Router Identity Id"
+          }
+        },
+        "title": "ProjectRoutingRequest",
+        "type": "object"
+      },
       "ProjectSessionCreateRequest": {
         "description": "Project-opted create shape whose agent may be filled by the server.\n\nThe public legacy `SessionCreateRequest` deliberately keeps\n`agent_id` required so requests without `project_id` retain their exact\nvalidation and OpenAPI contract.",
         "properties": {
@@ -13602,6 +13628,11 @@
           "project_orchestrator": {
             "default": false,
             "title": "Project Orchestrator",
+            "type": "boolean"
+          },
+          "project_router": {
+            "default": false,
+            "title": "Project Router",
             "type": "boolean"
           },
           "reasoning_effort": {
@@ -22038,7 +22069,7 @@
     },
     "/v1/projects/{project_id}/identities": {
       "get": {
-        "description": "List the project's identities, the built-in Orchestrator first.",
+        "description": "List the project's identities, the built-in Lead first unless it was removed.\n\nEach entry's `router` marks the one that receives routed events.",
         "operationId": "list_identities_v1_projects__project_id__identities_get",
         "parameters": [
           {
@@ -22473,6 +22504,61 @@
           }
         },
         "summary": "Accept Mandate Proposal",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/routing": {
+      "put": {
+        "description": "Choose the router persona and remove or restore the Lead. Owner-only, never agents.\n\nThe router receives ticket events, digests and escalations. Without a\nchoice it is the Lead, or the first persona once the Lead is removed.",
+        "operationId": "set_project_routing_v1_projects__project_id__routing_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectRoutingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Project Routing V1 Projects  Project Id  Routing Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Project Routing",
         "tags": [
           "projects"
         ]

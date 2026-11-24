@@ -440,10 +440,11 @@ async def test_agents_create_and_edit_their_own_identities_but_not_the_owners(
     )
     assert pm.status_code == 200
     assert (pm.json()["name"], pm.json()["created_by_session_id"]) == ("PM", source)
-    reserved = await project_client.post(
-        identities, json={"name": "orchestrator", "instructions": "x"}, headers=agent
-    )
-    assert reserved.status_code == 400
+    for name in ("orchestrator", "Lead"):
+        reserved = await project_client.post(
+            identities, json={"name": name, "instructions": "x"}, headers=agent
+        )
+        assert reserved.status_code == 400
     duplicate = await project_client.post(
         identities, json={"name": "pm", "instructions": "x"}, headers=agent
     )
@@ -453,7 +454,7 @@ async def test_agents_create_and_edit_their_own_identities_but_not_the_owners(
     )
     assert edited.json()["instructions"] == "You own pricing."
     owners = (
-        await project_client.post(identities, json={"name": "Lead", "instructions": "Mine."})
+        await project_client.post(identities, json={"name": "Ops", "instructions": "Mine."})
     ).json()
     assert owners["created_by_session_id"] is None
     refused = await project_client.patch(
@@ -463,7 +464,52 @@ async def test_agents_create_and_edit_their_own_identities_but_not_the_owners(
     deleted = await project_client.delete(f"{identities}/{pm.json()['id']}", headers=agent)
     assert deleted.status_code == 403
     names = [entry["name"] for entry in (await project_client.get(identities)).json()["data"]]
-    assert names[0] == "Orchestrator" and sorted(names[1:]) == ["Lead", "PM"]
+    assert names[0] == "Lead" and sorted(names[1:]) == ["Ops", "PM"]
+
+
+async def test_the_owner_routes_events_to_a_persona_and_can_remove_the_lead(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Routing defaults to the Lead, follows the owner's choice, then the first persona."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    project = f"/v1/projects/{created['id']}"
+    lead = {"identity_id": "orchestrator", "name": "Lead"}
+    assert created["router"] == lead
+    pm = (await project_client.post(f"{project}/identities", json={"name": "PM"})).json()
+    qa = (await project_client.post(f"{project}/identities", json={"name": "QA"})).json()
+    agent = {ORCHESTRATION_SOURCE_HEADER: created["main_session_id"]}
+    refused = await project_client.put(
+        f"{project}/routing", json={"router_identity_id": qa["id"]}, headers=agent
+    )
+    assert refused.status_code == 403
+
+    async def route(body: dict[str, object]) -> dict[str, object]:
+        response = await project_client.put(f"{project}/routing", json=body)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    chosen = await route({"router_identity_id": qa["id"], "lead_removed": True})
+    assert chosen["router"] == {"identity_id": qa["id"], "name": "QA"}
+    listed = (await project_client.get(f"{project}/identities")).json()["data"]
+    assert [(entry["name"], entry["router"]) for entry in listed] == [
+        ("PM", False),
+        ("QA", True),
+    ]
+    snapshot = await project_client.get(f"/v1/sessions/{qa['active_session_id']}")
+    assert snapshot.json()["project_router"] is True
+    lead_session = await project_client.get(f"/v1/sessions/{created['main_session_id']}")
+    assert lead_session.json()["project_router"] is False
+    # A client config replace keeps the server-owned routing settings.
+    await project_client.patch(project, json={"config": {"model": "m"}})
+    assert (await project_client.get(project)).json()["router"]["name"] == "QA"
+    first = await route({"router_identity_id": None, "lead_removed": True})
+    assert first["router"] == {"identity_id": pm["id"], "name": "PM"}
+    removing = await project_client.put(
+        f"{project}/routing", json={"router_identity_id": "orchestrator", "lead_removed": True}
+    )
+    assert removing.status_code == 400
+    restored = await route({"router_identity_id": None, "lead_removed": False})
+    assert (restored["router"], restored["lead_removed"]) == (lead, False)
 
 
 async def test_agents_open_an_identitys_one_session_but_cannot_edit_it(

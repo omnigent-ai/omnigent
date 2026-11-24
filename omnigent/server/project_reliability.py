@@ -1,4 +1,4 @@
-"""Check in on stalled project work and escalate to the project's lead orchestrator.
+"""Check in on stalled project work and escalate to the project's router (its Lead by default).
 
 A server-run, non-LLM loop. Every check it looks at each project with an
 orchestrator and:
@@ -41,6 +41,11 @@ from omnigent.entities.project_ticket import (
     TicketActor,
     TicketLabel,
     UpdateTicket,
+)
+from omnigent.server.project_router import (
+    project_router,
+    router_session_id,
+    router_session_ids,
 )
 
 _logger = logging.getLogger(__name__)
@@ -467,7 +472,7 @@ class ReliabilityLoop:
         if len(stages) < 2:
             return
         working = {stage["id"]: stage["name"] for stage in stages[1:-1]}
-        excluded = {project.main_session_id, *project.retired_main_session_ids}
+        excluded = await router_session_ids(self.app, project)
         seen: set[str] = set()
         newest = 0
         for ticket in board.get("data", []):
@@ -599,7 +604,8 @@ class ReliabilityLoop:
                 ", ".join(f"`{w.id[:8]}`" for w in restarted) or "nothing"
             )
         if next_step == ESCALATE:
-            if project.main_session_id is None:
+            router = await router_session_id(self.app, project)
+            if router is None:
                 await self._park(project, state, ticket, None, minutes)
                 return
             summary = (
@@ -618,9 +624,9 @@ class ReliabilityLoop:
                 )
                 + " Please check it and decide the next step."
             )
-            await self._send(project.main_session_id, summary, project.user_id)
+            await self._send(router, summary, project.user_id)
             state.escalated.add(ticket_id)
-            text = f"no progress for {minutes} min; escalated to the lead orchestrator"
+            text = f"no progress for {minutes} min; escalated to the router `{router[:8]}`"
         ladder.step = next_step
         ladder.at = now
         ladder.ticket_mark = await self._note(project, ticket_id, f"step {next_step}/3, {text}.")
@@ -711,10 +717,15 @@ class ReliabilityLoop:
         state.tickets.pop(ticket_id, None)
         state.escalated.discard(ticket_id)
         since, reminded = state.owner_waits.get(ticket_id, (now, False))
-        if not reminded and now - since >= config.owner_wait_s and project.main_session_id:
+        router = (
+            await router_session_id(self.app, project)
+            if not reminded and now - since >= config.owner_wait_s
+            else None
+        )
+        if router:
             title = (ticket.get("title") or "")[:80]
             await self._send(
-                project.main_session_id,
+                router,
                 f'[{NOTE_PREFIX}] Ticket {ticket_id} ("{title}") has been waiting on the owner '
                 f"({reason}) for {int((now - since) // 3600)} h. If the ask is still open and "
                 "clear, leave it; otherwise restate it or unblock the ticket.",
@@ -802,9 +813,10 @@ class ReliabilityLoop:
             started = wait.set_at if wait.set_at is not None else now
             if not wait.confirm_asked and now - started >= config.max_wait_s:
                 wait.confirm_asked = True
-                if project.main_session_id:
+                router = await router_session_id(self.app, project)
+                if router:
                     await self._send(
-                        project.main_session_id,
+                        router,
                         f'[{NOTE_PREFIX}] Ticket {ticket_id} ("{title}") has been waiting '
                         f"{int((now - started) // 3600)} h, until {_when(wake_at)}: {note}. "
                         "Please confirm the wait is still right, or change or remove its "
@@ -844,26 +856,33 @@ class ReliabilityLoop:
         return True
 
     async def _wake_target(self, project: Any, setter: str | None) -> tuple[str | None, str]:
-        """The setter, restarted first if dead; the lead when it's gone or unknown."""
-        if setter and setter != project.main_session_id:
+        """The setter, restarted first if dead; the router when it's gone or unknown."""
+        router = await router_session_id(self.app, project)
+        if setter and setter != router:
             view = await self._session(setter)
             if view is not None:
                 if view.dead and await self._restart(view.id, project.user_id):
                     return view.id, " (restarted first)"
                 return view.id, ""
-            return project.main_session_id, " (the lead; the setter's session is gone)"
-        return project.main_session_id, ""
+            return router, " (the router; the setter's session is gone)"
+        return router, ""
 
     # -- the lead ------------------------------------------------------------
 
     async def _check_lead(
         self, project: Any, state: ProjectState, config: Settings, now: float
     ) -> bool:
-        """Recover an unresponsive lead; return whether it looks healthy."""
+        """Recover an unresponsive router; return whether it looks healthy.
+
+        The Lead is restored, restarted, then rolled over; a persona router is
+        restored or restarted (it has no rollover).
+        """
         from omnigent.server import project_orchestrator_rollover as rollover
         from omnigent.server.project_main_session import main_session_state
 
         lead = state.lead
+        if not (await project_router(self.app, project)).is_lead:
+            return await self._check_persona_router(project, lead, config, now)
         if rollover.rollover_in_progress(project.id):
             return False
         conversations = self._notifications.inputs.conversations
@@ -904,9 +923,7 @@ class ReliabilityLoop:
         reason = "failed" if view.dead else "not picking up queued messages"
         if lead.step < LEAD_RESTART and await self._restart(view.id, project.user_id):
             lead.step, lead.at = LEAD_RESTART, now
-            await self._lead_note(
-                project, state, f"the lead orchestrator was {reason}; restarted it"
-            )
+            await self._lead_note(project, state, f"the lead was {reason}; restarted it")
             return False
         if lead.step < LEAD_ROLLOVER:
             scheduled = rollover.schedule_rollover(
@@ -922,8 +939,32 @@ class ReliabilityLoop:
             lead.step, lead.at = LEAD_ROLLOVER, now
             if scheduled:
                 await self._lead_note(
-                    project, state, f"the lead orchestrator was still {reason}; rolled it over"
+                    project, state, f"the lead was still {reason}; rolled it over"
                 )
+        return False
+
+    async def _check_persona_router(
+        self, project: Any, lead: Any, config: Settings, now: float
+    ) -> bool:
+        """Restore a persona router's lost session, or restart a failed one."""
+        if lead.step and now - lead.at < config.step_s:
+            return False
+        session_id = await router_session_id(self.app, project)
+        view = await self._session(session_id) if session_id else None
+        if view is None:
+            lead.step, lead.at, lead.session_id = LEAD_RESTART, now, None
+            return False
+        if lead.session_id != view.id:
+            lead.step, lead.session_id = 0, view.id
+        waiting = view.oldest_pending_at is not None and now - view.oldest_pending_at >= (
+            config.lead_response_s
+        )
+        if not (view.dead or (waiting and view.status not in _MID_TURN)):
+            lead.step = 0
+            return True
+        if lead.step < LEAD_RESTART and await self._restart(view.id, project.user_id):
+            lead.step, lead.at = LEAD_RESTART, now
+            _logger.info("Reliability: restarted project %s's router %s", project.id, view.id)
         return False
 
     async def _lead_note(self, project: Any, state: ProjectState, text: str) -> None:
@@ -953,10 +994,11 @@ class ReliabilityLoop:
         last = state.last_review_at or state.started_at
         if not lead_ok or now - last < config.review_s or newest <= state.reviewed_mark:
             return
-        if project.main_session_id is None:
+        router = await router_session_id(self.app, project)
+        if router is None:
             return
         await self._send(
-            project.main_session_id,
+            router,
             f"[{NOTE_PREFIX}] Periodic review. Briefly check the board: does each open ticket's "
             "stage fit its work, is anything waiting on you (handoffs to land, verifications "
             "to arrange, final updates to write), and does the work still match what the "

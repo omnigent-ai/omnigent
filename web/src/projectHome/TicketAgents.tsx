@@ -53,12 +53,12 @@ export function TicketAgents({
           ) : (
             <Link
               to={projectOrchestratorPath(projectName)}
-              aria-label="Open orchestrator"
+              aria-label="Open the Lead"
               className="flex items-center gap-3 rounded-sm p-3 text-sm hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
             >
               <MessageSquareIcon aria-hidden className="size-4 text-muted-foreground" />
               <span className="min-w-0 flex-1">
-                <span className="block font-medium">Orchestrator</span>
+                <span className="block font-medium">Lead</span>
                 <span className="block text-muted-foreground">
                   Coordinates work and handles questions
                 </span>

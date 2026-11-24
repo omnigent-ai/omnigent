@@ -15,7 +15,8 @@ if TYPE_CHECKING:
     from omnigent.stores import ConversationStore, PermissionStore
 
 IdentitySessionState = Literal["absent", "missing", "archived", "idle", "busy", "unavailable"]
-# Built-in identity id for the project's Orchestrator (``projects.main_session_id``).
+# Built-in identity id for the project's Lead (``projects.main_session_id``); the
+# id keeps its original name so stored routing, mentions and links stay valid.
 ORCHESTRATOR_IDENTITY_ID = "orchestrator"
 # Live statuses meaning a turn is in flight; a new session must wait (single-tracked).
 _BUSY_LIVE_STATUSES = frozenset({"running", "waiting"})
@@ -71,12 +72,12 @@ def identity_response(identity: ProjectIdentity, state: IdentitySessionState) ->
 def orchestrator_identity_response(
     project: Project, state: IdentitySessionState
 ) -> dict[str, Any]:
-    """The built-in Orchestrator identity, backed by the project's main session."""
+    """The built-in Lead identity, backed by the project's main session."""
     return {
         "id": ORCHESTRATOR_IDENTITY_ID,
         "object": "project.identity",
         "project_id": project.id,
-        "name": "Orchestrator",
+        "name": "Lead",
         "builtin": True,
         "instructions": "",
         "agent_id": project.config.get("agent_id"),

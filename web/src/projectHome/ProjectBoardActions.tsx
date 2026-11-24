@@ -19,14 +19,17 @@ export function ProjectBoardActions({
   const isMobile = useIsMobileViewport();
   const [search] = useSearchParams();
   const { projectId, projects } = useTicketProject(projectName);
+  const leadRemoved = projects.data?.find((project) => project.id === projectId)?.lead_removed;
   return (
     <div className="flex items-center gap-2" role="group" aria-label="Project actions">
-      <Button asChild variant="ghost" size={isMobile ? "icon" : "sm"}>
-        <Link to={projectOrchestratorPath(projectName, search)} aria-label="Orchestrator">
-          <MessageSquareIcon />
-          {!isMobile && "Orchestrator"}
-        </Link>
-      </Button>
+      {!leadRemoved && (
+        <Button asChild variant="ghost" size={isMobile ? "icon" : "sm"}>
+          <Link to={projectOrchestratorPath(projectName, search)} aria-label="Lead">
+            <MessageSquareIcon />
+            {!isMobile && "Lead"}
+          </Link>
+        </Button>
+      )}
       {!projects.isLoading && !projects.isError && (
         <ProjectIdentityRoster projectId={projectId} projectName={projectName} />
       )}

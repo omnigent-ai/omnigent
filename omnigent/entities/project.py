@@ -32,12 +32,15 @@ class Project:
         empty dict when none are stored. The key vocabulary is owned by the
         client; the store persists and returns it whole. These are hints the
         new-chat dialog pre-fills, not enforced requirements.
-    :param main_session_id: The project's Orchestrator session, or ``None``.
+    :param main_session_id: The project's Lead session, or ``None``.
     :param mandate: Owner-written guidance (markdown) loaded into every agent
         session in the project to set its bounds, or ``None`` when unset.
     :param mandate_proposals: Proposed additions awaiting the owner, oldest first.
-    :param retired_main_session_ids: Former orchestrator sessions, oldest first.
-        Server-owned: messages addressed to one reach the current orchestrator.
+    :param retired_main_session_ids: Former lead sessions, oldest first.
+        Server-owned: messages addressed to one reach the current lead.
+    :param router_identity_id: The owner-chosen persona that receives routed
+        events (``"orchestrator"`` for the Lead), or ``None`` for the default.
+    :param lead_removed: Whether the owner removed the built-in Lead persona.
     """
 
     id: str
@@ -50,6 +53,8 @@ class Project:
     mandate: str | None = None
     mandate_proposals: list[MandateProposal] = field(default_factory=list)
     retired_main_session_ids: list[str] = field(default_factory=list)
+    router_identity_id: str | None = None
+    lead_removed: bool = False
 
 
 @dataclass(frozen=True)

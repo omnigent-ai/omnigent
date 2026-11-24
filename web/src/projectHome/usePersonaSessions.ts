@@ -7,7 +7,7 @@ import { PROJECT_IDENTITY_LABEL_KEY } from "@/lib/personaAvatar";
 import { useProjectIdentities } from "./useProjectIdentities";
 
 /**
- * Each project's Orchestrator session id. Keyed under `["projects"]` so the
+ * Each project's Lead session id. Keyed under `["projects"]` so the
  * project-change events that refresh the sidebar refresh this too.
  */
 export function useOrchestratorSessionIds(): ReadonlySet<string> {
@@ -32,7 +32,7 @@ export function sidebarPersonaName(
   session: { id: string; title?: string | null; labels?: Record<string, string> | null },
   orchestratorSessionIds: ReadonlySet<string>,
 ): string | null {
-  if (orchestratorSessionIds.has(session.id)) return "Orchestrator";
+  if (orchestratorSessionIds.has(session.id)) return "Lead";
   // Identity sessions are titled with their persona's name when they start.
   if (session.labels?.[PROJECT_IDENTITY_LABEL_KEY]) return session.title?.trim() || null;
   return null;

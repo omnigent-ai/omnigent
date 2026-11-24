@@ -208,8 +208,8 @@ async def _resolve_identity(
     )
     if identity is not None:
         return identity, ""
-    if folded == "orchestrator":
-        return None, json.dumps({"error": "The Orchestrator is built in, not a project identity"})
+    if folded in ("lead", "orchestrator"):
+        return None, json.dumps({"error": "The Lead is built in, not a project identity"})
     return None, json.dumps(
         {
             "error": f"No identity named {wanted!r}; create one with sys_project_identity_create",

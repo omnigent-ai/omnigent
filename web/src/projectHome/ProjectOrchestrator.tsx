@@ -91,10 +91,10 @@ export function ProjectOrchestrator({
     ) : (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6">
         {isLoading || sessionId ? (
-          <Spinner aria-label="Opening orchestrator" />
+          <Spinner aria-label="Opening the Lead" />
         ) : (
           <>
-            <TicketError error={error ?? new Error("Orchestrator is unavailable.")} />
+            <TicketError error={error ?? new Error("The Lead is unavailable.")} />
             {projectId && (
               <Button variant="ghost" onClick={() => void refresh()}>
                 Try again
@@ -107,28 +107,28 @@ export function ProjectOrchestrator({
   if (!onClose) return content;
   return (
     <section
-      aria-label="Orchestrator chat"
+      aria-label="Lead chat"
       data-project-session-panel
       className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-[16px] border bg-background"
     >
       <header className="flex h-11 shrink-0 items-center gap-1 border-b border-border/60 pr-1.5 pl-4">
-        <h2 className="min-w-0 flex-1 truncate text-ui font-medium">Orchestrator</h2>
+        <h2 className="min-w-0 flex-1 truncate text-ui font-medium">Lead</h2>
         {sessionId && !canReplace && (
           <Button
             variant="ghost"
             size="icon-sm"
-            aria-label="Roll over orchestrator"
-            title="Roll over: continue in a fresh orchestrator with a handoff"
+            aria-label="Roll over the Lead"
+            title="Roll over: continue in a fresh Lead session with a handoff"
             data-testid="rollover-orchestrator"
             onClick={() => {
               if (
                 !window.confirm(
-                  "Start a fresh orchestrator? It gets a handoff of the board and recent messages. This conversation is kept as read-only history, and messages to it are forwarded.",
+                  "Start a fresh Lead session? It gets a handoff of the board and recent messages. This conversation is kept as read-only history, and messages to it are forwarded.",
                 )
               )
                 return;
               rolloverOrchestrator(sessionId).then(
-                () => showToast("The orchestrator will roll over when its current turn ends"),
+                () => showToast("The Lead will roll over when its current turn ends"),
                 (err: unknown) => {
                   const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
                   showToast(`Couldn't roll over${detail}`);
@@ -143,14 +143,14 @@ export function ProjectOrchestrator({
           <Button variant="ghost" size="icon-sm" asChild>
             <Link
               to={`/c/${encodeURIComponent(sessionId)}`}
-              aria-label="Open orchestrator in full session"
+              aria-label="Open the Lead in full session"
               title="Open full session"
             >
               <Maximize2Icon />
             </Link>
           </Button>
         )}
-        <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="Close orchestrator">
+        <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="Close the Lead">
           <XIcon />
         </Button>
       </header>

@@ -63,11 +63,23 @@ _PREFERENCE_MAX_STORED_BYTES = 65535
 # current orchestrator. Hidden from ``Project.config`` and kept across replaces.
 RETIRED_MAIN_SESSIONS_CONFIG_KEY = "_omnigent_retired_main_sessions"
 _RETIRED_MAIN_SESSIONS_MAX = 50
+# Server-owned routing keys: the owner's chosen router persona and whether the
+# built-in Lead was removed. Owner-set only, through ``set_routing``.
+ROUTER_IDENTITY_CONFIG_KEY = "_omnigent_router_identity"
+LEAD_REMOVED_CONFIG_KEY = "_omnigent_lead_removed"
+_SERVER_CONFIG_KEYS = frozenset(
+    {RETIRED_MAIN_SESSIONS_CONFIG_KEY, ROUTER_IDENTITY_CONFIG_KEY, LEAD_REMOVED_CONFIG_KEY}
+)
 
 
 def _client_config(config: dict[str, Any] | None) -> dict[str, Any]:
     """Drop server-owned keys from a client-supplied config."""
-    return {k: v for k, v in (config or {}).items() if k != RETIRED_MAIN_SESSIONS_CONFIG_KEY}
+    return {k: v for k, v in (config or {}).items() if k not in _SERVER_CONFIG_KEYS}
+
+
+def _server_config(raw: str | None) -> dict[str, Any]:
+    """The server-owned keys of a stored config, kept when a client replaces it."""
+    return {k: v for k, v in _decode_config(raw).items() if k in _SERVER_CONFIG_KEYS}
 
 
 def _retired_ids(raw: str | None) -> list[str]:
@@ -76,9 +88,15 @@ def _retired_ids(raw: str | None) -> list[str]:
 
 
 def _with_retired(config: dict[str, Any], retired: list[str]) -> dict[str, Any]:
+    config = {k: v for k, v in config.items() if k != RETIRED_MAIN_SESSIONS_CONFIG_KEY}
     if not retired:
         return config
     return {**config, RETIRED_MAIN_SESSIONS_CONFIG_KEY: retired[-_RETIRED_MAIN_SESSIONS_MAX:]}
+
+
+def _router_identity_id(raw: str | None) -> str | None:
+    value = _decode_config(raw).get(ROUTER_IDENTITY_CONFIG_KEY)
+    return value if isinstance(value, str) and value else None
 
 
 def _encode_config(config: dict[str, Any] | None) -> str | None:
@@ -186,9 +204,9 @@ def _normalize_identity_name(name: str) -> str:
             f"identity name must be 1-{_IDENTITY_NAME_MAX_CHARS} characters",
             code=ErrorCode.INVALID_INPUT,
         )
-    if trimmed.casefold() == "orchestrator":
+    if trimmed.casefold() in ("lead", "orchestrator"):
         raise OmnigentError(
-            "Orchestrator is the project's built-in identity", code=ErrorCode.INVALID_INPUT
+            f"{trimmed} names the project's built-in Lead", code=ErrorCode.INVALID_INPUT
         )
     return trimmed
 
@@ -240,6 +258,8 @@ def _to_entity(row: SqlProject) -> Project:
         mandate=row.mandate,
         mandate_proposals=_decode_proposals(row.mandate_proposals),
         retired_main_session_ids=_retired_ids(row.config),
+        router_identity_id=_router_identity_id(row.config),
+        lead_removed=_decode_config(row.config).get(LEAD_REMOVED_CONFIG_KEY) is True,
     )
 
 
@@ -480,9 +500,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                     retired = [r for r in _retired_ids(row.config) if r != main_session_id]
                     if current_main not in retired:
                         retired.append(current_main)
-                    row.config = _encode_config(
-                        _with_retired(_client_config(_decode_config(row.config)), retired)
-                    )
+                    row.config = _encode_config(_with_retired(_decode_config(row.config), retired))
             if name is not None and row.name != name:
                 if self._name_taken(
                     session, user_id=row.user_id, name=name, exclude_id=project_id
@@ -494,9 +512,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 row.name = name
                 changed = True
             if client_config is not None:
-                encoded_config = _encode_config(
-                    _with_retired(client_config, _retired_ids(row.config))
-                )
+                encoded_config = _encode_config({**client_config, **_server_config(row.config)})
                 if row.config != encoded_config:
                     row.config = encoded_config
                     changed = True
@@ -649,6 +665,48 @@ class SqlAlchemyProjectStore(ProjectStore):
         operation = "accept_mandate_proposal" if accept else "dismiss_mandate_proposal"
         return run_write_transaction(self._session_immediate, operation, write)
 
+    def set_routing(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        router_identity_id: str | None,
+        lead_removed: bool,
+    ) -> Project:
+        """Set who receives the project's routed events. Owner-only.
+
+        :param router_identity_id: A persona's id, ``"orchestrator"`` for the Lead,
+            or ``None`` for the default (the Lead, else the first persona).
+        :param lead_removed: Whether the owner removed the built-in Lead.
+        :raises OmnigentError: ``NOT_FOUND`` for an unknown project or persona,
+            ``FORBIDDEN`` for a shared member.
+        """
+        updated_at = now_epoch()
+
+        def write(session: Session) -> Project:
+            row = self._require_owner(session, project_id, user_id, action="set its routing")
+            if router_identity_id not in (None, "orchestrator"):
+                identity = session.get(
+                    SqlProjectIdentity, (current_workspace_id(), project_id, router_identity_id)
+                )
+                if identity is None:
+                    raise OmnigentError("Persona not found", code=ErrorCode.NOT_FOUND)
+            config = _decode_config(row.config)
+            config.pop(ROUTER_IDENTITY_CONFIG_KEY, None)
+            config.pop(LEAD_REMOVED_CONFIG_KEY, None)
+            if router_identity_id is not None:
+                config[ROUTER_IDENTITY_CONFIG_KEY] = router_identity_id
+            if lead_removed:
+                config[LEAD_REMOVED_CONFIG_KEY] = True
+            encoded = _encode_config(config)
+            if row.config != encoded:
+                row.config = encoded
+                row.updated_at = updated_at
+            session.flush()
+            return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "set_project_routing", write)
+
     def list_main_sessions(self) -> builtins.list[tuple[str, str | None, str]]:
         with self._session("list_project_main_sessions") as session:
             rows = session.execute(
@@ -679,15 +737,20 @@ class SqlAlchemyProjectStore(ProjectStore):
 
     # -- Shares --
 
-    def _require_owner(self, session: Session, project_id: str, user_id: str | None) -> SqlProject:
+    def _require_owner(
+        self,
+        session: Session,
+        project_id: str,
+        user_id: str | None,
+        *,
+        action: str = "manage its shares",
+    ) -> SqlProject:
         row = session.get(SqlProject, (current_workspace_id(), project_id))
         role = project_role(session, row, user_id)
         if row is None or role is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         if role != "owner":
-            raise OmnigentError(
-                "Only the project owner can manage its shares", code=ErrorCode.FORBIDDEN
-            )
+            raise OmnigentError(f"Only the project owner can {action}", code=ErrorCode.FORBIDDEN)
         return row
 
     def list_shares(self, project_id: str, *, user_id: str | None) -> builtins.list[ProjectShare]:

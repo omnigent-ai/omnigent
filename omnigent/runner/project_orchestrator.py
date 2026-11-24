@@ -130,8 +130,12 @@ async def project_instructions(
     if snapshot is None:
         return None
     has_project_tools = spec.tool_groups.projects
+    # The router coordinates; older servers only report the main session.
     # Legacy server response fallback; remove in 0.25.0.
-    designated = snapshot.get("project_main_session", snapshot.get("project_orchestrator"))
+    designated = snapshot.get(
+        "project_router",
+        snapshot.get("project_main_session", snapshot.get("project_orchestrator")),
+    )
     in_ticket_project = has_project_tools and bool(snapshot.get("project_id"))
     blocks = (
         project_mandate_instruction(snapshot.get("project_mandate")),

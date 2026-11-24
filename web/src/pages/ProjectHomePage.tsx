@@ -144,7 +144,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
           )}
           {hasPanel && (
             <aside
-              aria-label={orchestratorOpen ? "Orchestrator side chat" : "Ticket details"}
+              aria-label={orchestratorOpen ? "Lead side chat" : "Ticket details"}
               // It closes on Escape, so page-wide Escape shortcuts leave keys inside it alone.
               data-escape-owner=""
               className={cn(

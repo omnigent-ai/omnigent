@@ -177,6 +177,17 @@ class ProjectStore(ABC):
         """Compare-and-set the main session; a repeated assignment is idempotent."""
         raise NotImplementedError
 
+    def set_routing(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        router_identity_id: str | None,
+        lead_removed: bool,
+    ) -> Project:
+        """Set the project's router persona and whether its Lead was removed (owner-only)."""
+        raise NotImplementedError
+
     def propose_mandate_addition(
         self,
         project_id: str,

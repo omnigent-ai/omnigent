@@ -427,7 +427,7 @@ describe("NewProjectButton", () => {
     renderButton();
     expect(
       screen.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent),
-    ).toEqual(["Run on", "Orchestrator"]);
+    ).toEqual(["Run on", "Lead"]);
     expect(screen.getByRole("button", { name: "Agent" })).toHaveTextContent("Claude Code");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Agent" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Codex" }));

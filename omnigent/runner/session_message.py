@@ -12,20 +12,20 @@ from omnigent.tools.builtins.session_message import (
     peer_session_messaging_enabled,
 )
 
+# Names the server resolves to the sender's project router.
+_ROUTER_ALIASES = frozenset({"lead", "orchestrator"})
+
 
 async def execute_message_tool(
     args: dict[str, Any], client: httpx.AsyncClient | None, source_id: str | None
 ) -> str:
     raw_target = args.get("session_id")
     try:
-        target = (
-            "orchestrator"
-            if isinstance(raw_target, str) and raw_target.strip().lower() == "orchestrator"
-            else normalize_session_id(raw_target)
-        )
+        alias = raw_target.strip().lower() if isinstance(raw_target, str) else None
+        target = alias if alias in _ROUTER_ALIASES else normalize_session_id(raw_target)
     except ValueError:
         return json.dumps(
-            {"error": "Provide a valid session_id (UUID, numeric managed ID or `orchestrator`)"}
+            {"error": "Provide a valid session_id (UUID, numeric managed ID or `lead`)"}
         )
     message = args.get("message")
     if (

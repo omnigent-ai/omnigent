@@ -6669,7 +6669,7 @@ function NewChatLandingContent({
             project_id: projectMainSession.projectId,
             project_main_session: true,
             expected_main_session_id: projectMainSession.expectedMainSessionId,
-            title: "Orchestrator",
+            title: "Lead",
           }
         : {};
       // Preserve an explicit Default in Orchestrator's composer with an empty list.

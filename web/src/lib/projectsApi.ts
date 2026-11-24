@@ -16,7 +16,7 @@ import { apiErrorFromResponse } from "./sessionsApi";
 /**
  * Default session settings a project stores, pre-filled into the new-chat
  * composer. All fields optional — an unset key means "no default for this
- * slot". Creation uses these choices for Orchestrator; later sessions prefill from them.
+ * slot". Creation uses these choices for the Lead; later sessions prefill from them.
  */
 export interface ProjectConfig {
   /** People besides the owner whose own `product-ok` approves others' features. Owner-only. */
@@ -91,7 +91,16 @@ export interface Project {
   owner_user_id?: string | null;
   /** True when another user owns the project and shared it with the caller. */
   shared?: boolean;
+  /** The owner's chosen router persona (`"orchestrator"` is the Lead); `null` = default. */
+  router_identity_id?: string | null;
+  /** Whether the owner removed the built-in Lead persona. */
+  lead_removed?: boolean;
+  /** Who receives ticket events, digests and escalations now, after fallbacks. */
+  router?: { identity_id: string; name: string } | null;
 }
+
+/** The Lead's identity id; it keeps its original value so stored links stay valid. */
+export const LEAD_IDENTITY_ID = "orchestrator";
 
 /** A user the owner shared a project with; members read and write everything in it. */
 export interface ProjectShare {
@@ -222,6 +231,23 @@ export async function updateProjectConfig(id: string, config: ProjectConfig): Pr
   return (await res.json()) as Project;
 }
 
+/**
+ * Owner-only: choose who receives routed events and remove or restore the Lead.
+ * `router_identity_id: null` is the default (the Lead, else the first persona).
+ */
+export async function setProjectRouting(
+  id: string,
+  routing: { router_identity_id: string | null; lead_removed: boolean },
+): Promise<Project> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/routing`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(routing),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as Project;
+}
+
 /** Replace a project's mandate; blank text clears it. Only `mandate` is sent. */
 export async function updateProjectMandate(id: string, mandate: string): Promise<Project> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`, {
@@ -267,7 +293,8 @@ export type ProjectIdentitySessionState =
 
 /**
  * A named persistent role in a project, such as a PM. The built-in
- * Orchestrator is listed first with `builtin: true` and cannot be edited here.
+ * Lead is listed first with `builtin: true` (unless the owner removed it) and
+ * cannot be edited here.
  */
 export interface ProjectIdentity {
   id: string;
@@ -282,6 +309,8 @@ export interface ProjectIdentity {
   active_session_state: ProjectIdentitySessionState;
   /** The agent session that created it; `null` or absent when the owner did. */
   created_by_session_id?: string | null;
+  /** Whether it receives the project's routed events (one entry at most). */
+  router?: boolean;
 }
 
 /** Fields an owner edits; an empty string clears `agent_id`, `model` or `effort`. */
@@ -301,7 +330,7 @@ function identitiesPath(projectId: string, identityId?: string): string {
   return identityId ? `${base}/${encodeURIComponent(identityId)}` : base;
 }
 
-/** List the project's identities, the built-in Orchestrator first. */
+/** List the project's identities, the built-in Lead first. */
 export async function listProjectIdentities(projectId: string): Promise<ProjectIdentity[]> {
   const res = await authenticatedFetch(identitiesPath(projectId));
   if (!res.ok) throw await apiErrorFromResponse(res);

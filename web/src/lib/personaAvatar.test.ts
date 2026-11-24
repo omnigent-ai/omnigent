@@ -22,7 +22,7 @@ describe("persona avatars", () => {
   it("marks only Orchestrator and identity sessions as personas in the sidebar", () => {
     const orchestrators = new Set(["main"]);
     expect(sidebarPersonaName({ id: "main", title: "Orchestrator" }, orchestrators)).toBe(
-      "Orchestrator",
+      "Lead",
     );
     const persona = { id: "s1", title: "PM", labels: { "omnigent.project_identity_id": "pm" } };
     expect(sidebarPersonaName(persona, orchestrators)).toBe("PM");

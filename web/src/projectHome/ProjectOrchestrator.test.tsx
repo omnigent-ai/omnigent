@@ -145,7 +145,7 @@ describe("project Orchestrator navigation", () => {
     setSessionDraft("lead", { text: "Keep my draft", files: [] });
     renderOrchestrator(<ProjectOrchestrator projectName="Shipping" onClose={onClose} />);
     expect(await screen.findByLabelText("Existing session")).toHaveTextContent("lead");
-    expect(screen.getByRole("region", { name: "Orchestrator chat" })).toBeVisible();
+    expect(screen.getByRole("region", { name: "Lead chat" })).toBeVisible();
     expect(screen.getByLabelText("Session draft")).toHaveValue("Keep my draft");
     expect(useSessionAgent).toHaveBeenCalledWith("lead");
     expect(vi.mocked(FullSessionChat).mock.calls.at(-1)?.[0]).toEqual(
@@ -160,12 +160,12 @@ describe("project Orchestrator navigation", () => {
     );
     expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith("lead");
     expect(projectsApi.createProject).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Close orchestrator" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close the Lead" }));
     expect(onClose).toHaveBeenCalledOnce();
-    const expand = screen.getByRole("link", { name: "Open orchestrator in full session" });
+    const expand = screen.getByRole("link", { name: "Open the Lead in full session" });
     expect(expand).toHaveAttribute("href", "/c/lead");
     fireEvent.click(expand);
-    expect(screen.queryByRole("region", { name: "Orchestrator chat" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Lead chat" })).toBeNull();
     expect(screen.getByLabelText("Existing session")).toHaveTextContent("lead");
     expect(screen.getByLabelText("Session draft")).toHaveValue("Keep my draft");
   });
@@ -199,15 +199,15 @@ describe("project Orchestrator navigation", () => {
       );
       expect(getSessionSlim).not.toHaveBeenCalled();
       expect(projectsApi.createProject).not.toHaveBeenCalled();
-      expect(screen.getByRole("region", { name: "Orchestrator chat" })).toBeVisible();
-      expect(screen.queryByRole("link", { name: "Open orchestrator in full session" })).toBeNull();
+      expect(screen.getByRole("region", { name: "Lead chat" })).toBeVisible();
+      expect(screen.queryByRole("link", { name: "Open the Lead in full session" })).toBeNull();
     },
   );
 
   it("does not offer replacement for an unavailable or foreign-project Orchestrator", async () => {
     fixture.session = { ...fixture.session, projectId: "another-project" };
     renderOrchestrator();
-    expect(await screen.findByRole("alert")).toHaveTextContent("Orchestrator is unavailable.");
+    expect(await screen.findByRole("alert")).toHaveTextContent("The Lead is unavailable.");
     expect(screen.queryByLabelText("Replacement composer")).toBeNull();
   });
 

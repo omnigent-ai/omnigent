@@ -157,7 +157,7 @@ describe("ProjectHomePage tickets", () => {
     (close) => {
       mocks.ticketsEnabled = true;
       renderPage("/projects/Payments/orchestrator?tickets=one");
-      const panel = screen.getByRole("complementary", { name: "Orchestrator side chat" });
+      const panel = screen.getByRole("complementary", { name: "Lead side chat" });
       expect(screen.getByTestId("ticket-board")).toBeVisible();
       expect(screen.getByTestId("project-orchestrator")).toBeVisible();
       expect(screen.queryByRole("tablist")).toBeNull();

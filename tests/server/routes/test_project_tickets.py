@@ -68,7 +68,7 @@ async def test_project_creation_has_one_normal_main_session(project_client, db_u
     ).json()
     session_id = project["main_session_id"]
     session = (await project_client.get(f"/v1/sessions/{session_id}")).json()
-    assert session["title"] == "Orchestrator"
+    assert session["title"] == "Lead"
     assert session["project_id"] == project["id"]
     assert session["project_main_session"] is True
     assert session["agent_name"] == "claude-native-ui"
@@ -263,7 +263,7 @@ async def test_existing_project_initializes_main_through_ordinary_sessions(
         "main_session_id"
     ] == session_id
     session = (await project_client.get(f"/v1/sessions/{session_id}")).json()
-    assert session["title"] == "Orchestrator"
+    assert session["title"] == "Lead"
     assert len(session["items"]) == 1
     assert session["items"][0]["data"]["content"][0]["text"] == (
         "Hello, what would you like to work on?"

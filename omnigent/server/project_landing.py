@@ -196,14 +196,16 @@ class LandingQueue:
             _logger.exception("Landing: could not message session %s", session_id)
 
     async def _stop(self, project: Any, tickets: list[dict[str, Any]], reason: str) -> None:
-        """Stop the queue for *project* and tell the lead; the owner re-enables it."""
+        """Stop the queue for *project* and tell its router; the owner re-enables it."""
+        from omnigent.server.project_router import router_session_id
+
         self.stopped[project.id] = reason
         self._save_stopped()
         for ticket in tickets:
             await self._note(project, ticket["id"], f"stopped: {reason}")
         await self._send(
             project,
-            project.main_session_id,
+            await router_session_id(self.app, project),
             f"[{NOTE_PREFIX}] Stopped for this project: {reason}. Nothing else lands until the "
             "owner fixes it and turns landing off and on again in the project's `landing` config.",
         )

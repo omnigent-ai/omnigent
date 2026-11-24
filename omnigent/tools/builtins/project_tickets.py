@@ -372,7 +372,8 @@ class SysProjectIdentityCreateTool(_TicketTool):
         "example when the user asks you to set up roles or a recurring workstream needs an "
         "owner. Give it a clear name and complete persona text. It takes effect at once and "
         "appears in the project's Team dialog; tell the user what you created. Names are unique "
-        "and 'Orchestrator' is reserved. Start its session with sys_project_identity_session."
+        "and 'Lead' and 'Orchestrator' are reserved. Start its session with "
+        "sys_project_identity_session."
     )
     arguments = CreateIdentity
 
@@ -397,8 +398,8 @@ class SysProjectIdentitySessionTool(_TicketTool):
         "fails with 'Session not found'. "
         "With message, also delivers that message to it like sys_session_message (queued if "
         "it is busy). Keep talking to it later with sys_session_message on the returned "
-        "session_id. The built-in Orchestrator is not an identity here. To add a role, use "
-        "sys_project_identity_create."
+        "session_id. The built-in Lead is not an identity here; message it as `lead`. To add "
+        "a role, use sys_project_identity_create."
     )
     arguments = OpenIdentitySession
 

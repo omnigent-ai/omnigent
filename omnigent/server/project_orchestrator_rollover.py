@@ -34,6 +34,8 @@ _logger = logging.getLogger(__name__)
 
 ROLLOVER_EVENT_TYPE = "rollover_orchestrator"
 ORCHESTRATOR_ALIAS = "orchestrator"
+# Names that address the project's router, the Lead unless the owner chose another.
+ROUTER_ALIASES = frozenset({ORCHESTRATOR_ALIAS, "lead"})
 SUCCESSOR_LABEL_KEY = "omnigent.project.successor_session"
 PREDECESSOR_LABEL_KEY = "omnigent.project.predecessor_session"
 ROLLOVER_CONFIG_KEY = "orchestrator_rollover"
@@ -107,11 +109,12 @@ async def resolve_message_target(
     request: Request, target: str, user_id: str | None
 ) -> tuple[str, str | None]:
     """
-    Resolve a ``session_message`` destination to the project's current orchestrator.
+    Resolve a ``session_message`` destination to the project's current router.
 
-    ``orchestrator`` names the sender's project orchestrator. A session that is
-    rolling over resolves to its successor once the switch finishes. A deleted or
-    archived former orchestrator resolves to the project's current main session.
+    ``orchestrator`` or ``lead`` names the sender's project router: its Lead, or
+    the persona the owner chose. A session that is rolling over resolves to its
+    successor once the switch finishes. A deleted or archived former Lead resolves
+    to the project's current Lead, or its router once the Lead was removed.
     Anything else is returned unchanged.
 
     :returns: ``(session_id, redirected_from)``; ``redirected_from`` is ``None``
@@ -121,7 +124,9 @@ async def resolve_message_target(
         conversations, projects, _, _ = _stores(request.app)
     except OmnigentError:
         return target, None
-    if target.strip().lower() == ORCHESTRATOR_ALIAS:
+    from omnigent.server.project_router import project_router, router_session_id
+
+    if target.strip().lower() in ROUTER_ALIASES:
         source_id = normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "")
         source = (
             await asyncio.to_thread(conversations.get_conversation, source_id)
@@ -134,9 +139,12 @@ async def resolve_message_target(
                 code=ErrorCode.INVALID_INPUT,
             )
         project = await asyncio.to_thread(projects.get, source.project_id, user_id=user_id)
-        if project is None or project.main_session_id is None:
-            raise OmnigentError("This project has no orchestrator", code=ErrorCode.NOT_FOUND)
-        resolved = await _await_switch(project.main_session_id)
+        router = (
+            await router_session_id(request.app, project, request=request) if project else None
+        )
+        if project is None or router is None:
+            raise OmnigentError("This project has no lead or router", code=ErrorCode.NOT_FOUND)
+        resolved = await _await_switch(router)
         return resolved, ORCHESTRATOR_ALIAS
     normalized = normalize_uuid(target)
     if normalized is None:
@@ -148,10 +156,16 @@ async def resolve_message_target(
     if conv is not None and not conv.archived:
         return target, None
     project = await _project_for_retired(projects, normalized, user_id, conv)
+    if project is not None and project.lead_removed:
+        # The Lead is gone by the owner's choice: its old addresses reach the router.
+        if not (await project_router(request.app, project)).is_lead:
+            router = await router_session_id(request.app, project, request=request)
+            if router is not None and router != normalized:
+                return router, normalized
     if project is None or project.main_session_id in (None, normalized):
         if conv is None and project is not None:
             raise OmnigentError(
-                "This project's orchestrator was deleted and has no successor yet",
+                "This project's lead was deleted and has no successor yet",
                 code=ErrorCode.NOT_FOUND,
             )
         return target, None
@@ -462,7 +476,7 @@ async def start_fresh_main_session(
     request = _owner_request(app, key, template_request)
     base: dict[str, Any] = {
         "project_id": project.id,
-        "title": "Orchestrator",
+        "title": "Lead",
         "agent_id": project.config.get("agent_id") or (previous.agent_id if previous else None),
         "project_main_session": True,
         "expected_main_session_id": expected_main_session_id,

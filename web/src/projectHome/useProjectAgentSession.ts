@@ -58,7 +58,7 @@ export function useProjectOrchestratorSession(projectName: string) {
     error:
       projects.error ??
       project.error ??
-      (unavailable ? new Error("Orchestrator is unavailable.") : canReplace ? null : session.error),
+      (unavailable ? new Error("The Lead is unavailable.") : canReplace ? null : session.error),
     refresh: refetch,
   };
 }

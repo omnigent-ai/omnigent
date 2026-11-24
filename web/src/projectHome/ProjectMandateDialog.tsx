@@ -114,7 +114,7 @@ export function ProjectMandateDialog({
           <DialogTitle>Mandate</DialogTitle>
           <DialogDescription>
             Bounds every agent in <span className="font-medium">{projectName}</span> follows,
-            including the Orchestrator and its workers. It overrides conflicting repo instructions
+            including the Lead and its workers. It overrides conflicting repo instructions
             such as CLAUDE.md, but never safety rules or approval prompts. Running sessions may keep
             the previous mandate until they restart.
           </DialogDescription>

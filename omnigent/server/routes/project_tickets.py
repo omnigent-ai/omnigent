@@ -39,7 +39,6 @@ from omnigent.runtime.project_ticket_instructions import (
 from omnigent.server import github_pr_intake, product_approval, session_live_state
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.persona_mentions import (
-    ORCHESTRATOR_MENTION_ID,
     Mention,
     MentionRateLimiter,
     PersonaMentionTargets,
@@ -182,9 +181,6 @@ def _spawn_mention_delivery(
     notifications = getattr(app.state, "project_ticket_notifications", None)
     if notifications is None:
         return
-    # A human comment already wakes the Orchestrator through the ticket update itself.
-    if who.session_id is None:
-        mentions = [entry for entry in mentions if entry.id != ORCHESTRATOR_MENTION_ID]
     if not mentions:
         return
 
@@ -194,6 +190,15 @@ def _spawn_mention_delivery(
         )
 
     async def run() -> None:
+        wanted = mentions
+        # A human comment already wakes the router through the ticket update itself.
+        if who.session_id is None:
+            from omnigent.server.project_router import project_router
+
+            router_id = (await project_router(app, project)).identity_id
+            wanted = [entry for entry in mentions if entry.id != router_id]
+            if not wanted:
+                return
         # A person's comment already reaches the ticket's linked sessions as worker routing.
         linked = (
             frozenset(
@@ -208,7 +213,7 @@ def _spawn_mention_delivery(
             project,
             ticket,
             text,
-            mentions,
+            wanted,
             event_id=f"{ticket['id']}:{ticket['comment_count']}",
             author_session_id=who.session_id,
             open_session=lambda mention: targets.open(request, project, mention),
@@ -275,8 +280,11 @@ def _spawn_review_routing(
             linked = await asyncio.to_thread(
                 notifications.tickets.ticket_session_ids, project.id, ticket["id"]
             )
+            from omnigent.server.project_router import router_session_ids
+
+            skipped = {who.session_id, *await router_session_ids(request.app, project)}
             for session_id in linked:
-                if session_id in (who.session_id, project.main_session_id):
+                if session_id in skipped:
                     continue
                 message = to_worker_message(ticket, text)
                 await deliver(

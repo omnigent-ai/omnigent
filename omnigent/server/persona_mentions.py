@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Built-in identity id for the project's Orchestrator, mirrored from project_identities.
+# Built-in identity id for the project's Lead, mirrored from project_identities.
 ORCHESTRATOR_MENTION_ID = "orchestrator"
 # Agent-authored mentions may wake one persona at most this often, so agents can't loop.
 AGENT_MENTION_LIMIT = 3

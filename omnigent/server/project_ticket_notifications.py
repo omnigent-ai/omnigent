@@ -20,6 +20,7 @@ from omnigent.server.project_orchestrator import (
     ticket_batch_message,
     ticket_comment_for_worker_message,
 )
+from omnigent.server.project_router import router_session_id, router_session_ids
 from omnigent.server.session_delivery import deliver_to_session
 from omnigent.server.startup_inputs import ManagedStartupInputs
 from omnigent.stores.project_store import ProjectStore
@@ -167,9 +168,11 @@ class ProjectTicketNotifications:
             self.tickets.ticket_session_ids, project.id, event["ticket_id"]
         )
         text = ticket_comment_for_worker_message(project.id, event)
+        # The router hears about every event in its digest instead.
+        router_sessions = await router_session_ids(app, project)
         delivered = False
         for session_id in session_ids:
-            if session_id == project.main_session_id:
+            if session_id in router_sessions:
                 continue
             stable_id = hashlib.sha256(f"{event['id']}:{session_id}".encode()).hexdigest()[:32]
             if await self.deliver_to_session(
@@ -202,16 +205,19 @@ class ProjectTicketNotifications:
                 )
                 continue
             remaining.append(event)
-        if not remaining or project.main_session_id is None:
+        if not remaining:
             return
         if not digest_due and not any(event["urgent"] for event in remaining):
+            return
+        router_session = await router_session_id(app, project)
+        if router_session is None:
             return
         # A stable input ID derived from the batch means a crash after enqueue but
         # before marking cannot duplicate an agent turn.
         if await self.deliver_to_session(
             app,
             project,
-            project.main_session_id,
+            router_session,
             stable_id=_batch_stable_id(remaining),
             text=ticket_batch_message(
                 project.id, remaining, worker_reply_seconds=self.worker_reply_seconds

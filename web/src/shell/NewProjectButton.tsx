@@ -892,8 +892,8 @@ export function NewProjectButton({
               </Collapsible>
             )}
           </section>
-          <section aria-label="Orchestrator" className="space-y-3 border-t pt-4">
-            <h3 className="text-xs font-medium text-muted-foreground">Orchestrator</h3>
+          <section aria-label="Lead" className="space-y-3 border-t pt-4">
+            <h3 className="text-xs font-medium text-muted-foreground">Lead</h3>
             <ProjectOrchestratorPicker
               choices={orchestrator}
               host={selectedHost}

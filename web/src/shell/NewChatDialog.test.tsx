@@ -1685,7 +1685,7 @@ describe("NewChatLandingScreen project Orchestrator", () => {
       project_id: main.projectId,
       project_main_session: true,
       expected_main_session_id: "old-main",
-      title: "Orchestrator",
+      title: "Lead",
       agent_id: "a2",
       model_override: "model-a",
       reasoning_effort: "high",
@@ -1746,7 +1746,7 @@ describe("NewChatLandingScreen project Orchestrator", () => {
         project_id: main.projectId,
         project_main_session: true,
         expected_main_session_id: "old-main",
-        title: "Orchestrator",
+        title: "Lead",
         host_type: "managed",
         workspace: null,
         git: null,
@@ -1920,7 +1920,7 @@ describe("NewChatLandingScreen project Orchestrator", () => {
       project_id: main.projectId,
       project_main_session: true,
       expected_main_session_id: "old-main",
-      title: "Orchestrator",
+      title: "Lead",
     });
     expect(JSON.parse(form.get("metadata") as string)).not.toHaveProperty("harness_override");
     expect(form.get("bundle")).toBe(bundle);

@@ -208,7 +208,7 @@ async def prepare_main_creation(
         )
     if await asyncio.to_thread(conversations.get_conversation, session_id) is not None:
         raise OmnigentError(
-            "Orchestrator creation is in progress; retry this submission", code=ErrorCode.CONFLICT
+            "Lead creation is in progress; retry this submission", code=ErrorCode.CONFLICT
         )
     state = await main_session_state(project, conversations, permissions)
     if state not in ("absent", "missing", "archived"):
@@ -236,7 +236,7 @@ async def create_initial_main_session(
         project,
         {
             "project_id": project.id,
-            "title": "Orchestrator",
+            "title": "Lead",
             "agent_id": project.config.get("agent_id"),
             "project_main_session": True,
             "expected_main_session_id": None,
