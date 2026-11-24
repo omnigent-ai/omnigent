@@ -85,6 +85,11 @@ import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { PreviewCommentBanner } from "./PreviewCommentBanner";
+import {
+  MarkdownPreviewComments,
+  type MarkdownPreviewCommentsProps,
+} from "./MarkdownPreviewComments";
+import { rehypeSourceOffsets } from "./markdownPreviewSource";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
@@ -170,14 +175,25 @@ function rehypeRawWhenPresent() {
 // iframe. Order matters: alerts transform before sanitize, slug adds IDs to
 // headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
 // later, rendering math from the already-sanitized tree.
-const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
+const MARKDOWN_SANITIZED_REHYPE_PLUGINS: NonNullable<Options["rehypePlugins"]> = [
   rehypeRawWhenPresent,
   rehypeSlug,
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
-  // After sanitize: sanitize neutralises the untrusted markdown/HTML, leaving the
-  // `language-math` code nodes as plain text; KaTeX then renders that trusted
-  // output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
+];
+// After sanitize: sanitize neutralises the untrusted markdown/HTML, leaving the
+// `language-math` code nodes as plain text; KaTeX then renders that trusted
+// output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
+const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
+  ...MARKDOWN_SANITIZED_REHYPE_PLUGINS,
+  MATH_PLUGIN.rehypePlugin,
+];
+
+// Commentable previews also record each text node's raw-source range, after
+// sanitize (so only this plugin sets the attributes) and before KaTeX.
+const MARKDOWN_COMMENTABLE_REHYPE_PLUGINS: Options["rehypePlugins"] = [
+  ...MARKDOWN_SANITIZED_REHYPE_PLUGINS,
+  rehypeSourceOffsets,
   MATH_PLUGIN.rehypePlugin,
 ];
 
@@ -282,10 +298,13 @@ function MarkdownPreview({
   tocOpen,
   onTocOpenChange,
   deferOffscreen = false,
+  sourceOffsets = false,
 }: {
   content: string;
   /** Skip layout of off-screen blocks; large documents otherwise lay out in full on open. */
   deferOffscreen?: boolean;
+  /** Tag rendered text with its raw-source range so selections can be commented on. */
+  sourceOffsets?: boolean;
   /** Workspace path of the previewed file, e.g. ``"docs/README.md"``. */
   path: string | null;
   rootRef?: RefObject<HTMLDivElement | null>;
@@ -299,13 +318,16 @@ function MarkdownPreview({
     () => (
       <ReactMarkdown
         remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+        rehypePlugins={
+          sourceOffsets ? MARKDOWN_COMMENTABLE_REHYPE_PLUGINS : MARKDOWN_REHYPE_PLUGINS
+        }
         components={MARKDOWN_COMPONENTS}
       >
+        {/* Offsets survive this rewrite: each delimiter pair keeps its length. */}
         {normalizeExplicitMathDelimiters(content)}
       </ReactMarkdown>
     ),
-    [content],
+    [content, sourceOffsets],
   );
   return (
     <div className="flex h-full">
@@ -355,6 +377,7 @@ function PreviewWithSearch({
   tocOpen,
   onTocOpenChange,
   commentHint,
+  commentLayer,
   deferOffscreen,
 }: {
   content: string;
@@ -375,11 +398,12 @@ function PreviewWithSearch({
   tocOpen: boolean;
   onTocOpenChange: (open: boolean) => void;
   /**
-   * When present, shows a banner pointing users at the editor for commenting
-   * (the rendered preview can't anchor text-selection comments). Omitted for
-   * notebooks, which have no comment surface.
+   * When present, shows a banner pointing users at the editor for commenting.
+   * Used for large Markdown, whose preview is not commentable.
    */
   commentHint?: { conversationId: string; onSwitchToEdit: () => void };
+  /** When present, Markdown text selections in the preview can be commented on. */
+  commentLayer?: Omit<MarkdownPreviewCommentsProps, "rootRef" | "content">;
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
   // A spreadsheet reads its file before its table (the scroller) mounts.
@@ -445,6 +469,7 @@ function PreviewWithSearch({
         tocOpen={tocOpen}
         onTocOpenChange={onTocOpenChange}
         deferOffscreen={deferOffscreen}
+        sourceOffsets={!!commentLayer && !truncated}
       />
     );
   // The find bar sits above the preview; a truncated preview also shows the
@@ -463,6 +488,9 @@ function PreviewWithSearch({
         />
       )}
       <div className="min-h-0 flex-1">{preview}</div>
+      {kind === "markdown" && commentLayer && !truncated && (
+        <MarkdownPreviewComments {...commentLayer} rootRef={previewRef} content={content} />
+      )}
     </div>
   );
 }
@@ -595,9 +623,8 @@ export interface CodeViewerProps {
   /** Callback to toggle TOC panel. */
   onTocToggle?: () => void;
   /**
-   * Switches a markdown file to the rich-text editor. When set, the rendered
-   * preview shows a banner pointing users there for commenting (the preview
-   * itself can't anchor text-selection comments).
+   * Switches a large markdown file to Source. When set, the large-file preview
+   * (which skips Preview commenting) shows a banner pointing users there.
    */
   onRequestEditMode?: () => void;
   /** Whether the session's agent opens an attached workspace path. */
@@ -1134,8 +1161,19 @@ export function CodeViewer({
         onTocOpenChange={(open) => !open && onTocToggle?.()}
         deferOffscreen={markdownSourceFallback}
         commentHint={
-          !isNotebook && onRequestEditMode
+          !isNotebook && markdownSourceFallback && onRequestEditMode
             ? { conversationId, onSwitchToEdit: onRequestEditMode }
+            : undefined
+        }
+        commentLayer={
+          !isNotebook && !markdownSourceFallback
+            ? {
+                conversationId,
+                comments: previewComments,
+                activeSelection,
+                onSetActiveSelection,
+                pendingBodyRef,
+              }
             : undefined
         }
       />

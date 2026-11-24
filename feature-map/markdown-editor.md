@@ -12,6 +12,8 @@ and the recording protocol for comparing revisions.
 - `find`: search finds edited content without typing into the document.
 - `modes`: Edit, Source, and Preview retain the same saved content.
 - `review`: selected text anchors a comment; an unsent draft remains editable.
+  Preview accepts the same comments on rendered text, highlights existing
+  ones, and activates a comment when its text is clicked.
 - `responsive`: desktop and mobile show the file and retain edits and drafts.
 - `load`: fixed mixed-content documents expose parsing and rendering costs.
 - `offline`: unsaved edits remain guarded when the workspace cannot save.
@@ -171,6 +173,11 @@ These runs do not cover every Markdown shape or establish the limits for every m
   including a word split across formatting beside a hidden URL and a plain copy,
   a bold word in an ordered-list parent followed by a nested ordered list,
   and a repeated bold word outside a table containing an escaped pipe.
+  `tests/e2e_ui/comments/test_markdown_preview_comments.py` drags across
+  rendered text spanning bold markup in Preview, saves a comment, checks its raw
+  range and painted highlight, and finds it in Edit; it also clicks a highlight
+  to activate its card. `web/src/shell/MarkdownPreviewComments.test.tsx` holds
+  the rendered-to-source mapping matrix.
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_mixed_structures_accumulated_comments_after_autosave`
   edits the mixed fixture, waits for real autosave, then comments on every
   duplicate through the UI, selecting the nested-list parent last. It checks
@@ -250,6 +257,9 @@ instead of treating one comparison clip as complete feature verification.
   raw-HTML parsing when the document has none, and skips layout of off-screen
   blocks; a single paragraph spanning tens of thousands of lines still parses
   slowly in GFM.
+- Preview comments come from rendered text spans tagged with raw-source
+  offsets. Math, Mermaid, images, and generated alert titles cannot anchor a
+  comment. Large-file Preview skips the tagging and keeps the switch-to-edit hint.
 - File editing uses TipTap. Chat Markdown, read-only Preview, and Source use
   different rendering paths; speeding up one does not validate the others.
 - Task-list tokenization and table-start detection bound the source passed to
