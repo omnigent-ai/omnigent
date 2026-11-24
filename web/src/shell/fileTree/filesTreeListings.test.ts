@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import {
+  changesWithinFolder,
   listingsVersion,
   treeMetadata,
   visibleEntries,
@@ -122,5 +123,37 @@ describe("withChangedFiles", () => {
   it("leaves files the listings already show alone", () => {
     const listings = [{ folder: "", entries: [file("a.ts")] }];
     expect(withChangedFiles(listings, [change("a.ts", "modified")])).toEqual(listings);
+  });
+});
+
+describe("changesWithinFolder", () => {
+  const change = (path: string) => ({
+    path,
+    name: path.split("/").at(-1)!,
+    status: "modified" as const,
+    bytes: 3,
+    modified_at: 9,
+  });
+  const changes = [change("README.md"), change("src/app.ts"), change("src/lib/util.ts")];
+
+  it("keeps every change at the workspace root", () => {
+    expect(changesWithinFolder(changes, "", "/work/repo")).toBe(changes);
+  });
+
+  it("keeps a folder's changes, relative to it", () => {
+    expect(changesWithinFolder(changes, "src", "/work/repo").map((each) => each.path)).toEqual([
+      "app.ts",
+      "lib/util.ts",
+    ]);
+  });
+
+  it("finds a workspace folder's changes when it is browsed by its absolute path", () => {
+    expect(
+      changesWithinFolder(changes, "/work/repo/src/lib", "/work/repo").map((each) => each.path),
+    ).toEqual(["util.ts"]);
+  });
+
+  it("has none for a folder outside the workspace", () => {
+    expect(changesWithinFolder(changes, "/tmp", "/work/repo")).toEqual([]);
   });
 });

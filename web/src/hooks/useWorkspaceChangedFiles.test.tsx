@@ -45,6 +45,9 @@ import {
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
   useWorkspaceServeable,
+  fetchWorkspaceFolderListing,
+  IgnoredFilesSearchError,
+  listingIgnoredFiles,
   workspaceDirectoryQuery,
 } from "./useWorkspaceChangedFiles";
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
@@ -255,6 +258,9 @@ beforeEach(() => {
   stubChatStore();
   hostOnlineMock.mockReturnValue(null);
   stubSession(null);
+  // Every case starts with a workspace API that declines, whatever the last one set.
+  vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValue(null);
+  vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -663,6 +669,100 @@ describe("useWorkspaceAllFiles without what Git ignores", () => {
   });
 });
 
+describe("listingIgnoredFiles over a real listing query", () => {
+  const pending = new Promise<never>(() => {});
+  type Answer = "pending" | "error" | ReturnType<typeof apiListing>;
+  /** Render the listing for `id`, answering each request with what `answer` gives it. */
+  function listing(id: string, answer: (hideIgnored: boolean) => Answer, environment = true) {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockImplementation(async () =>
+      environment ? environmentResponse() : jsonResponse({ metadata: {} }),
+    );
+    vi.mocked(listDirectoryViaWorkspaceApi).mockImplementation(
+      async (_session, _path, _max, _signal, options) => {
+        const answered = answer(options?.hideIgnored === true);
+        if (answered === "pending") return pending;
+        if (answered === "error") throw new Error("The host stopped answering.");
+        return answered;
+      },
+    );
+    return renderHook(
+      ({ hideIgnored }: { hideIgnored: boolean }) => {
+        const query = useWorkspaceAllFiles(id, { hideIgnored });
+        return { query, ignored: listingIgnoredFiles(query) };
+      },
+      { wrapper: stableWrapper(), initialProps: { hideIgnored: true } },
+    );
+  }
+  const everything = apiListing(["README.md", "build"]);
+  const withoutIgnored = { ...apiListing(["README.md"]), ignoredHidden: true as const };
+
+  it.each([
+    {
+      state: "no listing asked for yet",
+      run: async () => {
+        const { result } = listing("conv_ignored_idle", () => everything, false);
+        await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+        await flushMicrotasks();
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "the listing on its way",
+      run: async () => {
+        const { result } = listing("conv_ignored_loading", () => "pending");
+        await waitFor(() => expect(result.current.query.fetchStatus).toBe("fetching"));
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "rows kept from the listing with ignored files on",
+      run: async () => {
+        const { result, rerender } = listing("conv_ignored_kept", (hide) =>
+          hide ? "pending" : everything,
+        );
+        rerender({ hideIgnored: false });
+        await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
+        rerender({ hideIgnored: true });
+        expect(result.current.query.isPlaceholderData).toBe(true);
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "a failed listing",
+      run: async () => {
+        const { result } = listing("conv_ignored_failed", () => "error");
+        await waitFor(() => expect(result.current.query.isError).toBe(true));
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "a fresh listing that left ignored files out",
+      run: async () => {
+        const { result } = listing("conv_ignored_hidden", () => withoutIgnored);
+        await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
+        return result.current;
+      },
+      expected: "hidden",
+    },
+    {
+      state: "a fresh listing that couldn't leave them out",
+      run: async () => {
+        const { result } = listing("conv_ignored_included", () => everything);
+        await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
+        return result.current;
+      },
+      expected: "included",
+    },
+  ])("says $expected for $state", async ({ run, expected }) => {
+    expect((await run()).ignored).toBe(expected);
+  });
+});
+
 describe("useWorkspaceEnvironment gating", () => {
   it("fetches the default environment when the runner is online", async () => {
     onlineMock.mockReturnValue(true);
@@ -961,6 +1061,76 @@ describe("workspaceDirectoryQuery", () => {
   });
 });
 
+describe("fetchWorkspaceFolderListing", () => {
+  const page = (names: string[], hasMore: boolean, lastId: string | null = names.at(-1) ?? null) =>
+    new Response(
+      JSON.stringify({
+        object: "list",
+        data: names.map((name) => ({
+          id: name,
+          name,
+          path: `src/${name}`,
+          type: "file",
+          bytes: null,
+          modified_at: null,
+        })),
+        has_more: hasMore,
+        last_id: lastId,
+      }),
+    );
+
+  it("reads each page after the last, and says more remain at the limit", async () => {
+    fetchMock.mockResolvedValueOnce(page(["a.ts", "b.ts"], true));
+    fetchMock.mockResolvedValueOnce(page(["c.ts", "d.ts"], true));
+
+    const listed = await fetchWorkspaceFolderListing("conv", "src", "", 4);
+
+    // Paths are relative to the location the folder is read from.
+    expect(listed.entries.map((entry) => entry.path)).toEqual([
+      "src/a.ts",
+      "src/b.ts",
+      "src/c.ts",
+      "src/d.ts",
+    ]);
+    expect(listed.hasMore).toBe(true);
+    const asked = fetchMock.mock.calls.map(([input]) => new URL(String(input), "http://x"));
+    expect(asked.map((url) => url.searchParams.get("after"))).toEqual([null, "b.ts"]);
+    expect(asked.map((url) => url.searchParams.get("limit"))).toEqual(["4", "2"]);
+  });
+
+  it("stops at a cursor that doesn't move, rather than asking again", async () => {
+    fetchMock.mockResolvedValueOnce(page(["a.ts"], true));
+    fetchMock.mockResolvedValueOnce(page(["a.ts"], true));
+
+    const listed = await fetchWorkspaceFolderListing("conv", "src", "", 10);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(listed.hasMore).toBe(true);
+  });
+
+  it("asks the workspace API for the whole limit and keeps whether more remain", async () => {
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+      data: [
+        { id: "src/a.ts", name: "a.ts", path: "src/a.ts", type: "file", bytes: 1, modified_at: 0 },
+      ],
+      hasMore: true,
+    });
+
+    const listed = await fetchWorkspaceFolderListing("conv", "src", "", 5000);
+
+    expect(vi.mocked(listDirectoryViaWorkspaceApi).mock.calls.at(-1)?.slice(0, 3)).toEqual([
+      "conv",
+      "src",
+      5000,
+    ]);
+    expect(listed).toEqual({
+      entries: [expect.objectContaining({ path: "src/a.ts" })],
+      hasMore: true,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("useWorkspaceFileSearch gating", () => {
   it("does not fetch when disabled by the caller", async () => {
     onlineMock.mockReturnValue(true);
@@ -1037,10 +1207,90 @@ describe("useWorkspaceFileSearch through the workspace API", () => {
     expect(searchFilesViaWorkspaceApi).toHaveBeenCalledWith(
       "conv_live",
       "main",
-      { path: "src", include: "*.ts", exclude: "", limit: 500 },
+      { path: "src", include: "*.ts", exclude: "", limit: 500, includeGitIgnored: true },
       expect.any(AbortSignal),
     );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("doesn't fall back to REST, which can't leave ignored files out, for a search without them", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce(null);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(
+      () => useWorkspaceFileSearch("conv_live", "main", "", "", { hideIgnored: true }, ""),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error).toBeInstanceOf(IgnoredFilesSearchError);
+    expect(result.current.data).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("recovers on its own once the API answers a search without ignored files again", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: "src/main.ts",
+            name: "main.ts",
+            path: "src/main.ts",
+            type: "file",
+            bytes: 1,
+            modified_at: 1,
+          },
+        ],
+        hasMore: false,
+        truncated: false,
+      });
+    // Retried as the app's queries are, without the wait between tries.
+    const client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } });
+    const { result } = renderHook(
+      () => useWorkspaceFileSearch("conv_live", "main", "", "", { hideIgnored: true }, ""),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.files.map((file) => file.path)).toEqual(["src/main.ts"]);
+    expect(vi.mocked(searchFilesViaWorkspaceApi)).toHaveBeenCalledTimes(2);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("asks the API to leave out what Git ignores, and keeps that search apart", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValue({
+      data: [],
+      hasMore: false,
+      truncated: false,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = renderHook(
+      ({ hideIgnored }: { hideIgnored: boolean }) =>
+        useWorkspaceFileSearch("conv_live", "main", "", "", { hideIgnored }, ""),
+      {
+        initialProps: { hideIgnored: true },
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+    await waitFor(() => expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(1));
+    rerender({ hideIgnored: false });
+    await waitFor(() => expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(2));
+
+    const asked = vi.mocked(searchFilesViaWorkspaceApi).mock.calls.map(([, , options]) => options);
+    expect(asked.map((options) => options.includeGitIgnored)).toEqual([false, true]);
   });
 
   it("falls back to REST when the workspace API declines a folder search", async () => {

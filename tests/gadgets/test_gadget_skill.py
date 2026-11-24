@@ -14,7 +14,7 @@ SKILL = FRAMEWORK_SKILLS_DIR / "gadget" / "SKILL.md"
 
 
 def _skills(spec: AgentSpec, *, workflows: bool) -> set[str]:
-    return {skill.name for skill in framework_skills(spec, workflows=workflows)}
+    return {skill.name for skill in framework_skills(spec, workflows_enabled=workflows)}
 
 
 def test_the_skill_comes_with_the_gadget_tool_group_not_with_workflows() -> None:
@@ -26,7 +26,7 @@ def test_the_skill_comes_with_the_gadget_tool_group_not_with_workflows() -> None
         "save-workflow",
     }
     assert "gadget" not in _skills(without_gadget_tools(spec), workflows=True)
-    [skill] = [s for s in framework_skills(spec, workflows=False) if s.name == "gadget"]
+    [skill] = [s for s in framework_skills(spec, workflows_enabled=False) if s.name == "gadget"]
     # Agent-facing: it never shows in the composer's slash menu.
     assert skill.user_invocable is False
     assert "Gadget action" in skill.description

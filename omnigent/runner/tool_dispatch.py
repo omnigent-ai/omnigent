@@ -11105,6 +11105,7 @@ def _execute_skill_tool(
     :returns: Tool output string.
     """
     from omnigent.spec.skill_sources import framework_skills
+    from omnigent.spec.types import AgentSpec
     from omnigent.tools.builtins.load_skill import LoadSkillTool
     from omnigent.tools.builtins.read_skill_file import ReadSkillFileTool
 
@@ -11123,8 +11124,8 @@ def _execute_skill_tool(
         agent_root=runner_workspace,
         skills_filter=skills_filter,
         fallback_skills=(
-            framework_skills(agent_spec, workflows=workflows_enabled)
-            if agent_spec is not None and getattr(agent_spec, "tool_groups", None) is not None
+            framework_skills(agent_spec, workflows_enabled=workflows_enabled)
+            if isinstance(agent_spec, AgentSpec)
             else []
         ),
     )

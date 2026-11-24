@@ -12,25 +12,34 @@ date it was last updated. The session's own project comes first, then memories
 about the user and the user's feedback, then the rest. A model wrote the paths
 and descriptions, possibly from untrusted input, so the index is quoted JSON
 under a note that it is data, not instructions.
+
+The module also offers, once per Claude Code config dir or Codex home, to import
+the notes that harness kept on the machine when its own memory is switched off.
+Those notes are counted, never read.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import itertools
 import json
 import logging
+import os
 import re
+import stat
 import unicodedata
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.errors import OmnigentError
+from omnigent.process_logging import data_dir
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.stores.memory_store import path_in_prefix, validate_path
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from pathlib import Path
+    from collections.abc import Callable, Mapping, Sequence
 
     import httpx
 
@@ -354,3 +363,231 @@ async def memory_startup_guidance(
     except Exception:
         _logger.debug("memory startup guidance unavailable for %s", session_id, exc_info=True)
         return None
+
+
+# Claude Code's auto memory keeps an index, MEMORY.md, and one note file per memory
+# under <config dir>/projects/<project>/memory/.
+_CLAUDE_INDEX_NAME = "MEMORY.md"
+# Caps that keep the count cheap on a large or unusual config dir.
+_CLAUDE_PROJECTS_SCAN_LIMIT = 500
+_CLAUDE_ENTRIES_SCAN_LIMIT = 1000
+# Codex keeps its notes in <Codex home>/memories/: MEMORY.md holds them and
+# memory_summary.md is the digest Codex loads into its prompt.
+_CODEX_MEMORY_DIR_NAME = "memories"
+_CODEX_NOTE_NAMES = ("MEMORY.md", "memory_summary.md")
+# A slow disk must not delay a harness launch.
+_IMPORT_COUNT_SECONDS = 2.0
+# One directory for every harness, so a host that keeps little else can keep it.
+_IMPORT_OFFER_DIR_NAME = "memory-import-offers"
+
+_IMPORT_OFFER_ASK = (
+    "In your first reply, ask the user once whether to import them into Omnigent memory "
+    "with the import-memory skill. If they decline, do not ask again."
+)
+_CLAUDE_MEMORY_IMPORT_NOTE = (
+    "## Claude Code's own memory\n"
+    "Claude Code's auto memory is off in this session because Omnigent memory is on, so "
+    "its notes are not loaded here. {count} note file{plural} from it {verb} still on this "
+    "machine under {directory}. " + _IMPORT_OFFER_ASK
+)
+_CODEX_MEMORY_IMPORT_NOTE = (
+    "## Codex's own memory\n"
+    "Codex's own memory is off in this session because Omnigent memory is on, so its notes "
+    "are not loaded here. They are still on this machine under {directory}. " + _IMPORT_OFFER_ASK
+)
+
+
+def _claude_config_dir(cwd: Path, env: Mapping[str, str]) -> Path:
+    """
+    The Claude Code config dir a native launch uses.
+
+    Read from the launch's own environment, which an ``env`` wrapper in the
+    configured launch command may have changed. A relative value is relative to
+    the launch's working directory, as Claude Code resolves it.
+
+    :param cwd: The launch's working directory, e.g. ``Path("/home/me/repo")``.
+    :param env: The launch's environment, e.g. ``{"HOME": "/home/me"}``.
+    :returns: ``$CLAUDE_CONFIG_DIR`` or ``$HOME/.claude``, e.g. ``Path("/home/me/.claude")``.
+    """
+    configured = env.get("CLAUDE_CONFIG_DIR")
+    if not configured:
+        home = env.get("HOME")
+        return (Path(home) if home else Path.home()) / ".claude"
+    return cwd / configured
+
+
+def _is_claude_note(entry: os.DirEntry[str]) -> bool:
+    """Whether a memory directory entry is a note file, by name alone."""
+    return entry.name.endswith(".md") and entry.name != _CLAUDE_INDEX_NAME and entry.is_file()
+
+
+def _count_claude_notes_in(memory_dir: str) -> int:
+    """Note files in one project's memory directory; a project without one has none."""
+    try:
+        entries = os.scandir(memory_dir)
+    except FileNotFoundError:
+        return 0
+    with entries:
+        return sum(
+            1
+            for entry in itertools.islice(entries, _CLAUDE_ENTRIES_SCAN_LIMIT)
+            if _is_claude_note(entry)
+        )
+
+
+def count_claude_memory_notes(config_dir: Path) -> int:
+    """
+    Count Claude Code's note files under *config_dir* without reading any of them.
+
+    :param config_dir: A Claude Code config dir, e.g. ``Path("/home/me/.claude")``.
+    :returns: The number of note files; ``0`` when the config dir has no projects.
+    :raises OSError: When a directory exists but cannot be read.
+    """
+    try:
+        projects = os.scandir(config_dir / "projects")
+    except FileNotFoundError:
+        return 0
+    with projects:
+        return sum(
+            _count_claude_notes_in(os.path.join(project.path, "memory"))
+            for project in itertools.islice(projects, _CLAUDE_PROJECTS_SCAN_LIMIT)
+            if project.is_dir(follow_symlinks=False)
+        )
+
+
+def count_codex_memory_notes(codex_home: Path) -> int:
+    """
+    Count Codex's note files under *codex_home* without reading them.
+
+    Only the two files Codex's notes end up in count. The rest of the directory
+    is the working material Codex distilled them from.
+
+    :param codex_home: A Codex home, e.g. ``Path("/home/me/.codex")``.
+    :returns: How many of ``MEMORY.md`` and ``memory_summary.md`` hold text.
+    :raises OSError: When the memory directory exists but cannot be read.
+    """
+    count = 0
+    for name in _CODEX_NOTE_NAMES:
+        try:
+            status = (codex_home / _CODEX_MEMORY_DIR_NAME / name).stat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if stat.S_ISREG(status.st_mode) and status.st_size > 0:
+            count += 1
+    return count
+
+
+def _import_offer_marker(harness: str, notes_home: Path) -> Path:
+    """
+    The per-machine marker that the import offer was made for *notes_home*.
+
+    It stays in the data directory, not beside the notes: Codex versions its
+    memory directory and passes what changes there to its own consolidation.
+    """
+    digest = hashlib.sha256(str(notes_home.resolve()).encode("utf-8")).hexdigest()[:32]
+    return data_dir() / _IMPORT_OFFER_DIR_NAME / f"{harness}-{digest}"
+
+
+def _claim_import_offer(harness: str, notes_home: Path) -> bool:
+    """
+    Record that the offer is made for *notes_home*, once.
+
+    Creating the marker exclusively keeps two launches from both offering it.
+
+    :returns: ``False`` when an earlier launch already made the offer.
+    """
+    marker = _import_offer_marker(harness, notes_home)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with marker.open("x", encoding="utf-8") as handle:
+            handle.write(str(notes_home))
+    except FileExistsError:
+        return False
+    return True
+
+
+async def _notes_to_offer(harness: str, notes_home: Path, count: Callable[[Path], int]) -> int:
+    """
+    Count the notes under *notes_home* and claim their one-time offer.
+
+    :param harness: Names the marker, e.g. ``"claude"``.
+    :param count: Counts the notes without reading them.
+    :returns: The note count when this launch makes the offer, otherwise ``0``.
+    """
+    found = await asyncio.wait_for(
+        asyncio.to_thread(count, notes_home), timeout=_IMPORT_COUNT_SECONDS
+    )
+    if found and await asyncio.to_thread(_claim_import_offer, harness, notes_home):
+        return found
+    return 0
+
+
+async def claude_memory_import_note(cwd: Path, env: Mapping[str, str]) -> str | None:
+    """
+    The one-time offer to import Claude Code's own notes, for a native launch.
+
+    Call it only when the launch has Claude Code's auto memory switched off. The
+    offer is made when the config dir holds note files and no earlier launch made
+    it for that dir; making it records the marker. Never raises: any failure means
+    no offer.
+
+    :param cwd: The launch's working directory, e.g. ``Path("/home/me/repo")``.
+    :param env: The launch's environment, after any ``env`` wrapper, e.g.
+        ``{"HOME": "/home/me", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
+    :returns: Launch instructions naming the note count and config dir, or ``None``.
+    """
+    try:
+        config_dir = _claude_config_dir(cwd, env)
+        count = await _notes_to_offer("claude", config_dir, count_claude_memory_notes)
+    except Exception:
+        _logger.debug("Claude Code memory import offer unavailable", exc_info=True)
+        return None
+    if not count:
+        return None
+    return _CLAUDE_MEMORY_IMPORT_NOTE.format(
+        count=count,
+        plural="" if count == 1 else "s",
+        verb="is" if count == 1 else "are",
+        directory=json.dumps(str(config_dir), ensure_ascii=False),
+    )
+
+
+def release_claude_memory_import_offer(cwd: Path, env: Mapping[str, str]) -> None:
+    """
+    Undo :func:`claude_memory_import_note`'s claim after the launch failed.
+
+    The offer never reached a running Claude, so a later launch should make it.
+    Never raises.
+
+    :param cwd: The working directory the offer was made for.
+    :param env: The launch environment the offer was made for.
+    """
+    try:
+        _import_offer_marker("claude", _claude_config_dir(cwd, env)).unlink(missing_ok=True)
+    except Exception:
+        _logger.debug("Claude Code memory import offer not released", exc_info=True)
+
+
+async def codex_memory_import_note(codex_home: Path) -> str | None:
+    """
+    The one-time offer to import Codex's own notes, for a native launch.
+
+    Call it only when the launch has Codex's own memory switched off. The offer
+    is made when the Codex home holds notes and no earlier launch made it for
+    that home; making it records the marker. Never raises: any failure means no
+    offer.
+
+    :param codex_home: The user's Codex home, e.g. ``Path("/home/me/.codex")``,
+        not a session's private one.
+    :returns: Launch instructions naming the notes' directory, or ``None``.
+    """
+    try:
+        count = await _notes_to_offer("codex", codex_home, count_codex_memory_notes)
+    except Exception:
+        _logger.debug("Codex memory import offer unavailable", exc_info=True)
+        return None
+    if not count:
+        return None
+    return _CODEX_MEMORY_IMPORT_NOTE.format(
+        directory=json.dumps(str(codex_home / _CODEX_MEMORY_DIR_NAME), ensure_ascii=False)
+    )

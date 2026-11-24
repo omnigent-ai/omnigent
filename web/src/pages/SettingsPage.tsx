@@ -42,6 +42,8 @@ import {
   useRef,
   useState,
 } from "react";
+import { paneCornersSetting } from "@/shell/settingsCommands";
+import { usePaneCorners } from "@/shell/useFloatingPanes";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import {
@@ -126,6 +128,7 @@ import {
   HIDE_UNCONFIGURED_HARNESSES_ENTRY,
   PEER_SESSION_MESSAGES_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
+  PANE_CORNERS_ENTRY,
   TERMINAL_THEME_ENTRY,
   THEME_MODE_ENTRY,
   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
@@ -696,6 +699,54 @@ function TerminalThemeControl() {
         />
       </SettingsOwner>
     </SettingsItem>
+  );
+}
+
+/** Floating panes or sharp corners on this device; the same setting ⌘K's Pane corners row offers. */
+function PaneCornersControl() {
+  const paneCorners = usePaneCorners();
+  const setting = paneCornersSetting(paneCorners);
+  const current = setting.choices.find((choice) => choice.value === setting.current);
+  return (
+    <SettingsItem entry={PANE_CORNERS_ENTRY} className="flex items-center justify-between gap-4">
+      <SettingsEntryLabel entry={PANE_CORNERS_ENTRY} className="flex-1" />
+      <SettingsOwner entry={PANE_CORNERS_ENTRY}>
+        <Select
+          value={setting.current}
+          onValueChange={(next) => void setting.choose(next)}
+          componentId="settings.appearance.pane_corners"
+          valueHasNoPii
+        >
+          <SelectTrigger
+            {...settingsControlProps(PANE_CORNERS_ENTRY)}
+            data-testid="pane-corners-select"
+            className="w-full sm:w-56"
+          >
+            <SelectValue>{current?.label}</SelectValue>
+          </SelectTrigger>
+          <SelectContent {...settingsOverlayProps(PANE_CORNERS_ENTRY)}>
+            {setting.choices.map((choice) => (
+              <SelectItem
+                key={choice.value}
+                value={choice.value}
+                data-testid={`pane-corners-${choice.value}`}
+              >
+                {choice.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </SettingsOwner>
+    </SettingsItem>
+  );
+}
+
+function PaneCornersRow() {
+  if (!usePaneCorners().available) return null;
+  return (
+    <div className="mt-4 border-t border-border pt-4">
+      <PaneCornersControl />
+    </div>
   );
 }
 
@@ -1354,6 +1405,7 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <ColorThemeControl />
             </div>
+            <PaneCornersRow />
           </SettingsGroup>
 
           <SettingsGroup title="Chat defaults" testId="settings-group-chat">

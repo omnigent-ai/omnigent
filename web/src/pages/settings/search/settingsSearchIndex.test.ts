@@ -62,6 +62,7 @@ const SHOWN: SettingsAvailability = {
   integrationProviders: { github: true, databricks: true },
   projectKanban: true,
   sessionTitleInstructions: true,
+  floatingPanes: true,
   proactiveAgent: true,
 };
 const HIDDEN: SettingsAvailability = {
@@ -77,6 +78,7 @@ const HIDDEN: SettingsAvailability = {
   integrationProviders: { github: false, databricks: false },
   projectKanban: false,
   sessionTitleInstructions: false,
+  floatingPanes: false,
   proactiveAgent: false,
 };
 
@@ -250,7 +252,7 @@ describe("availability", () => {
     ]);
   });
 
-  // The General rows the page renders only where the build or server offers them, each by its own
+  // The rows the page renders only where the build or server offers them, each by its own
   // gate: turning off only that gate hides it, and turning on only that gate shows it.
   it.each([
     ["browser-agent-tools", "inAppBrowser"],
@@ -259,6 +261,7 @@ describe("availability", () => {
     ["session-title-instructions", "sessionTitleInstructions"],
     ["proactive-agent", "proactiveAgent"],
     ["widen-window-for-right-sidebar", "widenWindowForRightSidebar"],
+    ["pane-corners", "floatingPanes"],
   ] as const)("offers the catalog's %s only where %s is on", (id, gate) => {
     const offered = (availability: SettingsAvailability) =>
       settingsSearchTargets(SETTINGS_ENTRIES, SECTIONS, availability).map((target) => target.key);

@@ -86,6 +86,13 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+- `palette-pane-corners`: where floating panes can show (`workspace_sidebar_v2` or
+  `floating_panes` on, and not a touch device), the QuickPick palette lists the
+  **Pane corners** setting. **Automatic** follows the server's `floating_panes`
+  policy and names what it gives now; **Floating panes** and **Sharp corners**
+  override it on this device, and a reload keeps the choice. Settings →
+  Appearance offers the same choice (`web/src/shell/settingsCommands.test.ts`,
+  `tests/e2e_ui/sessions/test_floating_panes.py`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
