@@ -143,6 +143,21 @@ describe("foldBackgroundTurns", () => {
     expect(rows.map((row) => row.kind)).toEqual(["background_updates", "user", "assistant"]);
   });
 
+  it("folds digest turns and keeps a batch that marks a ticket needs-human visible", () => {
+    const other = "fedcba9876543210fedcba9876543210";
+    const digest = user(
+      "d1",
+      `Ticket update digest for project p1. Nothing here asked to wake you.\n\nDigest of 2 background updates (agent notes, outputs and edits). Read a ticket only if a line needs action:\n- ${TICKET} "A": agent note\n- ${other} "B": output`,
+    );
+    const batch = user(
+      "b1",
+      `Automatic ticket update for project p1. Use the orchestrator skill to handle it.\n\nTicket ${TICKET} · comment\n{"text": "hi"}\n\nTicket ${other} · updated\n{"changes": {"labels": [{"key": "needs-human"}]}}`,
+    );
+    const rows = foldBackgroundTurns([digest, assistant("a1"), batch, assistant("a2")]);
+    expect(rows.map((row) => row.kind)).toEqual(["background_updates", "user", "assistant"]);
+    expect(rows[0]).toMatchObject({ updateCount: 1, ticketCount: 2 });
+  });
+
   it("leaves a session that never receives ticket updates unchanged", () => {
     const bubbles = [user("m1", "[Message from session abc123]\nDo the task."), assistant("a1")];
     expect(foldBackgroundTurns(bubbles)).toBe(bubbles);
