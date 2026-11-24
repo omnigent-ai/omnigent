@@ -69,7 +69,7 @@ export interface WorkspaceSidebarTabActionsOptions {
   releaseFor?: (tab: WorkspaceTab) => (() => Promise<boolean>) | undefined;
   /**
    * Closes the strip entry `tabId` stands for when the host shows several tabs as one, such as
-   * a split, returning the close; null to close it as a tab. Used by Close tab, its chord and ⌘W.
+   * a split, returning the close; null to close it as a tab. Used by Close tab and its chord.
    */
   closeEntry?: (tabId: TabId, source?: "pointer") => Promise<{ ok: boolean }> | null;
   /**
