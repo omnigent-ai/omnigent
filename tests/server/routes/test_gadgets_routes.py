@@ -277,6 +277,12 @@ async def test_an_owner_builds_publishes_and_uses_a_gadget(
         f"{base}/comments/{comment.json()['id']}", json={"status": "addressed"}, headers=_as(ALICE)
     )
     assert marked.json()["status"] == "addressed"
+    for odd in ([], {}):
+        refused = await client.patch(
+            f"{base}/comments/{comment.json()['id']}", json={"status": odd}, headers=_as(ALICE)
+        )
+        assert refused.status_code == 400
+        assert refused.json()["error"]["code"] == "INVALID_ARGUMENT"
 
     pinned = await client.put(f"{base}/pin", json={"pinned": True}, headers=_as(ALICE))
     assert pinned.json() == {

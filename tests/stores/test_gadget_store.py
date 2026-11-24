@@ -274,6 +274,30 @@ def test_reopening_removes_what_an_interrupted_deletion_left(tmp_path: Path) -> 
     assert (location / "gadgets" / kept.id / "gadget.json").exists()
 
 
+def test_reopening_removes_a_create_that_stopped_before_its_owner_marker(tmp_path: Path) -> None:
+    location = tmp_path / "gadgets"
+    store = LocalGadgetStore(str(location))
+    stopped = store.create(ALICE, "Half made")
+    finished = store.create(ALICE, "Board")
+    # One create stopped after its metadata but before its owner marker; the other
+    # finished but couldn't clear its note. Both notes are old.
+    [marker] = (location / "owners").rglob(stopped.id)
+    marker.unlink()
+    old = 1_000_000_000
+    for gadget in (stopped, finished):
+        note = location / ".creating" / gadget.id
+        note.touch()
+        os.utime(note, (old, old))
+
+    reopened = LocalGadgetStore(str(location))
+    # The gadget no one was handed is gone, so owner pages and account cleanup agree.
+    assert reopened.get(stopped.id) is None
+    assert not (location / "gadgets" / stopped.id).exists()
+    assert reopened.get(finished.id) == finished
+    assert [gadget.id for gadget in reopened.iter_owned(ALICE)] == [finished.id]
+    assert not list((location / ".creating").iterdir())
+
+
 def test_a_start_cleans_up_a_bounded_amount_and_never_lists_every_gadget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

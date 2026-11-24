@@ -1998,8 +1998,11 @@ def test_comments_are_shared_with_everyone_who_can_read_the_gadget(gadgets: Fixt
     )
     assert owner.list_comments(app["id"], "draft")["items"] == []
     assert editor.update_comment(app["id"], comment["id"], {"body": "Edited"})["body"] == "Edited"
-    with pytest.raises(InvalidInput):
-        owner.update_comment(app["id"], comment["id"], {"status": "done"})
+    for status in ("done", [], {}, 1):
+        with pytest.raises(InvalidInput):
+            owner.update_comment(app["id"], comment["id"], {"status": status})
+        with pytest.raises(InvalidInput):
+            owner.list_comments(app["id"], status)  # type: ignore[arg-type]
 
     other = editor.create_comment(
         app["id"], {"body": "Second", "anchor": {"text": "x"}, "operation_id": "c3"}

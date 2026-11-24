@@ -345,12 +345,36 @@ class LocalGadgetStore(GadgetStore):
                     if note.stat().st_mtime >= cutoff:
                         continue  # Maybe a create still in progress.
                     if _GADGET_ID.fullmatch(note.name) is not None:
-                        directory = self._gadget_dir(note.name)
-                        if directory.is_dir() and not (directory / _METADATA_FILE).exists():
-                            trash = self._root / ".trash" / f"orphan-{uuid.uuid4().hex}"
-                            trash.parent.mkdir(parents=True, exist_ok=True)
-                            os.replace(directory, trash)
+                        self._finish_interrupted_create(note.name)
                     os.unlink(note.path)
+
+    def _finish_interrupted_create(self, gadget_id: str) -> None:
+        """Remove what a create that stopped before its owner marker left behind.
+
+        A create returns only after its marker exists, so a gadget without one was never
+        handed to anyone; kept, it would be missing from owner pages and account cleanup.
+        """
+        directory = self._gadget_dir(gadget_id)
+        if not directory.is_dir():
+            return
+        try:
+            found = self._read_record(gadget_id)
+        except CorruptData:
+            found = None
+        if found is not None:
+            gadget, segment = found
+            owner_dir = self._owner_dir(gadget.owner_id, gadget.owner_registration)
+            with self._owner_index(owner_dir):
+                if (owner_dir / segment / gadget_id).exists():
+                    return  # Complete; only clearing its note failed.
+                self._detach_orphan(directory)
+            return
+        self._detach_orphan(directory)
+
+    def _detach_orphan(self, directory: Path) -> None:
+        trash = self._root / ".trash" / f"orphan-{uuid.uuid4().hex}"
+        trash.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(directory, trash)
 
     def _gadget_dir(self, gadget_id: str) -> Path:
         return self._root / "gadgets" / gadget_id

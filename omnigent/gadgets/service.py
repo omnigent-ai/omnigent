@@ -794,7 +794,7 @@ class GadgetService:
         The filter applies while paging, so a short or empty page can still continue;
         follow ``next_cursor`` to the end before sorting comments by time.
         """
-        if status is not None and status not in COMMENT_STATUSES:
+        if status is not None and (not isinstance(status, str) or status not in COMMENT_STATUSES):
             raise InvalidInput("status must be draft or addressed")
         gadget, permissions = self._resolve(app_id)
         page = self._comments(gadget).list("comments", _page_limit(limit, 200), cursor)
@@ -860,7 +860,7 @@ class GadgetService:
                 raise InvalidInput(f"A comment needs 1–{MAX_COMMENT_CHARS} characters")
             value["body"] = text.strip()
         if "status" in body:
-            if body["status"] not in COMMENT_STATUSES:
+            if not isinstance(body["status"], str) or body["status"] not in COMMENT_STATUSES:
                 raise InvalidInput("status must be draft or addressed")
             value["status"] = body["status"]
         if value == current.value:

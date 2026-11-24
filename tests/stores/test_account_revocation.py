@@ -1623,6 +1623,33 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     assert store.get(kept["id"]) is not None
 
 
+def test_a_gadget_whose_create_stopped_before_its_owner_marker_leaves_nothing_behind(
+    db_uri: str, tmp_path
+) -> None:
+    import os
+
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    alice = service("alice")
+    stopped = alice.create("Half made")
+    # The create stopped after its metadata, before its owner marker and its note's
+    # removal; owner pages, and so account cleanup, never see it.
+    location = tmp_path / "gadgets"
+    [marker] = (location / "owners").rglob(stopped["id"])
+    marker.unlink()
+    note = location / ".creating" / stopped["id"]
+    note.touch()
+    os.utime(note, (1_000_000_000, 1_000_000_000))
+
+    LocalGadgetStore(str(location))  # A restart finishes the interrupted create.
+    assert accounts.delete_user("alice") is True
+    assert store.get(stopped["id"]) is None
+    assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
+
+
 def test_a_password_change_keeps_the_accounts_gadgets_and_pins(db_uri: str, tmp_path) -> None:
     accounts = SqlAlchemyAccountStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
