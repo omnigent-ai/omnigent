@@ -230,7 +230,27 @@ Session-level policies let you customize agent behavior for your current task. T
 1. **UI** -- Open the information window to browse available policies and toggle them on or off.
 2. **Chat** -- Tell the agent directly, e.g. *"add a policy that asks me before running shell commands"*. The agent has a built-in `sys_add_policy` tool and will configure the policy for you.
 
-Session policies evaluate before agent spec and admin policies, so they can enforce stricter rules or add additional gates for your specific workflow.
+Session policies evaluate before agent spec and admin policies, so they can enforce stricter rules or add additional gates for your specific workflow. Sub-agents spawned from a session are governed by its policies too.
+
+### Policies and harness permission modes
+
+Native harnesses such as Claude Code and Codex have their own permission modes, for example Claude Code's `auto` or `bypassPermissions`. For their native tools, such as Claude Code's `Bash`, Omnigent evaluates policies in a pre-tool hook, so the verdict applies in every permission mode:
+
+- **DENY** blocks the call, even in a mode that never prompts.
+- **ASK** opens an Omnigent approval card and waits for your answer. The harness's permission mode can't approve it for you.
+- **ALLOW**, or no matching policy, leaves the decision to the harness's own permission mode.
+
+Codex runs the hook from version 0.129.0. On older versions Omnigent logs a warning and does not register the hook, so policies don't see Codex's native tools.
+
+### Auto-approving with guardrails
+
+To let an agent work without approval prompts while still stopping commands you never want it to run:
+
+1. Start the session in a permission mode that approves most actions itself, such as Claude Code's `auto`.
+2. Add [`blast_radius`](#blast_radius). It always denies catastrophic commands such as `rm -rf /` and force-pushes, and asks before recursive deletes, pushes and deploys. Set `risky_action: DENY` to block those instead.
+3. Add a [`cel_policy`](#cel_policy) for commands specific to your setup, for example one that asks before any command that mentions a production environment.
+
+These policies match command text, so they catch obvious mistakes but are not a security boundary. To restrict what the agent can reach, use a sandbox (see [`enforce_sandbox`](#enforce_sandbox)) or scoped credentials.
 
 ---
 
@@ -453,6 +473,32 @@ Controls Google Calendar access. Defaults to read-only.
 | `allow_modify_events` | boolean | `false` | Allow updating/deleting events |
 | `tool_prefixes` | string[] | `["mcp__google__", "google__"]` | Tool-name prefixes |
 
+### Shell commands
+
+#### `blast_radius`
+
+Gates shell commands by how hard they are to undo. It reads the command of a `sys_os_shell`, `Bash`, `bash`, `Shell`, `terminal`, `developer__shell` or `shell` tool call.
+
+- **Always denied:** a recursive `rm` of `/`, `/*`, `~`, a critical top-level directory such as `/home` or `/etc`, or anything under `/etc`, `/usr`, `/var` and the other system directories; a `git push` with `--force`, `--force-with-lease`, `--delete`, `--mirror`, `--prune`, `-f`, `-d`, or a `+` or `:` refspec; `git reset --hard` to a remote branch.
+- **Risky, gets `risky_action`:** any other recursive `rm`; any other `git push`; `gh pr merge`, `gh release` and `gh repo delete`; `kubectl`, `helm`, `terraform` and `databricks` commands that contain `apply`, `deploy`, `destroy` or `delete`.
+- **Allowed:** everything else, including a non-recursive `rm`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `gate_pushes` | boolean | `true` | Apply `risky_action` to risky commands. `false` allows them and keeps only the always-denied set |
+| `risky_action` | string | `"ASK"` | Verdict for risky commands (`ASK` or `DENY`). `DENY` also blocks every `git push` and `gh pr merge` |
+| `deny_reason` | string | `"Blocked by the blast-radius policy."` | Message shown on DENY |
+
+```yaml
+block_dangerous_shell:
+  type: function
+  handler: omnigent.policies.builtins.orchestration.blast_radius
+  factory_params:
+    risky_action: ASK
+```
+
+The policy splits a command on `;`, `&&`, `||`, `|` and newlines and classifies each part by its first word. It does not see a command run through `bash -c` or `xargs`, an `rm` called by path such as `/bin/rm`, or other ways to delete files, such as `find -delete`, `git clean` or a script.
+
 ### Working directory
 
 #### `block_working_dir_changes`
@@ -514,6 +560,40 @@ policies:
       expensive_models:
         - databricks-claude-opus-4-6
 ```
+
+### CEL expressions
+
+#### `cel_policy`
+
+Evaluates a [CEL](https://cel.dev/overview/cel-overview) expression against each policy event. The expression reads the event as `event` and returns a map with a `result` of `"DENY"`, `"ASK"` or `"ALLOW"` and an optional `reason`, or `null` to abstain. A syntax error is rejected when the policy is added.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `expression` | string | (required) | CEL expression to evaluate |
+| `reason` | string | `"Denied by policy."` | Reason for a DENY or ASK result whose map has no `reason` |
+
+For a shell tool call, `event.type` is `"tool_call"`, `event.data.name` is the tool name (`"Bash"` for Claude Code and Codex) and `event.data.arguments.command` is the command. This policy denies any command that runs `rm`:
+
+```yaml
+no_rm:
+  type: function
+  handler: omnigent.policies.builtins.cel.cel_policy
+  factory_params:
+    expression: >-
+      event.type == "tool_call"
+      && event.data.name in ["Bash", "bash", "Shell", "shell", "sys_os_shell", "terminal", "developer__shell"]
+      && event.data.arguments.command.matches(r"""(^|[\s;&|()'"/\\])rm(\s|$)""")
+      ? {"result": "DENY", "reason": "rm is blocked in this session."}
+      : null
+```
+
+To ask before commands that mention a production environment, use a pattern such as `r"(?i)\bprod\b"` with `"result": "ASK"`.
+
+When matching command text:
+
+- Match whole words with `matches()`. `command.contains("rm")` also matches `npm run format`, `terraform` and `docker run --rm`.
+- A pattern also matches quoted text, such as `git commit -m "rm unused file"`, and misses commands that act without the word, such as `find -delete`, `git clean` or a script.
+- Check `event.type` and `event.data.name` before reading `event.data.arguments.command`. If evaluation fails, for example on a missing field, the policy abstains and doesn't block the call.
 
 ---
 
