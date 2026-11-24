@@ -664,9 +664,10 @@ async def test_subagent_reports_its_own_model_to_its_child_session(tmp_path: Pat
     """
     A sub-agent reports the model in its own transcript on the child session.
 
-    The report retries after a failed post, survives a forwarder restart
-    without re-posting, and follows a later model change. The parent session
-    never receives the child's model.
+    A forwarder restarted after a failed post retries the checkpointed model
+    without re-reading it; once posted, a restart that re-reads the whole
+    transcript does not post again, and a later model change posts once. The
+    parent session never receives the child's model.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -734,12 +735,17 @@ async def test_subagent_reports_its_own_model_to_its_child_session(tmp_path: Pat
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
-        state = await poll(client, state)
+        await poll(client, state)
         assert model_posts == [(child_path, "claude-haiku-4-5")]
-        assert state.subagents["modelchild"].posted_model is None
 
-        # The next poll reads no new records but still retries the sticky model.
-        state = await poll(client, state)
+        # The checkpoint keeps the unposted model past the transcript cursor,
+        # so a restarted forwarder retries it without reading the record again.
+        reloaded = forwarder._read_subagent_forward_state(bridge_dir).subagents["modelchild"]
+        assert reloaded.byte_offset == subagent_jsonl.stat().st_size
+        assert (reloaded.observed_model, reloaded.posted_model) == ("claude-haiku-4-5", None)
+        state = await poll(
+            client, forwarder.SubagentForwardState(subagents={"modelchild": reloaded})
+        )
         assert model_posts[-1] == (child_path, "claude-haiku-4-5")
         assert len(model_posts) == 2
 
