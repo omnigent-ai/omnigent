@@ -1525,6 +1525,48 @@ def test_references_written_without_rules_leave_no_index_entries_to_read(
     assert examined == []
 
 
+def test_a_late_index_retirement_keeps_the_generation_a_later_rebuild_wrote(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild that pauses before retiring the generations it replaced, while a later
+    rebuild writes the next one, must not remove that newer index when it resumes: the
+    references it holds still refuse the delete."""
+    delayed: list[tuple[ConstraintGuard, int]] = []
+    retire = ConstraintGuard._retire_index_generations
+
+    def pause_first(guard: ConstraintGuard, current: int) -> None:
+        if not delayed:
+            delayed.append((guard, current))
+            return
+        retire(guard, current)
+
+    monkeypatch.setattr(ConstraintGuard, "_retire_index_generations", pause_first)
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_RUN_CARD_RESTRICT])
+    target = card(service, app, "target", "todo")
+    assert delayed, "the first rebuild retires the generations it replaced"
+    # A run written while no rule applied, then the rule published again: the next guarded
+    # write rebuilds the index into a newer generation.
+    revision = ruled_revision(service, app["id"], [])
+    app = service.publish(app["id"], {"revision_id": revision, "if_version": app["version"]})
+    _runs_naming(service, app, "target", 1)
+    revision = ruled_revision(service, app["id"], [_RUN_CARD_RESTRICT])
+    app = service.publish(app["id"], {"revision_id": revision, "if_version": app["version"]})
+    card(service, app, "warm", "todo")
+    guard, generation = delayed[0]
+    retire(guard, generation)  # The paused rebuild finally retires.
+
+    with pytest.raises(ConstraintViolation):
+        rpc(
+            service,
+            app,
+            "delete",
+            id="target",
+            if_version=target["version"],
+            operation_id="d-target",
+        )
+
+
 def test_a_lookup_over_too_many_left_behind_entries_rebuilds_the_index(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

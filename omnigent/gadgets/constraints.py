@@ -39,8 +39,9 @@ behind are checked against the record and dropped. A lookup reads at most
 ``MAX_STALE_INDEX_ENTRIES`` of those: one that would read more has the index rebuilt.
 When the rules change, the index needs rebuilding, or a write fails half-way, the derived
 state is rebuilt a page at a time into a new index generation, with its progress saved in
-the guard, so each step costs bounded work and a stopped rebuild resumes; the generations
-it replaces are then removed.
+the guard, so each step costs bounded work and a stopped rebuild resumes; generations
+older than the one it committed are then removed (never newer ones, which a later rebuild
+may be writing).
 """
 
 from __future__ import annotations
@@ -91,6 +92,7 @@ GUARD_BACKOFF_MAX_S = 0.4
 _ON_DELETE = ("restrict", "cascade", "unset")
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _EPOCH = re.compile(r"^e[0-9]{6,12}$")
+_GENERATION = re.compile(r"^g([0-9]{1,12})$")
 _GUARD_COLLECTION = "epochs"
 _STALE = "stale"
 _INITIAL_STATE = {"rules": _STALE, "counts": {}, "unique": {}, "pending": None, "writes": 0}
@@ -146,6 +148,12 @@ def _canonical(value: Any) -> bytes:
 
 def _digest(value: Any, length: int = 64) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()[:length]
+
+
+def _generation_number(name: str) -> int | None:
+    """The number in a reference index generation's directory name, ``g<number>``."""
+    match = _GENERATION.fullmatch(name)
+    return int(match.group(1)) if match else None
 
 
 def validate_guide(value: Any) -> str | None:
@@ -953,29 +961,31 @@ class ConstraintGuard:
                 self._retire_index_generations(generation)
 
     def _retire_index_generations(self, current: int) -> None:
-        """Remove the index generations and old rules' indexes the finished rebuild replaced.
+        """Remove the index generations older than *current*, the one the rebuild committed.
 
-        Each removal is one ``delete_tree`` of a directory, which the store does in bounded
-        work; a store that cannot delete keeps them, and lookups never read them again.
+        Generations only grow: a rebuild writes ``ref_generation + 1`` of the state it
+        started from, so every rebuild begun after this one committed, or still running,
+        writes a higher generation, whatever rules it is for. Removing only lower ones, under
+        every rule's directory, therefore never removes entries a later rebuild wrote, however
+        late this runs; rule directories stay, since a later rebuild may be writing into one.
+        Each removal is one ``delete_tree``, which the store does in bounded work; a store
+        that cannot delete keeps them, and lookups never read them again.
         """
         if not self.files.supports_delete:
             return
-        live = {_digest(rule, 16) for rule in self.rules if rule["kind"] == "reference"}
         root = self._index_root()
         with contextlib.suppress(NotFound):
             names, _more = self.files.list_page(root, after=None, limit=MAX_CONSTRAINTS * 4)
             for name in names:
-                if name not in live:
-                    with contextlib.suppress(NotFound):
-                        self.files.delete_tree(f"{root}/{name}")
-                    continue
-                generations, _ = self.files.list_page(
-                    f"{root}/{name}", after=None, limit=MAX_CONSTRAINTS * 4
-                )
-                for generation in generations:
-                    if generation != f"g{current}":
-                        with contextlib.suppress(NotFound):
-                            self.files.delete_tree(f"{root}/{name}/{generation}")
+                with contextlib.suppress(NotFound):
+                    generations, _ = self.files.list_page(
+                        f"{root}/{name}", after=None, limit=MAX_CONSTRAINTS * 4
+                    )
+                    for generation in generations:
+                        number = _generation_number(generation)
+                        if number is not None and number < current:
+                            with contextlib.suppress(NotFound):
+                                self.files.delete_tree(f"{root}/{name}/{generation}")
 
     def _rebuild_record(self, progress: dict, collection: str, record: Document) -> None:
         for rule in self.rules:
