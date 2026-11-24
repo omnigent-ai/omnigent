@@ -150,6 +150,8 @@ export function parsePlace(value: unknown): WorkspacePlace | null | "unknown" {
       return nonEmptyString(value.id) ? { kind: "agent", id: value.id } : null;
     case "chat":
       return nonEmptyString(value.id) ? { kind: "chat", id: value.id } : { kind: "chat" };
+    case "google-docs":
+      return { kind: "google-docs" };
     case "search":
       return nonEmptyString(value.query)
         ? { kind: "search", query: value.query }

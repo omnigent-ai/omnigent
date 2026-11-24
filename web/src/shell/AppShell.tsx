@@ -514,7 +514,7 @@ function AppShellImpl() {
   // (except the settings menu) and remembers the desktop state for widening.
   const mobileViewport = useIsMobileViewport();
   // The tabs host sits in the Workspace drawer once a narrow window has mounted it.
-  const tabsInDrawer = mobileViewport && tabsDrawerTarget !== null;
+  const [tabsInDrawer, setTabsInDrawer] = useState(false);
   const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
@@ -1226,6 +1226,7 @@ function AppShellImpl() {
     () =>
       ({
         files: showFilesPanel,
+        "google-docs": isFeatureEnabled(serverInfo, "google_docs"),
         "content-search":
           showFilesPanel && isFeatureEnabled(serverInfo, "workspace_content_search"),
         // Changes tab shares the Files gate — same on-disk workspace, just the
@@ -1718,7 +1719,8 @@ function AppShellImpl() {
       // gated nav tab — always valid, and never a fallback target.
       if (tab === null) return fallbackTab;
       if (tab === "sidechat") return tab;
-      if (tab === "content-search" && serverInfo === "loading") return tab;
+      if ((tab === "content-search" || tab === "google-docs") && serverInfo === "loading")
+        return tab;
       if (railTabsAvailable[tab]) return tab;
       return fallbackTab;
     });
@@ -3560,6 +3562,7 @@ function AppShellImpl() {
                     mobile={mobileViewport}
                     mobileTarget={tabsDrawerTarget}
                     layout="contents"
+                    onPlacementChange={setTabsInDrawer}
                   >
                     <Suspense fallback={null}>
                       <LazyWorkspaceTabsHost
@@ -3681,19 +3684,22 @@ function AppShellImpl() {
                 )}
               </div>
 
-              {conversationId && workspacePanelMounted && tabsSidebar && mobileViewport && (
-                // The narrow layout's Workspace drawer, where the one tabs host moves; kept
-                // mounted so its shells and pages stay live.
-                <MobilePanelDrawer
-                  open={tabsDrawerOpen}
-                  title="Workspace"
-                  onClose={() => setTabsDrawerOpen(false)}
-                  testId="workspace-tabs-drawer"
-                  keepMounted
-                >
-                  <div ref={setTabsDrawerTarget} className="contents" />
-                </MobilePanelDrawer>
-              )}
+              {conversationId &&
+                workspacePanelMounted &&
+                tabsSidebar &&
+                (mobileViewport || tabsInDrawer) && (
+                  // The narrow layout's Workspace drawer, where the one tabs host moves; kept
+                  // mounted so its shells and pages stay live.
+                  <MobilePanelDrawer
+                    open={tabsDrawerOpen}
+                    title="Workspace"
+                    onClose={() => setTabsDrawerOpen(false)}
+                    testId="workspace-tabs-drawer"
+                    keepMounted
+                  >
+                    <div ref={setTabsDrawerTarget} className="contents" />
+                  </MobilePanelDrawer>
+                )}
               <AppShellWorkspacePanels
                 conversationId={conversationId}
                 terminalFirst={terminalFirst}

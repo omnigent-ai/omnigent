@@ -1,3 +1,5 @@
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import {
   act,
   cleanup,
@@ -243,6 +245,7 @@ function renderWorkspace(
     showContentSearch?: boolean;
     showFilesPanel?: boolean;
     showBrowserTab?: boolean;
+    googleDocs?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
     maximized?: boolean;
@@ -276,60 +279,68 @@ function renderWorkspace(
     new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onHide = vi.fn();
   const tree = () => (
-    <TooltipProvider delayDuration={0}>
-      <WorkspacePanel
-        conversationId={overrides.conversationId ?? "conv_ws"}
-        contained={overrides.contained}
-        keyboardTarget={overrides.keyboardTarget}
-        width={overrides.width ?? 360}
-        open={overrides.open}
-        animateVisibility={overrides.animateVisibility}
-        resizing={overrides.resizing}
-        inert={overrides.inert}
-        handleProps={{
-          tabIndex: 0,
-          role: "separator",
-          "aria-label": "Resize panel",
-          onMouseDown: vi.fn(),
-          onKeyDown: vi.fn(),
-        }}
-        rightRailTab={overrides.rightRailTab === undefined ? "files" : overrides.rightRailTab}
-        onRightRailTabChange={onRightRailTabChange}
-        openPanels={overrides.openPanels ?? []}
-        onClosePanel={onClosePanel}
-        showFilesPanel={overrides.showFilesPanel ?? true}
-        showContentSearch={overrides.showContentSearch}
-        showGithubTab={overrides.showGithubTab ?? false}
-        showBrowserTab={overrides.showBrowserTab ?? false}
-        onReveal={onReveal}
-        onHide={overrides.withHide === false ? undefined : onHide}
-        changedCount={overrides.changedCount ?? 0}
-        subagentsWorking={0}
-        agentCount={1}
-        rootSessionId={null}
-        selectedFilePath={overrides.selectedFilePath ?? null}
-        openFiles={overrides.openFiles ?? []}
-        openFileViewer={openFileViewer}
-        onCloseFile={onCloseFile}
-        onShowScopeView={vi.fn()}
-        onCommentsOpenChange={vi.fn()}
-        openTerminalTab={openTerminalTab}
-        openTerminals={overrides.openTerminals ?? []}
-        selectedTerminalKey={overrides.selectedTerminalKey ?? null}
-        onCloseTerminal={onCloseTerminal}
-        maximized={overrides.maximized ?? false}
-        onToggleMaximized={onToggleMaximized}
-        permissionLevel={overrides.permissionLevel ?? null}
-        filesPanelSort={"recent" as ChangedSort}
-        onSortChange={vi.fn()}
-        filesPanelShowHidden={false}
-        onShowHiddenChange={vi.fn()}
-        liveness={overrides.liveness}
-        pending={overrides.pending}
-        mobileSideChatsOpen={overrides.mobileSideChatsOpen}
-        onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
-      />
-    </TooltipProvider>
+    <CapabilitiesProvider
+      info={
+        overrides.googleDocs === undefined
+          ? "loading"
+          : { ...FALLBACK_SERVER_INFO, features: { google_docs: overrides.googleDocs } }
+      }
+    >
+      <TooltipProvider delayDuration={0}>
+        <WorkspacePanel
+          conversationId={overrides.conversationId ?? "conv_ws"}
+          contained={overrides.contained}
+          keyboardTarget={overrides.keyboardTarget}
+          width={overrides.width ?? 360}
+          open={overrides.open}
+          animateVisibility={overrides.animateVisibility}
+          resizing={overrides.resizing}
+          inert={overrides.inert}
+          handleProps={{
+            tabIndex: 0,
+            role: "separator",
+            "aria-label": "Resize panel",
+            onMouseDown: vi.fn(),
+            onKeyDown: vi.fn(),
+          }}
+          rightRailTab={overrides.rightRailTab === undefined ? "files" : overrides.rightRailTab}
+          onRightRailTabChange={onRightRailTabChange}
+          openPanels={overrides.openPanels ?? []}
+          onClosePanel={onClosePanel}
+          showFilesPanel={overrides.showFilesPanel ?? true}
+          showContentSearch={overrides.showContentSearch}
+          showGithubTab={overrides.showGithubTab ?? false}
+          showBrowserTab={overrides.showBrowserTab ?? false}
+          onReveal={onReveal}
+          onHide={overrides.withHide === false ? undefined : onHide}
+          changedCount={overrides.changedCount ?? 0}
+          subagentsWorking={0}
+          agentCount={1}
+          rootSessionId={null}
+          selectedFilePath={overrides.selectedFilePath ?? null}
+          openFiles={overrides.openFiles ?? []}
+          openFileViewer={openFileViewer}
+          onCloseFile={onCloseFile}
+          onShowScopeView={vi.fn()}
+          onCommentsOpenChange={vi.fn()}
+          openTerminalTab={openTerminalTab}
+          openTerminals={overrides.openTerminals ?? []}
+          selectedTerminalKey={overrides.selectedTerminalKey ?? null}
+          onCloseTerminal={onCloseTerminal}
+          maximized={overrides.maximized ?? false}
+          onToggleMaximized={onToggleMaximized}
+          permissionLevel={overrides.permissionLevel ?? null}
+          filesPanelSort={"recent" as ChangedSort}
+          onSortChange={vi.fn()}
+          filesPanelShowHidden={false}
+          onShowHiddenChange={vi.fn()}
+          liveness={overrides.liveness}
+          pending={overrides.pending}
+          mobileSideChatsOpen={overrides.mobileSideChatsOpen}
+          onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
+        />
+      </TooltipProvider>
+    </CapabilitiesProvider>
   );
   const fileViewerContext =
     initialOverrides.fileGuard && fileViewerContextWithGuard(initialOverrides.fileGuard);
@@ -3357,5 +3368,31 @@ describe("WorkspacePanel desktop menu commands", () => {
     reopen();
     expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
     expect(onReveal).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("shared Google Docs pane", () => {
+  const url = "https://docs.google.com/document/d/example/edit";
+  it("gates the classic page and keeps its real iframe mounted while another page or collapsed rail is shown", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) =>
+      String(input).includes("/session-documents")
+        ? Response.json({
+            session_id: "docs_classic",
+            entries: [{ document_url: url, added_at: 1 }],
+          })
+        : Response.json({}),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    const view = renderWorkspace({ conversationId: "docs_classic", googleDocs: false });
+    expect(screen.queryByRole("tab", { name: "Google Docs" })).toBeNull();
+    view.rerender({ googleDocs: true, rightRailTab: "google-docs" });
+    const editor = await screen.findByTitle("Google Docs editor");
+    expect(editor).toHaveAttribute("src", url + "?embedded=true");
+    view.rerender({ rightRailTab: "files" });
+    expect(screen.getByTitle("Google Docs editor")).toBe(editor);
+    view.rerender({ rightRailTab: "google-docs", open: false });
+    expect(screen.getByTitle("Google Docs editor")).toBe(editor);
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    vi.unstubAllGlobals();
   });
 });

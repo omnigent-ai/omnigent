@@ -223,3 +223,12 @@ describe("shellChoiceEntries", () => {
     ]);
   });
 });
+
+it("offers the Docs page only when the caller supplies its available command", () => {
+  expect(entries().some((entry) => entry.id === "google-docs")).toBe(false);
+  expect(
+    entries({ openablePanels: [{ tab: "google-docs", label: "Google Docs" }] }).find(
+      (entry) => entry.id === "google-docs",
+    ),
+  ).toMatchObject({ action: { kind: "place", place: { kind: "google-docs" } } });
+});

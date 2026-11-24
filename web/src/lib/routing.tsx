@@ -45,6 +45,7 @@ import {
   useSearchParams as useRRSearchParams,
 } from "react-router-dom";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
+import { confirmRouteLeave, rememberRouteNavigation } from "./routeLeaveGuards";
 
 /**
  * The routing contract web depends on. Types are taken verbatim from
@@ -193,7 +194,29 @@ function useRouting(): RoutingApi {
   return useContext(RoutingContext) ?? reactRouterRouting;
 }
 
-export const useNavigate: typeof useRRNavigate = () => useRouting().useNavigate();
+function changesPath(to: To, pathname: string): boolean {
+  const target = typeof to === "string" ? to : to.pathname;
+  return !!target && new URL(target, window.location.origin + pathname).pathname !== pathname;
+}
+
+export const useNavigate: typeof useRRNavigate = () => {
+  const routing = useRouting();
+  const navigate = routing.useNavigate();
+  const { pathname } = routing.useLocation();
+  return useCallback(
+    ((to: To | number, options?: NavigateOptions) => {
+      if ((typeof to === "number" || changesPath(to, pathname)) && !confirmRouteLeave()) return;
+      if (typeof to === "number") {
+        rememberRouteNavigation(to);
+        return navigate(to);
+      }
+      const result = navigate(to, options);
+      rememberRouteNavigation();
+      return result;
+    }) as ReturnType<typeof useRRNavigate>,
+    [navigate, pathname],
+  );
+};
 
 export function useParams<
   ParamsOrKey extends string | Record<string, string | undefined> = string,
@@ -225,8 +248,30 @@ export function useReplaceSearchParams() {
 export const useRebasePath = (): ((path: string) => string) => useRouting().rebasePath;
 
 export const Link = forwardRef<HTMLAnchorElement, OmnigentLinkProps>((props, ref) => {
-  const { Link: Impl } = useRouting();
-  return <Impl ref={ref} {...props} />;
+  const routing = useRouting();
+  const { Link: Impl } = routing;
+  const { pathname } = routing.useLocation();
+  return (
+    <Impl
+      ref={ref}
+      {...props}
+      onClick={(event) => {
+        props.onClick?.(event);
+        if (
+          event.defaultPrevented ||
+          event.button !== 0 ||
+          event.metaKey ||
+          event.ctrlKey ||
+          event.shiftKey ||
+          event.altKey ||
+          (props.target && props.target !== "_self")
+        )
+          return;
+        if (changesPath(props.to, pathname) && !confirmRouteLeave()) event.preventDefault();
+        else queueMicrotask(() => rememberRouteNavigation());
+      }}
+    />
+  );
 });
 Link.displayName = "Link";
 

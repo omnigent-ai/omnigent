@@ -23,12 +23,13 @@ import {
 } from "lucide-react";
 import { useMemo, useRef } from "react";
 
-import type { DefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import type { WorkspacePageTab } from "@/shell/workspaceCommands/model";
 import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands";
 
 import type { WorkspaceCommand, WorkspaceTabAction } from "./model";
 
-const PANEL_ICONS: Record<DefaultWorkspaceTab, LucideIcon> = {
+const PANEL_ICONS: Record<WorkspacePageTab, LucideIcon> = {
+  "google-docs": FolderTreeIcon,
   files: FolderTreeIcon,
   changes: FileDiffIcon,
   github: GitPullRequestIcon,

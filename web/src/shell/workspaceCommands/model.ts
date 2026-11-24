@@ -12,6 +12,8 @@ import {
 } from "../workspaceTabs/workspaceHistory";
 import type { Visit } from "../workspaceTabs/workspacePlace";
 
+export type WorkspacePageTab = DefaultWorkspaceTab | "google-docs";
+
 /** Whether a new shell can start now, from the session's liveness. */
 export type ShellConnectState = "ready" | "wakeable" | "offline";
 
@@ -63,7 +65,7 @@ export interface OpenWorkspacePanel {
 export interface WorkspaceCommandFacts {
   /** Panels that open as tabs, with their labels; unavailable ones say why. */
   openablePanels: readonly {
-    tab: DefaultWorkspaceTab;
+    tab: WorkspacePageTab;
     label: string;
     availability?: CommandAvailability;
   }[];
@@ -79,7 +81,7 @@ export interface WorkspaceCommandFacts {
 }
 
 export type WorkspaceCommand =
-  | (WorkspaceCommandBase & { kind: "panel"; tab: DefaultWorkspaceTab })
+  | (WorkspaceCommandBase & { kind: "panel"; tab: WorkspacePageTab })
   | (WorkspaceCommandBase & { kind: "browser" | "side-chat" })
   | (WorkspaceCommandBase & {
       kind: "shell";

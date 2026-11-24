@@ -122,3 +122,10 @@ describe("resolveWorkspaceActiveView", () => {
     expect(view.sideChatSelected).toBe(true);
   });
 });
+
+it("resolves the Docs page independently of filesystem availability and respects its gate", () => {
+  expect(resolve({ rightRailTab: "google-docs" }, { showGoogleDocs: true }).scope).toBe(
+    "google-docs",
+  );
+  expect(resolve({ rightRailTab: "google-docs" }, { showGoogleDocs: false }).scope).toBe("files");
+});

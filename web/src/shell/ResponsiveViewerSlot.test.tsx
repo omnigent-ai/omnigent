@@ -5,6 +5,83 @@ import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 
 afterEach(cleanup);
 
+it("retains a conditionally mounted target until an accepted move has completed", () => {
+  function Host({ mobile }: { mobile: boolean }) {
+    const [target, setTarget] = useState<HTMLDivElement | null>(null);
+    const [placedInDrawer, setPlacedInDrawer] = useState(false);
+    return (
+      <>
+        <ResponsiveViewerSlot
+          mobile={mobile}
+          mobileTarget={target}
+          onPlacementChange={setPlacedInDrawer}
+        >
+          <iframe data-google-docs-editor="" title="Conditional editor" sandbox="" />
+        </ResponsiveViewerSlot>
+        {(mobile || placedInDrawer) && (
+          <aside data-testid="drawer-ancestor">
+            <div ref={setTarget} />
+          </aside>
+        )}
+      </>
+    );
+  }
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  const view = render(<Host mobile />);
+  const frame = screen.getByTitle("Conditional editor");
+  const host = frame.parentElement!;
+  const append = vi.spyOn(Node.prototype, "appendChild");
+  const ancestor = screen.getByTestId("drawer-ancestor");
+  expect(ancestor).toContainElement(frame);
+  confirm.mockClear();
+  confirm.mockImplementation(() => {
+    expect(frame).toBeInTheDocument();
+    return false;
+  });
+  view.rerender(<Host mobile={false} />);
+  expect(confirm).toHaveBeenCalledOnce();
+  expect(ancestor).toBeInTheDocument();
+  expect(ancestor).toContainElement(frame);
+  expect(ancestor).not.toContainElement(screen.getByRole("button", { name: "Move editor" }));
+  expect(append.mock.calls.filter(([child]) => child === host)).toHaveLength(0);
+  confirm.mockClear();
+  confirm.mockImplementation(() => {
+    expect(frame).toBeInTheDocument();
+    return true;
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Move editor" }));
+  expect(confirm).toHaveBeenCalledOnce();
+  expect(append.mock.calls.filter(([child]) => child === host)).toHaveLength(1);
+  expect(ancestor).not.toBeInTheDocument();
+  expect(screen.getByTitle("Conditional editor")).toBe(frame);
+  expect(frame).toBeInTheDocument();
+  append.mockRestore();
+  confirm.mockRestore();
+});
+
+it("confirms moving a Google Docs iframe and keeps it in place on cancel until explicitly retried", () => {
+  const target = document.createElement("div");
+  document.body.appendChild(target);
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+  const slot = (mobile: boolean) => (
+    <ResponsiveViewerSlot mobile={mobile} mobileTarget={target}>
+      <iframe data-google-docs-editor="" title="Docs moving editor" sandbox="" />
+    </ResponsiveViewerSlot>
+  );
+  const view = render(slot(false));
+  const frame = screen.getByTitle("Docs moving editor");
+  view.rerender(slot(true));
+  expect(target).not.toContainElement(frame);
+  expect(target).toContainElement(screen.getByRole("button", { name: "Move editor" }));
+  expect(frame).toBeInTheDocument();
+  confirm.mockReturnValue(true);
+  fireEvent.click(screen.getByRole("button", { name: "Move editor" }));
+  expect(target).toContainElement(frame);
+  view.unmount();
+  target.remove();
+  confirm.mockRestore();
+});
+
 it("preserves the editor, draft, focus, and backward selection across layout changes", () => {
   function Draft() {
     const [draft, setDraft] = useState("");

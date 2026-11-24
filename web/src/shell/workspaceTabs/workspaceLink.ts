@@ -189,6 +189,7 @@ function parsePlace(kind: string, id: string | undefined, params: Params): Works
     case "pulls":
     case "agents":
     case "tasks":
+    case "google-docs":
       noId(kind, id);
       return { kind };
     case "pull": {

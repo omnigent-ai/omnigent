@@ -1,3 +1,6 @@
+import { GoogleDocsWorkspacePane } from "./GoogleDocsWorkspacePane";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { type FilePosition, FileViewerContext, type OpenFileOptions } from "./FileViewerContext";
 import {
   BotIcon,
@@ -949,6 +952,21 @@ function WorkspacePanelImpl({
   const sideChats = useSideChats(conversationId);
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
+  const showGoogleDocs = isFeatureEnabled(useServerInfo(), "google_docs");
+  const [docsVisited, setDocsVisited] = useState<string[]>([]);
+  const [docsDrawerOpen, setDocsDrawerOpen] = useState(false);
+  const [docsDrawerTarget, setDocsDrawerTarget] = useState<HTMLDivElement | null>(null);
+  const [docsInDrawer, setDocsInDrawer] = useState(false);
+  const retainDesktopDocs =
+    isMobile &&
+    !docsInDrawer &&
+    rightRailTab === "google-docs" &&
+    docsVisited.includes(conversationId);
+  if (showGoogleDocs && rightRailTab === "google-docs" && !docsVisited.includes(conversationId))
+    setDocsVisited([...docsVisited, conversationId]);
+  useEffect(() => {
+    if (isMobile && rightRailTab === "google-docs") setDocsDrawerOpen(true);
+  }, [isMobile, rightRailTab]);
   const activeView = resolveWorkspaceActiveView(
     {
       rightRailTab,
@@ -963,6 +981,7 @@ function WorkspacePanelImpl({
       showGithubTab,
       showTasksTab: showTasksTab && Boolean(conversationId),
       showContentSearch,
+      showGoogleDocs,
       hasAgentTree: Boolean(rootSessionId),
       mobile: isMobile,
     },
@@ -1357,6 +1376,7 @@ function WorkspacePanelImpl({
   const visiblePermanentTabs = [
     ...availablePanels.filter((tab) => pinnedTabs.includes(tab)),
     ...(showContentSearch && (pending || showFilesPanel) ? ["content-search" as const] : []),
+    ...(showGoogleDocs && !pending ? ["google-docs" as const] : []),
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
@@ -1504,6 +1524,7 @@ function WorkspacePanelImpl({
       showGithubTab,
       showTasksTab,
       showContentSearch,
+      showGoogleDocs,
       changedCount,
       agentCount,
       subagentsWorking,
@@ -1746,7 +1767,7 @@ function WorkspacePanelImpl({
       className={cn(
         "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
-        contained &&
+        (contained || retainDesktopDocs) &&
           "flex min-h-0 flex-col overflow-hidden border-l border-border bg-card shrink-0",
         contained && maximized && "absolute inset-0",
       )}
@@ -1757,7 +1778,7 @@ function WorkspacePanelImpl({
         maximized
           ? undefined
           : ({
-              width: open ? width : 0,
+              width: open || retainDesktopDocs ? width : 0,
               "--omnigent-reserved-width": `${width}px`,
             } as CSSProperties)
       }
@@ -2064,6 +2085,27 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden focus:outline-none"
         >
+          {showGoogleDocs && docsVisited.includes(conversationId) && (
+            <ResponsiveViewerSlot
+              mobile={isMobile}
+              mobileTarget={docsDrawerTarget}
+              layout="contents"
+              onPlacementChange={setDocsInDrawer}
+            >
+              <GoogleDocsWorkspacePane
+                sessionId={conversationId}
+                permissionLevel={permissionLevel}
+                visible={
+                  docsInDrawer
+                    ? docsDrawerOpen
+                    : rightRailTab === "google-docs" &&
+                      frontFilePath === null &&
+                      frontTerminalKey === null &&
+                      (isMobile || (open && !inert))
+                }
+              />
+            </ResponsiveViewerSlot>
+          )}
           <RenderErrorBoundary
             name="this workspace pane"
             resetKey={JSON.stringify([
@@ -2180,7 +2222,7 @@ function WorkspacePanelImpl({
                 onFocused={clearBrowserFocus}
                 className="min-h-0 flex-1"
               />
-            ) : scopeView === "github" ? (
+            ) : scopeView === "google-docs" ? null : scopeView === "github" ? (
               <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
                 <PullRequestPanel conversationId={conversationId} active={open && !inert} />
               </RenderErrorBoundary>
@@ -2214,6 +2256,18 @@ function WorkspacePanelImpl({
       {rail}
       {/* The rail is `hidden` on phones, so the drawer renders beside it. A
         portal to the body would escape the embed's scoped styles. */}
+      {showGoogleDocs && (isMobile || docsInDrawer) && (
+        <MobilePanelDrawer
+          open={docsDrawerOpen}
+          title="Google Docs"
+          onClose={() => setDocsDrawerOpen(false)}
+          testId="google-docs-panel-drawer"
+          keepMounted
+        >
+          <div ref={setDocsDrawerTarget} className="contents" />
+        </MobilePanelDrawer>
+      )}
+
       {isMobile && (
         <MobilePanelDrawer
           open={mobileSideChatsOpen}

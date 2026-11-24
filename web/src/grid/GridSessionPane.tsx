@@ -1,3 +1,4 @@
+import { GoogleDocsSessionBoundary } from "@/shell/GoogleDocsSessionContext";
 import { DEFAULT_FILES_PANEL_PREFERENCES } from "@/lib/filesPanelPreferences";
 import {
   useCallback,
@@ -438,159 +439,215 @@ export function GridSessionPane({
       }}
     >
       <FileViewerContext.Provider value={fileContext}>
-        <section
-          ref={setPaneRef}
-          style={{ gridArea: area }}
-          data-grid-session={sessionId}
-          data-active={selected}
-          aria-label={`${title}${selected ? " (active)" : ""}`}
-          tabIndex={-1}
-          onClickCapture={onActivate}
-          onFocusCapture={onActivate}
-          className={cn(
-            "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background outline-none",
-            selected && "border-brand-accent/50 shadow-lg",
-            isDragging && "opacity-50",
-          )}
-        >
-          <header
+        <GoogleDocsSessionBoundary sessionId={sessionId} permissionLevel={permissionLevel}>
+          <section
+            ref={setPaneRef}
+            style={{ gridArea: area }}
+            data-grid-session={sessionId}
+            data-active={selected}
+            aria-label={`${title}${selected ? " (active)" : ""}`}
+            tabIndex={-1}
+            onClickCapture={onActivate}
+            onFocusCapture={onActivate}
             className={cn(
-              "flex h-8 shrink-0 items-center border-b px-1",
-              selected && "bg-brand-accent/10",
+              "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background outline-none",
+              selected && "border-brand-accent/50 shadow-lg",
+              isDragging && "opacity-50",
             )}
           >
-            <button
-              type="button"
-              ref={setActivatorNodeRef}
-              {...attributes}
-              {...listeners}
-              aria-label={`Move ${title}`}
-              title="Drag to another cell to swap positions"
+            <header
               className={cn(
-                "h-full min-w-0 flex-1 touch-none cursor-grab truncate px-1 text-left text-sm leading-normal font-medium select-none active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-ring",
-                !selected && "text-muted-foreground",
+                "flex h-8 shrink-0 items-center border-b px-1",
+                selected && "bg-brand-accent/10",
               )}
             >
-              {title}
-            </button>
-            <ViewModeToggle hotkeyEnabled={selected && !workspacePanel.maximized} alwaysVisible />
-            <Button asChild variant="ghost" size="icon-xs">
-              <Link
-                draggable={false}
-                to={`/c/${sessionId}`}
-                aria-label={`Open ${title} full screen`}
-              >
-                <Maximize2Icon className="size-3.5" />
-              </Link>
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label={`Remove ${title} from grid`}
-              onClick={() => grids.closePane(sessionId)}
-            >
-              <XIcon className="size-4" />
-            </Button>
-          </header>
-          <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-            <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
-              <RenderErrorBoundary name="chat" resetKey={sessionId}>
-                <SideChatPane
-                  childId={sessionId}
-                  fullSession
-                  readOnly={!canEdit}
-                  gridComposer={{
-                    leading: session && (
-                      <>
-                        <HostBadge
-                          sessionId={sessionId}
-                          appearance="composer"
-                          readOnly={!canEdit}
-                          launch={state.sandboxStatus}
-                        />
-                        <GridPermissionPicker permission={permission} />
-                      </>
-                    ),
-                    trailing: session && (
-                      <GridSessionHarnessPicker
-                        sessionId={sessionId}
-                        session={session}
-                        canEdit={canEdit}
-                        unreachable={unreachable}
-                        runnerOnline={runnerOnline}
-                      />
-                    ),
-                    cyclePermissionMode: permission.cycle,
-                  }}
-                />
-              </RenderErrorBoundary>
-            </div>
-            {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
-              <div
+              <button
+                type="button"
+                ref={setActivatorNodeRef}
+                {...attributes}
+                {...listeners}
+                aria-label={`Move ${title}`}
+                title="Drag to another cell to swap positions"
                 className={cn(
-                  "absolute inset-0 flex flex-col",
-                  !showTerminal && "invisible opacity-0",
+                  "h-full min-w-0 flex-1 touch-none cursor-grab truncate px-1 text-left text-sm leading-normal font-medium select-none active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-ring",
+                  !selected && "text-muted-foreground",
                 )}
-                ref={terminalInertRef}
-                aria-hidden={!showTerminal}
               >
-                <RenderErrorBoundary name="terminal" resetKey={sessionId}>
-                  <MainTerminalView
-                    conversationId={sessionId}
-                    visible={showTerminal}
-                    active={selected && !workspacePanel.maximized}
-                    className="pt-0"
-                    readOnly={!session || !isOwnerLevel(permissionLevel)}
-                    runnerOnline={runnerOnline}
-                    onResume={canEdit ? resume : undefined}
-                    sandboxOffline={liveness.kind === "host_asleep"}
+                {title}
+              </button>
+              <ViewModeToggle hotkeyEnabled={selected && !workspacePanel.maximized} alwaysVisible />
+              <Button asChild variant="ghost" size="icon-xs">
+                <Link
+                  draggable={false}
+                  to={`/c/${sessionId}`}
+                  aria-label={`Open ${title} full screen`}
+                >
+                  <Maximize2Icon className="size-3.5" />
+                </Link>
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Remove ${title} from grid`}
+                onClick={() => grids.closePane(sessionId)}
+              >
+                <XIcon className="size-4" />
+              </Button>
+            </header>
+            <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+              <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
+                <RenderErrorBoundary name="chat" resetKey={sessionId}>
+                  <SideChatPane
+                    childId={sessionId}
+                    fullSession
+                    readOnly={!canEdit}
+                    gridComposer={{
+                      leading: session && (
+                        <>
+                          <HostBadge
+                            sessionId={sessionId}
+                            appearance="composer"
+                            readOnly={!canEdit}
+                            launch={state.sandboxStatus}
+                          />
+                          <GridPermissionPicker permission={permission} />
+                        </>
+                      ),
+                      trailing: session && (
+                        <GridSessionHarnessPicker
+                          sessionId={sessionId}
+                          session={session}
+                          canEdit={canEdit}
+                          unreachable={unreachable}
+                          runnerOnline={runnerOnline}
+                        />
+                      ),
+                      cyclePermissionMode: permission.cycle,
+                    }}
                   />
                 </RenderErrorBoundary>
               </div>
-            )}
-          </div>
-          {isOver && active?.id !== sessionId && (
-            <div
-              data-testid="grid-move-ghost"
-              className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-lg border-2 border-dashed border-brand-accent bg-brand-accent/25"
-            >
-              {/* <span className="rounded-md border bg-background/95 px-3 py-2 text-sm shadow-sm"> */}
-              {/* Swap with {title} */}
-              {/* </span> */}
+              {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
+                <div
+                  className={cn(
+                    "absolute inset-0 flex flex-col",
+                    !showTerminal && "invisible opacity-0",
+                  )}
+                  ref={terminalInertRef}
+                  aria-hidden={!showTerminal}
+                >
+                  <RenderErrorBoundary name="terminal" resetKey={sessionId}>
+                    <MainTerminalView
+                      conversationId={sessionId}
+                      visible={showTerminal}
+                      active={selected && !workspacePanel.maximized}
+                      className="pt-0"
+                      readOnly={!session || !isOwnerLevel(permissionLevel)}
+                      runnerOnline={runnerOnline}
+                      onResume={canEdit ? resume : undefined}
+                      sandboxOffline={liveness.kind === "host_asleep"}
+                    />
+                  </RenderErrorBoundary>
+                </div>
+              )}
             </div>
-          )}
-          <CloseShellDialog
-            open={pendingClose !== null}
-            shellLabel={terminalToClose?.name ?? null}
-            onCancel={() => setPendingClose(null)}
-            onConfirm={() => {
-              if (terminalToClose)
-                deleteTerminal.mutate(terminalToClose.id, {
-                  onSuccess: () => {
-                    if (workspace.selectedTerminalKey === pendingClose)
-                      updateWorkspace({ selectedTerminalKey: null });
-                  },
-                });
-              setPendingClose(null);
-            }}
-          />
-        </section>
-        {/* Keep inactive views mounted so switching cells preserves unsaved edits. */}
-        {workspaceTarget &&
-          createPortal(
-            <div className={selected && workspacePanel.open ? "contents" : "hidden"}>
-              {tabsSidebar ? (
-                <Suspense fallback={null}>
-                  <LazyWorkspaceTabsHost
+            {isOver && active?.id !== sessionId && (
+              <div
+                data-testid="grid-move-ghost"
+                className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-lg border-2 border-dashed border-brand-accent bg-brand-accent/25"
+              >
+                {/* <span className="rounded-md border bg-background/95 px-3 py-2 text-sm shadow-sm"> */}
+                {/* Swap with {title} */}
+                {/* </span> */}
+              </div>
+            )}
+            <CloseShellDialog
+              open={pendingClose !== null}
+              shellLabel={terminalToClose?.name ?? null}
+              onCancel={() => setPendingClose(null)}
+              onConfirm={() => {
+                if (terminalToClose)
+                  deleteTerminal.mutate(terminalToClose.id, {
+                    onSuccess: () => {
+                      if (workspace.selectedTerminalKey === pendingClose)
+                        updateWorkspace({ selectedTerminalKey: null });
+                    },
+                  });
+                setPendingClose(null);
+              }}
+            />
+          </section>
+          {/* Keep inactive views mounted so switching cells preserves unsaved edits. */}
+          {workspaceTarget &&
+            createPortal(
+              <div className={selected && workspacePanel.open ? "contents" : "hidden"}>
+                {tabsSidebar ? (
+                  <Suspense fallback={null}>
+                    <LazyWorkspaceTabsHost
+                      contained
+                      keyboardTarget={selected}
+                      bindsHistory={selected}
+                      conversationId={sessionId}
+                      sessionHarness={state.sessionHarness}
+                      agentId={state.boundAgentId ?? session?.agentId ?? null}
+                      {...workspacePanel}
+                      open={selected && workspacePanel.open}
+                      inert={!selected || !workspacePanel.open}
+                      showFilesPanel={showFiles}
+                      showGithubTab={showFiles}
+                      showTasksTab={
+                        (isFeatureEnabled(serverInfo, "workflows") &&
+                          serverInfo !== "loading" &&
+                          serverInfo.session_journal === true) ||
+                        (state.todos?.length ?? 0) > 0
+                      }
+                      showBrowserTab={supportsBrowser()}
+                      onReveal={onOpenWorkspace}
+                      changedCount={changedCount}
+                      changedFiles={changedFiles}
+                      subagentsWorking={childSessions.filter((child) => child.busy).length}
+                      agentCount={childSessions.length + 1}
+                      rootSessionId={rootSessionId}
+                      terminals={terminals}
+                      terminalKeys={session ? openTerminals : null}
+                      openTerminalTab={openTerminal}
+                      permissionLevel={permissionLevel}
+                      filesPanelSort={sort}
+                      onSortChange={setSort}
+                      filesPanelShowHidden={showHidden}
+                      onShowHiddenChange={setShowHidden}
+                      liveness={liveness}
+                    />
+                  </Suspense>
+                ) : (
+                  <WorkspacePanel
                     contained
                     keyboardTarget={selected}
-                    bindsHistory={selected}
                     conversationId={sessionId}
                     sessionHarness={state.sessionHarness}
                     agentId={state.boundAgentId ?? session?.agentId ?? null}
                     {...workspacePanel}
                     open={selected && workspacePanel.open}
                     inert={!selected || !workspacePanel.open}
+                    rightRailTab={rightRailTab}
+                    onRightRailTabChange={selectTab}
+                    openPanels={workspace.openPanels ?? []}
+                    onClosePanel={(tab) => {
+                      navigateWorkspace("", undefined, () =>
+                        setWorkspace((previous) => {
+                          const remaining =
+                            previous.openPanels?.filter((panel) => panel !== tab) ?? [];
+                          return {
+                            ...previous,
+                            openPanels: remaining,
+                            rightRailTab:
+                              previous.rightRailTab === tab
+                                ? (remaining.at(-1) ?? readInitialWorkspaceTab())
+                                : previous.rightRailTab,
+                          };
+                        }),
+                      );
+                    }}
                     showFilesPanel={showFiles}
                     showGithubTab={showFiles}
                     showTasksTab={
@@ -602,13 +659,30 @@ export function GridSessionPane({
                     showBrowserTab={supportsBrowser()}
                     onReveal={onOpenWorkspace}
                     changedCount={changedCount}
-                    changedFiles={changedFiles}
                     subagentsWorking={childSessions.filter((child) => child.busy).length}
                     agentCount={childSessions.length + 1}
                     rootSessionId={rootSessionId}
-                    terminals={terminals}
-                    terminalKeys={session ? openTerminals : null}
+                    selectedFilePath={canBrowse ? (workspace.selectedFilePath ?? null) : null}
+                    filePosition={position}
+                    openFiles={canBrowse ? (workspace.openFiles ?? []) : []}
+                    openFileViewer={openFile}
+                    onCloseFile={closeFile}
+                    onShowScopeView={() => selectTab(rightRailTab)}
+                    onCommentsOpenChange={() => {}}
                     openTerminalTab={openTerminal}
+                    openTerminals={openTerminals}
+                    selectedTerminalKey={
+                      openTerminals.includes(workspace.selectedTerminalKey ?? "")
+                        ? (workspace.selectedTerminalKey ?? null)
+                        : null
+                    }
+                    closingTerminalKey={
+                      deleteTerminal.isPending && closingTerminal
+                        ? terminalTabKey(closingTerminal)
+                        : null
+                    }
+                    onCloseTerminal={setPendingClose}
+                    maximized={selected && workspacePanel.maximized}
                     permissionLevel={permissionLevel}
                     filesPanelSort={sort}
                     onSortChange={setSort}
@@ -616,82 +690,11 @@ export function GridSessionPane({
                     onShowHiddenChange={setShowHidden}
                     liveness={liveness}
                   />
-                </Suspense>
-              ) : (
-                <WorkspacePanel
-                  contained
-                  keyboardTarget={selected}
-                  conversationId={sessionId}
-                  sessionHarness={state.sessionHarness}
-                  agentId={state.boundAgentId ?? session?.agentId ?? null}
-                  {...workspacePanel}
-                  open={selected && workspacePanel.open}
-                  inert={!selected || !workspacePanel.open}
-                  rightRailTab={rightRailTab}
-                  onRightRailTabChange={selectTab}
-                  openPanels={workspace.openPanels ?? []}
-                  onClosePanel={(tab) => {
-                    navigateWorkspace("", undefined, () =>
-                      setWorkspace((previous) => {
-                        const remaining =
-                          previous.openPanels?.filter((panel) => panel !== tab) ?? [];
-                        return {
-                          ...previous,
-                          openPanels: remaining,
-                          rightRailTab:
-                            previous.rightRailTab === tab
-                              ? (remaining.at(-1) ?? readInitialWorkspaceTab())
-                              : previous.rightRailTab,
-                        };
-                      }),
-                    );
-                  }}
-                  showFilesPanel={showFiles}
-                  showGithubTab={showFiles}
-                  showTasksTab={
-                    (isFeatureEnabled(serverInfo, "workflows") &&
-                      serverInfo !== "loading" &&
-                      serverInfo.session_journal === true) ||
-                    (state.todos?.length ?? 0) > 0
-                  }
-                  showBrowserTab={supportsBrowser()}
-                  onReveal={onOpenWorkspace}
-                  changedCount={changedCount}
-                  subagentsWorking={childSessions.filter((child) => child.busy).length}
-                  agentCount={childSessions.length + 1}
-                  rootSessionId={rootSessionId}
-                  selectedFilePath={canBrowse ? (workspace.selectedFilePath ?? null) : null}
-                  filePosition={position}
-                  openFiles={canBrowse ? (workspace.openFiles ?? []) : []}
-                  openFileViewer={openFile}
-                  onCloseFile={closeFile}
-                  onShowScopeView={() => selectTab(rightRailTab)}
-                  onCommentsOpenChange={() => {}}
-                  openTerminalTab={openTerminal}
-                  openTerminals={openTerminals}
-                  selectedTerminalKey={
-                    openTerminals.includes(workspace.selectedTerminalKey ?? "")
-                      ? (workspace.selectedTerminalKey ?? null)
-                      : null
-                  }
-                  closingTerminalKey={
-                    deleteTerminal.isPending && closingTerminal
-                      ? terminalTabKey(closingTerminal)
-                      : null
-                  }
-                  onCloseTerminal={setPendingClose}
-                  maximized={selected && workspacePanel.maximized}
-                  permissionLevel={permissionLevel}
-                  filesPanelSort={sort}
-                  onSortChange={setSort}
-                  filesPanelShowHidden={showHidden}
-                  onShowHiddenChange={setShowHidden}
-                  liveness={liveness}
-                />
-              )}
-            </div>,
-            workspaceTarget,
-          )}
+                )}
+              </div>,
+              workspaceTarget,
+            )}
+        </GoogleDocsSessionBoundary>
       </FileViewerContext.Provider>
     </TerminalFirstContextProvider>
   );

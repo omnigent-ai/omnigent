@@ -56,6 +56,7 @@ export type WorkspacePlace =
   | { kind: "agents" }
   /** The session's Tasks page, with its workflows. */
   | { kind: "tasks" }
+  | { kind: "google-docs" }
   | { kind: "agent"; id: string }
   /** A side chat; no `id` is a new side chat with nothing sent yet. */
   | { kind: "chat"; id?: string }
@@ -114,6 +115,8 @@ export function placeIdentity(place: WorkspacePlace): string | null {
       return "agents";
     case "tasks":
       return "tasks";
+    case "google-docs":
+      return "google-docs";
     case "agent":
       return `agent:${place.id}`;
     case "chat":

@@ -28,6 +28,7 @@ export interface WorkspacePanelTabContext {
   /** Whether the session has a Tasks tab. */
   showTasksTab: boolean;
   showContentSearch: boolean;
+  showGoogleDocs?: boolean;
   changedCount: number;
   agentCount: number;
   subagentsWorking: number;
@@ -58,6 +59,11 @@ export interface WorkspacePanelTabDescriptor {
 }
 
 export const WORKSPACE_PANEL_TABS: Record<WorkspacePanelTab, WorkspacePanelTabDescriptor> = {
+  "google-docs": {
+    label: "Google Docs",
+    icon: FolderTreeIcon,
+    shown: ({ showGoogleDocs }) => showGoogleDocs === true,
+  },
   "content-search": {
     label: "Content search",
     icon: SearchIcon,

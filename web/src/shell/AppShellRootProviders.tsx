@@ -1,6 +1,7 @@
 import type { ComponentProps, ReactNode } from "react";
 
 import { CommandContextProvider } from "./commandContext";
+import { GoogleDocsSessionBoundary } from "./GoogleDocsSessionContext";
 import { FileViewerContext } from "./FileViewerContext";
 
 type CommandContextInputs = Omit<ComponentProps<typeof CommandContextProvider>, "children">;
@@ -22,7 +23,16 @@ export function AppShellRootProviders({
       workspaceTab={command.workspaceTab}
       filePath={command.filePath}
     >
-      <FileViewerContext.Provider value={fileViewer}>{children}</FileViewerContext.Provider>
+      <FileViewerContext.Provider value={fileViewer}>
+        <GoogleDocsSessionBoundary
+          sessionId={command.session?.id}
+          permissionLevel={
+            command.session?.permissionResolved ? command.session.permissionLevel : 1
+          }
+        >
+          {children}
+        </GoogleDocsSessionBoundary>
+      </FileViewerContext.Provider>
     </CommandContextProvider>
   );
 }

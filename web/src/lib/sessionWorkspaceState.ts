@@ -18,6 +18,7 @@ const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
   "subagents",
 ];
 const RAIL_TABS: readonly RightRailTab[] = [
+  "google-docs",
   ...WORKSPACE_PANEL_TABS,
   "browser",
   "sidechat",

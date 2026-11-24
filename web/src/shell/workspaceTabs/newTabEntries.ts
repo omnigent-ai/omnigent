@@ -8,8 +8,11 @@
 import { isCommandListed, type CommandAvailability } from "@/store/paletteCommands";
 import type { ShortcutId } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 import { WORKSPACE_TEXT_SEARCH_COPY } from "@/lib/workspaceTextSearchCopy";
-import type { WorkspaceCommand, WorkspaceShellCommand } from "@/shell/workspaceCommands/model";
-import type { DefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import type {
+  WorkspaceCommand,
+  WorkspaceShellCommand,
+  WorkspacePageTab,
+} from "@/shell/workspaceCommands/model";
 
 import type { WorkspacePlace } from "./workspacePlace";
 
@@ -23,7 +26,8 @@ export type NewTabAppId =
   | "tasks"
   | "side-chat"
   | "browser"
-  | "search";
+  | "search"
+  | "google-docs";
 
 /** What picking a row does. */
 export type NewTabAction =
@@ -52,7 +56,8 @@ export interface NewTabFacts {
   textSearch: boolean;
 }
 
-const PANEL_PLACES: Record<DefaultWorkspaceTab, { id: NewTabAppId; place: WorkspacePlace }> = {
+const PANEL_PLACES: Record<WorkspacePageTab, { id: NewTabAppId; place: WorkspacePlace }> = {
+  "google-docs": { id: "google-docs", place: { kind: "google-docs" } },
   files: { id: "files", place: { kind: "files" } },
   changes: { id: "changes", place: { kind: "changes" } },
   github: { id: "pulls", place: { kind: "pulls" } },
@@ -72,6 +77,7 @@ const ORDER: readonly NewTabAppId[] = [
   "tasks",
   "browser",
   "search",
+  "google-docs",
 ];
 
 /** Other shells listed as their own rows; more than this and the rest wait behind "Choose shell…". */

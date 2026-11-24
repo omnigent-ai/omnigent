@@ -331,6 +331,7 @@ export async function openWorkspaceFileLink(
 }
 
 const PAGE_PLACES = {
+  "google-docs": { kind: "google-docs" },
   files: { kind: "files" },
   changes: { kind: "changes" },
   github: { kind: "pulls" },

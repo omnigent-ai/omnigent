@@ -228,6 +228,8 @@ export function placeTitle(place: WorkspacePlace, facts: PlaceTitleFacts = {}): 
       return title("Agents", "agents");
     case "tasks":
       return title("Tasks", "tasks");
+    case "google-docs":
+      return title("Google Docs", "file");
     case "agent":
       return title(facts.agentName?.trim() || SUBAGENT_TAB_FALLBACK_LABEL, "agent");
     case "chat":

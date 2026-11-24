@@ -1,3 +1,5 @@
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -75,35 +77,46 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
-type PanelOverrides = Partial<WorkspaceTabsPanelProps> & { conversationId: string };
+type PanelOverrides = Partial<WorkspaceTabsPanelProps> & {
+  conversationId: string;
+  googleDocs?: boolean;
+};
 
 function panel(overrides: PanelOverrides) {
   return (
-    <WorkspaceTabsPanel
-      key={overrides.conversationId}
-      width={360}
-      handleProps={{ tabIndex: 0 }}
-      showFilesPanel
-      showGithubTab={false}
-      showBrowserTab
-      changedCount={0}
-      changedFiles={[]}
-      subagentsWorking={0}
-      agentCount={0}
-      rootSessionId={overrides.conversationId}
-      terminalKeys={[]}
-      openTerminalTab={vi.fn()}
-      confirmCloseShell={vi.fn(async () => true)}
-      endShell={vi.fn(async () => true)}
-      maximized={false}
-      onToggleMaximized={vi.fn()}
-      permissionLevel={3}
-      filesPanelSort="alpha"
-      onSortChange={vi.fn()}
-      filesPanelShowHidden={false}
-      onShowHiddenChange={vi.fn()}
-      {...overrides}
-    />
+    <CapabilitiesProvider
+      info={
+        overrides.googleDocs
+          ? { ...FALLBACK_SERVER_INFO, features: { google_docs: true } }
+          : "loading"
+      }
+    >
+      <WorkspaceTabsPanel
+        key={overrides.conversationId}
+        width={360}
+        handleProps={{ tabIndex: 0 }}
+        showFilesPanel
+        showGithubTab={false}
+        showBrowserTab
+        changedCount={0}
+        changedFiles={[]}
+        subagentsWorking={0}
+        agentCount={0}
+        rootSessionId={overrides.conversationId}
+        terminalKeys={[]}
+        openTerminalTab={vi.fn()}
+        confirmCloseShell={vi.fn(async () => true)}
+        endShell={vi.fn(async () => true)}
+        maximized={false}
+        onToggleMaximized={vi.fn()}
+        permissionLevel={3}
+        filesPanelSort="alpha"
+        onSortChange={vi.fn()}
+        filesPanelShowHidden={false}
+        onShowHiddenChange={vi.fn()}
+        {...overrides}
+      />
+    </CapabilitiesProvider>
   );
 }
 
@@ -829,4 +842,45 @@ describe("a shell's tab", () => {
       await waitFor(() => expect(resume).not.toBeDisabled());
     },
   );
+});
+
+describe("shared Google Docs pane", () => {
+  it("retains its real iframe across tabs and guards cancelling and confirming tab close", async () => {
+    const id = "docs_tabs";
+    const url = "https://docs.google.com/document/d/example/edit";
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockImplementation(async (input) =>
+          String(input).includes("/session-documents")
+            ? Response.json({ session_id: id, entries: [{ document_url: url, added_at: 1 }] })
+            : Response.json({}),
+        ),
+    );
+    const session = workspaceTabsSession(id);
+    await session.store.open({ place: { kind: "google-docs" } }, { opener: "user" });
+    renderPanels([{ conversationId: id, googleDocs: true }]);
+    const editor = await screen.findByTitle("Google Docs editor");
+    const docs = session.store
+      .tabs()
+      .find((tab) => "place" in tab && tab.place.kind === "google-docs")!;
+    await act(async () => {
+      await session.store.open({ place: { kind: "files" } }, { opener: "user" });
+    });
+    expect(screen.getByTitle("Google Docs editor")).toBe(editor);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await act(async () => {
+      await session.store.close(docs.id);
+    });
+    expect(session.store.tabs().some((tab) => tab.id === docs.id)).toBe(true);
+    expect(screen.getByTitle("Google Docs editor")).toBe(editor);
+    confirm.mockReturnValue(true);
+    await act(async () => {
+      await session.store.close(docs.id);
+    });
+    expect(screen.queryByTitle("Google Docs editor")).toBeNull();
+    confirm.mockRestore();
+    vi.unstubAllGlobals();
+  });
 });

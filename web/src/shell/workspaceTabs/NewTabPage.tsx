@@ -33,6 +33,7 @@ import {
 import type { WorkspacePlace } from "./workspacePlace";
 
 const ICONS: Record<string, LucideIcon> = {
+  "google-docs": FolderTreeIcon,
   terminal: SquareTerminalIcon,
   "choose-shell": SquareTerminalIcon,
   files: FolderTreeIcon,

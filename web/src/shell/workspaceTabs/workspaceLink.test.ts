@@ -19,6 +19,7 @@ const PR = "https://github.com/o/r/pull/12";
 
 describe("parseWorkspaceLink / formatWorkspaceLink", () => {
   const canonical: [string, WorkspaceLink][] = [
+    ["omnigent://google-docs", { place: { kind: "google-docs" } }],
     ["omnigent://new", { place: { kind: "new" } }],
     ["omnigent://new?app=terminal", { place: { kind: "new", app: "terminal" } }],
     ["omnigent://files", { place: { kind: "files" } }],

@@ -1,3 +1,6 @@
+import { GoogleDocsWorkspacePane } from "../GoogleDocsWorkspacePane";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 // The workspace sidebar's tab strip and the selected place's content.
 
 import { WorkspacePlaceView } from "./placeViews/WorkspacePlaceView";
@@ -123,7 +126,7 @@ import {
   type WorkspaceTabsSession,
   workspaceTabsSession,
 } from "./workspaceTabsSessions";
-import type { DefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import type { WorkspacePageTab } from "@/shell/workspaceCommands/model";
 import { WORKSPACE_TEXT_SEARCH_COPY } from "@/lib/workspaceTextSearchCopy";
 import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import { TasksPanel } from "../TasksPanel";
@@ -287,6 +290,7 @@ function WorkspaceTabsPanelImpl({
   historyCommands = NO_HISTORY_COMMANDS,
   onHistoryGo,
 }: WorkspaceTabsPanelProps) {
+  const showGoogleDocs = isFeatureEnabled(useServerInfo(), "google_docs");
   const { session, tabs, selectedTabId } = useWorkspaceTabs(conversationId);
   const { store } = session;
   const knownTabs = tabs.filter((tab): tab is WorkspaceTab => !isUnknownTab(tab));
@@ -656,8 +660,11 @@ function WorkspaceTabsPanelImpl({
   const closeTab = actions.closeTab;
 
   // ── Commands, shared by "+", the menus and ⌘K ────────────────────────────
-  const openablePanels = (["files", "changes", "github", "subagents", "tasks"] as const)
+  const openablePanels = (
+    ["files", "changes", "github", "subagents", "tasks", "google-docs"] as const
+  )
     .filter((page) => {
+      if (page === "google-docs") return showGoogleDocs;
       if (page === "subagents") return true;
       if (page === "github") return showGithubTab;
       if (page === "tasks") return showTasksTab;
@@ -798,10 +805,19 @@ function WorkspaceTabsPanelImpl({
     leaveGuardRegistrars.current.clear();
   }, [session]);
 
+  const docsTab = knownTabs.find((tab) => tab.place.kind === "google-docs");
+  const docsTabId = docsTab?.id;
+  const registerDocsLeaveGuard = useCallback(
+    (guard: LeaveGuard) => (docsTabId ? session.registerLeaveGuard(docsTabId, guard) : () => {}),
+    [session, docsTabId],
+  );
+
   const renderTabContent = (tab: WorkspaceTab, selected: boolean): ReactNode => {
     const active = selected && open && !inert;
     const { place } = tab;
     switch (place.kind) {
+      case "google-docs":
+        return showGoogleDocs ? null : <Unavailable text="Google Docs is disabled." />;
       case "new":
         return (
           <NewTabPage
@@ -1231,6 +1247,14 @@ function WorkspaceTabsPanelImpl({
           }
           contentRef={contentRef}
         >
+          {showGoogleDocs && docsTab && (
+            <GoogleDocsWorkspacePane
+              sessionId={conversationId}
+              permissionLevel={permissionLevel}
+              visible={!pending && selectedTab?.place.kind === "google-docs" && open && !inert}
+              registerLeaveGuard={registerDocsLeaveGuard}
+            />
+          )}
           {pending ? (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
               <Spinner />
@@ -1238,14 +1262,16 @@ function WorkspaceTabsPanelImpl({
             </div>
           ) : (
             <>
-              {mountedTabs.map((tab) => {
-                const selected = tab.id === selectedTabId;
-                return (
-                  <WorkspaceSidebarTabPanel key={tab.id} tabId={tab.id} selected={selected}>
-                    {renderTabContent(tab, selected)}
-                  </WorkspaceSidebarTabPanel>
-                );
-              })}
+              {mountedTabs
+                .filter((tab) => !showGoogleDocs || tab.place.kind !== "google-docs")
+                .map((tab) => {
+                  const selected = tab.id === selectedTabId;
+                  return (
+                    <WorkspaceSidebarTabPanel key={tab.id} tabId={tab.id} selected={selected}>
+                      {renderTabContent(tab, selected)}
+                    </WorkspaceSidebarTabPanel>
+                  );
+                })}
               {selectedUnknown && (
                 <UnsupportedTabContent onClose={() => closeTab(selectedUnknown.id)} />
               )}
@@ -1257,8 +1283,10 @@ function WorkspaceTabsPanelImpl({
   );
 }
 
-function pagePlace(page: DefaultWorkspaceTab): WorkspacePlace {
+function pagePlace(page: WorkspacePageTab): WorkspacePlace {
   switch (page) {
+    case "google-docs":
+      return { kind: "google-docs" };
     case "files":
       return { kind: "files" };
     case "changes":

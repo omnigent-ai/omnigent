@@ -196,3 +196,16 @@ describe("workspace tab storage", () => {
     expect(saveWorkspaceTabsSession("s1", state)).toBe("failed");
   });
 });
+
+it("persists the Docs workspace page without a selected document or URL", () => {
+  const docs = {
+    ...state,
+    tabs: [{ id: "docs", place: { kind: "google-docs" } as const, openedBy: "user" as const }],
+    selectedTabId: "docs",
+    timeline: [],
+    cursor: -1,
+    closed: [],
+  };
+  expect(saveWorkspaceTabsSession("docs-session", docs)).toBe("saved");
+  expect(readWorkspaceTabsSession("docs-session")).toEqual({ status: "saved", state: docs });
+});
