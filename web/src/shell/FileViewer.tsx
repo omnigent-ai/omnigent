@@ -48,6 +48,7 @@ import {
   CodeIcon,
   Columns2Icon,
   DownloadIcon,
+  ExternalLinkIcon,
   EyeIcon,
   EyeOffIcon,
   FileDiffIcon,
@@ -98,6 +99,10 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { useHostSshTarget } from "@/hooks/useHostSshTarget";
+import { useRepositoryContext } from "@/hooks/useRepositoryContext";
+import { useSessionPullRequests } from "@/hooks/useSessionPullRequests";
+import { openLink } from "@/lib/openLinkInApp";
+import { workspaceFileLink } from "./fileCommands/codeHostFileLink";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { workspaceSocketBridge } from "@/lib/nativeBridge";
@@ -979,6 +984,20 @@ function FileViewerBody({
       : (changedFiles.data?.data.some((f) => f.path === path) ?? false));
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
+  const repositoryContext = useRepositoryContext(conversationId, open && !isDeletedFile);
+  const sessionPullRequests = useSessionPullRequests(conversationId);
+  const codeHostLink = useMemo(
+    () =>
+      workspaceFileLink({
+        context: repositoryContext.data,
+        path,
+        // A session PR on a host is evidence that it serves GitHub Enterprise.
+        githubHosts: sessionPullRequests.data?.prs
+          .filter((pr) => !pr.provider || pr.provider === "github")
+          .map((pr) => pr.host),
+      }),
+    [repositoryContext.data, path, sessionPullRequests.data],
+  );
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
@@ -1352,6 +1371,8 @@ function FileViewerBody({
     noActiveCheck?: boolean;
     /** Chord shown beside the item; omit when the viewer surface doesn't bind it. */
     shortcut?: readonly string[];
+    /** Shown, but not selectable, with this reason as its tooltip. */
+    disabledReason?: string;
   }
   interface ToolbarAction {
     key: string;
@@ -1546,8 +1567,8 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // One "⋯" menu holds Find, Download, Wrap lines (Monaco views) and the diff-only
-  // whitespace toggle to save toolbar width; toggles keep the menu open.
+  // One "⋯" menu holds Find, Download, Open in GitHub, Wrap lines (Monaco views) and
+  // the diff-only whitespace toggle to save toolbar width; toggles keep the menu open.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
@@ -1576,6 +1597,19 @@ function FileViewerBody({
       icon: <DownloadIcon className="size-4" />,
       active: false,
       onSelect: downloadFile,
+    });
+  }
+  if (codeHostLink && !isDeletedFile) {
+    const { url, unavailableReason } = codeHostLink;
+    settingsMenu.push({
+      key: "open-on-code-host",
+      label: codeHostLink.label,
+      icon: <ExternalLinkIcon className="size-4" />,
+      active: false,
+      disabledReason: unavailableReason,
+      onSelect: () => {
+        if (url) openLink(conversationId, url);
+      },
     });
   }
   // One wrap preference covers the source editor and the diff. Other views
@@ -1667,6 +1701,27 @@ function FileViewerBody({
     ].join("|"),
   );
 
+  // The span keeps a hover target for the reason, which a disabled item doesn't give.
+  const renderDisabledMenuItem = (item: ToolbarOption, reason: string) => (
+    <TooltipProvider key={item.key}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="block">
+            <DropdownMenuItem
+              disabled
+              aria-label={`${item.label} disabled: ${reason}`}
+              className="whitespace-nowrap"
+            >
+              {item.icon}
+              {item.label}
+            </DropdownMenuItem>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{reason}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+
   const renderActionButton = (action: ToolbarAction, interactive: boolean) => {
     const button = (
       <Button
@@ -1715,27 +1770,31 @@ function FileViewerBody({
             </Tooltip>
           </TooltipProvider>
           <DropdownMenuContent align="end" className="w-auto min-w-40">
-            {action.menu.map((item) => (
-              <DropdownMenuItem
-                key={item.key}
-                className="whitespace-nowrap"
-                onSelect={
-                  interactive
-                    ? (e) => {
-                        if (item.keepOpen) e.preventDefault();
-                        item.onSelect();
-                      }
-                    : undefined
-                }
-              >
-                {item.icon}
-                {item.label}
-                {item.shortcut && (
-                  <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
-                )}
-                {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
-              </DropdownMenuItem>
-            ))}
+            {action.menu.map((item) =>
+              item.disabledReason ? (
+                renderDisabledMenuItem(item, item.disabledReason)
+              ) : (
+                <DropdownMenuItem
+                  key={item.key}
+                  className="whitespace-nowrap"
+                  onSelect={
+                    interactive
+                      ? (e) => {
+                          if (item.keepOpen) e.preventDefault();
+                          item.onSelect();
+                        }
+                      : undefined
+                  }
+                >
+                  {item.icon}
+                  {item.label}
+                  {item.shortcut && (
+                    <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
+                  )}
+                  {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
+                </DropdownMenuItem>
+              ),
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       ) : action.options ? (
@@ -1985,22 +2044,26 @@ function FileViewerBody({
                           // The settings menu's items are already independent
                           // toggles/actions, so flatten them straight into this "⋯"
                           // overflow rather than nesting a "⋯"-in-"⋯" submenu.
-                          action.menu.map((option) => (
-                            <DropdownMenuItem
-                              key={option.key}
-                              className="whitespace-nowrap"
-                              onSelect={(e) => {
-                                if (option.keepOpen) e.preventDefault();
-                                option.onSelect();
-                              }}
-                            >
-                              {option.icon}
-                              {option.label}
-                              {option.active && !option.noActiveCheck && (
-                                <CheckIcon className="ml-auto size-4" />
-                              )}
-                            </DropdownMenuItem>
-                          ))
+                          action.menu.map((option) =>
+                            option.disabledReason ? (
+                              renderDisabledMenuItem(option, option.disabledReason)
+                            ) : (
+                              <DropdownMenuItem
+                                key={option.key}
+                                className="whitespace-nowrap"
+                                onSelect={(e) => {
+                                  if (option.keepOpen) e.preventDefault();
+                                  option.onSelect();
+                                }}
+                              >
+                                {option.icon}
+                                {option.label}
+                                {option.active && !option.noActiveCheck && (
+                                  <CheckIcon className="ml-auto size-4" />
+                                )}
+                              </DropdownMenuItem>
+                            ),
+                          )
                         ) : action.disabled ? (
                           <TooltipProvider key={action.key}>
                             <Tooltip>

@@ -228,6 +228,15 @@ import {
   writeFileViewPreferences,
 } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
+import {
+  PushUnresolved,
+  RepositoryContextProblem,
+  type ResolveRepositoryContextResponse,
+} from "@/lib/workspaceSidebarApi";
+import {
+  DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
+  setWorkspaceSidebarSourceForTests,
+} from "@/lib/workspaceSidebarSource";
 
 const useCommentsMock = vi.mocked(useComments);
 const useOptionalCommentSenderMock = vi.mocked(useOptionalCommentSender);
@@ -2426,6 +2435,84 @@ describe("FileViewer view-settings menu", () => {
     expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
     // Hiding whitespace changes only means something in the diff view.
     expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
+  });
+
+  describe("Open in GitHub", () => {
+    const pushed = "c".repeat(40);
+    const pushTarget = {
+      remoteName: "origin",
+      branch: "feature",
+      host: "github.com",
+      owner: "acme",
+      repo: "app",
+      trackingSha: pushed,
+    };
+    const repositoryContext = (
+      overrides: Partial<ResolveRepositoryContextResponse> = {},
+    ): ResolveRepositoryContextResponse => ({
+      problem: RepositoryContextProblem.UNSPECIFIED,
+      branch: "feature",
+      headSha: pushed,
+      push: pushTarget,
+      pushUnresolved: PushUnresolved.UNSPECIFIED,
+      upstreamRef: "refs/remotes/origin/feature",
+      remotes: [{ name: "origin", host: "github.com", owner: "acme", repo: "app" }],
+      unsupportedRemoteCount: 0,
+      truncatedRemotes: false,
+      workspacePrefix: "web/",
+      ...overrides,
+    });
+    const answering = (response: ResolveRepositoryContextResponse) => {
+      const resolve = vi.fn(() => Promise.resolve(response));
+      setWorkspaceSidebarSourceForTests({
+        ...DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
+        resolveRepositoryContext: resolve,
+      });
+      return resolve;
+    };
+
+    afterEach(() => setWorkspaceSidebarSourceForTests(null));
+
+    it("opens the file at its pushed commit, below the workspace's place in the repository", async () => {
+      answering(repositoryContext());
+      const openWindow = vi.fn();
+      vi.stubGlobal("open", openWindow);
+      render(viewerTree({ open: true }));
+      openSettingsMenu();
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Open in GitHub" }));
+      expect(openWindow).toHaveBeenCalledWith(
+        `https://github.com/acme/app/blob/${pushed}/web/file1.py`,
+        "_blank",
+        "noopener,noreferrer",
+      );
+    });
+
+    it("shows the item disabled, with why, while the branch isn't pushed", async () => {
+      answering(repositoryContext({ push: { ...pushTarget, trackingSha: "" } }));
+      render(viewerTree({ open: true }));
+      openSettingsMenu();
+      expect(
+        await screen.findByRole("menuitem", {
+          name: "Open in GitHub disabled: Push this branch to open the file in GitHub.",
+        }),
+      ).toHaveAttribute("aria-disabled", "true");
+    });
+
+    it("leaves the item out of a workspace that isn't a repository", async () => {
+      const resolve = answering(
+        repositoryContext({
+          problem: RepositoryContextProblem.NOT_A_REPOSITORY,
+          push: undefined,
+          remotes: [],
+          workspacePrefix: undefined,
+        }),
+      );
+      render(viewerTree({ open: true }));
+      await waitFor(() => expect(resolve).toHaveBeenCalledWith("conv_1", expect.anything()));
+      openSettingsMenu();
+      expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: /Open in GitHub/ })).toBeNull();
+    });
   });
 
   it("toggling Wrap lines in a code file flips the code viewer's wrapLines prop", () => {
