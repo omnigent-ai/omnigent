@@ -5383,6 +5383,7 @@ def _publish_status(
     if status not in ("running", "waiting") or background_agents:
         _session_turn_request_cache.pop(session_id, None)
         _session_turn_ends[session_id] = _session_turn_ends.get(session_id, 0) + 1
+        pending_inputs.mark_turn_ended(session_id)
         # The ended turn took up any message still held; a turn the runner
         # starts with held messages names them on its running edge.
         _session_held_request_cache.pop(session_id, None)

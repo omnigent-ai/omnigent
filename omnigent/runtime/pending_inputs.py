@@ -987,6 +987,20 @@ def has_pending_turn_start(conversation_id: str) -> bool:
         )
 
 
+def mark_turn_ended(conversation_id: str) -> None:
+    """
+    Count every message still queued for *conversation_id* as starting a turn.
+
+    A follow-up sent during a turn that ended before the agent took it up starts
+    the next turn, so :func:`has_pending_turn_start` reports it from now on.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    """
+    with _lock:
+        for entry in _pending.get(conversation_id, {}).values():
+            entry.queued_during_turn = False
+
+
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     """
     Return un-consumed messages for one session, for snapshot replay.
