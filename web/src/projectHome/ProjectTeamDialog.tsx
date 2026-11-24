@@ -22,6 +22,7 @@ import {
   type ProjectIdentity,
   type ProjectIdentityInput,
 } from "@/lib/projectsApi";
+import { IdentityModelEffortFields } from "./IdentityModelEffortFields";
 import { ProjectRoutingSection } from "./ProjectRoutingSection";
 import { TicketError } from "./TicketControls";
 import { useProjectRecord } from "./useProjectAgentSession";
@@ -69,7 +70,8 @@ export function ProjectTeamDialog({
   onClose: () => void;
 }) {
   const identities = useProjectIdentities(projectId);
-  const shared = useProjectRecord(projectId).data?.shared === true;
+  const project = useProjectRecord(projectId).data;
+  const shared = project?.shared === true;
   // `null` is the new-identity form; an id edits that identity.
   const [selected, setSelected] = useState<string | null>(null);
   const [draft, setDraft] = useState<IdentityDraft>(EMPTY_DRAFT);
@@ -223,26 +225,14 @@ export function ProjectTeamDialog({
                     renamed or deleted here, and its model comes from the project's settings.
                   </p>
                 ) : (
-                  <div className="flex gap-3">
-                    <label className="flex flex-1 flex-col gap-1 text-sm">
-                      Model
-                      <Input
-                        value={draft.model}
-                        placeholder="Project default"
-                        onChange={(event) => setDraft({ ...draft, model: event.target.value })}
-                        disabled={busy}
-                      />
-                    </label>
-                    <label className="flex flex-1 flex-col gap-1 text-sm">
-                      Effort
-                      <Input
-                        value={draft.effort}
-                        placeholder="Project default"
-                        onChange={(event) => setDraft({ ...draft, effort: event.target.value })}
-                        disabled={busy}
-                      />
-                    </label>
-                  </div>
+                  <IdentityModelEffortFields
+                    config={project?.config}
+                    agentId={selectedIdentity?.agent_id ?? null}
+                    model={draft.model}
+                    effort={draft.effort}
+                    disabled={busy}
+                    onChange={(next) => setDraft({ ...draft, ...next })}
+                  />
                 )}
                 {selectedIdentity?.created_by_session_id && (
                   <p
