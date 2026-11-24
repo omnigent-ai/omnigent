@@ -10,6 +10,7 @@ import { Outlet, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useProjectKanbanBoardPreference } from "@/lib/projectKanbanPreferences";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { CANVAS_SESSION_ROUTE, CHAT_SESSION_ROUTE } from "@/lib/sessionRoutes";
 import { AppShell } from "@/shell/AppShell";
 import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
 import { isElectronShell } from "@/lib/nativeBridge";
@@ -259,7 +260,7 @@ function AppRoutes({ basename }: AppProps) {
         />
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
-          <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route path={`${prefix}${CHAT_SESSION_ROUTE}`} element={<ChatPage />} />
           <Route
             path={`${prefix}/grid/:gridId`}
             element={
@@ -286,7 +287,7 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route
-            path={`${prefix}/canvas/c/:conversationId`}
+            path={`${prefix}${CANVAS_SESSION_ROUTE}`}
             element={
               <FeatureGatedPage feature="canvas">
                 <ChatPage />

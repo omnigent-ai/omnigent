@@ -3440,7 +3440,7 @@ function ConversationList({
     () => [...new Set(orderedConversationIds)].slice(0, SESSION_HOTKEY_DIGITS.length),
     [orderedConversationIds],
   );
-  useSessionNumberHotkeys(numberedSessionIds, activeId);
+  useSessionNumberHotkeys(numberedSessionIds);
   // Holding the command modifier shows each numbered row's jump number. The slots
   // come from the hotkey's own list, so a badge exists only where the key works.
   useCommandHoldTracking();
