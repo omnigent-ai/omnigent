@@ -813,14 +813,15 @@ export function hasNoTextDiff(path: string): boolean {
 // Markdown preview copy: rendered selection → Markdown source
 // ---------------------------------------------------------------------------
 
-interface SourcedHastNode {
+// The slice of an mdast or hast node these steps read.
+interface SourcedNode {
   type: string;
   properties?: Record<string, unknown>;
   position?: { start: { offset?: number }; end: { offset?: number } };
-  children?: SourcedHastNode[];
+  children?: SourcedNode[];
 }
 
-function nodeSource(node: SourcedHastNode): { start: number; end: number } | null {
+function nodeSource(node: SourcedNode): { start: number; end: number } | null {
   const start = node.position?.start.offset;
   const end = node.position?.end.offset;
   return start === undefined || end === undefined ? null : { start, end };
@@ -834,7 +835,7 @@ function nodeSource(node: SourcedHastNode): { start: number; end: number } | nul
  * it came from. It runs after sanitize and adds only numbers.
  */
 export function rehypeSourceOffsets() {
-  const stamp = (node: SourcedHastNode) => {
+  const stamp = (node: SourcedNode) => {
     const span = nodeSource(node);
     if (node.type === "element" && span) {
       const texts = (node.children ?? []).filter((child) => child.type === "text");
@@ -854,16 +855,21 @@ export function rehypeSourceOffsets() {
   return stamp;
 }
 
+// Markdown the preview never shows as written: raw HTML, which can hold a
+// comment or a stripped `<script>`'s body, and link definitions such as
+// `[//]: # (a note)`.
+const HIDDEN_SOURCE_NODES = new Set(["html", "definition"]);
+
 /**
- * Rehype step that records in *spans* where raw HTML sits in the source. It
- * runs before rehype-raw parses it, so a copy can avoid carrying what the
- * preview never shows, such as a comment or a stripped `<script>`'s body.
+ * Remark step that records in *spans* where source the preview never shows
+ * sits, so a copy reaching it keeps the browser's copy instead of carrying
+ * hidden text along.
  */
-export function rehypeRecordRawHtml(spans: SourceSpan[]) {
-  return (tree: SourcedHastNode) => {
+export function remarkRecordHiddenSource(spans: SourceSpan[]) {
+  return (tree: SourcedNode) => {
     spans.length = 0;
-    const visit = (node: SourcedHastNode) => {
-      const span = node.type === "raw" ? nodeSource(node) : null;
+    const visit = (node: SourcedNode) => {
+      const span = HIDDEN_SOURCE_NODES.has(node.type) ? nodeSource(node) : null;
       if (span) spans.push(span);
       node.children?.forEach(visit);
     };
@@ -1105,21 +1111,22 @@ function widenOverLeftElements(
  * whole source, each block the selection covers from its edge copies whole,
  * markers included, and one entered mid-text starts or ends mid-line. A code
  * block copies whole when the selection leaves it, and a table once the
- * selection spans its cells or leaves it. A slice reaching raw HTML is never
- * copied, since it could carry text the preview hides.
+ * selection spans its cells or leaves it. A slice reaching raw HTML or a link
+ * definition is never copied, since it could carry text the preview hides.
  *
  * :param range: The selection, e.g. `window.getSelection().getRangeAt(0)`.
  * :param root: The element holding the rendered document.
  * :param source: The Markdown the preview rendered.
- * :param rawHtml: Where raw HTML sits in *source*, from `rehypeRecordRawHtml`.
+ * :param hiddenSource: Where source the preview hides sits in *source*, from
+ *     `remarkRecordHiddenSource`.
  * :returns: The selection's Markdown, or null when it reaches outside *root*,
- *     reaches raw HTML or can't be mapped, so the browser's own copy applies.
+ *     reaches hidden source or can't be mapped, so the browser's own copy applies.
  */
 export function markdownPreviewSelectionSource(
   range: Range,
   root: Element,
   source: string,
-  rawHtml: readonly SourceSpan[],
+  hiddenSource: readonly SourceSpan[],
 ): string | null {
   if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null;
   const bounds = selectedTextBounds(range);
@@ -1137,7 +1144,7 @@ export function markdownPreviewSelectionSource(
   const copied = table
     ? { start: Math.min(from, table.start), end: Math.max(to, table.end) }
     : { start: from, end: to };
-  if (rawHtml.some((html) => html.start < copied.end && html.end > copied.start)) return null;
+  if (hiddenSource.some((span) => span.start < copied.end && span.end > copied.start)) return null;
   const markdown = source.slice(copied.start, copied.end);
   return markdown.trim() ? markdown : null;
 }

@@ -685,18 +685,20 @@ describe("CodeViewer markdown preview copy", () => {
     expectBrowserCopy(node);
   });
 
-  // Raw HTML can hold text the preview never shows; the copy must not carry it.
+  // Raw HTML and link definitions can hold text the preview never shows; the
+  // copy must not carry it.
   it.each([
-    ["a hidden comment", "a<!--INERT-->**b**"],
-    ["a stripped element", 'a<script type="text/plain">INERT</script>**b**'],
-  ])("keeps the browser's copy across %s", (_shape, markdown) => {
+    ["a hidden comment", "a<!--INERT-->**b**", "a", "b"],
+    ["a stripped element", 'a<script type="text/plain">INERT</script>**b**', "a", "b"],
+    ["a link definition", "First para\n\n[//]: # (INERT)\n\nSecond para", "First", "Second para"],
+  ])("keeps the browser's copy across %s", (_shape, markdown, from, to) => {
     renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
-    expect(document.querySelector(".markdown-preview")?.textContent).toBe("ab");
-    const start = previewText("a");
-    const end = previewText("b");
+    expect(document.querySelector(".markdown-preview")?.textContent).not.toContain("INERT");
+    const start = previewText(from);
+    const end = previewText(to);
     const range = document.createRange();
     range.setStart(start.node, start.offset);
-    range.setEnd(end.node, end.offset + 1);
+    range.setEnd(end.node, end.offset + to.length);
     window.getSelection()?.addRange(range);
     expectBrowserCopy(start.node);
   });
