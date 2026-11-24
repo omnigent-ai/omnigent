@@ -1443,6 +1443,27 @@ describe("the current file's actions in ⌘K", () => {
     expect(onFileMenuOpenChange.mock.calls).toEqual([[true], [false]]);
   });
 
+  it("reports a file's menu closed when its header goes away while it's open", () => {
+    const onFileMenuOpenChange = vi.fn();
+    render(<DiffReview {...twoFiles({ onFileMenuOpenChange })} />);
+    const item = codeView.props!.items.find((each) => each.id.endsWith(SECOND))!;
+    const header = render(
+      <TooltipProvider>
+        {(
+          codeView.props as { renderHeaderMetadata?: (item: unknown) => ReactNode }
+        ).renderHeaderMetadata?.(item)}
+      </TooltipProvider>,
+    );
+    fireEvent.pointerDown(
+      within(header.container).getByRole("button", { name: `More actions for ${SECOND}` }),
+      { button: 0, ctrlKey: false },
+    );
+    expect(onFileMenuOpenChange.mock.calls).toEqual([[true]]);
+    // The file leaves the review, taking its header and open menu with it.
+    header.unmount();
+    expect(onFileMenuOpenChange.mock.calls).toEqual([[true], [false]]);
+  });
+
   it("leaves ⌘K's file to whoever owns it while the review doesn't", () => {
     const view = render(<DiffReview {...twoFiles({ fileActionsInPalette: false })} />);
     expect(fileCommands()).toEqual([]);

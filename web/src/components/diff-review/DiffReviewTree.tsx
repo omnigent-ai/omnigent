@@ -33,6 +33,7 @@ import { useTreeRowTooltip } from "@/components/file-tree/treeRowTooltip";
 import type { DiffReviewFileAction } from "./diffReviewFileAction";
 import type { DiffReviewChange, DiffReviewFile } from "./diffReviewModel";
 import { treeCommandClickOpen, treeKeyOpen, treeMiddleClickOpen } from "./treeOpenGesture";
+import { useReportMenuOpen } from "./useReportMenuOpen";
 import {
   focusedReviewFolderTree,
   publishFocusedReviewFolder,
@@ -266,8 +267,8 @@ function ChangedFileRows({
   pathSet.current = new Set(paths);
   const filesByPath = useRef(new Map(files.map((file) => [file.path, file])));
   filesByPath.current = new Map(files.map((file) => [file.path, file]));
-  const latest = useRef({ onOpenInNewTab, rowActions, folderActions, onRowMenuOpenChange });
-  latest.current = { onOpenInNewTab, rowActions, folderActions, onRowMenuOpenChange };
+  const latest = useRef({ onOpenInNewTab, rowActions, folderActions });
+  latest.current = { onOpenInNewTab, rowActions, folderActions };
   const [menu, setMenu] = useState<{
     directory: boolean;
     /** The row the menu is for, and the one focus goes back to when it closes. */
@@ -305,13 +306,10 @@ function ChangedFileRows({
   const openRowMenu = (row: FileTreeVisibleRow, anchor: DOMRect) => {
     const target = { directory: row.kind === "directory", path: row.path };
     if (rowMenuActions(target).length === 0) return;
-    latest.current.onRowMenuOpenChange?.(true);
     setMenu({ ...target, point: { x: anchor.left, y: anchor.bottom } });
   };
-  const closeRowMenu = () => {
-    latest.current.onRowMenuOpenChange?.(false);
-    setMenu(null);
-  };
+  const closeRowMenu = () => setMenu(null);
+  useReportMenuOpen(menu !== null, onRowMenuOpenChange);
   // A row that leaves the list, or loses every action, closes its menu rather than hiding it.
   const menuActions = menu ? rowMenuActions(menu) : [];
   const menuEmptied = menu !== null && menuActions.length === 0;

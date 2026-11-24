@@ -577,8 +577,12 @@ export function ChangesReview({
   const sessionHostId = useSessionHostId();
   const fileEnvironment = useFileCommandEnvironment(sessionHostId, conversationId);
   // The host's SSH name, for opening a file in an editor, is read while a file's menu is open.
-  const [fileMenuOpen, setFileMenuOpen] = useState(false);
-  useFileSshTargetDemand(sessionHostId, conversationId, fileMenuOpen);
+  const [openFileMenus, setOpenFileMenus] = useState(0);
+  const onFileMenuOpenChange = useCallback(
+    (open: boolean) => setOpenFileMenus((count) => Math.max(0, count + (open ? 1 : -1))),
+    [],
+  );
+  useFileSshTargetDemand(sessionHostId, conversationId, openFileMenus > 0);
   const { preferences, update } = useReviewViewPreferences();
   const [pickerOpen, setPickerOpen] = useState(false);
   // Without access the picker goes, with its typed text; it reopens closed.
@@ -867,7 +871,7 @@ export function ChangesReview({
               onFindClose={() => setFindOpen(false)}
               fileActions={fileActions}
               folderActions={folderActions}
-              onFileMenuOpenChange={setFileMenuOpen}
+              onFileMenuOpenChange={onFileMenuOpenChange}
               fileActionsInPalette={commitActive}
               onOpenFileInNewTab={onOpenFileInNewTab}
               active={commitActive}
@@ -1074,7 +1078,7 @@ export function ChangesReview({
         onFindClose={() => setFindOpen(false)}
         fileActions={fileActions}
         folderActions={folderActions}
-        onFileMenuOpenChange={setFileMenuOpen}
+        onFileMenuOpenChange={onFileMenuOpenChange}
         fileActionsInPalette={changesActive}
         onOpenFileInNewTab={onOpenFileInNewTab}
         active={changesActive}

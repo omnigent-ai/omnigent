@@ -181,6 +181,7 @@ import { useDiffReviewFind } from "./useDiffReviewFind";
 import { CONTEXT_LOAD_CSS, type ContextLoadState, markContextLoads } from "./contextLoadIndicator";
 import { ContextLoadStatus } from "./ContextLoadStatus";
 import { useContextLoads } from "./useContextLoads";
+import { useReportMenuOpen } from "./useReportMenuOpen";
 import {
   createDiffRenderFailureReporter,
   DIFF_RENDER_FAILED_MESSAGE,
@@ -2799,14 +2800,17 @@ function FileActionsMenu({
 }) {
   // Read when the menu opens: the header's width decides whether the title shows the copy button.
   const [copyInTitle, setCopyInTitle] = useState(false);
+  const [open, setOpen] = useState(false);
+  // A menu left with nothing to offer renders nothing, so it counts as closed.
+  useReportMenuOpen(open && actions.length > 0, onOpenChange);
   if (actions.length === 0) return null;
   const others = actions.filter((action) => action.id !== "copy-path");
   const menuActions = copyInTitle && others.length > 0 ? others : actions;
   return (
     <DropdownMenu
-      onOpenChange={(open) => {
-        if (open) setCopyInTitle(titleShowsCopy(path));
-        onOpenChange?.(open);
+      onOpenChange={(nextOpen) => {
+        if (nextOpen) setCopyInTitle(titleShowsCopy(path));
+        setOpen(nextOpen);
       }}
     >
       <DropdownMenuTrigger asChild>

@@ -284,6 +284,30 @@ describe("a row menu whose actions load while it's open", () => {
     expect(onRowMenuOpenChange.mock.calls).toEqual([[true], [false]]);
   });
 
+  it("reports closing when a change to the files drops the open menu", async () => {
+    const onRowMenuOpenChange = vi.fn();
+    const tree = (files: readonly DiffReviewFile[]) => (
+      <DiffReviewTree
+        files={files}
+        navigate={() => undefined}
+        searchQuery={null}
+        setSearchQuery={() => undefined}
+        searchFocusRequest={0}
+        dark={false}
+        rowActions={() => [copyPath]}
+        onRowMenuOpenChange={onRowMenuOpenChange}
+      />
+    );
+    const view = render(tree([file(FIRST), file(SECOND)]));
+    fireEvent.contextMenu(await findTreeRow(SECOND));
+    await screen.findByRole("menuitem", { name: "Copy path" });
+
+    // The listing changes, so the tree's rows mount afresh without the menu.
+    view.rerender(tree([file(FIRST)]));
+    await waitFor(() => expect(screen.queryByRole("menuitem")).toBeNull());
+    expect(onRowMenuOpenChange.mock.calls).toEqual([[true], [false]]);
+  });
+
   it("closes when its row loses every action, and doesn't come back by itself", async () => {
     const { onRowMenuOpenChange, setActions } = renderLoadingTree([copyPath]);
     fireEvent.contextMenu(await findTreeRow(SECOND));

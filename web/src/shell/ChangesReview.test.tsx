@@ -32,6 +32,8 @@ const mocks = vi.hoisted(() => ({
   source: vi.fn(),
   fetchBranchCommits: vi.fn(),
   body: vi.fn(),
+  /** Whether the review wanted the host's SSH name, on each render. */
+  sshWanted: [] as boolean[],
   asleep: vi.fn(() => false),
   resume: vi.fn(),
   /** The open commit's comparisons, as its owner was given them. */
@@ -87,7 +89,8 @@ vi.mock("./WorkingCopyDiffReview", () => ({
 }));
 vi.mock("./fileCommands/useFileCommandFacts", () => ({
   useFileCommandEnvironment: () => ({}),
-  useFileSshTargetDemand: () => {},
+  useFileSshTargetDemand: (_host: string | null, _session: string | null, wanted: boolean) =>
+    void mocks.sshWanted.push(wanted),
 }));
 vi.mock("./fileCommands/target", () => ({
   useSessionHostId: () => null,
@@ -231,6 +234,26 @@ describe("ChangesReview", () => {
     expect(body.revealPath).toBe("src/app.ts");
     expect(body.presentation?.tree?.appearance).toBe("reference");
     expect(body.presentation?.treeRowActions).toBe(true);
+  });
+
+  it("wants the host's SSH name while any file menu is open", () => {
+    mocks.source.mockReturnValue(source(changes()));
+    renderReview();
+    const report = (open: boolean) =>
+      act(() =>
+        (mocks.body.mock.calls.at(-1)![0] as WorkingCopyDiffReviewBodyProps).onFileMenuOpenChange!(
+          open,
+        ),
+      );
+    const wanted = () => mocks.sshWanted.at(-1);
+    expect(wanted()).toBe(false);
+    // A header menu opens, then a tree row's, before the first reports closing.
+    report(true);
+    report(true);
+    report(false);
+    expect(wanted()).toBe(true);
+    report(false);
+    expect(wanted()).toBe(false);
   });
 
   it("offers View File for each file, and withdraws ⌘K's file actions while inactive", () => {
