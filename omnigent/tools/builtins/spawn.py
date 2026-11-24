@@ -20,6 +20,7 @@ from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -543,7 +544,8 @@ class SysSessionListTool(Tool):
             "the sessions you own (visibility 'mine', the default), each "
             "with status, runner connectivity and "
             "created_by_session_id (creation origin for independent workers). "
-            "Match that field to your session ID to find workers you created. "
+            "Match that field to your session ID to find workers you created, or "
+            "pass created_by_this_session true to list only those. "
             "Pass visibility 'shared' for sessions other users shared with you, "
             "or 'all' for both; those rows carry owner, so check it before "
             "treating a session as yours. "
@@ -604,6 +606,15 @@ class SysSessionListTool(Tool):
                                 "Optional: also list archived sessions in the "
                                 "global 'sessions' view; each row then carries "
                                 "'archived'. Defaults to false."
+                            ),
+                        },
+                        "created_by_this_session": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional: list only sessions this session started "
+                                "(created_by_session_id is your session ID) in the "
+                                "global 'sessions' view, in one call where possible; "
+                                "sub_agents is then empty. Defaults to false."
                             ),
                         },
                         "limit": {
@@ -693,14 +704,15 @@ class SysSessionGetInfoTool(Tool):
     A **global read**: resolves against any session the caller is
     permitted to access (bounded by the server's per-user permission
     model), not just the caller's spawn subtree. Reports lifecycle
-    status, title, agent binding (id + name), runner binding and live
+    status, archived state, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
-    effective model, parent
+    effective model, current permission mode, parent
     linkage, workspace / git branch, project, persisted last-activity time, and
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
-    is advancing from one whose persisted output has stalled. For the
-    conversation transcript, use
+    is advancing from one whose persisted output has stalled. With
+    ``include_usage`` it also reports cost and token usage so far, the same
+    totals the session's cost badge shows. For the conversation transcript, use
     ``sys_session_get_history`` instead.
 
     ``session_id`` is optional — when omitted, the caller's own
@@ -722,12 +734,22 @@ class SysSessionGetInfoTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Return a session's metadata: lifecycle status, title, "
+            "Return a session's metadata: lifecycle status, whether it is "
+            "archived, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
+            "permission_mode (the mode it is in now, named as "
+            "sys_session_create's permission_mode names it; a mode that skips "
+            "approval shows only if the session launched in it; null when its "
+            "harness has no permission modes or the mode is unknown), "
             "parent session, workspace, project_id, project_name, "
             "persisted last-activity time, and outstanding approval "
-            "prompts. Global read — any "
+            "prompts. Pass include_usage: true to add a usage object with "
+            "cost so far (total_cost_usd) and token totals, overall and per "
+            "model. Usage counts the session and the sub-agents it started; "
+            "total_cost_usd is null when the session is unpriced or the "
+            "server hides cost, and for some harnesses it is an estimate. "
+            "Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
             "use sys_session_get_history for the conversation transcript."
@@ -738,7 +760,8 @@ class SysSessionGetInfoTool(Tool):
         Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict; ``session_id`` is optional.
+            ``"function"`` sub-dict; ``session_id`` and ``include_usage``
+            are optional.
         """
         return {
             "type": "function",
@@ -756,6 +779,14 @@ class SysSessionGetInfoTool(Tool):
                                 "from sys_session_list or a prior "
                                 "sys_session_send handle. Omit to "
                                 "describe the calling session itself."
+                            ),
+                        },
+                        "include_usage": {
+                            "type": "boolean",
+                            "description": (
+                                "Also return the session's cost and token "
+                                "usage so far. Off by default because it sums "
+                                "usage over the session's sub-agents."
                             ),
                         },
                     },
@@ -970,7 +1001,7 @@ class SysSessionCreateTool(Tool):
             "A project_name other than this session's project makes a standalone "
             "session there, not a nested agent. "
             "An independent worker's optional "
-            "first message must contain 1–8000 characters. "
+            f"first message must contain 1–{SESSION_MESSAGE_MAX_CHARS} characters. "
             "Independent sessions do not forward replies: "
             "read their status/history, and use sys_session_message for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}, plus project_id "
@@ -1141,7 +1172,13 @@ class SysSessionCreateTool(Tool):
                                 "harness's vocabulary, e.g. Claude Code 'auto' or Codex "
                                 "'approve-for-me' (agent_id only). Modes that skip "
                                 "approval, such as 'bypassPermissions' or 'full-access', "
-                                "are refused. Omit to use the agent's default."
+                                "are refused. Omit it and a child of a Claude Code "
+                                "session starts in the closest match to that session's "
+                                "current mode, if the agent sets none; another session "
+                                "starts in your current mode when both run Claude Code or "
+                                "Codex and its agent sets none (a mode that skips approval "
+                                "only on your own host), else in "
+                                "the agent's default."
                             ),
                         },
                         "workflow_id": {

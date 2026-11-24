@@ -128,6 +128,8 @@ class _SessionTurn:
     session_id: str
     conversation_id: str | None
     turn_active: bool = False
+    # Ending a turn invalidates its pending permission and form replies.
+    generation: int = 0
     # Assistant message of the step in flight (``session.step.started``).
     assistant_message_id: str | None = None
     # Id the turn's ``running`` edge went out with; stamped on every item.
@@ -534,8 +536,8 @@ class OpenCodeNativeForwarder:
         # Permission/form ids we are answering, and those the TUI resolved meanwhile.
         self._answering: set[str] = set()
         self._answered_elsewhere: set[str] = set()
-        # Request/form id -> OpenCode session whose running edge shows a failed reply.
-        self._blocked_replies: dict[str, str] = {}
+        # Request/form id -> session and turn generation showing a failed reply.
+        self._blocked_replies: dict[str, tuple[str, int]] = {}
         # assistantMessageID -> step usage (root session only).
         self._usage_by_message: dict[str, _AssistantUsage] = {}
         # Authoritative session totals from ``session.usage.updated``.
@@ -749,6 +751,7 @@ class OpenCodeNativeForwarder:
         extra: _JsonMapping | None = None,
     ) -> None:
         """Post the terminal edge stamped with the turn's id and reset per-turn state."""
+        turn.generation += 1
         await self._flush_pending_text(turn)
         await self._persist_partial_text(turn)
         turn.turn_active = False
@@ -1439,22 +1442,28 @@ class OpenCodeNativeForwarder:
             return
         if not self.state.mark(self._key("perm", request.request_id)):
             return
-        task = asyncio.create_task(self._handle_permission(request))
+        turn = self._turns.get(request.session_id or self._opencode_session_id)
+        turn_generation = turn.generation if turn is not None else None
+        task = asyncio.create_task(self._handle_permission(request, turn_generation))
         self._permission_tasks[request.request_id] = task
         task.add_done_callback(
             lambda _t, rid=request.request_id: self._permission_tasks.pop(rid, None)
         )
 
-    async def _handle_permission(self, request: OpenCodePermissionRequest) -> None:
+    async def _handle_permission(
+        self, request: OpenCodePermissionRequest, turn_generation: int | None
+    ) -> None:
         """Resolve one permission and reply ``once`` or ``reject`` (never ``always``)."""
         self._answering.add(request.request_id)
         try:
-            await self._answer_permission(request)
+            await self._answer_permission(request, turn_generation)
         finally:
             self._answering.discard(request.request_id)
             self._answered_elsewhere.discard(request.request_id)
 
-    async def _answer_permission(self, request: OpenCodePermissionRequest) -> None:
+    async def _answer_permission(
+        self, request: OpenCodePermissionRequest, turn_generation: int | None
+    ) -> None:
         """Evaluate policy and send the reply; a failed reply surfaces ``blocked_on``."""
         decision = await self._resolve_permission(request_dict=request)
         # ``ask`` means no human resolution was obtained upstream: fail closed.
@@ -1478,16 +1487,19 @@ class OpenCodeNativeForwarder:
                 request.session_id or self._opencode_session_id,
                 request.request_id,
                 f"permission reply failed for {request.request_id}",
+                turn_generation=turn_generation,
             )
 
-    async def _surface_reply_failure(self, session_id: str, item_id: str, label: str) -> None:
+    async def _surface_reply_failure(
+        self, session_id: str, item_id: str, label: str, *, turn_generation: int | None
+    ) -> None:
         """Show a failed reply as ``blocked_on`` unless the TUI already resolved it."""
         if item_id in self._answered_elsewhere:
             return
         turn = self._turns.get(session_id)
-        if turn is None:
+        if turn is None or turn.generation != turn_generation:
             return
-        self._blocked_replies[item_id] = session_id
+        self._blocked_replies[item_id] = (session_id, turn.generation)
         await self._post_status(turn, _STATUS_RUNNING, extra={"blocked_on": label})
 
     async def _note_resolved_after_our_mark(self, item_id: str) -> None:
@@ -1495,9 +1507,12 @@ class OpenCodeNativeForwarder:
         if item_id in self._answering:
             self._answered_elsewhere.add(item_id)
             return
-        session_id = self._blocked_replies.pop(item_id, None)
-        turn = self._turns.get(session_id) if session_id is not None else None
-        if turn is not None and turn.turn_active:
+        blocked_turn = self._blocked_replies.pop(item_id, None)
+        if blocked_turn is None:
+            return
+        session_id, turn_generation = blocked_turn
+        turn = self._turns.get(session_id)
+        if turn is not None and turn.turn_active and turn.generation == turn_generation:
             await self._post_status(
                 turn,
                 _STATUS_RUNNING,
@@ -1565,20 +1580,28 @@ class OpenCodeNativeForwarder:
             return
         if not self.state.mark(self._key("form", form_id)):
             return
-        task = asyncio.create_task(self._handle_form(session_id, form_id, dict(form)))
+        turn = self._turns.get(session_id)
+        turn_generation = turn.generation if turn is not None else None
+        task = asyncio.create_task(
+            self._handle_form(session_id, form_id, dict(form), turn_generation)
+        )
         self._form_tasks[form_id] = task
         task.add_done_callback(lambda _t, fid=form_id: self._form_tasks.pop(fid, None))
 
-    async def _handle_form(self, session_id: str, form_id: str, form: dict[str, Any]) -> None:
+    async def _handle_form(
+        self, session_id: str, form_id: str, form: dict[str, Any], turn_generation: int | None
+    ) -> None:
         """Park one form, reply, and track TUI answers that race our reply."""
         self._answering.add(form_id)
         try:
-            await self._answer_form(session_id, form_id, form)
+            await self._answer_form(session_id, form_id, form, turn_generation)
         finally:
             self._answering.discard(form_id)
             self._answered_elsewhere.discard(form_id)
 
-    async def _answer_form(self, session_id: str, form_id: str, form: dict[str, Any]) -> None:
+    async def _answer_form(
+        self, session_id: str, form_id: str, form: dict[str, Any], turn_generation: int | None
+    ) -> None:
         """Park one form as a web card and reply with the mapped answer.
 
         Any outcome other than a valid ``accept`` cancels the form so the
@@ -1626,7 +1649,10 @@ class OpenCodeNativeForwarder:
             )
             await self._cancel_form_quietly(session_id, form_id)
             await self._surface_reply_failure(
-                session_id, form_id, f"form reply failed for {form_id}"
+                session_id,
+                form_id,
+                f"form reply failed for {form_id}",
+                turn_generation=turn_generation,
             )
 
     async def _cancel_form_quietly(self, session_id: str, form_id: str) -> None:

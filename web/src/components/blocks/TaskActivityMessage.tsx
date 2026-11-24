@@ -4,6 +4,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import {
   planChangeText,
   readTaskActivity,
+  showsTaskActivity,
   taskMarkerId,
   taskMarkerLabel,
   type TaskActivity,
@@ -46,7 +47,7 @@ export function TaskActivityMessage({ activity }: { activity: TaskActivity }) {
   const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
   const id = taskMarkerId(activity);
   const flashing = useChatStore((state) => state.flashItemId === id);
-  if (!workflowsEnabled && (activity.kind === "plan" || !activity.native)) return null;
+  if (!showsTaskActivity(activity, workflowsEnabled)) return null;
   let content;
   if (activity.kind === "plan") {
     const text = planChangeText(activity);

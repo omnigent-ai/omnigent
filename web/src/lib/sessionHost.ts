@@ -10,13 +10,16 @@
 //
 // A small standalone map (rather than reading the TanStack Query cache) keeps
 // this decoupled from the query-key convention and needs no QueryClient handle.
-// A session's host_id is fixed for its lifetime, so the recorded value can't go
-// stale. Returns `null` when the session hasn't been loaded yet or is a hostless
+// A host switch can leave an entry stale until reparsed or a wrong_replica refusal corrects it.
+// Returns `null` when the session hasn't been loaded yet or is a hostless
 // local session; such requests carry the client's own key (`routingKey.ts`).
 
 import { clientRoutingKey } from "./routingKey.ts";
 
 const _sessionHosts = new Map<string, string>();
+// Track newer observations even when a host or parent returns to its previous value.
+const _sessionRoutingRevisions = new Map<string, number>();
+let _nextRoutingRevision = 0;
 const _hostChangeListeners = new Set<() => void>();
 
 /** Subscribe to host/parent changes so live streams can recheck their effective host. */
@@ -37,6 +40,7 @@ function notifySessionHostChanges(): void {
  * that loses its host binding stops routing to the old replica.
  */
 export function setSessionHost(sessionId: string, hostId: string | null | undefined): void {
+  _sessionRoutingRevisions.set(sessionId, ++_nextRoutingRevision);
   if ((_sessionHosts.get(sessionId) ?? null) === (hostId || null)) return;
   if (hostId) {
     _sessionHosts.set(sessionId, hostId);
@@ -85,6 +89,7 @@ export function setSessionParent(
   parentId: string | null | undefined,
   labels?: Record<string, string>,
 ): void {
+  _sessionRoutingRevisions.set(sessionId, ++_nextRoutingRevision);
   const routingParent = parentId ?? parentIdFromLabels(labels);
   const nextParent = routingParent && routingParent !== sessionId ? routingParent : null;
   if ((_sessionParents.get(sessionId) ?? null) === nextParent) return;
@@ -111,15 +116,28 @@ export function getSessionParent(sessionId: string): string | null {
  * depth limit, so only a revisited id (a malformed cycle) ends the walk.
  */
 export function getSessionHost(sessionId: string): string | null {
+  return getSessionHostRouting(sessionId).hostId;
+}
+
+export interface SessionHostRouting {
+  readonly ownerId: string | null;
+  readonly hostId: string | null;
+  readonly revision: number;
+}
+
+/** Resolve the host's owner and newest observation along the routing ancestry. */
+export function getSessionHostRouting(sessionId: string): SessionHostRouting {
   const visited = new Set<string>();
   let id: string | null = sessionId;
+  let revision = 0;
   while (id !== null && !visited.has(id)) {
     visited.add(id);
-    const host = _sessionHosts.get(id);
-    if (host) return host;
+    revision = Math.max(revision, _sessionRoutingRevisions.get(id) ?? 0);
+    const hostId = _sessionHosts.get(id);
+    if (hostId) return { ownerId: id, hostId, revision };
     id = _sessionParents.get(id) ?? null;
   }
-  return null;
+  return { ownerId: null, hostId: null, revision };
 }
 
 // ── Keyless-demoted hosts ────────────────────────────────────────────────────

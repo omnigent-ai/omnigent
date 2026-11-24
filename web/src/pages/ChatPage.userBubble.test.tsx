@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { AUTOMATION_CONTEXT_NOTE } from "@/lib/systemMessage";
@@ -9,7 +10,9 @@ import { SessionSharedContext } from "@/components/chat/chatBubbleParts";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { EditSentMessageContext, type SentMessage } from "@/components/chat/editSentMessage";
 import type * as IdentityModule from "@/lib/identity";
-import { BubbleView, buildPendingBubbles } from "./ChatPage";
+import { BtwSidechatAnswer, BubbleView, buildPendingBubbles } from "./ChatPage";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { usePublishComposerCommands } from "@/components/composer/composerHighlight";
 
 // Unmocked, the viewer id is null in jsdom; Edit tests pin who is signed in.
 const viewer = vi.hoisted(() => ({ id: null as string | null }));
@@ -158,6 +161,52 @@ describe("UserBubble markdown rendering", () => {
     expect(katex.querySelector(".sqrt")).not.toBeNull();
     expect(katex.textContent).toContain("x");
     expect(katex.textContent).toContain("1");
+  });
+});
+
+const PR_REF_FILE_VIEWER = { ...FILE_VIEWER_NOOP, conversationId: "conv_pr" };
+
+function renderWithSessionRepo(children: ReactNode) {
+  // GitHub info never arrives over the network; the test seeds the cache.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => new Promise<Response>(() => {})),
+  );
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  queryClient.setQueryData(["github-info", "conv_pr"], {
+    object: "session.github.info",
+    available: true,
+    repo: { name_with_owner: "acme/app", host: "github.com" },
+    workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+  });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <FileViewerContext.Provider value={PR_REF_FILE_VIEWER}>{children}</FileViewerContext.Provider>
+    </QueryClientProvider>,
+  );
+}
+
+describe("UserBubble pull request references", () => {
+  it("links a PR reference to the session repo", () => {
+    renderWithSessionRepo(<BubbleView bubble={userBubble("See #4242 and acme/lib#7")} />);
+    expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
+    );
+    expect(screen.getByRole("link", { name: /acme\/lib#7/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/lib/pull/7",
+    );
+  });
+});
+
+describe("/btw answer pull request references", () => {
+  it("links a PR reference to the session repo", () => {
+    renderWithSessionRepo(<BtwSidechatAnswer answer="Fixed in #4242." />);
+    expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
+    );
   });
 });
 
@@ -404,7 +453,7 @@ describe("UserBubble awaiting-agent marker", () => {
   const content: MessageContentBlock[] = [{ type: "input_text", text: "steer" }];
 
   it.each([false, true])(
-    "shares the timestamp row while keeping mobile pending status visible (mobile=%s)",
+    "stays visible beside the hover-revealed timestamp and actions (mobile=%s)",
     (mobile) => {
       vi.stubGlobal("matchMedia", () => ({
         matches: mobile,
@@ -419,16 +468,18 @@ describe("UserBubble awaiting-agent marker", () => {
       renderBubble({ ...pending, createdAtS: 1_762_000_000 });
       const explanation = screen.getByTestId("message-awaiting-agent");
       expect(explanation).toHaveTextContent("The agent will read this after its current step");
-      const footer = screen.getByTestId("message-timestamp").parentElement;
-      expect(explanation.parentElement).toBe(footer);
-      expect(explanation.nextElementSibling).toBe(screen.getByTestId("message-timestamp"));
-      expect(footer).toContainElement(screen.getByRole("button", { name: "Copy" }));
-      expect(footer).toHaveClass("pt-1");
+      const row = explanation.parentElement;
+      const actions = screen.getByTestId("message-timestamp").parentElement;
+      expect(explanation.nextElementSibling).toBe(actions);
+      expect(actions).not.toContainElement(explanation);
+      expect(actions).toContainElement(screen.getByRole("button", { name: "Copy" }));
+      expect(row).toHaveClass("pt-1");
+      expect(row?.className).not.toMatch(/opacity|invisible/);
       if (mobile) {
-        expect(footer).toHaveClass("opacity-100");
-        expect(footer).not.toHaveClass("invisible");
+        expect(actions).toHaveClass("opacity-100");
+        expect(actions).not.toHaveClass("invisible");
       } else {
-        expect(footer).toHaveClass(
+        expect(actions).toHaveClass(
           "md:opacity-0",
           "md:group-hover:opacity-100",
           "md:group-focus-within:opacity-100",
@@ -453,11 +504,12 @@ describe("UserBubble awaiting-agent marker", () => {
     if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
     renderBubble({ ...pending, createdAtS: 1_762_000_000 });
     const explanation = screen.getByTestId("message-awaiting-agent");
-    const footer = explanation.parentElement;
+    const actions = screen.getByTestId("message-timestamp").parentElement;
     expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
     expect(screen.getByTestId("copy-message-link")).toBeDisabled();
-    expect(footer).toHaveClass("opacity-100");
-    expect(footer).not.toHaveClass("md:opacity-0");
+    expect(explanation.parentElement?.className).not.toMatch(/opacity|invisible/);
+    expect(actions).toHaveClass("opacity-100");
+    expect(actions).not.toHaveClass("md:opacity-0");
   });
 
   it("stays hidden for a send that started a turn and for committed history", () => {
@@ -483,9 +535,7 @@ describe("UserBubble copy button", () => {
     renderBubble(userBubble("copy me please"));
 
     expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
-    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass(
-      "[@media(pointer:coarse)]:size-8",
-    );
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass("max-md:size-8");
   });
 
   it("copies the message text to the clipboard when clicked", async () => {
@@ -841,5 +891,232 @@ describe("UserBubble still-sending note", () => {
       </FileViewerContext.Provider>,
     );
     expect(screen.queryByTestId("message-still-sending")).toBeNull();
+  });
+});
+
+const SCOPED_FILE_VIEWER = { ...FILE_VIEWER_NOOP, conversationId: "conv_cmd" };
+
+describe("UserBubble command tint", () => {
+  function PublishCommands({
+    commands = PUBLISHED_COMMANDS,
+    nativeShell = null,
+  }: {
+    commands?: string[];
+    nativeShell?: string | null;
+  }) {
+    usePublishComposerCommands("conv_cmd", commands, nativeShell);
+    return null;
+  }
+  const PUBLISHED_COMMANDS = ["/team"];
+  const TINTED_TEAM = '<span class="text-brand-accent">/team</span>';
+  let queryClient: QueryClient;
+
+  beforeEach(() => {
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // Bubbles may ask for session info; keep it pending instead of hitting the network.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>(() => {})),
+    );
+  });
+  afterEach(() => {
+    queryClient.clear();
+    vi.unstubAllGlobals();
+  });
+
+  function scopedTree(bubble: Bubble, publish: ReactNode) {
+    return (
+      <QueryClientProvider client={queryClient}>
+        <ConversationScopeContext.Provider value="conv_cmd">
+          {publish}
+          <FileViewerContext.Provider value={SCOPED_FILE_VIEWER}>
+            <BubbleView bubble={bubble} />
+          </FileViewerContext.Provider>
+        </ConversationScopeContext.Provider>
+      </QueryClientProvider>
+    );
+  }
+  function renderScoped(bubble: Bubble, publish: ReactNode) {
+    return render(scopedTree(bubble, publish));
+  }
+
+  it("tints a known command the composer published, keeping the args in its paragraph", () => {
+    renderScoped(userBubble("/team fix **the** bug"), <PublishCommands />);
+    const token = screen.getByText("/team");
+    expect(token).toHaveClass("text-brand-accent");
+    expect(token.closest("p")).toHaveTextContent("/team fix the bug");
+  });
+
+  it("tints the command and links a PR reference in the same paragraph", () => {
+    queryClient.setQueryData(["github-info", "conv_cmd"], {
+      object: "session.github.info",
+      available: true,
+      repo: { name_with_owner: "acme/app", host: "github.com" },
+      workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+    });
+    renderScoped(userBubble("/team review #4242"), <PublishCommands />);
+    expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
+    expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
+    );
+  });
+
+  it("tints the command and pills a tagged file in the same paragraph", () => {
+    renderScoped(userBubble("/team review [Attached: src/a.ts] now"), <PublishCommands />);
+    const token = screen.getByText("/team");
+    expect(token).toHaveClass("text-brand-accent");
+    expect(pills()).toEqual(["@src/a.ts"]);
+    expect(token.closest("p")).toHaveTextContent("/team review @src/a.ts now");
+  });
+
+  it.each([
+    ["a reply quote", userBubble("/team fix it\n\n> the quoted line")],
+    [
+      "a file",
+      userBubble("", {
+        content: [
+          { type: "input_text", text: "/team fix it" },
+          { type: "input_file", file_id: "file_1", filename: "notes.txt" },
+        ],
+      }),
+    ],
+    [
+      "an image",
+      userBubble("", {
+        content: [
+          { type: "input_text", text: "/team fix it" },
+          { type: "input_image", file_id: "file_2", filename: "shot.png" },
+        ],
+      }),
+    ],
+  ])(
+    "leaves a command untinted when the send carries %s, as the composer does",
+    (_label, bubble) => {
+      renderScoped(bubble, <PublishCommands />);
+      expect(screen.getByTestId("user-message-content")).toHaveTextContent("/team fix it");
+      expect(document.querySelector(".text-brand-accent")).toBeNull();
+    },
+  );
+
+  // A known limit: Markdown makes a four-space indent a code block, so the token never leads a
+  // paragraph and stays plain, while the text renders unchanged.
+  it("leaves an indented command untinted and its text unchanged", () => {
+    renderScoped(userBubble("    /team fix it"), <PublishCommands />);
+    expect(screen.getByTestId("user-message-content")).toHaveTextContent("/team fix it");
+    expect(document.querySelector(".text-brand-accent")).toBeNull();
+  });
+
+  it("follows the catalog as it is replaced and removed under an existing bubble", () => {
+    const bubble = userBubble("/team fix it");
+    const view = renderScoped(bubble, <PublishCommands />);
+    const tinted = () => screen.queryByText("/team", { selector: ".text-brand-accent" });
+    const text = () => screen.getByTestId("user-message-content").textContent;
+    expect(tinted()).not.toBeNull();
+
+    const rerender = (publish: ReactNode) => view.rerender(scopedTree(bubble, publish));
+    rerender(<PublishCommands commands={["/help"]} />);
+    expect(tinted()).toBeNull();
+    expect(text()).toBe("/team fix it");
+
+    rerender(<PublishCommands commands={["/help", "/team"]} />);
+    expect(tinted()).not.toBeNull();
+
+    rerender(null);
+    expect(tinted()).toBeNull();
+    expect(text()).toBe("/team fix it");
+  });
+
+  it("adds no trailing space after a command sent without args", () => {
+    renderScoped(userBubble("/team"), <PublishCommands />);
+    expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
+    expect(screen.getByTestId("user-message-content").textContent).toBe("/team");
+  });
+
+  it.each([
+    ["a skill", "$review fix it", "$review"],
+    ["leading whitespace", "  /team fix it", "/team"],
+  ])("tints a command after %s", (_label, text, token) => {
+    renderScoped(userBubble(text), <PublishCommands commands={["/team", "$review"]} />);
+    expect(screen.getByText(token)).toHaveClass("text-brand-accent");
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(text.trim());
+  });
+
+  // The parse-equivalence matrix lives with FilePathAwareMessageResponse; this one goes through
+  // the bubble, whose raw HTML renders as text.
+  it("renders a tinted command with raw HTML args like the untinted text", () => {
+    const text = "/team <details>more</details>";
+    const plain = renderScoped(userBubble(text), null);
+    const untinted = screen.getByTestId("user-message-content").innerHTML;
+    plain.unmount();
+
+    renderScoped(userBubble(text), <PublishCommands />);
+    const tinted = screen.getByTestId("user-message-content").innerHTML;
+    expect(tinted).toContain(TINTED_TEAM);
+    expect(tinted.replace(TINTED_TEAM, "/team")).toBe(untinted);
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(text);
+  });
+
+  it.each([
+    ["an unknown command", "/typo fix it", "/typo", <PublishCommands key="p" />],
+    ["no published commands", "/team fix it", "/team", null],
+  ])("leaves %s untinted", (_label, text, token, publish) => {
+    renderScoped(userBubble(text), publish);
+    expect(screen.queryByText(token)).toBeNull();
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(text);
+  });
+
+  it("renders a pending `!cmd` literally only when the session runs native shell input", () => {
+    const bubble = userBubble("!echo **hi**", { pending: true });
+    const view = renderScoped(bubble, <PublishCommands nativeShell="codex-native" />);
+    expect(screen.getByText("!echo **hi**").tagName).toBe("CODE");
+    view.unmount();
+
+    renderScoped(bubble, <PublishCommands />);
+    expect(screen.queryByText("!echo **hi**")).toBeNull();
+    const rendered = screen.getByTestId("message-bubble");
+    expect(within(rendered).getByText("hi")).toHaveAttribute("data-streamdown", "strong");
+    expect(rendered.querySelector("pre")).toBeNull();
+    expect(rendered).toHaveTextContent("!echo hi");
+  });
+
+  it("classifies a pending peer message by its raw text, keeping the sender", () => {
+    renderScoped(
+      userBubble("[Message from session s_source]\n!echo **hi**", { pending: true }),
+      <PublishCommands nativeShell="codex-native" />,
+    );
+    expect(screen.getByTestId("collapsed-session-message")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("expand-session-message"));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(within(bubble).getByTestId("message-origin")).toBeInTheDocument();
+    expect(bubble.querySelector("pre")).toBeNull();
+    expect(within(bubble).getByText("hi")).toHaveAttribute("data-streamdown", "strong");
+  });
+
+  it("does not tint a known command in another session's message", () => {
+    renderScoped(userBubble("[Message from session s_source]\n/team fix it"), <PublishCommands />);
+    fireEvent.click(screen.getByTestId("expand-session-message"));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(within(bubble).getByTestId("message-origin")).toBeInTheDocument();
+    expect(bubble).toHaveTextContent("/team fix it");
+    expect(bubble.querySelector(".text-brand-accent")).toBeNull();
+  });
+
+  it.each([
+    ["a committed bubble", userBubble("!echo **hi**")],
+    [
+      "a multi-block bubble",
+      userBubble("", {
+        pending: true,
+        content: [
+          { type: "input_text", text: "!echo " },
+          { type: "input_text", text: "**hi**" },
+        ],
+      }),
+    ],
+  ])("renders `!cmd` as markdown for %s", (_label, bubble) => {
+    renderScoped(bubble, <PublishCommands nativeShell="codex-native" />);
+    expect(screen.queryByText("!echo **hi**")).toBeNull();
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent("!echo hi");
   });
 });

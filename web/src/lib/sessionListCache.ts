@@ -431,6 +431,50 @@ export function unmarkRecentlyCreated(id: string): void {
 }
 
 /**
+ * Sidebar row from a session snapshot; snapshots carry no `owner`, so it reads as viewer-owned.
+ */
+export function conversationRowFromSession(session: Session): Conversation {
+  return {
+    id: session.id,
+    object: "conversation",
+    title: session.title,
+    created_at: session.createdAt,
+    updated_at: session.updatedAt ?? session.createdAt,
+    labels: session.labels ?? {},
+    permission_level: session.permissionLevel,
+    agent_id: session.agentId,
+    agent_name: session.agentName,
+    harness: session.harness,
+    family: session.family,
+    runner_id: session.runnerId ?? null,
+    host_id: session.hostId ?? null,
+    workspace: session.workspace ?? null,
+    git_branch: session.gitBranch ?? null,
+    archived: session.archived,
+    parent_session_id: session.parentSessionId,
+    project_id: session.projectId ?? null,
+  };
+}
+
+/**
+ * Insert a just-created session into the cached sidebar lists it belongs to and arm the keep-alive.
+ */
+export function insertCreatedRowIntoCaches(queryClient: QueryClient, row: Conversation): void {
+  markRecentlyCreated(row);
+  const candidates = new Map([[row.id, row]]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const { data: next } = insertNewRowsIntoPages(
+      data,
+      candidates,
+      filtersFromConversationQueryKey(key),
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+/**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
  * refetch (which lags the search index). A new row sorts newest-first, so page 0
@@ -658,6 +702,35 @@ export function overlayArchivedIntoCaches(
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
     old ? { ...old, archived } : old,
   );
+}
+
+/**
+ * Write a server-confirmed `updated_at` onto the session's cached list rows,
+ * keeping any newer one, so recency-sorted lists (⌘K's recent sessions) see an
+ * archive the push stream hasn't delivered.
+ */
+export function settleUpdatedAtIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  updatedAt: number,
+): void {
+  const itemsById = new Map<string, SessionListWireItem>([[id, { id, updated_at: updatedAt }]]);
+  const isOlder = (data: ConversationsInfiniteData | undefined): boolean =>
+    data?.pages.some((page) =>
+      page.data.some((row) => row.id === id && (row.updated_at ?? 0) < updatedAt),
+    ) ?? false;
+  for (const [root, filtersFromKey] of [
+    ["conversations", filtersFromConversationQueryKey],
+    ["project-sessions", filtersFromProjectQueryKey],
+  ] as const) {
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: [root],
+    })) {
+      if (!isOlder(data)) continue;
+      const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromKey(key));
+      if (next !== data) queryClient.setQueryData(key, next);
+    }
+  }
 }
 
 /**

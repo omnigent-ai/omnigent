@@ -24,6 +24,7 @@ from collections.abc import Callable
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.advise_models import SysAdviseModelsTool
 from omnigent.tools.builtins.agents import (
     SysAgentDownloadTool,
@@ -49,6 +50,13 @@ from omnigent.tools.builtins.load_skill import (
     format_skill_content,
     format_skill_meta_text,
     list_skill_resources,
+)
+from omnigent.tools.builtins.memory import (
+    MemoryDeleteTool,
+    MemoryGetTool,
+    MemoryListTool,
+    MemorySearchTool,
+    MemoryWriteTool,
 )
 from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
 from omnigent.tools.builtins.nimble_research import NimbleResearchTool
@@ -83,6 +91,7 @@ from omnigent.tools.builtins.timer import (
     SysTimerSetTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
+from omnigent.tools.builtins.user_inbox import SysUserInboxListTool, SysUserInboxPostTool
 from omnigent.tools.builtins.web_read import WebReadTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 
@@ -91,6 +100,11 @@ __all__ = [
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
+    "MemoryDeleteTool",
+    "MemoryGetTool",
+    "MemoryListTool",
+    "MemorySearchTool",
+    "MemoryWriteTool",
     "NimbleExtractTool",
     "NimbleResearchTool",
     "ReadSkillFileTool",
@@ -125,6 +139,8 @@ __all__ = [
     "SysSessionUpdateTool",
     "SysTimerCancelTool",
     "SysTimerSetTool",
+    "SysUserInboxListTool",
+    "SysUserInboxPostTool",
     "UpdateCommentTool",
     "WebReadTool",
     "WebSearchTool",
@@ -146,18 +162,6 @@ __all__ = [
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
 
 
-def _create_upload_file(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for UploadFileTool.
-
-    :param config: Tool config (unused).
-    :returns: An UploadFileTool instance.
-    """
-    from omnigent.tools.builtins.upload_file import UploadFileTool
-
-    return UploadFileTool()
-
-
 def _create_search_conversations(config: dict[str, str]) -> Tool:
     """
     Lazy factory for SearchConversationsTool.
@@ -170,30 +174,6 @@ def _create_search_conversations(config: dict[str, str]) -> Tool:
     )
 
     return SearchConversationsTool()
-
-
-def _create_list_files(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for ListFilesTool.
-
-    :param config: Tool config (unused).
-    :returns: A ListFilesTool instance.
-    """
-    from omnigent.tools.builtins.list_files import ListFilesTool
-
-    return ListFilesTool()
-
-
-def _create_download_file(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for DownloadFileTool.
-
-    :param config: Tool config (unused).
-    :returns: A DownloadFileTool instance.
-    """
-    from omnigent.tools.builtins.download_file import DownloadFileTool
-
-    return DownloadFileTool()
 
 
 def _create_export_agent(config: dict[str, str]) -> Tool:
@@ -277,9 +257,6 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "web_read": lambda config: WebReadTool(config=config),
     "nimble_research": lambda config: NimbleResearchTool(config=config),
     "nimble_extract": lambda config: NimbleExtractTool(config=config),
-    "upload_file": _create_upload_file,
-    "list_files": _create_list_files,
-    "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
     # Framework-owned: need runtime context. ``web_fetch`` is
@@ -292,6 +269,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "web_fetch": None,
     "list_comments": None,
     "update_comment": None,
+    # Session file tools: registered by ``ToolManager._register_file_tools``
+    # only when the spec sets ``tool_groups.files: true``.
+    "sys_files_upload": None,
+    "sys_files_list": None,
+    "sys_files_download": None,
     # ``sys_list_models`` is auto-registered by
     # ``ToolManager._register_sub_agent_tools`` with the dispatch grant
     # and intercepted by name in the runner's tool dispatch — reserved
@@ -316,6 +298,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_click": None,
     "browser_type": None,
     "browser_screenshot": None,
+    **dict.fromkeys(sorted(ADVANCED_BROWSER_TOOL_NAMES)),
     "ui_open_file": None,
 }
 

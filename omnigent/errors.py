@@ -16,7 +16,7 @@ import functools
 import inspect
 from collections.abc import Callable
 from enum import Enum
-from typing import Any, ParamSpec, TypeVar, cast
+from typing import Any, Literal, LiteralString, ParamSpec, TypeVar, cast
 
 from omnigent.util.uuid import normalize_uuid
 
@@ -544,6 +544,69 @@ class OmnigentError(Exception):
         """Lifecycle phase: the constructor override if given, else the code's
         mapping."""
         return self._phase_override or phase_for_code(self.code)
+
+
+class HarnessConfigurationError(OmnigentError):
+    """Keep a framework-authored repair separate from private configuration details."""
+
+    def __init__(
+        self,
+        client_message: LiteralString,
+        *,
+        diagnostic: str | None = None,
+    ) -> None:
+        self.client_message = client_message
+        super().__init__(diagnostic or self.client_message, code=ErrorCode.INVALID_INPUT)
+
+
+class CodexSignerConfigurationError(OmnigentError):
+    """Fixed public guidance for recognized signer-backed Codex setup failures."""
+
+    def __init__(
+        self, reason: Literal["auth_command", "worker_egress", "profile", "state", "binding"]
+    ) -> None:
+        self.client_message = {
+            "auth_command": (
+                "signer-backed Codex conflicts with HARNESS_CODEX_GATEWAY_AUTH_COMMAND; "
+                "remove that environment override and retry."
+            ),
+            "worker_egress": (
+                "signer-backed Codex does not support os_env.sandbox.egress_rules or tcp_egress; "
+                "brokered sessions are model-only. Remove those worker egress declarations "
+                "and use model_egress for model routes."
+            ),
+            "profile": (
+                "signer-backed Codex requires an explicit Databricks profile. "
+                "Set the Databricks provider's 'profile' and retry."
+            ),
+            "state": (
+                "signer-backed Codex requires configured provider state. "
+                "Run the provider's Codex setup and retry."
+            ),
+            "binding": (
+                "signer-backed Codex requires a supported trusted model endpoint; "
+                "run the provider's Codex setup and retry."
+            ),
+        }[reason]
+        super().__init__(self.client_message, code=ErrorCode.INVALID_INPUT)
+
+
+class KimiAuthConfigurationError(OmnigentError):
+    """Fixed public guidance for Kimi's unsupported per-invocation auth."""
+
+    client_message = (
+        "The 'kimi' harness does not support per-invocation provider / "
+        "auth injection: upstream kimi has no per-spawn config override "
+        "(no ``--config-file`` / ``--mcp-config-file``). Remove "
+        "``executor.auth`` from the spec and configure the provider once "
+        "via `kimi provider add` in $KIMI_CODE_HOME/config.toml (default "
+        "~/.kimi-code/config.toml), then pin the "
+        "resulting model id in the agent spec. Omnigent-side provider "
+        "injection is a deferred follow-up."
+    )
+
+    def __init__(self) -> None:
+        super().__init__(self.client_message, code=ErrorCode.INVALID_INPUT)
 
 
 class StaleCursorError(OmnigentError):
