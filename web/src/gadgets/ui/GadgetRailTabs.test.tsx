@@ -8,6 +8,7 @@ import {
   exitGadgetRailFullScreen,
   noteGadgetFrameConnected,
   noteGadgetStartFailed,
+  requestGadgetCreateSessionMenu,
   requestGadgetRailTab,
   resetGadgetRailRequests,
   setFullScreenGadget,
@@ -742,6 +743,28 @@ describe("the gadget beside New session", () => {
 
       expect(screen.queryByTestId("gadget-new-session-panel")).toBeNull();
     });
+  });
+
+  it("shows a message the full screen gadget wrote in its Create session menu", async () => {
+    vi.mocked(getGadget).mockResolvedValue(BOARD);
+    useGadgetRailRequest.setState({ newSessionMaximized: true });
+    renderWithGadgets(<GadgetNewSessionPanel active />, {
+      path: "/?gadget_start=1&gadget=1&prompt=Rewrite%20every%20card",
+    });
+    const panel = await screen.findByRole("complementary", { name: "Board" });
+    await waitFor(() => expect(panel).toHaveAttribute("data-maximized", "true"));
+
+    act(() =>
+      requestGadgetCreateSessionMenu({
+        prompt: "Rewrite every card",
+        gadgetId: "1",
+        gadgetName: "Board",
+      }),
+    );
+
+    const review = await screen.findByTestId("gadget-open-session-review");
+    expect(review).toHaveTextContent("Written by the gadget “Board”");
+    expect(review).toHaveTextContent("Rewrite every card");
   });
 
   it("closes the sidebar for full screen and opens it again after", async () => {

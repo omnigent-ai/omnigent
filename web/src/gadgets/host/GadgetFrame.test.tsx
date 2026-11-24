@@ -313,6 +313,32 @@ describe("GadgetFrame", () => {
       );
     });
 
+    it("hands a message it writes for a new session to the Create session menu to show first", () => {
+      act(() => useGadgetRailRequest.setState({ fullScreenGadgetId: "app-1" }));
+      const { call } = connectAndClick();
+
+      call("navigation.v1.newSession", { prompt: "Rewrite every card", display: "panel" });
+
+      const state = useGadgetRailRequest.getState();
+      expect(state.createSessionMenuRequested).toBe(true);
+      expect(state.createSessionReview).toMatchObject({
+        gadgetId: "app-1",
+        gadgetName: "Team board",
+      });
+      // The menu shows the whole message Create session would send.
+      expect(state.createSessionReview?.prompt).toContain("Rewrite every card");
+    });
+
+    it("asks for no review when the gadget's new session carries no message", () => {
+      act(() => useGadgetRailRequest.setState({ fullScreenGadgetId: "app-1" }));
+      const { call } = connectAndClick();
+
+      call("navigation.v1.newSession", { display: "panel" });
+
+      expect(useGadgetRailRequest.getState().createSessionMenuRequested).toBe(true);
+      expect(useGadgetRailRequest.getState().createSessionReview).toBeNull();
+    });
+
     it("opens a page in a new tab under the deployment's base path", () => {
       window.__OMNIGENT_BASE_PATH__ = "/app";
       const opened = vi.spyOn(window, "open").mockImplementation(() => null);

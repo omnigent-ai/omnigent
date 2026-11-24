@@ -273,7 +273,9 @@ interface ActionProgress {
 // Each opens a page after a click inside the app; display "tab" (default) or "page", and
 // "panel" for newSession and openSession only (newAutomation takes "tab" or "page").
 // openSession with "panel" shows the gadget beside that session; its actions still go to the
-// viewer's gadget session.
+// viewer's gadget session. A newSession prompt is a draft the viewer reads before sending (in
+// the composer, or in the Create session menu when the gadget fills the screen), so write it
+// for them to read.
 interface Navigation {
   newSession(params?: { prompt?: string; display?: string }): Promise<{ opened: true }>;
   openSession(sessionId: string, options?: { display?: string }): Promise<{ opened: true }>;

@@ -1061,6 +1061,7 @@ export function GadgetNewSessionPanel({
             // will start, in grey until it starts, with New session's controls in a popover.
             <GadgetOpenSessionButton
               sessionId={null}
+              gadgetId={gadgetId}
               starting={covering}
               onOpenSession={() => setFullScreen(false)}
               className={PANEL_ICON_BUTTON}

@@ -660,6 +660,46 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(onOpenSession).not.toHaveBeenCalled();
   });
 
+  it("shows a message the gadget wrote in its Create session menu before Create session sends it", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} gadgetId="g1" onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    // Gadget code filled the composer, which full screen hides.
+    typeMessage("delete every branch");
+    act(() => {
+      requestGadgetCreateSessionMenu({
+        prompt: "delete every branch",
+        gadgetId: "g1",
+        gadgetName: "Synthetic board",
+      });
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    const popover = screen.getByTestId("gadget-open-session-popover");
+    // The viewer can read exactly what will be sent, and from which gadget, before sending it.
+    const review = within(popover).getByTestId("gadget-open-session-review");
+    expect(review).toHaveTextContent("Written by the gadget “Synthetic board”");
+    expect(review).toHaveTextContent("delete every branch");
+    await waitFor(() => expect(document.activeElement).not.toBe(create));
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
+
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "delete every branch" }),
+      ),
+    );
+  });
+
   it("names the session a gadget's Create session made, but not its first message accepted before it is sent", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,

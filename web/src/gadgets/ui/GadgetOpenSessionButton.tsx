@@ -12,7 +12,11 @@ import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { useSessionIndicatorState } from "@/hooks/useSessionIndicatorState";
 import type { Conversation } from "@/hooks/useConversations";
 import { getEmbedRoot } from "@/lib/host";
-import { takeGadgetCreateSessionMenuRequest, useGadgetRailRequest } from "@/lib/gadgetRailTabs";
+import {
+  clearGadgetCreateSessionReview,
+  takeGadgetCreateSessionMenuRequest,
+  useGadgetRailRequest,
+} from "@/lib/gadgetRailTabs";
 import { cn } from "@/lib/utils";
 import {
   useSessionControlSlotRef,
@@ -80,14 +84,32 @@ function CreateSlot({ onFilled }: { onFilled: (element: HTMLElement | null) => v
   );
 }
 
+/** The message gadget code wrote for the session, shown before Create session sends it. */
+function PromptReview({ gadgetName, prompt }: { gadgetName: string; prompt: string }) {
+  return (
+    <div
+      data-testid="gadget-open-session-review"
+      className="mb-2 max-w-[min(36rem,calc(100vw-2rem))] rounded-md border bg-muted/50 p-2 text-sm"
+    >
+      <p className="mb-1 text-xs text-muted-foreground">
+        Written by the gadget “{gadgetName}”. Create session sends it to your agent.
+      </p>
+      <p className="max-h-48 overflow-y-auto break-words whitespace-pre-wrap">{prompt}</p>
+    </div>
+  );
+}
+
 export function GadgetOpenSessionButton({
   sessionId,
+  gadgetId = null,
   starting = false,
   onOpenSession,
   className,
 }: {
   /** The session the gadget is shown beside; null for New session. */
   sessionId: string | null;
+  /** The gadget beside New session, whose own messages the menu shows before sending. */
+  gadgetId?: string | null;
   /** Whether the session New session created is starting, before it shows the gadget. */
   starting?: boolean;
   onOpenSession: () => void;
@@ -153,13 +175,29 @@ export function GadgetOpenSessionButton({
   // A request from the gadget before its session exists opens the menu, with focus on Create
   // session, and keeps it open until the viewer dismisses it.
   const requested = useGadgetRailRequest((state) => state.createSessionMenuRequested);
+  // A message the gadget itself wrote is shown in the menu, and focus goes to the menu, not
+  // Create session: confirming the session must not confirm text the viewer hasn't seen.
+  const storedReview = useGadgetRailRequest((state) => state.createSessionReview);
+  const review =
+    sessionId === null && storedReview !== null && storedReview.gadgetId === gadgetId
+      ? storedReview
+      : null;
+  const reviewing = review !== null;
   useEffect(() => {
     if (sessionId !== null || !requested || !takeGadgetCreateSessionMenuRequest()) return;
     changeOpen(true);
     pinned.current = true;
     setModal(true);
-    focusInMenu(true);
-  }, [changeOpen, focusInMenu, requested, sessionId]);
+    if (reviewing) {
+      requestAnimationFrame(() => contentRef.current?.focus({ preventScroll: true }));
+    } else {
+      focusInMenu(true);
+    }
+  }, [changeOpen, focusInMenu, requested, reviewing, sessionId]);
+  // The session exists: what the gadget wrote has been sent.
+  useEffect(() => {
+    if (sessionId !== null) clearGadgetCreateSessionReview();
+  }, [sessionId]);
 
   const openSession = useCallback(() => {
     changeOpen(false);
@@ -320,6 +358,7 @@ export function GadgetOpenSessionButton({
           if (nestedOpen()) event.preventDefault();
         }}
       >
+        {review !== null && <PromptReview gadgetName={review.gadgetName} prompt={review.prompt} />}
         <div
           ref={setContentRef}
           data-testid="gadget-open-session-controls"

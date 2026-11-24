@@ -19,6 +19,7 @@ import { useNavigate, useRebasePath } from "@/lib/routing";
 import {
   noteGadgetFrameConnected,
   requestGadgetCreateSessionMenu,
+  type GadgetPromptReview,
   gadgetFillsScreen,
 } from "@/lib/gadgetRailTabs";
 
@@ -256,12 +257,18 @@ export function GadgetFrame({
       const current = { id: latestRef.current.app.id, name: latestRef.current.app.name };
       let path: string;
       let createSessionMenu = false;
+      let review: GadgetPromptReview | null = null;
       switch (request.kind) {
         case "newSession": {
           const prompt = request.prompt ? composeGadgetContextPrompt(request.prompt, current) : "";
           // A full screen gadget stays so: New session's composer holds the prompt, and the
           // Create session menu beside the gadget starts the session.
           createSessionMenu = request.display === "panel" && gadgetFillsScreen(current.id);
+          // Full screen hides the composer, so the menu shows what Create session would send
+          // and where it came from: confirming the session must not confirm unseen text.
+          if (createSessionMenu && prompt) {
+            review = { prompt, gadgetId: current.id, gadgetName: current.name };
+          }
           path =
             request.display === "panel"
               ? gadgetBoardNewSessionUrl(current.id, prompt, { fullScreen: createSessionMenu })
@@ -297,7 +304,7 @@ export function GadgetFrame({
         window.open(new URL(href, window.location.origin).href, "_blank", "noopener,noreferrer");
       } else {
         navigationRef.current.navigate(path);
-        if (createSessionMenu) requestGadgetCreateSessionMenu();
+        if (createSessionMenu) requestGadgetCreateSessionMenu(review);
       }
       return true;
     },

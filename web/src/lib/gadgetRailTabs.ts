@@ -26,6 +26,12 @@ interface GadgetRailState {
    */
   createSessionMenuRequested: boolean;
   /**
+   * Text gadget code put in New session's composer for that menu's Create session to send,
+   * with the gadget it came from. Full screen hides the composer, so the menu shows it for the
+   * viewer to read first.
+   */
+  createSessionReview: GadgetPromptReview | null;
+  /**
    * How many times a frame of each gadget has connected, and how many sessions started beside
    * each full screen gadget failed to show it. The gadget beside New session covers the session
    * it started until that session's own frame connects, or its start fails.
@@ -34,12 +40,20 @@ interface GadgetRailState {
   failedStarts: Record<string, number>;
 }
 
+/** A message gadget code wrote for a new session, and the gadget it came from. */
+export interface GadgetPromptReview {
+  prompt: string;
+  gadgetId: string;
+  gadgetName: string;
+}
+
 export const useGadgetRailRequest = create<GadgetRailState>(() => ({
   requested: null,
   exitFullScreen: null,
   newSessionMaximized: false,
   fullScreenGadgetId: null,
   createSessionMenuRequested: false,
+  createSessionReview: null,
   frameConnections: {},
   failedStarts: {},
 }));
@@ -105,9 +119,19 @@ export function gadgetFillsScreen(gadgetId: string): boolean {
   return state.fullScreenGadgetId === gadgetId || state.newSessionMaximized;
 }
 
-/** Opens the Create session menu beside the full screen gadget that has no session yet. */
-export function requestGadgetCreateSessionMenu(): void {
-  useGadgetRailRequest.setState({ createSessionMenuRequested: true });
+/**
+ * Opens the Create session menu beside the full screen gadget that has no session yet. With
+ * `review`, the menu shows the message gadget code wrote for the session before Create session
+ * can send it.
+ */
+export function requestGadgetCreateSessionMenu(review: GadgetPromptReview | null = null): void {
+  useGadgetRailRequest.setState({ createSessionMenuRequested: true, createSessionReview: review });
+}
+
+/** Forgets the message the Create session menu was showing, once its session exists. */
+export function clearGadgetCreateSessionReview(): void {
+  if (useGadgetRailRequest.getState().createSessionReview === null) return;
+  useGadgetRailRequest.setState({ createSessionReview: null });
 }
 
 /** Takes a request to open the Create session menu; true when there was one. */
@@ -146,6 +170,7 @@ export function resetGadgetRailRequests(): void {
     newSessionMaximized: false,
     fullScreenGadgetId: null,
     createSessionMenuRequested: false,
+    createSessionReview: null,
     frameConnections: {},
     failedStarts: {},
   });

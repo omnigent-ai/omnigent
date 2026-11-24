@@ -199,6 +199,12 @@ the SDK at any time, so the web app (`gadgetGestureGate.ts`) reads only host-sid
   itself needs its own activation, and calls are spaced at least a second apart, which bounds
   what one click can start; a later call after the frame is activated again is allowed.
 
+A gesture only lets gadget code open a page; it never sends a message for the viewer. A
+`newSession` prompt lands in New session's composer, and when the gadget fills the screen (so
+the composer is hidden) the Create session menu shows the whole message and the gadget it came
+from, with focus on the menu rather than on Create session, so creating the session is never
+the first sight of what it sends.
+
 ## Not in scope
 
 - Server-side execution of gadget code (gadgets run only in the viewer's browser).
