@@ -2994,6 +2994,19 @@ def build_hook_settings(
             "mcp__omnigent__sys_scheduled_task_update",
         )
     )
+    # A workflow run's timer wakes it with no one watching, so its own journal and
+    # timer calls must not wait on a prompt or classifier; Omnigent policies still apply.
+    allow_rules.extend(
+        f"mcp__omnigent__{name}"
+        for name in (
+            "sys_timer_set",
+            "sys_timer_cancel",
+            "sys_journal_read",
+            "sys_journal_write_plan",
+            "sys_journal_write_status",
+            "sys_journal_write_note",
+        )
+    )
     permissions["allow"] = allow_rules
     if permissions:
         settings["permissions"] = permissions

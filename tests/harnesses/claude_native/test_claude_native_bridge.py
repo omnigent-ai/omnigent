@@ -4596,6 +4596,21 @@ def test_augment_claude_args_keeps_auto_compaction_on(tmp_path: Path) -> None:
     assert settings.get("autoCompactEnabled") is True
 
 
+# Omnigent tools Claude runs without its own prompt or auto-mode classifier: scheduled-task
+# changes get Omnigent's human review, and a workflow run's timer and journal calls happen
+# unattended.
+_OMNIGENT_ALLOW_RULES = (
+    "mcp__omnigent__sys_scheduled_task_create",
+    "mcp__omnigent__sys_scheduled_task_update",
+    "mcp__omnigent__sys_timer_set",
+    "mcp__omnigent__sys_timer_cancel",
+    "mcp__omnigent__sys_journal_read",
+    "mcp__omnigent__sys_journal_write_plan",
+    "mcp__omnigent__sys_journal_write_status",
+    "mcp__omnigent__sys_journal_write_note",
+)
+
+
 @pytest.mark.parametrize(
     ("launch_args", "default_mode"),
     [
@@ -4636,8 +4651,7 @@ def test_augment_claude_args_allows_reading_session_attachments(
     assert permissions.get("defaultMode") == default_mode
     assert permissions.get("allow") == [
         f"Read(/{attachment.parent.as_posix()}/**)",
-        "mcp__omnigent__sys_scheduled_task_create",
-        "mcp__omnigent__sys_scheduled_task_update",
+        *_OMNIGENT_ALLOW_RULES,
     ]
 
 
@@ -4663,10 +4677,7 @@ def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
 
     assert settings.get("permissions") == {
         **(expected_permissions or {}),
-        "allow": [
-            "mcp__omnigent__sys_scheduled_task_create",
-            "mcp__omnigent__sys_scheduled_task_update",
-        ],
+        "allow": list(_OMNIGENT_ALLOW_RULES),
     }
 
 

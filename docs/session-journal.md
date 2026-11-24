@@ -67,7 +67,9 @@ keeps a progress timer: `sys_timer_set` repeating every 3 minutes, which brings
 it back to the run if its turn ends early. On a server with the
 `session_timers` feature on, a top-level session's timer is saved there and
 survives the runner restarting. The agent cancels it when the run finishes,
-waits only on you, or is stopped.
+waits only on you, or is stopped. Claude Code runs the journal and timer tools
+without its own permission prompt or auto-mode check, since a timer's turn has
+no one to answer either; Omnigent's policies still apply to them.
 
 A status belongs to a step ID within a run, not to a plan version. Replanning
 or saving the plan keeps that progress. Starting another invocation resets it;
