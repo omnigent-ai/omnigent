@@ -13,7 +13,11 @@ import {
 } from "@/components/file-tree/vendored";
 import { FILE_TREE_THEME, WORKSPACE_FILE_TREE_CLASS } from "@/components/file-tree/fileTreeStyle";
 import { useTreeRowTooltip } from "@/components/file-tree/treeRowTooltip";
-import { type WorkspaceFile, useWorkspaceDirectories } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  type WorkspaceFile,
+  listingCutOff,
+  useWorkspaceDirectories,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { type PrefetchTarget, useWorkspacePrefetch } from "@/hooks/useWorkspacePrefetch";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { folderTreePath } from "../breadcrumbPaths";
@@ -455,6 +459,19 @@ function FilesTreeRows(props: FilesTreeProps) {
   const pending = loadingFolders.find(
     (folder) => directories.get(folder)?.isLoading && !directories.get(folder)?.data,
   );
+  // A folder whose listing stopped short: the tree can't show what lies past it.
+  const cutOffListing = rawListings.find(({ entries }) => listingCutOff(entries));
+  const cutOffName =
+    cutOffListing &&
+    ((cutOffListing.folder || browseLocation).split("/").filter(Boolean).at(-1) || "this folder");
+  const status =
+    failed !== undefined
+      ? `Couldn’t load ${failed.split("/").at(-1)}.`
+      : pending !== undefined
+        ? `Loading ${pending.split("/").at(-1)}…`
+        : cutOffListing
+          ? `Showing the first ${cutOffListing.entries.length.toLocaleString("en-US")} entries of ${cutOffName}.`
+          : null;
   return (
     // The tree stays mounted while its folder is empty, so its listeners are there once files arrive.
     <div ref={containerRef} className="flex min-h-0 flex-1 flex-col">
@@ -480,14 +497,12 @@ function FilesTreeRows(props: FilesTreeProps) {
           ...(isEmpty ? { display: "none" } : {}),
         }}
       />
-      {!isEmpty && (failed ?? pending) !== undefined && (
+      {!isEmpty && status !== null && (
         <div
           role="status"
           className="shrink-0 truncate border-t border-border px-3 py-1.5 text-ui text-muted-foreground"
         >
-          {failed !== undefined
-            ? `Couldn’t load ${failed.split("/").at(-1)}.`
-            : `Loading ${pending?.split("/").at(-1)}…`}
+          {status}
         </div>
       )}
       {rowTooltip}

@@ -451,28 +451,109 @@ async function listViaWorkspaceApi(
   );
 }
 
+/** The most entries the filesystem endpoint returns in one page. */
+const LISTING_PAGE_SIZE = 1000;
+/** Where a folder listing stops, so a runaway folder can't stall the tree. */
+export const LISTING_ENTRY_LIMIT = 50_000;
+
+/** A folder's entries; `cutOff` marks a listing that stopped with more entries past it. */
+export type WorkspaceListing = WorkspaceFile[] & { readonly cutOff?: true };
+
+/** Whether a folder's listing stopped short, so the tree can't show what lies past it. */
+export function listingCutOff(entries: readonly WorkspaceFile[]): boolean {
+  return (entries as Readonly<WorkspaceListing>).cutOff === true;
+}
+
+/** A listing's entries, marked cut off when the listing reported more past them. */
+function listingEntries(json: FilesystemListResponse, target = "", prefix = ""): WorkspaceListing {
+  const entries: WorkspaceListing = mapFilesystemEntries(json, target, prefix);
+  // An own property, which query caching keeps rather than sharing the array away.
+  return json.has_more ? Object.assign(entries, { cutOff: true as const }) : entries;
+}
+
+/**
+ * A whole folder listing, read a page at a time through the `after` cursor, so a
+ * folder of thousands of entries lists all of them, up to {@link LISTING_ENTRY_LIMIT}.
+ * `fetchPage` returns null when the folder can't be listed at all, which fails the
+ * listing on a later page; a listing that stops early keeps `has_more`.
+ */
+export async function readListingPages(
+  fetchPage: (after: string | null) => Promise<FilesystemListResponse | null>,
+): Promise<FilesystemListResponse | null> {
+  const first = await fetchPage(null);
+  if (first === null) return null;
+  const data = [...first.data];
+  let page = first;
+  let truncated = first.truncated ?? false;
+  // A server that hands back a cursor already asked for is cycling.
+  const requested = new Set<string>();
+  // Each request needs the cursor returned by the previous page.
+  /* oxlint-disable no-await-in-loop */
+  while (page.has_more && data.length < LISTING_ENTRY_LIMIT) {
+    // A page that names no new cursor would only repeat itself.
+    if (page.data.length === 0 || !page.last_id || requested.has(page.last_id)) break;
+    const after = page.last_id;
+    requested.add(after);
+    const next = await fetchPage(after);
+    // Half a folder would read as the whole of it.
+    if (next === null) throw new Error("the folder was removed while it was being listed");
+    page = next;
+    truncated ||= next.truncated ?? false;
+    data.push(...next.data);
+  }
+  /* oxlint-enable no-await-in-loop */
+  // Exactly the limit, so the tree can tell a listing that stopped there.
+  const overLimit = data.length > LISTING_ENTRY_LIMIT;
+  if (overLimit) data.length = LISTING_ENTRY_LIMIT;
+  return {
+    ...first,
+    data,
+    has_more: overLimit || page.has_more,
+    last_id: overLimit ? (data.at(-1)?.id ?? null) : page.last_id,
+    truncated,
+  };
+}
+
+/** One page of a folder listing through REST, `after` the previous page's last entry. */
+function listingPageUrl(conversationId: string, target: string, after: string | null): string {
+  const segment = browseLocationSegment(target);
+  const params = new URLSearchParams({ limit: String(LISTING_PAGE_SIZE), order: "asc" });
+  const base = browseLocationBase(target);
+  if (base) params.set("base", base);
+  if (after) params.set("after", after);
+  return `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}?${params}`;
+}
+
 async function fetchWorkspaceAllFiles(
   conversationId: string,
   location = "",
   hideIgnored = false,
 ): Promise<WorkspaceAllFilesResult> {
-  const viaApi = await listViaWorkspaceApi(conversationId, location, 1000, hideIgnored);
+  const viaApi = await listViaWorkspaceApi(
+    conversationId,
+    location,
+    LISTING_ENTRY_LIMIT,
+    hideIgnored,
+  );
   if (viaApi) {
-    const data = mapFilesystemEntries(viaApi, location);
+    const data = listingEntries(viaApi, location);
     return viaApi.ignoredHidden
       ? { available: true, data, ignoredHidden: true }
       : { available: true, data };
   }
-  const segment = browseLocationSegment(location);
-  const params = new URLSearchParams({ limit: "1000", order: "asc" });
-  const base = browseLocationBase(location);
-  if (base) params.set("base", base);
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}?${params}`,
+  const json = await readListingPages(async (after) =>
+    readAllFilesPage(await authenticatedFetch(listingPageUrl(conversationId, location, after))),
   );
-  if (res.status === 404) {
-    return { available: false, data: [] };
-  }
+  if (json === null) return { available: false, data: [] };
+  return { available: true, data: listingEntries(json, location) };
+}
+
+/**
+ * Reads one page of the browsed folder's listing; null when the session has no
+ * filesystem. A later page that fails fails the whole listing.
+ */
+async function readAllFilesPage(res: Response): Promise<FilesystemListResponse | null> {
+  if (res.status === 404) return null;
   // The caller asked for somewhere this session may not browse. Surfaced as a
   // typed error so the panel can name what IS reachable instead of rendering
   // an empty tree that looks like an empty directory.
@@ -493,8 +574,7 @@ async function fetchWorkspaceAllFiles(
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as FilesystemListResponse;
-  return { available: true, data: mapFilesystemEntries(json, location) };
+  return (await res.json()) as FilesystemListResponse;
 }
 
 /**
@@ -806,20 +886,22 @@ async function fetchWorkspaceDirectory(
   hideIgnored = false,
 ): Promise<WorkspaceFile[]> {
   const target = joinBrowseLocation(location, dirPath);
-  const viaApi = await listViaWorkspaceApi(conversationId, target, 1000, hideIgnored);
-  // The tree addresses children relative to the location it is rooted at.
-  if (viaApi) return mapFilesystemEntries(viaApi, target, dirPath);
-  const encodedPath = browseLocationSegment(target);
-  const params = new URLSearchParams({ limit: "1000", order: "asc" });
-  const base = browseLocationBase(target);
-  if (base) params.set("base", base);
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}?${params}`,
+  const viaApi = await listViaWorkspaceApi(
+    conversationId,
+    target,
+    LISTING_ENTRY_LIMIT,
+    hideIgnored,
   );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // The tree addresses children relative to the location it is rooted at.
+  if (viaApi) return listingEntries(viaApi, target, dirPath);
+  const json = await readListingPages(async (after) => {
+    const res = await authenticatedFetch(listingPageUrl(conversationId, target, after));
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return (await res.json()) as FilesystemListResponse;
+  });
   // The tree addresses children relative to the location it is rooted at, one
   // level shallower than the directory just listed.
-  return mapFilesystemEntries((await res.json()) as FilesystemListResponse, target, dirPath);
+  return json === null ? [] : listingEntries(json, target, dirPath);
 }
 
 // ── Path existence check (parent-directory listing) ──────────────────────────

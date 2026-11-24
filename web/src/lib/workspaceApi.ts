@@ -397,9 +397,12 @@ async function listDirectory(
 ): Promise<{ data: ListedEntry[]; hasMore: boolean }> {
   const data: ListedEntry[] = [];
   let pageToken = "";
+  // A host that hands back a token already asked for is cycling; stop before asking again.
+  const requested = new Set<string>();
   // Each page needs the token the previous one returned.
   /* oxlint-disable no-await-in-loop */
   do {
+    requested.add(pageToken);
     const page = await client.listDirectory(
       {
         path,
@@ -416,9 +419,12 @@ async function listDirectory(
     pageToken = page.nextPageToken;
     // A page that adds nothing would never end the listing; report the rest as more.
     if (page.entries.length === 0) break;
-  } while (pageToken && data.length < maxEntries);
+  } while (pageToken && !requested.has(pageToken) && data.length < maxEntries);
   /* oxlint-enable no-await-in-loop */
-  return { data, hasMore: pageToken !== "" };
+  // A host may ignore the page size; keep to the caller's limit and report the rest as more.
+  const overLimit = data.length > maxEntries;
+  if (overLimit) data.length = maxEntries;
+  return { data, hasMore: overLimit || pageToken !== "" };
 }
 
 interface CallOptions {

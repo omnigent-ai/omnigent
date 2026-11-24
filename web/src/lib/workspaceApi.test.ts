@@ -486,6 +486,54 @@ describe("readFileViaWorkspaceApi", () => {
     },
   );
 
+  /** Answers ListDirectory with `pageFor(token)`, so a test can script the host's pages. */
+  function scriptPages(pageFor: (token: string) => { paths: string[]; next: string }) {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      if (methodOf(input) === "GetCapabilities") return unimplemented();
+      const request = fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array);
+      const { paths, next } = pageFor(request.pageToken);
+      const page = create(ListDirectoryResponseSchema, {
+        entries: paths.map((path) => ({ name: path.split("/").at(-1)!, path })),
+        nextPageToken: next,
+      });
+      return new Response(toBinary(ListDirectoryResponseSchema, page), {
+        headers: { "content-type": "application/proto" },
+      });
+    });
+  }
+
+  it("stops before asking again for a page token it already asked for, and reports more", async () => {
+    enable("workspace_api_server_access");
+    // The host cycles: "" → A → B → A.
+    const next: Record<string, string> = { "": "A", A: "B", B: "A" };
+    scriptPages((token) => ({ paths: [`src/${token || "first"}.ts`], next: next[token]! }));
+
+    const listed = await listDirectoryViaWorkspaceApi("s-list-cycle", "src", 1000);
+
+    expect(listed?.hasMore).toBe(true);
+    expect(
+      methodCalls("ListDirectory").map(
+        ([, init]) => fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array).pageToken,
+      ),
+    ).toEqual(["", "A", "B"]);
+  });
+
+  it("keeps a listing to the caller's limit when the host ignores the page size", async () => {
+    enable("workspace_api_server_access");
+    // 51,000 entries in pages of 3,000, then the end: a complete listing past the limit.
+    scriptPages((token) => {
+      const start = Number(token || 0);
+      const paths = Array.from({ length: 3000 }, (_, i) => `src/${start + i}`);
+      return { paths, next: start + 3000 < 51_000 ? String(start + 3000) : "" };
+    });
+
+    const listed = await listDirectoryViaWorkspaceApi("s-list-oversized", "src", 50_000);
+
+    expect(listed?.data).toHaveLength(50_000);
+    expect(listed?.data.at(-1)?.path).toBe("src/49999");
+    expect(listed?.hasMore).toBe(true);
+  });
+
   it("leaves a listing the host answers with an error to REST, and keeps the route for reads", async () => {
     enable("workspace_api_server_access");
     vi.mocked(authenticatedFetch).mockImplementation(async (input) =>
