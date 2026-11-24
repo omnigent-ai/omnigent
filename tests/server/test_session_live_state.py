@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -69,9 +70,27 @@ class _RecordingStore:
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
         self.labels: dict[str, dict[str, str]] = {}
+        self.children: dict[str, list[str]] = {}
+        self.child_pending: dict[str, int] = {}
+        self.on_child_read: Callable[[], None] | None = None
 
     def get_conversation(self, conversation_id: str) -> SimpleNamespace:
         return SimpleNamespace(labels=self.labels.get(conversation_id, {}))
+
+    def list_child_conversation_ids_page(
+        self, parent_conversation_id: str, *, limit: int = 128
+    ) -> list[tuple[str, int]]:
+        if self.on_child_read is not None:
+            self.on_child_read()
+        return [(child_id, 0) for child_id in self.children.get(parent_conversation_id, [])][
+            :limit
+        ]
+
+    def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SimpleNamespace]:
+        return {
+            child_id: SimpleNamespace(pending_elicitation_count=self.child_pending.get(child_id))
+            for child_id in conversation_ids
+        }
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
@@ -293,19 +312,105 @@ def test_pending_count_hook_persists_publish_and_resolve(
     ]
 
 
-def test_forced_pending_count_write_skips_the_replica_dedupe(
+def _publish_prompt(conversation_id: str, elicitation_id: str) -> None:
+    """Record one outstanding prompt for *conversation_id* in this replica's index."""
+    pending_elicitations.record_publish(
+        conversation_id,
+        {"type": "response.elicitation_request", "elicitation_id": elicitation_id},
+    )
+
+
+@pytest.mark.parametrize(
+    ("live", "stored", "children", "child_stored", "child_live", "expected"),
+    [
+        pytest.param(0, 0, [], {}, [], [], id="matching-count-is-left-alone"),
+        pytest.param(1, 0, [], {}, [], [("conv_1", 1)], id="raises-a-lagging-count"),
+        pytest.param(0, 1, [], {}, [], [("conv_1", 0)], id="lowers-without-children"),
+        pytest.param(
+            0, 1, ["child_1"], {"child_1": 0}, [], [("conv_1", 0)], id="lowers-idle-children"
+        ),
+        pytest.param(0, 1, ["child_1"], {"child_1": 1}, [], [], id="keeps-a-child-stored-prompt"),
+        pytest.param(
+            0, 1, ["child_1"], {"child_1": 0}, ["child_1"], [], id="keeps-a-child-local-prompt"
+        ),
+        pytest.param(
+            0,
+            1,
+            [f"child_{index}" for index in range(128)],
+            {},
+            [],
+            [],
+            id="keeps-a-full-child-page",
+        ),
+    ],
+)
+def test_reconcile_pending_count_lowers_only_from_a_complete_index(
+    recording_store: _RecordingStore,
+    live: int,
+    stored: int,
+    children: list[str],
+    child_stored: dict[str, int],
+    child_live: list[str],
+    expected: list[tuple[str, int]],
+) -> None:
+    """Reconciling raises a stored count freely but lowers it only when no child counts a prompt.
+
+    Whichever replica records a child's prompt also mirrors it into the parent's
+    stored count, so the parent's own index cannot vouch for a lower value while
+    a child counts one, or while there are too many children to check.
+    """
+    pending_elicitations.reset_for_tests()
+    for index in range(live):
+        _publish_prompt("conv_1", f"elicit_{index}")
+    for child_id in child_live:
+        _publish_prompt(child_id, f"elicit_{child_id}")
+    recording_store.children["conv_1"] = children
+    recording_store.child_pending.update(child_stored)
+
+    repair = session_live_state.reconcile_pending_count("conv_1", stored)
+    assert repair is not None
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == expected
+    pending_elicitations.reset_for_tests()
+
+
+def test_reconcile_pending_count_keeps_a_prompt_published_during_its_child_read(
     recording_store: _RecordingStore,
 ) -> None:
-    """A forced write reaches the store even when this replica last wrote the same count.
+    """A prompt published while the repair reads children survives the repair.
 
-    Every replica shares the stored count, so repeating this replica's last
-    write proves nothing about the row: another replica may have written since.
+    The repair runs on the ordered writer and reads the index again after the
+    child read, so the stored count ends at 1 instead of the 0 sampled first.
     """
-    session_live_state.persist_pending_count("conv_1", 0)
-    session_live_state.persist_pending_count("conv_1", 0)
-    session_live_state.persist_pending_count("conv_1", 0, force=True)
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
+    recording_store.on_child_read = lambda: _publish_prompt("conv_1", "elicit_new")
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1)
+    assert repair is not None
+    repair.result(timeout=10)
     _wait_until(lambda: len(recording_store.pending_writes) >= 2)
-    assert recording_store.pending_writes == [("conv_1", 0), ("conv_1", 0)]
+
+    assert recording_store.pending_writes == [("conv_1", 1), ("conv_1", 1)]
+    pending_elicitations.reset_for_tests()
+
+
+def test_reconcile_pending_count_failure_writes_nothing(
+    recording_store: _RecordingStore,
+) -> None:
+    """A failed child read is logged and dropped; the stored count is left as it was."""
+
+    def _fail() -> None:
+        raise RuntimeError("child read failed")
+
+    pending_elicitations.reset_for_tests()
+    recording_store.on_child_read = _fail
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1)
+    assert repair is not None
+    assert repair.result(timeout=10) is None
+    assert recording_store.pending_writes == []
 
 
 def test_runner_liveness_touch_and_clear_pass_through(

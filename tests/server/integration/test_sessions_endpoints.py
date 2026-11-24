@@ -4746,19 +4746,22 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
 
 
 @pytest.mark.parametrize(
-    ("holds_runner", "child_counts_prompt", "expected_count"),
+    ("holds_runner", "child_counts_prompt", "child_read_fails", "expected_count"),
     [
-        pytest.param(True, False, 0, id="repairs-on-runner-replica"),
-        pytest.param(False, False, 1, id="keeps-count-off-runner-replica"),
-        pytest.param(True, True, 1, id="keeps-child-prompt-from-another-replica"),
+        pytest.param(True, False, False, 0, id="repairs-on-runner-replica"),
+        pytest.param(False, False, False, 1, id="keeps-count-off-runner-replica"),
+        pytest.param(True, True, False, 1, id="keeps-child-prompt-from-another-replica"),
+        pytest.param(True, False, True, 1, id="serves-snapshot-when-repair-fails"),
     ],
 )
 async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
     app: FastAPI,
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
     holds_runner: bool,
     child_counts_prompt: bool,
+    child_read_fails: bool,
     expected_count: int,
 ) -> None:
     """Opening a session repairs its stored pending count only from a complete index.
@@ -4767,13 +4770,16 @@ async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
     count at 1, so the list keeps showing a prompt the snapshot no longer has.
     The replica holding the session's runner repairs the count, unless a child
     counts a prompt: another replica may have recorded that prompt and mirrored
-    it into this session's count. A replica without the runner leaves it alone.
+    it into this session's count. A replica without the runner leaves it alone,
+    and a repair that fails never fails the snapshot.
 
     :param app: The app behind ``client``; its tunnel registry gets the runner.
     :param client: Test HTTP client backed by the real app.
     :param db_uri: The app's DB, opened directly to seed the stored counts.
+    :param monkeypatch: Breaks the repair's child read in the failure case.
     :param holds_runner: Whether this replica holds the session's runner.
     :param child_counts_prompt: Whether a child counts a prompt held elsewhere.
+    :param child_read_fails: Whether the repair's child read raises.
     :param expected_count: The listed count once the session has been opened.
     """
     from omnigent.runtime import pending_elicitations
@@ -4796,6 +4802,14 @@ async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
             runner_id="runner_child_replica",
         )
         store.set_pending_elicitation_count(child.id, 1)
+    if child_read_fails:
+
+        def _fail(*_args: object, **_kwargs: object) -> list[tuple[str, int]]:
+            raise RuntimeError("child read failed")
+
+        monkeypatch.setattr(
+            session_live_state.conversation_store(), "list_child_conversation_ids_page", _fail
+        )
 
     async def listed_count() -> int:
         resp = await client.get("/v1/sessions")

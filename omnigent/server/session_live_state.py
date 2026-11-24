@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.runtime import pending_elicitations
 from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
@@ -84,6 +85,8 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Children read before lowering a stored pending count; a full page leaves it as is.
+_PENDING_COUNT_REPAIR_CHILD_LIMIT = 128
 # Last parked reason persisted per session (``""`` = not parked), for dedupe.
 _last_blocked_on: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Handoffs to another replica per session. A write queued before a handoff sees
@@ -411,7 +414,7 @@ def _agent_worked_on_run(conversation_id: str, run_id: str) -> bool:
     )
 
 
-def persist_pending_count(conversation_id: str, count: int, *, force: bool = False) -> None:
+def persist_pending_count(conversation_id: str, count: int) -> None:
     """
     Persist an outstanding-elicitation count change.
 
@@ -420,11 +423,8 @@ def persist_pending_count(conversation_id: str, count: int, *, force: bool = Fal
 
     :param conversation_id: Session/conversation identifier.
     :param count: Outstanding elicitations, ``>= 0``.
-    :param force: Write even when this replica last wrote the same count.
-        The row is shared by every replica, so another replica may have
-        changed it since; callers repairing the row pass ``True``.
     """
-    if _store is None or (not force and _last_pending.get(conversation_id) == count):
+    if _store is None or _last_pending.get(conversation_id) == count:
         return
     _last_pending[conversation_id] = count
 
@@ -440,6 +440,65 @@ def persist_pending_count(conversation_id: str, count: int, *, force: bool = Fal
         conversation_id,
         count,
         on_failure=_evict,
+    )
+
+
+def reconcile_pending_count(conversation_id: str, stored_count: int | None) -> Future[Any] | None:
+    """
+    Repair a stored pending count that disagrees with this replica's index.
+
+    Call only on the replica holding the session's runner, where the
+    session's own prompts park. The repair runs on the ordered writer, so a
+    count change made while it reads queues its own write behind the repair.
+    Raising the stored count is always safe. Lowering it is safe only when no
+    child counts a prompt: whichever replica records a child's prompt also
+    mirrors it into this count, and that replica may be another one.
+
+    :param conversation_id: Session/conversation identifier.
+    :param stored_count: The session's stored count as the caller read it,
+        or ``None`` when never reported.
+    :returns: Future of the repair, or ``None`` without a store.
+    """
+    store = _store
+    if store is None:
+        return None
+    stored = stored_count or 0
+
+    def _repair() -> None:
+        live = pending_elicitations.count_for(conversation_id)
+        if live == stored or (
+            live < stored and _children_may_count_prompts(store, conversation_id)
+        ):
+            return
+        # Read again: a prompt published during the child reads is counted now.
+        store.set_pending_elicitation_count(
+            conversation_id, pending_elicitations.count_for(conversation_id)
+        )
+        # This replica's last write no longer describes the row, so the next
+        # count change must reach the store even when it repeats that value.
+        _last_pending.pop(conversation_id, None)
+
+    return submit("pending_count_repair", _repair)
+
+
+def _children_may_count_prompts(store: ConversationStore, conversation_id: str) -> bool:
+    """
+    Report whether a child of the session may count an outstanding prompt.
+
+    :param store: Store holding the session's children.
+    :param conversation_id: Parent session identifier.
+    :returns: ``True`` when a child's stored count or this replica's index
+        counts a prompt, or when a full page of children is too many to tell.
+    """
+    children = store.list_child_conversation_ids_page(
+        conversation_id, limit=_PENDING_COUNT_REPAIR_CHILD_LIMIT
+    )
+    if len(children) >= _PENDING_COUNT_REPAIR_CHILD_LIMIT:
+        return True
+    child_ids = [child_id for child_id, _ in children]
+    return any(pending_elicitations.counts_for(child_ids).values()) or any(
+        (activity.pending_elicitation_count or 0) > 0
+        for activity in store.get_session_activity(child_ids).values()
     )
 
 

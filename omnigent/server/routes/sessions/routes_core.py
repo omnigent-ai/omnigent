@@ -594,44 +594,6 @@ def _unsupported_model_detail(result: _RunnerForwardResult | None) -> str | None
     return detail if isinstance(detail, str) and detail else "This terminal cannot use that model."
 
 
-# Children read before lowering a stored pending count; a full page leaves it as is.
-_PENDING_COUNT_REPAIR_CHILD_LIMIT = 128
-
-
-def _repair_stored_pending_count(
-    conversation_store: ConversationStore, conv: Conversation
-) -> None:
-    """
-    Rewrite a session's stored pending count from this replica's index.
-
-    Call only while this replica holds the session's runner, where the
-    session's own prompts park. Raising the stored count is always safe.
-    Lowering it is safe only when no child counts a prompt: whichever replica
-    records a child's prompt also mirrors it into this session's count, and
-    that replica may be another one.
-
-    :param conversation_store: Store holding the session and its children.
-    :param conv: The session's conversation row, as read for this request.
-    """
-    live_count = pending_elicitations.count_for(conv.id)
-    stored_count = conv.pending_elicitation_count or 0
-    if live_count == stored_count:
-        return
-    if live_count < stored_count:
-        children = conversation_store.list_child_conversation_ids_page(
-            conv.id, limit=_PENDING_COUNT_REPAIR_CHILD_LIMIT
-        )
-        if len(children) >= _PENDING_COUNT_REPAIR_CHILD_LIMIT:
-            return
-        child_ids = [child_id for child_id, _ in children]
-        if any(pending_elicitations.counts_for(child_ids).values()) or any(
-            (activity.pending_elicitation_count or 0) > 0
-            for activity in conversation_store.get_session_activity(child_ids).values()
-        ):
-            return
-    session_live_state.persist_pending_count(conv.id, live_count, force=True)
-
-
 @dataclasses.dataclass(frozen=True)
 class _SessionBatchReads:
     """Per-batch enrichment reads behind one ``GET /sessions`` page."""
@@ -2580,7 +2542,7 @@ def register_core_routes(
         if bound_runner_connection(tunnel_registry, conv.runner_id) is not None and (
             pending_elicitations.count_for(conv.id) != (conv.pending_elicitation_count or 0)
         ):
-            await asyncio.to_thread(_repair_stored_pending_count, conversation_store, conv)
+            session_live_state.reconcile_pending_count(conv.id, conv.pending_elicitation_count)
         return snapshot
 
     @router.get(
