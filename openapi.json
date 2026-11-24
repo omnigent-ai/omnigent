@@ -11768,6 +11768,12 @@
             "title": "Role",
             "type": "string"
           },
+          "sender_in_context": {
+            "default": false,
+            "description": "`True` when the model received this user message behind a line naming `created_by`; omitted when `False`.",
+            "title": "Sender In Context",
+            "type": "boolean"
+          },
           "startup_options": {
             "anyOf": [
               {
