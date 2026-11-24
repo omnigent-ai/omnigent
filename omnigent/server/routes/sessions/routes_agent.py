@@ -292,12 +292,17 @@ def register_agent_routes(
                 bundle_bytes,
                 operator_authored=agent.operator_authored,
             )
+        # Only a runner loading the spec gets the compatibility copy: runners have asked for
+        # the MCP selection since before these groups existed, and one that names no
+        # accepted groups predates them. Every other caller (an export, sys_agent_download,
+        # a host reading skills) gets the bundle as written, opt-outs included.
+        runner_spec_fetch = request.headers.get(MCP_SELECTION_HEADER) == "1"
         accepted = {
             group.strip()
             for group in request.headers.get(ACCEPTED_TOOL_GROUPS_HEADER, "").split(",")
         }
         unknown_groups = NEGOTIATED_TOOL_GROUPS - accepted
-        if unknown_groups:
+        if runner_spec_fetch and unknown_groups:
             bundle_bytes = await asyncio.to_thread(
                 bundle_without_tool_groups, bundle_bytes, frozenset(unknown_groups)
             )

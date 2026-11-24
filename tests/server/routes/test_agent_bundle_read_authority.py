@@ -256,3 +256,93 @@ def test_fork_agent_copy_is_redacted_only_for_read(tmp_path: Path, level: int) -
         assert validate_agent_bundle(bundle).executor.harness_kind == "cursor"
     finally:
         clear_engine_cache()
+
+
+def test_only_an_older_runner_loading_the_spec_gets_the_tool_group_opt_out_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An author's ``tool_groups.gadgets: false`` stays in every export, sys_agent_download
+    included; only a runner that loads the spec without naming the group gets it dropped,
+    since its parser would refuse the key and it has no gadget tools anyway."""
+    import yaml
+
+    from omnigent.automations_availability import ACCEPTED_TOOL_GROUPS_HEADER
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER
+
+    monkeypatch.setattr(routes_agent, "local_single_user_enabled", lambda: False)
+    uri = f"sqlite:///{tmp_path / 'agent-bundle.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    permissions = SqlAlchemyPermissionStore(uri)
+    agents = SqlAlchemyAgentStore(uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent = agents.create("b" * 32, "opted-out", "agents/opted-out.tar.gz")
+    config = json.dumps(
+        {
+            "spec_version": 1,
+            "name": agent.name,
+            "instructions": "Help.",
+            "executor": {"type": "omnigent", "config": {"harness": "cursor"}},
+            "tool_groups": {"gadgets": False},
+        }
+    ).encode()
+    source = io.BytesIO()
+    with tarfile.open(fileobj=source, mode="w:gz") as archive:
+        member = tarfile.TarInfo("config.yaml")
+        member.size = len(config)
+        archive.addfile(member, io.BytesIO(config))
+    bundle = source.getvalue()
+    artifacts.put(agent.bundle_location, bundle)
+    conversation = conversations.create_conversation(agent_id=agent.id)
+    permissions.grant("author@example.com", conversation.id, LEVEL_EDIT)
+
+    router = APIRouter()
+    register_agent_routes(
+        router,
+        conversation_store=conversations,
+        agent_store=agents,
+        artifact_store=artifacts,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        permission_store=permissions,
+    )
+    app = FastAPI()
+    app.include_router(router, prefix="/v1")
+
+    def tool_groups(content: bytes) -> object:
+        with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+            data = archive.extractfile("config.yaml")
+            assert data is not None
+            return yaml.safe_load(data).get("tool_groups")
+
+    path = f"/v1/sessions/{conversation.id}/agent/contents"
+    try:
+        with TestClient(app, headers={"X-Forwarded-Email": "author@example.com"}) as client:
+            exported = client.get(path)
+            older_runner = client.get(path, headers={MCP_SELECTION_HEADER: "1"})
+            current_runner = client.get(
+                path, headers={MCP_SELECTION_HEADER: "1", ACCEPTED_TOOL_GROUPS_HEADER: "gadgets"}
+            )
+        assert exported.status_code == 200, exported.text
+        assert exported.content == bundle
+        assert current_runner.content == bundle
+        assert tool_groups(older_runner.content) is None
+
+        async def download_via_tool() -> dict[str, object]:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+                headers={"X-Forwarded-Email": "author@example.com"},
+            ) as server_client:
+                result = await _execute_agent_tool(
+                    "sys_agent_download",
+                    {"session_id": conversation.id},
+                    server_client=server_client,
+                    agent_spec=None,
+                    conversation_id=conversation.id,
+                    runner_workspace=tmp_path / "runner",
+                )
+            return json.loads(result)
+
+        downloaded = asyncio.run(download_via_tool())
+        assert tool_groups(Path(str(downloaded["path"])).read_bytes()) == {"gadgets": False}
+    finally:
+        clear_engine_cache()

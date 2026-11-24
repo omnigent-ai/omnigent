@@ -273,13 +273,14 @@ def redacted_agent_bundle(
 
 
 def bundle_without_tool_groups(source_bundle: bytes, groups: frozenset[str]) -> bytes:
-    """*source_bundle* with *groups* taken out of every config's ``tool_groups``.
+    """*source_bundle* with *groups* taken out of every agent spec's ``tool_groups``.
 
     For runners released before those groups: their spec parser refuses a ``tool_groups``
     key it doesn't know, so an author's opt-out would stop the session from starting. Such
-    a runner offers none of those tools anyway, so dropping the key loses nothing. A
-    bundle that names none of *groups* is returned as it is; other files are copied
-    unchanged.
+    a runner offers none of those tools anyway, so dropping the key loses nothing. The
+    specs are the files the loader reads (:func:`_spec_member_names`); other files, a
+    nested ``assets/config.yaml`` included, are copied unchanged, and a bundle whose specs
+    name none of *groups* is returned as it is.
     """
     import yaml
 
@@ -308,10 +309,11 @@ def bundle_without_tool_groups(source_bundle: bytes, groups: frozenset[str]) -> 
             (member, archive.extractfile(member).read() if member.isfile() else None)  # type: ignore[union-attr]
             for member in archive.getmembers()
         ]
+    specs = _spec_member_names(members)
     changed = False
     rewritten = []
     for member, data in members:
-        if data is not None and PurePosixPath(member.name).name in ("config.yaml", "agent.yaml"):
+        if data is not None and _member_path(member.name) in specs:
             replacement = stripped(data)
             if replacement is not None:
                 member = copy.copy(member)
@@ -329,6 +331,64 @@ def bundle_without_tool_groups(source_bundle: bytes, groups: frozenset[str]) -> 
         for member, data in rewritten:
             archive.addfile(member, io.BytesIO(data) if data is not None else None)
     return output.getvalue()
+
+
+def _member_path(name: str) -> str:
+    """A tar member's path relative to the bundle root, without a leading ``./``."""
+    return posixpath.normpath(name).lstrip("/") if name not in ("", ".") else ""
+
+
+def _spec_member_names(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> set[str]:
+    """The members the spec loader reads as agent specs, by its own rules.
+
+    ``config.yaml`` at the root and in each sub-agent directory (``agents/<dir>/``, at any
+    depth). A root without ``config.yaml`` is a single-file bundle instead: its one
+    root-level ``.yaml`` or ``.yml`` agent spec (a mapping with a name and a prompt, and no
+    ``spec_version``), as :func:`omnigent.spec._find_omnigent_yaml_in_dir` picks it.
+    """
+    import yaml
+
+    from omnigent.spec._omnigent_compat import (
+        _OMNIGENT_DISCRIMINATOR_KEY,
+        _OMNIGENT_NAME_KEY,
+        _OMNIGENT_SYSTEM_PROMPT_KEYS,
+    )
+
+    files = {_member_path(member.name): data for member, data in members if data is not None}
+    specs = {
+        path
+        for path in files
+        if path == "config.yaml"
+        or (path.endswith("/config.yaml") and _is_sub_agent_dir(path.rsplit("/", 1)[0]))
+    }
+    if "config.yaml" in files:
+        return specs
+    candidates = []
+    for path, data in files.items():
+        if "/" in path or PurePosixPath(path).suffix.lower() not in (".yaml", ".yml"):
+            continue
+        try:
+            raw = yaml.safe_load(data.decode("utf-8"))  # type: ignore[union-attr]
+        except (UnicodeDecodeError, yaml.YAMLError):
+            continue
+        if (
+            isinstance(raw, dict)
+            and _OMNIGENT_DISCRIMINATOR_KEY not in raw
+            and _OMNIGENT_NAME_KEY in raw
+            and _OMNIGENT_SYSTEM_PROMPT_KEYS & raw.keys()
+        ):
+            candidates.append(path)
+    if len(candidates) == 1:
+        specs.add(candidates[0])
+    return specs
+
+
+def _is_sub_agent_dir(directory: str) -> bool:
+    """Whether *directory* is ``agents/<dir>``, or one nested in another sub-agent's."""
+    parts = directory.split("/")
+    return (
+        len(parts) >= 2 and len(parts) % 2 == 0 and all(part == "agents" for part in parts[0::2])
+    )
 
 
 def copy_agent_bundle(
