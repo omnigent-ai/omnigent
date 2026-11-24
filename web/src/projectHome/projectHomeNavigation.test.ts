@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { parseAskPosition } from "./useTicketAsk";
 import {
   PROJECT_PANEL_SESSION_PARAM,
+  TICKET_ASK_PARAM,
   projectHomePath,
   projectOrchestratorPath,
   projectNameFromHomePath,
@@ -65,5 +67,24 @@ describe("project home navigation", () => {
     expect(back.get("ticket")).toBe("two");
     expect(back.has("session")).toBe(false);
     expect(ticketSelectionIds(back)).toEqual(["one", "two"]);
+  });
+});
+
+describe("ticket ask links", () => {
+  it("drops another ticket's scroll target when opening a ticket", () => {
+    const next = new URLSearchParams(
+      ticketPanelSearch("two", new URLSearchParams({ ticket: "one", [TICKET_ASK_PARAM]: "7" })),
+    );
+    expect(next.get("ticket")).toBe("two");
+    expect(next.has(TICKET_ASK_PARAM)).toBe(false);
+  });
+
+  it("accepts only non-negative integer positions", () => {
+    expect(parseAskPosition("12")).toBe(12);
+    expect(parseAskPosition("0")).toBe(0);
+    expect(parseAskPosition(null)).toBeNull();
+    expect(parseAskPosition("-1")).toBeNull();
+    expect(parseAskPosition("3.5")).toBeNull();
+    expect(parseAskPosition("abc")).toBeNull();
   });
 });

@@ -86,8 +86,13 @@ import { Textarea } from "@/components/ui/textarea";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSidebarData } from "@/hooks/useSidebarData";
-import type { TicketRequest } from "@/lib/ticketRequestsApi";
-import { projectHomePath, ticketPanelSearch } from "@/projectHome/projectHomeNavigation";
+import { useSessionTickets } from "@/hooks/useTicketRequests";
+import type { SessionTicket, TicketRequest } from "@/lib/ticketRequestsApi";
+import {
+  TICKET_ASK_PARAM,
+  projectHomePath,
+  ticketPanelSearch,
+} from "@/projectHome/projectHomeNavigation";
 import {
   clearUnreadOverride,
   isConversationUnseen,
@@ -460,6 +465,10 @@ export function InboxPage() {
     .join(" · ");
   const emptyState = EMPTY_STATES[filter];
 
+  const sessionTickets = useSessionTickets([
+    ...visibleApprovals.map((item) => item.row.id),
+    ...visibleUnread.map((item) => item.row.id),
+  ]);
   const groups = groupInboxEntries<InboxEntry>([
     ...visibleTicketRequests.map((item) => ({
       kind: "ticket" as const,
@@ -747,10 +756,7 @@ export function InboxPage() {
           <p className="text-sm text-muted-foreground">{waitingOn}</p>
           <InboxActions>
             <Button asChild size="xs" className={PRIMARY_ACTION}>
-              <Link
-                to={`${projectHomePath(item.project_name)}${ticketPanelSearch(item.ticket_id)}`}
-                componentId="inbox.ticket.open"
-              >
+              <Link to={ticketLocation(item, item.ask_position)} componentId="inbox.ticket.open">
                 Open ticket <ArrowRightIcon className="size-3.5" />
               </Link>
             </Button>
@@ -867,6 +873,12 @@ export function InboxPage() {
             className="border-0 bg-transparent p-0"
           />
           <InboxActions>
+            {sessionTickets[item.row.id] && (
+              <OpenTicketButton
+                ticket={sessionTickets[item.row.id]}
+                componentId="inbox.approval.open_ticket"
+              />
+            )}
             <Button asChild variant="outline" size="xs" className={OUTLINE_ACTION}>
               <Link to={`/c/${item.row.id}`} componentId="inbox.approval.open_session">
                 Open session
@@ -969,6 +981,9 @@ export function InboxPage() {
     const previewReady = previewQuery?.isSuccess === true;
     const showReplyField = canReply && !replyAwaitingAnswer;
     const sendIsPrimary = showReplyField && replyDraft.trim() !== "";
+    // A worker's session opens its ticket first; the chat stays one click away.
+    const linkedTicket = sessionTickets[sessionId];
+    const openSessionIsPrimary = !sendIsPrimary && !linkedTicket;
     const sendReply = () => {
       if (!replyDraft.trim() || replySending || !previewReady) return;
       // One telemetry point for both the button and the keyboard shortcut.
@@ -1097,13 +1112,22 @@ export function InboxPage() {
             <CheckIcon className="size-3.5" />
             Mark as read
           </Button>
-          {/* One live primary action: Send once there's a draft, else Open session. */}
+          {/* One live primary action: Send once there's a draft, else Open ticket or session. */}
+          {linkedTicket && (
+            <OpenTicketButton
+              ticket={linkedTicket}
+              primary={!sendIsPrimary}
+              disabled={replySending}
+              onOpen={markRead}
+              componentId="inbox.unread.open_ticket"
+            />
+          )}
           <Button
             asChild
-            variant={sendIsPrimary ? "outline" : "default"}
+            variant={openSessionIsPrimary ? "default" : "outline"}
             size="xs"
             className={cn(
-              sendIsPrimary ? OUTLINE_ACTION : PRIMARY_ACTION,
+              openSessionIsPrimary ? PRIMARY_ACTION : OUTLINE_ACTION,
               "aria-disabled:pointer-events-none aria-disabled:opacity-50",
             )}
           >
@@ -1504,6 +1528,59 @@ function SuggestionLinks({ item }: { item: Suggestion }) {
         ))}
       </ul>
     </section>
+  );
+}
+
+/** Board route with the ticket's panel open, scrolled to activity *askPosition* when given. */
+function ticketLocation(
+  ticket: Pick<SessionTicket, "project_name" | "ticket_id">,
+  askPosition?: number | null,
+): string {
+  const search = new URLSearchParams(ticketPanelSearch(ticket.ticket_id).slice(1));
+  if (askPosition != null) search.set(TICKET_ASK_PARAM, String(askPosition));
+  return `${projectHomePath(ticket.project_name)}?${search}`;
+}
+
+function OpenTicketButton({
+  ticket,
+  primary = true,
+  disabled = false,
+  onOpen,
+  componentId,
+}: {
+  ticket: SessionTicket;
+  primary?: boolean;
+  disabled?: boolean;
+  onOpen?: () => void;
+  componentId: string;
+}) {
+  return (
+    <Button
+      asChild
+      variant={primary ? "default" : "outline"}
+      size="xs"
+      className={cn(
+        primary ? PRIMARY_ACTION : OUTLINE_ACTION,
+        "aria-disabled:pointer-events-none aria-disabled:opacity-50",
+      )}
+    >
+      <Link
+        to={ticketLocation(ticket)}
+        aria-disabled={disabled}
+        title={ticket.title}
+        onClick={(event) => {
+          if (disabled) {
+            event.preventDefault();
+            return;
+          }
+          onOpen?.();
+        }}
+        componentId={componentId}
+      >
+        Open ticket
+        <ArrowRightIcon className="size-3.5" />
+      </Link>
+    </Button>
   );
 }
 

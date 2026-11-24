@@ -1,4 +1,4 @@
-import { Fragment, useState, type KeyboardEvent, type ReactNode, type Ref } from "react";
+import { Fragment, useRef, useState, type KeyboardEvent, type ReactNode, type Ref } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
@@ -51,7 +51,7 @@ import {
 } from "@/lib/projectTicketsApi";
 import { getCurrentUserId } from "@/lib/identity";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
-import { ticketPanelSearch } from "./projectHomeNavigation";
+import { TICKET_ASK_PARAM, ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCopyLinkButton } from "./TicketCopyLinkButton";
 import { TicketCostSection } from "./ProjectCost";
@@ -66,6 +66,7 @@ import { TicketImageAttachButton, TicketMarkdown, useTicketImageUpload } from ".
 import { TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
+import { parseAskPosition, useTicketAsk } from "./useTicketAsk";
 import { useTicketSeen } from "./useTicketSeen";
 import {
   newTicketDraftKey,
@@ -529,7 +530,7 @@ function TicketDetails({
           {!editing && <TicketError error={update.error} />}
           <TicketOutputs projectId={projectId} ticketId={ticketId} />
           {lifecycle && <TicketRelatedTickets projectId={projectId} ticketId={ticketId} />}
-          <TicketActivity projectId={projectId} ticket={ticket} />
+          <TicketActivity key={ticket.id} projectId={projectId} ticket={ticket} />
         </Panel>
       </div>
       {chatSessionId ? (
@@ -1005,6 +1006,10 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
   const projectSessionId = useProjectAgentSession(projectId).sessionId;
   const personaLookup = useProjectPersonaLookup(projectId);
   const events = query.data?.pages.flatMap((page) => page.data) ?? [];
+  const [searchParams] = useSearchParams();
+  // Read once: the question the viewer came from the Inbox to answer.
+  const [askPosition] = useState(() => parseAskPosition(searchParams.get(TICKET_ASK_PARAM)));
+  const activityRef = useRef<HTMLElement | null>(null);
   const { dividerPosition, dividerRef } = useTicketSeen({
     projectId,
     ticket,
@@ -1012,6 +1017,15 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
     hasNextPage: query.hasNextPage,
     isFetching: query.isFetching,
     fetchNextPage: query.fetchNextPage,
+    scrollToNew: askPosition === null,
+  });
+  const askTarget = useTicketAsk({
+    askPosition,
+    events,
+    hasNextPage: query.hasNextPage,
+    isFetching: query.isFetching,
+    fetchNextPage: query.fetchNextPage,
+    containerRef: activityRef,
   });
   const [showAgentNotes, setShowAgentNotes] = useState(false);
   if (!query.isPending && !query.error && !query.hasNextPage && events.length === 0) return null;
@@ -1025,10 +1039,15 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
       nowMs={now.getTime()}
       viewerId={viewerId}
       fallbackSessionId={projectSessionId}
+      highlighted={event.position === askTarget}
     />
   );
   return (
-    <section aria-label="Ticket activity" className="space-y-4 border-t border-border/60 pt-5">
+    <section
+      ref={activityRef}
+      aria-label="Ticket activity"
+      className="space-y-4 border-t border-border/60 pt-5"
+    >
       <div className="flex items-center justify-between gap-3">
         <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Activity</h3>
         {hasAgentNotes && (
@@ -1179,12 +1198,15 @@ function TicketActivityItem({
   nowMs,
   viewerId,
   fallbackSessionId,
+  highlighted = false,
 }: {
   event: TicketEvent;
   personaLookup: ReturnType<typeof useProjectPersonaLookup>;
   nowMs: number;
   viewerId: string | null;
   fallbackSessionId: string | null;
+  /** The open question the viewer followed an Inbox link to. */
+  highlighted?: boolean;
 }) {
   const note = event.kind === "comment" || event.kind === "execution";
   const body = typeof event.payload.text === "string" ? event.payload.text : null;
@@ -1212,7 +1234,15 @@ function TicketActivityItem({
   const stage = ticketEventStage(event);
   const age = relativeTime(event.created_at * 1000, nowMs);
   return (
-    <li className="relative flex min-w-0 gap-3 pb-4 last:pb-0 before:absolute before:top-6 before:bottom-0 before:left-3 before:w-px before:bg-border/60 last:before:hidden">
+    <li
+      data-ticket-event-position={event.position}
+      data-ask-highlight={highlighted || undefined}
+      className={cn(
+        "relative flex min-w-0 gap-3 pb-4 last:pb-0 before:absolute before:top-6 before:bottom-0 before:left-3 before:w-px before:bg-border/60 last:before:hidden",
+        highlighted &&
+          "-mx-2 rounded-md bg-status-yellow/10 px-2 pt-2 ring-1 ring-status-yellow/40",
+      )}
+    >
       <span
         className={cn(
           "relative flex size-6 shrink-0 items-center justify-center bg-background text-muted-foreground",

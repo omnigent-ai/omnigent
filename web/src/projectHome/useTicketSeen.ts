@@ -14,6 +14,7 @@ export function useTicketSeen({
   hasNextPage,
   isFetching,
   fetchNextPage,
+  scrollToNew = true,
 }: {
   projectId: string;
   ticket: ProjectTicket;
@@ -21,6 +22,8 @@ export function useTicketSeen({
   hasNextPage: boolean;
   isFetching: boolean;
   fetchNextPage: () => unknown;
+  /** False when another target, like an Inbox question, owns the initial scroll. */
+  scrollToNew?: boolean;
 }) {
   const client = useQueryClient();
   const [firstNewPosition] = useState(() => ticket.first_new_position ?? null);
@@ -41,10 +44,12 @@ export function useTicketSeen({
       : (events.find((event) => event.position >= firstNewPosition)?.position ?? null);
 
   useEffect(() => {
-    if (scrolled.current || dividerPosition === null || !dividerRef.current) return;
+    if (!scrollToNew || scrolled.current || dividerPosition === null || !dividerRef.current) {
+      return;
+    }
     scrolled.current = true;
     dividerRef.current.scrollIntoView({ block: "start", behavior: "smooth" });
-  }, [dividerPosition]);
+  }, [dividerPosition, scrollToNew]);
 
   const latestPosition = events.reduce((latest, event) => Math.max(latest, event.position), -1);
   useEffect(() => {

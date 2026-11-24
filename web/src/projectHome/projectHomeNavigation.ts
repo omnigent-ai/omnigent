@@ -18,6 +18,9 @@ export function isLegacyOrchestratorLink(search: URLSearchParams): boolean {
   );
 }
 
+/** Query parameter naming the activity position of a ticket's open question to scroll to. */
+export const TICKET_ASK_PARAM = "ask";
+
 /** The project home's query parameter naming the session in its side panel. */
 export const PROJECT_PANEL_SESSION_PARAM = "session";
 
@@ -34,6 +37,8 @@ export function ticketBatchSearch(ticketIds: readonly string[]): string {
 export function ticketPanelSearch(ticketId: string, search = new URLSearchParams()): string {
   const next = new URLSearchParams(search);
   next.set("ticket", ticketId);
+  // A scroll target belongs to the ticket it was opened for.
+  next.delete(TICKET_ASK_PARAM);
   next.delete(PROJECT_PANEL_SESSION_PARAM);
   next.delete("orchestrator");
   next.delete("agent");

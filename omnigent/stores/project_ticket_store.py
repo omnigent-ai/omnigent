@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
+    SqlConversationMetadata,
     SqlProject,
     SqlProjectTicket,
     SqlProjectTicketEvent,
@@ -646,6 +647,71 @@ class ProjectTicketStore:
                 )
             return summary
 
+    def session_tickets(
+        self, session_ids: builtins.list[str], *, user_id: str | None
+    ) -> dict[str, dict[str, Any]]:
+        """The one ticket each session works on, for sessions linked to exactly one.
+
+        A session linked to several tickets, like a project's Lead, maps to none, so
+        the Inbox keeps sending the viewer to its chat.
+        """
+        if len(session_ids) > TICKET_PAGE_MAX:
+            raise OmnigentError("Too many sessions", code=ErrorCode.INVALID_INPUT)
+        try:
+            ids = sorted({uuid_to_bytes(value).hex() for value in session_ids})
+        except InvalidUuidError as exc:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND) from exc
+        if not ids:
+            return {}
+        link = SqlProjectTicketSession
+        with self._session("list_inbox_session_tickets") as session:
+            rows = session.execute(
+                select(
+                    link.session_id,
+                    SqlProjectTicket.id,
+                    SqlProjectTicket.title,
+                    SqlProject.id,
+                    SqlProject.name,
+                )
+                .join(
+                    SqlConversationMetadata,
+                    (SqlConversationMetadata.workspace_id == link.workspace_id)
+                    & (SqlConversationMetadata.id == link.session_id)
+                    & (SqlConversationMetadata.project_id == link.project_id),
+                )
+                .join(
+                    SqlProjectTicket,
+                    (SqlProjectTicket.workspace_id == link.workspace_id)
+                    & (SqlProjectTicket.project_id == link.project_id)
+                    & (SqlProjectTicket.id == link.ticket_id),
+                )
+                .join(
+                    SqlProject,
+                    (SqlProject.workspace_id == link.workspace_id)
+                    & (SqlProject.id == link.project_id),
+                )
+                .where(
+                    link.workspace_id == current_workspace_id(),
+                    link.session_id.in_(ids),
+                    SqlProject.id.in_(accessible_project_ids(user_id)),
+                )
+            ).all()
+            grouped: dict[str, builtins.list[dict[str, Any]]] = {}
+            for session_id, ticket_id, title, project_id, project_name in rows:
+                grouped.setdefault(session_id, []).append(
+                    {
+                        "ticket_id": ticket_id,
+                        "title": title,
+                        "project_id": project_id,
+                        "project_name": project_name,
+                    }
+                )
+            return {
+                session_id: tickets[0]
+                for session_id, tickets in grouped.items()
+                if len(tickets) == 1
+            }
+
     def human_requests(self, *, user_id: str | None) -> dict[str, Any]:
         """Open ``needs-human`` asks across the viewer's projects that are routed to them.
 
@@ -686,7 +752,7 @@ class ProjectTicketStore:
                     reason, responders = human_request_routing(routing_project, ticket.labels)
                     if user_id not in responders:
                         continue
-                    request = self._open_human_request(session, ticket, responders)
+                    request = self._open_human_request(session, ticket, responders, user_id)
                     if request is None:
                         continue
                     requests.append(
@@ -709,9 +775,18 @@ class ProjectTicketStore:
             }
 
     def _open_human_request(
-        self, session: Session, ticket: SqlProjectTicket, responders: set[str | None]
+        self,
+        session: Session,
+        ticket: SqlProjectTicket,
+        responders: set[str | None],
+        viewer: str | None,
     ) -> dict[str, Any] | None:
-        """The ask's raise time and question, or ``None`` once a routed person acted."""
+        """The ask's raise time and question for *viewer*, or ``None`` once answered.
+
+        A person who raised the ask is asking someone else: it isn't listed for
+        them, and their own follow-ups don't answer it. Any other routed person's
+        comment or edit answers it for everyone.
+        """
         asks = self._human_asks(session, ticket)
         ask = asks[-1] if asks and asks[-1].end is None else None
         start = ask.start if ask is not None else -1
@@ -720,23 +795,10 @@ class ProjectTicketStore:
             SqlProjectTicketEvent.project_id == ticket.project_id,
             SqlProjectTicketEvent.ticket_id == ticket.id,
         )
-        people = [r for r in responders if r is not None]
-        answered = session.scalar(
-            select(SqlProjectTicketEvent.position)
-            .where(
-                *scope,
-                SqlProjectTicketEvent.position > start,
-                SqlProjectTicketEvent.session_id.is_(None),
-                SqlProjectTicketEvent.agent_id.is_(None),
-                SqlProjectTicketEvent.kind.in_((*NEW_UPDATE_KINDS, *NEW_COMMENT_KINDS)),
-                SqlProjectTicketEvent.user_id.in_(people)
-                if people
-                else SqlProjectTicketEvent.user_id.is_(None),
-            )
-            .limit(1)
+        by_person = (
+            SqlProjectTicketEvent.session_id.is_(None),
+            SqlProjectTicketEvent.agent_id.is_(None),
         )
-        if answered is not None:
-            return None
         raised = (
             session.scalar(
                 select(SqlProjectTicketEvent).where(
@@ -746,7 +808,49 @@ class ProjectTicketStore:
             if start >= 0
             else None
         )
-        question_position = self._latest_ask_position(session, ticket, asks)
+        raised_by_person = (
+            raised is not None and raised.session_id is None and raised.agent_id is None
+        )
+        asker = raised.user_id if raised is not None and raised_by_person else None
+        if raised_by_person and viewer == asker:
+            return None
+        answerers = [
+            r for r in responders if r is not None and not (raised_by_person and r == asker)
+        ]
+        answered = (
+            session.scalar(
+                select(SqlProjectTicketEvent.position)
+                .where(
+                    *scope,
+                    *by_person,
+                    SqlProjectTicketEvent.position > start,
+                    SqlProjectTicketEvent.kind.in_((*NEW_UPDATE_KINDS, *NEW_COMMENT_KINDS)),
+                    SqlProjectTicketEvent.user_id.in_(answerers)
+                    if answerers
+                    else SqlProjectTicketEvent.user_id.is_(None),
+                )
+                .limit(1)
+            )
+            if answerers or not raised_by_person
+            else None
+        )
+        if answered is not None:
+            return None
+        if raised_by_person:
+            # The comment a person sent with the label (or right after) states the question.
+            question_position = session.scalar(
+                select(func.min(SqlProjectTicketEvent.position)).where(
+                    *scope,
+                    *by_person,
+                    SqlProjectTicketEvent.position >= start,
+                    SqlProjectTicketEvent.kind.in_(NEW_COMMENT_KINDS),
+                    SqlProjectTicketEvent.user_id == asker
+                    if asker is not None
+                    else SqlProjectTicketEvent.user_id.is_(None),
+                )
+            )
+        else:
+            question_position = self._latest_ask_position(session, ticket, asks)
         question = (
             session.scalar(
                 select(SqlProjectTicketEvent).where(
@@ -756,9 +860,12 @@ class ProjectTicketStore:
             if question_position is not None
             else None
         )
+        anchor = question if question is not None else raised
         return {
+            "ask_position": anchor.position if anchor is not None else None,
             "raised_at": raised.created_at if raised is not None else ticket.updated_at,
             "raised_by_session_id": ask.session_id if ask is not None else None,
+            "raised_by_user_id": asker,
             "question": (question.payload.get("text") or "")[:500] if question else None,
         }
 
