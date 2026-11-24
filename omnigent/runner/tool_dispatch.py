@@ -8214,6 +8214,11 @@ async def execute_tool(
         refusal = _ungranted_tool_reason(tool_name, agent_spec, effective_harness)
         if refusal is not None:
             return json.dumps({"error": refusal})
+    from omnigent.runner.side_chat_guard import guard_role_side_chat_tool
+
+    side_chat_refusal = guard_role_side_chat_tool(tool_name, args, conversation_id)
+    if side_chat_refusal is not None:
+        return json.dumps({"error": side_chat_refusal})
     from omnigent.sandbox.copy_on_write import has_copy_on_write
 
     disposable = has_copy_on_write(getattr(agent_spec, "os_env", None)) or bool(

@@ -1478,3 +1478,36 @@ async def test_shared_members_read_the_description_but_cannot_edit_it(
     assert refused.status_code == 403
     renamed = await multi_user_client.patch(path, json={"name": "Shared 2"}, headers=_as_user(BOB))
     assert renamed.json()["description"] == "Mission."
+
+
+async def test_side_chats_of_the_lead_and_a_persona_carry_the_role_but_not_hold_it(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """A role's side chat learns the role and persona; it never becomes the router or identity."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    project = f"/v1/projects/{created['id']}"
+    await project_client.patch(f"{project}/identities/orchestrator", json={"instructions": "C."})
+    pm = (
+        await project_client.post(
+            f"{project}/identities", json={"name": "PM", "instructions": "Plan."}
+        )
+    ).json()
+    params = {"include_project_mandate": "true"}
+    for source, role in (
+        (created["main_session_id"], {"id": "orchestrator", "name": "Lead", "instructions": "C."}),
+        (pm["active_session_id"], {"id": pm["id"], "name": "PM", "instructions": "Plan."}),
+    ):
+        fork = await project_client.post(f"/v1/sessions/{source}/fork", json={"side_chat": True})
+        assert fork.status_code == 201, fork.text
+        side = (
+            await project_client.get(f"/v1/sessions/{fork.json()['id']}", params=params)
+        ).json()
+        assert side["project_side_chat_role"] == role
+        assert (side["project_main_session"], side["project_router"]) == (False, False)
+        assert (side["project_identity"], side["project_lead_charter"]) == (None, None)
+        bare = (await project_client.get(f"/v1/sessions/{fork.json()['id']}")).json()
+        assert "instructions" not in bare["project_side_chat_role"]
+    plain_fork = await project_client.post(f"/v1/sessions/{pm['active_session_id']}/fork", json={})
+    assert plain_fork.status_code == 201, plain_fork.text
+    plain = (await project_client.get(f"/v1/sessions/{plain_fork.json()['id']}")).json()
+    assert plain["project_side_chat_role"] is None

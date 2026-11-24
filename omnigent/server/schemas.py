@@ -2722,6 +2722,10 @@ class SessionResponse(BaseModel):
     # Whether this session is the project's router (the Lead by default), which
     # receives routed ticket events and coordinates the board.
     project_router: bool = False
+    # When this side chat was forked from the project's Lead or an identity's
+    # active session: that role's ``{"id", "name"}``, plus ``instructions``
+    # (the charter or persona) for runner requests. The fork never holds the role.
+    project_side_chat_role: dict[str, str] | None = None
 
 
 class UpdateSessionRequest(BaseModel):

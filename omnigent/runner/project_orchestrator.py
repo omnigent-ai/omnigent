@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import httpx
 
+from omnigent.runner.side_chat_guard import record_session_snapshot
 from omnigent.runtime.project_ticket_instructions import (
     PROJECT_CONVERSATION_INSTRUCTION,
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
 from omnigent.runtime.prompt import append_framework_instructions
-from omnigent.runtime.side_chat_instructions import side_chat_instruction
+from omnigent.runtime.side_chat_instructions import (
+    side_chat_instruction,
+    side_chat_role_instruction,
+)
 from omnigent.spec import AgentSpec
 
 PROJECT_ORCHESTRATOR_INSTRUCTION = (
@@ -139,16 +143,18 @@ async def project_instructions(
 ) -> str | None:
     """Resolve project guidance and the role from the session, never its agent or title.
 
-    Blocks follow a fixed order: the mandate, then the identity persona or the
-    Lead's charter, then conversation and ticket guidance, then the orchestrator
-    role, then the side-chat note. The mandate, persona, charter and side-chat
-    note reach their sessions without project tools; the rest need them.
+    Blocks follow a fixed order: the mandate, then the identity persona, the
+    Lead's charter or a role side chat's persona, then conversation and ticket
+    guidance, then the orchestrator role, then the side-chat note. The mandate,
+    persona, charter and side-chat note reach their sessions without project
+    tools; the rest need them.
     """
     if server_client is None or spec is None:
         return None
     snapshot = await _project_session_snapshot(server_client, session_id)
     if snapshot is None:
         return None
+    record_session_snapshot(session_id, snapshot)
     has_project_tools = spec.tool_groups.projects
     # The router coordinates; older servers only report the main session.
     # Legacy server response fallback; remove in 0.25.0.
@@ -161,6 +167,7 @@ async def project_instructions(
         project_mandate_instruction(snapshot.get("project_mandate")),
         project_identity_instruction(snapshot.get("project_identity")),
         project_lead_charter_instruction(snapshot.get("project_lead_charter")),
+        side_chat_role_instruction(snapshot.get("project_side_chat_role")),
         PROJECT_CONVERSATION_INSTRUCTION if in_ticket_project else None,
         PROJECT_TICKET_WORK_INSTRUCTION if in_ticket_project else None,
         PROJECT_ORCHESTRATOR_INSTRUCTION if has_project_tools and designated is True else None,

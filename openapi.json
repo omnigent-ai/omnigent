@@ -13957,6 +13957,20 @@
             "title": "Project Router",
             "type": "boolean"
           },
+          "project_side_chat_role": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Side Chat Role"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
