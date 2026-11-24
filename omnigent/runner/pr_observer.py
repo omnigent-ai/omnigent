@@ -886,18 +886,49 @@ def _git_checkouts(
     command = arguments.get("command", arguments.get("cmd"))
     if not isinstance(command, str) or len(command) > 100_000:
         return []
+    start = _shell_directory(tool_name, arguments, result, cwd)
     if tool_name == "sys_os_shell":
         segments = _shell_segments(command)
-        reported = result.get("cwd") if isinstance(result, dict) else None
         runs_git = any(os.path.basename(s.invocation_tokens[0]) == "git" for s in segments)
-        return [reported] if runs_git and isinstance(reported, str) and reported else []
+        return [start] if runs_git and start else []
     steps = _checkout_steps(command)
-    workdir = arguments.get("workdir")
-    start = _resolve_directory(cwd, workdir) if isinstance(workdir, str) and workdir else cwd
     walker = _CheckoutWalker(steps)
     with contextlib.suppress(_TooComplex):
         walker.run((start,))
     return list(walker.found)[:4]
+
+
+def _shell_directory(
+    tool_name: str, arguments: dict[str, object], result: object, cwd: str | None
+) -> str | None:
+    """Return the directory a shell call started in, or ``sys_os_shell``'s reported one."""
+    if tool_name == "sys_os_shell":
+        reported = result.get("cwd") if isinstance(result, dict) else None
+        return reported if isinstance(reported, str) and reported else None
+    workdir = arguments.get("workdir")
+    return _resolve_directory(cwd, workdir) if isinstance(workdir, str) and workdir else cwd
+
+
+# More PR URLs than this in one output list PRs rather than report a published one.
+_MAX_PRINTED_PRS = 3
+_HTTPS_URL = re.compile(r"https://[^\s<>\"'`]+")
+
+
+def _printed_prs(tool_name: str, result: object) -> list[PullRequestRef]:
+    """Return the PRs a successful shell call's output names by URL, skipping its stderr."""
+    if tool_name not in SHELL_TOOLS and tool_name not in {"exec_command", "run_command"}:
+        return []
+    if _failed(result):
+        return []
+    if isinstance(result, dict):
+        # A separate stderr holds diagnostics, which may mention unrelated PRs.
+        result = {key: value for key, value in result.items() if key != "stderr"}
+    references = {
+        reference.url: reference
+        for url in _HTTPS_URL.findall(output_text(result))
+        if (reference := pr_reference(url)) is not None
+    }
+    return list(references.values()) if len(references) <= _MAX_PRINTED_PRS else []
 
 
 def observe_tool_completion(
@@ -974,6 +1005,23 @@ def observe_tool_completion(
     except Exception:
         _logger.warning(
             "Failed to record session PRs", extra={"session_id": session_id}, exc_info=True
+        )
+    try:
+        from omnigent.runner.pr_resource import infer_printed_pr
+
+        shell_result = _shell_result(tool_name, result)
+        if printed := _printed_prs(tool_name, shell_result):
+            # A command that runs no git, such as a forge CLI, prints for where it started.
+            checkouts = _git_checkouts(tool_name, arguments, shell_result, cwd) or [
+                directory
+                for directory in [_shell_directory(tool_name, arguments, shell_result, cwd)]
+                if directory is not None
+            ]
+            for checkout in checkouts:
+                _lookup_pool.submit(infer_printed_pr, session_id, checkout, printed)
+    except Exception:
+        _logger.warning(
+            "Failed to infer printed session PRs", extra={"session_id": session_id}, exc_info=True
         )
 
 

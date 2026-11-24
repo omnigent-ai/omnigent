@@ -56,6 +56,8 @@ if args[:3] == ["repo", "set-default", "--view"]:
 if args[:2] == ["repo", "set-default"]:
     finish(0)
 if args[:2] == ["pr", "view"]:
+    if not config["found_by_branch"] and (len(args) < 3 or args[2].startswith("-")):
+        finish(1, err="no pull requests found for branch")
     json_at = args.index("--json") if "--json" in args else -1
     fields = args[json_at + 1].split(",") if 0 <= json_at < len(args) - 1 else []
     if "statusCheckRollup" in fields and config["checks_error"]:
@@ -68,7 +70,7 @@ if args[:1] == ["api"] and len(args) > 1 and re.fullmatch(
 ):
     row = {"number": pr["number"], "state": "open", "html_url": pr["url"],
            "base": {"repo": {"full_name": repo}}}
-    finish(0, json.dumps([row]))
+    finish(0, json.dumps([row] if config["found_by_branch"] else []))
 if args[:1] == ["api"] and args[-1].startswith(f"repos/{repo}/pulls/{pr['number']}/files"):
     finish(0, "[[]]" if "--slurp" in args else "[]")
 finish(1, err="gh shim: unexpected command " + json.dumps(args))
@@ -76,16 +78,29 @@ finish(1, err="gh shim: unexpected command " + json.dumps(args))
 
 
 def write_gh_shim(
-    binary: Path, *, repo: str, pr: dict[str, Any], checks_error: str | None = None
+    binary: Path,
+    *,
+    repo: str,
+    pr: dict[str, Any],
+    checks_error: str | None = None,
+    found_by_branch: bool = True,
 ) -> Path:
     """Install the ``gh`` stand-in into ``binary`` and return its path.
 
     ``pr`` is the ``gh pr view`` object for the branch's PR in ``repo``.
     ``checks_error`` makes a ``pr view`` that asks for ``statusCheckRollup`` fail
     with that stderr, as gh does for a token without the Checks permission.
+    ``found_by_branch=False`` serves ``pr`` only to a ``pr view`` that names its
+    number, as for a PR on a host none of the checkout's remotes name: gh's lookups
+    by the current branch and by commit find no PR.
     """
     binary.mkdir(parents=True, exist_ok=True)
-    config = {"repo": repo, "pr": pr, "checks_error": checks_error}
+    config = {
+        "repo": repo,
+        "pr": pr,
+        "checks_error": checks_error,
+        "found_by_branch": found_by_branch,
+    }
     (binary / "config.json").write_text(json.dumps(config))
     (binary / "gh-calls.log").write_text("")
     impl = binary / "gh_impl.py"
@@ -133,9 +148,14 @@ def stack_env(binary: Path, runtime: Path, model_url: str) -> dict[str, str]:
     return env
 
 
-def create_session(base_url: str, runner_id: str, workspace: Path) -> str:
-    """A runner-bound single-agent session whose workspace is ``workspace``."""
-    model = f"pr-checks-{uuid.uuid4().hex[:8]}"
+def create_session(
+    base_url: str, runner_id: str, workspace: Path, *, model: str | None = None
+) -> str:
+    """A runner-bound single-agent session whose workspace is ``workspace``.
+
+    Pass ``model`` to script the agent's turns through that mock-LLM queue.
+    """
+    model = model or f"pr-checks-{uuid.uuid4().hex[:8]}"
     spec = f"""name: pr-checks
 prompt: Run the requested shell command and report completion.
 executor:

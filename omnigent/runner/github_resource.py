@@ -1306,6 +1306,17 @@ def _pr_status_before(
     )
 
 
+def _open_pr_head_before(root: str, reference: PullRequestRef, deadline: float) -> str | None:
+    """Return the PR's head commit while it is open, with every ``gh`` call ending by ``deadline``.
+
+    :func:`_pr_json` asks an Enterprise host only after ``gh`` reports a login there.
+    """
+    with _gh_deadline_scope(deadline):
+        data = _pr_json(root, reference, "state,headRefOid")
+    head = data.get("headRefOid") if data and data.get("state") == "OPEN" else None
+    return head if isinstance(head, str) and head else None
+
+
 def _verify_pr_access(root: str, reference: PullRequestRef) -> None:
     """Raise unless ``gh`` on the host can read the PR.
 
