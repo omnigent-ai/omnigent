@@ -1,7 +1,7 @@
 """add gadget_shares table
 
 Revision ID: e4c7a91b2d3f
-Revises: bf30d7cbda61
+Revises: 47d3e8fc3e25
 Create Date: 2026-11-19 00:00:00.000000
 
 Adds ``gadget_shares``, one row per user or group a gadget is shared with, at
@@ -14,7 +14,7 @@ application code that writes it. Rollout and rollback order:
 - The upgrade runs at startup. A server started against the upgraded database
   needs a build that knows this revision; older builds refuse to start.
 - To roll back to a build without this revision, first downgrade to
-  ``bf30d7cbda61`` with a build that knows it. The downgrade drops the table and
+  ``47d3e8fc3e25`` with a build that knows it. The downgrade drops the table and
   any shares in it, so it is safe only before the first share is saved.
 
 There are no foreign-key constraints (schema Rule R032).
@@ -28,7 +28,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "e4c7a91b2d3f"
-down_revision: str | None = "bf30d7cbda61"
+down_revision: str | None = "47d3e8fc3e25"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 # Dialects that store a value of any type in any column, and ignore VARCHAR lengths.
@@ -50,6 +50,11 @@ def upgrade() -> None:
                 "length(CAST(gadget_id AS BLOB)) <= 64",
                 name="ck_gadget_shares_gadget_id_bytes",
             ),
+            # The grantee key is 64 hex digits.
+            sa.CheckConstraint(
+                "length(CAST(user_key AS BLOB)) <= 64",
+                name="ck_gadget_shares_user_key_bytes",
+            ),
             sa.CheckConstraint(
                 "typeof(workspace_id) = 'integer'",
                 name="ck_gadget_shares_workspace_id_integer",
@@ -67,6 +72,9 @@ def upgrade() -> None:
         # String(128) matches session_permissions.user_id; a user or group ID.
         sa.Column("user_id", sa.String(128), nullable=False),
         sa.Column("level", sa.SmallInteger(), nullable=False),
+        # SHA-256 hex of the NFC-normalized, case-folded user_id, written by the application,
+        # so a re-share in another letter case finds the same grant on every database.
+        sa.Column("user_key", sa.String(64), nullable=False),
         # Leads with workspace_id; the prefix serves per-gadget reads and deletes.
         sa.PrimaryKeyConstraint("workspace_id", "gadget_id", "user_id"),
         *constraints,
@@ -78,18 +86,18 @@ def upgrade() -> None:
         ["workspace_id", "user_id", "gadget_id"],
         unique=False,
     )
-    # Finds a grantee's existing grant on a gadget in any letter case. A function
-    # expression (not text) gets MySQL's required parentheses; user_id completes the key.
+    # Finds a grantee's existing grant on a gadget in any letter case; user_id completes
+    # the primary key.
     op.create_index(
-        "ix_gadget_shares_gadget_user_lower",
+        "ix_gadget_shares_gadget_user_key",
         "gadget_shares",
-        ["workspace_id", "gadget_id", sa.func.lower(sa.column("user_id")), "user_id"],
+        ["workspace_id", "gadget_id", "user_key", "user_id"],
         unique=False,
     )
 
 
 def downgrade() -> None:
     """Drop the ``gadget_shares`` index and table."""
-    op.drop_index("ix_gadget_shares_gadget_user_lower", table_name="gadget_shares")
+    op.drop_index("ix_gadget_shares_gadget_user_key", table_name="gadget_shares")
     op.drop_index("ix_gadget_shares_user_id", table_name="gadget_shares")
     op.drop_table("gadget_shares")
