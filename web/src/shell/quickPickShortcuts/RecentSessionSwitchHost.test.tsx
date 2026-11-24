@@ -33,7 +33,7 @@ function renderHost(mine: Mine) {
   });
   const wrap = (current: Mine): ReactNode => sidebarWith(client, { mine: current } as never);
   const view = render(wrap(mine));
-  return { rerender: (next: Mine) => view.rerender(wrap(next)) };
+  return { client, rerender: (next: Mine) => view.rerender(wrap(next)) };
 }
 
 function sidebarWith(client: QueryClient, sidebarData: never): ReactNode {
@@ -72,6 +72,24 @@ describe("RecentSessionSwitchHost", () => {
       sessionsKnown: true,
       sessionsFailed: true,
     });
+  });
+
+  it("offers a session cached only as an opened session's fetched row, until it's archived or gone", () => {
+    const { client, rerender } = renderHost({ data: undefined, isError: false });
+    rerender({ data: { pages: [] }, isError: false });
+    const live = () =>
+      [...(useRecentSessionSwitchStore.getState().readLiveSessionIds?.() ?? [])].toSorted();
+    // A deep-linked older session that no cached list page holds.
+    client.setQueryData(["conversation-backfill", "deep"], conversation("deep"));
+    expect(live()).toEqual(["a", "b", "deep"]);
+    client.setQueryData(
+      ["conversation-backfill", "deep"],
+      conversation("deep", { archived: true }),
+    );
+    expect(live()).toEqual(["a", "b"]);
+    // A session the viewer lost access to, or one deleted elsewhere, reads as null.
+    client.setQueryData(["conversation-backfill", "deep"], null);
+    expect(live()).toEqual(["a", "b"]);
   });
 
   it("records each session the sidebar opens as the latest visit", () => {

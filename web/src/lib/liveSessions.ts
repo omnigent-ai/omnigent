@@ -1,7 +1,8 @@
 // The sessions the client knows are live: every non-archived row in the cached
-// session lists (sidebar scopes, project folders, pins), whether or not the
-// sidebar currently shows it. The cache patchers apply WS deltas, archives, and
-// deletes to all of these lists, so a removed session drops out here too.
+// session lists (sidebar scopes, project folders, pins) and the rows fetched for
+// sessions opened outside them, whether or not the sidebar shows it. The cache
+// patchers apply WS deltas, archives, deletes and lost access to all of these, so a
+// removed session drops out here too.
 
 import type { QueryClient } from "@tanstack/react-query";
 
@@ -12,7 +13,7 @@ import {
 } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 
-/** Every live session in the cached session lists, by id; the first cached row wins. */
+/** Every live session in the cached session lists and fetched rows, by id; a list's row wins. */
 export function liveSessionsInCache(queryClient: QueryClient): Map<string, Conversation> {
   const sessions = new Map<string, Conversation>();
   const addLive = (rows: readonly Conversation[]) => {
@@ -29,6 +30,12 @@ export function liveSessionsInCache(queryClient: QueryClient): Map<string, Conve
     queryKey: PINNED_CONVERSATIONS_KEY,
   })) {
     addLive(data?.conversations ?? []);
+  }
+  // An older session opened by link, which no cached page holds; null once it's gone.
+  for (const [, row] of queryClient.getQueriesData<Conversation | null>({
+    queryKey: ["conversation-backfill"],
+  })) {
+    if (row) addLive([row]);
   }
   return sessions;
 }
