@@ -1325,7 +1325,9 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    await user.click(await screen.findByRole("button", { name: "Edit ticket" }));
+    await user.click(await screen.findByRole("button", { name: "Edit title" }));
+    // The title's Edit edits only the title.
+    expect(screen.queryByLabelText("Description (optional)")).toBeNull();
     fireEvent.change(screen.getByLabelText("Title"), {
       target: { value: "Ship a polished board" },
     });
@@ -1459,7 +1461,10 @@ describe("Project ticket board", () => {
       />,
     );
     expect(await screen.findByText("Approach and acceptance criteria")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Edit ticket" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+    // The description edits on its own, with the title left as it is.
+    expect(screen.queryByLabelText("Title")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Ship the board", level: 3 })).toBeInTheDocument();
     expect(screen.getByLabelText("Description (optional)")).toHaveValue(
       "Approach and acceptance criteria",
     );
@@ -1469,7 +1474,6 @@ describe("Project ticket board", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     expect(await screen.findByRole("heading", { name: "Acceptance" })).toBeInTheDocument();
     expect(api.updateTicket).toHaveBeenCalledWith("project", "ticket", {
-      title: "Ship the board",
       description: "## Acceptance\n\n- **Readable** UI",
     });
   });
@@ -1523,7 +1527,7 @@ describe("Project ticket board", () => {
       onExpandedChange,
     };
     const { rerender } = renderBoard(<ProjectTicketPanel {...props} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Edit ticket" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit description" }));
     fireEvent.change(screen.getByLabelText("Description (optional)"), {
       target: { value: "Keep the draft" },
     });
