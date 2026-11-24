@@ -1408,3 +1408,27 @@ describe("ConversationScrollRefBridge", () => {
     expect(seenBeforePaint).toBe(screen.getByText("row").parentElement?.parentElement);
   });
 });
+
+describe("automatic ticket updates", () => {
+  const ticketId = "a".repeat(32);
+  const text = [
+    `Ticket update digest for project ${"d".repeat(32)}. Nothing here asked to wake you; act only where the orchestrator skill says to.`,
+    "",
+    "Digest of 1 background update (agent notes, outputs and edits). Read a ticket only if a line needs action:",
+    `- ${ticketId} "Board overflow": agent note — latest: Rebased onto the tip.`,
+  ].join("\n");
+
+  it("shows a ticket card and keeps the raw text one click away", () => {
+    render(
+      <BubbleView
+        bubble={{ kind: "user", itemId: "ticket_update", content: [{ type: "input_text", text }] }}
+      />,
+    );
+    const card = screen.getByTestId("ticket-update-card");
+    expect(card).toHaveTextContent("Board overflow");
+    expect(card).toHaveTextContent("Rebased onto the tip.");
+    expect(screen.queryByTestId("message-bubble")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show raw" }));
+    expect(screen.getByTestId("ticket-update-raw")).toHaveTextContent(`- ${ticketId}`);
+  });
+});

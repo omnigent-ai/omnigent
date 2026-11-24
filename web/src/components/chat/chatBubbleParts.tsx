@@ -59,6 +59,8 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { ActivityNotice } from "@/components/blocks/TaskActivityMessage";
+import { TicketUpdateCards } from "@/components/chat/TicketUpdateCards";
+import { parseTicketUpdateMessage } from "@/lib/ticketUpdateMessage";
 import {
   isSystemUserContent,
   parseSystemMessage,
@@ -1140,6 +1142,21 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   if (!origin && images.length === 0 && fileChips.length === 0) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
+    // The server's automatic ticket notifications read as ticket cards.
+    if (!isShellCommand && !bubble.pending) {
+      const rawText = stripAutomationContext(joinTextBlocks(bubble.content));
+      const ticketUpdate = parseTicketUpdateMessage(rawText);
+      if (ticketUpdate)
+        return (
+          <div data-message-id={bubble.itemId} className="flex w-full">
+            <TicketUpdateCards
+              message={ticketUpdate}
+              rawText={rawText}
+              createdAtS={bubble.createdAtS}
+            />
+          </div>
+        );
+    }
   }
   if (origin && collapsesOrigin && !originExpanded) {
     return (
