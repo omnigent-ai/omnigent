@@ -159,8 +159,9 @@ implements them separately, so a fix for one harness does not reach the others.
     own outcome decides.
   - Background work shows the working spinner with the tooltip "Working in the
     background". A Claude session whose only remaining work is background
-    shells shows a static terminal icon instead, with the tooltip "Agent idle,
-    background shell still running"; it stays in the Working group. Output from
+    shells shows a static terminal icon instead, labelled "Agent idle,
+    background shell still running" (the tooltip on its Canvas card); it stays
+    in the Working group. Output from
     the ended turn that the viewer hasn't seen shows the unread dot instead until
     the session is opened. The composer lists running
     Claude background shells and Codex background terminals as "1 background
