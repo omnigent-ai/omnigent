@@ -289,6 +289,49 @@ export function findMentionTokens(text: string, tokens: readonly string[]): Ment
   return ranges.sort((a, b) => a.start - b.start);
 }
 
+/** Text landing in `[start, end)` of a draft, as a typed or pasted insert. */
+export interface ComposerInsert {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** The text to insert instead, and where the caret lands inside it. */
+export interface ComposerInsertAdjustment {
+  text: string;
+  caret: number;
+}
+
+/**
+ * The insert with a space added where it would break a token it touches: right after one, or
+ * right before one. ``caret`` stays after the inserted text. Null when no space is needed, or
+ * when one would make a touched token match a different tag; the insert then lands as typed.
+ */
+export function separateMentionEdges(
+  value: string,
+  insert: ComposerInsert,
+  tokens: readonly string[],
+): ComposerInsertAdjustment | null {
+  const { start, end, text } = insert;
+  if (text === "") return null;
+  const ranges = findMentionTokens(value, tokens);
+  const before = ranges.find((range) => range.end === start);
+  const after = ranges.find((range) => range.start === end);
+  const lead = before && !TOKEN_END_RE.test(text[0]!) ? " " : "";
+  const trail = after && !/\s/.test(text[text.length - 1]!) ? " " : "";
+  if (lead === "" && trail === "") return null;
+  const adjusted = { text: lead + text + trail, caret: lead.length + text.length };
+  // The space must not change which token a neighbour matches, e.g. a longer tag swallowing it.
+  const next = value.slice(0, start) + adjusted.text + value.slice(end);
+  const shift = adjusted.text.length - (end - start);
+  const nextRanges = findMentionTokens(next, tokens);
+  const keeps = (range: MentionTokenRange, at: number) =>
+    nextRanges.some((match) => match.start === at && match.token === range.token);
+  if (before && !keeps(before, before.start)) return null;
+  if (after && !keeps(after, after.start + shift)) return null;
+  return adjusted;
+}
+
 /** Token the caret is at the end of, or inside, so Backspace removes it whole. */
 export function mentionTokenAtCaret(
   text: string,

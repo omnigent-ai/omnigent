@@ -11,7 +11,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { ReactElement } from "react";
+import { createRef, type ComponentRef, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -1175,6 +1175,21 @@ describe.each(["textarea", "codemirror"] as const)(
       act(() => composerTargetOf(composerInput())!.setSelectionRange(offset, offset));
     const typeAt = (text: string, offset = valueOf().length) =>
       act(() => insertComposerText(composerTargetOf(composerInput())!, text, offset, offset));
+    /** A key typed at the caret: a CodeMirror typed transaction, or a textarea insert. */
+    const typeKey = (text: string) =>
+      act(() => {
+        if (engine === "codemirror") {
+          const view = EditorView.findFromDOM(composerInput())!;
+          const { from, to } = view.state.selection.main;
+          view.dispatch({
+            changes: { from, to, insert: text },
+            selection: { anchor: from + text.length },
+            userEvent: "input.type",
+          });
+          return;
+        }
+        insertComposerText(composerTargetOf(composerInput())!, text);
+      });
 
     /** ⌘Z. jsdom has no native textarea undo, so its browser undo is the input event it fires. */
     function undoTo(text: string) {
@@ -1268,6 +1283,111 @@ describe.each(["textarea", "codemirror"] as const)(
       expect(valueOf()).toBe("Read @readme.md more");
       expect(caretOf()).toBe("Read @readme.md ".length);
     });
+
+    it.runIf(engine === "textarea")(
+      "releases the pill when text is typed right after it",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        typeKey("x");
+
+        expect(valueOf()).toBe("Read @readme.mdx ");
+        expect(tokens()).toEqual([]);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "keeps a pill when text is typed right after it, and still attaches it on send",
+      async () => {
+        const props = composerProps();
+        await renderComposer(props);
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        typeKey("x");
+
+        expect(valueOf()).toBe("Read @readme.md x ");
+        expect(tokens()).toEqual(["@readme.md"]);
+        fireEvent.submit(composerInput().closest("form")!);
+        expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md] x", undefined);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "keeps a pill when text is typed right before it, with the caret after the typed text",
+      async () => {
+        const props = composerProps();
+        await renderComposer(props);
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read ".length);
+        typeKey("x");
+
+        expect(valueOf()).toBe("Read x @readme.md ");
+        expect(caretOf()).toBe("Read x".length);
+        expect(tokens()).toEqual(["@readme.md"]);
+        fireEvent.submit(composerInput().closest("form")!);
+        expect(props.onSend).toHaveBeenCalledWith("Read x [Attached: readme.md]", undefined);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "undoes text typed beside a pill, and the space it added, in one step with the pill kept",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        typeKey("x");
+        expect(valueOf()).toBe("Read @readme.md x ");
+        expect(tokens()).toEqual(["@readme.md"]);
+
+        undoTo("Read @readme.md ");
+        expect(tokens()).toEqual(["@readme.md"]);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "adds no space beside a pill in reply-quote mode, where the editor paints no pills",
+      async () => {
+        const ref = createRef<ComponentRef<typeof Composer>>();
+        render(
+          <CapabilitiesProvider info={codeMirrorInfo}>
+            <TooltipProvider>
+              <Composer {...composerProps()} ref={ref} />
+            </TooltipProvider>
+          </CapabilitiesProvider>,
+        );
+        await waitFor(() => expect(composerInput()).toHaveClass("cm-content"));
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        act(() => ref.current?.appendReplyQuote("Quoted text"));
+
+        const before = composerTargetOf(screen.getByLabelText("Reply text before quote 1"))!;
+        expect(before.value).toBe("Read @readme.md ");
+        act(() =>
+          insertComposerText(before, "x", "Read @readme.md".length, "Read @readme.md".length),
+        );
+        expect(before.value).toBe("Read @readme.mdx ");
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "places the caret after a typed @ that lands before a pill",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read ".length);
+        typeKey("@");
+
+        expect(valueOf()).toBe("Read @ @readme.md ");
+        expect(caretOf()).toBe("Read @".length);
+        expect(tokens()).toEqual(["@readme.md"]);
+      },
+    );
 
     it.runIf(engine === "codemirror")(
       "steps undo and redo back through a completed mention and a folder drill-in",
