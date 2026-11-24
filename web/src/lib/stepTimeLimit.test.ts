@@ -117,11 +117,24 @@ describe("withStepTimeLimit", () => {
     );
   });
 
-  it("leaves a Time limit line in a fenced code block alone", () => {
-    const example = "Fix it.\n\n```markdown\n**Time limit:** 1 day\n```";
+  it.each([
+    ["Fix it.\n\n```markdown\n**Time limit:** 1 day\n```"],
+    // A shorter fence, or one with an info string, doesn't close a longer one.
+    ["Fix it.\n\n````\n```\n**Time limit:** 1 day\n````"],
+    ["Fix it.\n\n```\n```js\n**Time limit:** 1 day\n```"],
+  ])("leaves a Time limit line in a fenced code block alone: %j", (example) => {
     expect(stepTimeLimit(example)).toBeNull();
     expect(withStepTimeLimit(example, "2 hours")).toBe(`${example}\n\n**Time limit:** 2 hours`);
     expect(withStepTimeLimit(example, null)).toBe(example);
+  });
+
+  it("changes only the edited lines: their breaks and the first line's indent stay", () => {
+    expect(withStepTimeLimit("Fix it.\r\n\r\n**Details:** run it.", "1 hour")).toBe(
+      "Fix it.\r\n\r\n**Time limit:** 1 hour\r\n\r\n**Details:** run it.",
+    );
+    expect(withStepTimeLimit("    indented code\n\nFix it.", "1 hour")).toBe(
+      "    indented code\n\nFix it.\n\n**Time limit:** 1 hour",
+    );
   });
 
   it("keeps one Time limit line, the first, when a description has several", () => {

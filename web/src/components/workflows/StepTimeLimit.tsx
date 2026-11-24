@@ -121,8 +121,10 @@ export function StepTimeLimit({
         <DropdownMenuRadioGroup
           value={choice}
           onValueChange={(value) => {
-            // Picking the checked option again would rewrite a limit worded at more length.
-            if (value !== choice) onChange({ stepId, limit: value === NO_LIMIT ? null : value });
+            // A pick while paused is ignored, as is the checked option again, which would rewrite
+            // a limit worded at more length.
+            if (!disabled && value !== choice)
+              onChange({ stepId, limit: value === NO_LIMIT ? null : value });
           }}
         >
           <DropdownMenuRadioItem value={NO_LIMIT}>No limit</DropdownMenuRadioItem>

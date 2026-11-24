@@ -221,11 +221,14 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     : workflow.shareable === false
       ? UNSHAREABLE_WORKFLOW_MESSAGE
       : undefined;
-  // A save records the planning chat's current proposal, so the menus wait for its journal.
+  // A save records which proposal the description stands over, so the menus wait until the page
+  // knows: the planning session, its journal and where the description's source sits. A planning
+  // session that fails to load has no proposal to record.
   const planningLoading =
     !!workflow.planning_session_id &&
     !planningSessionGone &&
-    (!planningSession || journal.isLoading);
+    !planningSessionError &&
+    (!planningSession || journal.isLoading || sourcePosition.isLoading);
   // A time limit is a line in the step's description, saved with the workflow's steps.
   const changeTimeLimit = ({ stepId, limit }: StepTimeLimitChange) =>
     saveTimeLimit.mutate(

@@ -262,6 +262,31 @@ describe("a step's time limit", () => {
     ).toBeDisabled();
   });
 
+  it("ignores a pick made after its open menu pauses", () => {
+    const onTimeLimitChange = vi.fn();
+    const { rerender } = render(
+      <WorkflowStepsGraph
+        steps={LIMITED}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+      />,
+    );
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Time limit for Fix the test: 2 hours" }),
+      { button: 0 },
+    );
+    rerender(
+      <WorkflowStepsGraph
+        steps={LIMITED}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+        timeLimitPaused
+      />,
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "4 hours" }));
+    expect(onTimeLimitChange).not.toHaveBeenCalled();
+  });
+
   it("opens a step's hover card again after its open menu goes away", async () => {
     const { rerender } = renderWithQueries(
       <WorkflowStepsGraph steps={LIMITED} title="Triage flaky tests" onTimeLimitChange={vi.fn()} />,

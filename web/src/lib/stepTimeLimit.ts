@@ -17,7 +17,8 @@ export const TIME_LIMIT_CHOICES = [
 // A line of its own, as a paragraph or a list item, e.g. "- **Time limit:** 2 hours".
 const LIMIT_LINE = /^([ \t]*(?:[-*+][ \t]+)?)\*\*Time limit:\*\*[ \t]*(.*?)[ \t]*$/i;
 const DETAILS_LINE = /^([ \t]*)([-*+][ \t]+)?\*\*Details:\*\*/i;
-const FENCE = /^[ \t]*(`{3,}|~{3,})/;
+// A fence's run of backticks or tildes, and what follows it.
+const FENCE = /^[ \t]*(`{3,}|~{3,})(.*)$/;
 // One part of a length, e.g. "1 hour" in "1 hour 30 minutes" or "1h" in "1h30m", with what
 // separates it from the next.
 const LENGTH_PART =
@@ -28,16 +29,22 @@ function descriptionLines(goal: string | null): string[] {
   return goal ? goal.split(/\r?\n/) : [];
 }
 
-/** Which lines sit in a fenced code block, fences included: an example there names no limit. */
+/**
+ * Which lines sit in a fenced code block, fences included: an example there names no limit. A
+ * block closes on a bare fence of the same character, at least as long as the one that opened it.
+ */
 function fencedLines(lines: readonly string[]): boolean[] {
-  let fence: string | null = null;
+  let opening: string | null = null;
   return lines.map((line) => {
-    const marker = FENCE.exec(line)?.[1]?.[0];
-    if (fence === null) {
-      fence = marker ?? null;
-      return marker !== undefined;
+    const fence = FENCE.exec(line);
+    if (opening === null) {
+      opening = fence?.[1] ?? null;
+      return fence !== null;
     }
-    if (marker === fence) fence = null;
+    const run = fence?.[1];
+    if (run && run[0] === opening[0] && run.length >= opening.length && !fence![2]!.trim()) {
+      opening = null;
+    }
     return true;
   });
 }
@@ -128,8 +135,12 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       lines.splice(details, 0, ...before, limitLine, "");
     }
   }
-  const text = lines.join("\n").trim();
-  return text || null;
+  // Only the edited lines change: the line breaks stay, and only blank lines at the ends go.
+  const text = lines
+    .join(goal?.includes("\r\n") ? "\r\n" : "\n")
+    .replace(/^(?:[ \t]*\r?\n)+/, "")
+    .replace(/(?:\r?\n[ \t]*)+$/, "");
+  return text.trim() ? text : null;
 }
 
 /**

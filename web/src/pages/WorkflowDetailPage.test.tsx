@@ -304,6 +304,61 @@ function renderPage(client = new QueryClient()) {
   });
 }
 
+interface StorePatch {
+  steps?: WorkflowStep[];
+  description?: string;
+  expected_description?: string;
+  description_source?: string | null;
+}
+
+// Answers PATCH like the workflow store: a description applies only while the stored one is
+// still `expected_description`, and keeps the proposal it was saved with as its source. With
+// `hold` set, PATCHes wait for `release`; with `fail` set, they're refused.
+function serveLikeTheStore(initial: WorkflowDetail) {
+  const held: (() => void)[] = [];
+  const server = {
+    stored: initial,
+    patches: [] as StorePatch[],
+    hold: false,
+    fail: false,
+    release: () =>
+      act(async () => {
+        for (const resolve of held.splice(0)) resolve();
+      }),
+  };
+  vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+    if (options?.method === "PATCH") {
+      const body = JSON.parse(String(options.body));
+      server.patches.push(body);
+      if (server.hold)
+        await new Promise<void>((resolve) => {
+          held.push(resolve);
+        });
+      if (server.fail)
+        return new Response(
+          JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
+          { status: 500 },
+        );
+      const { stored } = server;
+      const describes =
+        body.description !== undefined &&
+        (body.expected_description === undefined ||
+          body.expected_description === stored.description);
+      server.stored = {
+        ...stored,
+        steps: body.steps ?? stored.steps,
+        description: describes ? body.description : stored.description,
+        description_source: describes
+          ? (body.description_source ?? null)
+          : stored.description_source,
+        updated_at: (stored.updated_at ?? 0) + 100,
+      };
+    }
+    return new Response(JSON.stringify(server.stored));
+  });
+  return server;
+}
+
 describe("WorkflowDetailPage", () => {
   beforeEach(() => {
     vi.mocked(useIsMobileViewport).mockReturnValue(false);
@@ -429,56 +484,25 @@ describe("WorkflowDetailPage", () => {
     },
   );
 
-  interface Patch {
-    steps: WorkflowStep[];
-    description?: string;
-    description_source?: string;
-  }
-
-  /**
-   * A saved workflow whose planning chat holds *entries*. Each PATCH stores its steps and any
-   * description, as the server does, and *hold* makes the next ones wait for `release`.
-   */
-  async function workflowWithProposals(saved: WorkflowStep[], entries: JournalEntry[]) {
+  /** A saved workflow whose planning chat holds *entries*, served like the store. */
+  async function workflowWithProposals(
+    saved: WorkflowStep[],
+    entries: JournalEntry[],
+    extra: Partial<WorkflowDetail> = {},
+  ) {
     vi.mocked(useServerInfo).mockReturnValue(FALLBACK_SERVER_INFO);
     const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
     vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
     mockRuns([]);
-    let stored: WorkflowDetail = {
+    const server = serveLikeTheStore({
       ...WORKFLOW,
       steps: saved,
       planning_session_id: "a".repeat(32),
       updated_at: 10,
-    };
-    const patches: Patch[] = [];
-    const held: (() => void)[] = [];
-    const server = { hold: false, fail: false };
-    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
-      if (options?.method !== "PATCH") return new Response(JSON.stringify(stored));
-      const body = JSON.parse(String(options.body)) as Patch;
-      patches.push(body);
-      if (server.hold)
-        await new Promise<void>((resolve) => {
-          held.push(resolve);
-        });
-      if (server.fail)
-        return new Response(
-          JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
-          { status: 500 },
-        );
-      stored = {
-        ...stored,
-        steps: body.steps,
-        ...(body.description === undefined
-          ? {}
-          : { description: body.description, description_source: body.description_source }),
-        updated_at: (stored.updated_at ?? 0) + 10,
-      };
-      return new Response(JSON.stringify(stored));
+      ...extra,
     });
     mockJournal(entries);
-    const release = () => act(async () => held.splice(0).forEach((resolve) => resolve()));
-    return { patches, server, release };
+    return { patches: server.patches, server, release: server.release };
   }
 
   function mockJournal(entries: JournalEntry[]) {
@@ -532,7 +556,7 @@ describe("WorkflowDetailPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Clear Fix the test's limit" }));
     await waitFor(() => expect(graphGoals()).toEqual([null, "The suite passes"]));
-    expect(patches.at(-1)!.steps[1]!.goal).toBe("The suite passes");
+    expect(patches.at(-1)!.steps![1]!.goal).toBe("The suite passes");
     expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
     expect(runButton()).toBeEnabled();
   });
@@ -558,6 +582,52 @@ describe("WorkflowDetailPage", () => {
     expect(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeEnabled();
   });
 
+  it("pauses the time limit menus until it knows which proposal the description stands over", async () => {
+    // The description stands over a proposal the loaded journal page doesn't hold.
+    const { server } = await workflowWithProposals(
+      WORKFLOW.steps,
+      [
+        plan(5, WORKFLOW.steps),
+        plan(15, WORKFLOW.steps, "Finds flaky tests and fixes the worst one."),
+      ],
+      { description_source: "f".repeat(32) },
+    );
+    const storeFetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
+    let place: () => void = () => {};
+    const placed = new Promise<void>((resolve) => {
+      place = resolve;
+    });
+    vi.mocked(authenticatedFetch).mockImplementation(async (path, options) => {
+      if (!String(path).includes("/journal?")) return storeFetch(path, options);
+      await placed;
+      const page = { object: "list", data: [{ position: 0 }], has_more: true };
+      return new Response(JSON.stringify(page));
+    });
+    renderPage();
+    expect(
+      await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }),
+    ).toBeDisabled();
+
+    await act(async () => place());
+    // The newer proposal's description is offered, so the menus give way to Save plan.
+    expect(await screen.findByRole("button", { name: "Save plan" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeNull();
+    expect(server.patches).toEqual([]);
+  });
+
+  it("keeps the time limit menus usable when the planning session can't load", async () => {
+    await workflowWithProposals(WORKFLOW.steps, []);
+    vi.mocked(useSession).mockImplementation((id) => ({
+      session: null,
+      isLoading: false,
+      error: id ? new ApiError("Server error", 500, null) : null,
+    }));
+    renderPage();
+    expect(
+      await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }),
+    ).toBeEnabled();
+  });
+
   it("gives a proposal's new step its limit, and leaves a saved step's limit to the menu", async () => {
     const { patches } = await workflowWithProposals(WORKFLOW.steps, [
       plan(50, [
@@ -570,7 +640,7 @@ describe("WorkflowDetailPage", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Save plan" }));
     await waitFor(() => expect(patches).toHaveLength(1));
-    expect(patches[0]!.steps.map((step) => step.goal)).toEqual([
+    expect(patches[0]!.steps!.map((step) => step.goal)).toEqual([
       null,
       "The suite passes",
       "**Time limit:** 30 minutes",
@@ -1062,34 +1132,6 @@ describe("WorkflowDetailPage", () => {
       vi.mocked(authenticatedFetch).mockImplementation(async (path) =>
         String(path).includes("/journal?") ? place() : new Response(JSON.stringify(stored())),
       );
-    }
-
-    // Answers PATCH like the workflow store: a description applies only while the stored one is
-    // still `expected_description`, and keeps the proposal it was saved with as its source.
-    function serveLikeTheStore(initial: WorkflowDetail) {
-      const server = { stored: initial, patches: [] as Record<string, unknown>[] };
-      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
-        if (options?.method === "PATCH") {
-          const body = JSON.parse(String(options.body));
-          server.patches.push(body);
-          const { stored } = server;
-          const describes =
-            body.description !== undefined &&
-            (body.expected_description === undefined ||
-              body.expected_description === stored.description);
-          server.stored = {
-            ...stored,
-            steps: body.steps ?? stored.steps,
-            description: describes ? body.description : stored.description,
-            description_source: describes
-              ? (body.description_source ?? null)
-              : stored.description_source,
-            updated_at: (stored.updated_at ?? 0) + 100,
-          };
-        }
-        return new Response(JSON.stringify(server.stored));
-      });
-      return server;
     }
 
     async function renderJournal(entries: JournalEntry[], initial: WorkflowDetail) {
