@@ -128,6 +128,7 @@ from omnigent.process_logging import (
     log_once,
     redact_log_text,
 )
+from omnigent.tools.builtins.project_tickets import READ_ONLY_TICKET_TOOLS
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     EFFORT_ORDER,
@@ -319,10 +320,12 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
 #: so codex never raises an interactive prompt for them. The rename keeps a
 #: session's title current, which the framework does unprompted on any session.
 # Automation mutations still require Omnigent's server-side human approval.
+# Read-only project board tools only read state the session's project can see.
 _FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
     "sys_session_rename",
     "sys_scheduled_task_create",
     "sys_scheduled_task_update",
+    *READ_ONLY_TICKET_TOOLS,
 )
 
 #: Additionally pre-approved for an auto-harness Smart Routing session, whose

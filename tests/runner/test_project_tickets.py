@@ -6,7 +6,7 @@ import pytest
 from omnigent.entities.project_ticket import default_ticket_stages
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.project_tickets import execute_ticket_tool
-from omnigent.tools.builtins.project_tickets import TICKET_TOOLS
+from omnigent.tools.builtins.project_tickets import READ_ONLY_TICKET_TOOLS, TICKET_TOOLS
 
 SOURCE = "a" * 32
 PROJECT = "b" * 32
@@ -365,6 +365,37 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
         transport=httpx.MockTransport(handler), base_url="http://test"
     ) as client:
         assert "error" in json.loads(await execute_ticket_tool(name, args, client, SOURCE))
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("sys_ticket_list", {}),
+        ("sys_ticket_get", {"ticket_id": TICKET}),
+        ("sys_project_identity_list", {}),
+    ],
+)
+async def test_read_only_tools_only_send_gets(name, args):
+    # Codex runs these without an approval prompt, so they must never write.
+    assert READ_ONLY_TICKET_TOOLS == (
+        "sys_ticket_list",
+        "sys_ticket_get",
+        "sys_project_identity_list",
+    )
+    methods = []
+
+    def handler(request):
+        methods.append(request.method)
+        if request.url.path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        await execute_ticket_tool(name, args, client, SOURCE)
+    assert len(methods) > 1
+    assert set(methods) == {"GET"}
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():

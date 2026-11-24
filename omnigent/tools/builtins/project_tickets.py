@@ -184,6 +184,8 @@ class _TicketTool(Tool):
     tool_name: ClassVar[str]
     help_text: ClassVar[str]
     arguments: ClassVar[type[BaseModel]]
+    #: Only reads project state, so harnesses may run it without an approval prompt.
+    read_only: ClassVar[bool] = False
 
     @classmethod
     def name(cls) -> str:
@@ -209,6 +211,7 @@ class _TicketTool(Tool):
 
 class SysTicketListTool(_TicketTool):
     tool_name = "sys_ticket_list"
+    read_only = True
     help_text = (
         "List tickets, oldest first, and this project's ordered stages. By default rows are "
         "compact (ID, title, stage, labels, truncated latest update, updated_at, running "
@@ -223,6 +226,7 @@ class SysTicketListTool(_TicketTool):
 
 class SysTicketGetTool(_TicketTool):
     tool_name = "sys_ticket_get"
+    read_only = True
     help_text = (
         "Read a ticket, its description, and pages of activity, sessions "
         "and related tickets, plus the project's current stage definitions. "
@@ -398,6 +402,7 @@ class SysProjectIdentityUpdateTool(_TicketTool):
 
 class SysProjectIdentityListTool(_TicketTool):
     tool_name = "sys_project_identity_list"
+    read_only = True
     help_text = (
         "List this project's identities (the Team, excluding the built-in Lead): each one's "
         "name, ID, persona, whether an agent or the owner created it, and its session ID and "
@@ -474,3 +479,6 @@ TICKET_TOOL_CLASSES = (
     SysProjectArtifactSaveTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}
+READ_ONLY_TICKET_TOOLS: tuple[str, ...] = tuple(
+    tool.name() for tool in TICKET_TOOL_CLASSES if tool.read_only
+)

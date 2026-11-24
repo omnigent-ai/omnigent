@@ -21,6 +21,9 @@ _PLAIN_TOOL_APPROVALS = {
     "sys_session_rename": {"approval_mode": "approve"},
     "sys_scheduled_task_create": {"approval_mode": "approve"},
     "sys_scheduled_task_update": {"approval_mode": "approve"},
+    "sys_ticket_list": {"approval_mode": "approve"},
+    "sys_ticket_get": {"approval_mode": "approve"},
+    "sys_project_identity_list": {"approval_mode": "approve"},
 }
 
 
