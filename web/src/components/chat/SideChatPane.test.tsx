@@ -1777,27 +1777,53 @@ describe("grid cell composer shares its session's draft", () => {
     );
   });
 
-  it("renames a cell's tray file that shares a pasted chip's name, so both send with distinct names", () => {
-    const trayShot = new File(["t"], "image.png", { type: "image/png" });
+  it("keeps a tray file's name when the text refers to it, in a grid cell", () => {
+    const notes = new File(["n"], "notes.txt", { type: "text/plain" });
+    bridgedCell({ text: "Summarize @notes.txt", files: [notes] });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const sent = send.mock.calls[0]!;
+    expect(sent[0]).toBe("Summarize @notes.txt");
+    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt"]);
+  });
+
+  it("keeps a restored failed send's text and tray file names unchanged", () => {
+    const notes = new File(["n"], "notes.txt", { type: "text/plain" });
+    const shot = new File(["s"], "shot.png", { type: "image/png" });
+    bridgedCell({ text: "Summarize @notes.txt and @shot.png", files: [notes, shot] });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const sent = send.mock.calls[0]!;
+    expect(sent[0]).toBe("Summarize @notes.txt and @shot.png");
+    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt", "shot.png"]);
+  });
+
+  it("keeps an ordinary side chat's tray file name when the text refers to it", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+    const notes = new File(["n"], "notes.txt", { type: "text/plain" });
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Summarize @notes.txt" } });
+    fireEvent.paste(input, {
+      clipboardData: { items: [{ kind: "file", type: notes.type, getAsFile: () => notes }] },
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const sent = send.mock.calls[0]!;
+    expect(sent[0]).toBe("Summarize @notes.txt");
+    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt"]);
+  });
+
+  it("sends a chip's file under its own name when a later tray file has the same name", () => {
+    // shortcut: a tray file added after a chip with the same name sends under it too; renaming would rewrite the typed @name reference.
     const chipShot = new File(["c"], "image.png", { type: "image/png" });
+    const trayShot = new File(["t"], "image.png", { type: "image/png" });
     bridgedCell({
-      text: "Compare @image.png",
+      text: "Look @image.png",
       files: [trayShot],
       mentions: { files: [], sessions: [], attachments: [{ token: "@image.png", file: chipShot }] },
     });
     fireEvent.click(screen.getByTestId("side-chat-send"));
-    const sent = send.mock.calls[0]![2] as File[];
-    expect(sent.map((file) => file.name)).toEqual(["image (2).png", "image.png"]);
-    expect(sent[1]).toBe(chipShot);
-  });
-
-  it("gives a cell's tray files distinct names when they share one", () => {
-    const first = new File(["1"], "image.png", { type: "image/png" });
-    const second = new File(["2"], "image.png", { type: "image/png" });
-    bridgedCell({ text: "Two shots", files: [first, second] });
-    fireEvent.click(screen.getByTestId("side-chat-send"));
-    const sent = send.mock.calls[0]![2] as File[];
-    expect(sent.map((file) => file.name)).toEqual(["image.png", "image (2).png"]);
+    const sent = send.mock.calls[0]!;
+    expect(sent[0]).toBe("Look @image.png");
+    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["image.png", "image.png"]);
   });
 
   it("sends a tagged skill command as an ordinary message, not as a local command", () => {

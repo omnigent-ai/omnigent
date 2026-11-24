@@ -86,13 +86,7 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
-import {
-  attachmentAccept,
-  attachmentFilename,
-  clipboardFiles,
-  validateAttachments,
-} from "@/lib/attachments";
-import { uniqueAttachmentName } from "@/lib/pastedAttachments";
+import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -147,7 +141,6 @@ import {
   recallSessionMentions,
   type MentionState,
   type TaggedMentions,
-  findMentionTokens,
 } from "@/lib/composerMentions";
 import { clearLocalReviewContexts } from "@/lib/localReviewContext";
 import {
@@ -1167,23 +1160,10 @@ function SideChatComposer({
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
   // A pasted chip the shared draft still shows sends its file with the tray's.
-  // Tray files are renamed for the send where they clash with a chip, a literal spelling in the
-  // text, or an earlier tray file: the cell's tray is local, so the composer's namespace is rebuilt.
-  const chipTokens = (sharedTags?.attachments ?? []).map((attachment) => attachment.token);
-  const takenForSend = [...chipTokens];
-  const literalText = [text, ...quotes.map((replyQuote) => replyQuote.before)].join("\n");
-  const sendableTrayFiles = files.map((file) => {
-    const unique = uniqueAttachmentName(
-      attachmentFilename(file),
-      (candidate) =>
-        takenForSend.includes(`@${candidate}`) ||
-        findMentionTokens(literalText, [`@${candidate}`]).length > 0,
-    );
-    takenForSend.push(`@${unique}`);
-    return unique === file.name ? file : new File([file], unique, { type: file.type });
-  });
+  // A chip's file goes out with the tray's, under the names they were given.
+  // shortcut: a tray file added later with a chip's exact name is sent under that name too, a rare duplicate; renaming would rewrite the typed reference, so no reconciliation.
   const attachedFiles = [
-    ...sendableTrayFiles,
+    ...files,
     ...(sharedTags?.attachments ?? []).map((attachment) => attachment.file),
   ];
   const canSend =
