@@ -7216,6 +7216,7 @@ def create_runner_app(
                 dispatch_tool_locally,
                 get_arguments,
                 get_call_id,
+                get_item_id,
                 get_tool_name,
                 is_action_required,
                 should_dispatch_locally,
@@ -7766,6 +7767,7 @@ def create_runner_app(
                                                 dispatch_tool_locally(
                                                     tool_name=tool_name,
                                                     call_id=get_call_id(event),
+                                                    invocation_id=get_item_id(event) or None,
                                                     arguments=get_arguments(event),
                                                     response_id=_response_id,
                                                     harness_client=client,

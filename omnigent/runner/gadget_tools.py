@@ -56,12 +56,30 @@ def _gadget_id(args: dict[str, Any]) -> str:
     return value
 
 
-def _operation_id(args: dict[str, Any], call_id: str | None) -> str:
-    """The agent's operation ID, or one derived from the tool call so its retries match."""
+def _invocation(
+    conversation_id: str, call_id: str | None, invocation_id: str | None
+) -> str | None:
+    """What names this tool invocation for a derived operation ID, or ``None``.
+
+    The harness's output item ID is minted once per invocation, so a redelivered call
+    keeps it while an independent call gets another, even one with the same call ID (a
+    harness can derive call IDs from the call's content, as the Gemini adapter does).
+    Without one, the call ID within this session is the best there is. Either is scoped
+    to the session, so another session's call never matches.
+    """
+    if invocation_id:
+        return f"item\0{conversation_id}\0{invocation_id}"
+    if call_id:
+        return f"call\0{conversation_id}\0{call_id}"
+    return None
+
+
+def _operation_id(args: dict[str, Any], invocation: str | None) -> str:
+    """The agent's operation ID, or one derived from the invocation so its retries match."""
     given = args.get("operation_id")
     if isinstance(given, str) and given:
         return given
-    seed = call_id or uuid.uuid4().hex
+    seed = invocation or uuid.uuid4().hex
     return "tool-" + hashlib.sha256(seed.encode()).hexdigest()[:40]
 
 
@@ -120,7 +138,7 @@ class _Server:
 
 
 async def _record(
-    server: _Server, args: dict[str, Any], gadget_id: str, call_id: str | None
+    server: _Server, args: dict[str, Any], gadget_id: str, invocation: str | None
 ) -> Any:
     op = args.get("op")
     if not isinstance(op, str) or op not in GADGET_RECORD_OPS:
@@ -131,7 +149,7 @@ async def _record(
         if key in {"collection", "id", "value", "if_version", "limit", "cursor"}
     }
     if op in {"create", "replace", "delete"}:
-        params["operation_id"] = _operation_id(args, call_id)
+        params["operation_id"] = _operation_id(args, invocation)
     path = f"/{gadget_id}"
     revision = (await server.call("GET", path)).get("published_revision")
     if not isinstance(revision, str):
@@ -163,7 +181,7 @@ async def _run(
     *,
     server: _Server,
     conversation_id: str,
-    call_id: str | None,
+    invocation: str | None,
 ) -> Any:
     if tool_name == "sys_gadget_list":
         query = {"limit": args.get("limit"), "cursor": args.get("cursor")}
@@ -200,7 +218,7 @@ async def _run(
         }
         body = {
             "if_version": args.get("if_version"),
-            "operation_id": _operation_id(args, call_id),
+            "operation_id": _operation_id(args, invocation),
             **changes,
         }
         action = _segment(args.get("id"), "id")
@@ -227,7 +245,7 @@ async def _run(
         body = {"revision_id": args.get("revision_id"), "if_version": args.get("if_version")}
         return await server.call("POST", f"{path}/publish", body=body)
     if tool_name == "sys_gadget_records":
-        return await _record(server, args, gadget_id, call_id)
+        return await _record(server, args, gadget_id, invocation)
     raise _ToolError(f"unknown gadget tool {tool_name}")
 
 
@@ -238,6 +256,7 @@ async def execute_gadget_tool(
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
     call_id: str | None = None,
+    invocation_id: str | None = None,
 ) -> str:
     """Run one ``sys_gadget_*`` call against the server's gadget routes.
 
@@ -246,8 +265,11 @@ async def execute_gadget_tool(
     :param server_client: HTTP client pointed at the Omnigent server, authenticated
         as the session's owner.
     :param conversation_id: The calling session.
-    :param call_id: The harness's tool call ID; a write without an ``operation_id``
-        derives one from it, so a retried call is applied once.
+    :param call_id: The harness's tool call ID.
+    :param invocation_id: The harness's output item ID for this call. A write without
+        an ``operation_id`` derives one from this, or else from *call_id*, within the
+        session, so a retried call is applied once and an independent one is not taken
+        for it.
     :returns: The route's JSON; ``{"error": ...}`` on failure, with the server's
         ``code``, ``message`` and ``details`` when it refused the call.
     """
@@ -265,7 +287,7 @@ async def execute_gadget_tool(
             args,
             server=_Server(server_client, conversation_id),
             conversation_id=conversation_id,
-            call_id=call_id,
+            invocation=_invocation(conversation_id, call_id, invocation_id),
         )
     except _ToolError as exc:
         return json.dumps({"error": exc.error}, ensure_ascii=False)

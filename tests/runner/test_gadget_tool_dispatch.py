@@ -35,6 +35,7 @@ from omnigent.tools.builtins.gadgets import GADGET_TOOLS
 from tests.server.helpers import build_agent_bundle
 
 SESSION = "4e92b5a0c0ee6db3f874f9c4a3f855a5"
+OTHER_SESSION = "7d1c2e0f4b5a49c3a8e6f0b1c2d3e4f5"
 _CARDS = {"cards": {"type": "object", "properties": {"title": {"type": "string"}}}}
 
 
@@ -113,6 +114,7 @@ async def server(db_uri: str, tmp_path: Path) -> AsyncIterator[httpx.AsyncClient
     conversations = SqlAlchemyConversationStore(db_uri)
     # The calling session, which a new gadget is shown beside.
     conversations.create_conversation(conversation_id=SESSION)
+    conversations.create_conversation(conversation_id=OTHER_SESSION)
     app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
@@ -425,3 +427,120 @@ async def test_an_agent_changes_one_region_of_a_page_without_sending_it_again(
     )
     assert source["guide"] == "# Radar" and source["collections"] == _CARDS
     assert missed["error"]["details"] == {"edit": 1, "reason": "not_found"}
+
+
+async def _create_card(
+    client: httpx.AsyncClient,
+    gadget_id: str,
+    title: str,
+    *,
+    session: str = SESSION,
+    call_id: str | None,
+    invocation_id: str | None = None,
+) -> dict:
+    output = await execute_gadget_tool(
+        "sys_gadget_records",
+        json.dumps(
+            {
+                "gadget_id": gadget_id,
+                "op": "create",
+                "collection": "cards",
+                "value": {"title": title},
+            }
+        ),
+        server_client=client,
+        conversation_id=session,
+        call_id=call_id,
+        invocation_id=invocation_id,
+    )
+    return json.loads(output)
+
+
+@pytest.mark.asyncio
+async def test_independent_calls_sharing_a_call_id_each_create_a_record_and_retries_do_not(
+    server: httpx.AsyncClient,
+) -> None:
+    gadget_id = (await _call(server, "sys_gadget_create", name="Board"))["id"]
+    revision = await _call(
+        server,
+        "sys_gadget_revision_create",
+        gadget_id=gadget_id,
+        html="<main>Board</main>",
+        sdk_version=1,
+        capabilities=["data.read", "data.write"],
+        collections=_CARDS,
+    )
+    await _call(
+        server,
+        "sys_gadget_publish",
+        gadget_id=gadget_id,
+        revision_id=revision["id"],
+        if_version=None,
+    )
+    # A harness can derive call IDs from a call's content, so independent identical calls in
+    # one session repeat a call ID; each is its own output item.
+    first = await _create_card(
+        server, gadget_id, "Ship", call_id="call_same", invocation_id="fc_1"
+    )
+    second = await _create_card(
+        server, gadget_id, "Ship", call_id="call_same", invocation_id="fc_2"
+    )
+    other = await _create_card(
+        server, gadget_id, "Plan", call_id="call_same", invocation_id="fc_3"
+    )
+    assert "error" not in other
+    assert len({first["id"], second["id"], other["id"]}) == 3
+    # A retry of each invocation is the record that invocation made.
+    assert (
+        await _create_card(server, gadget_id, "Ship", call_id="call_same", invocation_id="fc_1")
+        == first
+    )
+    assert (
+        await _create_card(server, gadget_id, "Ship", call_id="call_same", invocation_id="fc_2")
+        == second
+    )
+    # With only a call ID, the same one in another session is another invocation.
+    here = await _create_card(server, gadget_id, "Ship", call_id="call_x")
+    there = await _create_card(server, gadget_id, "Ship", session=OTHER_SESSION, call_id="call_x")
+    assert here["id"] != there["id"]
+    assert await _create_card(server, gadget_id, "Ship", call_id="call_x") == here
+    listed = await _call(
+        server, "sys_gadget_records", gadget_id=gadget_id, op="list", collection="cards"
+    )
+    assert len(listed["items"]) == 5
+
+
+@pytest.mark.asyncio
+async def test_the_runner_passes_each_calls_output_item_id_to_the_gadget_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.runner.tool_dispatch as tool_dispatch
+
+    seen: list[tuple[str | None, str | None]] = []
+
+    async def fake_gadget_tool(*_args, call_id=None, invocation_id=None, **_kwargs):  # type: ignore[no-untyped-def]
+        seen.append((call_id, invocation_id))
+        return "{}"
+
+    monkeypatch.setattr(tool_dispatch, "execute_gadget_tool", fake_gadget_tool)
+    event = {
+        "type": "response.output_item.done",
+        "item": {
+            "id": "fc_0a1b2c",
+            "type": "function_call",
+            "status": "action_required",
+            "name": "sys_gadget_list",
+            "arguments": "{}",
+            "call_id": "call_same",
+        },
+    }
+    assert tool_dispatch.get_item_id(event) == "fc_0a1b2c"
+    assert tool_dispatch.get_item_id({"item": {"call_id": "call_same"}}) == ""
+    await tool_dispatch.execute_tool(
+        tool_name="sys_gadget_list",
+        arguments="{}",
+        conversation_id=SESSION,
+        call_id=tool_dispatch.get_call_id(event),
+        invocation_id=tool_dispatch.get_item_id(event),
+    )
+    assert seen == [("call_same", "fc_0a1b2c")]

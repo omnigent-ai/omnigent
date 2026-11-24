@@ -1120,6 +1120,17 @@ def get_call_id(event: _JsonObject) -> str:
     return call_id if isinstance(call_id, str) else ""
 
 
+def get_item_id(event: _JsonObject) -> str:
+    """Extract the output item ID of an action_required event, ``""`` when it has none.
+
+    The harness mints it once per tool invocation, so it tells apart two invocations
+    that share a call ID (a harness can derive call IDs from the call's content), while a
+    redelivered event keeps it.
+    """
+    item_id = _event_item(event).get("id")
+    return item_id if isinstance(item_id, str) else ""
+
+
 def get_arguments(event: _JsonObject) -> str:
     """Extract the arguments JSON string from an action_required event."""
     arguments = _event_item(event).get("arguments")
@@ -8290,6 +8301,7 @@ async def execute_tool(
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     call_id: str | None = None,
+    invocation_id: str | None = None,
     caller_user_id: str | None = None,
     session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
@@ -8324,6 +8336,9 @@ async def execute_tool(
         runner can wake a session that is no longer in a turn.
     :param call_id: The harness's tool call ID, when the caller has one; the
         journal tools key their writes on it.
+    :param invocation_id: The harness's output item ID for this call (see
+        :func:`get_item_id`), when the caller has one; the gadget tools key derived
+        operation IDs on it.
     :param session_workspace: The session's own server-stored workspace, e.g.
         ``Path("/repo")``; ``None`` when it has none, or
         :data:`UNKNOWN_SESSION_WORKSPACE` when it could not be read. Bounds
@@ -8624,6 +8639,7 @@ async def execute_tool(
                 server_client=server_client,
                 conversation_id=conversation_id,
                 call_id=call_id,
+                invocation_id=invocation_id,
             )
         elif tool_name in _USER_INBOX_TOOLS:
             output = await _execute_user_inbox_tool(
@@ -8769,6 +8785,7 @@ async def dispatch_tool_locally(
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     caller_user_id: str | None = None,
+    invocation_id: str | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -8794,6 +8811,8 @@ async def dispatch_tool_locally(
         ``execute_tool`` for the granted-surface check.
     :param wake_on_async_result: Forwarded to ``execute_tool`` so a
         ``sys_call_async`` result can wake the session after its turn ends.
+    :param invocation_id: The event's output item ID (:func:`get_item_id`), forwarded
+        to ``execute_tool``.
     :returns: The tool output string.
     """
     if not conversation_id:
@@ -8823,6 +8842,7 @@ async def dispatch_tool_locally(
         effective_harness=effective_harness,
         wake_on_async_result=wake_on_async_result,
         call_id=call_id,
+        invocation_id=invocation_id,
         caller_user_id=caller_user_id,
     )
 
