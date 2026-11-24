@@ -252,6 +252,28 @@ describe("prefetchSessionHostChain", () => {
     },
   );
 
+  it("keeps its snapshot read when a component that joined it unmounts", async () => {
+    const { client, Wrapper } = harness();
+    let finishRead!: (value: Session) => void;
+    getSessionSlimMock.mockImplementation(
+      () =>
+        new Promise<Session>((done) => {
+          finishRead = done;
+        }),
+    );
+    const lookup = new AbortController();
+
+    const walk = prefetchSessionHostChain(client, "watched", { signal: lookup.signal });
+    await flush();
+    const view = renderHook(() => useSession("watched"), { wrapper: Wrapper });
+    view.unmount();
+    finishRead(routed("watched", "host_watched", null));
+    await walk;
+
+    expect(getSessionHost("watched")).toBe("host_watched");
+    expect(getSessionSlimMock).toHaveBeenCalledOnce();
+  });
+
   it("starts no fresh read when its lookup times out while waiting on another read", async () => {
     const { client } = harness();
     let finishOldSnapshot!: (value: Session) => void;

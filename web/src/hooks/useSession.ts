@@ -223,7 +223,9 @@ export async function prefetchSessionHostChain(
     const hopId: string = id;
     const queryOptions = {
       queryKey: ["session", hopId],
-      queryFn: ({ signal }: { signal: AbortSignal }) => getSessionSlim(hopId, { signal }),
+      // The lookup's own signal, not the query's: a component that joins this
+      // read and unmounts mid-walk must not cancel it.
+      queryFn: () => getSessionSlim(hopId, { signal: options.signal }),
       staleTime: options.force ? 0 : Infinity,
       retry: false,
     };
