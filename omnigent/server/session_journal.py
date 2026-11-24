@@ -134,6 +134,24 @@ def open_store(conversation_store: object) -> SessionJournalStore | None:
         return store
 
 
+def record_copied_plan_progress(conversation_store: object, session_id: str) -> None:
+    """Record where a copied journal's plan stands, so the copy's row shows its step.
+
+    A fork or an automation's copy of a session gets its journal by copying
+    entries, not through the appends that record progress. Blocking; a failure
+    is logged, and the copy's next plan or status write records it instead.
+
+    :param session_id: The new session, e.g. a fork of a workflow run.
+    """
+    store = open_store(conversation_store)
+    if store is None:
+        return
+    try:
+        store.refresh_plan_progress(session_id)
+    except Exception:  # the copy already exists; progress is display metadata
+        _logger.warning("Could not record the plan progress of %s", session_id, exc_info=True)
+
+
 def titled_for_workflow_run(
     conversation_store: ConversationStore, conversation_id: str, title: str | None
 ) -> bool:

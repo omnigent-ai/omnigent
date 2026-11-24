@@ -282,7 +282,7 @@ from omnigent.server.schemas import (
     UpdateSessionRequest,
 )
 from omnigent.server.session_journal import open_store as open_journal_store
-from omnigent.server.session_journal import titled_for_workflow_run
+from omnigent.server.session_journal import record_copied_plan_progress, titled_for_workflow_run
 from omnigent.server.session_orchestration import (
     require_archive_outside_source_lineage,
     require_named_source_private,
@@ -5646,6 +5646,7 @@ def register_core_routes(
             if clone_location is not None:
                 await _delete_unreturned_agent_copy(new_conv.id, fork_agent_id, clone_location)
             raise
+        await asyncio.to_thread(record_copied_plan_progress, conversation_store, new_conv.id)
 
         # Create the fork-owned rows the rewritten items now reference —
         # before the fork is announced or returned, so no reader sees the ids

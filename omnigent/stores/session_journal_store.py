@@ -702,6 +702,49 @@ class SessionJournalStore:
         )
         return JournalAppend(entry=entry, created=created)
 
+    def refresh_plan_progress(self, conversation_id: str) -> None:
+        """Record where the session's plan stands from its journal as it is now.
+
+        For a journal written without :meth:`append`, such as a fork's copy. Locks
+        the heads row as an append does, so it can't overwrite a newer write's.
+
+        :param conversation_id: The session, e.g. a fork that copied a run.
+        """
+
+        def write(session: Session) -> None:
+            heads = SqlSessionJournalHead
+            next_position = session.execute(
+                select(heads.next_position)
+                .where(
+                    heads.workspace_id == current_workspace_id(),
+                    heads.conversation_id == conversation_id,
+                )
+                .with_for_update()
+                .with_hint(heads, "FORCE INDEX (PRIMARY)", "mysql")
+            ).scalar_one_or_none()
+            plan_row = (
+                self._newest_kind_row(session, conversation_id, _PLAN_KIND)
+                if next_position is not None
+                else None
+            )
+            if next_position is None or plan_row is None:
+                return
+            (plan,) = self._entries([plan_row])
+            boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+            revision = plan.content.get("graph_revision")
+            progress = self._plan_progress_value(
+                session,
+                conversation_id,
+                plan.content["steps"],
+                graph_revision=revision if isinstance(revision, str) else None,
+                start_position=boundary.position if boundary is not None else None,
+                fresh_run=False,
+                written=None,
+            )
+            _set_next_position(session, conversation_id, next_position, progress)
+
+        run_write_transaction(self._session_immediate, "refresh_plan_progress", write)
+
     # ── Reads ─────────────────────────────────────────
 
     @staticmethod

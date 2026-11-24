@@ -87,6 +87,34 @@ async def test_creating_client_surface_survives_create_child_and_fork(
     assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
 
 
+async def test_a_fork_lists_the_step_its_copied_plan_is_on(
+    app: Any, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+    from omnigent.stores.session_journal_store import SessionJournalStore
+
+    app.state.feature_flags = FeatureFlags(enabled_features=frozenset({Feature.WORKFLOWS}))
+    agent = await create_test_agent(client, name="fork-plan-progress")
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201, created.text
+    source_id = created.json()["id"]
+    journal = SessionJournalStore(db_uri)
+    steps = [
+        {"id": "build", "name": "Build"},
+        {"id": "ship", "name": "Ship", "depends_on": ["build"]},
+    ]
+    journal.append(source_id, "plan", {"name": "Release", "steps": steps}, idempotency_key="k0")
+    journal.append(source_id, "status", {"status": "started"}, idempotency_key="k1", step="build")
+
+    fork = await client.post(f"/v1/sessions/{source_id}/fork", json={})
+
+    assert fork.status_code == 201, fork.text
+    listed = await client.get("/v1/sessions")
+    rows = {row["id"]: row for row in listed.json()["data"]}
+    assert rows[source_id]["plan_progress"]["step"] == {"name": "Build", "state": "started"}
+    assert rows[fork.json()["id"]]["plan_progress"] == rows[source_id]["plan_progress"]
+
+
 async def test_native_clear_replacement_keeps_creating_surface(
     client: httpx.AsyncClient,
     db_uri: str,

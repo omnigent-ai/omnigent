@@ -1248,3 +1248,22 @@ def test_a_replan_keeps_the_runs_statuses_and_a_new_run_starts_afresh(
     automation_run = _progress(journal)
     assert (automation_run["done"], automation_run["started"]) == (0, 1)
     assert automation_run["step"] == {"name": "B", "state": "started"}
+
+
+def test_a_copied_journal_records_its_progress_when_refreshed(
+    journal: SessionJournalStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    journal.append(SESSION, "plan", _plan("build", "ship"), idempotency_key="k0")
+    _status(journal, "k1", "build", "done")
+    _status(journal, "k2", "ship", "started")
+    fork = conversations.fork_conversation(SESSION)
+    # Copying entries isn't an append, so it records nothing on its own.
+    assert journal.plan_progress_by_session([fork.id]) == {}
+
+    journal.refresh_plan_progress(fork.id)
+
+    assert journal.plan_progress_by_session([fork.id])[fork.id] == _progress(journal)
+    # Sessions without a journal, or that don't exist, are left alone.
+    journal.refresh_plan_progress(OTHER)
+    journal.refresh_plan_progress(MISSING)
+    assert journal.plan_progress_by_session([OTHER, MISSING]) == {}
