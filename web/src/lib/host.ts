@@ -413,6 +413,10 @@ function fetchReportingUpload(
 ): Promise<Response> {
   const signal = init?.signal ?? undefined;
   if (signal?.aborted) return Promise.reject(abortReason(signal));
+  // XMLHttpRequest would send a stream's text as "[object ReadableStream]"; refuse it as a network failure.
+  if (typeof ReadableStream !== "undefined" && init?.body instanceof ReadableStream) {
+    return Promise.reject(new TypeError("Failed to fetch"));
+  }
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     const onAbort = () => request.abort();

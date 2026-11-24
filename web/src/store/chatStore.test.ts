@@ -4880,6 +4880,10 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     useChatStore.setState({ conversationId, abortController: new AbortController() });
   });
 
+  afterEach(() => {
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+  });
+
   it("a Cancel after the uploads finish names the message, not a file", async () => {
     const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>

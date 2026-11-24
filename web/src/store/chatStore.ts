@@ -297,6 +297,8 @@ export interface SendOptions {
    * tracker stays as it is. A failure before the POST parks it again.
    */
   retryOfParkedUpload?: boolean;
+  /** Resources a parked attempt created, which this Retry carries on as its own to delete. */
+  inheritedUploads?: { file: File; fileId: string }[];
 }
 
 // Who hears of each send the runner takes, by its committed item's id and by the pending
@@ -3104,7 +3106,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       cancelled: false,
       file: undefined as File | undefined,
       /** Resources this attempt's batch created, which Remove may delete; reuses are not included. */
-      owned: [] as { file: File; fileId: string }[],
+      owned: [...(opts?.inheritedUploads ?? [])],
     };
     const uploadKeyOf = (file: File) => uploadProgressKey(tempId, pendingFileIdOf(file));
     const cancelUpload = () => {
@@ -3312,8 +3314,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // real failure must not replace that failure's reason.
       const cancelled =
         uploads.cancelled && (err as { name?: unknown } | null)?.name === "AbortError";
-      // A failed batch has already removed what it created.
-      if (uploads.uploading) uploads.owned = [];
+      // A failed batch removed what it created; what came from an earlier attempt stays owned.
+      if (uploads.uploading) uploads.owned = [...(opts?.inheritedUploads ?? [])];
       if (opts?.external && !posting) {
         // Never posted (held back, or its upload failed or was stopped): drop only this
         // attempt's bubble and latch. A turn seen starting since isn't this send's to end.
@@ -3510,6 +3512,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 replyDraft: opts?.replyDraft,
                 pinnedConversationId: parkedIn,
                 retryOfParkedUpload: true,
+                inheritedUploads: ownedUploads,
               });
             },
             remove: () => {
