@@ -355,6 +355,8 @@ class StartupInputOptions(BaseModel):
     tools: list[dict[str, Any]] | None = None
     background_titles_enabled: bool = False
     scheduled_run: ScheduledRunLogContext | None = None
+    # Server-sent turns such as ticket digests; they expire instead of showing as undelivered.
+    automatic: str | None = None
 
 
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.

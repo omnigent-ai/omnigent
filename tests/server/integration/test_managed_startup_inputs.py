@@ -33,6 +33,8 @@ from omnigent.server.routes.sessions import routes_core
 from omnigent.server.scheduled.telemetry import scheduled_run_scope
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.startup_inputs import (
+    AUTOMATIC_TTL_ENV,
+    EXPIRED_AUTOMATIC_LABEL,
     STARTUP_LABEL,
     ManagedStartupInputs,
     StartupInputContext,
@@ -1345,6 +1347,91 @@ async def test_refused_input_does_not_hold_back_the_next_one(
         await recover_until_idle()
         assert sent() == ["Second input", _TEXT]
         assert env.conv_store.list_pending_inputs(session_id) == []
+    finally:
+        await runner.aclose()
+
+
+async def test_undeliverable_automatic_input_expires_into_one_catch_up_note(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An automatic turn that can't be delivered expires; a person's keeps its failed state."""
+    env = startup_env
+    session_id = await _create(env)
+    host_id = uuid4().hex
+    env.conv_store.set_host_id(session_id, host_id, "/tmp/managed-workspace")
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    connection = _connect_host(env, host_id)
+    startup = env.app.state.startup_inputs
+
+    async def enqueue(text: str, automatic: str | None = None) -> None:
+        await startup.enqueue(
+            session_id,
+            SessionEventInput.model_validate(
+                {
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                }
+            ),
+            user_id=None,
+            headers=Headers(),
+            first=False,
+            automatic=automatic,
+        )
+
+    denied_texts = {_TEXT, "Digest A", "Typed by owner"}
+
+    async def evaluate(_request: Any, _session_id: str, _conv: Any, body: Any, *_: Any, **__: Any):
+        text = body.data["content"][-1]["text"]
+        return {"verdict": "deny", "reason": "Session down"} if text in denied_texts else None
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._evaluate_input_policy", evaluate
+    )
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+
+    def sent() -> list[str]:
+        return [
+            event["content"][-1]["text"] for event in forwarded if event.get("type") == "message"
+        ]
+
+    async def recover_until_idle() -> None:
+        for _ in range(10):
+            await startup._recover_session(env.app, session_id, connection)
+            await asyncio.gather(*startup._deliveries.values(), return_exceptions=True)
+
+    try:
+        await enqueue("Digest A", automatic="ticket_update")
+        await enqueue("Typed by owner")
+        await recover_until_idle()
+        assert sent() == []
+        _, failed = await startup.snapshot(session_id)
+        assert [entry["content"][-1]["text"] for entry in failed] == [_TEXT, "Typed by owner"]
+        errors = [
+            item.data.message
+            for item in env.conv_store.list_items(session_id).data
+            if item.type == "error"
+        ]
+        assert all("Digest A" not in message for message in errors)
+        labels = env.conv_store.get_conversation(session_id).labels
+        assert labels[EXPIRED_AUTOMATIC_LABEL].endswith(":1")
+
+        denied_texts.clear()
+        await enqueue("Digest C", automatic="ticket_update")
+        await recover_until_idle()
+        assert sent()[0] == "Digest C"
+        [note] = sent()[1:]
+        assert note.startswith("Catch-up:") and "1 automatic update " in note
+        assert "Re-read the board" not in note
+        assert EXPIRED_AUTOMATIC_LABEL not in env.conv_store.get_conversation(session_id).labels
+        assert len((await startup.snapshot(session_id))[1]) == 2
+
+        monkeypatch.setenv(AUTOMATIC_TTL_ENV, "0")
+        await enqueue("Old digest", automatic="ticket_update")
+        await asyncio.sleep(1.1)
+        await recover_until_idle()
+        assert "Old digest" not in sent()
+        assert sent()[-1].startswith("Catch-up:") and "1 automatic update " in sent()[-1]
     finally:
         await runner.aclose()
 

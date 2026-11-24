@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
+import time
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
@@ -65,6 +67,70 @@ _FAILED_INPUT_NOTE = (
 # recording it (e.g. a slash command Claude Code answers only in its TUI), and then
 # no echo comes. Matches the in-memory pending-input TTL.
 _RECEIPT_TIMEOUT_S = 600.0
+
+AUTOMATIC_TTL_ENV = "OMNIGENT_AUTOMATIC_MESSAGE_TTL_SECONDS"
+_DEFAULT_AUTOMATIC_TTL_S = 720.0
+# "<oldest expired created_at>:<count>" while automatic turns expired unseen.
+EXPIRED_AUTOMATIC_LABEL = "omnigent.expired_automatic"
+CATCH_UP = "catch_up"
+
+
+def _automatic_ttl_s() -> float:
+    raw = os.environ.get(AUTOMATIC_TTL_ENV, "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else _DEFAULT_AUTOMATIC_TTL_S
+    except ValueError:
+        return _DEFAULT_AUTOMATIC_TTL_S
+
+
+def automatic_kind(item: ConversationItem, session_id: str) -> str | None:
+    """
+    What sent a saved input on its own, e.g. ``"ticket_update"``, or None.
+
+    None for a person's message and for the input a session was created for,
+    such as a scheduled run's prompt in its new session: those stay for retry.
+    """
+    if item.id == initial_input_id(session_id):
+        return None
+    options = (
+        item.data.startup_options
+        if isinstance(item.data, (MessageData, SlashCommandData))
+        else None
+    )
+    if options is None:
+        return None
+    if options.automatic:
+        return options.automatic
+    return "scheduled_prompt" if options.scheduled_run is not None else None
+
+
+def _expired_ledger(conv: Conversation | None) -> tuple[int, int] | None:
+    raw = conv.labels.get(EXPIRED_AUTOMATIC_LABEL) if conv is not None else None
+    try:
+        since, count = (int(part) for part in (raw or "").split(":"))
+    except ValueError:
+        return None
+    return since, count
+
+
+def catch_up_message(*, since: int, count: int, now: float, on_board: bool) -> str:
+    """The one turn that replaces automatic messages this session never received."""
+    minutes = max(1, round((now - since) / 60))
+    started = time.strftime("%H:%M UTC", time.gmtime(since))
+    plural = "" if count == 1 else "s"
+    return (
+        f"Catch-up: this session couldn't receive messages for about {minutes} minute"
+        f"{'' if minutes == 1 else 's'} (since {started}), so {count} automatic update"
+        f"{plural} (ticket digests, ticket updates or scheduled prompts) expired instead of "
+        "being delivered. Messages people typed and messages from other sessions were kept. "
+        + (
+            f"Re-read the board for tickets that changed since {started} before acting."
+            if on_board
+            else "Check anything those updates would have covered before acting."
+        )
+    )
+
+
 _UNCONFIRMED_INPUT_NOTE = (
     "The agent never confirmed it received this message. Check the terminal; "
     "if the agent didn't act on it, send it again."
@@ -203,6 +269,7 @@ class ManagedStartupInputs:
         user_id: str | None,
         headers: Headers,
         first: bool = True,
+        automatic: str | None = None,
     ) -> ConversationItem:
         from omnigent.server.background_session_titles import background_session_titles_enabled
         from omnigent.server.routes._sessions.helpers import (
@@ -238,6 +305,7 @@ class ManagedStartupInputs:
                     tools=event.tools,
                     background_titles_enabled=background_session_titles_enabled(headers),
                     scheduled_run=current_scheduled_run(),
+                    automatic=automatic,
                 )
             }
         )
@@ -256,13 +324,7 @@ class ManagedStartupInputs:
             if settled is not None:
                 # Settled after this was admitted, possibly after the settlement
                 # failed what it saw: settle this input the same way.
-                if await asyncio.to_thread(
-                    self.conversations.transition_pending_input,
-                    session_id,
-                    saved[0].id,
-                    expected="in_progress",
-                    status="failed",
-                ):
+                if await self._fail_or_expire(session_id, saved[0], expected="in_progress"):
                     withdrawn = settled == STARTUP_WITHDRAWN
                     await self._report_failure(
                         session_id,
@@ -306,12 +368,8 @@ class ManagedStartupInputs:
                 self.conversations.list_pending_inputs, session_id
             ):
                 if item.status == "in_progress":
-                    undelivered |= await asyncio.to_thread(
-                        self.conversations.transition_pending_input,
-                        session_id,
-                        item.id,
-                        expected="in_progress",
-                        status="failed",
+                    undelivered |= await self._fail_or_expire(
+                        session_id, item, expected="in_progress"
                     )
         reason = await reason() if callable(reason) else reason
         if undelivered:
@@ -348,13 +406,7 @@ class ManagedStartupInputs:
         undelivered = False
         for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
             if item.status == "in_progress":
-                undelivered |= await asyncio.to_thread(
-                    self.conversations.transition_pending_input,
-                    session_id,
-                    item.id,
-                    expected="in_progress",
-                    status="failed",
-                )
+                undelivered |= await self._fail_or_expire(session_id, item, expected="in_progress")
         if undelivered:
             await self._report_failure(
                 session_id, "launch_withdrawn", message, publish_status=False
@@ -626,6 +678,7 @@ class ManagedStartupInputs:
         self._deliveries[key] = task
         context: StartupInputContext | None = None
         sent = False
+        catch_up = False
         dispatch_id = uuid4().hex
         try:
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
@@ -637,6 +690,13 @@ class ManagedStartupInputs:
                 or current.response_id != PENDING_INPUT_RESPONSE_ID
                 or current.status != "in_progress"
             ):
+                return
+            kind = automatic_kind(current, session_id)
+            if kind not in (None, CATCH_UP) and time.time() - current.created_at > (
+                _automatic_ttl_s()
+            ):
+                # Stale automatic turns are replaced by one catch-up note.
+                catch_up = await self._expire_stale(session_id)
                 return
             options = (
                 item.data.startup_options
@@ -702,6 +762,12 @@ class ManagedStartupInputs:
                 await asyncio.to_thread(
                     self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
                 )
+                if kind == CATCH_UP:
+                    await asyncio.to_thread(
+                        self.conversations.delete_label, session_id, EXPIRED_AUTOMATIC_LABEL
+                    )
+                else:
+                    catch_up = True
         except asyncio.CancelledError:
             log_delivery(
                 "scheduled_run_prompt_dispatch_interrupted",
@@ -733,6 +799,12 @@ class ManagedStartupInputs:
                 exception_type=type(exc).__name__,
             )
             _logger.exception("Unable to deliver saved message for session %s", session_id)
+            if (context is None or not context.submitted) and automatic_kind(
+                item, session_id
+            ) is not None:
+                # Nobody typed it: it expires quietly instead of showing as undelivered.
+                await self._expire_automatic(session_id, item, expected="in_progress")
+                return
             if context is None or not context.submitted:
                 await asyncio.to_thread(
                     self.conversations.transition_pending_input,
@@ -756,6 +828,11 @@ class ManagedStartupInputs:
             )
         finally:
             self._deliveries.pop(key, None)
+            if catch_up:
+                try:
+                    await self._catch_up(app, session_id, item.created_by)
+                except Exception:
+                    _logger.exception("Unable to send a catch-up note to session %s", session_id)
 
     async def _waits_out_session_move(self, session_id: str, exc: Exception) -> bool:
         """Whether *exc* refused delivery only while ``/clear`` moves the session.
@@ -780,6 +857,13 @@ class ManagedStartupInputs:
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
             return
+        current = await asyncio.to_thread(self.conversations.get_item, session_id, item_id)
+        if current is not None and automatic_kind(current, session_id) is not None:
+            if await self._expire_automatic(session_id, current, expected="incomplete"):
+                pending_inputs.resolve(session_id, pending_id)
+                if conv.host_id is not None:
+                    wake_startup_worker(conv.host_id)
+            return
         # The echo replaces the row, so only an input still awaiting it changes here.
         if not await asyncio.to_thread(
             self.conversations.transition_pending_input,
@@ -796,6 +880,98 @@ class ManagedStartupInputs:
         )
         if conv.host_id is not None:
             wake_startup_worker(conv.host_id)
+
+    async def _fail_or_expire(
+        self, session_id: str, item: ConversationItem, *, expected: str
+    ) -> bool:
+        """Fail an undeliverable input a person sent; an automatic one expires. Returns failed."""
+        if automatic_kind(item, session_id) is not None:
+            await self._expire_automatic(session_id, item, expected=expected)
+            return False
+        return await asyncio.to_thread(
+            self.conversations.transition_pending_input,
+            session_id,
+            item.id,
+            expected=expected,
+            status="failed",
+        )
+
+    async def _expire_automatic(
+        self, session_id: str, item: ConversationItem, *, expected: str
+    ) -> bool:
+        """Drop an automatic input and count it toward the session's catch-up note."""
+        if not await asyncio.to_thread(
+            self.conversations.transition_pending_input,
+            session_id,
+            item.id,
+            expected=expected,
+            status=None,
+        ):
+            return False
+        pending_inputs.resolve(session_id, pending_inputs.make_pending_id(session_id, item.id))
+        _logger.info(
+            "Expired automatic %s message %s for session %s",
+            automatic_kind(item, session_id),
+            item.id,
+            session_id,
+        )
+        if automatic_kind(item, session_id) == CATCH_UP:
+            return True
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        since, count = _expired_ledger(conv) or (item.created_at, 0)
+        with contextlib.suppress(ConversationNotFoundError):
+            await asyncio.to_thread(
+                self.conversations.set_labels,
+                session_id,
+                {EXPIRED_AUTOMATIC_LABEL: f"{min(since, item.created_at)}:{count + 1}"},
+            )
+        return True
+
+    async def _expire_stale(self, session_id: str) -> bool:
+        """Expire every queued automatic input older than the expiry window."""
+        before = time.time() - _automatic_ttl_s()
+        expired = False
+        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+            kind = automatic_kind(item, session_id)
+            if (
+                item.status == "in_progress"
+                and kind not in (None, CATCH_UP)
+                and item.created_at < before
+            ):
+                expired |= await self._expire_automatic(session_id, item, expected="in_progress")
+        return expired
+
+    async def _catch_up(self, app: Any, session_id: str, user_id: str | None) -> None:
+        """Queue one catch-up note once a session that missed automatic turns takes input."""
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        ledger = _expired_ledger(conv)
+        if conv is None or conv.archived or ledger is None:
+            return
+        items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        if any(automatic_kind(item, session_id) == CATCH_UP for item in items):
+            return
+        since, count = ledger
+        text = catch_up_message(
+            since=since, count=count, now=time.time(), on_board=conv.project_id is not None
+        )
+        await self.enqueue(
+            session_id,
+            SessionEventInput(
+                type="message",
+                data={
+                    "role": "user",
+                    "stable_id": uuid5(
+                        NAMESPACE_URL, f"catch-up:{session_id}:{since}:{count}"
+                    ).hex,
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            ),
+            user_id=user_id,
+            headers=Headers(),
+            first=False,
+            automatic=CATCH_UP,
+        )
+        await self.deliver_pending(app, session_id)
 
     async def retry(self, session_id: str) -> bool:
         changed = False
