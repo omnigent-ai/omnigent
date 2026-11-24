@@ -10407,7 +10407,11 @@ describe("NewChatLandingScreen @-file-mention", () => {
         inputType: "insertText",
         data: "x",
       });
-      if (field.dispatchEvent(beforeInput)) insertComposerText(field, "x");
+      // Not cancelled: the browser inserts the key itself, without the composer's adjustment.
+      if (field.dispatchEvent(beforeInput)) {
+        field.setRangeText("x", field.selectionStart, field.selectionEnd, "end");
+        field.dispatchEvent(new Event("input", { bubbles: true }));
+      }
     });
     expect((input() as HTMLTextAreaElement).value).toBe("@README.md x ");
     expect(screen.getByTestId("composer-mention-token").textContent).toBe("@README.md");

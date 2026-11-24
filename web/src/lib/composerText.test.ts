@@ -143,8 +143,9 @@ describe("insertComposerText with a registered insert adjuster", () => {
     expect(seen).toEqual([{ value: "Read @readme.md x", caret: 17 }]);
   });
 
-  it("does not insert twice when execCommand reports failure after inserting", () => {
+  it("does not insert twice when execCommand reports failure after inserting silently", () => {
     const element = adjustingTextarea("Read @readme.md", 15);
+    const seen = recordCaretAtInput(element);
     stubExecCommand((...args: unknown[]) => {
       element.setRangeText(String(args[2]), element.selectionStart, element.selectionEnd, "end");
       return false;
@@ -153,6 +154,24 @@ describe("insertComposerText with a registered insert adjuster", () => {
     insertComposerText(element, "x");
 
     expect(element.value).toBe("Read @readme.md x");
+    expect(element.selectionStart).toBe(17);
+    expect(seen).toEqual([{ value: "Read @readme.md x", caret: 17 }]);
+  });
+
+  it("notifies exactly once when execCommand reports failure after its own input event", () => {
+    const element = adjustingTextarea("Read @readme.md", 15);
+    const seen = recordCaretAtInput(element);
+    stubExecCommand((...args: unknown[]) => {
+      element.setRangeText(String(args[2]), element.selectionStart, element.selectionEnd, "end");
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      return false;
+    });
+
+    insertComposerText(element, "x");
+
+    expect(element.value).toBe("Read @readme.md x");
+    expect(element.selectionStart).toBe(17);
+    expect(seen).toEqual([{ value: "Read @readme.md x", caret: 17 }]);
   });
 
   it("leaves an insert alone when no tag is at its edge", () => {

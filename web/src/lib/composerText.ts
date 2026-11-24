@@ -54,16 +54,22 @@ export function insertComposerText(
   const placeCaret = () => {
     if (caret !== null) textarea.setSelectionRange(caret, caret);
   };
-  textarea.addEventListener("input", placeCaret, { capture: true, once: true });
+  let notified = false;
+  const onCommandInput = () => {
+    notified = true;
+    placeCaret();
+  };
+  textarea.addEventListener("input", onCommandInput, { capture: true, once: true });
   const inserted =
     typeof document.execCommand === "function" &&
     (insertedText || start === end
       ? document.execCommand("insertText", false, insertedText)
       : document.execCommand("delete"));
-  textarea.removeEventListener("input", placeCaret, { capture: true });
-  // A command that reports failure but still changed the text is not inserted again.
-  if (!inserted && textarea.value === valueBefore) {
-    textarea.setRangeText(insertedText, start, end, "end");
+  textarea.removeEventListener("input", onCommandInput, { capture: true });
+  // Without a notification from the command, notify once here; never insert the text a second time.
+  const changed = textarea.value !== valueBefore;
+  if (!notified && (changed || !inserted)) {
+    if (!changed) textarea.setRangeText(insertedText, start, end, "end");
     placeCaret();
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
   }

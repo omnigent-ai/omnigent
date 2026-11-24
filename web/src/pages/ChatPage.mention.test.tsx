@@ -1197,8 +1197,11 @@ describe.each(["textarea", "codemirror"] as const)(
           inputType: "insertText",
           data: text,
         });
+        // Not cancelled: the browser inserts the key itself, without the composer's adjustment.
         if (composerInput().dispatchEvent(beforeInput)) {
-          insertComposerText(composerTargetOf(composerInput())!, text);
+          const field = composerInput() as HTMLTextAreaElement;
+          field.setRangeText(text, field.selectionStart, field.selectionEnd, "end");
+          field.dispatchEvent(new Event("input", { bubbles: true }));
         }
       });
 
