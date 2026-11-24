@@ -790,6 +790,16 @@ Cross-harness journeys:
   and the "did not respond" cases in
   `web/src/pages/settings/SettingsHarnessesSection.test.tsx` and
   `web/src/shell/NewChatDialog.test.tsx`.
+- **`model-and-effort`, Claude Smart Routing (own environment):**
+  `tests/e2e_ui/chat/test_claude_native_routing_preserves_default.py::test_claude_routing_preserves_default_and_delivers_once`
+  drives create-time routing, a first Chat message and a first message typed
+  into the embedded Terminal. It starts an isolated server and host, with a
+  loopback judge and provider and a distinct saved Claude default. Each path
+  checks two delivered turns against the native transcript, fresh same-session
+  status and provider requests, one judge call, unchanged saved settings and
+  exactly one browser copy per message. It requires Claude Code 2.1.323+ and
+  tmux. This covers OSS routing integration with a scripted judge; it does not
+  establish live gateway decisions or other-platform acceptance.
 - **`model-and-effort`, Claude runtime selection (own environment):**
   `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
   uses real Claude catalog discovery, production invocation settings, a real
