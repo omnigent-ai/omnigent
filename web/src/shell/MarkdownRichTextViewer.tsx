@@ -45,6 +45,7 @@ import {
   type SearchDecorationState,
 } from "./TipTapSearchExtension";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
+import { MarkdownClipboard } from "./TipTapMarkdownClipboard";
 import { isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { applyExternalMarkdown } from "./TipTapEditorHelpers";
 import { rememberSourceBlocks } from "./markdownSourceBlocks";
@@ -357,6 +358,7 @@ function MarkdownRichTextViewerInner({
       ...createMarkdownDocumentExtensions(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
       createSearchDecorationExtension(searchStateRef),
+      MarkdownClipboard,
     ],
     // commentStateRef is stable and a path change remounts this component
     // (editorKey), so the closed-over conversationId/path can't go stale;
