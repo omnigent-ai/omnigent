@@ -220,3 +220,64 @@ async def test_agents_and_inbox_name_exactly_the_configured_product_approvers(mu
         items = (await client.get(PATH, headers=_as_user(viewer))).json()["data"]
         assert [item["responders"] for item in items] == [sorted(read["product_approvers"])]
     assert (await client.get(PATH, headers=_as_user(carol))).json()["data"] == []
+
+    # An approver adding product-ok answers the ask for everyone, owner included.
+    approved = await client.patch(
+        path,
+        json={"labels": [*labels, {"key": "needs-human"}, {"key": "product-ok", "value": "yes"}]},
+        headers=_as_user(BOB),
+    )
+    assert approved.status_code == 200, approved.text
+    for viewer in (ALICE, BOB):
+        assert (await client.get(PATH, headers=_as_user(viewer))).json()["data"] == []
+
+
+async def test_an_approver_cannot_clear_what_only_the_owner_can_answer(multi_user_client, db_uri):
+    client = multi_user_client
+    project = (
+        await client.post("/v1/projects", json={"name": "Owner gates"}, headers=_as_user(ALICE))
+    ).json()
+    await client.post(
+        f"/v1/projects/{project['id']}/shares", json={"user_id": BOB}, headers=_as_user(ALICE)
+    )
+    await client.patch(
+        f"/v1/projects/{project['id']}",
+        json={"config": {"product_approvers": [BOB]}},
+        headers=_as_user(ALICE),
+    )
+    store = ProjectTicketStore(db_uri)
+    worker = TicketActor(ALICE, uuid4().hex, uuid4().hex)
+    base = f"/v1/projects/{project['id']}/tickets"
+    feature = [{"key": "kind", "value": "feature"}]
+    product_ok = {"key": "product-ok", "value": "yes"}
+    risk = {"key": "risk", "value": "migration"}
+
+    def raise_ask(title: str, labels: list[dict]) -> str:
+        ticket = store.create(project["id"], CreateTicket(title=title), TicketActor(BOB))
+        store.update(
+            project["id"],
+            ticket["id"],
+            UpdateTicket(labels=[*labels, {"key": "needs-human"}]),
+            worker,
+        )
+        return f"{base}/{ticket['id']}"
+
+    # One ask covering product-ok and risk-ok: Bob's product-ok leaves Alice the risk-ok part.
+    risky = raise_ask("Risky feature", [*feature, risk])
+    assert await _requests(client, BOB) == ["Risky feature"]
+    approved = await client.patch(
+        risky,
+        json={"labels": [*feature, risk, {"key": "needs-human"}, product_ok]},
+        headers=_as_user(BOB),
+    )
+    assert approved.status_code == 200, approved.text
+
+    # An owner-only question on an already approved feature: Bob's comment doesn't answer it.
+    question = raise_ask("Owner question", [*feature, product_ok])
+    commented = await client.post(
+        f"{question}/comments", json={"text": "Looks fine to me."}, headers=_as_user(BOB)
+    )
+    assert commented.status_code == 201, commented.text
+
+    assert await _requests(client, ALICE) == ["Owner question", "Risky feature"]
+    assert await _requests(client, BOB) == []

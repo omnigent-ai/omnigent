@@ -103,3 +103,22 @@ def human_request_routing(
     if ticket_kind(labels) == FEATURE_KIND and PRODUCT_OK_LABEL not in keys:
         return REQUEST_PRODUCT_OK, {*product_approvers(project), project.user_id}
     return REQUEST_OWNER, {project.user_id}
+
+
+# The owner's own sign-offs; mirrors the landing gate's labels.
+RISK_LABEL = "risk"
+RISK_OK_LABEL = "risk-ok"
+OWNER_OK_LABEL = "owner-ok"
+
+
+def owner_sign_off_pending(labels: list[dict[str, Any]] | None, requested_by: str | None) -> bool:
+    """Whether the ticket still waits on a sign-off only the owner can give.
+
+    That is ``risk-ok`` on a ``risk`` ticket, or ``owner-ok`` on an imported outside PR.
+    """
+    from omnigent.server.github_pr_intake import is_outside_requester
+
+    keys = {label.get("key") for label in labels or []}
+    return (RISK_LABEL in keys and RISK_OK_LABEL not in keys) or (
+        is_outside_requester(requested_by) and OWNER_OK_LABEL not in keys
+    )

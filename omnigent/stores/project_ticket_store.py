@@ -149,6 +149,7 @@ def _note_audience(
 
 
 NEEDS_HUMAN_LABEL = "needs-human"
+PRODUCT_OK_LABEL = "product-ok"
 _UNDELIVERED = (NOTIFICATION_PENDING, NOTIFICATION_DIGEST, NOTIFICATION_ESCALATED)
 _URGENT = (NOTIFICATION_PENDING, NOTIFICATION_ESCALATED)
 # Worker activity that counts as answering a person's comment on its ticket.
@@ -722,7 +723,13 @@ class ProjectTicketStore:
         label is removed or any of its routed people acts on the ticket (a comment
         or an edit), which clears it for all of them.
         """
-        from omnigent.server.product_approval import human_request_routing
+        from omnigent.server.product_approval import (
+            FEATURE_KIND,
+            human_request_routing,
+            owner_sign_off_pending,
+            product_approvers,
+            ticket_kind,
+        )
 
         with self._session("list_viewer_human_requests") as session:
             projects = session.scalars(
@@ -755,7 +762,18 @@ class ProjectTicketStore:
                     reason, responders = human_request_routing(routing_project, ticket.labels)
                     if user_id not in responders:
                         continue
-                    request = self._open_human_request(session, ticket, responders, user_id)
+                    # Only the owner can clear an ask still waiting on their own sign-off;
+                    # otherwise an approver adding product-ok answers a feature's ask.
+                    owner_pending = owner_sign_off_pending(ticket.labels, ticket.requested_by)
+                    answerers = {project.user_id} if owner_pending else responders
+                    product_ok_from = (
+                        product_approvers(routing_project)
+                        if not owner_pending and ticket_kind(ticket.labels) == FEATURE_KIND
+                        else set()
+                    )
+                    request = self._open_human_request(
+                        session, ticket, answerers, user_id, product_ok_from=product_ok_from
+                    )
                     if request is None:
                         continue
                     requests.append(
@@ -783,6 +801,8 @@ class ProjectTicketStore:
         ticket: SqlProjectTicket,
         responders: set[str | None],
         viewer: str | None,
+        *,
+        product_ok_from: set[str] | None = None,
     ) -> dict[str, Any] | None:
         """The ask's raise time and question for *viewer*, or ``None`` once answered.
 
@@ -839,6 +859,10 @@ class ProjectTicketStore:
         )
         if answered is not None:
             return None
+        if product_ok_from and self._product_ok_added_since(
+            session, ticket, start, product_ok_from
+        ):
+            return None
         if raised_by_person:
             # The comment a person sent with the label (or right after) states the question.
             question_position = session.scalar(
@@ -871,6 +895,42 @@ class ProjectTicketStore:
             "raised_by_user_id": asker,
             "question": (question.payload.get("text") or "")[:500] if question else None,
         }
+
+    @staticmethod
+    def _product_ok_added_since(
+        session: Session, ticket: SqlProjectTicket, start: int, approvers: set[str]
+    ) -> bool:
+        """Whether one of *approvers* added ``product-ok`` after position *start*."""
+        rows = session.scalars(
+            select(SqlProjectTicketEvent)
+            .where(
+                SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+                SqlProjectTicketEvent.project_id == ticket.project_id,
+                SqlProjectTicketEvent.ticket_id == ticket.id,
+                SqlProjectTicketEvent.kind.in_(NEW_UPDATE_KINDS),
+            )
+            .order_by(SqlProjectTicketEvent.position)
+        )
+        had = False
+        for row in rows:
+            labels = _event_labels(row)
+            if labels is None:
+                continue
+            has = isinstance(labels, list) and any(
+                isinstance(label, dict) and label.get("key") == PRODUCT_OK_LABEL
+                for label in labels
+            )
+            if (
+                has
+                and not had
+                and row.position > start
+                and row.session_id is None
+                and row.agent_id is None
+                and row.user_id in approvers
+            ):
+                return True
+            had = has
+        return False
 
     def _stage_rows(
         self,
