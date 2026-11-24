@@ -291,6 +291,11 @@ export interface ServerInfo {
   /** Scheduled tasks accept `mcp_services`; older servers reject it. */
   scheduled_task_mcp_services?: boolean;
   /**
+   * Scheduled tasks accept `workflow_id` and `workflow_details`, and the server writes
+   * the prompt that runs the workflow; older servers reject them.
+   */
+  scheduled_task_workflow_id?: boolean;
+  /**
    * True when a session create (and so ``sys_session_create``) accepts
    * ``permission_mode``. Older servers ignore the field, so trigger templates
    * write a worker mode only here. Fails to ``false``.
@@ -568,6 +573,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   session_create_permission_modes: false,
   session_create_workflow_id: false,
   scheduled_task_mcp_services: false,
+  scheduled_task_workflow_id: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_trigger_headers: false,
@@ -761,6 +767,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_create_permission_modes: data.session_create_permission_modes === true,
           session_create_workflow_id: data.session_create_workflow_id === true,
           scheduled_task_mcp_services: data.scheduled_task_mcp_services === true,
+          scheduled_task_workflow_id: data.scheduled_task_workflow_id === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,

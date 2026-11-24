@@ -36,14 +36,17 @@ _TOO_SOON = (
     f"A reminder must be at least {MIN_REMINDER_DELAY.seconds // 60} minutes in the future."
 )
 
-_WORKFLOW_PROMPT_DESC = (
-    "To run one of your saved workflows on the schedule, the prompt is exactly "
-    "'/workflow Run the saved workflow \"<name>\" (ID <id>).', with the ID from "
-    "sys_workflow_list, optionally followed by a blank line and this run's details. "
-    "Each run then starts as a run of that workflow: its saved steps are the new "
-    "session's plan, and the workflow's page lists the run. The workflow must exist "
-    "and be runnable by you; if it is deleted later, the next run fails and the task "
-    "is paused."
+_WORKFLOW_ID_DESC = (
+    "Optional. One of your saved workflows, by its ID from sys_workflow_list, to run on "
+    "the schedule instead of a prompt: the server writes the prompt that runs it, each "
+    "run starts as a run of that workflow with its saved steps as the new session's "
+    "plan, and the workflow's page lists the run. Leave out prompt, give this run's "
+    "specifics as workflow_details, and keep session_mode 'new'. The workflow must be "
+    "runnable by you; if it is deleted later, the next run fails and the task is paused."
+)
+_WORKFLOW_DETAILS_DESC = (
+    "Optional, with workflow_id: this run's specifics, sent after the request to run the "
+    "workflow, e.g. 'Only the upload tests'."
 )
 
 _RRULE_DESC = (
@@ -98,7 +101,7 @@ class SysScheduledTaskCreateTool(Tool):
                             "type": "string",
                             "description": (
                                 "The instruction dispatched to the agent on each firing. "
-                                + _WORKFLOW_PROMPT_DESC
+                                "Required unless workflow_id names a saved workflow to run."
                             ),
                         },
                         "rrule": {"type": "string", "description": _RRULE_DESC},
@@ -175,9 +178,9 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional. 'new' (default) starts a new session for every "
                                 "run. 'continue' sends every run's prompt into one session, "
                                 "keeping its context: session_id when given, otherwise the "
-                                "session the first run creates. A prompt that runs a saved "
-                                "workflow ('/workflow Run the saved workflow ...') needs "
-                                "'new': every workflow run gets its own session."
+                                "session the first run creates. A task with workflow_id, "
+                                "or a prompt that runs a saved workflow, needs 'new': every "
+                                "workflow run gets its own session."
                             ),
                         },
                         "session_id": {
@@ -227,6 +230,11 @@ class SysScheduledTaskCreateTool(Tool):
                                 "if you have none. Do not set project_id with it."
                             ),
                         },
+                        "workflow_id": {"type": "string", "description": _WORKFLOW_ID_DESC},
+                        "workflow_details": {
+                            "type": "string",
+                            "description": _WORKFLOW_DETAILS_DESC,
+                        },
                         "project_id": {
                             "type": "string",
                             "description": (
@@ -237,7 +245,6 @@ class SysScheduledTaskCreateTool(Tool):
                     },
                     "required": [
                         "name",
-                        "prompt",
                         "rrule",
                         "agent_id",
                         "permission_mode",
@@ -320,7 +327,11 @@ class SysScheduledTaskUpdateTool(Tool):
                         "name": {"type": "string", "description": "New task name."},
                         "prompt": {
                             "type": "string",
-                            "description": f"New prompt. {_WORKFLOW_PROMPT_DESC}",
+                            "description": (
+                                "New prompt. For a task that runs a saved workflow the "
+                                "server writes the prompt: resend it unchanged, and change "
+                                "the run's specifics with workflow_details."
+                            ),
                         },
                         "rrule": {"type": "string", "description": _RRULE_DESC},
                         "agent_id": {
@@ -376,7 +387,7 @@ class SysScheduledTaskUpdateTool(Tool):
                             "enum": ["new", "continue"],
                             "description": (
                                 "'new' starts a new session for every run; 'continue' sends "
-                                "every run's prompt into one session. A prompt that runs a "
+                                "every run's prompt into one session. A task that runs a "
                                 "saved workflow needs 'new'."
                             ),
                         },
@@ -420,6 +431,22 @@ class SysScheduledTaskUpdateTool(Tool):
                             "description": (
                                 "File future fired sessions into this project, by name: "
                                 "your existing project with this name, or a new one."
+                            ),
+                        },
+                        "workflow_id": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "Run this saved workflow, by its ID from sys_workflow_list, "
+                                "from now on; the server writes the prompt. JSON null stops "
+                                "running the task's workflow and needs a new prompt. Omit "
+                                "to keep it."
+                            ),
+                        },
+                        "workflow_details": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "New specifics for each run of the task's saved workflow; "
+                                "JSON null clears them. Omit to keep them."
                             ),
                         },
                         "project_id": {

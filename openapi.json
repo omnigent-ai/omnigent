@@ -2591,8 +2591,15 @@
             "title": "Project Id"
           },
           "prompt": {
-            "title": "Prompt",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -2654,6 +2661,29 @@
             "default": "UTC",
             "title": "Timezone"
           },
+          "workflow_details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Details"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -2669,7 +2699,6 @@
         },
         "required": [
           "name",
-          "prompt",
           "rrule",
           "agent_id"
         ],
@@ -8271,6 +8300,11 @@
           "scheduled_task_trigger_headers": {
             "default": true,
             "title": "Scheduled Task Trigger Headers",
+            "type": "boolean"
+          },
+          "scheduled_task_workflow_id": {
+            "default": true,
+            "title": "Scheduled Task Workflow Id",
             "type": "boolean"
           },
           "scheduled_task_worktrees": {
@@ -15996,6 +16030,29 @@
               }
             ],
             "title": "Timezone"
+          },
+          "workflow_details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Details"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
           },
           "workspace": {
             "anyOf": [

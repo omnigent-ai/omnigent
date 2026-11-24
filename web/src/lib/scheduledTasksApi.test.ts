@@ -381,6 +381,24 @@ describe("createScheduledTask", () => {
     expect(bodies[1]).not.toHaveProperty("project_id");
   });
 
+  it("sends a saved workflow in place of a prompt, and reads it back", async () => {
+    const workflowId = "0123456789abcdef0123456789abcdef";
+    fetchMock.mockResolvedValue(
+      mockResponse({ ...TASK_WIRE, workflow_id: workflowId, workflow_details: "Only bugs" }),
+    );
+    const created = await createScheduledTask({
+      name: "n",
+      rrule: "FREQ=DAILY",
+      agentId: "ag_1",
+      workflowId,
+      workflowDetails: "Only bugs",
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).not.toHaveProperty("prompt");
+    expect(body).toMatchObject({ workflow_id: workflowId, workflow_details: "Only bugs" });
+    expect(created).toMatchObject({ workflowId, workflowDetails: "Only bugs" });
+  });
+
   it("sends picked MCP services and omits an empty pick", async () => {
     fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
     const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
@@ -393,6 +411,17 @@ describe("createScheduledTask", () => {
 });
 
 describe("updateScheduledTask", () => {
+  it("stops running a saved workflow with an explicit null, and leaves it when omitted", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    await updateScheduledTask("st_1", { workflowId: null, prompt: "Summarize" });
+    await updateScheduledTask("st_1", { workflowDetails: "Only bugs" });
+    await updateScheduledTask("st_1", { workflowDetails: null });
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(bodies[0]).toEqual({ workflow_id: null, prompt: "Summarize" });
+    expect(bodies[1]).toEqual({ workflow_details: "Only bugs" });
+    expect(bodies[2]).toEqual({ workflow_details: null });
+  });
+
   it.each([undefined, null, 2.5])(
     "preserves, clears, or sets the cost limit (%s)",
     async (maxCostUsd) => {

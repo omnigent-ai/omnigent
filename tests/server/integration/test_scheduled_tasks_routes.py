@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -4264,18 +4265,22 @@ async def test_a_schedule_runs_only_a_workflow_its_owner_can_run(
         bobs: "workflow_not_found",
     }
     for workflow_id, reason in refused.items():
-        created = await client.post(
-            "/v1/scheduled-tasks",
-            json=_create_body(prompt=_workflow_run_prompt(workflow_id)),
-            headers=_headers(),
-        )
-        assert created.status_code == 400, created.text
-        assert created.json()["error"]["message"].startswith(reason)
+        for body in (
+            _create_body(prompt=_workflow_run_prompt(workflow_id)),
+            _workflow_create_body(workflow_id),
+        ):
+            created = await client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+            assert created.status_code == 400, created.text
+            assert created.json()["error"]["message"].startswith(reason)
     created = await client.post(
         "/v1/scheduled-tasks", json=_create_body(prompt=workflow_prompt), headers=_headers()
     )
     assert created.status_code == 200, created.text
     url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    for workflow_id, reason in refused.items():
+        switched = await client.patch(url, json={"workflow_id": workflow_id}, headers=_headers())
+        assert switched.status_code == 400, switched.text
+        assert switched.json()["error"]["message"].startswith(reason)
     switched = await client.patch(
         url, json={"prompt": _workflow_run_prompt(bobs)}, headers=_headers()
     )
@@ -4413,6 +4418,35 @@ async def test_a_workflow_automation_saved_continuing_a_session_runs_until_edite
     assert (switched.json()["prompt"], switched.json()["session_mode"]) == (edited_prompt, "new")
 
 
+async def test_an_agent_switch_rewrites_a_continued_workflow_prompt_only_for_a_new_prefix(
+    workflows_client: httpx.AsyncClient, workflow_prompt: str, db_uri: str
+) -> None:
+    """Saved before workflows needed new sessions, the task keeps running as long as an
+    agent switch leaves its prompt as it is."""
+    from omnigent.native.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    prompt = f"  {workflow_prompt}\n"
+    task = SqlAlchemyScheduledTaskStore(db_uri).create(
+        scheduled_task_id=uuid.uuid4().hex,
+        user_id="alice@example.com",
+        **_create_body(prompt=prompt, session_mode="continue"),
+    )
+    url = f"/v1/scheduled-tasks/{task.id}"
+    for change in (
+        {"agent_id": builtin_agent_id(PI_NATIVE_AGENT_NAME)},
+        {"agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME), "prompt": prompt},
+    ):
+        kept = await workflows_client.patch(url, json=change, headers=_headers())
+        assert kept.status_code == 200, kept.text
+        assert (kept.json()["prompt"], kept.json()["session_mode"]) == (prompt, "continue")
+    # Native Codex invokes the skill with $, which changes what each run sends.
+    rewritten = await workflows_client.patch(
+        url, json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}, headers=_headers()
+    )
+    assert rewritten.status_code == 400, rewritten.text
+    assert rewritten.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+
+
 async def test_concurrent_edits_cant_combine_a_workflow_with_a_continued_session(
     workflows_client: httpx.AsyncClient, workflow_prompt: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4426,8 +4460,10 @@ async def test_concurrent_edits_cant_combine_a_workflow_with_a_continued_session
     checked = asyncio.Barrier(2)
     workflow_saved = asyncio.Event()
 
-    async def check_together(prompt: str, session_mode: str) -> str | None:
-        problem = await check(prompt, session_mode)
+    async def check_together(
+        prompt: str, session_mode: str, workflow_id: str | None = None
+    ) -> str | None:
+        problem = await check(prompt, session_mode, workflow_id)
         await checked.wait()
         if session_mode == "continue":
             await workflow_saved.wait()
@@ -4452,6 +4488,451 @@ async def test_concurrent_edits_cant_combine_a_workflow_with_a_continued_session
     assert continued.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
     saved = (await workflows_client.get(url, headers=_headers())).json()
     assert (saved["prompt"], saved["session_mode"]) == (workflow_prompt, "new")
+
+
+def _workflow_create_body(workflow_id: str, **overrides: object) -> dict[str, object]:
+    """A create body that names a saved workflow to run instead of a prompt."""
+    body = {key: value for key, value in _create_body(**overrides).items() if key != "prompt"}
+    return {**body, "workflow_id": workflow_id}
+
+
+async def test_a_schedule_saved_with_a_workflow_starts_every_run_in_a_new_session(
+    workflows_client: httpx.AsyncClient,
+) -> None:
+    """The server writes the prompt that runs the workflow, whatever an update says it is."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    refused = await client.post(
+        "/v1/scheduled-tasks",
+        json=_workflow_create_body(workflow_id, session_mode="continue"),
+        headers=_headers(),
+    )
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json={**_workflow_create_body(workflow_id), "workflow_details": "Only bugs"},
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    assert task["prompt"] == f"{_workflow_run_prompt(workflow_id)}\n\nOnly bugs"
+    assert (task["workflow_id"], task["workflow_details"]) == (workflow_id, "Only bugs")
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    continuing = await client.patch(url, json={"session_mode": "continue"}, headers=_headers())
+    assert continuing.status_code == 400, continuing.text
+    assert continuing.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    # A prompt an agent rewords can't make it something that may continue a session.
+    reworded = await client.patch(
+        url,
+        json={"session_mode": "continue", "prompt": "Run my saved workflow Triage"},
+        headers=_headers(),
+    )
+    assert reworded.status_code == 400, reworded.text
+    assert reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_PROMPT_OWNED_MSG
+    saved = (await client.get(url, headers=_headers())).json()
+    assert (saved["prompt"], saved["session_mode"]) == (task["prompt"], "new")
+
+
+async def test_only_an_explicit_null_stops_a_schedule_running_its_workflow(
+    workflows_client: httpx.AsyncClient,
+) -> None:
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post(
+        "/v1/scheduled-tasks", json=_workflow_create_body(workflow_id), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    # The agent tool resends the saved prompt with every update.
+    renamed = await client.patch(
+        url, json={"name": "renamed", "prompt": task["prompt"]}, headers=_headers()
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["workflow_id"] == workflow_id
+    detailed = await client.patch(url, json={"workflow_details": "Only bugs"}, headers=_headers())
+    assert detailed.status_code == 200, detailed.text
+    assert detailed.json()["prompt"] == f"{_workflow_run_prompt(workflow_id)}\n\nOnly bugs"
+    assert detailed.json()["workflow_details"] == "Only bugs"
+    other_id = await _save_workflow(client, name="Other")
+    replaced = await client.patch(url, json={"workflow_id": other_id}, headers=_headers())
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.json()["prompt"] == (
+        f'/workflow Run the saved workflow "Other" (ID {other_id}).\n\nOnly bugs'
+    )
+    restored = await client.patch(url, json={"workflow_id": workflow_id}, headers=_headers())
+    assert restored.status_code == 200, restored.text
+    cleared = await client.patch(url, json={"workflow_details": None}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert (cleared.json()["prompt"], cleared.json()["workflow_id"]) == (
+        _workflow_run_prompt(workflow_id),
+        workflow_id,
+    )
+    assert cleared.json()["workflow_details"] == ""
+    reworded = await client.patch(
+        url, json={"prompt": "Summarize overnight activity"}, headers=_headers()
+    )
+    assert reworded.status_code == 400, reworded.text
+    assert reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_PROMPT_OWNED_MSG
+    for change in (
+        {"workflow_id": None},
+        {"workflow_id": None, "prompt": _workflow_run_prompt(workflow_id)},
+    ):
+        refused = await client.patch(url, json=change, headers=_headers())
+        assert refused.status_code == 400, refused.text
+        assert (
+            refused.json()["error"]["message"]
+            == scheduled_tasks_routes._STOP_WORKFLOW_NEEDS_PROMPT_MSG
+        )
+    stopped = await client.patch(
+        url,
+        json={"workflow_id": None, "prompt": "Summarize overnight activity"},
+        headers=_headers(),
+    )
+    assert stopped.status_code == 200, stopped.text
+    assert (stopped.json()["workflow_id"], stopped.json()["workflow_details"]) == (None, None)
+    contradicts = await client.patch(
+        url,
+        json={"workflow_id": None, "prompt": _workflow_run_prompt(workflow_id)},
+        headers=_headers(),
+    )
+    assert contradicts.status_code == 400, contradicts.text
+    continuing = await client.patch(url, json={"session_mode": "continue"}, headers=_headers())
+    assert continuing.status_code == 200, continuing.text
+
+
+async def test_a_prompt_in_the_exact_form_saves_the_workflow_it_runs(
+    workflows_client: httpx.AsyncClient, workflow_prompt: str, db_uri: str
+) -> None:
+    """Older clients write the run message themselves, and older servers stored nothing else."""
+    client = workflows_client
+    workflow_id = workflow_prompt.split("(ID ")[1][:32]
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(prompt=f"{workflow_prompt}\n\nOnly bugs"),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    assert (created.json()["workflow_id"], created.json()["workflow_details"]) == (
+        workflow_id,
+        "Only bugs",
+    )
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    assert store.get(created.json()["id"]).workflow_id == workflow_id
+    legacy = store.create(
+        scheduled_task_id=uuid.uuid4().hex,
+        user_id="alice@example.com",
+        **_create_body(prompt=workflow_prompt),
+    )
+    assert legacy.workflow_id is None
+    url = f"/v1/scheduled-tasks/{legacy.id}"
+    assert (await client.get(url, headers=_headers())).json()["workflow_id"] == workflow_id
+    continuing = await client.patch(url, json={"session_mode": "continue"}, headers=_headers())
+    assert continuing.status_code == 400, continuing.text
+    detailed = await client.patch(
+        url, json={"workflow_details": "Only flakes"}, headers=_headers()
+    )
+    assert detailed.status_code == 200, detailed.text
+    assert store.get(legacy.id).workflow_id == workflow_id
+
+
+async def test_an_unchanged_workflow_doesnt_block_other_edits_once_it_is_gone(
+    workflows_client: httpx.AsyncClient,
+) -> None:
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json={**_workflow_create_body(workflow_id), "workflow_details": "Only bugs"},
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    deleted = await client.delete(f"/v1/workflows/{workflow_id}", headers=_headers())
+    assert deleted.status_code == 200, deleted.text
+    # Resending the workflow and details it runs, however they're trimmed, leaves them be.
+    renamed = await client.patch(
+        url,
+        json={"name": "renamed", "workflow_id": workflow_id, "workflow_details": " Only bugs\n"},
+        headers=_headers(),
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["prompt"] == task["prompt"]
+    # Another agent's harness invokes the workflow skill its own way.
+    switched = await client.patch(
+        url, json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}, headers=_headers()
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["prompt"] == f"${task['prompt'][1:]}"
+    # Changing what it runs needs a workflow its owner can run.
+    detailed = await client.patch(
+        url, json={"workflow_details": "Only flakes"}, headers=_headers()
+    )
+    assert detailed.status_code == 400, detailed.text
+    assert detailed.json()["error"]["message"].startswith("workflow_not_found")
+
+
+async def test_a_prompt_an_older_server_rewrote_decides_what_the_task_runs(
+    workflows_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Its later edit leaves the stored workflow behind; edits still save and realign it."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post(
+        "/v1/scheduled-tasks", json=_workflow_create_body(workflow_id), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    # A server that doesn't store workflows writes only the prompt.
+    store.update(task_id, prompt="Summarize overnight activity")
+    assert store.get(task_id).workflow_id == workflow_id
+    url = f"/v1/scheduled-tasks/{task_id}"
+    assert (await client.get(url, headers=_headers())).json()["workflow_id"] is None
+    paused = await client.patch(url, json={"state": "paused"}, headers=_headers())
+    assert paused.status_code == 200, paused.text
+    assert store.get(task_id).workflow_id is None
+    continuing = await client.patch(url, json={"session_mode": "continue"}, headers=_headers())
+    assert continuing.status_code == 200, continuing.text
+
+
+async def test_a_run_message_inside_other_text_keeps_it(
+    workflows_client: httpx.AsyncClient, workflow_prompt: str, db_uri: str
+) -> None:
+    """The server rewrites only a bare run message, so it never drops a header around one."""
+    client = workflows_client
+    prompt = f"<!-- omnigent-trigger v1 {{}} -->\n{workflow_prompt}"
+    task = SqlAlchemyScheduledTaskStore(db_uri).create(
+        scheduled_task_id=uuid.uuid4().hex,
+        user_id="alice@example.com",
+        **_create_body(prompt=prompt),
+    )
+    url = f"/v1/scheduled-tasks/{task.id}"
+    other_id = await _save_workflow(client, name="Other")
+    for change in ({"workflow_details": "Only bugs"}, {"workflow_id": other_id}):
+        refused = await client.patch(url, json=change, headers=_headers())
+        assert refused.status_code == 400, refused.text
+        assert (
+            refused.json()["error"]["message"]
+            == scheduled_tasks_routes._WORKFLOW_PROMPT_WRAPPED_MSG
+        )
+    switched = await client.patch(
+        url, json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}, headers=_headers()
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["prompt"] == prompt
+
+
+async def test_a_workflow_runs_with_its_agents_skill_prefix(
+    workflows_client: httpx.AsyncClient,
+) -> None:
+    workflow_id = await _save_workflow(workflows_client)
+    created = await workflows_client.post(
+        "/v1/scheduled-tasks",
+        json=_workflow_create_body(
+            workflow_id, agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+        ),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["prompt"] == f"${_workflow_run_prompt(workflow_id)[1:]}"
+
+
+async def test_an_edit_checked_before_a_concurrent_attach_cant_replace_its_prompt(
+    workflows_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The edit checked while the task ran no workflow lands second, and is refused."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    assert created.status_code == 200, created.text
+    url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    check = scheduled_tasks_routes._workflow_reuse_problem
+    checked = asyncio.Barrier(2)
+    workflow_saved = asyncio.Event()
+
+    async def check_together(
+        prompt: str, session_mode: str, workflow_id: str | None = None
+    ) -> str | None:
+        problem = await check(prompt, session_mode, workflow_id)
+        await checked.wait()
+        if workflow_id is None:
+            await workflow_saved.wait()
+        return problem
+
+    async def attach_workflow() -> httpx.Response:
+        try:
+            return await client.patch(url, json={"workflow_id": workflow_id}, headers=_headers())
+        finally:
+            workflow_saved.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_workflow_reuse_problem", check_together)
+    async with asyncio.timeout(10):
+        attached, reworded = await asyncio.gather(
+            attach_workflow(),
+            client.patch(url, json={"prompt": "Summarize overnight activity"}, headers=_headers()),
+        )
+    assert attached.status_code == 200, attached.text
+    assert reworded.status_code == 409, reworded.text
+    assert reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_CHANGED_MSG
+    saved = (await client.get(url, headers=_headers())).json()
+    assert (saved["prompt"], saved["workflow_id"]) == (
+        _workflow_run_prompt(workflow_id),
+        workflow_id,
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}, {"workflow_details": "Only flakes"}],
+    ids=["agent-only", "details-only"],
+)
+async def test_an_edit_derived_before_a_concurrent_detach_cant_restore_the_workflow(
+    workflows_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    change: dict[str, object],
+) -> None:
+    """An edit whose run message came from the snapshot lands after a detach, and is refused."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json={**_workflow_create_body(workflow_id), "workflow_details": "Only bugs"},
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    check = scheduled_tasks_routes._workflow_reuse_problem
+    checked = asyncio.Barrier(2)
+    detached = asyncio.Event()
+
+    async def check_together(
+        prompt: str, session_mode: str, workflow_id: str | None = None
+    ) -> str | None:
+        problem = await check(prompt, session_mode, workflow_id)
+        await checked.wait()
+        if workflow_id is not None:
+            await detached.wait()
+        return problem
+
+    async def detach() -> httpx.Response:
+        try:
+            return await client.patch(
+                url,
+                json={"workflow_id": None, "prompt": "Summarize overnight activity"},
+                headers=_headers(),
+            )
+        finally:
+            detached.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_workflow_reuse_problem", check_together)
+    async with asyncio.timeout(10):
+        stopped, stale = await asyncio.gather(
+            detach(), client.patch(url, json=change, headers=_headers())
+        )
+    assert stopped.status_code == 200, stopped.text
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_CHANGED_MSG
+    saved = (await client.get(url, headers=_headers())).json()
+    assert (saved["prompt"], saved["workflow_id"]) == ("Summarize overnight activity", None)
+
+
+async def test_a_resent_prompt_cant_undo_a_detach_that_lands_first(
+    workflows_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The agent tool resends the current prompt with a rename; it saves nothing new."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post(
+        "/v1/scheduled-tasks", json=_workflow_create_body(workflow_id), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    align = scheduled_tasks_routes._align_stored_workflow
+    read = threading.Event()
+    detached = threading.Event()
+
+    def align_after_detach(existing: Any, fields: dict[str, Any]) -> bool:
+        # Runs in a worker thread, so waiting here leaves the detach free to land.
+        if fields.get("name") == "renamed":
+            read.set()
+            assert detached.wait(timeout=10)
+        return align(existing, fields)
+
+    async def detach() -> httpx.Response:
+        await asyncio.to_thread(read.wait, 10)
+        try:
+            return await client.patch(
+                url,
+                json={"workflow_id": None, "prompt": "Summarize overnight activity"},
+                headers=_headers(),
+            )
+        finally:
+            detached.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_align_stored_workflow", align_after_detach)
+    async with asyncio.timeout(15):
+        renamed, stopped = await asyncio.gather(
+            client.patch(
+                url, json={"name": "renamed", "prompt": task["prompt"]}, headers=_headers()
+            ),
+            detach(),
+        )
+    assert stopped.status_code == 200, stopped.text
+    assert renamed.status_code == 200, renamed.text
+    saved = (await client.get(url, headers=_headers())).json()
+    assert (saved["name"], saved["prompt"], saved["workflow_id"]) == (
+        "renamed",
+        "Summarize overnight activity",
+        None,
+    )
+
+
+async def test_an_agent_switch_read_before_a_concurrent_attach_conflicts(
+    workflows_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whether the new agent needs another skill prefix was decided without the workflow."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    assert created.status_code == 200, created.text
+    url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    codex = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    align = scheduled_tasks_routes._align_stored_workflow
+    read = threading.Event()
+    attached = threading.Event()
+
+    def align_after_attach(existing: Any, fields: dict[str, Any]) -> bool:
+        # Runs in a worker thread, so waiting here leaves the attach free to land.
+        if fields.get("agent_id") == codex:
+            read.set()
+            assert attached.wait(timeout=10)
+        return align(existing, fields)
+
+    async def attach() -> httpx.Response:
+        await asyncio.to_thread(read.wait, 10)
+        try:
+            return await client.patch(url, json={"workflow_id": workflow_id}, headers=_headers())
+        finally:
+            attached.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_align_stored_workflow", align_after_attach)
+    async with asyncio.timeout(15):
+        switched, attaching = await asyncio.gather(
+            client.patch(url, json={"agent_id": codex}, headers=_headers()), attach()
+        )
+    assert attaching.status_code == 200, attaching.text
+    assert switched.status_code == 409, switched.text
+    assert switched.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_CHANGED_MSG
+    saved = (await client.get(url, headers=_headers())).json()
+    # The run message still matches the agent the task runs.
+    assert (saved["agent_id"], saved["prompt"]) == (
+        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        _workflow_run_prompt(workflow_id),
+    )
 
 
 async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(
