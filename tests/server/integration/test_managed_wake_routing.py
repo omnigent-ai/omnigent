@@ -90,8 +90,9 @@ def managed_wake(
     events: list[str] = []
     dial: dict[str, Any] = {"replica": stack.tunnel_replica}
 
-    async def fake_resume(host_id: str, *_args: object, **_kwargs: object) -> None:
+    async def fake_resume(host_id: str, *_args: object, **kwargs: object) -> None:
         events.append("resume")
+        events.append(f"slice_key_enabled={kwargs.get('slice_key_enabled')}")
         dial["replica"].state.host_registry.register(
             host_id,
             AsyncMock(),
@@ -222,6 +223,26 @@ async def test_matching_key_wakes_and_launches_runner_before_ready(
     assert not _wrong_replica(response), response.text
     assert "resume" in events and "launch" in events and "ready" in events, events
     assert events.index("resume") < events.index("launch") < events.index("ready"), events
+    assert "slice_key_enabled=True" in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("entry_point", ["message", "compact", "terminal", "retry"])
+async def test_joined_session_routed_by_its_host_wakes_the_host_keyed(
+    two_replica_stack: Any, managed_wake: Any, entry_point: str
+) -> None:
+    """A session that joined the host carries no label; the request's key still keys the wake."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=False, wrapper=entry_point == "compact")
+    method, path, body = _route(entry_point, session_id)
+
+    response = await two_replica_stack.tunnel_client.request(
+        method, path, headers=_headers(HOST_ID), json=body
+    )
+
+    assert not _wrong_replica(response), response.text
+    assert events.index("resume") < events.index("launch") < events.index("ready"), events
+    assert "slice_key_enabled=True" in events, events
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
@@ -237,6 +258,163 @@ async def test_unkeyed_host_wakes_from_the_default_route(
 
     assert not _wrong_replica(response), response.text
     assert events.index("resume") < events.index("launch") < events.index("ready"), events
+    assert "slice_key_enabled=False" in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("labelled", [True, False], ids=["create", "joined"])
+async def test_keyless_request_never_restarts_a_host_live_elsewhere(
+    two_replica_stack: Any, managed_wake: Any, db_uri: str, labelled: bool
+) -> None:
+    """A keyless request is re-addressed by the host's id while the host is live elsewhere."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=labelled)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+
+    response = await two_replica_stack.keyless_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(None), json=MESSAGE
+    )
+
+    assert _wrong_replica(response), response.text
+    assert response.json()["error"]["slice_key"] == HOST_ID
+    assert "resume" not in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("labelled", [True, False], ids=["create", "joined"])
+async def test_host_keyed_request_to_a_host_live_on_the_default_route_is_sent_back_keyless(
+    two_replica_stack: Any, managed_wake: Any, db_uri: str, labelled: bool
+) -> None:
+    """A host-keyed request is refused at once, well inside a client's request timeout."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=labelled, local_tunnel_on_keyless=True)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+
+    started = time.monotonic()
+    response = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+
+    assert time.monotonic() - started < 5
+    assert _wrong_replica(response), response.text
+    assert "slice_key" not in response.json()["error"]
+    assert "resume" not in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("labelled", [True, False], ids=["create", "joined"])
+async def test_host_keyed_request_wakes_a_paused_host_whose_row_still_reads_live(
+    two_replica_stack: Any,
+    managed_wake: Any,
+    db_uri: str,
+    labelled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replica died with the host's tunnel: no replica holds it, but the row is still fresh."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=labelled)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+    monkeypatch.setattr(orchestration, "host_sandbox_is_running", lambda _host, _config: False)
+
+    response = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+
+    assert not _wrong_replica(response), response.text
+    assert events.index("resume") < events.index("launch") < events.index("ready"), events
+    assert "slice_key_enabled=True" in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+async def test_host_keyed_retry_after_a_failed_wake_of_a_stale_local_tunnel_wakes_again(
+    two_replica_stack: Any, managed_wake: Any, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a failed wake, the provider's paused sandbox outranks the row's fresh heartbeat."""
+    from fastapi import HTTPException
+
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=True)
+    monkeypatch.setattr(orchestration, "host_sandbox_is_running", lambda _host, _config: False)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+    connection = two_replica_stack.tunnel_replica.state.host_registry.register(
+        HOST_ID,
+        AsyncMock(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="stale", runners=[]),
+        owner=None,
+        registered_with_managed_token=True,
+    )
+    connection.last_frame_at = 0.0
+
+    async def failing_resume(*_args: object, **_kwargs: object) -> None:
+        events.append("failed-resume")
+        raise HTTPException(status_code=502, detail="resume failed")
+
+    real_resume = managed_hosts.resume_managed_host
+    monkeypatch.setattr(managed_hosts, "resume_managed_host", failing_resume)
+    failed = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+    assert not _wrong_replica(failed), failed.text
+    assert "failed-resume" in events, events
+
+    monkeypatch.setattr(managed_hosts, "resume_managed_host", real_resume)
+    retried = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+
+    assert not _wrong_replica(retried), retried.text
+    assert events.index("resume") < events.index("launch") < events.index("ready"), events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("slice_key", [None, FOREIGN_KEY], ids=["keyless", "foreign-key"])
+async def test_mismatched_key_is_rerouted_without_asking_the_provider(
+    two_replica_stack: Any,
+    managed_wake: Any,
+    db_uri: str,
+    slice_key: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal the key already decides never waits on, or fails with, the provider."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=True)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+
+    def provider_down(_host: object, _config: object) -> bool:
+        raise RuntimeError("provider status API down")
+
+    monkeypatch.setattr(orchestration, "host_sandbox_is_running", provider_down)
+
+    response = await two_replica_stack.keyless_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(slice_key), json=MESSAGE
+    )
+
+    assert _wrong_replica(response), response.text
+    assert response.json()["error"]["slice_key"] == HOST_ID
+    assert "resume" not in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+async def test_host_keyed_request_to_a_live_host_is_refused_when_the_provider_errors(
+    two_replica_stack: Any, managed_wake: Any, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable provider status leaves the live row in charge: refuse, don't restart."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=True)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+
+    def provider_down(_host: object, _config: object) -> bool:
+        raise RuntimeError("provider status API down")
+
+    monkeypatch.setattr(orchestration, "host_sandbox_is_running", provider_down)
+
+    response = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+
+    assert _wrong_replica(response), response.text
+    assert "slice_key" not in response.json()["error"]
+    assert "resume" not in events, events
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
@@ -252,6 +430,7 @@ async def test_single_replica_is_unaffected_by_a_foreign_key(
 
     assert not _wrong_replica(response), response.text
     assert events.index("resume") < events.index("launch") < events.index("ready"), events
+    assert "slice_key_enabled=True" in events, events
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
@@ -317,3 +496,4 @@ async def test_server_internal_wake_is_not_guarded(
 
     # No request means no routing key to check, so the wake runs here as before.
     assert "resume" in events, events
+    assert "slice_key_enabled=True" in events, events

@@ -20,6 +20,7 @@ from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import ErrorData
 from omnigent.errors import ErrorCode, OmnigentError
@@ -3173,11 +3174,13 @@ async def test_subagent_session_reuses_managed_sandbox_runner(
     del tunnels
 
 
+@pytest.mark.parametrize("keyed_request", [False, True], ids=["keyless", "host-keyed"])
 @pytest.mark.parametrize("requested_host_id", [None, "0123456789abcdef0123456789abcdef"])
 async def test_message_relaunches_dead_managed_sandbox(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
     requested_host_id: str | None,
+    keyed_request: bool,
 ) -> None:
     """
     A message to a session whose managed sandbox died provisions a new
@@ -3194,6 +3197,9 @@ async def test_message_relaunches_dead_managed_sandbox(
     """
     env = managed_session_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    # A host-keyed request is what a client sends on a host-sharded deployment; a keyless
+    # one exercises the single-replica path, where the guard doesn't refuse it.
+    monkeypatch.setattr("omnigent.server.routes._host_launch._host_sharded", keyed_request)
     # Let the initial create settle successfully; after that this test switches
     # the relaunch generation back to a runner-connect timeout.
     monkeypatch.setattr(
@@ -3273,6 +3279,7 @@ async def test_message_relaunches_dead_managed_sandbox(
                 "content": [{"type": "input_text", "text": "wake up"}],
             },
         },
+        headers={OMNIGENT_SLICE_KEY_HEADER: conv.host_id} if keyed_request else {},
         # The POST rides the relaunch (provision + host registration);
         # generous bound, resolves in ~a second with the fake.
         timeout=30.0,
@@ -3301,9 +3308,10 @@ async def test_message_relaunches_dead_managed_sandbox(
     assert len(fake.host_starts) == 2
     assert fake.host_starts[1].host_id == conv.host_id
     assert fake.host_starts[1].token != fake.host_starts[0].token
-    # The relaunch keeps the keying the session's create chose.
+    # The launch keys the host only when the create named its id; the relaunched
+    # generation is keyed as well when the waking request routes by the host's id.
     slice_key = render_host_config_write_command({"host": {"slice_key_enabled": True}})
-    assert fake.commands.count(slice_key) == (2 if requested_host_id else 0)
+    assert fake.commands.count(slice_key) == (2 if requested_host_id else int(keyed_request))
     assert env.host_store.is_online(conv.host_id) is True
     # The session row was re-bound to a fresh runner binding for the
     # new generation.
