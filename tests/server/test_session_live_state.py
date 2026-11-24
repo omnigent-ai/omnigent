@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -69,15 +71,49 @@ class _RecordingStore:
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
         self.labels: dict[str, dict[str, str]] = {}
+        self.children: dict[str, list[str]] = {}
+        # Stored pending counts by session, kept current by count writes.
+        self.child_pending: dict[str, int] = {}
+        self.child_runner: dict[str, str] = {}
+        self.on_child_read: Callable[[], None] | None = None
+        # Runs once, after an activity read has captured its answer.
+        self.after_activity_read: Callable[[], None] | None = None
+        self.fail_next_activity_read = False
 
     def get_conversation(self, conversation_id: str) -> SimpleNamespace:
         return SimpleNamespace(labels=self.labels.get(conversation_id, {}))
+
+    def list_child_conversation_ids_page(
+        self, parent_conversation_id: str, *, limit: int = 128
+    ) -> list[tuple[str, int]]:
+        if self.on_child_read is not None:
+            self.on_child_read()
+        return [(child_id, 0) for child_id in self.children.get(parent_conversation_id, [])][
+            :limit
+        ]
+
+    def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SimpleNamespace]:
+        if self.fail_next_activity_read:
+            self.fail_next_activity_read = False
+            raise RuntimeError("activity read failed")
+        activity = {
+            child_id: SimpleNamespace(
+                pending_elicitation_count=self.child_pending.get(child_id),
+                runner_id=self.child_runner.get(child_id),
+            )
+            for child_id in conversation_ids
+        }
+        after, self.after_activity_read = self.after_activity_read, None
+        if after is not None:
+            after()
+        return activity
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         self.pending_writes.append((conversation_id, count))
+        self.child_pending[conversation_id] = count
 
     def set_background_work_running(
         self,
@@ -291,6 +327,283 @@ def test_pending_count_hook_persists_publish_and_resolve(
         ("conv_1", 1),
         ("conv_1", 0),
     ]
+
+
+def _publish_prompt(conversation_id: str, elicitation_id: str) -> None:
+    """Record one outstanding prompt for *conversation_id* in this replica's index."""
+    pending_elicitations.record_publish(
+        conversation_id,
+        {"type": "response.elicitation_request", "elicitation_id": elicitation_id},
+    )
+
+
+@pytest.mark.parametrize(
+    ("live", "stored", "children", "child_stored", "child_live", "expected"),
+    [
+        pytest.param(0, 0, [], {}, [], [], id="matching-count-is-left-alone"),
+        pytest.param(1, 0, [], {}, [], [("conv_1", 1)], id="raises-a-lagging-count"),
+        pytest.param(0, 1, [], {}, [], [("conv_1", 0)], id="lowers-without-children"),
+        pytest.param(
+            0, 1, ["child_1"], {"child_1": 0}, [], [("conv_1", 0)], id="lowers-idle-children"
+        ),
+        pytest.param(0, 1, ["child_1"], {"child_1": 1}, [], [], id="keeps-a-child-stored-prompt"),
+        pytest.param(
+            0, 1, ["child_1"], {"child_1": 0}, ["child_1"], [], id="keeps-a-child-local-prompt"
+        ),
+        pytest.param(
+            0,
+            1,
+            [f"child_{index}" for index in range(128)],
+            {},
+            [],
+            [],
+            id="keeps-a-full-child-page",
+        ),
+    ],
+)
+def test_reconcile_pending_count_lowers_only_from_a_complete_index(
+    recording_store: _RecordingStore,
+    live: int,
+    stored: int,
+    children: list[str],
+    child_stored: dict[str, int],
+    child_live: list[str],
+    expected: list[tuple[str, int]],
+) -> None:
+    """Reconciling raises a stored count freely but lowers it only when no child counts a prompt.
+
+    Whichever replica records a child's prompt also mirrors it into the parent's
+    stored count, so the parent's own index cannot vouch for a lower value while
+    a child counts one, or while there are too many children to check.
+    """
+    pending_elicitations.reset_for_tests()
+    for index in range(live):
+        _publish_prompt("conv_1", f"elicit_{index}")
+    for child_id in child_live:
+        _publish_prompt(child_id, f"elicit_{child_id}")
+    recording_store.children["conv_1"] = children
+    recording_store.child_pending.update(child_stored)
+
+    repair = session_live_state.reconcile_pending_count("conv_1", stored)
+    assert repair is not None
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == expected
+    pending_elicitations.reset_for_tests()
+
+
+def test_reconcile_pending_count_keeps_a_prompt_published_during_its_child_read(
+    recording_store: _RecordingStore,
+) -> None:
+    """A prompt published while the repair reads children survives the repair.
+
+    The repair runs on the ordered writer and reads the index again after the
+    child read, so the stored count ends at 1 instead of the 0 sampled first.
+    """
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
+    recording_store.on_child_read = lambda: _publish_prompt("conv_1", "elicit_new")
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1)
+    assert repair is not None
+    repair.result(timeout=10)
+    _wait_until(lambda: len(recording_store.pending_writes) >= 2)
+
+    assert recording_store.pending_writes == [("conv_1", 1), ("conv_1", 1)]
+    pending_elicitations.reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        pytest.param("before-writing", [], id="before-writing-leaves-the-count"),
+        pytest.param(
+            "confirming-a-lowered-count",
+            [("conv_1", 0), ("conv_1", 1)],
+            id="confirming-a-lowered-count-restores-it",
+        ),
+    ],
+)
+def test_reconcile_pending_count_failure_keeps_the_count(
+    recording_store: _RecordingStore,
+    failure: str,
+    expected: list[tuple[str, int]],
+) -> None:
+    """A failed read never leaves a count lowered without confirmation.
+
+    A read that fails before any write leaves the stored count as it was. One
+    that fails while confirming a lowered count restores it, since a child's
+    prompt may have been mirrored into the row in the meantime.
+    """
+
+    def _fail() -> None:
+        raise RuntimeError("child read failed")
+
+    pending_elicitations.reset_for_tests()
+    if failure == "before-writing":
+        recording_store.on_child_read = _fail
+    else:
+        recording_store.children["conv_1"] = ["child_1"]
+        recording_store.child_pending["child_1"] = 0
+        recording_store.after_activity_read = lambda: setattr(
+            recording_store, "fail_next_activity_read", True
+        )
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1)
+    assert repair is not None
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == expected
+
+
+@pytest.mark.parametrize(
+    ("children", "child_pending", "child_runner", "expected"),
+    [
+        pytest.param(
+            {"conv_1": ["child_1"]},
+            {"child_1": 1},
+            {"child_1": "runner_a"},
+            [("child_1", 0), ("conv_1", 0)],
+            id="corrects-a-same-runner-child-first",
+        ),
+        pytest.param(
+            {"conv_1": ["child_1"]},
+            {"child_1": 1},
+            {"child_1": "runner_b"},
+            [],
+            id="keeps-a-child-on-another-runner",
+        ),
+        pytest.param(
+            {"conv_1": ["child_1"], "child_1": ["grandchild_1"]},
+            {"child_1": 1, "grandchild_1": 1},
+            {"child_1": "runner_a", "grandchild_1": "runner_b"},
+            [],
+            id="keeps-a-child-over-a-grandchild-on-another-runner",
+        ),
+    ],
+)
+def test_reconcile_pending_count_repairs_same_runner_children_first(
+    recording_store: _RecordingStore,
+    children: dict[str, list[str]],
+    child_pending: dict[str, int],
+    child_runner: dict[str, str],
+    expected: list[tuple[str, int]],
+) -> None:
+    """Children on this replica's runner are repaired before they hold back their parent.
+
+    This replica holds the runner, so it holds those children's prompts too, and
+    their stored counts can be corrected from its index. A child on another runner,
+    or one held back by its own child there, keeps the parent's count.
+    """
+    pending_elicitations.reset_for_tests()
+    recording_store.children.update(children)
+    recording_store.child_pending.update(child_pending)
+    recording_store.child_runner.update(child_runner)
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1, runner_id="runner_a")
+    assert repair is not None
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == expected
+
+
+@pytest.mark.parametrize(
+    "handed_off",
+    [
+        "while-queued",
+        "during-child-read",
+        "child-during-activity-read",
+        "child-rebound-during-activity-read",
+    ],
+)
+def test_reconcile_pending_count_writes_nothing_after_a_handoff(
+    recording_store: _RecordingStore,
+    handed_off: str,
+) -> None:
+    """A repair writes nothing for a session once another replica may own it.
+
+    The new owner may already have stored a genuine prompt, which this replica's
+    index never saw. That holds for the session itself and for a same-runner child
+    handed off or rebound on its own, so neither stale count is cleared.
+    """
+    pending_elicitations.reset_for_tests()
+    recording_store.children["conv_1"] = ["child_1"]
+    recording_store.child_pending["child_1"] = 1
+    recording_store.child_runner["child_1"] = "runner_a"
+    release = threading.Event()
+    blocker = session_live_state.submit("test blocker", lambda: release.wait(10))
+    if handed_off == "during-child-read":
+        recording_store.on_child_read = lambda: session_live_state.forget_live_status("conv_1")
+    elif handed_off == "child-during-activity-read":
+        recording_store.after_activity_read = lambda: session_live_state.forget_live_status(
+            "child_1"
+        )
+    elif handed_off == "child-rebound-during-activity-read":
+        recording_store.after_activity_read = lambda: recording_store.child_runner.update(
+            child_1="runner_b"
+        )
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1, runner_id="runner_a")
+    assert repair is not None
+    if handed_off == "while-queued":
+        session_live_state.forget_live_status("conv_1")
+    release.set()
+    blocker.result(timeout=10)
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == []
+
+
+def test_reconcile_pending_count_keeps_counts_past_its_session_budget(
+    recording_store: _RecordingStore,
+) -> None:
+    """A chain of stale same-runner children longer than the budget keeps every count.
+
+    The repair stops descending once its session budget is spent and treats the
+    unexamined child as possibly holding a prompt, so it reads a bounded number of
+    sessions and lowers none.
+    """
+    chain = ["conv_1"] + [f"child_{depth}" for depth in range(40)]
+    for parent, child in pairwise(chain):
+        recording_store.children[parent] = [child]
+        recording_store.child_pending[child] = 1
+        recording_store.child_runner[child] = "runner_a"
+    child_reads: list[None] = []
+    recording_store.on_child_read = lambda: child_reads.append(None)
+    pending_elicitations.reset_for_tests()
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1, runner_id="runner_a")
+    assert repair is not None
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == []
+    assert len(child_reads) <= 32
+
+
+def test_reconcile_pending_count_restores_a_child_prompt_published_after_its_check(
+    recording_store: _RecordingStore,
+) -> None:
+    """A child prompt another replica publishes after the child check survives the repair.
+
+    That replica writes the child's count, then mirrors the prompt into the
+    parent's row, after this repair read the child as idle. The repair finds
+    the child's prompt on a second look and restores the parent's count.
+    """
+    pending_elicitations.reset_for_tests()
+    recording_store.children["conv_1"] = ["child_1"]
+    recording_store.child_pending["child_1"] = 0
+
+    def _publish_on_another_replica() -> None:
+        recording_store.child_pending["child_1"] = 1
+        recording_store.set_pending_elicitation_count("conv_1", 1)
+
+    recording_store.after_activity_read = _publish_on_another_replica
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1)
+    assert repair is not None
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == [("conv_1", 1), ("conv_1", 0), ("conv_1", 1)]
 
 
 def test_runner_liveness_touch_and_clear_pass_through(

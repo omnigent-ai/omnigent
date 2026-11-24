@@ -7504,6 +7504,8 @@ function NewChatLandingContent({
   let composerAppearance: "panel" | "glass" | "default" = "default";
   if (floating) composerAppearance = "panel";
   else if (isMobileViewport) composerAppearance = "glass";
+  // The panel's prompt sits under the window's top edge, so suggestions open below it.
+  const suggestionPlacement = floating ? "below" : "above";
 
   return (
     // Desktop keeps the centered composition; mobile docks the composer. The
@@ -7694,6 +7696,7 @@ function NewChatLandingContent({
                       <SlashCommandMenu
                         query={slashCompletion.query}
                         activeIndex={slashCompletion.index}
+                        placement={suggestionPlacement}
                         onSelect={applySlashSelection}
                         commands={slashCompletion.commands}
                         builtinNames={slashCompletion.builtinNames}
@@ -7711,6 +7714,7 @@ function NewChatLandingContent({
                         query={mention?.query ?? ""}
                         fileQuery={mentionFilter}
                         activeIndex={mentionIndex}
+                        placement={suggestionPlacement}
                         entries={mentionEntries}
                         loading={mentionListingPending}
                         onOpenDir={openMentionDir}

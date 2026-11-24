@@ -144,9 +144,11 @@ const {
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerLaunchMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 } = require("./floating_composer_window");
+const { createFloatingLaunchOffers } = require("./floating_launch_offers");
 const {
   createFloatingComposerSupport,
   floatingComposerTarget,
@@ -1862,6 +1864,8 @@ const rightSidebarWindow = createRightSidebarWindow({
 
 // Main-window documents that can render the floating New Agent panel (see registerIpc).
 const floatingComposerSupport = createFloatingComposerSupport();
+// Launch messages a routed main window may send itself (see the open-in-main-window handler).
+const floatingLaunchOffers = createFloatingLaunchOffers();
 
 // "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
 // come forward from another app. The floating panel's ⇧⌘Space is held only while a
@@ -2020,6 +2024,18 @@ function openFloatingComposerFromShortcut() {
 function serverPageShown(win) {
   if (win.isDestroyed()) return null;
   return serverPageOf(win.webContents.getURL(), windows.get(win)?.serverUrl);
+}
+
+/**
+ * The window a panel route for `serverUrl` goes to: the most recent one showing its app.
+ *
+ * @param {string | null | undefined} serverUrl
+ * @returns {BrowserWindow | undefined}
+ */
+function appWindowOfServer(serverUrl) {
+  return mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
+    (win) => windows.get(win)?.serverUrl === serverUrl && serverPageShown(win) === "app",
+  );
 }
 
 /**
@@ -5425,7 +5441,10 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("get-global-shortcut is only available to a connected server page");
     }
-    return requireSettingsShortcut(id).current();
+    const shortcut = requireSettingsShortcut(id);
+    // Opening Settings is the user's cue to retry a chord another app may have released.
+    shortcut.refresh();
+    return shortcut.current();
   });
   ipcMain.handle("omnigent:set-global-shortcut", (event, setting, id = "show") => {
     if (!isPinnedOriginSender(event)) {
@@ -5498,6 +5517,8 @@ function registerIpc() {
       contents.removeListener("render-process-gone", revoke);
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
+      // Offers to this document end now, so the panel delivers without waiting out the timeout.
+      floatingLaunchOffers.forgetTaker(contents);
       // A panel built ahead goes once its server has had no supporting page for a while; a
       // reload announces again within moments, which calls the release off.
       if (!floatingComposerSupport.serves(serverUrl)) {
@@ -5544,36 +5565,89 @@ function registerIpc() {
 
   // From the panel: a session it launched, or an app page it links to, in a main window of
   // its server. The panel then hides.
-  ipcMain.handle("omnigent:floating-composer:open-in-main-window", (event, routePath) => {
+  ipcMain.handle(
+    "omnigent:floating-composer:open-in-main-window",
+    (event, routePath, launchMessage) => {
+      const panel = BrowserWindow.fromWebContents(event.sender);
+      if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
+        return { ok: false, error: "not-composer" };
+      }
+      const sessionPath = floatingComposerSessionPath(routePath);
+      const openPath = sessionPath ?? floatingComposerAppPagePath(routePath);
+      if (openPath === null) return { ok: false, error: "bad-path" };
+      // Bound by main when it built the panel; never taken from the page.
+      const serverUrl = floatingComposerController.serverUrlFor(panel);
+      // Only a window showing its server's app hears the route, not one on setup or sign-in.
+      const target = appWindowOfServer(serverUrl);
+      // A window still connecting would drop the route when its page loads; the panel stays.
+      if (target && connectionAttempts.get(target)?.pending === true) {
+        return { ok: false, error: "window-loading" };
+      }
+      // A launched session or a linked page comes forward, over the app the user was in.
+      let offer = null;
+      if (target) {
+        sendOpenPath(target, openPath);
+        focusAndRestore(target);
+        const message = sessionPath === null ? null : floatingComposerLaunchMessage(launchMessage);
+        if (message !== null && floatingLaunchOffers.isTaker(target.webContents)) {
+          offer = floatingLaunchOffers.offer(target.webContents, {
+            sessionId: sessionPath.slice("/c/".length),
+            message,
+          });
+        }
+      } else {
+        createWindow(undefined, { serverUrl, path: openPath });
+      }
+      // focusAndRestore already brought the app forward on macOS.
+      if (!target || process.platform !== "darwin") app.focus({ steal: true });
+      // After a launch the next open starts at the default placement again.
+      floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
+      if (offer === null) return { ok: true };
+      // Only the offer's outcome is awaited, and no window is focused after it, so a reopened panel keeps focus.
+      return offer.then((confirmed) => (confirmed ? { ok: true, delivery: "page" } : { ok: true }));
+    },
+  );
+
+  // From the panel: whether a launch's first message would go to a window that can send it.
+  ipcMain.handle("omnigent:floating-composer:can-hand-off", (event) => {
     const panel = BrowserWindow.fromWebContents(event.sender);
-    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
-      return { ok: false, error: "not-composer" };
-    }
-    const sessionPath = floatingComposerSessionPath(routePath);
-    const openPath = sessionPath ?? floatingComposerAppPagePath(routePath);
-    if (openPath === null) return { ok: false, error: "bad-path" };
-    // Bound by main when it built the panel; never taken from the page.
-    const serverUrl = floatingComposerController.serverUrlFor(panel);
-    // Only a window showing its server's app hears the route, not one on setup or sign-in.
-    const target = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
-      (win) => windows.get(win)?.serverUrl === serverUrl && serverPageShown(win) === "app",
+    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return false;
+    const target = appWindowOfServer(floatingComposerController.serverUrlFor(panel));
+    return (
+      target !== undefined &&
+      connectionAttempts.get(target)?.pending !== true &&
+      floatingLaunchOffers.isTaker(target.webContents)
     );
-    // A window still connecting would drop the route when its page loads; the panel stays.
-    if (target && connectionAttempts.get(target)?.pending === true) {
-      return { ok: false, error: "window-loading" };
+  });
+
+  // From a main window's top document: whether it sends the first messages of launches offered
+  // to it, for its server. Its unsubscribe sends false.
+  ipcMain.on("omnigent:floating-composer:launch-takers", (event, subscribed) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
+    if (event.senderFrame !== event.sender.mainFrame) return;
+    if (subscribed !== true) floatingLaunchOffers.forgetTaker(event.sender);
+    else if (floatingComposerSupport.supports(event.sender.id, windows.get(win).serverUrl)) {
+      floatingLaunchOffers.addTaker(event.sender);
     }
-    // A launched session or a linked page comes forward, over the app the user was in.
-    if (target) {
-      sendOpenPath(target, openPath);
-      focusAndRestore(target);
-    } else {
-      createWindow(undefined, { serverUrl, path: openPath });
-    }
-    // focusAndRestore already brought the app forward on macOS.
-    if (!target || process.platform !== "darwin") app.focus({ steal: true });
-    // After a launch the next open starts at the default placement again.
-    floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
-    return { ok: true };
+  });
+
+  // From a main window's top document: the message of a launch offered to it, once.
+  ipcMain.handle("omnigent:floating-composer:launch-take", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return null;
+    return floatingLaunchOffers.take(event.sender, offerId);
+  });
+
+  // From a main window's top document: it has rebuilt the offered message and will send it.
+  ipcMain.handle("omnigent:floating-composer:launch-confirm", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return false;
+    return floatingLaunchOffers.confirm(event.sender, offerId);
+  });
+
+  // From a main window's top document: it won't send the offered message, so the panel delivers.
+  ipcMain.handle("omnigent:floating-composer:launch-decline", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return false;
+    return floatingLaunchOffers.decline(event.sender, offerId);
   });
 
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the

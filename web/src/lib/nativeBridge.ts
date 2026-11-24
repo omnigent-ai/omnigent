@@ -359,6 +359,19 @@ export interface RightSidebarWindowBridge {
 /** Why the shell didn't open a path from the floating panel in a main window. */
 export type FloatingComposerOpenError = "not-composer" | "bad-path" | "window-loading";
 
+/** A panel launch's first message, handed to a main window that sends it. */
+export interface FloatingLaunchMessage {
+  text: string;
+  skill: { name: string; args: string } | null;
+  files: { name: string; type: string; bytes: Uint8Array<ArrayBuffer> }[];
+}
+
+/** A launch's first message the shell offers a main window to send itself. */
+export interface FloatingLaunchOffer {
+  offerId: number;
+  sessionId: string;
+}
+
 /** The desktop shell's floating New Agent panel. */
 export interface FloatingComposerBridge {
   /** From a main window: this document can render the panel (version 1) for its server. */
@@ -368,13 +381,24 @@ export interface FloatingComposerBridge {
   /** From the panel: show `/c/<id>` or an app page in a main window, then hide. */
   openInMainWindow: (
     path: string,
-  ) => Promise<{ ok: true } | { ok: false; error: FloatingComposerOpenError }>;
+    message?: FloatingLaunchMessage | null,
+  ) => Promise<{ ok: true; delivery?: "page" } | { ok: false; error: FloatingComposerOpenError }>;
   /** From the panel: its native file picker opened or closed. */
   filePicker: (state: "open" | "closed") => void;
   /** From the panel: its composer rendered, so the shell shows it without a loading state. Newer shells only. */
   ready?: () => void;
   /** To the panel: it came on screen or took the keyboard again. Returns an unsubscribe. Newer shells only. */
   onShown?: (callback: () => void) => () => void;
+  /** From the panel: whether a launch's message can go to a main window that sends it. Newer shells only. */
+  canHandOffLaunch?: () => Promise<boolean>;
+  /** From a main window: takes launches' first messages offered to it; returns an unsubscribe. Newer shells only. */
+  onLaunchOffer?: (callback: (offer: FloatingLaunchOffer) => void) => () => void;
+  /** From a main window: the offered message, once; null when it isn't ours. Newer shells only. */
+  takeLaunchOffer?: (offerId: number) => Promise<FloatingLaunchMessage | null>;
+  /** From a main window: whether the taken offer is still ours, so it may be sent. Newer shells only. */
+  confirmLaunchOffer?: (offerId: number) => Promise<boolean>;
+  /** From a main window: won't send the offer, so the panel delivers it now. Newer shells only. */
+  declineLaunchOffer?: (offerId: number) => Promise<boolean>;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
@@ -641,11 +665,17 @@ export interface GlobalShortcutSaveResult {
   ok: boolean;
   setting?: GlobalShortcutSetting;
   error?: string;
+  /** A free chord to offer in place of the one the shell couldn't register. */
+  suggestion?: string;
 }
 
-/** The saved shortcut, with `error` while it is on but the shell couldn't register it. */
+/**
+ * The saved shortcut, with `error` while it is on but the shell couldn't register it, and a
+ * `suggestion` free chord when there is one.
+ */
 export interface GlobalShortcutStatus extends GlobalShortcutSetting {
   error?: string;
+  suggestion?: string;
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";

@@ -85,6 +85,15 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   const [setting, setSetting] = useState<GlobalShortcutSetting | null>(null);
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A free chord the shell proposes, with the on or off state of the attempt it replaces.
+  const [suggestion, setSuggestion] = useState<{ accelerator: string; enabled: boolean } | null>(
+    null,
+  );
+  // A save is waiting on the shell's approval; the row's controls wait with it. They're
+  // aria-disabled rather than disabled, so the focused one keeps the keyboard.
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const recorderRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -99,8 +108,13 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
       const saved = await getGlobalShortcut(shortcutId);
       if (cancelled) return;
       setSetting(saved);
-      // On, but the shell couldn't register it at launch.
-      if (saved?.error) setError(saved.error);
+      // On, but the shell couldn't register it.
+      if (saved?.error) {
+        setError(saved.error);
+        setSuggestion(
+          saved.suggestion ? { accelerator: saved.suggestion, enabled: saved.enabled } : null,
+        );
+      }
     })();
     return () => {
       cancelled = true;
@@ -108,16 +122,30 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   }, [shortcutId]);
 
   const save = useCallback(
-    async (next: GlobalShortcutChange) => {
-      const result = await setGlobalShortcut(next, shortcutId);
-      if (result.ok) {
-        // Turning off keeps the shell's saved chord, which another window may have changed.
-        setSetting(
-          (current) => result.setting ?? { accelerator: current?.accelerator ?? "", ...next },
-        );
-        setError(null);
-      } else {
-        setError(result.error ?? "Couldn't save the shortcut.");
+    async (next: GlobalShortcutChange): Promise<boolean> => {
+      // The switch, recorder and proposal all save here, so one pending save holds all three.
+      if (savingRef.current) return false;
+      savingRef.current = true;
+      setSaving(true);
+      try {
+        const result = await setGlobalShortcut(next, shortcutId);
+        if (result.ok) {
+          // Turning off keeps the shell's saved chord, which another window may have changed.
+          setSetting(
+            (current) => result.setting ?? { accelerator: current?.accelerator ?? "", ...next },
+          );
+          setError(null);
+          setSuggestion(null);
+        } else {
+          setError(result.error ?? "Couldn't save the shortcut.");
+          setSuggestion(
+            result.suggestion ? { accelerator: result.suggestion, enabled: next.enabled } : null,
+          );
+        }
+        return result.ok;
+      } finally {
+        savingRef.current = false;
+        setSaving(false);
       }
     },
     [shortcutId],
@@ -135,6 +163,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   useEffect(() => endShellRecording, [endShellRecording]);
 
   const startRecording = () => {
+    if (savingRef.current) return;
     setRecording(true);
     if (!shellRecordsGlobalShortcut() || setting === null || shellRecordingRef.current !== null) {
       return;
@@ -193,7 +222,9 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
             {...settingsControlProps(entry, "recorder", {
               runtime: recording ? RECORDING_PROMPT : formatAccelerator(setting.accelerator),
             })}
+            ref={recorderRef}
             data-testid={`${ids.testIdPrefix}-recorder`}
+            aria-disabled={saving}
             onClick={startRecording}
             onBlur={stopRecording}
           >
@@ -209,6 +240,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
               )
             }
             data-testid={`${ids.testIdPrefix}-toggle`}
+            aria-disabled={saving}
             componentId={ids.componentId}
           />
         </div>
@@ -217,6 +249,28 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
         <p role="alert" className="text-sm text-destructive">
           {error}
         </p>
+      )}
+      {suggestion && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="self-start"
+          {...settingsControlProps(entry, "suggestion", {
+            runtime: formatAccelerator(suggestion.accelerator),
+          })}
+          aria-disabled={saving}
+          data-testid={`${ids.testIdPrefix}-suggestion`}
+          onClick={() => {
+            // Accepted, the proposal goes away, so the keyboard moves to the chord it set.
+            void save({ enabled: suggestion.enabled, accelerator: suggestion.accelerator }).then(
+              (ok) => {
+                if (ok) recorderRef.current?.focus();
+              },
+            );
+          }}
+        >
+          Use {formatAccelerator(suggestion.accelerator)} instead
+        </Button>
       )}
     </SettingsItem>
   );
