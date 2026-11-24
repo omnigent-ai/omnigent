@@ -30,6 +30,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
 from tests.server.integration.test_managed_startup_inputs import (
@@ -255,6 +256,70 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
     )
     assert response.status_code in {400, 403}, response.text
     assert not captured.get("posts")
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        pytest.param(
+            "archived",
+            "Session {receiver} is archived; unarchive it or use another session",
+            id="archived",
+        ),
+        pytest.param("closed", "Session {receiver} is closed; use another session", id="closed"),
+        pytest.param(
+            "archived_parent",
+            "Session {receiver} belongs to an archived session; "
+            "unarchive that session or use another one",
+            id="archived_parent",
+        ),
+        pytest.param(
+            "archived_sender",
+            "Session {sender} is archived; unarchive it or use another session",
+            id="archived_sender",
+        ),
+        pytest.param(
+            "archived_other_owner",
+            "Session is not owned or available",
+            id="archived_other_owner",
+        ),
+    ],
+)
+async def test_archived_or_closed_session_refusal_says_why(
+    state, expected, auth_client, peers, db_uri
+):
+    source, receiver, captured = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    if state == "archived_parent":
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={"agent_id": receiver["agent_id"], "parent_session_id": receiver["id"]},
+        )
+        assert response.status_code == 201, response.text
+        store.update_conversation(receiver["id"], archived=True)
+        receiver = response.json()
+    elif state == "archived_other_owner":
+        receiver = await _create_session_as(auth_client, "", "bob")
+        SqlAlchemyPermissionStore(db_uri).grant("alice", receiver["id"], LEVEL_EDIT)
+        store.update_conversation(receiver["id"], archived=True)
+    elif state == "closed":
+        store.set_labels(receiver["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    else:
+        archived = source if state == "archived_sender" else receiver
+        store.update_conversation(archived["id"], archived=True)
+    captured.clear()
+    refusal = await _send(auth_client, source, receiver)
+    assert expected.format(sender=source["id"], receiver=receiver["id"]) in refusal["detail"]
+    assert not captured.get("posts")
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": receiver["id"]}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert info["archived"] is (state in {"archived", "archived_other_owner"})
 
 
 @pytest.mark.parametrize("manager_kind", ["root", "child", "side_chat"])

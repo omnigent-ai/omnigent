@@ -6465,6 +6465,8 @@ async def _session_get_info_via_rest(
         {
             "session_id": snap.get("id"),
             "status": snap.get("status"),
+            # An archived session refuses messages from other sessions until unarchived.
+            "archived": snap.get("archived"),
             # Persisted conversation activity is distinct from lifecycle
             # status: repeated polls with an unchanged value let an
             # orchestrator detect a running session that is not advancing.

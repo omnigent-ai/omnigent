@@ -35,6 +35,22 @@ def _shared_with_editors(session_id: str, user_id: str, permissions: PermissionS
             return False
 
 
+def _unusable_session_error(
+    identifier: str, session: Conversation, unusable: Conversation
+) -> OmnigentError:
+    """Tell the owner that the session, or one it belongs to, is closed or archived."""
+    closed = is_session_closed(unusable.labels, unusable.title)
+    if unusable.id == session.id:
+        subject = f"Session {identifier} is {'closed' if closed else 'archived'}"
+        remedy = "use another session" if closed else "unarchive it or use another session"
+    else:
+        subject = (
+            f"Session {identifier} belongs to {'a closed' if closed else 'an archived'} session"
+        )
+        remedy = "use another session" if closed else "unarchive that session or use another one"
+    return OmnigentError(f"{subject}; {remedy}", code=ErrorCode.FORBIDDEN)
+
+
 def require_owned_session(
     identifier: str,
     user_id: str,
@@ -47,11 +63,15 @@ def require_owned_session(
     session_id = normalize_uuid(identifier)
     session = conversations.get_conversation(session_id) if session_id else None
     current, seen = session, set()
+    # Named only once ownership is established, so other callers learn nothing new.
+    unusable: Conversation | None = None
     while current is not None:
-        if current.id in seen or len(seen) >= 32 or current.archived:
+        if current.id in seen or len(seen) >= 32:
             break
-        if is_session_closed(current.labels, current.title):
-            break
+        if unusable is None and (
+            current.archived or is_session_closed(current.labels, current.title)
+        ):
+            unusable = current
         seen.add(current.id)
         if current.parent_conversation_id is not None:
             current = conversations.get_conversation(current.parent_conversation_id)
@@ -59,6 +79,9 @@ def require_owned_session(
         grant = permissions.get(user_id, current.id)
         if grant is None or grant.level != LEVEL_OWNER:
             break
+        if unusable is not None:
+            assert session is not None
+            raise _unusable_session_error(identifier, session, unusable)
         if private:
             # Child access comes from the root. Read-only viewers, including the
             # public grant, cannot add input, so they cannot steer other sessions.
