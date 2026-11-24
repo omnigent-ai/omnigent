@@ -20,8 +20,27 @@ _ENTRIES = "session_journal_entries"
 _HEADS = "session_journal_heads"
 
 
-def test_mysql_journal_content_is_bounded_bytes_the_store_encodes() -> None:
-    migration = import_module("omnigent.db.migrations.versions.5d872cd6632a_add_session_journal")
+@pytest.mark.parametrize(
+    ("revision", "column", "ddl", "limit"),
+    [
+        (
+            "5d872cd6632a_add_session_journal",
+            SqlSessionJournalEntry.__table__.c.content,
+            "content VARBINARY(16383) NOT NULL",
+            16_383,
+        ),
+        (
+            "ce6afa56e9f7_add_session_journal_plan_progress",
+            SqlSessionJournalHead.__table__.c.plan_progress,
+            "ADD COLUMN plan_progress VARBINARY(2048)",
+            2048,
+        ),
+    ],
+)
+def test_mysql_journal_payloads_are_bounded_bytes_the_store_encodes(
+    revision: str, column: sa.Column, ddl: str, limit: int
+) -> None:
+    migration = import_module(f"omnigent.db.migrations.versions.{revision}")
     dialect = mysql.dialect()
     output = StringIO()
     context = MigrationContext.configure(
@@ -29,15 +48,14 @@ def test_mysql_journal_content_is_bounded_bytes_the_store_encodes() -> None:
     )
     with Operations.context(context):
         migration.upgrade()
-    column = SqlSessionJournalEntry.__table__.c.content
-    assert str(column.type.compile(dialect=dialect)) == "VARBINARY(16383)"
-    assert "content VARBINARY(16383) NOT NULL" in output.getvalue()
-    # The journal store encodes content itself, so the column passes bytes through.
+    assert str(column.type.compile(dialect=dialect)) == f"VARBINARY({limit})"
+    assert ddl in output.getvalue()
+    # The journal store encodes these itself, so the column passes bytes through.
     bind = column.type.dialect_impl(dialect).bind_processor(dialect)
     stored = b"\x00\x00{}"
     assert bind is not None and bind(stored) == stored
     with pytest.raises(ValueError):
-        bind(stored + b"x" * 16_383)
+        bind(stored + b"x" * limit)
 
 
 @pytest.mark.parametrize(
@@ -79,27 +97,6 @@ def test_mysql_payload_types_are_bounded_and_keep_the_codec(
     assert read(bind(value)) == value
     with pytest.raises(ValueError):
         bind(value + b"x" * limit)
-
-
-def test_mysql_plan_progress_is_bounded_bytes_the_store_encodes() -> None:
-    migration = import_module(
-        "omnigent.db.migrations.versions.ce6afa56e9f7_add_session_journal_plan_progress"
-    )
-    dialect = mysql.dialect()
-    output = StringIO()
-    context = MigrationContext.configure(
-        dialect_name="mysql", opts={"as_sql": True, "output_buffer": output}
-    )
-    with Operations.context(context):
-        migration.upgrade()
-    column = SqlSessionJournalHead.__table__.c.plan_progress
-    assert str(column.type.compile(dialect=dialect)) == "VARBINARY(2048)"
-    assert "ADD COLUMN plan_progress VARBINARY(2048)" in output.getvalue()
-    bind = column.type.dialect_impl(dialect).bind_processor(dialect)
-    stored = b'\x00\x00{"total": 1}'
-    assert bind is not None and bind(stored) == stored
-    with pytest.raises(ValueError):
-        bind(stored + b"x" * 2048)
 
 
 def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) -> None:
@@ -169,7 +166,7 @@ def test_plan_progress_downgrade_keeps_heads_and_reupgrades(tmp_path: Path) -> N
         connection.execute(
             sa.text(
                 f"INSERT INTO {_HEADS} (workspace_id, conversation_id, next_position, "
-                "plan_progress) VALUES (0, :conversation, 3, :progress)"
+                "plan_progress, plan_progress_position) VALUES (0, :conversation, 3, :progress, 3)"
             ),
             {"conversation": b"\x01" * 16, "progress": b'\x00\x00{"total": 1}'},
         )
@@ -182,9 +179,9 @@ def test_plan_progress_downgrade_keeps_heads_and_reupgrades(tmp_path: Path) -> N
 
     _migrate(uri, engine, "head")
     with engine.connect() as connection:
-        # The column returns empty: the next plan or status write records it.
+        # The columns return empty: the next plan or status write records them.
         assert connection.execute(
-            sa.text(f"SELECT next_position, plan_progress FROM {_HEADS}")
-        ).one() == (3, None)
+            sa.text(f"SELECT next_position, plan_progress, plan_progress_position FROM {_HEADS}")
+        ).one() == (3, None, None)
     engine.dispose()
     clear_engine_cache()

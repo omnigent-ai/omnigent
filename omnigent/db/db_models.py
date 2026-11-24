@@ -2062,6 +2062,10 @@ class SqlSessionJournalHead(OmnigentBase):
         journal store encodes it, so a session list reads it by primary key
         instead of reading the journal. ``None`` until a plan or status write
         records it.
+    :param plan_progress_position: The ``next_position`` that ``plan_progress``
+        was recorded at. A server that doesn't record progress advances
+        ``next_position`` without it, so progress whose position differs is out
+        of date.
     """
 
     __tablename__ = "session_journal_heads"
@@ -2074,6 +2078,7 @@ class SqlSessionJournalHead(OmnigentBase):
     plan_progress: Mapped[bytes | None] = mapped_column(
         BoundedBinary(PLAN_PROGRESS_MAX_STORED_BYTES), nullable=True
     )
+    plan_progress_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class SqlWorkflow(OmnigentBase):
