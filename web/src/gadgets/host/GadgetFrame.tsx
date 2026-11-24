@@ -184,13 +184,8 @@ function newMount(): FrameMount {
 }
 
 /**
- * Runs a gadget's published HTML and answers its SDK calls. The default frame is a sandboxed
- * `srcdoc` iframe with an opaque origin and a CSP that blocks network requests (not the
- * document navigating itself); a host can supply its
- * own frame (`OmnigentHostConfig.gadgetFrame`). Each frame document gets one MessagePort, handed
- * over only after a hello carrying this mount's nonce from the frame's own window; the bridge
- * checks every call against the gadget's capabilities and the viewer's permissions, and the
- * server checks them again.
+ * Runs a gadget's published HTML in a sandboxed frame (or the host's own frame) and answers its
+ * SDK calls over one MessagePort per frame document.
  */
 export function GadgetFrame({
   app,

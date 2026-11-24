@@ -1869,6 +1869,29 @@ def test_only_a_manager_deletes_a_gadget_and_it_is_gone_for_everyone(gadgets: Fi
     assert owner.list_owned() == {"items": [], "next_cursor": None}
 
 
+def test_a_delete_whose_grant_cleanup_fails_can_be_tried_again(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = gadgets.service()
+    app = publish_board(owner)
+    gadgets.access.share(app, 2, EDIT)
+    forget = gadgets.access.forget
+    calls = []
+
+    def failing_once(gadget_id: str) -> None:
+        calls.append(gadget_id)
+        if len(calls) == 1:
+            raise OSError("grant store unavailable")
+        forget(gadget_id)
+
+    monkeypatch.setattr(gadgets.access, "forget", failing_once)
+    with pytest.raises(OSError):
+        owner.delete(app["id"])
+    assert owner.get(app["id"])["id"] == app["id"]  # Still there to delete again.
+    assert owner.delete(app["id"]) == {"id": app["id"], "deleted": True}
+    assert not gadgets.access.grants
+
+
 def test_a_gadget_is_renamed_for_everyone_by_someone_who_can_edit_it(gadgets: Fixture) -> None:
     owner = gadgets.service()
     app = publish_actions_board(owner)

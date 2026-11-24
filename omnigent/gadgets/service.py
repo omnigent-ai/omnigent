@@ -576,8 +576,10 @@ class GadgetService:
         """Deletes the gadget for everyone, with its versions, data and comments."""
         gadget, permissions = self._resolve(app_id)
         self._require(permissions, "manage")
-        self.store.delete(gadget.id)
+        # Grants first: a failed cleanup leaves the gadget there to delete again, rather
+        # than grant rows for a gadget that's already gone.
         self.access.forget(gadget.id)
+        self.store.delete(gadget.id)
         return {"id": app_id, "deleted": True}
 
     def gadget_session_status(self, app_id: str) -> dict:

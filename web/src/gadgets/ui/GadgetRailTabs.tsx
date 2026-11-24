@@ -1,9 +1,4 @@
-// Gadgets in a session's side panel: a tab for each gadget shown beside the session, a New
-// gadget tab that builds one in that session, and the gadget beside New session. The panel keeps
-// which tab is selected (saved per session, like its other tabs); gadget code asks for a tab
-// through `requestGadgetRailTab`. A gadget filling the screen is named in the page's URL, so
-// reloading, sharing or going Forward opens it the same way. Phones have no side panel, so a
-// gadget there covers the session instead.
+// Session gadget tabs and the gadget beside New session.
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MaximizeIcon, PanelsTopLeftIcon, XIcon } from "lucide-react";
