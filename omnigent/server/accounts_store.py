@@ -39,6 +39,9 @@ from omnigent.db.db_models import (
     SqlUser,
     SqlUserDailyCost,
     SqlWorkflow,
+    SqlWorkTask,
+    SqlWorkTaskSession,
+    SqlWorkView,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import (
@@ -96,6 +99,19 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
     as tombstones instead of being dropped.
     """
     workspace_id = current_workspace_id()
+    task_ids = select(SqlWorkTask.id).where(
+        SqlWorkTask.workspace_id == workspace_id, SqlWorkTask.user_id == user_id
+    )
+    session.execute(
+        delete(SqlWorkTaskSession).where(
+            SqlWorkTaskSession.workspace_id == workspace_id,
+            SqlWorkTaskSession.task_id.in_(task_ids),
+        )
+    )
+    for model in (SqlWorkTask, SqlWorkView):
+        session.execute(
+            delete(model).where(model.workspace_id == workspace_id, model.user_id == user_id)
+        )
     session.execute(
         delete(SqlUserDailyCost).where(
             SqlUserDailyCost.workspace_id == workspace_id,

@@ -940,6 +940,58 @@ class SqlProject(OmnigentBase):
     )
 
 
+class SqlWorkTask(OmnigentBase):
+    """Owner-scoped work that may span sessions and optionally belongs to a project."""
+
+    __tablename__ = "work_tasks"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    title: Mapped[str] = mapped_column(String(768), nullable=False)
+    description: Mapped[str] = mapped_column(EnvelopedText(65535), nullable=False)
+    status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    priority: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index("ix_work_tasks_owner", "workspace_id", "user_id", "created_at", "id"),
+        Index("ix_work_tasks_project", "workspace_id", "project_id", "id"),
+    )
+
+
+class SqlWorkTaskSession(OmnigentBase):
+    """Each session contributes to at most one durable task."""
+
+    __tablename__ = "work_task_sessions"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    task_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    involvement: Mapped[str] = mapped_column(String(1200), nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (Index("ix_work_task_sessions_task", "workspace_id", "task_id"),)
+
+
+class SqlWorkView(OmnigentBase):
+    """A personal query and presentation, never a container for its results."""
+
+    __tablename__ = "work_views"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    name: Mapped[str] = mapped_column(String(480), nullable=False)
+    definition: Mapped[dict[str, Any]] = mapped_column(EnvelopedJSON(16383), nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (Index("ix_work_views_owner", "workspace_id", "user_id", "created_at", "id"),)
+
+
 class SqlConversation(ConversationBase):
     """
     SQLAlchemy model for the ``conversations`` table.

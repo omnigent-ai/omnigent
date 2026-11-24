@@ -647,9 +647,12 @@ def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str
     from sqlalchemy.orm import Session
 
     from omnigent.db.db_models import SqlPreference, workspace_scope
+    from omnigent.entities.work_view import LinkWorkSession, SaveView, SaveWorkTask, ViewQuery
+    from omnigent.stores.work_view_store import WorkViewStore
 
     accounts = SqlAlchemyAccountStore(db_uri)
     workflows = WorkflowStore(db_uri)
+    views = WorkViewStore(db_uri)
     saved = {}
     for workspace_id in (101, 102):
         with workspace_scope(workspace_id):
@@ -660,6 +663,11 @@ def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str
                     name="Private workflow",
                     description="Private steps.",
                     steps=[],
+                )
+                work_task = views.save_task(SaveWorkTask(title="Private task"), user_id)
+                views.save_view(SaveView(name="Personal view"), user_id)
+                views.link_session(
+                    work_task["id"], LinkWorkSession(session_id=uuid.uuid4().hex), user_id
                 )
     with Session(accounts._engine) as session:
         session.add_all(
@@ -688,6 +696,16 @@ def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str
         with workspace_scope(workspace_id):
             expected = None if (workspace_id, user_id) == (101, "alice") else workflow
             assert workflows.get(workflow.id, user_id=user_id) == expected
+            count = 0 if expected is None else 1
+            assert len(views.list_views(user_id)["data"]) == count
+            tasks = views.query(ViewQuery(), user_id)["data"]
+            assert len(tasks) == count
+            for task in tasks:
+                assert len(views.get_task(task["id"], user_id)["sessions"]) == 1
+    from omnigent.db.db_models import SqlWorkTaskSession
+
+    with Session(accounts._engine) as session:
+        assert len(session.scalars(select(SqlWorkTaskSession)).all()) == 3
 
 
 def test_cleanup_failure_rolls_back_revocation(

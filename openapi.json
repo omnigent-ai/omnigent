@@ -4662,6 +4662,27 @@
         "title": "LaunchRunnerRequest",
         "type": "object"
       },
+      "LinkWorkSession": {
+        "additionalProperties": false,
+        "properties": {
+          "involvement": {
+            "default": "",
+            "maxLength": 300,
+            "title": "Involvement",
+            "type": "string"
+          },
+          "session_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "LinkWorkSession",
+        "type": "object"
+      },
       "LiveMCPServerStatus": {
         "description": "One MCP server's connection inside a session's running harness.",
         "properties": {
@@ -7840,6 +7861,104 @@
         "title": "SandboxStatus",
         "type": "object"
       },
+      "SaveView": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 1000,
+            "title": "Description",
+            "type": "string"
+          },
+          "display": {
+            "$ref": "#/components/schemas/ViewDisplay"
+          },
+          "entity_type": {
+            "default": "tasks",
+            "enum": [
+              "tasks",
+              "projects",
+              "sessions"
+            ],
+            "title": "Entity Type",
+            "type": "string"
+          },
+          "favorite": {
+            "default": false,
+            "title": "Favorite",
+            "type": "boolean"
+          },
+          "filters": {
+            "$ref": "#/components/schemas/ViewFilters"
+          },
+          "name": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "SaveView",
+        "type": "object"
+      },
+      "SaveWorkTask": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 12000,
+            "title": "Description",
+            "type": "string"
+          },
+          "priority": {
+            "default": 0,
+            "format": "int64",
+            "maximum": 4.0,
+            "minimum": 0.0,
+            "title": "Priority",
+            "type": "integer"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "status": {
+            "default": "todo",
+            "enum": [
+              "backlog",
+              "todo",
+              "in_progress",
+              "review",
+              "done",
+              "canceled"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "SaveWorkTask",
+        "type": "object"
+      },
       "ScheduledRunLogContext": {
         "description": "Occurrence identity retained with a saved prompt across replica changes.",
         "properties": {
@@ -8431,6 +8550,11 @@
           },
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          },
+          "work_views": {
+            "default": false,
+            "title": "Work Views",
+            "type": "boolean"
           },
           "workflow_sharing": {
             "default": false,
@@ -16648,6 +16772,178 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "ViewDisplay": {
+        "additionalProperties": false,
+        "properties": {
+          "direction": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Direction",
+            "type": "string"
+          },
+          "group_by": {
+            "default": "status",
+            "enum": [
+              "none",
+              "status",
+              "project",
+              "priority"
+            ],
+            "title": "Group By",
+            "type": "string"
+          },
+          "layout": {
+            "default": "list",
+            "enum": [
+              "list",
+              "board"
+            ],
+            "title": "Layout",
+            "type": "string"
+          },
+          "order_by": {
+            "default": "updated_at",
+            "enum": [
+              "created_at",
+              "updated_at",
+              "title",
+              "priority"
+            ],
+            "title": "Order By",
+            "type": "string"
+          },
+          "properties": {
+            "items": {
+              "enum": [
+                "status",
+                "project",
+                "priority",
+                "created_at",
+                "updated_at"
+              ],
+              "type": "string"
+            },
+            "maxItems": 5,
+            "title": "Properties",
+            "type": "array"
+          },
+          "show_empty_groups": {
+            "default": false,
+            "title": "Show Empty Groups",
+            "type": "boolean"
+          }
+        },
+        "title": "ViewDisplay",
+        "type": "object"
+      },
+      "ViewFilters": {
+        "additionalProperties": false,
+        "properties": {
+          "include_archived": {
+            "default": false,
+            "title": "Include Archived",
+            "type": "boolean"
+          },
+          "no_project": {
+            "default": false,
+            "title": "No Project",
+            "type": "boolean"
+          },
+          "priorities": {
+            "items": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "maxItems": 5,
+            "title": "Priorities",
+            "type": "array"
+          },
+          "project_ids": {
+            "items": {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            "maxItems": 50,
+            "title": "Project Ids",
+            "type": "array"
+          },
+          "search": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Search",
+            "type": "string"
+          },
+          "statuses": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "title": "Statuses",
+            "type": "array"
+          },
+          "updated_after": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated After"
+          }
+        },
+        "title": "ViewFilters",
+        "type": "object"
+      },
+      "ViewQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "display": {
+            "$ref": "#/components/schemas/ViewDisplay"
+          },
+          "entity_type": {
+            "default": "tasks",
+            "enum": [
+              "tasks",
+              "projects",
+              "sessions"
+            ],
+            "title": "Entity Type",
+            "type": "string"
+          },
+          "filters": {
+            "$ref": "#/components/schemas/ViewFilters"
+          },
+          "limit": {
+            "default": 100,
+            "format": "int64",
+            "maximum": 200.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "ViewQuery",
         "type": "object"
       },
       "WorkflowDeleted": {
@@ -28974,6 +29270,540 @@
         "summary": "Get Usage",
         "tags": [
           "usage"
+        ]
+      }
+    },
+    "/v1/work-tasks": {
+      "post": {
+        "operationId": "create_task_v1_work_tasks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveWorkTask"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Task V1 Work Tasks Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Task",
+        "tags": [
+          "Work views"
+        ]
+      }
+    },
+    "/v1/work-tasks/{task_id}": {
+      "get": {
+        "operationId": "get_task_v1_work_tasks__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Task V1 Work Tasks  Task Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Task",
+        "tags": [
+          "Work views"
+        ]
+      },
+      "put": {
+        "operationId": "update_task_v1_work_tasks__task_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveWorkTask"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Task V1 Work Tasks  Task Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Task",
+        "tags": [
+          "Work views"
+        ]
+      }
+    },
+    "/v1/work-tasks/{task_id}/sessions": {
+      "post": {
+        "operationId": "link_session_v1_work_tasks__task_id__sessions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkWorkSession"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Link Session V1 Work Tasks  Task Id  Sessions Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Link Session",
+        "tags": [
+          "Work views"
+        ]
+      }
+    },
+    "/v1/work-tasks/{task_id}/sessions/{session_id}": {
+      "delete": {
+        "operationId": "unlink_session_v1_work_tasks__task_id__sessions__session_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Unlink Session V1 Work Tasks  Task Id  Sessions  Session Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Session",
+        "tags": [
+          "Work views"
+        ]
+      }
+    },
+    "/v1/work-views": {
+      "get": {
+        "operationId": "list_views_v1_work_views_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{32}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Views V1 Work Views Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Views",
+        "tags": [
+          "Work views"
+        ]
+      },
+      "post": {
+        "operationId": "create_view_v1_work_views_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveView"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create View V1 Work Views Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create View",
+        "tags": [
+          "Work views"
+        ]
+      }
+    },
+    "/v1/work-views/query": {
+      "post": {
+        "operationId": "query_view_v1_work_views_query_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ViewQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Query View V1 Work Views Query Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Query View",
+        "tags": [
+          "Work views"
+        ]
+      }
+    },
+    "/v1/work-views/{view_id}": {
+      "delete": {
+        "operationId": "delete_view_v1_work_views__view_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "view_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "View Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Delete View V1 Work Views  View Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete View",
+        "tags": [
+          "Work views"
+        ]
+      },
+      "get": {
+        "operationId": "get_view_v1_work_views__view_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "view_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "View Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get View V1 Work Views  View Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get View",
+        "tags": [
+          "Work views"
+        ]
+      },
+      "put": {
+        "operationId": "update_view_v1_work_views__view_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "view_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "View Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveView"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update View V1 Work Views  View Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update View",
+        "tags": [
+          "Work views"
         ]
       }
     },

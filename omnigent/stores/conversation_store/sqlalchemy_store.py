@@ -55,6 +55,7 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
+    SqlWorkTaskSession,
     current_workspace_id,
     uuid_to_bytes,
 )
@@ -7763,6 +7764,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         subtree_ids, retained_tasks = ap_result
 
         def delete_metadata(session: Session, batch_ids: tuple[str, ...]) -> None:
+            session.execute(
+                delete(SqlWorkTaskSession).where(
+                    SqlWorkTaskSession.workspace_id == current_workspace_id(),
+                    SqlWorkTaskSession.session_id.in_(batch_ids),
+                )
+            )
             host_ids = session.scalars(
                 select(SqlConversationMetadata.host_id)
                 .where(

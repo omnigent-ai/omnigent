@@ -83,6 +83,7 @@ import {
   ListChevronsDownUpIcon,
   ListChevronsUpDownIcon,
   ListFilterIcon,
+  LayersIcon,
   LaptopIcon,
   LayoutDashboardIcon,
   Loader2Icon,
@@ -622,6 +623,7 @@ function useActiveNavItem(): {
   isInboxPage: boolean;
   isCanvasPage: boolean;
   isTasksPage: boolean;
+  isViewsPage: boolean;
   isWorkflowsPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
@@ -645,6 +647,7 @@ function useActiveNavItem(): {
   // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
   // match the "tasks" segment by position from the end, not an absolute path.
   const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
+  const isViewsPage = !isExtensionRoute && (leaf === "views" || segments.at(-2) === "views");
   // Likewise /workflows (list) and /workflows/:workflowId (a workflow's page).
   const isWorkflowsPage =
     !isExtensionRoute && (leaf === "workflows" || segments.at(-2) === "workflows");
@@ -661,6 +664,7 @@ function useActiveNavItem(): {
     !isInboxPage &&
     !isCanvasPage &&
     !isTasksPage &&
+    !isViewsPage &&
     !isWorkflowsPage &&
     !isUsagePage &&
     !isExtensionRoute;
@@ -678,6 +682,7 @@ function useActiveNavItem(): {
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isViewsPage,
     isWorkflowsPage,
     isUsagePage,
     activeExtensionPageId,
@@ -985,6 +990,7 @@ function SidebarImpl({
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isViewsPage,
     isWorkflowsPage,
     isUsagePage,
     activeExtensionPageId,
@@ -1520,6 +1526,24 @@ function SidebarImpl({
                       )}
                     />
                     Automations
+                  </Link>
+                </Button>
+              )}
+              {serverInfo !== "loading" && serverInfo.work_views && (
+                <Button
+                  asChild
+                  variant="ghost"
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal mobile-touch-target",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isViewsPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  data-testid="views-nav"
+                >
+                  <Link to="/views" onClick={onNavClick} componentId="sidebar.views">
+                    <LayersIcon className="ui-icon text-muted-foreground" />
+                    Views
                   </Link>
                 </Button>
               )}

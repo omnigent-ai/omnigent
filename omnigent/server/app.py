@@ -283,6 +283,7 @@ class FilesystemAttachmentsInfo(BaseModel):
 
 
 class ServerInfoResponse(BaseModel):
+    work_views: bool = False
     accounts_enabled: bool
     single_user: bool
     login_url: str | None
@@ -4223,6 +4224,7 @@ def create_app(
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
                 },
+                "work_views": project_store is not None,
                 "scheduled_task_projects": automations_enabled and project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "scheduled_task_one_time": automations_enabled
@@ -4633,6 +4635,15 @@ def create_app(
     # First-class projects (owner-private session containers). Mounted only
     # when a project store is wired; the endpoints self-scope to the caller.
     if project_store is not None:
+        from omnigent.server.routes.work_views import create_work_views_router
+
+        app.include_router(
+            create_work_views_router(
+                project_store, conversation_store, permission_store, auth_provider
+            ),
+            prefix="/v1",
+            tags=["Work views"],
+        )
         app.include_router(
             create_projects_router(
                 project_store=project_store,

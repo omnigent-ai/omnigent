@@ -135,6 +135,7 @@ export interface ServerInfo {
   managed_sandboxes_enabled: boolean;
   /** The create request durably accepts managed sessions' first input. */
   durable_initial_input?: boolean;
+  work_views?: boolean;
   /**
    * Short name of the backing sandbox provider (e.g. ``"modal"``,
    * ``"lakebox"``) used to label the new-session sandbox option per
@@ -719,6 +720,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           databricks_features: data.databricks_features === true,
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
           durable_initial_input: data.durable_initial_input === true,
+          work_views: data.work_views === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           sandbox_providers: Array.isArray(data.sandbox_providers)

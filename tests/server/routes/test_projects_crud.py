@@ -30,7 +30,7 @@ from fastapi import FastAPI
 from omnigent.runtime import user_session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -49,6 +49,134 @@ BOB = "bob@example.com"
 def _as_user(user: str) -> dict[str, str]:
     """Header identifying the requesting user under header auth."""
     return {"X-Forwarded-Email": user}
+
+
+async def test_work_views_and_tasks_crud(project_client: httpx.AsyncClient, db_uri: str) -> None:
+    client = project_client
+    assert (await client.get("/v1/info")).json()["work_views"] is True
+    task_response = await client.post("/v1/work-tasks", json={"title": "Investigate"})
+    assert task_response.status_code == 200, task_response.text
+    task = task_response.json()
+    project = (await client.post("/v1/projects", json={"name": "Release"})).json()
+    update = await client.put(
+        f"/v1/work-tasks/{task['id']}",
+        json={"title": "Ship", "project_id": project["id"], "status": "review", "priority": 2},
+    )
+    assert update.status_code == 200, update.text
+    definition = {
+        "name": "Review",
+        "filters": {"statuses": ["review"]},
+        "display": {"layout": "board", "group_by": "project"},
+    }
+    saved_response = await client.post("/v1/work-views", json=definition)
+    assert saved_response.status_code == 200, saved_response.text
+    saved = saved_response.json()
+    assert (await client.get(f"/v1/work-views/{saved['id']}")).json() == saved
+    results = await client.post("/v1/work-views/query", json={"filters": definition["filters"]})
+    assert [row["id"] for row in results.json()["data"]] == [task["id"]]
+    conversations = SqlAlchemyConversationStore(db_uri)
+    session = conversations.create_conversation(title="Implement", agent_id="a" * 32)
+    linked = await client.post(
+        f"/v1/work-tasks/{task['id']}/sessions",
+        json={"session_id": session.id, "involvement": "Implementation"},
+    )
+    assert linked.status_code == 200, linked.text
+    conversations.update_conversation(session.id, archived=True)
+    detail = (await client.get(f"/v1/work-tasks/{task['id']}")).json()
+    assert detail["status"] == "review"
+    assert detail["sessions"][0]["title"] == "Implement"
+    assert detail["sessions"][0]["status"] == "archived"
+    assert (
+        await client.delete(f"/v1/work-tasks/{task['id']}/sessions/{session.id}")
+    ).status_code == 200
+    assert (await client.delete(f"/v1/work-views/{saved['id']}")).status_code == 200
+    assert (await client.get(f"/v1/work-tasks/{task['id']}")).json()["sessions"] == []
+    assert (await client.get(f"/v1/work-views/{saved['id']}")).status_code == 404
+    assert (await client.get("/v1/work-tasks/invalid")).status_code == 422
+    from omnigent.stores.work_view_store import WorkViewStore
+
+    await client.post(f"/v1/work-tasks/{task['id']}/sessions", json={"session_id": session.id})
+    assert await conversations.delete_conversation(session.id)
+    retained = WorkViewStore(db_uri).get_task(task["id"], None)
+    assert retained["sessions"] == []
+    assert retained["status"] == "review"
+
+
+async def test_work_views_personal_access_and_session_permissions(
+    multi_user_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    client = multi_user_client
+    alice, bob = _as_user(ALICE), _as_user(BOB)
+    task = (await client.post("/v1/work-tasks", json={"title": "Private"}, headers=alice)).json()
+    view = (await client.post("/v1/work-views", json={"name": "Private"}, headers=alice)).json()
+    assert (await client.get("/v1/work-views", headers=bob)).json()["data"] == []
+    assert (await client.get(f"/v1/work-tasks/{task['id']}", headers=bob)).status_code == 404
+    assert (
+        await client.put(f"/v1/work-views/{view['id']}", json={"name": "Changed"}, headers=bob)
+    ).status_code == 404
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    session = conversations.create_conversation(title="Private session", agent_id="a" * 32)
+    permissions.grant(BOB, session.id, 3)
+    endpoint = f"/v1/work-tasks/{task['id']}/sessions"
+    assert (
+        await client.post(endpoint, json={"session_id": session.id}, headers=alice)
+    ).status_code == 404
+    permissions.grant(ALICE, session.id, 1)
+    assert (
+        await client.post(endpoint, json={"session_id": session.id}, headers=alice)
+    ).status_code == 403
+    permissions.grant(ALICE, session.id, LEVEL_OWNER)
+    assert (
+        await client.post(endpoint, json={"session_id": session.id}, headers=alice)
+    ).status_code == 200
+    permissions.revoke(ALICE, session.id)
+    assert (await client.get(f"/v1/work-tasks/{task['id']}", headers=alice)).json()[
+        "sessions"
+    ] == []
+
+
+async def test_session_view_filters_and_continuation(
+    multi_user_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    client = multi_user_client
+    headers = _as_user(ALICE)
+    project = (await client.post("/v1/projects", json={"name": "Release"}, headers=headers)).json()
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    expected = []
+    for index in range(5):
+        session = conversations.create_conversation(
+            title=f"Session {index}",
+            agent_id="a" * 32,
+            project_id=project["id"] if index < 2 else None,
+        )
+        permissions.grant(ALICE if index < 4 else BOB, session.id, 3)
+        if index < 2:
+            expected.append(session.id)
+    definition = {
+        "entity_type": "sessions",
+        "filters": {"project_ids": [project["id"]], "statuses": ["offline"]},
+        "limit": 1,
+    }
+    first = await client.post("/v1/work-views/query", json=definition, headers=headers)
+    assert first.status_code == 200, first.text
+    page = first.json()
+    assert len(page["data"]) == 1 and page["has_more"]
+    second = (
+        await client.post(
+            "/v1/work-views/query",
+            json={**definition, "cursor": page["next_cursor"]},
+            headers=headers,
+        )
+    ).json()
+    assert {row["id"] for row in page["data"] + second["data"]} == set(expected)
+    all_sessions = (
+        await client.post(
+            "/v1/work-views/query", json={"entity_type": "sessions"}, headers=headers
+        )
+    ).json()
+    assert len(all_sessions["data"]) == 4
 
 
 @pytest.fixture()
