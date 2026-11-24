@@ -54,7 +54,8 @@ together in Comments.
   A compact **Loading review threads** spinner beside the layout toggle indicates
   an in-flight read. Conversation navigation shares the diff toolbar.
 - `chat-references`: `#1234` and `owner/repo#12` in agent replies, user messages
-  and /btw answers link to the github.com PR. Bare references use the session's
+  and /btw answers link to the github.com PR, or to the deployment's configured
+  destination (`link-destination`). Bare references use the session's
   own repo, including in a side chat. They stay text in tool output, code, existing
   links, after an escaped `#`, and in Enterprise, other-forge or unrecognized-remote
   checkouts, and while the runner hasn't reported the workspace repo.
@@ -188,8 +189,9 @@ same references and the panel's **Open in** menu open the configured tool, while
 
 ## Gotchas
 
-- Chat references link only to github.com. A tracked PR's repo doesn't decide the
-  workspace: an Enterprise origin with a github.com upstream stays text.
+- Chat references resolve only against github.com repos, though a configured
+  `pull_request_links` destination may then open them elsewhere. A tracked PR's repo
+  doesn't decide the workspace: an Enterprise origin with a github.com upstream stays text.
 
 - Browser stubs prove UI behavior; runner/host tests prove provider transport.
   They do not constitute a live GitHub write test.

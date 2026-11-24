@@ -967,6 +967,30 @@ def test_pull_request_links_accept_destinations_with_ports_and_ip_literals(
             },
             "url_template",
         ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://[fe80::1%25eth0]/{number}",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://bad host\\@review.example.com/{number}",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://user@review.example.com/{number}",
+            },
+            "url_template",
+        ),
     ],
     ids=[
         "not-a-mapping",
@@ -999,6 +1023,9 @@ def test_pull_request_links_accept_destinations_with_ports_and_ip_literals(
         "template-invalid-punycode",
         "template-field-in-host",
         "template-host-field-subdomain",
+        "template-scoped-ipv6",
+        "template-backslash-user-info",
+        "template-user-info",
     ],
 )
 def test_malformed_pull_request_links_stop_startup(block: object, message: str) -> None:

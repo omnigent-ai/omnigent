@@ -510,6 +510,8 @@ function parsePullRequestLinks(raw: unknown): PullRequestLinks | null {
   const value = raw as Record<string, unknown>;
   const { url_template, name, applies_to } = value;
   if (typeof url_template !== "string" || typeof name !== "string") return null;
+  // The template becomes PR links' href; never let a `javascript:` URL through.
+  if (!/^https?:\/\//i.test(url_template)) return null;
   if (!Array.isArray(applies_to) || !applies_to.every((prefix) => typeof prefix === "string")) {
     return null;
   }

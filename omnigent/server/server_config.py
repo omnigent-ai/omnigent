@@ -245,6 +245,9 @@ PULL_REQUEST_LINKS_KEY = "pull_request_links"
 _PULL_REQUEST_LINK_FIELD = re.compile(r"\{(?:host|owner|repo|number)\}")
 # Dot-separated hostname labels a browser accepts unescaped.
 _DESTINATION_HOSTNAME = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?")
+# Only a host and optional port: no user info, escapes, fields or other characters a
+# browser and ``urlsplit`` read differently, as in ``bad host\@review.example.com``.
+_DESTINATION_AUTHORITY = re.compile(r"[a-z0-9._:\[\]-]+")
 # A browser parses a host whose last label is a number as IPv4, as in `review.123`.
 _NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
 # GitHub owner and repository names, lowercased as ``applies_to`` compares them.
@@ -311,7 +314,7 @@ def _is_http_destination(template: str) -> bool:
     Whether *template* is an absolute http(s) URL whose host and port hold no fields and are valid.
     """
     parts = urlsplit(template)
-    if "{" in parts.netloc or "}" in parts.netloc:
+    if not _DESTINATION_AUTHORITY.fullmatch(parts.netloc.lower()):
         return False
     try:
         # ``port`` raises for a non-numeric or out-of-range port.

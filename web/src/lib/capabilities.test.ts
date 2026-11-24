@@ -630,6 +630,7 @@ describe("pull request links", () => {
     null,
     { ...LINKS, name: 7 },
     { ...LINKS, url_template: null },
+    { ...LINKS, url_template: "javascript:alert({number})" },
     { ...LINKS, applies_to: "github.com" },
     { ...LINKS, applies_to: ["github.com", 42] },
   ])("keeps code-host links for an older server or a malformed block: %j", async (links) => {
