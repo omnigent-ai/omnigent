@@ -1645,6 +1645,67 @@ def test_an_editor_requests_a_declared_action_and_the_session_records_its_progre
         update(running["version"], "u-3", state="failed")
 
 
+def test_an_identical_action_retry_after_a_republish_gets_its_first_receipt(
+    gadgets: Fixture,
+) -> None:
+    service = gadgets.service()
+    app = publish_actions_board(service)
+    request = {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "req-1"}
+    queued = service.request_action(app["id"], request)
+    # An HTML-only publication: same actions, a different revision.
+    revision = service.create_revision(
+        app["id"],
+        {
+            "html": "<main>Synthetic action board, restyled</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read", "data.write"],
+            "collections": _RULED_COLLECTIONS,
+            "actions": [RUN_CARD_ACTION],
+        },
+    )
+    current = service.get(app["id"])
+    service.publish(app["id"], {"revision_id": revision["id"], "if_version": current["version"]})
+    assert service.request_action(app["id"], request) == queued
+    # The same operation ID for a different request is still refused.
+    with pytest.raises(Conflict) as reused:
+        service.request_action(app["id"], {**request, "params": {"cardId": "c2"}})
+    assert reused.value.reason == "operation_reuse"
+
+
+def test_an_action_past_the_open_limit_is_refused_before_it_is_accepted(
+    gadgets: Fixture,
+) -> None:
+    service = gadgets.service()
+    app = publish_actions_board(service)
+    limit = service_module.MAX_OPEN_ACTIONS
+    for number in range(limit):
+        service.request_action(
+            app["id"],
+            {
+                "action": "run_card",
+                "params": {"cardId": f"c{number}"},
+                "operation_id": f"r{number}",
+            },
+        )
+    with pytest.raises(CapacityExceeded) as full:
+        service.request_action(
+            app["id"],
+            {"action": "run_card", "params": {"cardId": "extra"}, "operation_id": "r-extra"},
+        )
+    assert full.value.details == {"reason": "too_many_open_actions", "limit": limit}
+    # Nothing was accepted, and every accepted action is still followed and deliverable.
+    listed = service.list_actions(app["id"])["items"]
+    assert len(listed) == limit
+    assert all(item["value"]["params"]["cardId"] != "extra" for item in listed)
+    tracked = service.action_progress(app["id"], [])["items"]
+    assert sorted(item["id"] for item in tracked) == sorted(item["id"] for item in listed)
+    # A retry of an accepted request is still answered while the gadget is full.
+    again = service.request_action(
+        app["id"], {"action": "run_card", "params": {"cardId": "c0"}, "operation_id": "r0"}
+    )
+    assert again["merged"] is False
+
+
 @pytest.mark.parametrize(
     "request_body",
     [

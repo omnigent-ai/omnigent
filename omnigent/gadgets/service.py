@@ -1209,11 +1209,19 @@ class GadgetService:
     def request_action(self, app_id: str, body: dict) -> dict:
         gadget, permissions, revision, _ = self._active(app_id)
         self._require(permissions, "publish")
-        name, params = validate_request(
-            revision.get("actions", []), body.get("action"), body.get("params")
-        )
         operation_id = _operation_id(body.get("operation_id"))
         record_id = _digest([*self.viewer.principal, operation_id])
+        ledger = self._ledger(gadget)
+        # A retry is answered from what it first asked for, before the published revision
+        # is consulted: a newer publication (even an HTML-only one) must not turn the
+        # identical request into a different one.
+        existing = self._requested_action(ledger, record_id, body)
+        if existing is None:
+            name, params = validate_request(
+                revision.get("actions", []), body.get("action"), body.get("params")
+            )
+        else:
+            name, params = existing.value["action"], existing.value["params"]
         digest = _digest([name, params])
         viewer = self._sessions(gadget).get("viewers", self.viewer.key)
         open_records = self._open_records(viewer)
@@ -1221,7 +1229,7 @@ class GadgetService:
         # Asking again for an action that is still open joins it instead of running it twice.
         # One never delivered (the viewer left the New session it opened) says so, so the
         # web app can hand it to a session again rather than wait for it.
-        for record in open_records:
+        for record in open_records if existing is None else ():
             known = progress.get(str(record.get("id")))
             if (
                 known is not None
@@ -1234,27 +1242,38 @@ class GadgetService:
                     "merged": True,
                     "delivered": delivery_of(record) is not None,
                 }
-        value = {
-            "action": name,
-            "params": params,
-            "state": "queued",
-            "summary": None,
-            "session_id": None,
-            "requested_by": self.viewer.user_id,
-            "revision_id": revision["id"],
-        }
-        if self.viewer.registration is not None:
-            value["requester_registration"] = self.viewer.registration
-        document = self._ledger(gadget).create(
-            "actions", record_id, value, operation_id, self.viewer.user_id
-        )
+        still_open = [
+            record
+            for record in open_records
+            if record.get("id") in progress
+            and progress[record["id"]]["progress"].status in OPEN_STATUSES
+        ]
+        if existing is not None:
+            document = existing
+        else:
+            # Refused before it is accepted: the viewer record follows at most this many, and
+            # an action it no longer follows could neither be delivered nor tracked.
+            if len(still_open) >= MAX_OPEN_ACTIONS:
+                raise CapacityExceeded(
+                    f"You already have {MAX_OPEN_ACTIONS} actions open on this gadget; "
+                    "ask again once one of them has finished",
+                    details={"reason": "too_many_open_actions", "limit": MAX_OPEN_ACTIONS},
+                )
+            value = {
+                "action": name,
+                "params": params,
+                "state": "queued",
+                "summary": None,
+                "session_id": None,
+                "requested_by": self.viewer.user_id,
+                "revision_id": revision["id"],
+            }
+            if self.viewer.registration is not None:
+                value["requester_registration"] = self.viewer.registration
+            document = ledger.create(
+                "actions", record_id, value, operation_id, self.viewer.user_id
+            )
         if not any(record.get("id") == document.id for record in open_records):
-            still_open = [
-                record
-                for record in open_records
-                if record.get("id") in progress
-                and progress[record["id"]]["progress"].status in OPEN_STATUSES
-            ]
             record = {"id": document.id, "digest": digest, "requested_at": int(time.time())}
             self._save_viewer(gadget, viewer, [*still_open, record], "open-" + operation_id)
             delivered = False
@@ -1265,6 +1284,25 @@ class GadgetService:
                 for record in open_records
             )
         return {**document.to_dict(), "merged": False, "delivered": delivered}
+
+    def _requested_action(self, ledger: Any, record_id: str, body: dict) -> Any:
+        """The ledger entry this operation ID already requested, if any.
+
+        :raises Conflict: ``operation_reuse`` when it asked for a different action or params.
+        """
+        existing = ledger.get("actions", record_id)
+        if existing is None:
+            return None
+        params = {} if body.get("params") is None else body.get("params")
+        if (existing.value.get("action"), existing.value.get("params")) != (
+            body.get("action"),
+            params,
+        ):
+            raise Conflict(
+                "operation_id was already used for a different request",
+                reason="operation_reuse",
+            )
+        return existing
 
     def record_delivery(self, app_id: str, action_id: str, body: dict) -> dict:
         """Records that the web app posted the viewer's action into their gadget session."""

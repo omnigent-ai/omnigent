@@ -104,9 +104,16 @@ class InvalidInput(StoreError):
 
 
 class CapacityExceeded(StoreError):
-    """A bounded resource (revisions, records, listing size) is full."""
+    """A bounded resource (revisions, records, listing size) is full.
+
+    ``details`` is machine-readable context the API returns with the error.
+    """
 
     code = "CAPACITY_EXCEEDED"
+
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details
 
 
 class CorruptData(StoreError):
