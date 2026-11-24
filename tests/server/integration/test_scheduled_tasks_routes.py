@@ -4426,8 +4426,10 @@ async def test_concurrent_edits_cant_combine_a_workflow_with_a_continued_session
     checked = asyncio.Barrier(2)
     workflow_saved = asyncio.Event()
 
-    async def check_together(prompt: str, session_mode: str) -> str | None:
-        problem = await check(prompt, session_mode)
+    async def check_together(
+        prompt: str, session_mode: str, workflow_id: str | None = None
+    ) -> str | None:
+        problem = await check(prompt, session_mode, workflow_id)
         await checked.wait()
         if session_mode == "continue":
             await workflow_saved.wait()
@@ -4452,6 +4454,166 @@ async def test_concurrent_edits_cant_combine_a_workflow_with_a_continued_session
     assert continued.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
     saved = (await workflows_client.get(url, headers=_headers())).json()
     assert (saved["prompt"], saved["session_mode"]) == (workflow_prompt, "new")
+
+
+def _workflow_create_body(workflow_id: str, **overrides: object) -> dict[str, object]:
+    """A create body that names a saved workflow to run instead of a prompt."""
+    body = {key: value for key, value in _create_body(**overrides).items() if key != "prompt"}
+    return {**body, "workflow_id": workflow_id}
+
+
+async def test_a_schedule_saved_with_a_workflow_starts_every_run_in_a_new_session(
+    workflows_client: httpx.AsyncClient,
+) -> None:
+    """The server writes the prompt that runs the workflow, whatever an update says it is."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    refused = await client.post(
+        "/v1/scheduled-tasks",
+        json=_workflow_create_body(workflow_id, session_mode="continue"),
+        headers=_headers(),
+    )
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json={**_workflow_create_body(workflow_id), "workflow_details": "Only bugs"},
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    assert task["prompt"] == f"{_workflow_run_prompt(workflow_id)}\n\nOnly bugs"
+    assert (task["workflow_id"], task["workflow_details"]) == (workflow_id, "Only bugs")
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    continuing = await client.patch(url, json={"session_mode": "continue"}, headers=_headers())
+    assert continuing.status_code == 400, continuing.text
+    assert continuing.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    # A prompt an agent rewords can't make it something that may continue a session.
+    reworded = await client.patch(
+        url,
+        json={"session_mode": "continue", "prompt": "Run my saved workflow Triage"},
+        headers=_headers(),
+    )
+    assert reworded.status_code == 400, reworded.text
+    assert (
+        reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_PROMPT_OWNED_MSG
+    )
+    saved = (await client.get(url, headers=_headers())).json()
+    assert (saved["prompt"], saved["session_mode"]) == (task["prompt"], "new")
+
+
+async def test_only_an_explicit_null_stops_a_schedule_running_its_workflow(
+    workflows_client: httpx.AsyncClient,
+) -> None:
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post(
+        "/v1/scheduled-tasks", json=_workflow_create_body(workflow_id), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    # The agent tool resends the saved prompt with every update.
+    renamed = await client.patch(
+        url, json={"name": "renamed", "prompt": task["prompt"]}, headers=_headers()
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["workflow_id"] == workflow_id
+    detailed = await client.patch(url, json={"workflow_details": "Only bugs"}, headers=_headers())
+    assert detailed.status_code == 200, detailed.text
+    assert detailed.json()["prompt"] == f"{_workflow_run_prompt(workflow_id)}\n\nOnly bugs"
+    assert detailed.json()["workflow_details"] == "Only bugs"
+    reworded = await client.patch(
+        url, json={"prompt": "Summarize overnight activity"}, headers=_headers()
+    )
+    assert reworded.status_code == 400, reworded.text
+    assert (
+        reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_PROMPT_OWNED_MSG
+    )
+    for change in (
+        {"workflow_id": None},
+        {"workflow_id": None, "prompt": _workflow_run_prompt(workflow_id)},
+    ):
+        refused = await client.patch(url, json=change, headers=_headers())
+        assert refused.status_code == 400, refused.text
+        assert (
+            refused.json()["error"]["message"]
+            == scheduled_tasks_routes._STOP_WORKFLOW_NEEDS_PROMPT_MSG
+        )
+    stopped = await client.patch(
+        url,
+        json={"workflow_id": None, "prompt": "Summarize overnight activity"},
+        headers=_headers(),
+    )
+    assert stopped.status_code == 200, stopped.text
+    assert (stopped.json()["workflow_id"], stopped.json()["workflow_details"]) == (None, None)
+    continuing = await client.patch(url, json={"session_mode": "continue"}, headers=_headers())
+    assert continuing.status_code == 200, continuing.text
+
+
+async def test_a_prompt_in_the_exact_form_saves_the_workflow_it_runs(
+    workflows_client: httpx.AsyncClient, workflow_prompt: str, db_uri: str
+) -> None:
+    """Older clients write the run message themselves, and older servers stored nothing else."""
+    client = workflows_client
+    workflow_id = workflow_prompt.split("(ID ")[1][:32]
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(prompt=f"{workflow_prompt}\n\nOnly bugs"),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    assert (created.json()["workflow_id"], created.json()["workflow_details"]) == (
+        workflow_id,
+        "Only bugs",
+    )
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    assert store.get(created.json()["id"]).workflow_id == workflow_id
+    legacy = store.create(
+        scheduled_task_id=uuid.uuid4().hex,
+        user_id="alice@example.com",
+        **_create_body(prompt=workflow_prompt),
+    )
+    assert legacy.workflow_id is None
+    url = f"/v1/scheduled-tasks/{legacy.id}"
+    assert (await client.get(url, headers=_headers())).json()["workflow_id"] == workflow_id
+    continuing = await client.patch(url, json={"session_mode": "continue"}, headers=_headers())
+    assert continuing.status_code == 400, continuing.text
+    detailed = await client.patch(url, json={"workflow_details": "Only flakes"}, headers=_headers())
+    assert detailed.status_code == 200, detailed.text
+    assert store.get(legacy.id).workflow_id == workflow_id
+
+
+async def test_a_workflow_runs_with_its_agents_skill_prefix(
+    workflows_client: httpx.AsyncClient,
+) -> None:
+    workflow_id = await _save_workflow(workflows_client)
+    created = await workflows_client.post(
+        "/v1/scheduled-tasks",
+        json=_workflow_create_body(workflow_id, agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME)),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["prompt"] == f"${_workflow_run_prompt(workflow_id)[1:]}"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"prompt": "triage the queue"},
+        {"workflow_details": "Only bugs", "workflow_id": None},
+    ],
+    ids=["prompt-with-workflow", "details-without-workflow"],
+)
+async def test_a_create_names_either_a_prompt_or_a_workflow(
+    workflows_client: httpx.AsyncClient, change: dict[str, object]
+) -> None:
+    workflow_id = await _save_workflow(workflows_client)
+    body = {**_workflow_create_body(workflow_id), **change}
+    if body.get("workflow_id") is None:
+        body.pop("workflow_id")
+    refused = await workflows_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert refused.status_code == 422, refused.text
 
 
 async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(

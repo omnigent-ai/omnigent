@@ -5212,8 +5212,11 @@ def _sql_agent() -> FakeAgentStore:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+# A task an older server saved names its workflow only in its prompt; otherwise the
+# workflow the task stores decides, whatever its prompt says.
+@pytest.mark.parametrize("named_by", ["prompt", "workflow_id"])
 async def test_each_run_of_a_workflow_automation_starts_as_a_run_of_the_workflow(
-    db_uri: str, execution_target: str
+    db_uri: str, execution_target: str, named_by: str
 ) -> None:
     conversations = SqlAlchemyConversationStore(db_uri)
     workflow = open_workflow_store(conversations).create(
@@ -5225,7 +5228,11 @@ async def test_each_run_of_a_workflow_automation_starts_as_a_run_of_the_workflow
     store = FakeScheduledTaskStore(
         rows={
             "task_1": _task(
-                prompt=_workflow_prompt(workflow.id),
+                **(
+                    {"prompt": _workflow_prompt(workflow.id)}
+                    if named_by == "prompt"
+                    else {"prompt": "Only bugs", "workflow_id": workflow.id}
+                ),
                 execution_target=execution_target,
                 agent_id=next(iter(agents.agents)),
                 host_id=_SQL_HOST_ID,

@@ -165,7 +165,7 @@ from omnigent.server.scheduled.telemetry import (
     start_fire_stage,
     startup_failure_stage,
 )
-from omnigent.server.scheduled.workflow_automations import saved_workflow_id
+from omnigent.server.scheduled.workflow_automations import task_workflow_id
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.session_journal import (
     WorkflowNotFoundError,
@@ -1118,7 +1118,7 @@ async def _task_workflow(deps: FireDeps, task: ScheduledTask) -> Workflow | None
     :raises _CannotLaunchScheduledFire: ``workflows_disabled``, ``workflow_missing``
         when the owner can no longer run it, or ``workflow_invalid``.
     """
-    workflow_id = await asyncio.to_thread(saved_workflow_id, task.prompt)
+    workflow_id = await asyncio.to_thread(task_workflow_id, task)
     if workflow_id is None:
         return None
     if not workflows_enabled(deps.app_state):

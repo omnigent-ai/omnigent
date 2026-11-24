@@ -346,6 +346,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_source_sessions: bool = True
     # Scheduled tasks accept ``mcp_services``; older servers reject it.
     scheduled_task_mcp_services: bool = True
+    # Scheduled tasks accept ``workflow_id`` and ``workflow_details`` and write the prompt
+    # that runs the saved workflow; older servers reject them.
+    scheduled_task_workflow_id: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as

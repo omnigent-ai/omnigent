@@ -869,6 +869,37 @@ def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -
     ) in reason.splitlines()
 
 
+def test_ask_on_scheduled_task_change_shows_the_saved_workflow_it_runs() -> None:
+    """A task created to run a saved workflow has no prompt; its details show in full."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    details = "Only the upload tests. " * 20
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_create",
+            "data": {
+                "name": "sys_scheduled_task_create",
+                "arguments": {
+                    "name": "nightly triage",
+                    "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                    "agent_id": "ag_1",
+                    "permission_mode": None,
+                    "workflow_id": "0123456789abcdef0123456789abcdef",
+                    "workflow_details": details,
+                },
+            },
+        }
+    )
+    reason = result["reason"]
+    assert result["result"] == "ASK", reason
+    assert "workflow_id=0123456789abcdef0123456789abcdef" in reason
+    instructions = reason.split("Full automation instructions:\n", 1)[1]
+    assert instructions.startswith("Runs the saved workflow 0123456789abcdef0123456789abcdef")
+    assert details in instructions
+    assert "workflow_details=" not in reason
+
+
 @pytest.mark.parametrize(
     "extras,expected",
     [
