@@ -4949,9 +4949,9 @@ async def test_codex_discover_thread_and_forward_ends_a_still_starting_record_on
             )
         )
         await asyncio.wait_for(still_starting.wait(), timeout=10.0)
-        assert codex_native_bridge.read_bridge_startup_failure(tmp_path).code == (
-            "agent_startup_pending"
-        )
+        pending = codex_native_bridge.read_bridge_startup_failure(tmp_path)
+        assert pending is not None
+        assert pending.code == codex_native_bridge.CODEX_STARTUP_PENDING_CODE
         discovery.cancel()
         with pytest.raises(asyncio.CancelledError):
             await discovery

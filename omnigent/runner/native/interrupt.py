@@ -709,7 +709,14 @@ class NativeInterruptRunner:
             )
         return Response(status_code=204)
 
-    async def _codex_interrupt(self, conv_id: str) -> Response:
+    async def _codex_interrupt(self, conv_id: str) -> Response | None:
+        """
+        Interrupt the session's Codex turn, or hand a turn waiting for Codex to the caller.
+
+        :param conv_id: Session whose turn to interrupt.
+        :returns: The interrupt's response, or ``None`` before Codex has a thread,
+            so the caller cancels the in-process turn waiting for it to start.
+        """
         from omnigent.harnesses.codex_native.app_server import (
             CodexAppServerResponseError,
             client_for_transport,
@@ -724,7 +731,8 @@ class NativeInterruptRunner:
 
         state, bridge_dir = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
-            return Response(status_code=204)
+            # A message held for Codex to start lives in the runner's turn, not in Codex.
+            return None
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)
         if state.active_turn_id is None and not pending_mcp:
             self._logger.info(

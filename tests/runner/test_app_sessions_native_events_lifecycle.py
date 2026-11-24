@@ -3330,6 +3330,79 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     assert int_resp.status_code == 204, int_resp.text
 
 
+@pytest.mark.asyncio
+async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_held_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop before Codex has a thread reaches the turn holding the message for it.
+
+    With no bridge state there is no Codex turn to interrupt: the message waits
+    in the runner's own turn until Codex starts. Stop must interrupt and cancel
+    that turn, or the held message would still be sent once Codex is up.
+    """
+    from omnigent.runner import app as runner_app_module
+    from tests.runner.conftest import _BlockingHarnessClient, _sse
+
+    conv_id = "7a4e2c9b1d3f4e6a8c0b2d4f6a8c0e1b"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        """Keep Codex from starting, so the session has no bridge state."""
+        del kwargs
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    never_released = asyncio.Event()
+    harness = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_held"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_held"}}),
+        ],
+        never_released,
+    )
+    codex_native_spec = _harness_spec("codex-native")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return codex_native_spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        sent = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        )
+        assert sent.status_code == 202, sent.text
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5)
+        turn = app.state.active_turns[conv_id]
+
+        stopped = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"})
+        assert stopped.status_code == 204, stopped.text
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(turn, timeout=5)
+
+    # The harness was told to stop the held turn, and the runner cancelled it and settled the Stop.
+    assert {"type": "interrupt"} in harness.patched_events
+    assert turn.cancelled()
+    assert conv_id not in app.state.interrupted_sessions
+
+
 class _StaleTurnCodexAppServerClient(_RecordingCodexAppServerClient):
     """Codex app-server double that faults the recorded-turn interrupt.
 

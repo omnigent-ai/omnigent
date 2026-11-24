@@ -4000,8 +4000,8 @@ def test_run_turn_holds_the_message_while_codex_is_still_starting(
     notice, *waits, outcome = events
     assert isinstance(notice, TextChunk)
     assert "your message will be sent once it's ready" in notice.text.lower()
-    # A keep-alive per check refreshes only the idle watchdog while the message waits.
-    assert [type(event) for event in waits] == [ExecutorWait, ExecutorWait]
+    # A keep-alive per check, and one as the hold ends, refresh only the idle watchdog.
+    assert [type(event) for event in waits] == [ExecutorWait, ExecutorWait, ExecutorWait]
     assert hold_polls == [0.25, 0.25]
     if expected_error_code is None:
         assert isinstance(outcome, TurnComplete)
@@ -4511,6 +4511,53 @@ def test_bridge_state_polling_backs_off_after_fast_window(
     assert all(delay == 0.05 for delay in sleep_delays[:-1])
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+def test_stop_as_codex_finishes_starting_submits_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A Stop that lands in the hold's last poll ends the turn before the message is sent.
+
+    The adapter checks for Stop only between events. When the thread starts in
+    the same poll the Stop arrived in, the hold still yields once more, so the
+    adapter sees the Stop and closes the turn with nothing submitted.
+    """
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    stopped = False
+
+    async def _stop_while_codex_starts(_seconds: float) -> None:
+        nonlocal stopped
+        _publish_started_thread(tmp_path)
+        stopped = True
+
+    monkeypatch.setattr(asyncio, "sleep", _stop_while_codex_starts)
+    write_bridge_startup_error(
+        tmp_path, "Codex is still starting.", code=CODEX_STARTUP_PENDING_CODE
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def _drive_like_the_adapter() -> list[object]:
+        events: list[object] = []
+        turn = executor.run_turn(
+            [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}], [], ""
+        )
+        async for event in turn:
+            events.append(event)
+            if stopped:
+                break
+        await turn.aclose()
+        return events
+
+    events = asyncio.run(_drive_like_the_adapter())
+
+    assert [type(event) for event in events] == [TextChunk, ExecutorWait, ExecutorWait]
+    assert _FakeCodexNativeClient.requests == []
 
 
 @pytest.mark.parametrize("startup_pending", [False, True], ids=["bounded-wait", "startup-hold"])

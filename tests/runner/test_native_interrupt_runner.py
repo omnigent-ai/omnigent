@@ -577,11 +577,15 @@ async def test_codex_and_pi_stop_route_to_interrupt(
 
 
 @pytest.mark.asyncio
-async def test_codex_interrupt_noop_when_no_bridge_state() -> None:
-    """codex interrupt returns 204 when there is no live bridge state."""
+async def test_codex_interrupt_defers_to_the_runner_turn_before_codex_has_a_thread() -> None:
+    """
+    Before Codex has a thread, interrupt hands Stop back to the runner's turn.
+
+    A message held while Codex starts lives in the runner's in-process turn, so
+    ``None`` lets the caller cancel that turn instead of answering 204 for nothing.
+    """
     runner, _ = _make_runner()  # default codex_bridge_state returns None
-    resp = await runner.interrupt("codex-native", "conv_cx")
-    assert isinstance(resp, Response) and resp.status_code == 204
+    assert await runner.interrupt("codex-native", "conv_cx") is None
 
 
 @pytest.mark.asyncio

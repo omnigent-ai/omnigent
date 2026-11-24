@@ -259,7 +259,8 @@ async def _wait_out_codex_startup(
     :param session_id: Omnigent session the message belongs to, for logging.
     :param announce: Whether to tell the chat why the message waits, once per turn.
     :returns: Async iterator yielding the wait notice when *announce* is set,
-        then :class:`ExecutorWait` after each check.
+        then :class:`ExecutorWait` after each check and once more as the hold ends,
+        so the consumer can stop the turn before anything is submitted.
     """
     held_at = asyncio.get_running_loop().time()
     _logger.info(
@@ -271,6 +272,8 @@ async def _wait_out_codex_startup(
     while read_bridge_state(bridge_dir) is None and _codex_startup_pending(bridge_dir):
         yield ExecutorWait()
         await asyncio.sleep(_BRIDGE_STATE_SLOW_POLL_SECONDS)
+    # A Stop during the last poll is seen here, before the message is submitted.
+    yield ExecutorWait()
     _logger.info(
         "Codex startup hold ended",
         extra=with_input_attributes(
