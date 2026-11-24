@@ -117,7 +117,7 @@ class _Served:
 
 # The methods this host answers. Only these, and GetCapabilities, are dispatched.
 _SERVED: dict[str, _Served] = {
-    "ListDirectory": _Served(),
+    "ListDirectory": _Served(features=("list_directory.collapse_single_child_directories",)),
     "ReadFile": _Served(),
     "StatPath": _Served(),
     "ReadLinkText": _Served(),
@@ -193,6 +193,7 @@ class WorkspaceService(WorkspaceServiceMethods):
             request.path,
             limit=min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE),
             after=request.page_token or None,
+            collapse_single_child_directories=request.collapse_single_child_directories,
         )
         # The REST listing has no symlink flag, so look at each entry itself.
         links = await _read(_symlinks, reader.root, [item["path"] for item in page.data])
@@ -320,6 +321,7 @@ def _entry(item: ListedEntry, *, is_symlink: bool) -> Entry:
         size=item["bytes"],
         modify_time=Timestamp(seconds=item["modified_at"]),
         is_symlink=is_symlink,
+        leaf_directory_path=item.get("leaf_directory_path", ""),
     )
 
 

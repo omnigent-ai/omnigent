@@ -286,6 +286,41 @@ function routeCapabilities(
   return entry.pending;
 }
 
+const NO_CAPABILITIES: ReadonlySet<string> = new Set();
+// Failures of the route that carried GetCapabilities, not answers from its host.
+const ROUTE_FAILURE_CODES: ReadonlySet<Code> = new Set([
+  Code.Unavailable,
+  Code.Canceled,
+  Code.DeadlineExceeded,
+  Code.Unauthenticated,
+  Code.Unknown,
+]);
+
+/**
+ * A route's capabilities for a baseline method that only uses optional features: a host
+ * that answers GetCapabilities with an error still serves the method, just without them,
+ * for as long as an Unimplemented answer would be kept. A route that can't be reached
+ * fails, so the caller moves on to the next one.
+ */
+async function optionalCapabilities(
+  route: Route,
+  sessionId: string,
+  sshTarget: string | null | undefined,
+  signal: AbortSignal | undefined,
+): Promise<ReadonlySet<string>> {
+  try {
+    return await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (!(error instanceof ConnectError) || ROUTE_FAILURE_CODES.has(error.code)) throw error;
+    capabilities.set(routeKey(route, sessionId, sshTarget), {
+      pending: Promise.resolve(NO_CAPABILITIES),
+      expiresAtMs: Date.now() + ROUTE_RETRY_MS,
+    });
+    return NO_CAPABILITIES;
+  }
+}
+
 function concat(chunks: Uint8Array[]): Uint8Array {
   const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
   let offset = 0;
@@ -338,11 +373,14 @@ export interface ListedEntry {
 }
 
 const LIST_PAGE_SIZE = 1000;
+/** The ListDirectory feature that fills each entry's `leaf_directory_path`. */
+const DIRECTORY_CHAINS = "list_directory.collapse_single_child_directories";
 
 async function listDirectory(
   client: WorkspaceClient,
   path: string,
   maxEntries: number,
+  collapseSingleChildDirectories: boolean,
   signal?: AbortSignal,
 ): Promise<{ data: ListedEntry[]; hasMore: boolean }> {
   const data: ListedEntry[] = [];
@@ -351,7 +389,12 @@ async function listDirectory(
   /* oxlint-disable no-await-in-loop */
   do {
     const page = await client.listDirectory(
-      { path, pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length), pageToken },
+      {
+        path,
+        pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length),
+        pageToken,
+        collapseSingleChildDirectories,
+      },
       { signal },
     );
     // A host that hands back the token it was given is resending a page; stop before keeping it.
@@ -370,6 +413,8 @@ interface CallOptions {
   sshTarget?: string | null;
   /** Optional features of `method` the call relies on, e.g. "search_files.substring". */
   features?: readonly string[];
+  /** Optional features the call uses when the route's host lists them; `call` is told which. */
+  usesFeatures?: readonly string[];
   /** Codes that answer the request rather than fail the route. */
   answerCodes?: ReadonlySet<Code>;
   /** Throw an answer to the caller, for methods REST can't answer instead. */
@@ -391,11 +436,12 @@ interface CallOptions {
 async function viaWorkspaceApi<T>(
   sessionId: string,
   method: Method,
-  call: (client: WorkspaceClient) => Promise<T>,
+  call: (client: WorkspaceClient, served: ReadonlySet<string>) => Promise<T>,
   {
     signal,
     sshTarget,
     features = [],
+    usesFeatures = [],
     answerCodes = ANSWER_CODES,
     throwAnswers = false,
   }: CallOptions = {},
@@ -408,12 +454,22 @@ async function viaWorkspaceApi<T>(
     const unsupportedKey = `${key}:${method}`;
     if ((unsupportedUntil.get(unsupportedKey) ?? 0) > Date.now()) continue;
     try {
+      let served: ReadonlySet<string> = NO_CAPABILITIES;
       if (checked) {
-        const served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+        served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
         const required = [capabilityName(method), ...features];
         if (!required.every((name) => served.has(name))) continue;
+      } else if (usesFeatures.length > 0) {
+        served = await optionalCapabilities(route, sessionId, sshTarget, signal);
       }
-      return await callOn(route, sessionId, call, signal, sshTarget, answerCodes);
+      return await callOn(
+        route,
+        sessionId,
+        (client) => call(client, served),
+        signal,
+        sshTarget,
+        answerCodes,
+      );
     } catch (error) {
       signal?.throwIfAborted();
       if (error instanceof UnusableAnswerError) {
@@ -446,7 +502,9 @@ async function viaWorkspaceApi<T>(
 
 /**
  * List a workspace directory through the workspace API, in the REST listing's
- * shape and order (ascending by path), reading pages up to `maxEntries`.
+ * shape and order (ascending by path), reading pages up to `maxEntries`. Where the
+ * route's host offers it, each directory whose only entry is a directory carries the
+ * end of that chain as `leaf_directory_path`, so the tree shows "a/b/c" on one row.
  *
  * :param sessionId: The session whose workspace to list.
  * :param path: Workspace-relative directory, ``""`` for the root.
@@ -465,8 +523,9 @@ export function listDirectoryViaWorkspaceApi(
   return viaWorkspaceApi(
     sessionId,
     "listDirectory",
-    (client) => listDirectory(client, path, maxEntries, signal),
-    { signal },
+    (client, served) =>
+      listDirectory(client, path, maxEntries, served.has(DIRECTORY_CHAINS), signal),
+    { signal, usesFeatures: [DIRECTORY_CHAINS] },
   );
 }
 
