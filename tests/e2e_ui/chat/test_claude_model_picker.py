@@ -10,6 +10,7 @@ import subprocess
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlparse
 
 import httpx
@@ -1445,6 +1446,33 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             )
             box = bridge._composer_box(raw)
             assert box is not None and box.framed and len(box.rows) > 1
+            bridge_id = (
+                _live_claude_snapshot(base_url, session_id)
+                .get("labels", {})
+                .get(BRIDGE_ID_LABEL_KEY, session_id)
+            )
+            assert isinstance(bridge_id, str)
+            claims = []
+            for representation, capture in (("physical", raw), ("joined", joined)):
+                claimed = model_switch._draft(capture)
+                assert isinstance(claimed, str) and claimed != draft
+                with patch.object(bridge, "_run_tmux", wraps=bridge._run_tmux) as terminal_writes:
+                    with pytest.raises(bridge.ClaudeModelSwitchRefused) as refusal:
+                        bridge.inject_model_command(
+                            bridge_dir_for_bridge_id(bridge_id), model="opus", owned_draft=claimed
+                        )
+                    terminal_writes.assert_not_called()
+                claims.append(
+                    {
+                        "representation": representation,
+                        "constructed_claim": claimed,
+                        "phase": refusal.value.phase,
+                        "command_submitted": refusal.value.command_submitted,
+                    }
+                )
+            (evidence / f"{kind}-owned-claims.json").write_text(
+                json.dumps({"actual_input": draft, "claims": claims}, ensure_ascii=False, indent=2)
+            )
             refused = client.patch(f"/v1/sessions/{session_id}", json={"model_override": "opus"})
             assert refused.status_code == 503, refused.text
             preserved = bridge._composer_box(bridge._capture_pane(advert["socket_path"], target))
