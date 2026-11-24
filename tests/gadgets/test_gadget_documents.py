@@ -642,7 +642,7 @@ def test_a_late_create_retry_after_a_delete_is_answered_without_reading_the_hist
 def test_a_create_whose_index_write_stopped_still_cannot_come_back_after_a_delete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retried_at_once: bool
 ) -> None:
-    files, docs, _clock = _counting(tmp_path)
+    _files, docs, _clock = _counting(tmp_path)
     real_index = ImmutableDocumentStore._index_create
     stopped = {"once": True}
 
