@@ -41,10 +41,11 @@ async function fetchDefaultPolicies(): Promise<DefaultPolicy[]> {
 // ── Hooks ────────────────────────────────────────────────────────────────────
 
 /** Fetch all server-wide default policies. */
-export function useDefaultPolicies() {
+export function useDefaultPolicies(enabled = true) {
   return useQuery({
     queryKey: QUERY_KEY,
     queryFn: fetchDefaultPolicies,
+    enabled,
     staleTime: 5_000,
   });
 }

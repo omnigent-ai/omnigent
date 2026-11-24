@@ -7,6 +7,7 @@
 // policy hooks (useDefaultPolicies / usePolicyRegistry + add/update/delete
 // mutations) so no QueryClient or network is needed.
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -50,14 +51,12 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 
 beforeEach(() => identityUpdates.clear());
-vi.mock("@/hooks/useDefaultPolicies", () => ({
+vi.mock("@/hooks/useDefaultPolicies", async (importOriginal) => ({
+  ...(await importOriginal<typeof defaultPolicies>()),
   useDefaultPolicies: vi.fn(),
   useAddDefaultPolicy: vi.fn(),
   useUpdateDefaultPolicy: vi.fn(),
   useDeleteDefaultPolicy: vi.fn(),
-  // Same class the component imports (both resolve to this mocked module), so
-  // the component's `instanceof PoliciesForbiddenError` check matches.
-  PoliciesForbiddenError: class PoliciesForbiddenError extends Error {},
 }));
 vi.mock("@/hooks/usePolicies", () => ({ usePolicyRegistry: vi.fn() }));
 
@@ -130,6 +129,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("PoliciesPage gating", () => {
@@ -165,6 +165,54 @@ describe("PoliciesPage gating", () => {
     expect(
       await screen.findByText("You don't have permission to manage global policies."),
     ).toBeInTheDocument();
+  });
+
+  it("recovers an exhausted policies query after identity becomes available", async () => {
+    const actual = await vi.importActual<typeof defaultPolicies>("@/hooks/useDefaultPolicies");
+    vi.mocked(defaultPolicies.useDefaultPolicies).mockImplementation(actual.useDefaultPolicies);
+    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
+    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const denied = new actual.PoliciesForbiddenError("Not permitted to list default policies");
+    await expect(
+      client.fetchQuery({
+        queryKey: ["default-policies"],
+        queryFn: () => Promise.reject(denied),
+      }),
+    ).rejects.toBe(denied);
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ object: "list", data: [policy({ name: "recovered_policy" })] }),
+        {
+          status: 200,
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetch);
+    const view = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <PoliciesPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
+    expect(screen.getByText("Loading...")).toBeInTheDocument();
+    expect(fetch).not.toHaveBeenCalled();
+
+    vi.mocked(identity.getCurrentUserId).mockReturnValue("admin");
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+
+    expect(await screen.findByText("recovered_policy")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add policy" })).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0][0]).toBe("/v1/policies");
+    view.unmount();
+    client.clear();
   });
 
   it("hides the section with a permission message when the list call is forbidden", async () => {
