@@ -920,6 +920,26 @@ def test_pull_request_links_accept_destinations_with_ports_and_ip_literals(
             },
             "url_template",
         ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://256.256.256.256/{number}",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://review.123/{number}",
+            },
+            "url_template",
+        ),
+        ({"name": "Review", "applies_to": ["github.com?x=1"]}, "host/owner/repo"),
+        ({"name": "Review", "applies_to": ["github.com/example org"]}, "host/owner/repo"),
+        ({"name": "Review", "applies_to": ["https:github.com"]}, "host/owner/repo"),
+        ({"name": "Review", "applies_to": ["github.com/example_org"]}, "host/owner/repo"),
     ],
     ids=[
         "not-a-mapping",
@@ -941,6 +961,12 @@ def test_pull_request_links_accept_destinations_with_ports_and_ip_literals(
         "template-no-hostname",
         "template-hostname-space",
         "template-hostname-escaped-space",
+        "template-invalid-ipv4",
+        "template-numeric-last-label",
+        "prefix-with-query",
+        "prefix-owner-with-space",
+        "prefix-scheme-without-slashes",
+        "prefix-invalid-owner",
     ],
 )
 def test_malformed_pull_request_links_stop_startup(block: object, message: str) -> None:

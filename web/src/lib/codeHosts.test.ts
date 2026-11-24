@@ -111,6 +111,13 @@ describe("pullRequestLink", () => {
     ["an escaped slash in the owner", "https://github.com/example-org%2Fx/app/pull/5"],
     ["an escaped space in the repository", "https://github.com/example-org/a%20b/pull/5"],
     ["a malformed escape", "https://github.com/example-org/a%zz/pull/5"],
+    ["an escaped underscore in the owner", "https://github.com/example%5Forg/app/pull/5"],
+    ["an owner ending in a hyphen", "https://github.com/example-org-/app/pull/5"],
+    ["an owner longer than GitHub allows", `https://github.com/${"a".repeat(40)}/app/pull/5`],
+    [
+      "a repository longer than GitHub allows",
+      `https://github.com/example-org/${"a".repeat(101)}/pull/5`,
+    ],
     ["a pull request's files tab", `${PULL_REQUEST}/files`],
     ["a comment on the pull request", `${PULL_REQUEST}#issuecomment-1`],
     ["a pull request with a query", `${PULL_REQUEST}?w=1`],

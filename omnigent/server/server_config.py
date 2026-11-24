@@ -245,6 +245,11 @@ PULL_REQUEST_LINKS_KEY = "pull_request_links"
 _PULL_REQUEST_LINK_FIELD = re.compile(r"\{(?:host|owner|repo|number)\}")
 # Dot-separated hostname labels a browser accepts unescaped.
 _DESTINATION_HOSTNAME = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?")
+# A browser parses a host whose last label is a number as IPv4, as in `review.123`.
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+# GitHub owner and repository names, lowercased as ``applies_to`` compares them.
+_GITHUB_OWNER = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?")
+_GITHUB_REPO = re.compile(r"[a-z0-9._-]{1,100}")
 
 
 @dataclass(frozen=True)
@@ -280,11 +285,12 @@ class PullRequestLinks:
 
 def _is_destination_hostname(hostname: str | None) -> bool:
     """
-    Whether *hostname*, as ``urlsplit`` reports it, is a valid host name or IP literal.
+    Whether *hostname* is a host name or IP literal a browser accepts, e.g. ``"ghe.example.com"``.
     """
     if hostname is None:
         return False
-    if _DESTINATION_HOSTNAME.fullmatch(hostname):
+    last_label = hostname.rstrip(".").rsplit(".", 1)[-1]
+    if _DESTINATION_HOSTNAME.fullmatch(hostname) and not _NUMERIC_LABEL.fullmatch(last_label):
         return True
     try:
         ipaddress.ip_address(hostname)
@@ -334,8 +340,13 @@ def _pull_request_link_prefix(raw: str) -> str:
     Validate one ``applies_to`` entry, returning it lowercased without a trailing slash.
     """
     prefix = raw.strip().strip("/").lower()
-    segments = prefix.split("/")
-    if "://" in prefix or len(segments) > 3 or not all(segments):
+    host, *names = prefix.split("/")
+    patterns = (_GITHUB_OWNER, _GITHUB_REPO)
+    if (
+        len(names) > 2
+        or not _is_destination_hostname(host)
+        or not all(pattern.fullmatch(name) for pattern, name in zip(patterns, names, strict=False))
+    ):
         raise ValueError(
             f"{PULL_REQUEST_LINKS_KEY}.applies_to entries must be host, host/owner or"
             f" host/owner/repo, got {raw!r}"

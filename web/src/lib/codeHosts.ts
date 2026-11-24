@@ -9,6 +9,9 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 export type CodeHostProviderId = "github";
 
 const GITHUB_DOT_COM = "github.com";
+// GitHub owners can't end in `-`.
+export const GITHUB_OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+export const GITHUB_REPO = /^[A-Za-z0-9._-]{1,100}$/;
 const PULL_PATH = /^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/;
 
 /**
@@ -90,14 +93,11 @@ export interface PullRequestLinkTarget {
 }
 
 const PULL_REQUEST_LINK_FIELD = /\{(host|owner|repo|number)\}/g;
-// The characters GitHub allows in owner and repository names.
-const REPOSITORY_SEGMENT = /^[A-Za-z0-9._-]+$/;
-
-/** A link's `owner/repo` decoded once, or null when a segment isn't a valid name. */
+/** A link's `owner/repo` decoded once, or null when either isn't a valid GitHub name. */
 function repositorySegments(repository: string): { owner: string; repo: string } | null {
   try {
     const [owner, repo] = repository.split("/").map((segment) => decodeURIComponent(segment));
-    return REPOSITORY_SEGMENT.test(owner) && REPOSITORY_SEGMENT.test(repo) ? { owner, repo } : null;
+    return GITHUB_OWNER.test(owner) && GITHUB_REPO.test(repo) ? { owner, repo } : null;
   } catch {
     return null;
   }
