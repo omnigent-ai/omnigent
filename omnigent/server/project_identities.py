@@ -11,7 +11,7 @@ from omnigent.server.routes._auth_helpers import require_access
 
 if TYPE_CHECKING:
     from omnigent.entities import Project
-    from omnigent.entities.project import ProjectIdentity, ProjectIdentityProposal
+    from omnigent.entities.project import ProjectIdentity
     from omnigent.stores import ConversationStore, PermissionStore
 
 IdentitySessionState = Literal["absent", "missing", "archived", "idle", "busy", "unavailable"]
@@ -62,6 +62,7 @@ def identity_response(identity: ProjectIdentity, state: IdentitySessionState) ->
         "effort": identity.effort,
         "active_session_id": identity.active_session_id,
         "active_session_state": state,
+        "created_by_session_id": identity.created_by_session_id,
         "created_at": identity.created_at,
         "updated_at": identity.updated_at,
     }
@@ -85,19 +86,4 @@ def orchestrator_identity_response(
         "active_session_state": state,
         "created_at": project.created_at,
         "updated_at": project.updated_at,
-    }
-
-
-def identity_proposal_response(proposal: ProjectIdentityProposal) -> dict[str, Any]:
-    """Serialize a pending proposal as a ``ProjectIdentityProposalObject``."""
-    return {
-        "id": proposal.id,
-        "object": "project.identity_proposal",
-        "kind": "create" if proposal.identity_id is None else "update",
-        "identity_id": proposal.identity_id,
-        "name": proposal.name,
-        "instructions": proposal.instructions,
-        "rationale": proposal.rationale,
-        "session_id": proposal.session_id,
-        "created_at": proposal.created_at,
     }

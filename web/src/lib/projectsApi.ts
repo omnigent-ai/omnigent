@@ -233,6 +233,8 @@ export interface ProjectIdentity {
   effort: string | null;
   active_session_id: string | null;
   active_session_state: ProjectIdentitySessionState;
+  /** The agent session that created it; `null` or absent when the owner did. */
+  created_by_session_id?: string | null;
 }
 
 /** Fields an owner edits; an empty string clears `agent_id`, `model` or `effort`. */
@@ -288,57 +290,6 @@ export async function updateProjectIdentity(
 
 export async function deleteProjectIdentity(projectId: string, identityId: string): Promise<void> {
   const res = await authenticatedFetch(identitiesPath(projectId, identityId), {
-    method: "DELETE",
-  });
-  if (!res.ok) throw await apiErrorFromResponse(res);
-}
-
-/** A drafted identity or persona edit; it applies only once the owner accepts it. */
-export interface ProjectIdentityProposal {
-  id: string;
-  /** `create` proposes a new identity; `update` replaces an existing one's persona. */
-  kind: "create" | "update";
-  identity_id: string | null;
-  name: string;
-  instructions: string;
-  rationale: string;
-  /** The proposing session, or `null` when the owner proposed it. */
-  session_id: string | null;
-  created_at: number;
-}
-
-function identityProposalsPath(projectId: string, proposalId?: string): string {
-  const base = `${identitiesPath(projectId)}/proposals`;
-  return proposalId ? `${base}/${encodeURIComponent(proposalId)}` : base;
-}
-
-/** List identity proposals waiting for the owner, oldest first. */
-export async function listProjectIdentityProposals(
-  projectId: string,
-): Promise<ProjectIdentityProposal[]> {
-  const res = await authenticatedFetch(identityProposalsPath(projectId));
-  if (!res.ok) throw await apiErrorFromResponse(res);
-  return ((await res.json()) as { data: ProjectIdentityProposal[] }).data;
-}
-
-/** Apply a proposal, creating or updating its identity. */
-export async function acceptProjectIdentityProposal(
-  projectId: string,
-  proposalId: string,
-): Promise<ProjectIdentity> {
-  const res = await authenticatedFetch(`${identityProposalsPath(projectId, proposalId)}/accept`, {
-    method: "POST",
-  });
-  if (!res.ok) throw await apiErrorFromResponse(res);
-  return (await res.json()) as ProjectIdentity;
-}
-
-/** Drop a proposal without changing any identity. */
-export async function dismissProjectIdentityProposal(
-  projectId: string,
-  proposalId: string,
-): Promise<void> {
-  const res = await authenticatedFetch(identityProposalsPath(projectId, proposalId), {
     method: "DELETE",
   });
   if (!res.ok) throw await apiErrorFromResponse(res);

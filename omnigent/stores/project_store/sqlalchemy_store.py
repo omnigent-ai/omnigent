@@ -18,7 +18,6 @@ from omnigent.db.db_models import (
     SqlPreference,
     SqlProject,
     SqlProjectIdentity,
-    SqlProjectIdentityProposal,
     SqlProjectTicket,
     current_workspace_id,
 )
@@ -31,8 +30,6 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Project
 from omnigent.entities.project import (
-    IDENTITY_PROPOSAL_RATIONALE_MAX_BYTES,
-    IDENTITY_PROPOSALS_MAX_PENDING,
     MANDATE_PROPOSAL_MAX_BYTES,
     MANDATE_PROPOSALS_MAX_PENDING,
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
@@ -40,7 +37,6 @@ from omnigent.entities.project import (
     PROJECT_MANDATE_MAX_BYTES,
     MandateProposal,
     ProjectIdentity,
-    ProjectIdentityProposal,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
@@ -191,21 +187,9 @@ def _identity_entity(row: SqlProjectIdentity) -> ProjectIdentity:
         model=row.model,
         effort=row.effort,
         active_session_id=row.active_session_id,
+        created_by_session_id=row.created_by_session_id,
         created_at=row.created_at,
         updated_at=row.updated_at,
-    )
-
-
-def _identity_proposal_entity(row: SqlProjectIdentityProposal) -> ProjectIdentityProposal:
-    return ProjectIdentityProposal(
-        id=row.id,
-        project_id=row.project_id,
-        name=row.name,
-        instructions=row.instructions,
-        rationale=row.rationale,
-        identity_id=row.identity_id,
-        session_id=row.session_id,
-        created_at=row.created_at,
     )
 
 
@@ -518,8 +502,6 @@ class SqlAlchemyProjectStore(ProjectStore):
                 )
             for identity in self._identity_rows(session, project_id):
                 session.delete(identity)
-            for proposal in self._identity_proposal_rows(session, project_id):
-                session.delete(proposal)
             session.delete(row)
             return True
 
@@ -672,6 +654,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         model: str | None,
         effort: str | None,
         created_at: int,
+        created_by_session_id: str | None = None,
     ) -> SqlProjectIdentity:
         """Insert a normalized identity; the caller holds the project row lock."""
         rows = self._identity_rows(session, project_id)
@@ -691,6 +674,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             model=model or None,
             effort=effort or None,
             active_session_id=None,
+            created_by_session_id=created_by_session_id,
             created_at=created_at,
             updated_at=None,
         )
@@ -709,6 +693,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         agent_id: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        created_by_session_id: str | None = None,
     ) -> ProjectIdentity:
         stored_name = _normalize_identity_name(name)
         stored_instructions = _normalize_identity_instructions(instructions)
@@ -736,6 +721,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 model=model,
                 effort=effort,
                 created_at=created_at,
+                created_by_session_id=created_by_session_id,
             )
             return _identity_entity(row)
 
@@ -753,6 +739,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         model: str | None = None,
         effort: str | None = None,
         clear: frozenset[str] = frozenset(),
+        agent_editor: bool = False,
     ) -> ProjectIdentity | None:
         stored_name = _normalize_identity_name(name) if name is not None else None
         stored_instructions = (
@@ -772,6 +759,11 @@ class SqlAlchemyProjectStore(ProjectStore):
             )
             if row is None:
                 return None
+            if agent_editor and row.created_by_session_id is None:
+                raise OmnigentError(
+                    "Only the project owner can edit an identity the owner created",
+                    code=ErrorCode.FORBIDDEN,
+                )
             if stored_name is not None and stored_name != row.name:
                 self._require_unique_name(
                     self._identity_rows(session, project_id), stored_name, identity_id
@@ -804,171 +796,10 @@ class SqlAlchemyProjectStore(ProjectStore):
             )
             if row is None:
                 return False
-            for proposal in self._identity_proposal_rows(session, project_id):
-                if proposal.identity_id == identity_id:
-                    session.delete(proposal)
             session.delete(row)
             return True
 
         return run_write_transaction(self._session_immediate, "delete_project_identity", write)
-
-    # -- Identity proposals: agents draft, only the owner applies --
-
-    def _identity_proposal_rows(
-        self, session: Session, project_id: str
-    ) -> builtins.list[SqlProjectIdentityProposal]:
-        stmt = (
-            select(SqlProjectIdentityProposal)
-            .where(
-                SqlProjectIdentityProposal.workspace_id == current_workspace_id(),
-                SqlProjectIdentityProposal.project_id == project_id,
-            )
-            .order_by(
-                asc(SqlProjectIdentityProposal.created_at), asc(SqlProjectIdentityProposal.id)
-            )
-        )
-        return builtins.list(session.execute(stmt).scalars().all())
-
-    def list_identity_proposals(
-        self, project_id: str, *, user_id: str | None
-    ) -> builtins.list[ProjectIdentityProposal]:
-        with self._session("list_project_identity_proposals") as session:
-            if not self._owned_project(session, project_id, user_id):
-                return []
-            return [
-                _identity_proposal_entity(row)
-                for row in self._identity_proposal_rows(session, project_id)
-            ]
-
-    def propose_identity(
-        self,
-        project_id: str,
-        *,
-        user_id: str | None,
-        instructions: str,
-        name: str | None = None,
-        identity_id: str | None = None,
-        rationale: str = "",
-        session_id: str | None = None,
-    ) -> ProjectIdentityProposal | None:
-        if (name is None) == (identity_id is None):
-            raise OmnigentError(
-                "Give a name to propose a new identity, or identity_id to edit one's persona",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        stored_name = _normalize_identity_name(name) if name is not None else None
-        stored_instructions = _normalize_identity_instructions(instructions)
-        if not stored_instructions:
-            raise OmnigentError(
-                "instructions (the persona) are required", code=ErrorCode.INVALID_INPUT
-            )
-        stored_rationale = rationale.strip()
-        if len(stored_rationale.encode("utf-8")) > IDENTITY_PROPOSAL_RATIONALE_MAX_BYTES:
-            raise OmnigentError(
-                f"rationale must be at most {IDENTITY_PROPOSAL_RATIONALE_MAX_BYTES} bytes",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        created_at = now_epoch()
-
-        def write(session: Session) -> ProjectIdentityProposal | None:
-            require_active_account(session, user_id)
-            project = session.get(
-                SqlProject, (current_workspace_id(), project_id), with_for_update=True
-            )
-            if project is None or project.user_id != user_id:
-                return None
-            pending = self._identity_proposal_rows(session, project_id)
-            if len(pending) >= IDENTITY_PROPOSALS_MAX_PENDING:
-                raise OmnigentError(
-                    f"{len(pending)} identity proposals already await the owner; "
-                    "ask them to accept or dismiss some first",
-                    code=ErrorCode.CONFLICT,
-                )
-            identities = self._identity_rows(session, project_id)
-            if identity_id is not None:
-                target = next((row for row in identities if row.id == identity_id), None)
-                if target is None:
-                    raise OmnigentError(
-                        "No identity with that id; propose a new one by name instead",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
-                proposal_name = target.name
-            else:
-                assert stored_name is not None
-                self._require_unique_name(identities, stored_name, None)
-                folded = stored_name.casefold()
-                if any(
-                    row.identity_id is None and row.name.casefold() == folded for row in pending
-                ):
-                    raise OmnigentError(
-                        f"An identity named {stored_name!r} is already proposed",
-                        code=ErrorCode.ALREADY_EXISTS,
-                    )
-                proposal_name = stored_name
-            row = SqlProjectIdentityProposal(
-                workspace_id=current_workspace_id(),
-                project_id=project_id,
-                id=uuid.uuid4().hex,
-                identity_id=identity_id,
-                name=proposal_name,
-                instructions=stored_instructions,
-                rationale=stored_rationale,
-                session_id=session_id,
-                created_at=created_at,
-            )
-            session.add(row)
-            session.flush()
-            return _identity_proposal_entity(row)
-
-        return run_write_transaction(self._session_immediate, "insert_identity_proposal", write)
-
-    def resolve_identity_proposal(
-        self, project_id: str, proposal_id: str, *, user_id: str | None, accept: bool
-    ) -> ProjectIdentity | None:
-        now = now_epoch()
-
-        def write(session: Session) -> ProjectIdentity | None:
-            require_active_account(session, user_id)
-            project = session.get(
-                SqlProject, (current_workspace_id(), project_id), with_for_update=True
-            )
-            if project is None or project.user_id != user_id:
-                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-            proposal = session.get(
-                SqlProjectIdentityProposal, (current_workspace_id(), project_id, proposal_id)
-            )
-            if proposal is None:
-                raise OmnigentError("Identity proposal not found", code=ErrorCode.NOT_FOUND)
-            identity: SqlProjectIdentity | None = None
-            if accept and proposal.identity_id is None:
-                identity = self._insert_identity(
-                    session,
-                    project_id,
-                    uuid.uuid4().hex,
-                    name=proposal.name,
-                    instructions=proposal.instructions,
-                    agent_id=None,
-                    model=None,
-                    effort=None,
-                    created_at=now,
-                )
-            elif accept:
-                identity = session.get(
-                    SqlProjectIdentity, (current_workspace_id(), project_id, proposal.identity_id)
-                )
-                if identity is None:
-                    raise OmnigentError(
-                        "The identity this proposal edits no longer exists; dismiss it",
-                        code=ErrorCode.NOT_FOUND,
-                    )
-                identity.instructions = proposal.instructions
-                identity.updated_at = now
-            session.delete(proposal)
-            session.flush()
-            return _identity_entity(identity) if identity is not None else None
-
-        operation = "accept_identity_proposal" if accept else "dismiss_identity_proposal"
-        return run_write_transaction(self._session_immediate, operation, write)
 
     def set_identity_session(
         self,

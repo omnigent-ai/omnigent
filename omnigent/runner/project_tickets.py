@@ -73,21 +73,17 @@ async def execute_ticket_tool(
                 },
                 ensure_ascii=False,
             )
-        if name == "sys_project_identity_propose":
-            if "identity_id" in body:
-                body["identity_id"] = uuid_to_bytes(body["identity_id"]).hex()
-            proposal = await request(
-                "POST", f"/v1/projects/{project_id}/identities/proposals", json=body
-            )
+        if name == "sys_project_identity_create":
+            created = await request("POST", f"/v1/projects/{project_id}/identities", json=body)
             return json.dumps(
                 {
-                    "status": "pending_owner_approval",
-                    "proposal": proposal,
-                    "note": "Not in effect until the project owner accepts it in the "
-                    "project's Team dialog.",
+                    "identity": {key: created[key] for key in ("id", "name", "instructions")},
+                    "note": "Created; it appears in the project's Team dialog.",
                 },
                 ensure_ascii=False,
             )
+        if name == "sys_project_identity_update":
+            return await _update_identity(body, project_id, request)
         if name == "sys_project_identity_session":
             return await _open_identity_session(body, project_id, request, client, source_id)
         path = f"/v1/projects/{project_id}/tickets"
@@ -140,18 +136,11 @@ async def execute_ticket_tool(
         return json.dumps({"error": str(exc)})
 
 
-async def _open_identity_session(
-    body: dict[str, Any],
-    project_id: str,
-    request: Any,
-    client: httpx.AsyncClient,
-    source_id: str,
-) -> str:
-    """Start or reuse an existing identity's single session, then optionally message it."""
-    from omnigent.runner.session_message import execute_message_tool
-
-    base = f"/v1/projects/{project_id}/identities"
-    wanted = body["identity"].strip()
+async def _resolve_identity(
+    wanted: str, base: str, request: Any
+) -> tuple[dict[str, Any] | None, str]:
+    """Find a non-built-in identity by ID or case-insensitive name, or explain the miss."""
+    wanted = wanted.strip()
     folded = wanted.casefold()
     try:
         wanted_id = uuid_to_bytes(wanted).hex()
@@ -166,17 +155,46 @@ async def _open_identity_session(
         ),
         None,
     )
+    if identity is not None:
+        return identity, ""
+    if folded == "orchestrator":
+        return None, json.dumps({"error": "The Orchestrator is built in, not a project identity"})
+    return None, json.dumps(
+        {
+            "error": f"No identity named {wanted!r}; create one with sys_project_identity_create",
+            "identities": [entry["name"] for entry in roles],
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _update_identity(body: dict[str, Any], project_id: str, request: Any) -> str:
+    """Rename or re-persona an agent-created identity; the server refuses owner-made ones."""
+    base = f"/v1/projects/{project_id}/identities"
+    identity, error = await _resolve_identity(body.pop("identity"), base, request)
     if identity is None:
-        if folded == "orchestrator":
-            return json.dumps({"error": "The Orchestrator is not an identity session target"})
-        return json.dumps(
-            {
-                "error": f"No identity named {wanted!r}; only the owner creates identities "
-                "(propose one with sys_project_identity_propose)",
-                "identities": [entry["name"] for entry in roles],
-            },
-            ensure_ascii=False,
-        )
+        return error
+    updated = await request("PATCH", f"{base}/{identity['id']}", json=body)
+    return json.dumps(
+        {"identity": {key: updated[key] for key in ("id", "name", "instructions")}},
+        ensure_ascii=False,
+    )
+
+
+async def _open_identity_session(
+    body: dict[str, Any],
+    project_id: str,
+    request: Any,
+    client: httpx.AsyncClient,
+    source_id: str,
+) -> str:
+    """Start or reuse an existing identity's single session, then optionally message it."""
+    from omnigent.runner.session_message import execute_message_tool
+
+    base = f"/v1/projects/{project_id}/identities"
+    identity, error = await _resolve_identity(body["identity"], base, request)
+    if identity is None:
+        return error
     opened = await request(
         "POST",
         f"{base}/{identity['id']}/session",

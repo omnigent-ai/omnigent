@@ -14,23 +14,15 @@ import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  acceptProjectIdentityProposal,
   createProjectIdentity,
   deleteProjectIdentity,
-  dismissProjectIdentityProposal,
   PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
   updateProjectIdentity,
   type ProjectIdentity,
   type ProjectIdentityInput,
-  type ProjectIdentityProposal,
 } from "@/lib/projectsApi";
 import { TicketError } from "./TicketControls";
-import {
-  projectIdentitiesKey,
-  projectIdentityProposalsKey,
-  useProjectIdentities,
-  useProjectIdentityProposals,
-} from "./useProjectIdentities";
+import { projectIdentitiesKey, useProjectIdentities } from "./useProjectIdentities";
 
 const encoder = new TextEncoder();
 
@@ -96,29 +88,11 @@ export function ProjectTeamDialog({
       setDraft(EMPTY_DRAFT);
     },
   });
-  const proposals = useProjectIdentityProposals(projectId);
-  const resolve = useMutation({
-    mutationFn: ({ proposal, accept }: { proposal: ProjectIdentityProposal; accept: boolean }) =>
-      accept
-        ? acceptProjectIdentityProposal(projectId, proposal.id)
-        : dismissProjectIdentityProposal(projectId, proposal.id).then(() => null),
-    onSettled: () => {
-      void refresh();
-      void client.invalidateQueries({ queryKey: projectIdentityProposalsKey(projectId) });
-    },
-    onSuccess: (identity) => {
-      // Show what was accepted unless the owner is midway through another edit.
-      if (identity && (selected === identity.id || (selected === null && !draft.name.trim()))) {
-        setSelected(identity.id);
-        setDraft(draftOf(identity));
-      }
-    },
-  });
-  const pending = proposals.data ?? [];
   const roles = (identities.data ?? []).filter((identity) => !identity.builtin);
+  const selectedIdentity = roles.find((identity) => identity.id === selected);
   const bytes = encoder.encode(draft.instructions.trim()).length;
   const tooLarge = bytes > PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES;
-  const busy = save.isPending || remove.isPending || resolve.isPending;
+  const busy = save.isPending || remove.isPending;
   const choose = (identity: ProjectIdentity | null) => {
     save.reset();
     remove.reset();
@@ -144,70 +118,11 @@ export function ProjectTeamDialog({
           <DialogTitle>Team</DialogTitle>
           <DialogDescription>
             Persistent roles in <span className="font-medium">{projectName}</span> you can talk to,
-            beside the Orchestrator. Each works in one session at a time and follows the project
-            mandate. Assign a ticket with the label{" "}
+            beside the Orchestrator. Agents can add roles too. Each works in one session at a time
+            and follows the project mandate. Assign a ticket with the label{" "}
             <span className="font-mono">assignee: Name</span>.
           </DialogDescription>
         </DialogHeader>
-        {pending.length > 0 && (
-          <section
-            aria-label="Proposed identities"
-            className="flex flex-col gap-2"
-            data-testid="project-identity-proposals"
-          >
-            <h3 className="font-medium text-ui">Proposed</h3>
-            <p className="text-sm text-muted-foreground">
-              Agents drafted these. Nothing changes until you accept one.
-            </p>
-            {pending.map((proposal) => (
-              <div
-                key={proposal.id}
-                className="flex flex-col gap-2 rounded-lg border border-border p-2.5"
-                data-testid="project-identity-proposal"
-              >
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm font-medium">
-                      {proposal.name}
-                      <span className="ml-2 text-xs font-normal text-muted-foreground">
-                        {proposal.kind === "create" ? "New identity" : "New persona"}
-                      </span>
-                    </p>
-                    {proposal.rationale && (
-                      <p className="text-sm text-muted-foreground">{proposal.rationale}</p>
-                    )}
-                  </div>
-                  <div className="flex shrink-0 gap-1">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="ghost"
-                      disabled={busy}
-                      data-testid="project-identity-proposal-dismiss"
-                      onClick={() => resolve.mutate({ proposal, accept: false })}
-                    >
-                      Dismiss
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={busy}
-                      data-testid="project-identity-proposal-accept"
-                      onClick={() => resolve.mutate({ proposal, accept: true })}
-                    >
-                      Accept
-                    </Button>
-                  </div>
-                </div>
-                <p className="max-h-32 overflow-y-auto whitespace-pre-wrap rounded bg-muted/50 p-2 text-sm">
-                  {proposal.instructions}
-                </p>
-              </div>
-            ))}
-            <TicketError error={resolve.error} />
-          </section>
-        )}
         {identities.isLoading ? (
           <Spinner aria-label="Loading team" />
         ) : (
@@ -289,6 +204,12 @@ export function ProjectTeamDialog({
                   />
                 </label>
               </div>
+              {selectedIdentity?.created_by_session_id && (
+                <p className="text-xs text-muted-foreground" data-testid="project-team-agent-made">
+                  Created by an agent, so agents can also edit it. Identities you create stay yours
+                  to edit.
+                </p>
+              )}
               <TicketError error={save.error ?? remove.error ?? identities.error} />
               <DialogFooter className="border-t-0 bg-transparent">
                 {selected !== null && (

@@ -285,7 +285,7 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 12
+    assert len(TICKET_TOOLS) == 13
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (
@@ -412,5 +412,5 @@ async def test_identity_session_reuses_the_named_identitys_session_and_messages_
         "previous_state": "idle",
         "message_delivery": {"queued": True},
     }
-    assert "not an identity" in missing["error"]
+    assert "not a project identity" in missing["error"]
     assert ("POST", f"/v1/sessions/{live}/events") in requests

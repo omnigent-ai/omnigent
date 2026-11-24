@@ -30,7 +30,6 @@ from omnigent.server import session_live_state
 from omnigent.server.auth import AuthProvider
 from omnigent.server.project_identities import (
     ORCHESTRATOR_IDENTITY_ID,
-    identity_proposal_response,
     identity_response,
     identity_session_state,
     orchestrator_identity_response,
@@ -54,7 +53,6 @@ from omnigent.server.schemas import (
     ProjectIdentitySessionRequest,
     ProjectOrderRequest,
     ProjectOrderResponse,
-    ProposeIdentityRequest,
     ProposeMandateRequest,
     UpdateProjectRequest,
 )
@@ -428,12 +426,11 @@ def create_projects_router(
 
     # -- Identities: the built-in Orchestrator plus owner-defined roles --
 
-    def _refuse_agent_identity_write(request: Request) -> None:
-        """Identities shape agents' personas, so only the project owner edits them."""
+    def _refuse_agent_identity_delete(request: Request) -> None:
+        """Agents may create and edit identities, but only the project owner removes them."""
         if ORCHESTRATION_SOURCE_HEADER in request.headers:
             raise OmnigentError(
-                "Only the project owner can change a project's identities; propose one "
-                "with sys_project_identity_propose instead",
+                "Only the project owner can remove a project's identities",
                 code=ErrorCode.FORBIDDEN,
             )
 
@@ -478,110 +475,20 @@ def create_projects_router(
         except (InvalidUuidError, ValueError):
             return None
 
-    @router.get("/projects/{project_id}/identities/proposals")
-    async def list_identity_proposals(request: Request, project_id: str) -> dict[str, Any]:
-        """List identity proposals waiting for the owner, oldest first."""
-        user_id = require_user(request, auth_provider)
-        project = await _owned_project(project_id, user_id)
-        proposals = await asyncio.to_thread(
-            project_store.list_identity_proposals, project.id, user_id=user_id
-        )
-        return {"object": "list", "data": [identity_proposal_response(p) for p in proposals]}
-
-    @router.post("/projects/{project_id}/identities/proposals")
-    async def propose_identity(
-        request: Request, project_id: str, body: ProposeIdentityRequest
-    ) -> dict[str, Any]:
-        """Queue a new identity or persona edit; agents may propose but never apply one.
-
-        :returns: The pending proposal.
-        :raises OmnigentError: 404 for an unknown project, 400 for bad bounds or
-            an unknown target, 409 for a taken name or a full queue.
-        """
-        user_id = require_user(request, auth_provider)
-        await _require_private_source(request, user_id)
-        project = await _owned_project(project_id, user_id)
-        target = _identity_id(body.identity_id) if body.identity_id is not None else None
-        source_session = _source_session(request)
-        proposal = await asyncio.to_thread(
-            project_store.propose_identity,
-            project.id,
-            user_id=user_id,
-            instructions=body.instructions,
-            name=body.name,
-            identity_id=target,
-            rationale=body.rationale,
-            session_id=source_session,
-        )
-        if proposal is None:
-            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        if source_session is not None:
-            # The owner must accept or dismiss it, so the proposing session needs their eyes.
-            session_live_state.raise_attention(source_session)
-        announce_projects_changed(user_id)
-        return identity_proposal_response(proposal)
-
-    def _refuse_agent_proposal_resolution(request: Request) -> None:
-        if ORCHESTRATION_SOURCE_HEADER in request.headers:
-            raise OmnigentError(
-                "Only the project owner can accept or dismiss an identity proposal",
-                code=ErrorCode.FORBIDDEN,
-            )
-
-    @router.post("/projects/{project_id}/identities/proposals/{proposal_id}/accept")
-    async def accept_identity_proposal(
-        request: Request, project_id: str, proposal_id: str
-    ) -> dict[str, Any]:
-        """Create or update the proposed identity. Owner only, never an agent tool.
-
-        :returns: The created or updated identity.
-        :raises OmnigentError: 403 for an agent request, 404 for an unknown
-            project, proposal or edited identity, 409 for a taken name.
-        """
-        user_id = require_user(request, auth_provider)
-        _refuse_agent_proposal_resolution(request)
-        project = await _owned_project(project_id, user_id)
-        identity = await asyncio.to_thread(
-            project_store.resolve_identity_proposal,
-            project.id,
-            _identity_id(proposal_id),
-            user_id=user_id,
-            accept=True,
-        )
-        if identity is None:
-            raise OmnigentError("Identity proposal not found", code=ErrorCode.NOT_FOUND)
-        announce_projects_changed(user_id)
-        return await _identity_payload(project, identity)
-
-    @router.delete("/projects/{project_id}/identities/proposals/{proposal_id}")
-    async def dismiss_identity_proposal(
-        request: Request, project_id: str, proposal_id: str
-    ) -> dict[str, Any]:
-        """Drop a proposal without changing any identity. Owner only.
-
-        :raises OmnigentError: 403 for an agent request, 404 for an unknown proposal.
-        """
-        user_id = require_user(request, auth_provider)
-        _refuse_agent_proposal_resolution(request)
-        project = await _owned_project(project_id, user_id)
-        normalized = _identity_id(proposal_id)
-        await asyncio.to_thread(
-            project_store.resolve_identity_proposal,
-            project.id,
-            normalized,
-            user_id=user_id,
-            accept=False,
-        )
-        announce_projects_changed(user_id)
-        return {"id": normalized, "object": "project.identity_proposal.deleted", "deleted": True}
-
     @router.post("/projects/{project_id}/identities")
     async def create_identity(
         request: Request, project_id: str, body: ProjectIdentityRequest
     ) -> dict[str, Any]:
-        """Add a named role to the project, e.g. a PM with its own persona."""
+        """Add a named role to the project, e.g. a PM with its own persona.
+
+        Agents may create one directly (``sys_project_identity_create``); it is
+        recorded as agent-created, so agents may later edit it too.
+        """
         user_id = require_user(request, auth_provider)
-        _refuse_agent_identity_write(request)
+        await _require_private_source(request, user_id)
+        source_session = _source_session(request)
+        if ORCHESTRATION_SOURCE_HEADER in request.headers and source_session is None:
+            raise OmnigentError("Invalid orchestration source", code=ErrorCode.INVALID_INPUT)
         if body.name is None:
             raise OmnigentError("name is required", code=ErrorCode.INVALID_INPUT)
         project = await _owned_project(project_id, user_id)
@@ -599,6 +506,7 @@ def create_projects_router(
             agent_id=body.agent_id,
             model=body.model,
             effort=body.effort,
+            created_by_session_id=source_session,
         )
         announce_projects_changed(user_id)
         return await _identity_payload(project, identity)
@@ -607,9 +515,12 @@ def create_projects_router(
     async def update_identity(
         request: Request, project_id: str, identity_id: str, body: ProjectIdentityRequest
     ) -> dict[str, Any]:
-        """Edit an identity's name, persona or session defaults; empty strings clear."""
+        """Edit an identity's name, persona or session defaults; empty strings clear.
+
+        Agents may edit only identities an agent created; owner-made ones stay owner-only.
+        """
         user_id = require_user(request, auth_provider)
-        _refuse_agent_identity_write(request)
+        await _require_private_source(request, user_id)
         project = await _owned_project(project_id, user_id)
         clear = frozenset(
             field
@@ -627,6 +538,7 @@ def create_projects_router(
             model=body.model or None,
             effort=body.effort or None,
             clear=clear,
+            agent_editor=ORCHESTRATION_SOURCE_HEADER in request.headers,
         )
         if identity is None:
             raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
@@ -637,9 +549,9 @@ def create_projects_router(
     async def delete_identity(
         request: Request, project_id: str, identity_id: str
     ) -> dict[str, Any]:
-        """Remove an identity; its past sessions stay in the project."""
+        """Remove an identity; its past sessions stay in the project. Owner only."""
         user_id = require_user(request, auth_provider)
-        _refuse_agent_identity_write(request)
+        _refuse_agent_identity_delete(request)
         project = await _owned_project(project_id, user_id)
         normalized = _identity_id(identity_id)
         deleted = await asyncio.to_thread(
@@ -662,7 +574,7 @@ def create_projects_router(
         Single-tracked: a live (idle or busy) session is reused, never doubled.
         A missing or archived one is replaced, guarded by ``expected_session_id``.
         Agents may call it (``sys_project_identity_session``) to delegate to an
-        existing identity; they still cannot create, edit or delete identities.
+        existing identity.
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)

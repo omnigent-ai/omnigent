@@ -5,7 +5,6 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities.project import (
-    IDENTITY_PROPOSAL_RATIONALE_MAX_BYTES,
     MANDATE_PROPOSAL_MAX_BYTES,
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
 )
@@ -91,36 +90,47 @@ class ProposeMandateAddition(BaseModel):
     )
 
 
-class ProposeIdentity(BaseModel):
+_IDENTITY_NAME = Field(
+    min_length=1,
+    max_length=60,
+    description="A clear role name, unique in the project, e.g. 'PM' or 'Designer'.",
+)
+_IDENTITY_PERSONA = Field(
+    min_length=1,
+    max_length=PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
+    description=(
+        "The complete persona, addressed to the identity in the second person: its role, what "
+        "it owns and how it works, e.g. 'You are the project's PM. You own the roadmap and "
+        "write ticket descriptions; you don't write code.'"
+    ),
+)
+
+
+class CreateIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str | None = Field(
-        default=None,
+    name: str = _IDENTITY_NAME
+    instructions: str = _IDENTITY_PERSONA
+
+
+class UpdateIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    identity: str = Field(
         min_length=1,
-        max_length=60,
-        description="Name of a new identity, e.g. 'PM' or 'Designer'. Omit when editing.",
+        max_length=64,
+        description="The identity's current name (case-insensitive) or ID.",
     )
-    identity_id: str | None = Field(
+    name: str | None = Field(default=None, min_length=1, max_length=60, description="New name.")
+    instructions: str | None = Field(
         default=None,
-        description="ID of an existing identity whose persona to replace. Omit for a new one.",
-    )
-    instructions: str = Field(
         min_length=1,
         max_length=PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
-        description=(
-            "The complete persona, written to the identity in the second person, e.g. 'You are "
-            "the project's PM. You own the roadmap and write ticket descriptions.'"
-        ),
-    )
-    rationale: str | None = Field(
-        default=None,
-        max_length=IDENTITY_PROPOSAL_RATIONALE_MAX_BYTES,
-        description="One or two sentences for the owner on why, e.g. what the user asked for.",
+        description="The complete replacement persona.",
     )
 
     @model_validator(mode="after")
-    def _one_target(self) -> "ProposeIdentity":
-        if (self.name is None) == (self.identity_id is None):
-            raise ValueError("Give name for a new identity or identity_id to edit one, not both")
+    def _has_change(self) -> "UpdateIdentity":
+        if self.name is None and self.instructions is None:
+            raise ValueError("Give a new name, new instructions, or both")
         return self
 
 
@@ -294,21 +304,27 @@ class SysProjectMandateProposeTool(_TicketTool):
         return cls.help_text
 
 
-class SysProjectIdentityProposeTool(_TicketTool):
-    tool_name = "sys_project_identity_propose"
+class SysProjectIdentityCreateTool(_TicketTool):
+    tool_name = "sys_project_identity_create"
     help_text = (
-        "Propose a project identity (a named persistent role such as a PM or Designer, whose "
-        "persona is added to every session working as it), or a new persona for an existing "
-        "identity. Use it when the user asks you to set up roles; call once per identity. "
-        "Nothing changes until the owner accepts it in the project's Team dialog, so tell the "
-        "user it is waiting for them and never claim it exists before then. Agents cannot "
-        "create, edit or delete identities directly. Scoped to this session's project."
+        "Create a project identity: a named persistent role such as a PM or Designer whose "
+        "persona is added to every session working as it. Create one when it is useful, for "
+        "example when the user asks you to set up roles or a recurring workstream needs an "
+        "owner. Give it a clear name and complete persona text. It takes effect at once and "
+        "appears in the project's Team dialog; tell the user what you created. Names are unique "
+        "and 'Orchestrator' is reserved. Start its session with sys_project_identity_session."
     )
-    arguments = ProposeIdentity
+    arguments = CreateIdentity
 
-    @classmethod
-    def description(cls) -> str:
-        return cls.help_text
+
+class SysProjectIdentityUpdateTool(_TicketTool):
+    tool_name = "sys_project_identity_update"
+    help_text = (
+        "Rename an agent-created project identity or replace its persona. Identities the "
+        "owner created are owner-only and refuse agent edits, and only the owner can delete "
+        "identities. Running sessions keep the old persona until they restart."
+    )
+    arguments = UpdateIdentity
 
 
 class SysProjectIdentitySessionTool(_TicketTool):
@@ -319,8 +335,8 @@ class SysProjectIdentitySessionTool(_TicketTool):
         "it with the identity's persona only when it has none; it never starts a second one. "
         "With message, also delivers that message to it like sys_session_message (queued if "
         "it is busy). Keep talking to it later with sys_session_message on the returned "
-        "session_id. The built-in Orchestrator is not an identity here. This cannot create "
-        "or edit identities; use sys_project_identity_propose for that."
+        "session_id. The built-in Orchestrator is not an identity here. To add a role, use "
+        "sys_project_identity_create."
     )
     arguments = OpenIdentitySession
 
@@ -367,7 +383,8 @@ TICKET_TOOL_CLASSES = (
     SysSessionLinkTicketTool,
     SysTicketLinkTool,
     SysProjectMandateProposeTool,
-    SysProjectIdentityProposeTool,
+    SysProjectIdentityCreateTool,
+    SysProjectIdentityUpdateTool,
     SysProjectIdentitySessionTool,
     SysProjectArtifactSaveTool,
 )
