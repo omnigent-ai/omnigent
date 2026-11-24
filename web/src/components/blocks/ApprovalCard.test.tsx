@@ -1863,6 +1863,43 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.queryByText(/wants to call/)).toBeNull();
   });
 
+  it("shows attachment-like answers as typed, and a session marker as a pill", () => {
+    const { container } = render(
+      <ApprovalCard
+        elicitationId="elic_literal"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview=""
+        requestedSchema={{}}
+        status="responded"
+        response={{
+          action: "accept",
+          content: {
+            "Which framework?": "[Attached: /tmp/report.txt]",
+            "Pick snacks": ["[Attached: /tmp/a.txt]", "plain"],
+            "Any notes?":
+              'Base it on the fix from [Session: "Fix CI" id=s_ci subagent=no]\n\n[Tagged sessions: read with sys_session_get_history]',
+          },
+        }}
+        askUserQuestion={{
+          questions: [
+            { question: "Which framework?", multiSelect: false, options: [{ label: "React" }] },
+            { question: "Pick snacks", multiSelect: true, options: [{ label: "Popcorn" }] },
+            { question: "Any notes?", multiSelect: false, options: [{ label: "None" }] },
+          ],
+        }}
+      />,
+    );
+    expect(container.textContent).toContain("[Attached: /tmp/report.txt]");
+    expect(container.textContent).toContain("[Attached: /tmp/a.txt], plain");
+    // A session marker in the same card is a pill, with its tool hint hidden.
+    expect(screen.getByTestId("mention-pill")).toHaveTextContent("@Fix CI");
+    expect(container.textContent).toContain("Base it on the fix from");
+    expect(container.textContent).not.toContain("[Session:");
+    expect(container.textContent).not.toContain("Tagged sessions");
+  });
+
   describe("unsent answers across a remount", () => {
     const draftQuestions: ClaudeQuestion[] = [
       {

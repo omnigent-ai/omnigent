@@ -289,6 +289,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   session pill opens that session. The new-session composer lists the same
   sessions (no subagents yet) with the same title search; its files come from
   the host directory listing only, without the recursive workspace search.
+  Behind `chat_composer_codemirror`, a question card's custom answer takes the
+  same session tags (no files, no subagents); the answer goes to the agent with the
+  markers and tool hint, and the answered card shows them as pills.
   States: file listing still loading (Enter holds; a pending session search
   does not hold it), no match (Enter sends the literal text), late results
   arriving (the highlighted row stays put), a file and a session with the same
