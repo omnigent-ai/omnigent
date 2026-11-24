@@ -4663,6 +4663,61 @@ async def test_interrupt_does_not_wait_for_a_steer_held_for_compaction(
             await steer
 
 
+def test_a_refused_submission_after_a_late_hold_reports_its_own_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A refusal after the hold reports Codex's cause, not the still-starting record held on.
+
+    The still-starting record can land just after the hold check, so the locked
+    read finds it and the message holds again. Once Codex starts, an otherwise
+    unclassified ``turn/start`` refusal must fail the turn with that refusal,
+    not tell the person their message will still be sent.
+    """
+
+    class _RefusingClient(_FakeCodexNativeClient):
+        requests: list[tuple[str, dict[str, Any]]] = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/start":
+                raise CodexAppServerResponseError({"code": -32603, "message": "synthetic refusal"})
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _RefusingClient
+    )
+    real_state_read = codex_native_executor.read_bridge_state_result
+    locked_reads = 0
+
+    def _record_lands_after_the_hold_check(bridge_dir: Path) -> Any:
+        nonlocal locked_reads
+        locked_reads += 1
+        if locked_reads == 1:
+            write_bridge_startup_error(
+                bridge_dir, "Codex is still starting.", code=CODEX_STARTUP_PENDING_CODE
+            )
+        return real_state_read(bridge_dir)
+
+    async def _start_codex(_seconds: float) -> None:
+        if codex_native_executor.read_bridge_startup_error(tmp_path) is not None:
+            _publish_started_thread(tmp_path)
+
+    monkeypatch.setattr(
+        codex_native_executor, "read_bridge_state_result", _record_lands_after_the_hold_check
+    )
+    monkeypatch.setattr(asyncio, "sleep", _start_codex)
+    write_bridge_startup_timeout(tmp_path, 120.0)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    error = events[-1]
+    assert isinstance(error, ExecutorError)
+    assert "synthetic refusal" in error.message
+    assert error.code != CODEX_STARTUP_PENDING_CODE
+    assert "sent once it's ready" not in error.message
+
+
 def test_stop_as_codex_finishes_starting_submits_nothing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

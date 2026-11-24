@@ -1414,7 +1414,9 @@ class CodexNativeExecutor(Executor):
                         startup_failure is not None
                         and startup_failure.code == CODEX_STARTUP_PENDING_CODE
                     ):
-                        # Recorded again since the hold ended: hold once more.
+                        # Recorded again since the hold ended: hold once more, keeping no
+                        # still-starting cause for a later, unrelated failure to report.
+                        startup_failure = None
                         continue
                     if startup_failure is not None and not startup_failure.code:
                         startup_failure = None
