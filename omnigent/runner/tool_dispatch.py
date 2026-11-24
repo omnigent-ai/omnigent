@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.route_ids import route_identifier as _route_identifier
 
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
@@ -197,13 +198,6 @@ def _string_object_dict(value: object) -> _JsonObject | None:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         return None
     return cast("_JsonObject", value)
-
-
-def _route_identifier(value: object, kind: str) -> str:
-    """Keep one identifier in one URL segment, including legacy prefixed IDs."""
-    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
-        raise ValueError(f"{kind} id must contain only letters, digits, underscores or hyphens")
-    return value
 
 
 def _session_url(session_id: object) -> str:

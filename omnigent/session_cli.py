@@ -497,7 +497,9 @@ async def _wait_for_reply(
     report the end before its last reply is mirrored. A failure counts once it can't
     be the old one: the session wasn't failed before the send, has shown another
     status since, reports a different error, or has an error item after the message.
-    A held message the session listed as failed to deliver ends the wait too.
+    It must also hold for ``_SETTLE_S`` with nothing waiting for the terminal: a turn
+    queued behind one that fails starts right after that failure is published. A held
+    message the session listed as failed to deliver ends the wait at once.
 
     :param after: The newest item id before the send, or ``None``.
     :param baseline: The session's state read before the send.
@@ -507,6 +509,7 @@ async def _wait_for_reply(
     interval = _WAIT_FIRST_INTERVAL_S
     turn_seen = left_failed = False
     settling: tuple[list[object], float] | None = None
+    failing_since: float | None = None
     while True:
         state = await _read_state(client, session_id)
         status = cast(str, state["status"])
@@ -524,17 +527,24 @@ async def _wait_for_reply(
                 return TurnResult("failed", 0, [], delivered=False)
         if status == "failed":
             found = await _messages_after_sent(client, session_id, after, sent)
-            if (
+            new_failure = (
                 baseline.get("status") != "failed"
                 or left_failed
                 or state.get("last_task_error") != baseline.get("last_task_error")
                 or (
                     found is not None and await _items_after(client, session_id, found[0], "error")
                 )
-            ):
-                return TurnResult(status, 0, found[1] if found else [])
+            )
+            if new_failure and not state.get("pending_inputs"):
+                now = loop.time()
+                if failing_since is None:
+                    failing_since = now
+                elif now - failing_since >= _SETTLE_S:
+                    return TurnResult(status, 0, found[1] if found else [])
+            else:
+                failing_since = None
         else:
-            left_failed = True
+            left_failed, failing_since = True, None
         if status == "running":
             turn_seen, settling = True, None
         elif status == "idle" and not state.get("pending_inputs"):
@@ -556,7 +566,8 @@ async def _wait_for_reply(
                     settling = (tail, now)
         else:
             settling = None
-        await asyncio.sleep(_SETTLE_S if settling is not None else interval)
+        confirming = settling is not None or failing_since is not None
+        await asyncio.sleep(_SETTLE_S if confirming else interval)
         interval = min(interval * 1.5, _WAIT_MAX_INTERVAL_S)
 
 

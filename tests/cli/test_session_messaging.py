@@ -629,6 +629,31 @@ def test_wait_reports_a_failed_turn(
     assert "The turn failed" in result.stderr
 
 
+@pytest.mark.parametrize("held", [False, True], ids=["stored-message", "held-input"])
+def test_wait_ignores_a_failure_of_the_turn_ahead_of_the_message(
+    router: respx.MockRouter, held: bool
+) -> None:
+    """The turn queued behind one that fails starts after that failure is published."""
+    pending = {"pending_inputs": [{"pending_id": "pending_1"}]} if held else {}
+    sent_turn = [_message("msg_sent", "user", "Fix it")] if held else []
+    _FakeSession(
+        ack=(202, {"queued": True, "pending_id": "pending_1"}) if held else _FakeSession.ack,
+        stores_sent_message=not held,
+        baseline={"status": "running"},
+        states=[
+            ({"status": "running", **pending}, []),
+            ({"status": "failed", "last_task_error": _OLD_ERROR, **pending}, []),
+            ({"status": "running"}, sent_turn),
+            ({"status": "idle"}, [_FIXED]),
+        ],
+    ).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == "Fixed the flaky test\n"
+
+
 def test_wait_retrying_a_failed_session_ignores_its_old_failure(
     router: respx.MockRouter,
 ) -> None:
@@ -690,6 +715,7 @@ def test_wait_timeout_covers_renewing_an_expired_login(
         time.sleep(timeout)
         return None
 
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
     monkeypatch.setattr("omnigent.session_cli._renew_stored_login", _renew_stored_login)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda server_url, **_: None)
     monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_stored_token)
@@ -711,12 +737,15 @@ def test_wait_timeout_does_not_wait_out_a_refresh_stuck_on_the_lock(
 ) -> None:
     """Another process holding the token file's lock can't keep the command past --timeout."""
     lock_released = threading.Event()
+    refresh_started = threading.Event()
 
     def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | None:
+        refresh_started.set()
         # The lock is taken before the refresh's HTTP timeout applies.
         lock_released.wait(timeout=10)
         return None
 
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
     monkeypatch.setattr("omnigent.session_cli._renew_stored_login", _renew_stored_login)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda server_url, **_: None)
     monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_stored_token)
@@ -728,6 +757,7 @@ def test_wait_timeout_does_not_wait_out_a_refresh_stuck_on_the_lock(
     finally:
         lock_released.set()
 
+    assert refresh_started.is_set()
     assert result.exit_code == 1
     assert "Timed out after 0.1s" in result.stderr
     assert elapsed < 1
@@ -771,6 +801,22 @@ def test_wait_timeout_covers_a_send_the_server_holds(router: respx.MockRouter) -
 
     assert result.exit_code == 1
     assert "Timed out after 0.5s before the server confirmed the message" in result.stderr
+
+
+@pytest.mark.parametrize("command", ["send", "get", "read"])
+def test_session_commands_refuse_an_id_that_would_change_the_route(
+    router: respx.MockRouter, command: str
+) -> None:
+    session = _FakeSession()
+    session.install(router)
+
+    result = _invoke(
+        [command, "conv_1/../other", "-m", "x"] if command == "send" else [command, "a?b"]
+    )
+
+    assert result.exit_code == 2
+    assert "Session id must contain only letters, digits, underscores or hyphens" in result.stderr
+    assert session.calls == []
 
 
 @pytest.mark.parametrize(

@@ -8221,8 +8221,18 @@ def _session_command_server(server: str | None) -> str:
 _SESSION_SERVER_HELP = "Omnigent server URL. Defaults to the configured server, or a local one."
 
 
+def _session_id_argument(_ctx: click.Context, _param: click.Parameter, value: str) -> str:
+    """Refuse a session id that would change the request's route, such as one with ``/``."""
+    from omnigent.util.route_ids import route_identifier
+
+    try:
+        return route_identifier(value, "Session")
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
+
 @session.command("send")
-@click.argument("session_id")
+@click.argument("session_id", callback=_session_id_argument)
 @click.option("-m", "--message", default=None, help="Message to send.")
 @click.option(
     "--message-file",
@@ -8331,7 +8341,7 @@ def session_send(
 
 
 @session.command("get")
-@click.argument("session_id")
+@click.argument("session_id", callback=_session_id_argument)
 @click.option(
     "--usage",
     "include_usage",
@@ -8370,7 +8380,7 @@ def session_get(
 
 
 @session.command("read")
-@click.argument("session_id")
+@click.argument("session_id", callback=_session_id_argument)
 @click.option(
     "--last",
     type=click.IntRange(1, 1000),

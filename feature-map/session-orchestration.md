@@ -65,7 +65,9 @@ MCP independent creation.
   every message after the sent one. It stops early, with the status shown, when a
   prompt waits for a person, the turn fails, or a held message is listed as never
   delivered (both exit 1). A failure already on the session before the send counts
-  only with a new status, a different error, or an error item after the message.
+  only with a new status, a different error, or an error item after the message, and a
+  failure must hold for 2s with nothing waiting for the terminal, since a turn queued
+  behind one that fails starts right after that failure.
   `--timeout` bounds the whole exchange, send included.
   `omnigent session get <id>` prints the fields `sys_session_get_info` returns plus
   the URL, with cost and tokens under `--usage`. `omnigent session read <id>` prints
