@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { useAdminViewSwitchShown } from "@/hooks/useAdminViewSwitchShown";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { desktopAppHandoffSupported } from "@/lib/desktopAppHandoff";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import {
   getDesktopFeatures,
@@ -37,6 +38,7 @@ export function useSettingsAvailability(): SettingsAvailability {
     globalShortcut && floatingComposerFlag && shellTakesPanelShortcut;
   const widenWindowForRightSidebar = supportsWidenWindowForRightSidebar();
   const inAppBrowser = supportsBrowser();
+  const desktopAppHandoff = desktopAppHandoffSupported();
   const adminView = useAdminViewSwitchShown();
   const accountsEnabled = loaded?.accounts_enabled === true;
   const archiveWorktreeCleanup = loaded?.archive_worktree_cleanup === true;
@@ -52,6 +54,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       floatingComposerShortcut,
       widenWindowForRightSidebar,
       inAppBrowser,
+      desktopAppHandoff,
       adminView,
       accountsEnabled,
       archiveWorktreeCleanup,
@@ -66,6 +69,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       floatingComposerShortcut,
       widenWindowForRightSidebar,
       inAppBrowser,
+      desktopAppHandoff,
       adminView,
       accountsEnabled,
       archiveWorktreeCleanup,

@@ -65,6 +65,8 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
+import { DesktopAppHandoffPage } from "@/components/DesktopAppHandoffPage";
+import { useDesktopAppHandoff } from "@/hooks/useDesktopAppHandoff";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
 import { useReportLocalTimezone } from "@/hooks/useReportLocalTimezone";
@@ -414,6 +416,11 @@ function AppShellImpl() {
   // create window (or on a stale temp reload, before ChatPage redirects).
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
   const pendingConversation = conversationId != null && serverConversationId == null;
+  const handedOverConversation = useDesktopAppHandoff(
+    serverConversationId,
+    !isCanvasPathname(location.pathname, rebasePath("/canvas")) &&
+      !new URLSearchParams(location.search).has("file"),
+  );
   // With tabs enabled, links, pages and shells open there. The session ref stays null
   // until a new session has its real id: there are no tabs to open in before that.
   const tabsSidebar = useTabsSidebar();
@@ -3259,6 +3266,8 @@ function AppShellImpl() {
       }}
       fileViewer={fileViewerContextValue}
     >
+      {/* Covers the page until the user chooses to stay in the browser. */}
+      {handedOverConversation && <DesktopAppHandoffPage conversationId={handedOverConversation} />}
       {/* One for the whole window, so a grid of sidebars runs each request once. */}
       {/* A host that breaks only disables the file actions. */}
       {tabsSidebar && (
