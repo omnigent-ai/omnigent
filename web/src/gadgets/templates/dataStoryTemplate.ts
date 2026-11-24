@@ -334,8 +334,6 @@ ${GADGET_KIT_HELPERS}
   var previewSeeded = false;
   var lastWidth = 0;
   var hiddenSeries = {};
-  // Whether the page itself last opened or closed the ideas box; a different state is the viewer's.
-  var ideasOpenSet = null;
 
   // ---- The view, and the fallback to the plain one
 
@@ -777,8 +775,10 @@ ${GADGET_KIT_HELPERS}
       button.disabled = !canAct || (find.open && !find.undelivered);
       button.textContent = find.open ? 'Looking…' : find.undelivered ? 'Create my gadget session' : button.id === 'find' ? 'Suggest others' : 'Find stories in my work';
     });
-    $('find').hidden = !canAct || !(found || story());
-    $('window-label').hidden = !canAct;
+    // Once a story is built the page is that story: another story is a new gadget.
+    var built = Boolean(story() && !story().example);
+    $('find').hidden = !canAct || !found || built;
+    $('window-label').hidden = !canAct || built;
     var line = find.text ? find.text + (find.working && find.since ? ' ' + elapsed(find.since) + ' · usually 1 to 3 minutes' : '') : '';
     $('empty-run').textContent = empty ? line : '';
     $('progress').hidden = !(empty && find.working);
@@ -881,20 +881,16 @@ ${GADGET_KIT_HELPERS}
     ]);
   }
 
+  // The ideas are the page until a story is built; then they go, and another story is a new gadget.
+  // Under the preview's example story they stay, folded, so the template shows both steps.
   function renderIdeas(found, value, build) {
     var box = $('ideas');
-    box.hidden = !found;
-    if (!found) { $('others').hidden = true; return; }
+    var wasHidden = box.hidden;
+    box.hidden = !found || Boolean(value && !value.example);
+    if (box.hidden) return;
+    if (wasHidden) box.open = !value;
     var list = ideaList();
     var busy = build.open && !build.undelivered;
-    // Until a story is built the ideas are the page; then they fold away under it.
-    if (!box.dataset.touched && ideasOpenSet !== !value) { ideasOpenSet = !value; box.open = ideasOpenSet; }
-    $('ideas-title').textContent = value
-      ? 'Other stories you could tell' + (list.length ? ' (' + list.length + ')' : '')
-      : 'Stories you could tell';
-    // Folded under a built story, the ideas are easy to miss: the header points to them.
-    $('others').hidden = !(value && list.length);
-    $('others').textContent = 'Other stories (' + list.length + ')';
     var note = [];
     if (found.example) note.push('Example ideas.');
     else if (found.scanned_at) note.push('From ' + (found.sessions_read || 0) + ' sessions in the last ' + found.window_days + ' days, ' + ago(found.scanned_at) + '.');
@@ -1017,15 +1013,7 @@ ${GADGET_KIT_HELPERS}
     $('find-empty').addEventListener('click', findStories);
     $('find').addEventListener('click', findStories);
     $('refresh').addEventListener('click', refreshData);
-    $('others').addEventListener('click', function () {
-      var box = $('ideas');
-      box.open = true;
-      box.dataset.touched = 'true';
-      box.scrollIntoView({ behavior: calm ? 'auto' : 'smooth', block: 'start' });
-      $('ideas-title').focus({ preventScroll: true });
-    });
     $('window').addEventListener('change', function () { $('window').dataset.touched = 'true'; });
-    $('ideas').addEventListener('toggle', function () { if ($('ideas').open !== ideasOpenSet) $('ideas').dataset.touched = 'true'; });
     // Not a form: the sandboxed frame may not submit forms, so Chrome would drop the submission.
     // The text stays until the request is sent, so a failed one can be sent again; text typed
     // since then is kept.
@@ -1120,7 +1108,6 @@ const KIT_BODY = `
           <option value="30">30 days</option>
         </select>
       </label>
-      <button type="button" id="others" class="quiet" aria-controls="ideas" hidden>Other stories</button>
       <button type="button" id="find" class="quiet" data-omnigent-requires="action" hidden>Suggest others</button>
       <button type="button" id="refresh" class="primary" data-omnigent-requires="action" hidden>Refresh data</button>
     </div>
@@ -1282,12 +1269,12 @@ export const DATA_STORY_GUIDE = [
   "",
   "## Finding stories",
   "",
-  "Find stories in my work and Suggest others request `find_stories` with `window_days`.",
+  "Find stories in my work, and Suggest others before a story is built, request `find_stories` with `window_days`. Once a story is built the page no longer shows ideas: another story is a new gadget from the Data story template, so do not offer more ideas after a build.",
   "",
   "1. List sessions with `sys_session_list` (visibility `mine`); keep those with `last_activity_at` (Unix seconds) within `window_days`, at most 25, newest first. Skip this gadget session and sessions you started for this gadget.",
   "2. Read only a little of each: its title, its journal with `sys_journal_read` when that tool is available, else `sys_session_get_history` limited to its last few items. Never read whole transcripts, and never ask a session to start a journal.",
   "3. Look for data work: tables or files queried, metrics checked, analyses run, results or charts discussed, questions left open.",
-  "4. Write 3 to 6 ideas, each a story worth telling from data the viewer already touched: `{id, title, question, why, chart_idea, effort: quick|medium|deep, sources: [{name, kind, detail}], sessions: [{id, title, quote}]}`. `question` is the one question the story answers; cite each idea's sessions with a short quote. On Suggest others, keep ideas the viewer may still want and replace the rest with different ones.",
+  "4. Write 3 to 6 ideas, each a story worth telling from data the viewer already touched: `{id, title, question, why, chart_idea, effort: quick|medium|deep, sources: [{name, kind, detail}], sessions: [{id, title, quote}]}`. `question` is the one question the story answers; cite each idea's sessions with a short quote. On Suggest others, replace the ideas with different ones.",
   "   Name only sources you saw: a file, table or path an idea cites must be one the session shows or one you checked exists (list the directory), never a guessed name.",
   "5. Replace the `ideas` record with `scanned_at`, `window_days`, `sessions_read` and `ideas`; add `note` when the window had little data work. Report the action `done` with a one-line summary.",
   "",
@@ -1298,7 +1285,7 @@ export const DATA_STORY_GUIDE = [
   "1. Gather the data with your own tools: run the queries the sessions ran, or read the files and tables they used. The page has no network, so everything it shows comes from records. Every number must come from data you read or a result a session shows; never invent or extrapolate data. When you cannot reach the data, say so in the session and in `caveats`, and stop rather than guess.",
   '2. Write each chart\'s `series` record: `{title, kind: line|area|bar|column, unit, x_label, y_label, series: [{name, points: [{x, y}]}], annotations: [{x, series, label}]}`. `x` is a string (a date like "2026-11-02" or a category), `y` a number. Annotate the moments that matter (a launch, a spike, a change).',
   "3. Replace the `story` record: `idea_id` (when built from an idea), `title`, `question`, `built_at` (now, ISO 8601 UTC), `headline: {label, value, unit, delta, direction: up|down|flat, good: up|down|none, context}`, `summary` (two or three plain sentences: the answer), `sections` (2 to 6: `{id, heading, body, chart, takeaway}`, where `chart` is a series record ID), `sources: [{name, kind, detail, as_of}]` (how to get the data again, such as the query), `sessions` it came from, and `caveats`. Delete `series` records no section uses.",
-  "4. Design the page (Designing the page), publish it, and write the `layout` record. On a later build of another story, change the page only when the new story does not fit it.",
+  "4. Design the page (Designing the page), publish it, and write the `layout` record.",
   '5. On the first story, while the gadget is still named "Data story", rename it to the story\'s title with `sys_gadget_rename`; keep any other name.',
   "6. Report the action `done` with a one-line summary.",
   "",

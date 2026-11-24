@@ -291,18 +291,26 @@ describe("data story template", () => {
     expect(opened).toEqual(["s1", "s1"]);
   });
 
-  it("points from a built story's header to the other stories folded under it", async () => {
-    const { load, ready } = startStory();
+  it("shows the ideas and Suggest others until a story is built, then only the story", async () => {
+    const { load, emit, ready } = startStory();
     await waitFor(() => expect(ready()).toBe(true));
-    load({ ideas: IDEAS, story: STORY, series: { weekly: WEEKLY } });
+    load({ ideas: IDEAS });
 
-    await waitFor(() => expect(byId("others").hidden).toBe(false));
-    const ideas = byId("ideas") as HTMLDetailsElement;
-    expect(ideas.open).toBe(false);
-    expect(byId("others").textContent).toBe("Other stories (2)");
-    expect(byId("ideas-title").textContent).toBe("Other stories you could tell (2)");
-    byId("others").click();
-    expect(ideas.open).toBe(true);
+    await waitFor(() => expect(byId("ideas").hidden).toBe(false));
+    expect((byId("ideas") as HTMLDetailsElement).open).toBe(true);
+    expect(byId("find").hidden).toBe(false);
+    expect(byId("find").textContent).toBe("Suggest others");
+    expect(byId("window-label").hidden).toBe(false);
+
+    emit("series", [{ id: "weekly", version: "v1", value: WEEKLY }]);
+    emit("story", [{ id: "current", version: "v1", value: STORY }]);
+    await waitFor(() => expect(byId("content").hidden).toBe(false));
+    // Another story is a new gadget from the template, so a built one offers no other ideas.
+    expect(byId("ideas").hidden).toBe(true);
+    expect(byId("find").hidden).toBe(true);
+    expect(byId("window-label").hidden).toBe(true);
+    expect(document.body.textContent).not.toContain("Other stories");
+    expect(byId("refresh").hidden).toBe(false);
   });
 
   it("shows a build's stages, then that it is designing once the story is written", async () => {
@@ -350,9 +358,8 @@ describe("data story template", () => {
     expect(view.querySelector("#section-trend .note-text")?.textContent).toBe("Launch");
     expect(byId("about").textContent).toContain("one row per signup");
     expect(byId("about").textContent).toContain("Caveats: October is incomplete.");
-    // A built story folds its ideas away under it.
-    expect((byId("ideas") as HTMLDetailsElement).open).toBe(false);
-    expect(byId("ideas-title").textContent).toBe("Other stories you could tell (2)");
+    // A built story is the whole page: its ideas are gone.
+    expect(byId("ideas").hidden).toBe(true);
     expect(byId("refresh").hidden).toBe(false);
   });
 
