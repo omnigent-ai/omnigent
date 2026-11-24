@@ -36,7 +36,7 @@ import {
   deleteGadget,
 } from "@/gadgets/api/gadgetApi";
 import { composeGadgetBuildPrompt, gadgetNameFrom } from "@/gadgets/host/gadgetBuild";
-import { GADGET_START_PARAM } from "@/gadgets/host/gadgetPages";
+import { GADGET_START_PARAM, sessionIdFromPath } from "@/gadgets/host/gadgetPages";
 import {
   openGadgetSession,
   gadgetIdFromRailKey,
@@ -216,7 +216,13 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
         heading={DRAFT_LABEL}
         explanation="Say what it shows, what data it uses and what people do with it. This session builds it here, and its buttons send their work back to this session."
         onBuild={build}
-        onCancel={() => setGadgetDraft(sessionId, false)}
+        onCancel={() => {
+          // Cancel after a failed build leaves no half-made gadget behind.
+          const abandoned = unfinished.current?.gadget;
+          unfinished.current = null;
+          if (abandoned) void deleteGadget(abandoned.id).catch(() => undefined);
+          setGadgetDraft(sessionId, false);
+        }}
         errorTitle="Couldn’t start building the gadget"
         initialDescription={gadgetDraftText(sessionId)}
         onDescriptionChange={(text) => setGadgetDraftText(sessionId, text)}
@@ -563,7 +569,8 @@ export function useGadgetRailTabState(
     closeMobile,
     render: (key, view) => {
       if (key === GADGET_DRAFT_KEY)
-        return <GadgetDraftPane sessionId={conversationId} view={view} />;
+        // Keyed by session: a draft's text and its unfinished build belong to one session.
+        return <GadgetDraftPane key={conversationId} sessionId={conversationId} view={view} />;
       const gadget = byKey.get(key);
       return gadget ? (
         <GadgetRailPane
@@ -811,9 +818,7 @@ export function GadgetNewSessionPanel({
   // Create session from the full screen gadget's menu moves New session to the session it
   // creates, at its temporary ID first. The gadget stays over it until the session shows it.
   const sessionPrefix = rebasePath("/c/");
-  const routeSessionId = location.pathname.startsWith(sessionPrefix)
-    ? decodeURIComponent(location.pathname.slice(sessionPrefix.length).replace(/\/$/, ""))
-    : null;
+  const routeSessionId = sessionIdFromPath(location.pathname, sessionPrefix);
   const [lastFullScreen, setLastFullScreen] = useState<string | null>(null);
   const [handoff, setHandoff] = useState<GadgetHandoff | null>(null);
   const shownFullScreen = shown && maximized ? gadgetId : null;

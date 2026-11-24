@@ -46,8 +46,10 @@ export function gadgetCommentsMessage(
 }
 
 // The panel tells a comment's card from a pending selection by character range. Gadget comments
-// have none, so each gets its own position and a pending selection one no comment has.
-const PENDING_POSITION = -1;
+// have none, so each gets its own position, and each pending selection a negative one no comment
+// has. A new selection gets a new one even when its text is the same, so a save that finishes
+// after it leaves its draft alone.
+let pendingPositions = 0;
 
 /**
  * A gadget comment as the panel's. The viewer's own comments carry no author, which the panel
@@ -127,6 +129,7 @@ export function useGadgetComments(
   });
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<GadgetCommentAnchor | null>(null);
+  const [pendingPosition, setPendingPosition] = useState(-1);
   // One per selection, so retrying a create whose outcome is unknown can't add it twice.
   const [pendingOperationId, setPendingOperationId] = useState<string>(() => randomUUID());
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -157,6 +160,8 @@ export function useGadgetComments(
     toPanelComment(gadget, item, positions.get(item.id) ?? 0);
 
   const startComment = useCallback((selection: GadgetSelection) => {
+    pendingPositions += 1;
+    setPendingPosition(-pendingPositions);
     setPending({
       text: selection.text,
       label: selection.label ?? null,
@@ -173,8 +178,8 @@ export function useGadgetComments(
     () =>
       pending
         ? {
-            start_index: PENDING_POSITION,
-            end_index: PENDING_POSITION,
+            start_index: pendingPosition,
+            end_index: pendingPosition,
             anchor_content: pending.text,
           }
         : selected
@@ -185,7 +190,7 @@ export function useGadgetComments(
               comment_id: selected.id,
             }
           : null,
-    [pending, positions, selected],
+    [pending, pendingPosition, positions, selected],
   );
 
   return {

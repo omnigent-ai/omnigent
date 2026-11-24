@@ -30,7 +30,7 @@ import {
   resetGadgetTabOrders,
   useGadgetRailTabState,
 } from "./GadgetRailTabs";
-import { renderWithGadgets, gadgetFixture } from "./testUtils";
+import { GADGETS_INFO, renderWithGadgets, gadgetFixture } from "./testUtils";
 import { useLocation, useNavigate } from "@/lib/routing";
 import { resetGadgetDrafts } from "./gadgetDrafts";
 import { resetGadgetStarts } from "./useAdoptStartedGadgetSession";
@@ -389,6 +389,61 @@ describe("New gadget tab", () => {
     },
   );
 
+  it("deletes the gadget a failed build made when the draft is cancelled", async () => {
+    const created = gadgetFixture({ id: "3", name: "Incident tracker", published_revision: null });
+    vi.mocked(createGadget).mockResolvedValue(created);
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(linkGadgetToSession).mockRejectedValueOnce(new Error("Link failed"));
+    renderWithGadgets(<Rail conversationId="conv_1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    const content = await screen.findByRole("region", { name: "content" });
+    fireEvent.change(within(content).getByRole("textbox", { name: "Describe the gadget" }), {
+      target: { value: "An incident tracker for my team" },
+    });
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    expect(await within(content).findByText("Link failed")).toBeVisible();
+    fireEvent.click(within(content).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("3"));
+  });
+
+  it("keeps each session's draft and unfinished build its own", async () => {
+    const madeInA = gadgetFixture({ id: "3", name: "Tracker A", published_revision: null });
+    const madeInB = gadgetFixture({ id: "4", name: "Tracker B", published_revision: null });
+    vi.mocked(createGadget).mockResolvedValueOnce(madeInA).mockResolvedValueOnce(madeInB);
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(linkGadgetToSession).mockRejectedValue(new Error("Link failed"));
+    // Both sessions have New gadget open, so switching keeps the same tab selected.
+    const { rerender } = renderWithGadgets(<Rail conversationId="conv_b" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    await screen.findByRole("textbox", { name: "Describe the gadget" });
+    rerender(<Rail conversationId="conv_a" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    let content = await screen.findByRole("region", { name: "content" });
+    fireEvent.change(within(content).getByRole("textbox", { name: "Describe the gadget" }), {
+      target: { value: "A tracker" },
+    });
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    expect(await within(content).findByText("Link failed")).toBeVisible();
+
+    rerender(<Rail conversationId="conv_b" />);
+    content = await screen.findByRole("region", { name: "content" });
+    const box = within(content).getByRole("textbox", { name: "Describe the gadget" });
+    // B starts with its own empty draft, not A's text.
+    expect(box).toHaveValue("");
+    fireEvent.change(box, { target: { value: "A tracker" } });
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    expect(await within(content).findByText("Link failed")).toBeVisible();
+    // B made its own gadget; A's unfinished one is neither reused nor deleted.
+    expect(createGadget).toHaveBeenCalledTimes(2);
+    expect(deleteGadget).not.toHaveBeenCalled();
+
+    rerender(<Rail conversationId="conv_a" />);
+    content = await screen.findByRole("region", { name: "content" });
+    expect(within(content).getByRole("textbox", { name: "Describe the gadget" })).toHaveValue(
+      "A tracker",
+    );
+  });
+
   it("closes without building on Cancel", async () => {
     renderWithGadgets(<Rail conversationId="conv_1" />);
     fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
@@ -441,6 +496,20 @@ describe("the gadget beside New session", () => {
     renderWithGadgets(<GadgetNewSessionPanel active={false} />, { path: "/?gadget_start=1" });
     expect(screen.queryByTestId("gadget-new-session-panel")).toBeNull();
     expect(getGadget).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["on", GADGETS_INFO],
+    ["off", { ...GADGETS_INFO, features: {}, gadget_sharing: false }],
+  ])("renders nothing for a malformed session URL with gadgets %s", (_state, info) => {
+    for (const path of ["/c/%E0%A4", "/c/100%"]) {
+      const { unmount } = renderWithGadgets(<GadgetNewSessionPanel active={false} />, {
+        path,
+        info,
+      });
+      expect(screen.queryByTestId("gadget-new-session-panel")).toBeNull();
+      unmount();
+    }
   });
 
   it("names the gadget in the URL in full screen, and closes back to a plain New session", async () => {

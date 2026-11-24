@@ -36,6 +36,21 @@ export function gadgetBoardPath(appId: string): string {
  */
 export const GADGET_START_PARAM = "gadget_start";
 
+/**
+ * The session ID in a path under `sessionPrefix` (`/c/` rebased), or null for any other page.
+ * A segment that isn't valid percent-encoding is kept as written, as `useActiveConversationId`
+ * does, so a malformed URL can't break rendering.
+ */
+export function sessionIdFromPath(pathname: string, sessionPrefix: string): string | null {
+  if (!pathname.startsWith(sessionPrefix)) return null;
+  const segment = pathname.slice(sessionPrefix.length).replace(/\/$/, "");
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 function withQuery(path: string, params: Record<string, string | undefined>): string {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {

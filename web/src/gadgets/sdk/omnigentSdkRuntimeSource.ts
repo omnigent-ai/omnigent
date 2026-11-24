@@ -312,6 +312,9 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
     if (size < 0) {
       return rejected('INVALID_ARGUMENT', 'The request is not JSON-serializable', operationId);
     }
+    // Send what was measured: JSON drops undefined properties (an omitted optional argument),
+    // which a structured clone would keep and the host refuses.
+    message = JSON.parse(JSON.stringify(message));
     if (size > LIMITS.maxMessageBytes) {
       return rejected('INVALID_ARGUMENT', 'The request exceeds ' + LIMITS.maxMessageBytes + ' bytes', operationId);
     }

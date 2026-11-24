@@ -9,7 +9,7 @@ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useRebasePath, useReplaceSearchParams } from "@/lib/routing";
 import { noteGadgetStartFailed, requestGadgetRailTab } from "@/lib/gadgetRailTabs";
 import { deleteGadget, getGadget, getGadgetGadgetSession } from "@/gadgets/api/gadgetApi";
-import { GADGET_START_PARAM } from "@/gadgets/host/gadgetPages";
+import { GADGET_START_PARAM, sessionIdFromPath } from "@/gadgets/host/gadgetPages";
 import {
   adoptStartedGadgetSession,
   isStartedSessionId,
@@ -22,7 +22,9 @@ import { invalidateGadgets, useGadgetsEnabled } from "./gadgetQueries";
 let starting: { gadgetId: string } | null = null;
 // Creates that began on a gadget's New session, by attempt number: the session each makes is
 // that gadget's, whatever page the viewer is on by then.
-const attempts = new Map<number, { gadgetId: string; fullScreen: boolean }>();
+// `wasUnbuilt` says whether the attempt took the gadget's unbuilt mark, so a failed attempt
+// gives back only a mark it took and never marks an existing gadget for deletion.
+const attempts = new Map<number, { gadgetId: string; fullScreen: boolean; wasUnbuilt: boolean }>();
 // Sessions an attempt made for a gadget, by session ID, until linking them succeeds; a page
 // that shows the session again retries a link that failed.
 const madeFor = new Map<
@@ -102,13 +104,13 @@ function onAttempt(attempt: number, outcome: "begun" | "failed"): void {
     const failed = attempts.get(attempt);
     attempts.delete(attempt);
     // Build's gadget stays unbuilt: leaving New session deletes it as if Build was never sent.
-    if (failed !== undefined) unbuilt.add(failed.gadgetId);
+    if (failed?.wasUnbuilt) unbuilt.add(failed.gadgetId);
     return;
   }
   if (starting === null) return;
   const gadgetId = starting.gadgetId;
-  attempts.set(attempt, { gadgetId, fullScreen: fullScreenStarts.has(gadgetId) });
-  unbuilt.delete(gadgetId);
+  const wasUnbuilt = unbuilt.delete(gadgetId);
+  attempts.set(attempt, { gadgetId, fullScreen: fullScreenStarts.has(gadgetId), wasUnbuilt });
 }
 
 function adopt(
@@ -171,9 +173,7 @@ export function useAdoptStartedGadgetSession(): void {
     }
     const params = new URLSearchParams(search);
     const marked = params.get(GADGET_START_PARAM);
-    const sessionId = pathname.startsWith(sessionPrefix)
-      ? decodeURIComponent(pathname.slice(sessionPrefix.length).replace(/\/$/, ""))
-      : null;
+    const sessionId = sessionIdFromPath(pathname, sessionPrefix);
     if (sessionId === null) {
       if (marked) beginGadgetStart(marked, queryClient);
       // Left New session without starting it: for another page, or a plain New session.

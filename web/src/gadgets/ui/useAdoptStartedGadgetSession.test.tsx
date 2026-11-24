@@ -249,6 +249,24 @@ describe("a session started beside a gadget", () => {
     await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("board"));
   });
 
+  it("never deletes an existing gadget whose Create session failed", async () => {
+    // An unpublished gadget the viewer already had, with no session: it was never made to be
+    // built here, so a failed create mustn't mark it for deletion.
+    vi.mocked(getGadget).mockResolvedValue(
+      gadgetFixture({ id: "board", published_revision: null }),
+    );
+    vi.mocked(getGadgetGadgetSession).mockResolvedValue(null);
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    noteSessionCreationFailed(pendingAttempt!);
+    pendingAttempt = null;
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(deleteGadget).not.toHaveBeenCalled();
+  });
+
   it("links the session its own create makes, when another create finishes first", () => {
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Creating" }));

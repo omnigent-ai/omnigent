@@ -3,7 +3,7 @@ import { runInNewContext } from "node:vm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { GadgetInitContext } from "./gadgetProtocol";
-import { GADGET_CONNECT_MESSAGE_TYPE, GADGET_LIMITS } from "./gadgetProtocol";
+import { GADGET_CONNECT_MESSAGE_TYPE, GADGET_LIMITS, parseFrameMessage } from "./gadgetProtocol";
 import { buildOmnigentSdkBootstrapScript } from "./omnigentSdkRuntimeSource";
 import type {
   OmnigentActionReceipt,
@@ -255,6 +255,23 @@ describe("omnigent SDK runtime", () => {
         code: "UNSUPPORTED",
       });
       expect(requestsOn(hostPort, sentBefore)).toEqual([]);
+    });
+
+    it("sends navigation calls with omitted options that the host accepts", async () => {
+      const runtime = loadRuntime();
+      const { hostPort, client } = await connected(runtime, { ...CONTEXT, capabilities: [] });
+      // What the host receives is a structured clone, which keeps undefined properties; each
+      // call must still pass the host's own parser.
+      const accepted = () => parseFrameMessage(structuredClone(lastFrameMessage(hostPort)));
+      void client.navigation.newSession({ prompt: "hi" }).catch(() => undefined);
+      expect(accepted()).toMatchObject({ ok: true });
+      void client.navigation.openSession("s1").catch(() => undefined);
+      expect(accepted()).toMatchObject({ ok: true });
+      void client.navigation
+        .newAutomation({ name: "Daily", prompt: "Check it", schedule: "FREQ=DAILY" })
+        .catch(() => undefined);
+      expect(accepted()).toMatchObject({ ok: true });
+      expect(lastFrameMessage(hostPort)).not.toHaveProperty("params.display");
     });
 
     it("sends navigation calls without any granted capability and resolves with the host result", async () => {
