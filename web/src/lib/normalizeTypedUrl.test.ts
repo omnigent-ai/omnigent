@@ -27,6 +27,10 @@ describe("normalizeTypedUrl", () => {
     expect(normalizeTypedUrl(" FILE:///tmp/a.html ")).toBe("FILE:///tmp/a.html");
   });
 
+  it("still treats a host named file with a port as a dotless host", () => {
+    expect(normalizeTypedUrl("file:8080/x")).toBe("http://file:8080/x");
+  });
+
   it("treats a host:port with no dot as dotless", () => {
     expect(normalizeTypedUrl("localhost:3000/x")).toBe("http://localhost:3000/x");
   });

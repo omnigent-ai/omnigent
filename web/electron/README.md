@@ -525,8 +525,9 @@ Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.
 
 `file://` URLs stay blocked, since agents can read the pages a Browser tab shows.
-To preview a local HTML file from a session on this machine, run
-`python3 -m http.server 8000` in its folder and open `http://localhost:8000/`.
+To preview a local HTML file from a session on this machine, serve its folder
+with a local web server (for example, `python3 -m http.server 8000`) and open
+its `http://localhost` URL.
 From any host, opening the file from **Files** shows a sandboxed preview, though
 it doesn't load the file's sibling CSS, scripts or images.
 
