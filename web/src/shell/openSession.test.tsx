@@ -2,6 +2,8 @@ import { act, cleanup, render } from "@testing-library/react";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
+
 import { isOpenSession, usePublishOpenSession } from "./openSession";
 
 const roots = new Map<string, string>();
@@ -53,6 +55,20 @@ describe("openSession", () => {
     expect(isOpenSession("other")).toBe(true);
     act(() => goTo("/settings?session=other"));
     expect(isOpenSession("other")).toBe(false);
+    // An extension's page can end in /projects/<name>, but it shows no board.
+    act(() => goTo("/extensions/demo/projects/Payments?session=other"));
+    expect(isOpenSession("other")).toBe(false);
+  });
+
+  it("counts a quick view on the project's home under an embedding mount", () => {
+    render(
+      <MemoryRouter initialEntries={["/mount/projects/Payments?session=card"]}>
+        <RoutingProvider value={basenamedRouting("/mount")}>
+          <Shell routed={null} />
+        </RoutingProvider>
+      </MemoryRouter>,
+    );
+    expect(isOpenSession("card")).toBe(true);
   });
 
   it("follows a switch to another session and clears once the shell unmounts", () => {
