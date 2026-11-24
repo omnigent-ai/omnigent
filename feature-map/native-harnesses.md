@@ -800,6 +800,11 @@ Cross-harness journeys:
   exactly one browser copy per message. It requires Claude Code 2.1.323+ and
   tmux. This covers OSS routing integration with a scripted judge; it does not
   establish live gateway decisions or other-platform acceptance.
+  For a wrapped first Terminal message, check that it is delivered once and
+  the terminal returns to its original size after any temporary widening.
+  Changed whitespace, logical newlines and replacement sessions must keep
+  their exact draft contents. Inert ownership and sizing coverage is in
+  `tests/harnesses/claude_native/test_claude_native_model_reflow.py`.
 - **`model-and-effort`, Claude runtime selection (own environment):**
   `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
   uses real Claude catalog discovery, production invocation settings, a real

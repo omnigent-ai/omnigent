@@ -1,0 +1,12 @@
+{
+  "source_run": "https://github.com/omnigent-ai/omnigent/actions/runs/45408757991",
+  "source_sha": "3333ddb4c14444c4761caa48dfbefc38d64560c9",
+  "source_failure_sha256": "a4aa689067fe95550d09765d4d54b5824fb0165276f373ee9ae659fabed9da19",
+  "cli_version": "2.1.323",
+  "deployment": "isolated Linux OSS CI",
+  "provider": "mock",
+  "columns": 105,
+  "input": "This is turn 1. Context marker route-user-1-34939ff6. Reply with exactly this token and nothing else: route-reply-1-34939ff6",
+  "raw": "─────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯ This is turn 1. Context marker route-user-1-34939ff6. Reply with exactly this token and nothing else:\n  route-reply-1-34939ff6\n─────────────────────────────────────────────────────────────────────────────────────────────────────────\n  ⏸ manual mode on · gh auth login for PR status                  ✔ Update installed · Restart to apply\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+  "joined": "─────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯ This is turn 1. Context marker route-user-1-34939ff6. Reply with exactly this token and nothing else:  \n  route-reply-1-34939ff6                        \n─────────────────────────────────────────────────────────────────────────────────────────────────────────\n  ⏸ manual mode on · gh auth login for PR status                  ✔ Update installed · Restart to apply\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+}

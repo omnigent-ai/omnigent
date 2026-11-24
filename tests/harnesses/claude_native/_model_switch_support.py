@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import textwrap
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -248,6 +249,9 @@ class _SessionModelComposer(_EditableComposer):
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         super().install(monkeypatch)
+        monkeypatch.setattr(
+            claude_native_bridge, "_reflow_composer", lambda *_, **__: nullcontext(False)
+        )
         monkeypatch.setattr(
             claude_native_bridge,
             "_claude_pane_state",

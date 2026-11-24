@@ -6946,6 +6946,97 @@ def _usable_composer_height(socket_path: str, tmux_target: str) -> Iterator[bool
             _INJECTION_CANCEL_EVENT.reset(token)
 
 
+@contextlib.contextmanager
+def _reflow_composer(
+    bridge_dir: Path, *, recipient: ClaudeLegacyModelPane, minimum_columns: int
+) -> Iterator[bool]:
+    """Temporarily widen the same recipient so logical draft boundaries can be read."""
+    import subprocess
+
+    if not 4 < minimum_columns <= 4096:
+        yield False
+        return
+
+    def same_recipient() -> bool:
+        current = _legacy_model_pane(bridge_dir)
+        return current is not None and replace(current, version=recipient.version) == recipient
+
+    _check_injection_cancelled()
+    if not same_recipient():
+        yield False
+        return
+    socket_path, tmux_target = recipient.socket_path, recipient.tmux_target
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "display-message",
+                "-p",
+                "-t",
+                tmux_target,
+                "#{window_width} #{window_height} #{window-size}",
+                ";",
+                "show-options",
+                "-w",
+                "-v",
+                "-t",
+                tmux_target,
+                "window-size",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_tmux_injection_timeout_s(),
+        )
+        lines = proc.stdout.splitlines()
+        width, height, policy = lines[0].split()
+        needs_resize = (
+            proc.returncode == 0 and 0 < int(width) < minimum_columns and int(height) > 0
+        )
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+        yield False
+        return
+    if (
+        not needs_resize
+        or policy not in {"manual", "latest", "largest", "smallest"}
+        or not same_recipient()
+    ):
+        yield False
+        return
+    restore_policy = (
+        ("set-option", "-w", "-t", tmux_target, "window-size", policy)
+        if len(lines) > 1
+        else ("set-option", "-wu", "-t", tmux_target, "window-size")
+    )
+    try:
+        _run_tmux(socket_path, "resize-window", "-t", tmux_target, "-x", str(minimum_columns))
+        yield True
+    finally:
+        # Release only this recipient's sizing override, even after cancellation.
+        token = _INJECTION_CANCEL_EVENT.set(None)
+        try:
+            if same_recipient():
+                _run_tmux(
+                    socket_path,
+                    "resize-window",
+                    "-t",
+                    tmux_target,
+                    "-x",
+                    width,
+                    "-y",
+                    height,
+                    ";",
+                    *restore_policy,
+                    allow_missing_target=True,
+                )
+        except (OSError, RuntimeError, ValueError):
+            _logger.warning("claude-native: could not restore terminal size", exc_info=True)
+        finally:
+            _INJECTION_CANCEL_EVENT.reset(token)
+
+
 def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
     """
     Capture the current visible contents of a tmux pane.

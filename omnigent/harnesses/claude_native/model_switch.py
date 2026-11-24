@@ -635,6 +635,37 @@ class SessionOnlyModelSwitch:
         )
         self.wait(lambda text: _draft(text) == "", seconds=1.0)
 
+    def clear_replay_draft(self, pane: str, expected: str) -> None:
+        if self.draft_matches(pane, expected):
+            self.clear_owned_draft(expected)
+            return
+        physical = _draft(pane)
+        columns = len(expected.encode("utf-8")) + 4
+        # Visual similarity permits reflow only; exact fresh captures still own clearing.
+        if (
+            physical is None
+            or "\n" not in physical
+            or "".join(physical.split()) != "".join(expected.split())
+            or columns > 4096
+        ):
+            raise self.refuse(
+                "An unrelated draft occupies Claude's input box. Finish it, then retry."
+            )
+        recipient = self.bridge._legacy_model_pane(self.bridge_dir)
+        self.check()
+        if recipient is None:
+            raise self.refuse("The Claude terminal changed before its draft could be checked.")
+        with self.bridge._reflow_composer(
+            self.bridge_dir, recipient=recipient, minimum_columns=columns
+        ) as resized:
+            if not resized:
+                raise self.refuse(
+                    "An unrelated draft occupies Claude's input box. Finish it, then retry."
+                )
+            self.wait(lambda text: self.draft_matches(text, expected), seconds=1.0)
+            self.clear_owned_draft(expected)
+        self.wait(lambda text: _draft(text) == "", seconds=1.0)
+
     def cleanup_owned_control(self) -> None:
         if not self.info:
             return
@@ -943,11 +974,11 @@ class SessionOnlyModelSwitch:
         pane = self.pane()
         draft = _draft(pane)
         if draft or (draft is None and self.owned_draft is not None):
-            if self.owned_draft is None or not self.draft_matches(pane, self.owned_draft):
+            if self.owned_draft is None:
                 raise self.refuse(
                     "An unrelated draft occupies Claude's input box. Finish it, then retry."
                 )
-            self.clear_owned_draft(self.owned_draft)
+            self.clear_replay_draft(pane, self.owned_draft)
         before_selection: str | None = None
         plain_context = not claude_picker_model_key(self.choice.model).endswith("[1m]")
         if hinted_current or not plain_context:
