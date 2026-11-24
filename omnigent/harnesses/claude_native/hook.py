@@ -145,11 +145,8 @@ def _env_float(name: str, default: float) -> float:
 # down server can no longer re-POST for a day. Overridable for operators who
 # want more slack against a flaky upstream.
 #
-# With the 30s backoff ceiling, 40 fast failures span about 17 minutes. That
-# rides out a brief server outage, so the request reaches Omnigent and the web
-# card appears once the server is back. Claude's terminal prompt stays
-# answerable meanwhile. A cap of a few attempts would give up within 90s and
-# leave only a terminal prompt that a web-only session never sees.
+# 40 failures ride out a brief outage, so the web card returns once the server
+# is back: about 17 minutes of 30s backoff, up to 40 when every connect times out.
 _PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 40))
 
 
