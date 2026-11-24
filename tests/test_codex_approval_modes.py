@@ -139,8 +139,10 @@ def test_preset_from_thread_settings_none_for_unmapped() -> None:
     assert codex_permission_preset_from_thread_settings({}) is None
 
 
+@pytest.mark.parametrize("reviewer", ["user", "auto_review"])
+@pytest.mark.parametrize("sandbox_key", ["sandboxPolicy", "sandbox"])
 @pytest.mark.parametrize(
-    ("sandbox_policy", "expected"),
+    ("sandbox", "expected"),
     [
         # What Codex reports for `--ask-for-approval never` (or a config
         # `approval_policy = "never"`) without a full-access sandbox: no prompts,
@@ -149,19 +151,31 @@ def test_preset_from_thread_settings_none_for_unmapped() -> None:
         ({"type": "workspace-write"}, None),
         ({"type": "externalSandbox"}, None),
         ({"type": "readOnly"}, "read-only"),
+        ({"type": "dangerFullAccess"}, "full-access"),
     ],
 )
-def test_preset_from_thread_settings_never_on_restricted_sandbox_is_not_full_access(
-    sandbox_policy: dict, expected: str | None
+def test_preset_from_thread_settings_never_follows_the_reported_sandbox(
+    reviewer: str, sandbox_key: str, sandbox: dict, expected: str | None
 ) -> None:
-    """Approval ``never`` alone must not read back as Full Access."""
+    """Approval ``never`` reads back as Full Access only on a full-access sandbox.
+
+    Settings notifications carry ``sandboxPolicy``; thread/resume results carry
+    ``sandbox``. The reviewer never makes it Approve for me: nothing is asked.
+    """
     settings = {
         "approvalPolicy": "never",
-        "approvalsReviewer": "user",
-        "sandboxPolicy": sandbox_policy,
+        "approvalsReviewer": reviewer,
+        sandbox_key: sandbox,
         "activePermissionProfile": None,
     }
     assert codex_permission_preset_from_thread_settings(settings) == expected
+
+
+def test_preset_from_thread_settings_never_without_sandbox_is_full_access() -> None:
+    """A ``never`` policy with no reported sandbox keeps reading as Full Access."""
+    assert codex_permission_preset_from_thread_settings({"approvalPolicy": "never"}) == (
+        "full-access"
+    )
 
 
 @pytest.mark.parametrize("sandbox_type", [{}, []])

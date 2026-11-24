@@ -125,13 +125,14 @@ _READ_ONLY_SANDBOX_TYPES = frozenset({"readOnly", "read-only"})
 def codex_permission_preset_from_thread_settings(settings: object) -> str | None:
     """Map a Codex ``threadSettings`` payload to a ``/permissions`` preset value.
 
-    Reads the approval fields Codex emits on a ``thread/settings/updated`` (and
-    ``thread/resume``) notification. Presets are distinguished by, in order: a
-    full-access sandbox/profile → ``full-access``; a read-only sandbox/profile →
-    ``read-only``; an ``auto_review`` reviewer under on-request →
+    Reads the approval fields of a ``thread/settings/updated`` notification's
+    ``threadSettings`` or a ``thread/resume`` result. Presets are distinguished
+    by, in order: a full-access sandbox/profile → ``full-access``; a read-only
+    sandbox/profile → ``read-only``; a ``never`` policy with no reported sandbox
+    → ``full-access``; an ``auto_review`` reviewer under on-request →
     ``approve-for-me``; a plain on-request policy → ``ask-for-approval``.
     Returns ``None`` when the payload doesn't resolve to a preset (e.g. a custom
-    profile, or a ``never`` policy on a workspace sandbox).
+    profile, or a ``never`` policy on a reported workspace sandbox).
 
     :param settings: The ``threadSettings`` mapping (or anything, defensively).
     :returns: A value from :data:`CODEX_NATIVE_PERMISSION_VALUES`, or ``None``.
@@ -140,7 +141,9 @@ def codex_permission_preset_from_thread_settings(settings: object) -> str | None
         return None
     approval_policy = settings.get("approvalPolicy")
     reviewer = settings.get("approvalsReviewer")
-    sandbox = settings.get("sandboxPolicy")
+    # Settings notifications name the sandbox ``sandboxPolicy``; thread/start,
+    # thread/resume and thread/fork results name it ``sandbox``.
+    sandbox = settings.get("sandboxPolicy", settings.get("sandbox"))
     sandbox_type = sandbox.get("type") if isinstance(sandbox, Mapping) else None
     if not isinstance(sandbox_type, str):
         sandbox_type = None
@@ -151,9 +154,9 @@ def codex_permission_preset_from_thread_settings(settings: object) -> str | None
     if sandbox_type in _READ_ONLY_SANDBOX_TYPES or profile_id == ":read-only":
         return "read-only"
     if approval_policy == "never":
-        # No prompts, but commands stay sandboxed and can't ask to escalate;
-        # Codex's own /permissions popup marks no row current for this.
-        return None
+        # On a reported workspace sandbox commands stay confined and can't ask
+        # to escalate; Codex's own /permissions popup marks no row current then.
+        return "full-access" if sandbox_type is None and profile_id is None else None
     if reviewer == "auto_review":
         return "approve-for-me"
     if approval_policy == "on-request":
