@@ -14,7 +14,7 @@ from omnigent.runner.native import orchestration
 async def test_refresh_writes_each_new_runner_bearer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each renewed runner bearer reaches ``permission_hook.json``, and only once."""
+    """Each renewed runner bearer reaches ``permission_hook.json`` once, past a failed mint."""
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = bridge.prepare_bridge_dir(
@@ -25,7 +25,7 @@ async def test_refresh_writes_each_new_runner_bearer(
         ap_server_url="http://127.0.0.1:8787",
         ap_auth_headers={"Authorization": "Bearer launch"},
     )
-    tokens = iter(["renewed", "renewed", "renewed-again"])
+    tokens = iter(["renewed", "renewed", RuntimeError("mint failed"), "renewed-again"])
     written: list[str] = []
     update = bridge.update_permission_hook_auth_headers
 
@@ -35,11 +35,17 @@ async def test_refresh_writes_each_new_runner_bearer(
 
     monkeypatch.setattr(bridge, "update_permission_hook_auth_headers", _recording_update)
 
+    def _next_token() -> str:
+        token = next(tokens, "renewed-again")
+        if isinstance(token, Exception):
+            raise token
+        return token
+
     task = asyncio.create_task(
         orchestration._refresh_claude_permission_hook_auth(
             bridge_dir=bridge_dir,
             server_url="http://127.0.0.1:8787",
-            auth_token_factory=lambda: next(tokens, "renewed-again"),
+            auth_token_factory=_next_token,
             refresh_interval_s=0.01,
         )
     )
