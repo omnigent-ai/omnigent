@@ -6,6 +6,7 @@ import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { joinBrowseLocation } from "@/hooks/useWorkspaceChangedFiles";
 import { useWorkspacePaths } from "@/shell/FileViewerContext";
 import { cn } from "@/lib/utils";
 import { CopyPathButton } from "./CopyPathButton";
@@ -90,7 +91,7 @@ export function FileBreadcrumbs({
             dark={dark}
             onOpenFile={(pathInFolder) => {
               setOpenSegment(null);
-              onOpenFile?.(joinFolder(folder, pathInFolder));
+              onOpenFile?.(joinBrowseLocation(folder, pathInFolder));
             }}
           />
         }
@@ -211,9 +212,4 @@ function FolderTreeContent({
       {tree}
     </PopoverContent>
   );
-}
-
-function joinFolder(folder: string, pathInFolder: string): string {
-  if (folder === "") return pathInFolder;
-  return folder === "/" ? `/${pathInFolder}` : `${folder}/${pathInFolder}`;
 }
