@@ -116,6 +116,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "workspace_api_server_access": False,
         "floating_composer": False,
         "sidebar_saved_views": False,
+        "shared_session_updates_socket": False,
     }
     assert data["sibling_sessions"] is True
     # Gadgets are off: the top-level capabilities the web reads say so too.

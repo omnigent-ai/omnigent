@@ -66,6 +66,7 @@ class Feature(StrEnum):
     SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
     FLOATING_PANES = "floating_panes"
     GADGETS = "gadgets"
+    SHARED_SESSION_UPDATES_SOCKET = "shared_session_updates_socket"
 
 
 class FeatureIntent(StrEnum):
@@ -386,6 +387,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="web",
         review_by_release="0.27.0",
         follows=Feature.WORKSPACE_SIDEBAR_V2,
+    ),
+    FeatureDefinition(
+        feature=Feature.SHARED_SESSION_UPDATES_SOCKET,
+        description="Share one session-updates WebSocket between a browser's tabs",
+        owner="web",
+        review_by_release="0.28.0",
     ),
 )
 
