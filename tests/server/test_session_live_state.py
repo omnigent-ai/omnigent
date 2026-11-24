@@ -293,6 +293,21 @@ def test_pending_count_hook_persists_publish_and_resolve(
     ]
 
 
+def test_forced_pending_count_write_skips_the_replica_dedupe(
+    recording_store: _RecordingStore,
+) -> None:
+    """A forced write reaches the store even when this replica last wrote the same count.
+
+    Every replica shares the stored count, so repeating this replica's last
+    write proves nothing about the row: another replica may have written since.
+    """
+    session_live_state.persist_pending_count("conv_1", 0)
+    session_live_state.persist_pending_count("conv_1", 0)
+    session_live_state.persist_pending_count("conv_1", 0, force=True)
+    _wait_until(lambda: len(recording_store.pending_writes) >= 2)
+    assert recording_store.pending_writes == [("conv_1", 0), ("conv_1", 0)]
+
+
 def test_runner_liveness_touch_and_clear_pass_through(
     recording_store: _RecordingStore,
 ) -> None:

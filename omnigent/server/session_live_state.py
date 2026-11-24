@@ -411,7 +411,7 @@ def _agent_worked_on_run(conversation_id: str, run_id: str) -> bool:
     )
 
 
-def persist_pending_count(conversation_id: str, count: int) -> None:
+def persist_pending_count(conversation_id: str, count: int, *, force: bool = False) -> None:
     """
     Persist an outstanding-elicitation count change.
 
@@ -420,8 +420,11 @@ def persist_pending_count(conversation_id: str, count: int) -> None:
 
     :param conversation_id: Session/conversation identifier.
     :param count: Outstanding elicitations, ``>= 0``.
+    :param force: Write even when this replica last wrote the same count.
+        The row is shared by every replica, so another replica may have
+        changed it since; callers repairing the row pass ``True``.
     """
-    if _store is None or _last_pending.get(conversation_id) == count:
+    if _store is None or (not force and _last_pending.get(conversation_id) == count):
         return
     _last_pending[conversation_id] = count
 

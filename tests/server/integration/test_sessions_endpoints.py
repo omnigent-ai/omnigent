@@ -60,7 +60,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
 from tests.debug_log_helpers import capture_debug_rows
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
 
@@ -4743,6 +4743,56 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     assert row["pending_elicitations_count"] == 2
 
     store.set_pending_elicitation_count(session_id, 0)
+
+
+async def test_get_session_repairs_stale_pending_count_while_holding_the_runner(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Opening a session repairs a stored pending count its runner's replica does not hold.
+
+    A prompt recorded on one replica and resolved on another leaves the stored
+    count at 1, so the list keeps showing a prompt the snapshot no longer has.
+    The replica holding the session's runner has the authoritative index, so
+    its snapshot read rewrites the stored count.
+
+    :param app: The app behind ``client``; its tunnel registry gets the runner.
+    :param client: Test HTTP client backed by the real app.
+    :param db_uri: The app's DB, opened directly to seed the stale row.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    pending_elicitations.reset_for_tests()
+    register_test_runner(app, "runner_stale_pending")
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner_stale_pending")
+    store.set_pending_elicitation_count(session_id, 1)
+
+    async def listed_count() -> int:
+        resp = await client.get("/v1/sessions")
+        assert resp.status_code == 200
+        return next(r for r in resp.json()["data"] if r["id"] == session_id)[
+            "pending_elicitations_count"
+        ]
+
+    assert await listed_count() == 1
+
+    resp = await client.get(
+        f"/v1/sessions/{session_id}",
+        params={"include_items": "false", "include_live_status": "false"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["pending_elicitations"] == []
+
+    for _ in range(400):
+        if await listed_count() == 0:
+            break
+        await asyncio.sleep(0.025)
+    assert await listed_count() == 0
 
 
 async def test_get_session_includes_runner_online(

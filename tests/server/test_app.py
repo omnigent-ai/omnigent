@@ -3073,6 +3073,64 @@ async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
 
 
 @pytest.mark.asyncio
+async def test_on_runner_connect_rewrites_pending_count_written_by_another_replica(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconnect repairs the stored pending count even after this replica wrote the same value.
+
+    This replica stored 0, then another replica stored a prompt that this replica's
+    index does not hold. Skipping the repair because it repeats this replica's last
+    write leaves the session list counting a prompt nobody can answer.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_routes
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_pending_repair_test"
+    (session_id,) = _bind_sessions(db_uri, runner_id)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_session_live_status(session_id, "idle")
+
+    async def stored_count_becomes(expected: int) -> int | None:
+        for _ in range(400):
+            conv = store.get_conversation(session_id)
+            assert conv is not None
+            if conv.pending_elicitation_count == expected:
+                break
+            await asyncio.sleep(0.025)
+        return conv.pending_elicitation_count
+
+    session_live_state.persist_pending_count(session_id, 0)
+    assert await stored_count_becomes(0) == 0
+    store.set_pending_elicitation_count(session_id, 1)
+
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+
+    async def _initialize(conv: Conversation, *_a: object, **_k: object) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
+
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert await stored_count_becomes(0) == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failed_read", ["list_child_conversation_ids_page", "get_conversations"])
 async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
     db_uri: str,

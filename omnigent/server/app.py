@@ -5428,8 +5428,10 @@ def create_app(
                         else:
                             prefetch_session_routing_catalogs(conv.id, conv, routed.client)
                         # A crash can leave a persisted count absent from the live index.
+                        # Forced: another replica may have rewritten the shared row since
+                        # this replica's last write, which the dedupe would not notice.
                         session_live_state.persist_pending_count(
-                            conv.id, pending_elicitations.count_for(conv.id)
+                            conv.id, pending_elicitations.count_for(conv.id), force=True
                         )
                         cached_sandbox = _session_sandbox_status_cache.get(conv.id)
                         # A reconnect proves readiness only for a launch already marked failed.
