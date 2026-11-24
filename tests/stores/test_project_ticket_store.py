@@ -117,28 +117,26 @@ def test_unseen_activity_counts_others_after_the_forward_only_marker(board):
     ids = [mine["id"], theirs["id"]]
 
     unseen = tickets.unseen_activity(project.id, ids, user_id="alice")
-    # Never viewed: the agent-created ticket is new; own edits and outputs never count.
+    # Only human-facing comments by others count; creation, stage moves and own notes don't.
     assert unseen[theirs["id"]] == {
         "viewer_seen_position": None,
         "new_comment_count": 0,
-        "new_update_count": 1,
-        "first_new_position": 0,
+        "first_new_position": None,
     }
     assert unseen[mine["id"]] == {
         "viewer_seen_position": None,
         "new_comment_count": 1,
-        "new_update_count": 1,
         "first_new_position": 2,
     }
 
     assert tickets.mark_seen(
         project.id, mine["id"], MarkTicketSeen(seen_position=2), user_id="alice"
     ) == {"viewer_seen_position": 2}
+    tickets.comment(project.id, mine["id"], CommentOnTicket(text="Agent note"), agent)
     assert tickets.unseen_activity(project.id, ids, user_id="alice")[mine["id"]] == {
         "viewer_seen_position": 2,
         "new_comment_count": 0,
-        "new_update_count": 1,
-        "first_new_position": 4,
+        "first_new_position": None,
     }
     # The marker never moves backwards and clamps to the latest activity.
     assert tickets.mark_seen(
@@ -147,10 +145,6 @@ def test_unseen_activity_counts_others_after_the_forward_only_marker(board):
     assert tickets.mark_seen(
         project.id, mine["id"], MarkTicketSeen(seen_position=99), user_id="alice"
     ) == {"viewer_seen_position": 4}
-    assert (
-        tickets.unseen_activity(project.id, ids, user_id="alice")[mine["id"]]["new_update_count"]
-        == 0
-    )
     with pytest.raises(OmnigentError):
         tickets.mark_seen(project.id, mine["id"], MarkTicketSeen(seen_position=4), user_id="bob")
     with pytest.raises(OmnigentError):

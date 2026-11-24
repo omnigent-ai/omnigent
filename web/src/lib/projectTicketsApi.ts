@@ -81,10 +81,9 @@ export interface ProjectTicket {
   updated_at: number;
   /** The viewer's last-seen activity position; null when never opened. Absent for agents. */
   viewer_seen_position?: number | null;
-  /** Comments and updates by others after the viewer's last-seen position. */
+  /** Human-facing comments by others after the viewer's last-seen position. */
   new_comment_count?: number;
-  new_update_count?: number;
-  /** Position of the first new comment or update, or null when nothing is new. */
+  /** Position of the first new comment, or null when nothing is new. */
   first_new_position?: number | null;
   /** The pinned result while the ticket stays complete; only on single-ticket reads. */
   final_update?: TicketFinalUpdate | null;

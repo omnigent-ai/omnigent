@@ -52,7 +52,6 @@ from tests.server.routes.test_projects_crud import project_client as project_cli
 NOTHING_NEW = {
     "viewer_seen_position": None,
     "new_comment_count": 0,
-    "new_update_count": 0,
     "first_new_position": None,
 }
 

@@ -491,16 +491,11 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
   );
 }
 
-/** Activity from others since the viewer last opened the ticket, like the sidebar Inbox badge. */
+/** Comments meant for the viewer since they last opened the ticket, like the sidebar Inbox badge. */
 function TicketNewActivity({ ticket }: { ticket: ProjectTicket }) {
   const comments = ticket.new_comment_count ?? 0;
-  const updates = ticket.new_update_count ?? 0;
-  if (comments + updates === 0) return null;
-  const parts = [
-    comments > 0 && `${comments} new ${comments === 1 ? "comment" : "comments"}`,
-    updates > 0 && `${updates} new ${updates === 1 ? "update" : "updates"}`,
-  ].filter(Boolean);
-  const label = parts.join(", ");
+  if (comments === 0) return null;
+  const label = `${comments} new ${comments === 1 ? "comment" : "comments"}`;
   return (
     <span
       data-testid="ticket-new-activity"
@@ -508,7 +503,7 @@ function TicketNewActivity({ ticket }: { ticket: ProjectTicket }) {
       aria-label={label}
       className="rounded-full bg-primary px-1.5 text-xs leading-5 font-semibold text-primary-foreground tabular-nums"
     >
-      {comments > 0 ? `+${comments}` : "New"}
+      +{comments}
     </span>
   );
 }

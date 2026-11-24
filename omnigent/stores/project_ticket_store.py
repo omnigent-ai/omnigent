@@ -573,7 +573,7 @@ class ProjectTicketStore:
     def unseen_activity(
         self, project_id: str, ticket_ids: builtins.list[str], *, user_id: str | None
     ) -> dict[str, dict[str, Any]]:
-        """Count each ticket's activity after the viewer's marker, excluding their own edits."""
+        """Count each ticket's human-facing comments after the viewer's marker, excluding their own."""
         if len(ticket_ids) > TICKET_PAGE_MAX:
             raise OmnigentError("Too many tickets", code=ErrorCode.INVALID_INPUT)
         ids = sorted({_identifier(ticket_id) for ticket_id in ticket_ids})
@@ -593,7 +593,6 @@ class ProjectTicketStore:
                 ticket_id: {
                     "viewer_seen_position": None,
                     "new_comment_count": 0,
-                    "new_update_count": 0,
                     "first_new_position": None,
                 }
                 for ticket_id in ids
@@ -623,20 +622,13 @@ class ProjectTicketStore:
                 read.user_id == viewer,
             )
 
-            def count_new(ticket_id: str, field: str, count: int, first_position: int) -> None:
+            def count_new(ticket_id: str, position: int) -> None:
                 entry = result[ticket_id]
-                entry[field] += count
-                if entry["first_new_position"] is None or first_position < entry["first_new_position"]:
-                    entry["first_new_position"] = first_position
+                entry["new_comment_count"] += 1
+                if entry["first_new_position"] is None or position < entry["first_new_position"]:
+                    entry["first_new_position"] = position
 
-            for ticket_id, count, first_position in session.execute(
-                select(event.ticket_id, func.count(), func.min(event.position))
-                .select_from(event)
-                .outerjoin(read, seen_marker)
-                .where(unseen, event.kind.in_(NEW_UPDATE_KINDS))
-                .group_by(event.ticket_id)
-            ):
-                count_new(ticket_id, "new_update_count", count, first_position)
+            # Only human-facing comments count; stage, label and other edits are routine.
             # Who a comment is for lives in its payload, so agent notes are filtered here.
             orchestrator_session_id = _orchestrator_session_id(project)
             asks_by_ticket: dict[str, builtins.list[_HumanAsk]] = {}
@@ -656,7 +648,7 @@ class ProjectTicketStore:
                         for ask in asks_by_ticket[row.ticket_id]
                     )
                 if human:
-                    count_new(row.ticket_id, "new_comment_count", 1, row.position)
+                    count_new(row.ticket_id, row.position)
             return result
 
     def mark_seen(
