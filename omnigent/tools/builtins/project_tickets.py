@@ -124,6 +124,24 @@ class ProposeIdentity(BaseModel):
         return self
 
 
+class OpenIdentitySession(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    identity: str = Field(
+        min_length=1,
+        max_length=64,
+        description="The identity's name (case-insensitive), e.g. 'PM', or its ID.",
+    )
+    message: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32_000,
+        description=(
+            "Optional self-contained message delivered like sys_session_message, e.g. the "
+            "ticket ID, goal, and how to report back."
+        ),
+    )
+
+
 class _TicketTool(Tool):
     tool_name: ClassVar[str]
     help_text: ClassVar[str]
@@ -293,6 +311,20 @@ class SysProjectIdentityProposeTool(_TicketTool):
         return cls.help_text
 
 
+class SysProjectIdentitySessionTool(_TicketTool):
+    tool_name = "sys_project_identity_session"
+    help_text = (
+        "Open the session of one of this project's existing identities (owner-defined roles "
+        "such as 'PM') to delegate a workstream to it. Returns its one live session, starting "
+        "it with the identity's persona only when it has none; it never starts a second one. "
+        "With message, also delivers that message to it like sys_session_message (queued if "
+        "it is busy). Keep talking to it later with sys_session_message on the returned "
+        "session_id. The built-in Orchestrator is not an identity here. This cannot create "
+        "or edit identities; use sys_project_identity_propose for that."
+    )
+    arguments = OpenIdentitySession
+
+
 class SaveProjectArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str = Field(
@@ -336,6 +368,7 @@ TICKET_TOOL_CLASSES = (
     SysTicketLinkTool,
     SysProjectMandateProposeTool,
     SysProjectIdentityProposeTool,
+    SysProjectIdentitySessionTool,
     SysProjectArtifactSaveTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}

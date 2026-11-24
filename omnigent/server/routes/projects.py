@@ -661,9 +661,11 @@ def create_projects_router(
 
         Single-tracked: a live (idle or busy) session is reused, never doubled.
         A missing or archived one is replaced, guarded by ``expected_session_id``.
+        Agents may call it (``sys_project_identity_session``) to delegate to an
+        existing identity; they still cannot create, edit or delete identities.
         """
         user_id = require_user(request, auth_provider)
-        _refuse_agent_identity_write(request)
+        await _require_private_source(request, user_id)
         project = await _owned_project(project_id, user_id)
         if identity_id == ORCHESTRATOR_IDENTITY_ID:
             raise OmnigentError(
@@ -697,14 +699,24 @@ def create_projects_router(
                 "agent_id": identity.agent_id or project.config.get("agent_id"),
                 "model_override": identity.model,
                 "reasoning_effort": identity.effort,
-                "labels": {PROJECT_IDENTITY_LABEL_KEY: identity.id},
             },
         )
         if not payload.get("agent_id"):
             payload["agent_id"] = await default_project_agent_id(
                 request, getattr(request.app.state, "agent_store", None), payload.get("host_id")
             )
-        created = await create_session(request, user_id, payload, None)
+
+        async def label_identity_session(session_id: str) -> None:
+            # Server-owned label, so it is written here rather than seeded by the
+            # client-validated payload; the runner reads it at launch for the persona.
+            assert conversation_store is not None
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                {PROJECT_IDENTITY_LABEL_KEY: identity.id},
+            )
+
+        created = await create_session(request, user_id, payload, label_identity_session)
         session_id = getattr(created, "id", None) or getattr(created, "session_id", None)
         if not isinstance(session_id, str):
             raise OmnigentError("Session creation failed", code=ErrorCode.INTERNAL_ERROR)

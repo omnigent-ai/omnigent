@@ -88,6 +88,8 @@ async def execute_ticket_tool(
                 },
                 ensure_ascii=False,
             )
+        if name == "sys_project_identity_session":
+            return await _open_identity_session(body, project_id, request, client, source_id)
         path = f"/v1/projects/{project_id}/tickets"
         if ticket_id is not None:
             path += f"/{ticket_id}"
@@ -136,6 +138,62 @@ async def execute_ticket_tool(
         )
     except (ValueError, httpx.HTTPError) as exc:
         return json.dumps({"error": str(exc)})
+
+
+async def _open_identity_session(
+    body: dict[str, Any],
+    project_id: str,
+    request: Any,
+    client: httpx.AsyncClient,
+    source_id: str,
+) -> str:
+    """Start or reuse an existing identity's single session, then optionally message it."""
+    from omnigent.runner.session_message import execute_message_tool
+
+    base = f"/v1/projects/{project_id}/identities"
+    wanted = body["identity"].strip()
+    folded = wanted.casefold()
+    try:
+        wanted_id = uuid_to_bytes(wanted).hex()
+    except ValueError:
+        wanted_id = None
+    roles = [entry for entry in (await request("GET", base))["data"] if not entry["builtin"]]
+    identity = next(
+        (
+            entry
+            for entry in roles
+            if entry["id"] == wanted_id or entry["name"].casefold() == folded
+        ),
+        None,
+    )
+    if identity is None:
+        if folded == "orchestrator":
+            return json.dumps({"error": "The Orchestrator is not an identity session target"})
+        return json.dumps(
+            {
+                "error": f"No identity named {wanted!r}; only the owner creates identities "
+                "(propose one with sys_project_identity_propose)",
+                "identities": [entry["name"] for entry in roles],
+            },
+            ensure_ascii=False,
+        )
+    opened = await request(
+        "POST",
+        f"{base}/{identity['id']}/session",
+        json={"expected_session_id": identity["active_session_id"]},
+    )
+    result: dict[str, Any] = {
+        "identity": {"id": identity["id"], "name": identity["name"]},
+        "session_id": opened["session_id"],
+        "created": opened["created"],
+        "previous_state": identity["active_session_state"],
+    }
+    if "message" in body:
+        delivery = await execute_message_tool(
+            {"session_id": opened["session_id"], "message": body["message"]}, client, source_id
+        )
+        result["message_delivery"] = json.loads(delivery)
+    return json.dumps(result, ensure_ascii=False)
 
 
 async def _save_artifact(

@@ -22181,7 +22181,7 @@
     },
     "/v1/projects/{project_id}/identities/{identity_id}/session": {
       "post": {
-        "description": "Return the identity's active session, starting one only when it has none.\n\nSingle-tracked: a live (idle or busy) session is reused, never doubled.\nA missing or archived one is replaced, guarded by `expected_session_id`.",
+        "description": "Return the identity's active session, starting one only when it has none.\n\nSingle-tracked: a live (idle or busy) session is reused, never doubled.\nA missing or archived one is replaced, guarded by `expected_session_id`.\nAgents may call it (`sys_project_identity_session`) to delegate to an\nexisting identity; they still cannot create, edit or delete identities.",
         "operationId": "open_identity_session_v1_projects__project_id__identities__identity_id__session_post",
         "parameters": [
           {

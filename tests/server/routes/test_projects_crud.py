@@ -458,7 +458,7 @@ async def test_agent_identity_proposals_apply_only_when_the_owner_accepts(
     )
     assert duplicate.status_code == 409
     listed = (await project_client.get(base)).json()["data"]
-    assert [entry["name"] for entry in listed] == ["PM", "Designer"]
+    assert sorted(entry["name"] for entry in listed) == ["Designer", "PM"]
     assert [entry["name"] for entry in (await project_client.get(identities)).json()["data"]] == [
         "Orchestrator"
     ]
@@ -490,6 +490,45 @@ async def test_agent_identity_proposals_apply_only_when_the_owner_accepts(
         base, json={"name": "X", "identity_id": accepted["id"], "instructions": "y"}
     )
     assert both.status_code == 400
+
+
+async def test_agents_open_an_identitys_one_session_but_cannot_edit_it(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Delegating to an owner-made identity starts its session once, then reuses it."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    agent = {ORCHESTRATION_SOURCE_HEADER: created["main_session_id"]}
+    identities = f"/v1/projects/{created['id']}/identities"
+    pm = (
+        await project_client.post(identities, json={"name": "PM", "instructions": "Plan."})
+    ).json()
+    session = f"{identities}/{pm['id']}/session"
+    first = await project_client.post(session, json={"expected_session_id": None}, headers=agent)
+    assert first.status_code == 200, first.text
+    assert first.json()["created"] is True
+    again = (
+        await project_client.post(session, json={"expected_session_id": None}, headers=agent)
+    ).json()
+    assert again == {"session_id": first.json()["session_id"], "created": False}
+    snapshot = await project_client.get(
+        f"/v1/sessions/{again['session_id']}", params={"include_project_mandate": "true"}
+    )
+    assert snapshot.json()["project_identity"] == {
+        "id": pm["id"],
+        "name": "PM",
+        "instructions": "Plan.",
+    }
+    orchestrator = await project_client.post(
+        f"{identities}/orchestrator/session", json={}, headers=agent
+    )
+    assert orchestrator.status_code == 400
+    edit = await project_client.patch(
+        f"{identities}/{pm['id']}", json={"instructions": "Anything."}, headers=agent
+    )
+    assert edit.status_code == 403
+    assert (
+        await project_client.delete(f"{identities}/{pm['id']}", headers=agent)
+    ).status_code == 403
 
 
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:

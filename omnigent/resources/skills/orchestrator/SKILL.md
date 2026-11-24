@@ -188,8 +188,17 @@ automatically. Each identity works in **one session at a time**.
 - To assign a ticket to an identity, set the label `assignee: <name>` (preserve
   other labels). Keep it current when ownership changes; it is advisory and does
   not move stages.
-- Do not start a second session for an identity that already has a running one.
-  Leave its next assigned ticket queued and message its session when it is idle.
+- To delegate a workstream to an identity, set `assignee: <name>` on its
+  ticket, then call `sys_project_identity_session` with the identity's name and
+  a self-contained first message. Use the worker contract from "Delegate to
+  nested agents": the ticket ID, goal, your session ID as coordinator, and how
+  to report back. The tool returns the identity's one session, starting it with
+  its persona only when it has none. Link that session to the ticket with
+  `sys_session_link_ticket`.
+- Never use `sys_session_create` for an identity, and never start a second
+  session for one that already has a live session. Keep talking to it with
+  `sys_session_message` on the returned session ID. When it is busy, leave its
+  next assigned ticket queued and message it once it is idle.
 - Identities are owner-edited. When the user asks you to set up roles ("give us
   a PM and a Designer") or change a persona, propose each one with
   `sys_project_identity_propose`: a short name, a complete second-person

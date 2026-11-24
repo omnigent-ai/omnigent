@@ -285,7 +285,7 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 10
+    assert len(TICKET_TOOLS) == 12
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (
@@ -352,3 +352,65 @@ async def test_mandate_proposal_goes_to_the_callers_project_and_reports_it_pendi
     assert len(requests) == 2
     description = TICKET_TOOLS["sys_project_mandate_propose"].description()
     assert "changes nothing until the owner accepts it" in description
+
+
+async def test_identity_session_reuses_the_named_identitys_session_and_messages_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "omnigent.runner.session_message.peer_session_messaging_enabled", lambda: True
+    )
+    identity = "d" * 32
+    live = "e" * 32
+    requests = []
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        assert request.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+        path = request.url.path
+        if path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        if path == f"/v1/projects/{PROJECT}/identities":
+            roster = [
+                {"id": "orchestrator", "name": "Orchestrator", "builtin": True},
+                {
+                    "id": identity,
+                    "name": "PM",
+                    "builtin": False,
+                    "active_session_id": live,
+                    "active_session_state": "idle",
+                },
+            ]
+            return httpx.Response(200, json={"data": roster})
+        if path == f"/v1/projects/{PROJECT}/identities/{identity}/session":
+            assert json.loads(request.content) == {"expected_session_id": live}
+            return httpx.Response(200, json={"session_id": live, "created": False})
+        assert path == f"/v1/sessions/{live}/events"
+        assert json.loads(request.content)["data"] == {"message": "Own ticket X."}
+        return httpx.Response(200, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        result = json.loads(
+            await execute_ticket_tool(
+                "sys_project_identity_session",
+                {"identity": "pm", "message": "Own ticket X."},
+                client,
+                SOURCE,
+            )
+        )
+        missing = json.loads(
+            await execute_ticket_tool(
+                "sys_project_identity_session", {"identity": "Orchestrator"}, client, SOURCE
+            )
+        )
+    assert result == {
+        "identity": {"id": identity, "name": "PM"},
+        "session_id": live,
+        "created": False,
+        "previous_state": "idle",
+        "message_delivery": {"queued": True},
+    }
+    assert "not an identity" in missing["error"]
+    assert ("POST", f"/v1/sessions/{live}/events") in requests
