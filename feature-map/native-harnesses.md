@@ -225,6 +225,12 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings drops Harnesses when none is left. The import review modal's See
   more opens Harnesses and dismisses the modal. Import sessions contains only
   session imports.
+- `gadget-tools`: with the server's `gadgets` feature on, native sessions get the
+  `sys_gadget_*` tools and the `gadget` framework skill, like other builtin tool
+  groups. A runner whose server doesn't advertise gadgets drops the group (and the
+  skill with it) from the agent and its sub-agents, and bundles that set
+  `tool_groups.gadgets: false` or deny the tools by policy (the proactive agent, the
+  researcher) never offer them.
 
 ## How to get to it (user POV)
 

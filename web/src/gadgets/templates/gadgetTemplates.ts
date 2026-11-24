@@ -1,8 +1,5 @@
 // Starting points for a new gadget, each a working example of the SDK's patterns. A template's
-// revision is uploaded and published as the gadget's first version. Both start empty: Where was
-// I? until its session scans the viewer's sessions, the data story until its session finds
-// story ideas in them and builds the one the viewer picks. Each session then designs the page;
-// only a template's preview shows an example.
+// revision is published as the gadget's first version.
 
 import { DATA_STORY_REVISION } from "./dataStoryTemplate";
 import type { CreateGadgetRevisionRequest } from "../api/gadgetApi";

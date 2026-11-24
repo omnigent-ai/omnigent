@@ -1769,7 +1769,7 @@ def test_shared_lists_only_other_peoples_readable_gadgets(gadgets: Fixture) -> N
     assert owner.shared() == {"items": [], "next_cursor": None}
 
 
-# --- Bug bash regressions ------------------------------------------------------------------------
+# --- Revisions, schemas, paging and other single-viewer cases ---------------------------------
 
 
 def test_a_pinned_gadget_the_viewer_lost_access_to_leaves_their_shelf(gadgets: Fixture) -> None:

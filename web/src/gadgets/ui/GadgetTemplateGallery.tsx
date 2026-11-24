@@ -1,6 +1,4 @@
-// The gadget templates as cards. A template with a page is previewed first; using it creates the
-// gadget under the template's name, which its first build replaces. The New gadget dialog, the create page and a session's New gadget tab
-// offer them.
+// The gadget templates as cards. Templates are previewed before use.
 import { useId, useMemo, useState } from "react";
 import {
   ChartLineIcon,
