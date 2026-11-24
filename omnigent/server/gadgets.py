@@ -25,7 +25,7 @@ from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse, Response
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.gadgets.access import GadgetAccess
+from omnigent.gadgets.access import GadgetAccess, workspace_registrations
 from omnigent.gadgets.actions import ACTION_STATES
 from omnigent.gadgets.constraints import ConstraintViolation
 from omnigent.gadgets.progress import SessionStateReader
@@ -261,10 +261,9 @@ def create_gadgets_router(
     def _viewer(user_id: str) -> GadgetViewer:
         # Gadgets belong to the account's registration, which a password change keeps. A
         # database read, so it runs in the request's worker thread.
-        registrations = (
-            permission_store.account_registrations([user_id]) if permission_store else {}
-        )
-        return GadgetViewer(user_id, registrations.get(user_id))
+        # Scoped to the request's workspace, so the same user ID in another workspace is
+        # someone else.
+        return GadgetViewer(user_id, workspace_registrations(permission_store, [user_id])[user_id])
 
     def _sessions(user_id: str) -> SessionStateReader:
         def can_read(session_id: str) -> bool:

@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from omnigent.db.db_models import DEFAULT_WORKSPACE_ID, current_workspace_id
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.stores.gadget_store import Gadget, GadgetStore
 from omnigent.stores.permission_store import MAX_SHARED_GADGETS_PAGE_SIZE, PermissionStore
@@ -64,6 +65,28 @@ def permissions_for_level(level: int | None) -> GadgetPermissions:
     if level >= LEVEL_EDIT:
         return GadgetPermissions(read=True, write_data=True, publish=True)
     return GadgetPermissions(read=True)
+
+
+def workspace_registration(registration: str | None) -> str | None:
+    """The registration gadgets are owned under: the account's *registration* within the
+    workspace the request is scoped to (:func:`~omnigent.db.db_models.workspace_scope`).
+
+    One user ID can stand for different people in different workspaces of a multi-tenant
+    server, and one gadget store can serve them all, so a gadget belongs to its owner only in
+    the workspace it was made in. The single-workspace default keeps the bare registration.
+    """
+    workspace = current_workspace_id()
+    if workspace == DEFAULT_WORKSPACE_ID:
+        return registration
+    return f"w{workspace}" if registration is None else f"w{workspace}:{registration}"
+
+
+def workspace_registrations(
+    store: PermissionStore | None, user_ids: Sequence[str]
+) -> dict[str, str | None]:
+    """:func:`workspace_registration` for each of *user_ids*, from *store*'s accounts."""
+    found = store.account_registrations(user_ids) if store is not None else {}
+    return {user_id: workspace_registration(found.get(user_id)) for user_id in user_ids}
 
 
 def owned_by(gadget: Gadget, user_id: str, registration: str | None) -> bool:
@@ -130,7 +153,7 @@ class GadgetAccess(ABC):
         """Drop any sharing state kept for a deleted gadget. The default keeps none."""
 
 
-def _current(gadget: Gadget, registrations: dict[str, str]) -> bool:
+def _current(gadget: Gadget, registrations: dict[str, str | None]) -> bool:
     """Whether *gadget*'s owner registration is still its owner's: a username deleted and
     registered again leaves the old registration's gadgets shared with no one."""
     return gadget.owner_registration == registrations.get(gadget.owner_id)
@@ -148,9 +171,8 @@ class PermissionStoreGadgetAccess(GadgetAccess):
         self._store = store
         self._permission_store = permission_store
 
-    def _registrations(self, user_ids: Sequence[str]) -> dict[str, str]:
-        store = self._permission_store
-        return store.account_registrations(user_ids) if store is not None else {}
+    def _registrations(self, user_ids: Sequence[str]) -> dict[str, str | None]:
+        return workspace_registrations(self._permission_store, user_ids)
 
     def _grants(self) -> PermissionStore | None:
         store = self._permission_store

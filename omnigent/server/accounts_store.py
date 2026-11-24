@@ -56,6 +56,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Account, AccountToken
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.gadgets.access import workspace_registration
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.stores.permission_store.sqlalchemy_store import (
     delete_deleted_account_gadget_grants,
@@ -664,7 +665,9 @@ class SqlAlchemyAccountStore:
             tombstoned = row is not None and row.deleted_at is not None
             registration = account_registration(row.created_at) if row is not None else None
         if tombstoned:
-            self._gadgets.delete_owned(user_id, registration)
+            # Noted with the workspace, so a cleanup another workspace's request resumes
+            # still deletes only this one's gadgets.
+            self._gadgets.delete_owned(user_id, workspace_registration(registration))
         else:
             # Each registration also moves other deleted accounts' cleanups along.
             self._gadgets.resume()

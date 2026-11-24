@@ -7,15 +7,19 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.gadgets.access import (
     FULL_ACCESS,
     NO_ACCESS,
     GadgetPermissions,
     PermissionStoreGadgetAccess,
     SharedPage,
+    workspace_registrations,
 )
 from omnigent.gadgets.accounts import DeletedAccountGadgets
+from omnigent.gadgets.service import GadgetService, GadgetViewer
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ
+from omnigent.stores.gadget_store import NotFound
 from omnigent.stores.gadget_store.local import LocalGadgetStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
@@ -201,3 +205,38 @@ def test_grants_and_account_cleanup_work_for_a_store_without_uuid_ids(
     assert grants.list_for_gadget(board.id) == ([], None)
     assert grants.resolve_gadget_access([CAROL], report.id) is None
     assert access.shared_with(BOB) == SharedPage([], None)
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_a_gadget_belongs_to_its_owner_only_in_the_workspace_it_was_made_in(
+    setup: tuple[LocalGadgetStore, _GroupStore], registered: bool
+) -> None:
+    # One user ID in two workspaces of one server, sharing one gadget store: with no account
+    # row (an externally provisioned user) or the same registration in both.
+    store, grants = setup
+    access = PermissionStoreGadgetAccess(store, grants)
+
+    def service() -> GadgetService:
+        registration = workspace_registrations(grants, [ALICE])[ALICE]
+        return GadgetService(store, access, GadgetViewer(ALICE, registration), None)
+
+    if registered:
+        for workspace in (1, 2):
+            with workspace_scope(workspace):
+                grants.ensure_user(ALICE)
+    with workspace_scope(1):
+        made = service().create("Board")
+        assert access.permissions(ALICE, store.get(made["id"])) == FULL_ACCESS
+    with workspace_scope(2):
+        gadget = store.get(made["id"])
+        assert gadget is not None
+        assert access.permissions(ALICE, gadget) == NO_ACCESS
+        other = service()
+        assert other.list_owned()["items"] == []
+        # Hidden, as any gadget the viewer can't see.
+        with pytest.raises(NotFound):
+            other.get(made["id"])
+        with pytest.raises(NotFound):
+            other.delete(made["id"])
+    with workspace_scope(1):
+        assert service().get(made["id"])["id"] == made["id"]
