@@ -288,7 +288,7 @@ def test_a_split_resizes_through_a_whole_drag(
     _select_view(page, "terminal")
     panes = _main_panes(page)
     agent = _connected(panes.locator(_AGENT_PANE).get_by_test_id("terminal-view"))
-    shell = _split_from(page, panes, agent)
+    _split_from(page, panes, agent)
     if view == "chat":
         _select_view(page, "chat")
         expect(panes.locator("[data-chat-pane-body]")).to_be_visible(timeout=30_000)
@@ -321,5 +321,5 @@ def test_a_split_resizes_through_a_whole_drag(
     else:
         assert ends[0] == "lostpointercapture:Resize terminal panes", ends
         assert ends[1] != "pointerup:Resize terminal panes", ends
-    assert unsaved == []
     expect(divider).not_to_have_attribute("aria-valuenow", "50")
+    assert unsaved == []
