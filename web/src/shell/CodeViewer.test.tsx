@@ -622,6 +622,31 @@ describe("CodeViewer markdown preview copy", () => {
     expect(setData).toHaveBeenCalledWith("text/plain", expected);
   });
 
+  it.each([
+    ["before its caption", "![logo](logo.png) caption"],
+    ["after its caption", "caption ![logo](logo.png)"],
+  ])("copies a selected image %s", (_shape, markdown) => {
+    renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    const paragraph = document.querySelector(".markdown-preview p");
+    if (!paragraph) throw new Error("no rendered paragraph");
+    // Element boundaries, as a drag over the whole line makes, so the image is inside.
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    window.getSelection()?.addRange(range);
+    expect(fireCopyEvent(paragraph)).toHaveBeenCalledWith("text/plain", markdown);
+  });
+
+  it("keeps the browser's copy for a selection reaching a footnote's rendered definition", () => {
+    renderViewer("Text[^1] here\n\n[^1]: The note", true, "doc.md", { viewMode: "preview" });
+    const start = previewText("Text");
+    const end = previewText("The note");
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset + "The note".length);
+    window.getSelection()?.addRange(range);
+    expectBrowserCopy(start.node);
+  });
+
   it("keeps the selected cells' HTML inside their table, without source stamps", () => {
     renderViewer(TWO_ROW_TABLE, true, "doc.md", { viewMode: "preview" });
     const setData = copyPreviewSelection("alpha", "1");

@@ -587,6 +587,17 @@ describe("selectionMarkdown on copy", () => {
     expect(flavors.get("text/plain")).toBe("First para\n\n\n\nSecond para");
   });
 
+  it("copies a reference-style link inline alone, and as a reference with its definition", () => {
+    const ed = openMarkdown("See [docs][d] now.\n\n[d]: https://example.com/docs");
+    expect(copySelection(ed, "See", "now.").get("text/plain")).toBe(
+      "See [docs](https://example.com/docs) now.",
+    );
+    ed.commands.setTextSelection({ from: textPosition(ed, "See"), to: ed.state.doc.content.size });
+    expect(copyCurrentSelection(ed).get("text/plain")).toBe(
+      "See [docs][d] now.\n\n[d]: https://example.com/docs",
+    );
+  });
+
   it("copies a selected heading node whole, marker included", () => {
     const ed = openMarkdown("# Release notes\n\nBody text.");
     ed.commands.setNodeSelection(0);

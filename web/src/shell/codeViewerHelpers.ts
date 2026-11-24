@@ -883,6 +883,13 @@ interface TextPoint {
   offset: number;
 }
 
+/** A selection's first or last selected unit: a place in text, or a whole image or break. */
+type SelectionEdge = TextPoint | { node: Element };
+
+function isTextEdge(edge: SelectionEdge): edge is TextPoint {
+  return edge.node instanceof Text;
+}
+
 /** A `[start, end)` stretch of the Markdown source. */
 export interface SourceSpan {
   start: number;
@@ -920,17 +927,24 @@ function stampedSpan(element: Element): SourceSpan | null {
 }
 
 /**
- * The first and last selected characters of *range*. Boundaries that select
- * only whitespace, such as a triple-click ending at the next block's start,
- * move to the nearest selected text. Null when only whitespace is selected.
+ * The first and last selected units of *range*: characters, or source-stamped
+ * elements without children such as images. Boundaries that select only
+ * whitespace, such as a triple-click ending at the next block's start, move to
+ * the nearest selected unit. Null when only whitespace is selected.
  */
-function selectedTextBounds(range: Range): { start: TextPoint; end: TextPoint } | null {
+function selectedEdges(range: Range): { start: SelectionEdge; end: SelectionEdge } | null {
   const common = range.commonAncestorContainer;
-  const walker = document.createTreeWalker(common, NodeFilter.SHOW_TEXT);
-  let start: TextPoint | null = null;
-  let end: TextPoint | null = null;
+  const walker = document.createTreeWalker(common, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+  let start: SelectionEdge | null = null;
+  let end: SelectionEdge | null = null;
   let node = common instanceof Text ? common : walker.nextNode();
   for (; node; node = walker.nextNode()) {
+    if (node instanceof Element) {
+      if (node.firstChild || !stampedSpan(node) || !range.intersectsNode(node)) continue;
+      start ??= { node };
+      end = { node };
+      continue;
+    }
     if (!(node instanceof Text) || !range.intersectsNode(node)) continue;
     const from = node === range.startContainer ? range.startOffset : 0;
     const to = node === range.endContainer ? range.endOffset : node.length;
@@ -1043,13 +1057,18 @@ function textCharacters(node: Text, source: string): SourceSpan[] | null {
 }
 
 /**
- * Where *point* falls in the Markdown *source*, as the selection's *side* edge:
- * a start takes its first character's whole source, an end its last one's.
+ * Where *edge* falls in the Markdown *source*, as the selection's *side* edge:
+ * a start takes its first character's whole source, an end its last one's, and
+ * an image its whole stamped source.
  */
-function sourceOffset(point: TextPoint, side: SelectionSide, source: string): number | null {
-  const characters = textCharacters(point.node, source);
+function sourceOffset(edge: SelectionEdge, side: SelectionSide, source: string): number | null {
+  if (!isTextEdge(edge)) {
+    const span = stampedSpan(edge.node);
+    return span && (side === "start" ? span.start : span.end);
+  }
+  const characters = textCharacters(edge.node, source);
   if (!characters) return null;
-  return side === "start" ? characters[point.offset].start : characters[point.offset - 1].end;
+  return side === "start" ? characters[edge.offset].start : characters[edge.offset - 1].end;
 }
 
 /**
@@ -1069,33 +1088,41 @@ function textNodeSelectionSource(start: TextPoint, end: TextPoint, source: strin
   return copied;
 }
 
-/** Whether *element* renders text before (start) or after (end) *point*. */
-function hasTextBeyond(element: Element, point: TextPoint, side: SelectionSide): boolean {
+/** Whether *element* renders text or an image before (start) or after (end) *edge*. */
+function hasContentBeyond(element: Element, edge: SelectionEdge, side: SelectionSide): boolean {
   const range = document.createRange();
   range.selectNodeContents(element);
-  if (side === "start") range.setEnd(point.node, point.offset);
-  else range.setStart(point.node, point.offset);
-  return range.toString().trim() !== "";
+  if (isTextEdge(edge)) {
+    if (side === "start") range.setEnd(edge.node, edge.offset);
+    else range.setStart(edge.node, edge.offset);
+  } else if (side === "start") {
+    range.setEndBefore(edge.node);
+  } else {
+    range.setStartAfter(edge.node);
+  }
+  if (range.toString().trim()) return true;
+  const stamped = range.cloneContents().querySelectorAll("[data-md-start]");
+  return Array.from(stamped).some((leaf) => !leaf.firstChild);
 }
 
 /**
  * Widens *offset* over each stamped element the selection leaves on *side*:
- * the ancestors of *point* below the element that also holds *other*. An
+ * the ancestors of *edge* below the element that also holds *other*. An
  * element that can't be cut copies whole; a block does when the selection
  * covers it from that edge, which brings in its `#`s, list marker or `>`.
  */
 function widenOverLeftElements(
-  point: TextPoint,
-  other: Text,
+  edge: SelectionEdge,
+  other: Node,
   side: SelectionSide,
   offset: number,
   root: Element,
 ): number {
   let widened = offset;
-  for (let el = point.node.parentElement; el && el !== root; el = el.parentElement) {
+  for (let el = edge.node.parentElement; el && el !== root; el = el.parentElement) {
     if (el.contains(other)) break;
     const span = stampedSpan(el);
-    if (!span || (CUTTABLE_BLOCKS.has(el.tagName) && hasTextBeyond(el, point, side))) continue;
+    if (!span || (CUTTABLE_BLOCKS.has(el.tagName) && hasContentBeyond(el, edge, side))) continue;
     widened = side === "start" ? Math.min(widened, span.start) : Math.max(widened, span.end);
   }
   return widened;
@@ -1129,9 +1156,9 @@ export function markdownPreviewSelectionSource(
   hiddenSource: readonly SourceSpan[],
 ): string | null {
   if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null;
-  const bounds = selectedTextBounds(range);
+  const bounds = selectedEdges(range);
   if (!bounds) return null;
-  if (bounds.start.node === bounds.end.node) {
+  if (isTextEdge(bounds.start) && isTextEdge(bounds.end) && bounds.start.node === bounds.end.node) {
     const copied = textNodeSelectionSource(bounds.start, bounds.end, source);
     return copied?.trim() ? copied : null;
   }
@@ -1154,7 +1181,7 @@ export function markdownPreviewSelectionSource(
  * rows without their header don't read as a table. Null when the selection
  * stays inside one cell or leaves the table, where widening already applies.
  */
-function tableAcrossCells(start: Text, end: Text, root: Element): SourceSpan | null {
+function tableAcrossCells(start: Node, end: Node, root: Element): SourceSpan | null {
   const cell = start.parentElement?.closest("td, th");
   if (cell?.contains(end)) return null;
   const table = start.parentElement?.closest("table");
