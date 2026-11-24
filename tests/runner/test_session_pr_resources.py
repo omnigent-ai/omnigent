@@ -973,6 +973,66 @@ def test_panel_writes_and_new_tracked_prs_make_the_next_poll_read_again(
     assert len(views) == 3
 
 
+def test_a_poll_after_a_panel_write_does_not_join_or_keep_a_read_begun_before_it(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    views: list[int] = []
+    first_read_started = threading.Event()
+    first_read_may_finish = threading.Event()
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(number := len(views) + 1)
+            if number == 1:
+                first_read_started.set()
+                first_read_may_finish.wait(budget(5))
+            body = f"Read {number}"
+            return 0, json.dumps({"number": 42, "title": "Selected", "body": body}), ""
+        return 0, json.dumps({"title": "Listed"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        earlier = pool.submit(poll)
+        assert first_read_started.wait(budget(5))
+        # A failed write may still have changed the PR.
+        with suppress(ValueError, KeyError):
+            pr_resource.create_pr_comment(tracked, session_id="session", pr_url=B, body="Done")
+        later = pool.submit(poll)
+        assert later.result(timeout=budget(5))["pr"]["body"] == "Read 2"
+        first_read_may_finish.set()
+        assert earlier.result(timeout=budget(5))["pr"]["body"] == "Read 1"
+    assert poll()["pr"]["body"] == "Read 2"
+
+
+def test_a_failed_registry_check_after_a_read_lets_the_next_poll_read_again(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    views: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
+
+    def unreadable_registry(*_args: object) -> bool:
+        raise PermissionError("registry unreadable")
+
+    monkeypatch.setattr(github, "_gh", gh)
+    monkeypatch.setattr(pr_resource, "_lists_tracked_prs", unreadable_registry)
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    # Uncached titles make the read write the registry, so the check after it runs.
+    assert poll()["pr"]["title"] == "Selected"
+    assert not [key for key in pr_resource._RUNNING_PANEL_READS if key[0] == tracked]
+    poll()
+    assert len(views) == 2
+
+
 def test_a_read_without_allow_cached_reads_the_forge_even_while_a_poll_runs(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

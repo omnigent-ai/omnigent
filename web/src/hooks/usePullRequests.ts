@@ -488,31 +488,35 @@ export async function fetchPullRequestInfo(
  *  `gh` API call but only while the panel is actually focused. */
 const PULL_REQUEST_POLL_MS = 5_000;
 const PULL_REQUEST_LIST_POLL_MS = 30_000;
-/** Timer drift allowed when telling an interval poll from other refetches. */
-const POLL_SCHEDULE_SLACK_MS = 5_000;
 
 /**
- * Whether a fetch of `query` is a poll on schedule, which may take the runner's
+ * Whether a fetch of `query` is an interval poll, which may take the runner's
  * previous read: the answer is at most one read old, and the next poll corrects it.
- * Invalidations (Refresh, turn end, edits), first loads and refetches of data
- * older than the poll interval read the forge now.
+ *
+ * Mount, focus and reopen refetches run only once data is stale, and Refresh, turn
+ * end and edits invalidate first, so a fetch of valid data that is still fresh for
+ * an active polling observer is that observer's timer. Polls slower than the stale
+ * time, such as list rows, read the forge every time.
  */
 export function pollAcceptsCachedAnswer(
   query: Query<PullRequestInfo> | undefined,
   now = Date.now(),
 ): boolean {
   if (!query || query.state.data === undefined || query.state.isInvalidated) return false;
-  const intervals = query.observers.flatMap((observer) => {
-    const interval = observer.options.refetchInterval;
-    const value = typeof interval === "function" ? interval(query) : interval;
-    return observer.options.enabled !== false && typeof value === "number" && value > 0
-      ? [value]
-      : [];
+  const age = now - query.state.dataUpdatedAt;
+  return query.observers.some(({ options }) => {
+    const interval =
+      typeof options.refetchInterval === "function"
+        ? options.refetchInterval(query)
+        : options.refetchInterval;
+    return (
+      options.enabled !== false &&
+      typeof interval === "number" &&
+      interval > 0 &&
+      typeof options.staleTime === "number" &&
+      age < options.staleTime
+    );
   });
-  return (
-    intervals.length > 0 &&
-    now - query.state.dataUpdatedAt < Math.min(...intervals) + POLL_SCHEDULE_SLACK_MS
-  );
 }
 
 /**

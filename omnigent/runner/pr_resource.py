@@ -762,9 +762,13 @@ def _run_panel_read(
     registry = SessionPrRegistry(session_id)
     version = registry.version()
     # The read's own title cache writes change the files; a PR linked meanwhile must show.
-    current = payload is not None and (
-        version == read.registry_version or _lists_tracked_prs(payload, registry)
-    )
+    try:
+        current = payload is not None and (
+            version == read.registry_version or _lists_tracked_prs(payload, registry)
+        )
+    except Exception:  # an unreadable registry keeps the read out of the cache, not running
+        _logger.debug("Could not check a panel read against the PR registry", exc_info=True)
+        current = False
     with _PANEL_READ_LOCK:
         if _RUNNING_PANEL_READS.get(key) is read:
             del _RUNNING_PANEL_READS[key]

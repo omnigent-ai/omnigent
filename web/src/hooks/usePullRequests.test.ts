@@ -289,13 +289,14 @@ describe("pollAcceptsCachedAnswer", () => {
   const key = ["github-info", "conv"];
   const info = { object: "session.github.info", available: true } as PullRequestInfo;
 
-  function polledQuery(refetchInterval: number | false) {
+  // The PR info queries' stale time.
+  function polledQuery(refetchInterval: number | false, staleTime = 30_000) {
     const client = new QueryClient();
     client.setQueryData(key, info);
     const observer = new QueryObserver(client, {
       queryKey: key,
       queryFn: () => info,
-      staleTime: Infinity,
+      staleTime,
       refetchInterval,
     });
     const unsubscribe = observer.subscribe(() => undefined);
@@ -303,7 +304,7 @@ describe("pollAcceptsCachedAnswer", () => {
     return { query, unsubscribe };
   }
 
-  it("accepts an on-schedule poll of fresh data", () => {
+  it("accepts a poll of data that is still fresh", () => {
     const { query, unsubscribe } = polledQuery(10_000);
     expect(pollAcceptsCachedAnswer(query, query.state.dataUpdatedAt + 10_000)).toBe(true);
     unsubscribe();
@@ -311,7 +312,7 @@ describe("pollAcceptsCachedAnswer", () => {
 
   it("reads the forge now after an invalidation, for stale data, or without a poller", () => {
     const polled = polledQuery(10_000);
-    // A refetch of data older than the poll, such as a window-focus refetch.
+    // Mount, focus and reopen refetches run only once data is stale.
     expect(pollAcceptsCachedAnswer(polled.query, polled.query.state.dataUpdatedAt + 30_000)).toBe(
       false,
     );
@@ -319,6 +320,12 @@ describe("pollAcceptsCachedAnswer", () => {
     polled.query.invalidate();
     expect(pollAcceptsCachedAnswer(polled.query, polled.query.state.dataUpdatedAt)).toBe(false);
     polled.unsubscribe();
+
+    // A 30 s list row polls once its data is stale, so each of its polls reads fresh.
+    const row = polledQuery(30_000);
+    expect(pollAcceptsCachedAnswer(row.query, row.query.state.dataUpdatedAt + 30_000)).toBe(false);
+    expect(pollAcceptsCachedAnswer(row.query, row.query.state.dataUpdatedAt + 32_000)).toBe(false);
+    row.unsubscribe();
 
     const resting = polledQuery(false);
     expect(pollAcceptsCachedAnswer(resting.query, resting.query.state.dataUpdatedAt)).toBe(false);
