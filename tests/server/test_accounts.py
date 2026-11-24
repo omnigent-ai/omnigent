@@ -956,6 +956,7 @@ def _build_accounts_app(
     monkeypatch: pytest.MonkeyPatch,
     *,
     init_admin_password: str | None,
+    base_url: str | None = None,
 ) -> Iterator[TestClient]:
     """Build a production-shaped accounts-mode app + TestClient.
 
@@ -969,6 +970,9 @@ def _build_accounts_app(
     :param init_admin_password: When set, bootstrap creates the admin
         with it (admin exists, no setup pending). When ``None``, no
         admin is created and ``/v1/info`` reports ``needs_setup``.
+    :param base_url: When set, both ``OMNIGENT_ACCOUNTS_BASE_URL`` and the
+        TestClient's base URL, so ``Secure`` / ``__Host-`` cookies
+        round-trip on HTTPS. ``None`` keeps ``http://localhost:8000``.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
@@ -976,7 +980,7 @@ def _build_accounts_app(
     # so this fixture doesn't depend on the global default.
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
     monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", secrets.token_hex(32))
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_BASE_URL", "http://localhost:8000")
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_BASE_URL", base_url or "http://localhost:8000")
     if init_admin_password is not None:
         monkeypatch.setenv("OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD", init_admin_password)
     else:
@@ -1047,7 +1051,7 @@ def _build_accounts_app(
         auth_provider=auth_provider,
         account_store=account_store,
     )
-    with TestClient(app) as client:
+    with TestClient(app, base_url=base_url or "http://testserver") as client:
         yield client
 
 
