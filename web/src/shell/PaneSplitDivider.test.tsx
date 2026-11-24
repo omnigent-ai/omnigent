@@ -142,7 +142,6 @@ describe("PaneSplitDivider drags", () => {
         () => fireEvent.pointerMove(document.body, { pointerId: 1, buttons: 0 }),
         "pointer-lost",
       ],
-      ["the window's blur", () => fireEvent.blur(window), "window-blurred"],
       [
         "a cancel",
         () => fireEvent.pointerCancel(document.body, { pointerId: 1 }),

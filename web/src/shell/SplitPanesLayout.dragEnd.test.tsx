@@ -3,7 +3,7 @@
 // leaving the screen, or the pointer being taken away. A release logs nothing.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { useRef } from "react";
+import { type ComponentProps, useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 
 import type { TerminalSplitState } from "@/lib/terminalSplitLayout";
@@ -16,12 +16,16 @@ const SPLIT: TerminalSplitState = {
   focusedKey: "a",
 };
 
+const ignoreResize = () => {};
+
 function View({
   split,
   zoomedKey = null,
+  onResize = ignoreResize,
 }: {
   split: TerminalSplitState | undefined;
   zoomedKey?: string | null;
+  onResize?: ComponentProps<typeof SplitPanesLayout>["onResize"];
 }) {
   const panesRef = useRef<HTMLDivElement | null>(null);
   return (
@@ -31,7 +35,7 @@ function View({
       singlePaneKey="a"
       paneIdOf={(key) => key}
       renderPane={(key) => <div data-testid={`content-${key}`} />}
-      onResize={() => {}}
+      onResize={onResize}
       panesRef={panesRef}
       zoomedKey={zoomedKey}
       onUnzoom={() => {}}
@@ -125,19 +129,7 @@ describe("a divider drag that ends unsaved", () => {
 
   it("logs nothing when its capture ends just before a release elsewhere", () => {
     const onResize = vi.fn();
-    const panesRef = { current: null as HTMLDivElement | null };
-    render(
-      <SplitPanesLayout
-        conversationId="c1"
-        split={SPLIT}
-        singlePaneKey="a"
-        paneIdOf={(key) => key}
-        renderPane={(key) => <div data-testid={`content-${key}`} />}
-        onResize={onResize}
-        panesRef={panesRef}
-        sizing={() => null}
-      />,
-    );
+    render(<View split={SPLIT} onResize={onResize} />);
     const divider = pressDivider();
     fireEvent.lostPointerCapture(divider, { pointerId: 1 });
     fireEvent.pointerUp(screen.getByTestId("content-a"), { pointerId: 1 });
