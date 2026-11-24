@@ -18,6 +18,7 @@ import {
   NEW_TAB_DIVIDER_ROOM,
   NewTabButton,
   PINNED_TAB_WIDTH,
+  StripDivider,
   StripTab,
   StripTabMenu,
   type TabTitle,
@@ -125,6 +126,8 @@ import {
   type StripEntry,
   type TerminalGroup,
 } from "@/lib/terminalGroups";
+import { useFloatingPanesShown } from "../useFloatingPanes";
+import { WorkspaceRailEdgeHandle, WorkspaceRailGutterHandle } from "../WorkspaceRailResizeHandle";
 import { WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
 import { useMountedShellKeys } from "./shellTabBudget";
@@ -679,6 +682,9 @@ function WorkspaceTabsPanelImpl({
     onReveal?.();
   };
   const inDrawer = placement === "drawer";
+  // Where the panes float now: the flag on and 48rem or wider. The drawer keeps its classic strip.
+  // A grid cell keeps its own layout, as the floating styles leave it.
+  const floatingPanes = useFloatingPanesShown() && !inDrawer && !contained;
   // Hotkeys and ⌘K rows act only while this panel is the keyboard target.
   const commandsActive = !pending && keyboardTarget;
   useNewBrowserHotkey(() => addBrowser(), showBrowserTab && commandsActive);
@@ -1257,18 +1263,38 @@ function WorkspaceTabsPanelImpl({
     }
   };
 
-  const selectedUnknown = tabs.find((tab) => tab.id === selectedTabId && isUnknownTab(tab));
-  const effectiveHandleProps = pending
-    ? {
-        ...handleProps,
-        onMouseDown: undefined,
-        onKeyDown: undefined,
-        "aria-disabled": true,
-        tabIndex: -1,
+  // All tabs: before the tabs in the classic strip; with floating panes the strip starts with the
+  // tabs, and the list opens from beside Full screen.
+  const tabSearch = !pending && tabs.length > 0 && (
+    <WorkspaceTabSearch
+      trailing={floatingPanes}
+      open={tabSearchOpen}
+      onOpenChange={setTabSearchOpen}
+      entries={tabSearchEntries}
+      closing={tabSearchClosing}
+      reopen={
+        reopenCommand.availability.available
+          ? {
+              label: reopenCommand.menuLabel,
+              ...(reopenCommand.shortcut ? { shortcut: shortcutKeys(reopenCommand.shortcut) } : {}),
+            }
+          : null
       }
-    : handleProps;
+      onChoose={(choice) => {
+        const command =
+          choice.kind === "reopen"
+            ? reopenCommand
+            : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
+        if (command) runCommand(command);
+      }}
+    />
+  );
 
-  return (
+  const selectedUnknown = tabs.find((tab) => tab.id === selectedTabId && isUnknownTab(tab));
+  // Floating panes leave a gutter beside the rail; dragging it resizes the rail too.
+  const gutterHandle = floatingPanes && !maximized;
+
+  const rail = (
     <aside
       aria-label="Workspace"
       {...commandRegionProps("workspace")}
@@ -1307,12 +1333,10 @@ function WorkspaceTabsPanelImpl({
         style={{ width: maximized || inDrawer ? "100%" : `calc(${width}px - 1px)` }}
       >
         {!maximized && !inDrawer && (
-          <div
-            {...effectiveHandleProps}
-            className={cn(
-              "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
-              pending && "cursor-default hover:bg-transparent active:bg-transparent",
-            )}
+          <WorkspaceRailEdgeHandle
+            handleProps={handleProps}
+            pending={pending}
+            bare={gutterHandle}
           />
         )}
         <WorkspaceSidebarFrame
@@ -1324,31 +1348,7 @@ function WorkspaceTabsPanelImpl({
               {!pending && onHistoryGo && (
                 <WorkspaceHistoryChevrons commands={historyCommands} onGo={onHistoryGo} />
               )}
-              {!pending && tabs.length > 0 && (
-                <WorkspaceTabSearch
-                  open={tabSearchOpen}
-                  onOpenChange={setTabSearchOpen}
-                  entries={tabSearchEntries}
-                  closing={tabSearchClosing}
-                  reopen={
-                    reopenCommand.availability.available
-                      ? {
-                          label: reopenCommand.menuLabel,
-                          ...(reopenCommand.shortcut
-                            ? { shortcut: shortcutKeys(reopenCommand.shortcut) }
-                            : {}),
-                        }
-                      : null
-                  }
-                  onChoose={(choice) => {
-                    const command =
-                      choice.kind === "reopen"
-                        ? reopenCommand
-                        : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
-                    if (command) runCommand(command);
-                  }}
-                />
-              )}
+              {!floatingPanes && tabSearch}
             </div>
           }
           tabs={
@@ -1465,12 +1465,18 @@ function WorkspaceTabsPanelImpl({
             // Below 160px "+" would run under Full screen, so it gives way; ⌘K and its chord still open a tab.
             !pending && (
               <div className="contents @max-[160px]/rail:hidden">
-                <NewTabButton onClick={newTab} />
+                <NewTabButton onClick={newTab} divider={!floatingPanes} />
               </div>
             )
           }
           trailing={
             <>
+              {floatingPanes && tabSearch ? (
+                <>
+                  <StripDivider />
+                  {tabSearch}
+                </>
+              ) : null}
               {!inDrawer && (
                 <WorkspaceTabTooltip
                   label={fullScreenCommand?.menuLabel ?? "Full screen"}
@@ -1568,6 +1574,19 @@ function WorkspaceTabsPanelImpl({
         </WorkspaceSidebarFrame>
       </div>
     </aside>
+  );
+  return (
+    <>
+      {rail}
+      {gutterHandle && (
+        <WorkspaceRailGutterHandle
+          onMouseDown={handleProps.onMouseDown}
+          pending={pending}
+          railWidth={width}
+          shown={open}
+        />
+      )}
+    </>
   );
 }
 

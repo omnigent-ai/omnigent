@@ -29,6 +29,8 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
+import { ChatPaneStrip } from "./ChatPaneStrip";
+import { useFloatingPanes, useFloatingPanesShown } from "./useFloatingPanes";
 import {
   Outlet,
   useLocation,
@@ -426,6 +428,8 @@ function AppShellImpl() {
   // With tabs enabled, links, pages and shells open there. The session ref stays null
   // until a new session has its real id: there are no tabs to open in before that.
   const tabsSidebar = useTabsSidebar();
+  const floatingPanes = useFloatingPanes();
+  const floatingPanesShown = useFloatingPanesShown();
   const tabsModeRef = useRef(false);
   tabsModeRef.current = tabsSidebar;
   const tabsSessionRef = useRef<string | null>(null);
@@ -3167,6 +3171,10 @@ function AppShellImpl() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" keeps the switcher.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  // A terminal-first chat's card has a row of its own, over its Chat and Terminal views, which
+  // takes the Chat/Terminal switch. A sidebar shell in the main view has no switch to hold.
+  // It shows wherever the cards float, below the desktop layout's width too.
+  const chatPaneStrip = floatingPanesShown && !!conversationId && terminalFirst && !isShellView;
   const shellViewTargetAvailable =
     isShellView && terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey);
 
@@ -3345,6 +3353,7 @@ function AppShellImpl() {
             // maximized workspace rail's tab strip in index.css): with the
             // sidebar open over the window corner there are no lights to clear.
             data-sidebar-open={sidebarOpen ? "true" : undefined}
+            data-floating-panes={floatingPanes ? "" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
           >
@@ -3436,15 +3445,17 @@ function AppShellImpl() {
               <div
                 data-workspace-panel-resizing={inlinePanelResizing || undefined}
                 data-workspace-panel-animate={rightPanelVisibilityAnimating || undefined}
+                // A session's column, whose chat page (its terminal view included) floats as one pane.
+                data-main-view={conversationId ? "chat" : undefined}
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
                 )}
                 style={
                   {
-                    "--workspace-panel-offset": workspacePanelVisible
-                      ? `${inlinePanelWidth}px`
-                      : "0px",
+                    // Only an inline rail takes room beside the header; below md it's a drawer.
+                    "--workspace-panel-offset":
+                      workspacePanelVisible && !mobileViewport ? `${inlinePanelWidth}px` : "0px",
                     "--omnigent-header-height": headerClearanceHidden ? "0px" : undefined,
                   } as CSSProperties
                 }
@@ -3564,7 +3575,11 @@ function AppShellImpl() {
                   data-flyout-boundary=""
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
+                  data-chat-pane-strip={chatPaneStrip ? "" : undefined}
                 >
+                  {chatPaneStrip && conversationId && (
+                    <ChatPaneStrip conversationId={conversationId} />
+                  )}
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
                       <ShellCommandContext.Provider value={shellCommandAction}>

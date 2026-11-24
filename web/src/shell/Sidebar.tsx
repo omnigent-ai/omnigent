@@ -257,6 +257,7 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
+import { useFloatingPanes } from "@/shell/useFloatingPanes";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
@@ -1093,6 +1094,7 @@ function SidebarImpl({
   // class so it only applies on desktop — on mobile the sidebar is a
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, resizing, handleProps: resizeHandleProps } = useResizableSidebar();
+  const floatingPanes = useFloatingPanes();
 
   // On the mobile layout, a leftward swipe on the open drawer slides it shut and
   // a rightward swipe across the chat slides the closed one open, both under
@@ -1378,7 +1380,12 @@ function SidebarImpl({
         {!peek && (
           <div
             {...resizeHandleProps}
-            className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+            className={cn(
+              "absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
+              // Where the panes float, 48rem and wider, the cursor band spans the gap with no bar.
+              floatingPanes &&
+                "min-[48rem]:w-[calc(var(--pane-gap)+5px)] min-[48rem]:hover:bg-transparent min-[48rem]:active:bg-transparent",
+            )}
           />
         )}
         {inSettings ? (
