@@ -468,6 +468,10 @@ it.
   Build and review it as usual, then ask with `needs-human` and wait. Agents
   can't add `product-ok`.
 - `fix`, `perf` and `ux` land on approval like any change.
+- A ticket you file records you as its requester, which counts as the owner.
+  When you file or split one on a member's behalf, say so in its description
+  and treat a `feature` as product-gated: ask for `product-ok` with
+  `needs-human` before landing it.
 - Before landing by hand, run `sys_ticket_land` with `dry_run: true`. It
   checks every gate, even with the queue off. Don't land what it refuses.
 

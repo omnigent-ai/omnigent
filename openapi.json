@@ -15543,6 +15543,17 @@
       "StartupInputOptions": {
         "description": "Request options retained only while a startup input awaits delivery.",
         "properties": {
+          "automatic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic"
+          },
           "background_titles_enabled": {
             "default": false,
             "title": "Background Titles Enabled",
