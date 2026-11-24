@@ -7445,6 +7445,29 @@ describe("CreateScheduledTaskDialog workflow", () => {
     });
   });
 
+  it("reads a stored workflow from the task's fields, not its prompt's wording", async () => {
+    // A run message this client can't read back, for example from another harness.
+    const editingTask = {
+      ...storedWorkflowTask(),
+      prompt: "%workflow Run the saved workflow, then report back.",
+    };
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />, {
+      info: STORED_WORKFLOW_INFO,
+    });
+    expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("Triage flaky tests");
+    expect(screen.getByLabelText("Additional instructions (optional)")).toHaveValue(
+      "The upload tests",
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    // Neither the workflow nor its details changed, so the update leaves them be.
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited.prompt).toBeUndefined();
+  });
+
   it("saves other edits to a stored workflow's schedule once the workflow is gone", async () => {
     savedWorkflowsList.current = [];
     render(

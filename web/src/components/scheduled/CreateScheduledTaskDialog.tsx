@@ -643,7 +643,16 @@ export function CreateScheduledTaskDialog({
         : hasTriggerHeader(savedPrompt)
           ? { userPrompt: stripTriggerHeader(savedPrompt), systemPrompt: null }
           : splitTriggerPrompt(savedPrompt);
-      const savedRun = workflowsEnabled ? parseSavedWorkflowMessage(parts.userPrompt) : null;
+      const parsedRun = workflowsEnabled ? parseSavedWorkflowMessage(parts.userPrompt) : null;
+      // A task that stores its workflow is read from those fields, not its prompt's wording.
+      const savedRun =
+        workflowsEnabled && editingTask?.workflowId
+          ? {
+              id: editingTask.workflowId,
+              name: parsedRun?.name ?? "",
+              details: editingTask.workflowDetails ?? "",
+            }
+          : parsedRun;
       setWorkflowChoice(
         workflowsEnabled
           ? (lockedWorkflow ??

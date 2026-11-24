@@ -4521,6 +4521,13 @@ async def test_only_an_explicit_null_stops_a_schedule_running_its_workflow(
     assert detailed.status_code == 200, detailed.text
     assert detailed.json()["prompt"] == f"{_workflow_run_prompt(workflow_id)}\n\nOnly bugs"
     assert detailed.json()["workflow_details"] == "Only bugs"
+    cleared = await client.patch(url, json={"workflow_details": None}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert (cleared.json()["prompt"], cleared.json()["workflow_id"]) == (
+        _workflow_run_prompt(workflow_id),
+        workflow_id,
+    )
+    assert cleared.json()["workflow_details"] == ""
     reworded = await client.patch(
         url, json={"prompt": "Summarize overnight activity"}, headers=_headers()
     )
@@ -4699,6 +4706,61 @@ async def test_an_edit_checked_before_a_concurrent_attach_cant_replace_its_promp
         _workflow_run_prompt(workflow_id),
         workflow_id,
     )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}, {"workflow_details": "Only flakes"}],
+    ids=["agent-only", "details-only"],
+)
+async def test_an_edit_derived_before_a_concurrent_detach_cant_restore_the_workflow(
+    workflows_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    change: dict[str, object],
+) -> None:
+    """An edit whose run message came from the snapshot lands after a detach, and is refused."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json={**_workflow_create_body(workflow_id), "workflow_details": "Only bugs"},
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    check = scheduled_tasks_routes._workflow_reuse_problem
+    checked = asyncio.Barrier(2)
+    detached = asyncio.Event()
+
+    async def check_together(
+        prompt: str, session_mode: str, workflow_id: str | None = None
+    ) -> str | None:
+        problem = await check(prompt, session_mode, workflow_id)
+        await checked.wait()
+        if workflow_id is not None:
+            await detached.wait()
+        return problem
+
+    async def detach() -> httpx.Response:
+        try:
+            return await client.patch(
+                url,
+                json={"workflow_id": None, "prompt": "Summarize overnight activity"},
+                headers=_headers(),
+            )
+        finally:
+            detached.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_workflow_reuse_problem", check_together)
+    async with asyncio.timeout(10):
+        stopped, stale = await asyncio.gather(
+            detach(), client.patch(url, json=change, headers=_headers())
+        )
+    assert stopped.status_code == 200, stopped.text
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_CHANGED_MSG
+    saved = (await client.get(url, headers=_headers())).json()
+    assert (saved["prompt"], saved["workflow_id"]) == ("Summarize overnight activity", None)
 
 
 async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(

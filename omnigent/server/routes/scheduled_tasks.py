@@ -1270,7 +1270,7 @@ def create_scheduled_tasks_router(
 
     async def _apply_workflow_update(
         request: Request, existing: ScheduledTask, fields: dict[str, Any], owner: str
-    ) -> None:
+    ) -> bool:
         """Turn an update's ``workflow_id`` and ``workflow_details`` into the prompt it saves.
 
         While a task runs a saved workflow the server writes its prompt, and only
@@ -1279,6 +1279,8 @@ def create_scheduled_tasks_router(
 
         :param fields: The update's set fields; ``workflow_details`` is consumed, and
             ``prompt`` and ``workflow_id`` are set to what the task saves.
+        :returns: Whether ``prompt`` or ``workflow_id`` came from the snapshot rather than
+            the request, so they mustn't land on a row that has changed since.
         """
         current = await asyncio.to_thread(task_workflow_id, existing)
         saved_run = (
@@ -1298,7 +1300,7 @@ def create_scheduled_tasks_router(
                 not prompt_changed or await asyncio.to_thread(saved_workflow_id, prompt)
             ):
                 raise OmnigentError(_STOP_WORKFLOW_NEEDS_PROMPT_MSG, code=ErrorCode.INVALID_INPUT)
-            return
+            return False
         if "workflow_id" in fields or details_given:
             target = fields.get("workflow_id") or current
             if target is None:
@@ -1308,11 +1310,12 @@ def create_scheduled_tasks_router(
             if target != current or (details_given and details != saved_details):
                 workflow = await _runnable_workflow(request, target, owner)
                 agent = await _target_agent(existing, fields, owner)
+                derived = "workflow_id" not in fields or not details_given
                 fields["prompt"] = await _workflow_run_message(
                     agent, workflow, details if details_given else saved_details
                 )
                 fields["workflow_id"] = workflow.id
-                return
+                return derived
             # Unchanged, so other edits save without the workflow, which may be gone.
             fields["workflow_id"] = current
         if (
@@ -1331,14 +1334,15 @@ def create_scheduled_tasks_router(
                 saved_run.details,
             )
             fields["workflow_id"] = saved_run.workflow_id
-            return
+            return True
         if not prompt_changed or prompt is None:
-            return
+            return "workflow_id" in fields
         run = await asyncio.to_thread(saved_workflow_run, prompt)
         if run is not None:
             fields["workflow_id"] = run.workflow_id
         elif current is not None:
             raise OmnigentError(_WORKFLOW_PROMPT_OWNED_MSG, code=ErrorCode.INVALID_INPUT)
+        return False
 
     async def _target_agent(existing: ScheduledTask, fields: dict[str, Any], owner: str) -> Agent:
         """The agent an update leaves *existing* bound to."""
@@ -2140,7 +2144,7 @@ def create_scheduled_tasks_router(
             fields.pop("session_mode", None)
         if fields.get("mcp_services") is None:
             fields.pop("mcp_services", None)
-        await _apply_workflow_update(request, existing, fields, owner)
+        derives_workflow_prompt = await _apply_workflow_update(request, existing, fields, owner)
         target_session_mode = fields.get("session_mode", existing.session_mode)
         # The caller's own changes, before the ones derived below.
         requested_session = {
@@ -2355,6 +2359,12 @@ def create_scheduled_tasks_router(
                 shared_target_guard(locked)
             # The prompt was checked on the snapshot; a workflow attached since then owns it.
             if _breaks_workflow_prompt(locked, fields):
+                raise OmnigentError(_WORKFLOW_CHANGED_MSG, code=ErrorCode.CONFLICT)
+            # A prompt derived from the snapshot can't land on a prompt or workflow changed since.
+            if derives_workflow_prompt and (locked.prompt, locked.workflow_id) != (
+                existing.prompt,
+                existing.workflow_id,
+            ):
                 raise OmnigentError(_WORKFLOW_CHANGED_MSG, code=ErrorCode.CONFLICT)
             # Another update may have changed the prompt or session mode since the snapshot.
             locked_change = _workflow_reuse_change(locked, requested_session)

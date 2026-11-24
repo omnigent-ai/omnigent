@@ -93,7 +93,7 @@ export interface ScheduledTask {
   sourceSessionId?: string | null;
   /**
    * The saved workflow every run starts as a run of, whose run message `prompt` holds.
-   * `null` for other automations; absent from servers that don't store it.
+   * `null` for other automations, and from servers that don't store it.
    */
   workflowId?: string | null;
   /** The specifics each run of `workflowId` carries; `null` without a workflow. */

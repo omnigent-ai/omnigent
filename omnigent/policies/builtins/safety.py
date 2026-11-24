@@ -427,6 +427,13 @@ _PREVIEW_EXTRA_CHARS = 200
 _SCHEDULED_TASK_REVIEW_FIELDS = frozenset({"prompt", "permission_mode"})
 # Free text the review renders in full rather than among the bounded settings.
 _SCHEDULED_TASK_FULL_TEXT_FIELDS = frozenset({"prompt", "workflow_details"})
+# The message the server writes to run a saved workflow, whose specifics an update keeps
+# unless workflow_details replaces them (``saved_workflow_run`` in
+# omnigent/server/scheduled/workflow_automations.py reads the same form).
+_SAVED_WORKFLOW_RUN_MESSAGE = _re.compile(
+    r'[/$]workflow Run the saved workflow "[^\n\r\u2028\u2029]+" \(ID [0-9a-f]{32}\)\.'
+    r"(?:\n\n[\s\S]*)?"
+)
 _PERMISSION_MODE_VALUES = f"a mode name, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
 
 
@@ -515,11 +522,20 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     if action == "create" and "prompt" not in args and workflow_id is not None:
         prompt: object = f"Runs the saved workflow {workflow_id}"
     elif action == "update" and workflow_id:
-        # The specifics an update leaves out stay as the current prompt has them.
+        # Left out of the update, the specifics stay only if the current prompt has some.
+        keeps = isinstance(supplied, str) and bool(
+            _SAVED_WORKFLOW_RUN_MESSAGE.fullmatch(supplied.strip())
+        )
+        effect = (
+            "keeping the specifics of the current prompt below unless workflow_details "
+            "replaces them"
+            if keeps
+            else "in place of the current prompt below, whose instructions no longer run; "
+            "each run gets only the specifics in workflow_details"
+        )
         prompt = (
             f"Runs the saved workflow {workflow_id}. The server writes the prompt that runs "
-            "it, keeping the specifics of the current prompt below unless workflow_details "
-            f"replaces them.\n{supplied}"
+            f"it, {effect}.\n{supplied}"
         )
     else:
         prompt = supplied

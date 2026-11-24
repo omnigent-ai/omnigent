@@ -176,6 +176,9 @@ def _task(prompt: str, workflow_id: str | None = None) -> ScheduledTask:
 
 def test_a_task_runs_the_workflow_it_was_saved_with() -> None:
     assert task_workflow_id(_task("Summarize overnight activity", WORKFLOW_ID)) == WORKFLOW_ID
+    # The stored workflow wins over one a prompt names.
+    other_run = WORKFLOW_RUN.replace(WORKFLOW_ID, "f" * 32)
+    assert task_workflow_id(_task(other_run, WORKFLOW_ID)) == WORKFLOW_ID
     # Saved before tasks stored it, a task names its workflow only in its prompt.
     assert task_workflow_id(_task(WORKFLOW_RUN)) == WORKFLOW_ID
     assert task_workflow_id(_task("Summarize overnight activity")) is None

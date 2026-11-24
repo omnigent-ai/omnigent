@@ -946,7 +946,34 @@ def test_an_update_that_keeps_a_workflows_specifics_shows_them(workflow_id: str)
     )
     instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
     assert instructions.startswith(f"Runs the saved workflow {workflow_id}.")
+    assert "keeping the specifics of the current prompt below" in instructions
     assert saved in instructions
+
+
+def test_an_update_that_attaches_a_workflow_says_the_plain_prompt_stops_running() -> None:
+    """A plain prompt has no specifics to keep: the server writes the workflow's in its place."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    plain = "Only inspect the queue; make no modifications."
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "prompt": plain,
+                    "permission_mode": None,
+                    "workflow_id": "0123456789abcdef0123456789abcdef",
+                },
+            },
+        }
+    )
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert "whose instructions no longer run" in instructions
+    assert "keeping the specifics" not in instructions
+    assert plain in instructions
 
 
 def test_a_create_with_a_null_workflow_id_is_an_ordinary_create() -> None:
