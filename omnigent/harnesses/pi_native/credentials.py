@@ -1986,6 +1986,8 @@ def pi_thinking_launch_args(reasoning_effort: str | None) -> tuple[list[str], st
     except ValueError as exc:
         _LOGGER.warning("pi-native: %s", exc)
         return [], str(exc)
+    if effort is None:
+        return [], None
     return ["--thinking", to_pi_thinking_level(effort)], None
 
 

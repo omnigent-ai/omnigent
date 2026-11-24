@@ -3091,9 +3091,7 @@ async def _auto_create_pi_terminal(
         # Pi's own login or a terminal-pinned model still honours the session effort.
         from omnigent.harnesses.pi_native.credentials import pi_thinking_launch_args
 
-        thinking_args, own_effort_warning = pi_thinking_launch_args(
-            launch_config.reasoning_effort
-        )
+        thinking_args, own_effort_warning = pi_thinking_launch_args(launch_config.reasoning_effort)
         provider_args.extend(thinking_args)
         effort_notice = own_effort_warning
     agent_dir = Path(pi_env.get(PI_CODING_AGENT_DIR_ENV_VAR) or global_pi_agent_dir()).expanduser()
