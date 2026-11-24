@@ -40,6 +40,7 @@ import { ProjectOrchestrator } from "./ProjectOrchestrator";
 import {
   createTicket,
   getProjectFile,
+  getTicket,
   openProjectFile,
   requesterLabel,
   ticketOutputs,
@@ -459,7 +460,22 @@ function TicketDetails({
                 pending={update.isPending || comment.isPending}
                 onApprove={(label) => {
                   update.reset();
-                  update.mutate({ id: ticketId, changes: { labels: [...ticket.labels, label] } });
+                  // Labels replace the whole list: build on a fresh read, and only while the
+                  // ticket still asks for this sign-off, so a newer edit isn't undone.
+                  void getTicket(projectId, ticketId)
+                    .then((fresh) => {
+                      const stillOffered = (fresh.sign_offs ?? []).some(
+                        (offer) =>
+                          offer.key === label.key &&
+                          (offer.value ?? null) === (label.value ?? null),
+                      );
+                      if (!stillOffered) return void query.refetch();
+                      update.mutate({
+                        id: ticketId,
+                        changes: { labels: [...fresh.labels, label] },
+                      });
+                    })
+                    .catch(() => void query.refetch());
                 }}
                 onDecline={(label) =>
                   comment.mutate({
