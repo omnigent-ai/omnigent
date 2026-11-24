@@ -1069,13 +1069,21 @@ function AppShellImpl() {
     keys: string[];
     callbacks?: ShellCloseCallbacks;
   } | null>(null);
-  // While a close is in flight, grey the tab being killed so the delay between
-  // confirming and the tab disappearing (the DELETE round-trip + its
-  // ``resource.deleted``) reads as "closing", not frozen.
-  const closingTerminalKey =
-    deleteTerminalMutation.isPending && deleteTerminalMutation.variables
-      ? `terminal:${deleteTerminalMutation.variables}`
-      : null;
+  // While a close is in flight, grey the tabs being killed so the delay between
+  // confirming and a tab disappearing (the DELETE round-trip + its
+  // ``resource.deleted``) reads as "closing", not frozen. A bulk close kills
+  // several shells at once, and the mutation's ``variables`` holds only the last.
+  const [killingTerminalIds, setKillingTerminalIds] = useState<readonly string[]>([]);
+  const deletingTerminalId = deleteTerminalMutation.isPending
+    ? deleteTerminalMutation.variables
+    : undefined;
+  const closingTerminalKeys = useMemo(
+    () =>
+      [
+        ...new Set([...killingTerminalIds, ...(deletingTerminalId ? [deletingTerminalId] : [])]),
+      ].map((id) => `terminal:${id}`),
+    [killingTerminalIds, deletingTerminalId],
+  );
   // A user-initiated "+"→Shell create: snapshot the shell tabs present when it
   // starts so the effect below can focus the newly-created shell the instant
   // its tab lands in the list. That's decoupled from the create POST, which on
@@ -2747,8 +2755,13 @@ function AppShellImpl() {
     callbacks?.onConfirmed?.();
     for (const key of keys) {
       const info = terminals.find((t) => terminalTabKey(t) === key);
+      if (!info) continue;
+      setKillingTerminalIds((ids) => [...ids, info.id]);
       // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
-      if (info) deleteTerminalMutation.mutateAsync(info.id).catch(() => callbacks?.onFailed?.(key));
+      deleteTerminalMutation
+        .mutateAsync(info.id)
+        .catch(() => callbacks?.onFailed?.(key))
+        .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== info.id)));
     }
   }, [terminalPendingClose, openTerminals, terminals, conversationId, deleteTerminalMutation]);
 
@@ -3678,7 +3691,7 @@ function AppShellImpl() {
                       autoFocusTerminalRef.current.conversationId === conversationId &&
                       autoFocusTerminalRef.current.key === selectedTerminalKey
                     }
-                    closingTerminalKey={closingTerminalKey}
+                    closingTerminalKeys={closingTerminalKeys}
                     onCloseTerminal={requestCloseTerminal}
                     onCloseTerminals={requestCloseTerminals}
                     maximized={rightPanelMaximized}

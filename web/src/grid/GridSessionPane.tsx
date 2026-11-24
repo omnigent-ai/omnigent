@@ -241,7 +241,20 @@ export function GridSessionPane({
       throw new Error("The session is already connected; no recovery was performed");
   }, [sessionId]);
   const deleteTerminal = useDeleteTerminal(sessionId);
-  const closingTerminal = terminals.find((terminal) => terminal.id === deleteTerminal.variables);
+  // Shells whose kill is in flight; a bulk close kills several at once, and the
+  // mutation's ``variables`` holds only the last.
+  const [killingTerminalIds, setKillingTerminalIds] = useState<readonly string[]>([]);
+  const deletingTerminalId = deleteTerminal.isPending ? deleteTerminal.variables : undefined;
+  const closingTerminalKeys = useMemo(
+    () =>
+      terminals
+        .filter(
+          (terminal) =>
+            killingTerminalIds.includes(terminal.id) || terminal.id === deletingTerminalId,
+        )
+        .map(terminalTabKey),
+    [terminals, killingTerminalIds, deletingTerminalId],
+  );
   const [pendingClose, setPendingClose] = useState<{
     keys: string[];
     callbacks?: ShellCloseCallbacks;
@@ -570,14 +583,20 @@ export function GridSessionPane({
               pendingClose?.callbacks?.onConfirmed?.();
               for (const terminal of terminalsToClose) {
                 const key = terminalTabKey(terminal);
+                setKillingTerminalIds((ids) => [...ids, terminal.id]);
                 // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
-                deleteTerminal.mutateAsync(terminal.id).then(
-                  () => {
-                    if (workspace.selectedTerminalKey === key)
-                      updateWorkspace({ selectedTerminalKey: null });
-                  },
-                  () => pendingClose?.callbacks?.onFailed?.(key),
-                );
+                deleteTerminal
+                  .mutateAsync(terminal.id)
+                  .then(
+                    () => {
+                      if (workspace.selectedTerminalKey === key)
+                        updateWorkspace({ selectedTerminalKey: null });
+                    },
+                    () => pendingClose?.callbacks?.onFailed?.(key),
+                  )
+                  .finally(() =>
+                    setKillingTerminalIds((ids) => ids.filter((id) => id !== terminal.id)),
+                  );
               }
               setPendingClose(null);
             }}
@@ -679,11 +698,7 @@ export function GridSessionPane({
                       ? (workspace.selectedTerminalKey ?? null)
                       : null
                   }
-                  closingTerminalKey={
-                    deleteTerminal.isPending && closingTerminal
-                      ? terminalTabKey(closingTerminal)
-                      : null
-                  }
+                  closingTerminalKeys={closingTerminalKeys}
                   onCloseTerminal={(key, callbacks) => setPendingClose({ keys: [key], callbacks })}
                   onCloseTerminals={(keys, callbacks) => {
                     if (keys.length > 0) setPendingClose({ keys, callbacks });

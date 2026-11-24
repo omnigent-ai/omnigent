@@ -141,15 +141,20 @@ export function WorkspaceTabTooltip({
   label,
   shortcut,
   className,
+  open,
+  onOpenChange,
   children,
 }: {
   label: string;
   shortcut?: string | readonly string[];
   className?: string;
+  /** Controlled open state; omitted, the tooltip manages its own. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   children: ReactElement;
 }) {
   return (
-    <Tooltip>
+    <Tooltip open={open} onOpenChange={onOpenChange}>
       <TooltipTrigger asChild>
         <span className={cn("inline-flex shrink-0", className)}>{children}</span>
       </TooltipTrigger>
@@ -178,6 +183,8 @@ interface OpenTabCloseActions {
   closeAll?: () => void;
 }
 
+const NO_CLOSING_TERMINALS: readonly string[] = [];
+
 const OPEN_TAB_ACTIVE_CLASS =
   "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground";
 // Like browser tabs: labelled tabs shrink toward this floor, truncating their labels,
@@ -201,8 +208,18 @@ function OpenTabMenu({
   children: ReactElement;
 }) {
   const compact = useCompactWorkspaceTabs();
+  // An icon-only tab's name tooltip opens below the tab, over the menu's first item, and
+  // takes that item's click; it stays closed while the menu is open. A ref, since the
+  // tooltip's delayed open can call a handler from the render before the menu opened.
+  const menuOpenRef = useRef(false);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
   const menu = (
-    <ContextMenu>
+    <ContextMenu
+      onOpenChange={(open) => {
+        menuOpenRef.current = open;
+        if (open) setTooltipOpen(false);
+      }}
+    >
       <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
       {/* Focus returning to the tab would reopen its tooltip after the menu closes. */}
       <ContextMenuContent onCloseAutoFocus={(event) => event.preventDefault()}>
@@ -221,7 +238,17 @@ function OpenTabMenu({
       </ContextMenuContent>
     </ContextMenu>
   );
-  return compact ? <WorkspaceTabTooltip label={label}>{menu}</WorkspaceTabTooltip> : menu;
+  return compact ? (
+    <WorkspaceTabTooltip
+      label={label}
+      open={tooltipOpen}
+      onOpenChange={(open) => setTooltipOpen(open && !menuOpenRef.current)}
+    >
+      {menu}
+    </WorkspaceTabTooltip>
+  ) : (
+    menu
+  );
 }
 
 /**
@@ -706,7 +733,7 @@ function FileTabsStrip({
 function TerminalTabsStrip({
   openTerminals,
   activeTerminalKey,
-  closingKey,
+  closingKeys,
   canClose,
   labelFor,
   onSelect,
@@ -717,8 +744,8 @@ function TerminalTabsStrip({
   openTerminals: string[];
   /** Currently active terminal key, or null when another tab is active. */
   activeTerminalKey: string | null;
-  /** Tab key whose close (kill) is in flight — greyed + non-interactive. */
-  closingKey: string | null;
+  /** Tab keys whose close (kill) is in flight — greyed + non-interactive. */
+  closingKeys: readonly string[];
   /** Whether the viewer may close (kill) a shell. Closing is server-gated on
    *  edit access, so a read-only viewer gets no close affordance. */
   canClose: boolean;
@@ -745,7 +772,7 @@ function TerminalTabsStrip({
       {openTerminals.map((key) => {
         const name = labelFor(key);
         const active = key === activeTerminalKey;
-        const closing = key === closingKey;
+        const closing = closingKeys.includes(key);
         return (
           <OpenTabMenu
             key={key}
@@ -968,9 +995,9 @@ interface WorkspacePanelProps {
    *  False when the shell is merely restored on a session switch — then focus
    *  stays in the chat composer. */
   autoFocusSelectedTerminal?: boolean;
-  /** Tab key whose close (terminal kill) is in flight — rendered greyed and
-   *  non-interactive until it disappears. Null when no close is pending. */
-  closingTerminalKey?: string | null;
+  /** Tab keys whose close (terminal kill) is in flight — rendered greyed and
+   *  non-interactive until they disappear. */
+  closingTerminalKeys?: readonly string[];
   /** Close a single open shell tab by key. */
   onCloseTerminal: (key: string, callbacks?: ShellCloseCallbacks) => void;
   /** Close several shell tabs at once, behind a single confirmation. */
@@ -1120,7 +1147,7 @@ function WorkspacePanelImpl({
   openTerminals,
   selectedTerminalKey,
   autoFocusSelectedTerminal = false,
-  closingTerminalKey,
+  closingTerminalKeys = NO_CLOSING_TERMINALS,
   onCloseTerminal,
   onCloseTerminals,
   maximized,
@@ -1602,23 +1629,36 @@ function WorkspacePanelImpl({
   // only when every tab that just left was closed by the user with hiding allowed. Tabs
   // leaving any other way (a session switch, an agent closing its shell) keep the rail.
   const previousTabsRef = useRef({ conversationId, signature: openTabsSignature });
+  // Shells whose close hid the rail. A shell closed while still launching leaves the strip
+  // before its kill is sent; if that kill fails the shell is listed again, still running,
+  // and the rail comes back to show it. Any other tab opening ends the wait.
+  const hiddenForShellsRef = useRef<string[]>([]);
   useEffect(() => {
     const previous = previousTabsRef.current;
     previousTabsRef.current = { conversationId, signature: openTabsSignature };
     const intents = closeIntentsRef.current;
     if (previous.conversationId !== conversationId) {
       intents.clear();
+      hiddenForShellsRef.current = [];
       return;
     }
     const current: string[] = JSON.parse(openTabsSignature);
-    const removed = (JSON.parse(previous.signature) as string[]).filter(
-      (key) => !current.includes(key),
-    );
+    const before: string[] = JSON.parse(previous.signature);
+    const added = current.filter((key) => !before.includes(key));
+    if (added.length > 0) {
+      const shellReturned = added.some((key) => hiddenForShellsRef.current.includes(key));
+      hiddenForShellsRef.current = [];
+      if (shellReturned) onReveal?.();
+    }
+    const removed = before.filter((key) => !current.includes(key));
     if (removed.length === 0) return;
     const hide = current.length === 0 && removed.every((key) => intents.get(key) === true);
     for (const key of removed) intents.delete(key);
-    if (hide) onHide?.();
-  }, [conversationId, openTabsSignature, onHide]);
+    if (hide && onHide) {
+      hiddenForShellsRef.current = removed.filter((key) => key.startsWith("terminal:"));
+      onHide();
+    }
+  }, [conversationId, openTabsSignature, onHide, onReveal]);
   const showOpenTabs =
     !pending &&
     (visibleOpenPanels.length > 0 ||
@@ -1729,7 +1769,7 @@ function WorkspacePanelImpl({
       label: terminalLabelFor(key),
       active: selectedTerminalKey === key,
       select: () => openTerminalTab(key),
-      disabled: closingTerminalKey === key,
+      disabled: closingTerminalKeys.includes(key),
     })),
     ...(showBrowserTab ? browsers.tabs : []).map((tabId, index) => ({
       key: `browser:${tabId}`,
@@ -1811,7 +1851,7 @@ function WorkspacePanelImpl({
         // Viewers can't close shells; the tab shows no close button for them either.
         if (!isEditorLevel(permissionLevel)) return true;
         // A terminal already closing gets no second request.
-        if (closingTerminalKey !== selectedTerminalKey) closeTerminal(selectedTerminalKey);
+        if (!closingTerminalKeys.includes(selectedTerminalKey)) closeTerminal(selectedTerminalKey);
       } else if (selectedFilePath !== null) {
         handleCloseTab();
       } else if (scopeView === "sidechat" && sideChats.selected !== null) {
@@ -1904,7 +1944,7 @@ function WorkspacePanelImpl({
     // A confirmed shell close stays recorded until its tab leaves, so a slow kill isn't
     // requested again.
     ...(canCloseShells ? openTerminals : [])
-      .filter((key) => key !== closingTerminalKey && !closeIntentsRef.current.has(key))
+      .filter((key) => !closingTerminalKeys.includes(key) && !closeIntentsRef.current.has(key))
       .map((key) => ({ key, closeNow: () => {}, shell: true as const })),
     ...(showBrowserTab ? browsers.tabs : []).map((tabId) => ({
       key: `browser:${tabId}`,
@@ -2179,7 +2219,7 @@ function WorkspacePanelImpl({
                 <TerminalTabsStrip
                   openTerminals={openTerminals}
                   activeTerminalKey={selectedTerminalKey}
-                  closingKey={closingTerminalKey ?? null}
+                  closingKeys={closingTerminalKeys}
                   canClose={isEditorLevel(permissionLevel)}
                   labelFor={terminalLabelFor}
                   onSelect={openTerminalTab}
