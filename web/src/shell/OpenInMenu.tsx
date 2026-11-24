@@ -36,9 +36,11 @@ export function useOpenInActions(path: string | null, directory = false): OpenIn
   const target = useHostFileTarget(path);
   const conversationId = useFileViewerConversationId();
   const mobile = isAndroidShell() || isIOSShell();
+  // The editors show as a button whenever the host is reachable, so its SSH name is read here.
   const sshTarget = useHostSshTarget(
     !mobile && !localTarget ? (target?.hostId ?? null) : null,
     conversationId,
+    { resolve: true },
   );
   const preferred = usePreferredEditor();
   if (mobile || !target || (!localTarget && !sshTarget)) return [];

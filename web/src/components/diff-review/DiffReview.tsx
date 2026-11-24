@@ -310,6 +310,8 @@ export interface DiffReviewProps<A = undefined> {
   fileActions?: (file: DiffReviewFile) => readonly DiffReviewFileAction[];
   /** A changed-files tree folder's actions after its Collapse or Expand, such as copying its path. */
   folderActions?: (path: string) => readonly DiffReviewFileAction[];
+  /** Called as a file's or folder's menu opens, so the source can load what its actions need. */
+  onFileMenuOpen?: () => void;
   /** Whether ⌘K offers the current file's actions; false while another file, such as a focused row, has them. */
   fileActionsInPalette?: boolean;
   /**
@@ -411,6 +413,7 @@ export function DiffReview<A = undefined>({
   onScrollAnchorChange,
   fileActions,
   folderActions,
+  onFileMenuOpen,
   fileActionsInPalette = true,
   onOpenFileInNewTab,
   onTreeFileChosen,
@@ -1911,6 +1914,7 @@ export function DiffReview<A = undefined>({
             path={path}
             actions={richAction ? [richAction, ...actions] : actions}
             titleShowsCopy={titleShowsCopy}
+            onOpen={onFileMenuOpen}
           />
         </span>
       );
@@ -1922,6 +1926,7 @@ export function DiffReview<A = undefined>({
       filesByPath,
       onRetry,
       menuActionsFor,
+      onFileMenuOpen,
       ownedFiles,
       renderHeaderExtras,
       shownRich,
@@ -2339,6 +2344,7 @@ export function DiffReview<A = undefined>({
       onOpenInNewTab={onOpenFileInNewTab && openTreeFileInNewTab}
       rowActions={onOpenFileInNewTab || presentation?.treeRowActions ? treeRowActions : undefined}
       folderActions={folderActions}
+      onRowMenuOpen={onFileMenuOpen}
       folderOwner={folderOwner}
       appearance={presentation?.tree?.appearance}
       searchQuery={treeSearch}
@@ -2784,10 +2790,12 @@ function FileActionsMenu({
   path,
   actions,
   titleShowsCopy,
+  onOpen,
 }: {
   path: string;
   actions: readonly DiffReviewFileAction[];
   titleShowsCopy: (path: string) => boolean;
+  onOpen?: () => void;
 }) {
   // Read when the menu opens: the header's width decides whether the title shows the copy button.
   const [copyInTitle, setCopyInTitle] = useState(false);
@@ -2795,7 +2803,13 @@ function FileActionsMenu({
   const others = actions.filter((action) => action.id !== "copy-path");
   const menuActions = copyInTitle && others.length > 0 ? others : actions;
   return (
-    <DropdownMenu onOpenChange={(open) => open && setCopyInTitle(titleShowsCopy(path))}>
+    <DropdownMenu
+      onOpenChange={(open) => {
+        if (!open) return;
+        setCopyInTitle(titleShowsCopy(path));
+        onOpen?.();
+      }}
+    >
       <DropdownMenuTrigger asChild>
         <Button
           type="button"

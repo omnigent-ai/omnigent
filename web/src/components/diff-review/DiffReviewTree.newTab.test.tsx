@@ -242,6 +242,39 @@ describe("a row menu without tabs, as Changes review has", () => {
   });
 });
 
+describe("a row menu whose actions load as it opens", () => {
+  it("asks the review to load them, and lists one that arrives while the menu is open", async () => {
+    const onRowMenuOpen = vi.fn();
+    const copyPath = { id: "copy-path", label: "Copy path", icon: CopyIcon, run: () => {} };
+    const tree = (actions: readonly DiffReviewFileAction[]) => (
+      <DiffReviewTree
+        files={[file(FIRST), file(SECOND)]}
+        navigate={() => undefined}
+        searchQuery={null}
+        setSearchQuery={() => undefined}
+        searchFocusRequest={0}
+        dark={false}
+        rowActions={() => actions}
+        onRowMenuOpen={onRowMenuOpen}
+      />
+    );
+    const view = render(tree([copyPath]));
+    fireEvent.contextMenu(await findTreeRow(SECOND));
+    await screen.findByRole("menuitem", { name: "Copy path" });
+    expect(onRowMenuOpen).toHaveBeenCalledTimes(1);
+
+    const openInEditor = {
+      id: "open-in-editor",
+      label: "Open in Editor",
+      icon: CopyIcon,
+      run: () => {},
+    };
+    view.rerender(tree([copyPath, openInEditor]));
+    expect(await screen.findByRole("menuitem", { name: "Open in Editor" })).toBeInTheDocument();
+    expect(onRowMenuOpen).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("a folder row's menu", () => {
   const copyAction = (copied: string[]) => (path: string) => [
     { id: "copy-path", label: "Copy path", icon: CopyIcon, run: () => copied.push(path) },

@@ -4,7 +4,7 @@
 // review) derives each file's facts without a hook per file.
 
 import { useMemo } from "react";
-import { useHostSshTarget } from "@/hooks/useHostSshTarget";
+import { useHostSshTarget, useResolveHostSshTarget } from "@/hooks/useHostSshTarget";
 import { CODE_EDITORS, editorLink, type CodeEditor } from "@/lib/editorLinks";
 import { isAndroidShell, isIOSShell, supportsFileReveal } from "@/lib/nativeBridge";
 import { useDesktopHostId } from "@/lib/desktopHostId";
@@ -70,21 +70,25 @@ export function fileCommandFacts(
   };
 }
 
+/** Whether `hostId` is this machine, and the host whose files editors open over SSH, if any. */
+function useEditorHost(hostId: string | null): { local: boolean; sshHostId: string | null } {
+  const desktopHostId = useDesktopHostId();
+  const mobile = isAndroidShell() || isIOSShell();
+  const local = !mobile && hostId !== null && hostId === desktopHostId;
+  return { local, sshHostId: !mobile && !local ? hostId : null };
+}
+
 /**
  * The environment for session `conversationId`'s files on `hostId`. Editors open this
- * machine's files directly and a remote host's over SSH; a phone opens neither.
+ * machine's files directly and a remote host's over SSH; a phone opens neither. The remote
+ * host's SSH name is known once a menu offering it has opened, see {@link useResolveFileSshTarget}.
  */
 export function useFileCommandEnvironment(
   hostId: string | null,
   conversationId: string | null,
 ): FileCommandEnvironment {
-  const desktopHostId = useDesktopHostId();
-  const mobile = isAndroidShell() || isIOSShell();
-  const local = !mobile && hostId !== null && hostId === desktopHostId;
-  const sshTarget = useHostSshTarget(
-    !mobile && !local ? hostId : null,
-    conversationId ?? undefined,
-  );
+  const { local, sshHostId } = useEditorHost(hostId);
+  const sshTarget = useHostSshTarget(sshHostId, conversationId ?? undefined);
   return useMemo(
     () => ({
       local,
@@ -95,6 +99,17 @@ export function useFileCommandEnvironment(
     }),
     [local, sshTarget, conversationId],
   );
+}
+
+/**
+ * Read the SSH name of `hostId`, where `conversationId`'s files are, for a menu that offers
+ * opening them in an editor over SSH to call as it opens. Does nothing for this machine's files.
+ */
+export function useResolveFileSshTarget(
+  hostId: string | null,
+  conversationId: string | null,
+): () => void {
+  return useResolveHostSshTarget(useEditorHost(hostId).sshHostId, conversationId ?? undefined);
 }
 
 /** The facts for `target`; the open facts are the surface's own answer, as only it knows what it shows. */

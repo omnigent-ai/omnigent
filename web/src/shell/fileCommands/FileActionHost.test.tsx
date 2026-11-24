@@ -39,6 +39,7 @@ vi.mock("../RevealInFileManager", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useHostSshTarget", () => ({
   useHostSshTarget: (hostId: string | null) => (hostId === "dev-box" ? "dev-box.ssh" : null),
+  useResolveHostSshTarget: () => () => {},
 }));
 
 function target(

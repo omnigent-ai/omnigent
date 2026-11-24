@@ -1419,6 +1419,28 @@ describe("the current file's actions in ⌘K", () => {
     expect(opened).toEqual([SECOND]);
   });
 
+  it("tells the source as a file's menu opens, so it can load what the menu offers", () => {
+    const onFileMenuOpen = vi.fn();
+    render(<DiffReview {...twoFiles({ onFileMenuOpen })} />);
+    const item = codeView.props!.items.find((each) => each.id.endsWith(SECOND))!;
+    const header = within(
+      render(
+        <TooltipProvider>
+          {(
+            codeView.props as { renderHeaderMetadata?: (item: unknown) => ReactNode }
+          ).renderHeaderMetadata?.(item)}
+        </TooltipProvider>,
+      ).container,
+    );
+    expect(onFileMenuOpen).not.toHaveBeenCalled();
+    fireEvent.pointerDown(header.getByRole("button", { name: `More actions for ${SECOND}` }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(screen.getAllByRole("menuitem").length).toBeGreaterThan(0);
+    expect(onFileMenuOpen).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves ⌘K's file to whoever owns it while the review doesn't", () => {
     const view = render(<DiffReview {...twoFiles({ fileActionsInPalette: false })} />);
     expect(fileCommands()).toEqual([]);

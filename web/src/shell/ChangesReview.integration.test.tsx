@@ -45,7 +45,10 @@ vi.mock("@/components/diff-review/DiffReview", () => ({
     </div>
   ),
 }));
-vi.mock("./fileCommands/useFileCommandFacts", () => ({ useFileCommandEnvironment: () => ({}) }));
+vi.mock("./fileCommands/useFileCommandFacts", () => ({
+  useFileCommandEnvironment: () => ({}),
+  useResolveFileSshTarget: () => () => {},
+}));
 vi.mock("./fileCommands/target", () => ({
   useSessionHostId: () => null,
   resolveFileCommandTarget: (path: string) => ({ path }),

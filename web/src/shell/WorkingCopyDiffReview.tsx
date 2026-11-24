@@ -296,6 +296,7 @@ export interface WorkingCopyDiffReviewProps {
   /** Per-file actions for each file header's menu. */
   fileActions?: DiffReviewProps["fileActions"];
   folderActions?: DiffReviewProps["folderActions"];
+  onFileMenuOpen?: DiffReviewProps["onFileMenuOpen"];
   fileActionsInPalette?: DiffReviewProps["fileActionsInPalette"];
   onOpenFileInNewTab?: DiffReviewProps["onOpenFileInNewTab"];
   /** False while the viewer is mounted but hidden; the review's ⌘K commands are withdrawn. */
@@ -379,6 +380,7 @@ export function WorkingCopyDiffReviewBody({
   onFindClose,
   fileActions,
   folderActions,
+  onFileMenuOpen,
   fileActionsInPalette,
   onOpenFileInNewTab,
   active = true,
@@ -568,6 +570,7 @@ export function WorkingCopyDiffReviewBody({
         revealTarget={revealTarget}
         fileActions={fileActions}
         folderActions={folderActions}
+        onFileMenuOpen={onFileMenuOpen}
         fileActionsInPalette={fileActionsInPalette}
         onOpenFileInNewTab={onOpenFileInNewTab}
         markedLines={markedLines}

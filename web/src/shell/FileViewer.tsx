@@ -517,7 +517,9 @@ function FileViewerBody({
   const directReads =
     workspaceSocketBridge() !== null && isFeatureEnabled(serverInfo, "workspace_direct_access");
   const sessionHostId = useSessionHostId(conversationId);
-  const sshTarget = useHostSshTarget(directReads ? sessionHostId : null, conversationId);
+  const sshTarget = useHostSshTarget(directReads ? sessionHostId : null, conversationId, {
+    resolve: true,
+  });
   // Video playback reads the complete binary on demand, never the capped JSON preview.
   const fileQuery = useFileContent(
     conversationId,

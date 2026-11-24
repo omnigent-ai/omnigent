@@ -57,7 +57,10 @@ import { useBranchCommits } from "./useBranchCommits";
 import { REPOSITORY_REFS_KEY, useRepositoryRefs } from "./useRepositoryRefs";
 import { reviewFileActions, reviewFolderActions } from "./fileCommands/reviewFileActions";
 import { resolveFileCommandTarget, useSessionHostId } from "./fileCommands/target";
-import { useFileCommandEnvironment } from "./fileCommands/useFileCommandFacts";
+import {
+  useFileCommandEnvironment,
+  useResolveFileSshTarget,
+} from "./fileCommands/useFileCommandFacts";
 import { type FilePosition, useWorkspacePaths } from "./FileViewerContext";
 import { useStopFilePositionOnInput } from "./useStopFilePositionOnInput";
 import {
@@ -573,6 +576,8 @@ export function ChangesReview({
   const { root } = useWorkspacePaths();
   const sessionHostId = useSessionHostId();
   const fileEnvironment = useFileCommandEnvironment(sessionHostId, conversationId);
+  // The host's SSH name, for opening a file in an editor, is read once a file's menu opens.
+  const resolveSshTarget = useResolveFileSshTarget(sessionHostId, conversationId);
   const { preferences, update } = useReviewViewPreferences();
   const [pickerOpen, setPickerOpen] = useState(false);
   // Without access the picker goes, with its typed text; it reopens closed.
@@ -861,6 +866,7 @@ export function ChangesReview({
               onFindClose={() => setFindOpen(false)}
               fileActions={fileActions}
               folderActions={folderActions}
+              onFileMenuOpen={resolveSshTarget}
               fileActionsInPalette={commitActive}
               onOpenFileInNewTab={onOpenFileInNewTab}
               active={commitActive}
@@ -1067,6 +1073,7 @@ export function ChangesReview({
         onFindClose={() => setFindOpen(false)}
         fileActions={fileActions}
         folderActions={folderActions}
+        onFileMenuOpen={resolveSshTarget}
         fileActionsInPalette={changesActive}
         onOpenFileInNewTab={onOpenFileInNewTab}
         active={changesActive}

@@ -199,6 +199,8 @@ import { resolveDefaultShell } from "./preferredShell";
 import { type ShellCloseCallbacks, WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import { TasksTabOnOpen } from "./TasksTabOnOpen";
+import { useSessionHostId } from "./RevealInFileManager";
+import { useResolveFileSshTarget } from "./fileCommands/useFileCommandFacts";
 import {
   SessionCostButton,
   SessionOverview,
@@ -2254,6 +2256,14 @@ function AppShellImpl() {
   useEffect(() => {
     if (commandPaletteOpen) replaceThemePicker();
   }, [commandPaletteOpen]);
+  // ⌘K can open the session's files in an editor over SSH once it reads the host's SSH name.
+  const resolvePaletteSshTarget = useResolveFileSshTarget(
+    useSessionHostId(serverConversationId),
+    serverConversationId ?? null,
+  );
+  useEffect(() => {
+    if (commandPaletteOpen) resolvePaletteSshTarget();
+  }, [commandPaletteOpen, resolvePaletteSshTarget]);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.
