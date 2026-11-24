@@ -126,9 +126,12 @@ export function CommentsPanel({
   const activeAnchor = activeSelection?.anchor_content;
   // Counts selections, so a save that finishes after the viewer moved on leaves the new text.
   const selectionGeneration = useRef(0);
+  // While a save is in flight the draft is read-only, so its completion can't erase newer text.
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     selectionGeneration.current += 1;
+    setSaving(false);
     setBody("");
     if (pendingBodyRef) pendingBodyRef.current = "";
   }, [activeSelectionStart, activeSelectionEnd, activeCommentId, activeAnchor, pendingBodyRef]);
@@ -138,12 +141,21 @@ export function CommentsPanel({
       setBody("");
       if (pendingBodyRef) pendingBodyRef.current = "";
     };
+    if (saving) return;
     const outcome = onAddComment(body.trim());
     if (outcome instanceof Promise) {
       const generation = selectionGeneration.current;
-      void outcome.then((saved) => {
-        if (saved && selectionGeneration.current === generation) clear();
-      });
+      setSaving(true);
+      void outcome.then(
+        (saved) => {
+          if (selectionGeneration.current !== generation) return;
+          setSaving(false);
+          if (saved) clear();
+        },
+        () => {
+          if (selectionGeneration.current === generation) setSaving(false);
+        },
+      );
     } else {
       clear();
     }
@@ -310,6 +322,8 @@ export function CommentsPanel({
                 rows={3}
                 placeholder="Add a comment…"
                 value={body}
+                readOnly={saving}
+                aria-busy={saving || undefined}
                 onChange={(e) => {
                   setBody(e.target.value);
                   if (pendingBodyRef) pendingBodyRef.current = e.target.value;
@@ -322,7 +336,7 @@ export function CommentsPanel({
                 }}
                 onKeyDown={(e) => {
                   if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
-                  if (e.key === "Enter" && !e.shiftKey && body.trim()) {
+                  if (e.key === "Enter" && !e.shiftKey && body.trim() && !saving) {
                     e.preventDefault();
                     submitComment();
                   }
@@ -332,10 +346,10 @@ export function CommentsPanel({
                 type="button"
                 size="xs"
                 className="w-full"
-                disabled={!body.trim()}
+                disabled={!body.trim() || saving}
                 onClick={submitComment}
               >
-                Add Comment
+                {saving ? "Saving…" : "Add Comment"}
               </Button>
             </div>
           ) : null)}

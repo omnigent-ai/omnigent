@@ -181,6 +181,51 @@ describe("a gadget beside a session", () => {
     },
   );
 
+  it("keeps the draft read-only while its comment saves, so finishing can't erase newer text", async () => {
+    let finish: ((saved: boolean) => void) | undefined;
+    vi.mocked(createGadgetComment).mockImplementationOnce(
+      () =>
+        new Promise((resolve, reject) => {
+          finish = (saved) =>
+            saved
+              ? resolve({
+                  id: "c1",
+                  body: "Move it to Done",
+                  status: "draft",
+                  anchor: { text: "Ship it", label: null, ref: null, occurrence: 1 },
+                  createdBy: BOARD.viewer_id,
+                  createdAt: 1,
+                  updatedAt: 1,
+                })
+              : reject(new Error("offline"));
+        }),
+    );
+    renderView();
+    await waitFor(() => expect(frameProps?.onAddComment).toBeDefined());
+    act(() =>
+      frameProps?.onAddComment?.({
+        text: "Ship it",
+        occurrence: 1,
+        rect: { x: 0, y: 0, width: 1, height: 1 },
+      }),
+    );
+    const box = screen.getByPlaceholderText("Add a comment…");
+    fireEvent.change(box, { target: { value: "Move it to Done" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add Comment" }));
+    await waitFor(() => expect(createGadgetComment).toHaveBeenCalledTimes(1));
+
+    // Same selection: the text can't change and a second Add can't be sent while it saves.
+    expect(box).toHaveAttribute("readonly");
+    expect(screen.getByRole("button", { name: "Saving…" })).toBeDisabled();
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(createGadgetComment).toHaveBeenCalledTimes(1);
+
+    await act(async () => finish?.(false));
+    // A failed save gives the text back to edit.
+    expect(box).not.toHaveAttribute("readonly");
+    expect(box).toHaveValue("Move it to Done");
+  });
+
   it("loads the page again with what the viewer may do after their access changes", async () => {
     const reader = gadgetFixture({
       id: "board",
