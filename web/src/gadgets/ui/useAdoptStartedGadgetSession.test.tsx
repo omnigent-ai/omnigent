@@ -7,11 +7,15 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ServerInfo } from "@/lib/capabilities";
 import { resetGadgetRailRequests, useGadgetRailRequest } from "@/lib/gadgetRailTabs";
-import { deleteGadget, getGadget, getGadgetGadgetSession } from "@/gadgets/api/gadgetApi";
+import {
+  deleteGadget,
+  getGadget,
+  getGadgetGadgetSession,
+  recordGadgetActionDelivery,
+} from "@/gadgets/api/gadgetApi";
 import {
   acknowledgeStartedGadgetInput,
   adoptStartedGadgetSession,
-  recordGadgetDeliveries,
 } from "@/gadgets/host/gadgetSession";
 import {
   noteGadgetStartFullScreen,
@@ -34,13 +38,13 @@ vi.mock("@/gadgets/host/gadgetSession", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetSessionModule>()),
   adoptStartedGadgetSession: vi.fn(async () => true),
   acknowledgeStartedGadgetInput: vi.fn(async (): Promise<string[]> => []),
-  recordGadgetDeliveries: vi.fn(async (): Promise<string[]> => []),
 }));
 vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetApiModule>()),
   getGadget: vi.fn(),
   getGadgetGadgetSession: vi.fn(),
   deleteGadget: vi.fn(),
+  recordGadgetActionDelivery: vi.fn(async () => undefined),
 }));
 
 // The create the Creating button began, which Created then finishes.
@@ -234,11 +238,11 @@ describe("a session started beside a gadget", () => {
     await new Promise((resolve) => {
       setTimeout(resolve, 0);
     });
-    expect(recordGadgetDeliveries).not.toHaveBeenCalled();
+    expect(recordGadgetActionDelivery).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
     fireEvent.click(screen.getByRole("button", { name: "Session again" }));
     await waitFor(() =>
-      expect(recordGadgetDeliveries).toHaveBeenCalledWith("board", "conv_9", ["act1"]),
+      expect(recordGadgetActionDelivery).toHaveBeenCalledWith("board", "act1", "conv_9"),
     );
   });
 

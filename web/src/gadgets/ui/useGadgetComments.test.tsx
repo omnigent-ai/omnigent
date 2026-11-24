@@ -12,6 +12,7 @@ import {
 import { gadgetFixture } from "./testUtils";
 import { gadgetCommentsMessage, useGadgetComments } from "./useGadgetComments";
 import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
+import { BridgeError } from "@/gadgets/host/gadgetBridge";
 import { GADGET_SKILL_INSTRUCTION } from "@/gadgets/host/gadgetBuild";
 
 vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
@@ -165,10 +166,16 @@ describe("gadget comments", () => {
     );
   });
 
-  it("leaves the comments open when sending them fails", async () => {
+  it.each([
+    ["sending them fails", new Error("Your gadget session did not get the request")],
+    [
+      "a policy in the session refuses them",
+      new BridgeError("PERMISSION_DENIED", "A policy in that session refused the request."),
+    ],
+  ])("leaves the comments open when %s", async (_label, failure) => {
     vi.mocked(listGadgetComments).mockResolvedValue({ items: [comment("c1")], canComment: true });
     const address = vi.fn(async () => {
-      throw new Error("Your gadget session did not get the request");
+      throw failure;
     });
     const { result } = renderHook(() => useGadgetComments(BOARD, address), { wrapper });
     await waitFor(() => expect(result.current.draftCount).toBe(1));

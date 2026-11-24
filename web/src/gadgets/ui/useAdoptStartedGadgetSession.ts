@@ -14,9 +14,11 @@ import { GADGET_START_PARAM, sessionIdFromPath } from "@/gadgets/host/gadgetPage
 import {
   acknowledgeStartedGadgetInput,
   adoptStartedGadgetSession,
+  forgetUnrecordedDeliveries,
   isStartedSessionId,
   gadgetRailKey,
-  recordGadgetDeliveries,
+  keepUnrecordedDeliveries,
+  recordUnrecordedDeliveries,
 } from "@/gadgets/host/gadgetSession";
 import {
   acceptedFirstInput,
@@ -43,8 +45,6 @@ const awaitingInput = new Map<
   string,
   { gadgetId: string; linked: boolean; accepted: string | null | undefined }
 >();
-// Deliveries that couldn't be recorded, by session: tried again when the session shows.
-const unrecorded = new Map<string, { gadgetId: string; actionIds: string[] }>();
 // Gadget and session pairs linked or being linked, so a page that sees the session again does
 // nothing.
 const adopted = new Set<string>();
@@ -123,7 +123,7 @@ export function resetGadgetStarts(): void {
   fullScreenStarts.clear();
   discarding.clear();
   awaitingInput.clear();
-  unrecorded.clear();
+  forgetUnrecordedDeliveries();
 }
 
 function beginGadgetStart(gadgetId: string, queryClient: QueryClient): void {
@@ -200,23 +200,9 @@ function acknowledgeIfReady(sessionId: string): void {
   if (waiting === undefined || !waiting.linked || waiting.accepted === undefined) return;
   awaitingInput.delete(sessionId);
   void acknowledgeStartedGadgetInput(waiting.gadgetId, sessionId, waiting.accepted).then(
-    (failed) => keepUnrecorded(waiting.gadgetId, sessionId, failed),
+    // Deliveries whose records failed are kept, and tried again when the session shows.
+    (failed) => keepUnrecordedDeliveries(waiting.gadgetId, sessionId, failed),
     () => undefined,
-  );
-}
-
-function keepUnrecorded(gadgetId: string, sessionId: string, actionIds: string[]): void {
-  if (actionIds.length > 0) unrecorded.set(sessionId, { gadgetId, actionIds });
-  else unrecorded.delete(sessionId);
-}
-
-function recordAgain(sessionId: string): void {
-  const left = unrecorded.get(sessionId);
-  if (left === undefined) return;
-  unrecorded.delete(sessionId);
-  void recordGadgetDeliveries(left.gadgetId, sessionId, left.actionIds).then(
-    (failed) => keepUnrecorded(left.gadgetId, sessionId, failed),
-    () => keepUnrecorded(left.gadgetId, sessionId, left.actionIds),
   );
 }
 
@@ -266,7 +252,7 @@ export function useAdoptStartedGadgetSession(): void {
       replaceSearchParams(params);
     }
     // Deliveries whose records failed earlier: try them again now the session shows.
-    recordAgain(sessionId);
+    void recordUnrecordedDeliveries(sessionId);
     const made = madeFor.get(sessionId);
     if (made !== undefined) {
       // A link that failed earlier: try it again now the session shows.

@@ -163,9 +163,10 @@ export function gadgetActionMessage(entry: {
   return `Gadget action\n${JSON.stringify({ action_id: entry.id, action: entry.action, params: entry.params })}`;
 }
 
-/** Forgets every session this tab was about to start for a gadget; for tests. */
+/** Forgets every session this tab was about to start for a gadget, and kept deliveries; for tests. */
 export function forgetGadgetSessionStarts(): void {
   pendingStarts.clear();
+  unrecordedDeliveries.clear();
 }
 
 /** Remembers that this tab opened New session for the gadget's session, so it is adopted once started. */
@@ -206,22 +207,79 @@ function addPendingRequest(
   return pendingStarts.get(appId)?.messages ?? [message];
 }
 
+/** A session's input policy refused the message: the agent never got it. */
+class DeliveryRefused extends Error {}
+
 async function deliverMessage(
   appId: string,
   sessionId: string,
   message: string,
   actionId?: string,
 ): Promise<void> {
-  await sendUserMessage(sessionId, message);
+  const result = await sendUserMessage(sessionId, message);
+  // A refused message is answered like an accepted one, with `denied` set.
+  if (result?.denied) throw new DeliveryRefused("A policy in that session refused the request.");
   if (actionId) {
-    await recordDelivery(appId, actionId, sessionId);
+    // The message reached the session, so it isn't sent again; a record that still fails is
+    // kept and tried again instead.
+    const failed = await recordGadgetDeliveries(appId, sessionId, [actionId]);
+    keepUnrecordedDeliveries(appId, sessionId, failed);
   }
 }
 
-async function recordDelivery(appId: string, actionId: string, sessionId: string): Promise<void> {
-  // The message reached the session, so it isn't sent again; a record that still fails
-  // leaves its progress showing as not delivered.
-  await recordGadgetDeliveries(appId, sessionId, [actionId]);
+function deliveryError(prefix: string, error: unknown): BridgeError {
+  if (error instanceof DeliveryRefused) return new BridgeError("PERMISSION_DENIED", error.message);
+  return new BridgeError(
+    "UNAVAILABLE",
+    `${prefix}: ${error instanceof Error ? error.message : String(error)}`,
+  );
+}
+
+// Deliveries a session got whose records failed, by session, then gadget: their messages are
+// not sent again, only their records are tried again.
+const unrecordedDeliveries = new Map<string, Map<string, Set<string>>>();
+
+/** Keeps `actionIds`, delivered to `sessionId` but not recorded, to record them later. */
+export function keepUnrecordedDeliveries(
+  appId: string,
+  sessionId: string,
+  actionIds: readonly string[],
+): void {
+  if (actionIds.length === 0) return;
+  const byGadget = unrecordedDeliveries.get(sessionId) ?? new Map<string, Set<string>>();
+  const kept = byGadget.get(appId) ?? new Set<string>();
+  actionIds.forEach((actionId) => kept.add(actionId));
+  byGadget.set(appId, kept);
+  unrecordedDeliveries.set(sessionId, byGadget);
+}
+
+/** Tries again to record the deliveries kept for `sessionId`; ones still failing stay kept. */
+export async function recordUnrecordedDeliveries(sessionId: string): Promise<void> {
+  const byGadget = unrecordedDeliveries.get(sessionId);
+  if (byGadget === undefined) return;
+  unrecordedDeliveries.delete(sessionId);
+  await Promise.all(
+    [...byGadget].map(async ([appId, kept]) => {
+      const actionIds = [...kept];
+      const failed = await recordGadgetDeliveries(appId, sessionId, actionIds).catch(
+        () => actionIds,
+      );
+      keepUnrecordedDeliveries(appId, sessionId, failed);
+    }),
+  );
+}
+
+/** The session that got `actionId`'s request although its delivery isn't recorded, if any. */
+function unrecordedSession(appId: string, actionId: string): string | null {
+  for (const [sessionId, byGadget] of unrecordedDeliveries) {
+    if (byGadget.get(appId)?.has(actionId)) return sessionId;
+  }
+  return null;
+}
+
+/** Forgets the kept deliveries; for tests. */
+export function forgetUnrecordedDeliveries(): void {
+  unrecordedDeliveries.clear();
 }
 
 const RECORD_ATTEMPTS = 3;
@@ -279,14 +337,8 @@ export async function adoptStartedGadgetSession(
 }
 
 /**
- * Counts as delivered the requests carried in `acceptedText`, the first message the server
- * accepted for the session New session started for the gadget, once that session is the
- * gadget's: their actions are recorded delivered and their `onDelivered` callbacks run
- * (Address all marks its comments addressed). The accepted text decides, not the text New
- * session started with: a first send that failed, followed by a different message, carried
- * none of them. Requests not in it stay queued for the next session started there. Returns
- * the carried actions whose delivery couldn't be recorded, to try again
- * ({@link recordGadgetDeliveries}).
+ * Acknowledges only the requests carried by this session's accepted first input. Keeps other
+ * requests queued; returns failed delivery IDs for retry.
  */
 export async function acknowledgeStartedGadgetInput(
   appId: string,
@@ -381,10 +433,7 @@ export async function openGadgetSession(
       try {
         await deliverMessage(app.id, target, message, actionId);
       } catch (error) {
-        throw new BridgeError(
-          "UNAVAILABLE",
-          `This session did not get the request: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        throw deliveryError("This session did not get the request", error);
       }
     }
     return "sent";
@@ -401,10 +450,7 @@ export async function openGadgetSession(
       return "sent";
     } catch (error) {
       if (!sessionGone(error)) {
-        throw new BridgeError(
-          "UNAVAILABLE",
-          `Your gadget session did not get the request: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        throw deliveryError("Your gadget session did not get the request", error);
       }
     }
   }
@@ -443,6 +489,13 @@ export async function requestGadgetAction(
   if (entry.delivered) {
     // The same request is still open in a session (or this is a retry of one that reached it),
     // so nothing is sent again.
+    return { actionId: entry.id, delivery: entry.merged ? "merged" : "sent" };
+  }
+  const gotIt = unrecordedSession(app.id, entry.id);
+  if (gotIt !== null) {
+    // A session already got this request but its delivery wasn't recorded: record it, and
+    // don't send the message again.
+    await recordUnrecordedDeliveries(gotIt);
     return { actionId: entry.id, delivery: entry.merged ? "merged" : "sent" };
   }
   // A new entry, or an open one that never reached a session (for example its New session was

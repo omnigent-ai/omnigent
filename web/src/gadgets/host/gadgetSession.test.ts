@@ -13,6 +13,7 @@ import {
   onSessionGadgetsChanged,
   openGadgetFullScreen,
   openGadgetInSession,
+  openGadgetSession,
   quoteInGadgetSession,
   requestGadgetAction,
   gadgetSelectionQuote,
@@ -345,6 +346,107 @@ describe("gadget session", () => {
       ),
     ).toBe(true);
   });
+
+  it("refuses an action a policy in the gadget session denies, and records no delivery", async () => {
+    let deliveries = 0;
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: "s_1", version: "v" })),
+      ),
+      rest.post(`${API}/app-1/actions/act1/delivery`, (_req, res, ctx) => {
+        deliveries += 1;
+        return res(ctx.json({ items: [] }));
+      }),
+    );
+    // The events route answers a refused message like an accepted one, with `denied` set.
+    sendUserMessage.mockResolvedValueOnce({ queued: false, denied: true });
+
+    const request = requestGadgetAction(
+      EDITOR,
+      { action: "run_card", params: { cardId: "c1" } },
+      navigate,
+    );
+
+    await expect(request).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+    expect(deliveries).toBe(0);
+  });
+
+  it("reports Address all's message refused by a policy, so its comments stay open", async () => {
+    server.use(
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: "s_1", version: "v" })),
+      ),
+    );
+    sendUserMessage.mockResolvedValueOnce({ queued: false, denied: true });
+    const onDelivered = vi.fn();
+
+    await expect(
+      openGadgetSession(EDITOR, "Address these comments", navigate, {
+        deliver: true,
+        reveal: false,
+        onDelivered,
+      }),
+    ).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+    expect(onDelivered).not.toHaveBeenCalled();
+  });
+
+  it("still takes a message the session answers without queueing it", async () => {
+    server.use(
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: "s_1", version: "v" })),
+      ),
+    );
+    sendUserMessage.mockResolvedValueOnce({ queued: false });
+
+    expect(
+      await openGadgetSession(EDITOR, "Address these comments", navigate, {
+        deliver: true,
+        reveal: false,
+      }),
+    ).toBe("sent");
+  });
+
+  it("records a delivery it couldn't record later, without sending the request again", async () => {
+    let recordFails = true;
+    let deliveries = 0;
+    let merged = false;
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) =>
+        merged
+          ? res(ctx.json({ ...ENTRY, merged: true, delivered: false }))
+          : res(ctx.status(201), ctx.json(ENTRY)),
+      ),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: "s_1", version: "v" })),
+      ),
+      rest.post(`${API}/app-1/actions/act1/delivery`, (_req, res, ctx) => {
+        deliveries += 1;
+        return recordFails
+          ? res(ctx.status(503), ctx.json({ error: { message: "busy" } }))
+          : res(ctx.json({ items: [] }));
+      }),
+    );
+    const request = { action: "run_card", params: { cardId: "c1" } };
+
+    // The session gets the message; every try to record that fails.
+    expect(await requestGadgetAction(EDITOR, request, navigate)).toEqual({
+      actionId: "act1",
+      delivery: "sent",
+    });
+    expect(deliveries).toBe(3);
+
+    // The same request again joins the open entry, which the server still shows undelivered.
+    merged = true;
+    recordFails = false;
+    expect(await requestGadgetAction(EDITOR, request, navigate)).toEqual({
+      actionId: "act1",
+      delivery: "merged",
+    });
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(deliveries).toBe(4);
+    expect(navigate).not.toHaveBeenCalled();
+  }, 10_000);
 
   it("starts the gadget session when the viewer has none, and shows the gadget beside it once started", async () => {
     server.use(
