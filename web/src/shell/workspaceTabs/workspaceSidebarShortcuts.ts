@@ -15,11 +15,14 @@ import {
   currentShortcutEnvironment,
   shortcutBinding as registryShortcutBinding,
   type ShortcutEnvironment,
+  type ShortcutGroupId,
   type ShortcutId as RegistryShortcutId,
 } from "@/lib/shortcuts/registry";
 
 interface SidebarShortcutDefinition {
   label: string;
+  /** The Keyboard shortcuts page group its row is listed under. */
+  group: ShortcutGroupId;
   /** The chords the page matches here; empty for a command reached only from ⌘K. */
   chords: (environment: ShortcutEnvironment) => Chord[];
 }
@@ -30,19 +33,23 @@ const modAlt = (key: Chord): Chord => ({ mod: true, alt: true, ...key });
 const SIDEBAR_BINDINGS = {
   // A browser keeps ⌘T and ⌘W for its own tabs, so the sidebar's tabs add Option.
   "workspace.newTab": {
+    group: "workspace",
     label: "New workspace tab",
     chords: () => [modAlt({ shift: true, code: "KeyN" })],
   },
   "workspace.closeTab": {
+    group: "workspace",
     label: "Close workspace tab",
     chords: () => [modAlt({ code: "KeyW" })],
   },
   "workspace.reopenTab": {
+    group: "workspace",
     label: "Reopen closed workspace tab",
     chords: () => [modAlt({ shift: true, code: "KeyT" })],
   },
   // ⌘← / ⌘→ in the macOS app, as in the browsers it follows; text keeps them for line start / end.
   "workspace.back": {
+    group: "workspace",
     label: "Go back in the workspace",
     chords: (environment) => [
       environment.mac && environment.native
@@ -51,6 +58,7 @@ const SIDEBAR_BINDINGS = {
     ],
   },
   "workspace.forward": {
+    group: "workspace",
     label: "Go forward in the workspace",
     chords: (environment) => [
       environment.mac && environment.native
@@ -60,52 +68,59 @@ const SIDEBAR_BINDINGS = {
   },
   // A browser keeps ⇧⌘[ and ⇧⌘] for its own tabs.
   "workspace.nextTab": {
+    group: "workspace",
     label: "Next workspace tab",
     chords: (environment) =>
       environment.native ? [mod({ shift: true, code: "BracketRight" })] : [],
   },
   "workspace.previousTab": {
+    group: "workspace",
     label: "Previous workspace tab",
     chords: (environment) =>
       environment.native ? [mod({ shift: true, code: "BracketLeft" })] : [],
   },
   "workspace.moveTabLeft": {
+    group: "workspace",
     label: "Move workspace tab left",
     chords: () => [{ alt: true, shift: true, key: "ArrowLeft" }],
   },
   "workspace.moveTabRight": {
+    group: "workspace",
     label: "Move workspace tab right",
     chords: () => [{ alt: true, shift: true, key: "ArrowRight" }],
   },
   "workspace.toggleFullScreen": {
+    group: "workspace",
     label: "Toggle workspace full screen",
     chords: () => [mod({ shift: true, code: "KeyF" })],
   },
   "browser.new": {
+    group: "workspace",
     label: "Open a new browser tab",
     chords: () => [modAlt({ code: "KeyB" })],
   },
   // Physical keys, since Option rewrites letters; ⌃⌘F is the system's full screen on macOS.
   "palette.text": {
+    group: "workspace",
     label: "Search text in the open session's files",
     chords: (environment) =>
       environment.mac ? [{ ctrl: true, mod: true, code: "KeyO" }] : [modAlt({ code: "KeyF" })],
   },
   "palette.files": {
+    group: "workspace",
     label: "Go to a file in the open session",
     chords: (environment) =>
       environment.mac ? [{ ctrl: true, mod: true, code: "KeyP" }] : [modAlt({ code: "KeyP" })],
   },
   // The Explorer chord editors use.
   "files.toggleTree": {
+    group: "workspace",
     label: "Show or hide the Files tree",
     chords: () => [mod({ shift: true, code: "KeyE" })],
   },
-  "find.open": {
-    label: "Find in file",
-    chords: () => [mod({ key: "f" })],
-  },
+  "find.open": { group: "workspace", label: "Find in file", chords: () => [mod({ key: "f" })] },
   "file.findAndReplace": {
+    group: "files",
     label: "Find and replace",
     // Windows and Linux editors also replace with Control+H.
     chords: (environment) => [
@@ -114,72 +129,122 @@ const SIDEBAR_BINDINGS = {
     ],
   },
   "file.goToLine": {
+    group: "files",
     label: "Go to line",
     // Control on every platform, as in other editors.
     chords: () => [{ ctrl: true, code: "KeyG" }],
   },
   "file.toggleLineComment": {
+    group: "files",
     label: "Toggle line comment",
     chords: () => [mod({ key: "/" })],
   },
   "file.toggleBlockComment": {
+    group: "files",
     label: "Toggle block comment",
     chords: () => [{ alt: true, shift: true, code: "KeyA" }],
   },
-  "file.indentLines": { label: "Indent lines", chords: () => [mod({ code: "BracketRight" })] },
-  "file.outdentLines": { label: "Outdent lines", chords: () => [mod({ code: "BracketLeft" })] },
-  "file.moveLinesUp": { label: "Move lines up", chords: () => [{ alt: true, key: "ArrowUp" }] },
+  "file.indentLines": {
+    group: "files",
+    label: "Indent lines",
+    chords: () => [mod({ code: "BracketRight" })],
+  },
+  "file.outdentLines": {
+    group: "files",
+    label: "Outdent lines",
+    chords: () => [mod({ code: "BracketLeft" })],
+  },
+  "file.moveLinesUp": {
+    group: "files",
+    label: "Move lines up",
+    chords: () => [{ alt: true, key: "ArrowUp" }],
+  },
   "file.moveLinesDown": {
+    group: "files",
     label: "Move lines down",
     chords: () => [{ alt: true, key: "ArrowDown" }],
   },
   "file.copyLinesUp": {
+    group: "files",
     label: "Copy lines up",
     chords: () => [{ alt: true, shift: true, key: "ArrowUp" }],
   },
   "file.copyLinesDown": {
+    group: "files",
     label: "Copy lines down",
     chords: () => [{ alt: true, shift: true, key: "ArrowDown" }],
   },
-  "file.deleteLines": { label: "Delete lines", chords: () => [mod({ shift: true, code: "KeyK" })] },
-  "file.insertLineBelow": { label: "Insert line below", chords: () => [mod({ key: "Enter" })] },
+  "file.deleteLines": {
+    group: "files",
+    label: "Delete lines",
+    chords: () => [mod({ shift: true, code: "KeyK" })],
+  },
+  "file.insertLineBelow": {
+    group: "files",
+    label: "Insert line below",
+    chords: () => [mod({ key: "Enter" })],
+  },
   "file.insertLineAbove": {
+    group: "files",
     label: "Insert line above",
     chords: () => [mod({ shift: true, key: "Enter" })],
   },
-  "file.trimTrailingWhitespace": { label: "Trim trailing whitespace", chords: () => [] },
-  "file.undoCursor": { label: "Undo cursor change", chords: () => [mod({ code: "KeyU" })] },
-  "file.addCursorAbove": { label: "Add cursor above", chords: () => [modAlt({ key: "ArrowUp" })] },
+  "file.trimTrailingWhitespace": {
+    group: "files",
+    label: "Trim trailing whitespace",
+    chords: () => [],
+  },
+  "file.undoCursor": {
+    group: "files",
+    label: "Undo cursor change",
+    chords: () => [mod({ code: "KeyU" })],
+  },
+  "file.addCursorAbove": {
+    group: "files",
+    label: "Add cursor above",
+    chords: () => [modAlt({ key: "ArrowUp" })],
+  },
   "file.addCursorBelow": {
+    group: "files",
     label: "Add cursor below",
     chords: () => [modAlt({ key: "ArrowDown" })],
   },
   "file.selectNextOccurrence": {
+    group: "files",
     label: "Select next occurrence",
     chords: () => [mod({ key: "d" })],
   },
   "file.selectAllOccurrences": {
+    group: "files",
     label: "Select all occurrences",
     chords: () => [mod({ shift: true, code: "KeyL" })],
   },
   "file.expandLineSelection": {
+    group: "files",
     label: "Expand selection to line",
     chords: () => [mod({ code: "KeyL" })],
   },
   "file.goToBracket": {
+    group: "files",
     label: "Go to matching bracket",
     chords: () => [mod({ shift: true, code: "Backslash" })],
   },
   // ⌘⌥[ and ⌘⌥] toggle the sidebars, so folding takes Control+Shift and a bracket.
-  "file.fold": { label: "Fold", chords: () => [{ ctrl: true, shift: true, code: "BracketLeft" }] },
+  "file.fold": {
+    group: "files",
+    label: "Fold",
+    chords: () => [{ ctrl: true, shift: true, code: "BracketLeft" }],
+  },
   "file.unfold": {
+    group: "files",
     label: "Unfold",
     chords: () => [{ ctrl: true, shift: true, code: "BracketRight" }],
   },
-  "file.foldAll": { label: "Fold all", chords: () => [] },
-  "file.unfoldAll": { label: "Unfold all", chords: () => [] },
+  "file.foldAll": { group: "files", label: "Fold all", chords: () => [] },
+  "file.unfoldAll": { group: "files", label: "Unfold all", chords: () => [] },
   // A row that opens a place (a changed file, a commit or a pull request) opens it in a new tab.
   "rows.openInNewTab": {
+    group: "workspace",
     label: "Open the focused row in a new tab (⇧ to switch to it)",
     chords: () => [mod({ key: "Enter" }), mod({ shift: true, key: "Enter" })],
   },
