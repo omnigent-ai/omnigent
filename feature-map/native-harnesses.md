@@ -311,8 +311,8 @@ immediately from Chat and repeat from Terminal. Verify the target request uses
 Medium and retains earlier conversation text. Repeat with a later effort change
 while the model switch is pending; the latest choice must win. With no explicit
 session effort, Pi keeps its native defaults. Own-login and terminal-pinned
-launches pass the session effort as `--thinking` unless the terminal args set
-their own. Component coverage:
+launches pass the session effort as `--thinking` unless the terminal args or
+the selected model already set a thinking level. Component coverage:
 `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_pi_terminal_unmanaged_applies_session_effort`,
 `tests/runner/test_app_sessions_native_events_lifecycle.py::test_events_model_change_on_pi_native_enqueues_bridge_model_change`
 and
