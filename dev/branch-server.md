@@ -70,6 +70,54 @@ Save the screenshot to the ticket as a project artifact
 (`sys_project_artifact_save` with the ticket's `ticket_id`). Don't post a local
 path as the evidence.
 
+## Owner and member checks (`--auth-header`)
+
+By default the server runs in single-user mode, so every request is the same
+user. To check what an owner may do that a member may not, start it with
+header sign-in. Each request then acts as the user named in its
+`X-Forwarded-Email` header, and a request without one gets 401:
+
+```bash
+eval "$(dev/branch-server.sh up --auth-header | grep -E '^(URL|RUN_DIR)=')"
+OWNER=(-H 'X-Forwarded-Email: owner@example.com')
+MEMBER=(-H 'X-Forwarded-Email: member@example.com')
+JSON=(-H 'content-type: application/json')
+
+# Project agents must exist, so look two up.
+agent() { curl -s "${OWNER[@]}" "$URL/v1/agents" | jq -r --arg n "$1" '.data[] | select(.name==$n) | .id'; }
+CLAUDE=$(agent claude-native-ui) CODEX=$(agent codex-native-ui)
+
+# The owner makes a project and shares it with the member.
+PROJECT=$(curl -s "${OWNER[@]}" "${JSON[@]}" -X POST "$URL/v1/projects" \
+  -d "{\"name\":\"zz-e2e-members\",\"config\":{\"agent_id\":\"$CLAUDE\"}}" | jq -r .id)
+curl -s "${OWNER[@]}" "${JSON[@]}" -X POST "$URL/v1/projects/$PROJECT/shares" \
+  -d '{"user_id":"member@example.com"}' > /dev/null
+
+# Owner-only setting (the project's agent): 403 for the member, 200 for the owner.
+curl -s -o /dev/null -w '%{http_code}\n' "${MEMBER[@]}" "${JSON[@]}" -X PATCH \
+  "$URL/v1/projects/$PROJECT" -d "{\"config\":{\"agent_id\":\"$CODEX\"}}"   # 403
+curl -s -o /dev/null -w '%{http_code}\n' "${OWNER[@]}" "${JSON[@]}" -X PATCH \
+  "$URL/v1/projects/$PROJECT" -d "{\"config\":{\"agent_id\":\"$CODEX\"}}"   # 200
+```
+
+In the browser, act as a user by sending the same header with every request.
+The screenshot helper takes `--header` (repeatable) and can record a video:
+
+```bash
+.venv/bin/python -I dev/branch_screenshot.py "$URL/projects/zz-e2e-members" /tmp/evidence/member.png \
+  --header "X-Forwarded-Email:member@example.com" --video /tmp/evidence/video \
+  --click "Edit team" --expect "Only the project owner"
+```
+
+In your own Playwright script, pass
+`extra_http_headers={"X-Forwarded-Email": "member@example.com"}` to
+`browser.new_context(...)`. Use one context per user to switch between owner and
+member in the same run. `--auth-header` can't be combined with `--with-host`,
+because a host can't sign in by header.
+
+If a page sticks on "Loading Omnigent…" with 404s for `/assets/...`, the web
+build it serves was rebuilt after the server started. Restart the server.
+
 ## 4. Tear down
 
 ```bash

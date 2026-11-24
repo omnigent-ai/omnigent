@@ -9,11 +9,14 @@
 #
 # Usage:
 #   dev/branch-server.sh up [WORKTREE] [--port N] [--with-host] [--no-build] [--rebuild]
+#                           [--auth-header]
 #   dev/branch-server.sh down RUN_DIR|--all [--keep]
 #   dev/branch-server.sh list
 #
 # `up` prints KEY=VALUE lines (URL, RUN_DIR, PORT, SERVER_PID, HOST_PID); the
-# last line is the URL. `down` stops the instance's process groups and deletes
+# last line is the URL. `--auth-header` signs requests in by their
+# X-Forwarded-Email header, so owner/member checks can act as different users;
+# it also prints AUTH=header. `down` stops the instance's process groups and deletes
 # its run dir (--keep leaves the dir for post-mortem). `--all` stops every
 # instance started from the current worktree. See dev/branch-server.md for the e2e recipe.
 set -euo pipefail
@@ -66,17 +69,20 @@ web_needs_build() {
 }
 
 cmd_up() {
-  local wt="" port="" with_host=0 build=auto
+  local wt="" port="" with_host=0 build=auto auth=none
   while (($#)); do
     case $1 in
       --port) port=$2; shift 2 ;;
       --with-host) with_host=1; shift ;;
       --no-build) build=never; shift ;;
       --rebuild) build=always; shift ;;
+      --auth-header) auth=header; shift ;;
       -*) die "unknown option: $1" ;;
       *) wt=$1; shift ;;
     esac
   done
+  # A host can't sign in by header, so header-auth servers run without one.
+  [[ $auth == header && $with_host == 1 ]] && die "--auth-header can't be combined with --with-host"
   wt=$(cd "${wt:-$SCRIPT_DIR/..}" && git rev-parse --show-toplevel) || die "not a git worktree"
   [[ -f $wt/omnigent/cli.py ]] || die "$wt is not an omnigent checkout"
 
@@ -125,13 +131,17 @@ cmd_up() {
     OMNIGENT_DATABASE_URI="$db" \
     OMNIGENT_WEB_UI_DIST="$wt/omnigent/server/static/web-ui" \
     PYTHONPATH="$wt${PYTHONPATH:+:$PYTHONPATH}"
+  if [[ $auth == header ]]; then
+    export OMNIGENT_AUTH_ENABLED=1 OMNIGENT_AUTH_PROVIDER=header
+  fi
 
   cd "$wt"
   setsid nohup "$py" -m omnigent --log-to-stderr server --host 127.0.0.1 --port "$port" \
     --database-uri "$db" --artifact-location "$run/artifacts" \
     > "$run/logs/server.log" 2>&1 < /dev/null &
   local server_pid=$! host_pid=""
-  printf 'WORKTREE=%s\nPORT=%s\nURL=%s\nSERVER_PID=%s\n' "$wt" "$port" "$url" "$server_pid" > "$run/state"
+  printf 'WORKTREE=%s\nPORT=%s\nURL=%s\nSERVER_PID=%s\nAUTH=%s\n' \
+    "$wt" "$port" "$url" "$server_pid" "$auth" > "$run/state"
 
   local up=0
   for _ in $(seq 1 90); do
@@ -160,8 +170,9 @@ cmd_up() {
     ((connected)) || { echo "warning: host did not connect; see $run/logs/host.log" >&2; }
   fi
 
-  printf 'RUN_DIR=%s\nPORT=%s\nSERVER_PID=%s\nHOST_PID=%s\nURL=%s\n' \
-    "$run" "$port" "$server_pid" "$host_pid" "$url"
+  printf 'RUN_DIR=%s\nPORT=%s\nSERVER_PID=%s\nHOST_PID=%s\n' "$run" "$port" "$server_pid" "$host_pid"
+  [[ $auth == none ]] || printf 'AUTH=%s\n' "$auth"
+  printf 'URL=%s\n' "$url"
 }
 
 down_one() {
@@ -218,5 +229,5 @@ case ${1:-} in
   up) shift; cmd_up "$@" ;;
   down) shift; cmd_down "$@" ;;
   list) shift; cmd_list ;;
-  *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
