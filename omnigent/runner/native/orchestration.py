@@ -2590,7 +2590,11 @@ def _pi_args_have_session_control(args: list[str]) -> bool:
 
 
 def _pi_args_have_thinking(args: list[str]) -> bool:
-    """Return whether user Pi args set thinking via ``--thinking`` or a ``--model`` suffix."""
+    """Return whether user Pi args set thinking via ``--thinking`` or a ``--model`` suffix.
+
+    Pi lets ``--thinking`` override a suffix, so the user's explicit suffix is kept by
+    not adding the session ``--thinking``.
+    """
     from omnigent.util.reasoning_effort import PI_THINKING_LADDER
 
     for index, arg in enumerate(args):
@@ -2599,8 +2603,10 @@ def _pi_args_have_thinking(args: list[str]) -> bool:
         model = args[index + 1] if arg == "--model" and index + 1 < len(args) else None
         if arg.startswith("--model="):
             model = arg.removeprefix("--model=")
-        if model is not None and model.rpartition(":")[2] in PI_THINKING_LADDER:
-            return True
+        if model is not None:
+            _, separator, suffix = model.rpartition(":")
+            if separator and suffix in PI_THINKING_LADDER:
+                return True
     return False
 
 

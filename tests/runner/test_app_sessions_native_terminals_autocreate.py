@@ -791,6 +791,23 @@ async def test_auto_create_pi_terminal_unmanaged_applies_session_effort(
     assert notice_codes == expected_notices
 
 
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--model", "p/m:low"], True),
+        (["--model=p/m:xhigh"], True),
+        (["--model", "high"], False),
+        (["--model", "p/m:0"], False),
+        (["--thinking=low"], True),
+        ([], False),
+    ],
+)
+def test_pi_args_have_thinking(args: list[str], expected: bool) -> None:
+    """Only an explicit --thinking or a --model ':level' suffix counts as user thinking."""
+    from omnigent.runner.native.orchestration import _pi_args_have_thinking
+
+    assert _pi_args_have_thinking(args) is expected
+
 
 @pytest.mark.asyncio
 async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_model(
