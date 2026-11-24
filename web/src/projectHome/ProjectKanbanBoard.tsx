@@ -678,7 +678,8 @@ function KanbanCardBody({
     getSessionState(conversation),
     showsUnreadFor(conversation, isUnseen(conversation)),
   );
-  const working = state?.kind === "running";
+  // Background work alone keeps the badge and the last reply, not the working spinner.
+  const working = state?.kind === "running" && !state.background;
   const nestedCount = members.length - 1;
   const responsePreview = useLastResponsePreview(conversation);
   const show = useOptionalSidebarShow();
