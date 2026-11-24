@@ -418,7 +418,13 @@ def _occupy_tui_surface(
 
 
 def _wait_for_transcript_message(
-    page: Page, base_url: str, session_id: str, marker: str, *, role: str
+    page: Page,
+    base_url: str,
+    session_id: str,
+    marker: str,
+    *,
+    role: str,
+    timeout_s: float = _TRANSCRIPT_SETTLE_TIMEOUT_S,
 ) -> None:
     """Block until the canonical transcript holds *marker* in a *role* message.
 
@@ -432,9 +438,10 @@ def _wait_for_transcript_message(
     :param session_id: The session/conversation id.
     :param marker: Unique text the turn carried.
     :param role: ``"user"`` or ``"assistant"``.
+    :param timeout_s: Maximum time for this path's transcript delivery.
     :raises AssertionError: If the marker never reaches such an item.
     """
-    deadline = time.monotonic() + _TRANSCRIPT_SETTLE_TIMEOUT_S
+    deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         items = _ordered_message_items(base_url, session_id)
         if any(item.get("role") == role and marker in _item_text(item) for item in items):
@@ -442,7 +449,7 @@ def _wait_for_transcript_message(
         page.wait_for_timeout(500)
     raise AssertionError(
         f"{marker!r} never reached the canonical transcript as a {role} message within "
-        f"{_TRANSCRIPT_SETTLE_TIMEOUT_S}s — it was not delivered as a chat turn"
+        f"{timeout_s}s — it was not delivered as a chat turn"
     )
 
 

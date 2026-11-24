@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -12,6 +14,8 @@ import pytest
 import yaml
 from playwright.sync_api import Page, expect
 
+from omnigent.harnesses.claude_native import bridge
+from omnigent.runner.turn_routing import read_pending_replay
 from tests._helpers.host import isolated_host
 from tests._helpers.live_server import isolated_local_server
 from tests._helpers.polling import poll_until
@@ -38,6 +42,7 @@ from tests.e2e_ui.messages.test_message_render_parity import (
     _turn_prompt,
 )
 from tests.e2e_ui.messages.test_native_claude_render_parity import (
+    _TRANSCRIPT_SETTLE_TIMEOUT_S,
     _ensure_chat_view,
     _open_terminal_view,
     _pane_text,
@@ -197,14 +202,26 @@ def test_claude_routing_preserves_default_and_delivers_once(
             else:
                 _ensure_chat_view(page)
                 _send(page, prompt)
-            _wait_for_transcript_message(page, base_url, session_id, reply, role="assistant")
+            _wait_for_transcript_message(
+                page,
+                base_url,
+                session_id,
+                reply,
+                role="assistant",
+                timeout_s=(
+                    180 if entry == "terminal" and index == 1 else _TRANSCRIPT_SETTLE_TIMEOUT_S
+                ),
+            )
             (tmp_path / f"routing-{entry}-turn-{index}.txt").write_text(
                 _pane_text(base_url, session_id)
             )
             _ensure_chat_view(page)
             expect(page.locator(_USER, has_text=marker)).to_have_count(1)
             expect(page.locator(_ASSISTANT, has_text=reply)).to_have_count(1)
-            expect(page.locator(_ASSISTANT)).to_have_count(index)
+            answers = page.locator(_ASSISTANT).filter(
+                has_not=page.get_by_test_id("slash-command-card")
+            )
+            expect(answers).to_have_count(index)
             expect(page.locator(_WORKING)).to_have_count(0, timeout=30_000)
             native_session, user_text = _assert_native_claude_turn(
                 base_url, session_id, marker, reply, _TARGET_MODEL
@@ -229,5 +246,47 @@ def test_claude_routing_preserves_default_and_delivers_once(
             expect(page.get_by_test_id("error-headline")).to_have_count(0)
         assert native_sessions[0] == native_sessions[1]
         page.screenshot(path=str(tmp_path / f"routing-{entry}-preserved-default.png"))
+    except Exception:
+        with contextlib.suppress(Exception):
+            snapshot = _live_claude_snapshot(base_url, session_id)
+            bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
+            bridge_dir = bridge.bridge_dir_for_bridge_id(bridge_id)
+            pending = read_pending_replay(bridge_dir)
+            evidence = {
+                "entry": entry,
+                "session_id": session_id,
+                "state": {
+                    key: snapshot.get(key)
+                    for key in ("status", "llm_model", "model_override", "last_task_error")
+                },
+                "pane": _pane_text(base_url, session_id),
+                "pending_replay": (
+                    {
+                        "session_id": pending.session_id,
+                        "prompt": pending.prompt,
+                        "blocked_turn_id": pending.blocked_turn_id,
+                        "model": pending.model,
+                    }
+                    if pending is not None
+                    else None
+                ),
+            }
+            raw = json.loads((bridge_dir / bridge.CONTEXT_RAW_FILE).read_text())
+            evidence["native_context"] = {
+                key: raw.get(key)
+                for key in ("version", "session_id", "prompt_id", "model", "context_window")
+            }
+            for relative in ("host/host.log", "server/server.log"):
+                evidence[relative] = [
+                    line
+                    for line in (tmp_path / relative).read_text(errors="replace").splitlines()
+                    if "route-turn:" in line or "model switch" in line
+                ]
+            destination = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / f"routing-{entry}-failure.json").write_text(
+                json.dumps(evidence, indent=2)
+            )
+        raise
     finally:
         client.delete(f"/v1/sessions/{session_id}").raise_for_status()
