@@ -29,6 +29,10 @@ export function isLegacyOrchestratorLink(search: URLSearchParams): boolean {
 /** Query parameter naming the activity position of a ticket's open question to scroll to. */
 export const TICKET_ASK_PARAM = "ask";
 
+/** The project home's query parameter selecting a view other than the board. */
+export const PROJECT_TAB_PARAM = "tab";
+export const PROJECT_SUMMARY_TAB = "summary";
+
 /** The project home's query parameter naming the session in its side panel. */
 export const PROJECT_PANEL_SESSION_PARAM = "session";
 

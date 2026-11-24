@@ -12,6 +12,8 @@ import {
 import {
   PROJECT_PANEL_PERSONA_PARAM,
   PROJECT_PANEL_SESSION_PARAM,
+  PROJECT_SUMMARY_TAB,
+  PROJECT_TAB_PARAM,
   isLegacyOrchestratorLink,
   projectHomePath,
   ticketPanelSearch,
@@ -25,6 +27,7 @@ import { ProjectTicketPanel } from "@/projectHome/ProjectTicketPanel";
 import { ProjectOrchestrator, ProjectPersonaChat } from "@/projectHome/ProjectOrchestrator";
 import { useProjectIdentities } from "@/projectHome/useProjectIdentities";
 import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
+import { ProjectHomeTabs, ProjectSummary } from "@/projectHome/ProjectSummary";
 import { useProjectTicketsEnabled, useTicketProject } from "@/projectHome/useProjectTickets";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 
@@ -118,12 +121,37 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
     }
   }
 
+  const summaryOpen =
+    tickets && !orchestrator && searchParams.get(PROJECT_TAB_PARAM) === PROJECT_SUMMARY_TAB;
+  // The Summary replaces the board, so it drops the board's ticket and panel selection.
+  const showTab = (summary: boolean) => {
+    const next = summary ? new URLSearchParams() : new URLSearchParams(searchParams);
+    if (summary) next.set(PROJECT_TAB_PARAM, PROJECT_SUMMARY_TAB);
+    else next.delete(PROJECT_TAB_PARAM);
+    navigate(`${projectHomePath(projectName)}${next.size ? `?${next}` : ""}`);
+  };
+
   if (panelSessionId) return <ProjectSessionPanel sessionId={panelSessionId} />;
   if (tickets && !orchestrator && !panelTicketId && isLegacyOrchestratorLink(searchParams))
     return (
       <PageScroll contentClassName="flex min-h-full" maxWidthClassName="max-w-none">
         <ProjectOrchestrator key={projectName} projectName={projectName} />
       </PageScroll>
+    );
+
+  if (summaryOpen)
+    return (
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <ProjectFileViewerHost projectId={projectId} />
+        <PageScroll maxWidthClassName="max-w-none" extraTop={isMobile ? "0.25rem" : "0.5rem"}>
+          <ProjectHomeTabs
+            summaryOpen
+            onChange={showTab}
+            className="mx-auto w-full max-w-5xl px-1"
+          />
+          <ProjectSummary key={projectName} projectName={projectName} />
+        </PageScroll>
+      </div>
     );
 
   return (
@@ -133,12 +161,15 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
       <PageScroll
         className="overflow-hidden"
         maxWidthClassName="max-w-none"
-        contentClassName="flex h-full"
+        contentClassName="flex h-full flex-col"
         // Matches the compact project title row.
         extraTop={isMobile ? "0.25rem" : "0.5rem"}
         extraBottom="0px"
       >
-        <>
+        {tickets && !ticketFillsPage && (
+          <ProjectHomeTabs summaryOpen={false} onChange={showTab} className="px-4" />
+        )}
+        <div className="flex min-h-0 flex-1">
           {tickets ? (
             <div
               hidden={hideBoard}
@@ -216,7 +247,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
               )}
             </aside>
           )}
-        </>
+        </div>
       </PageScroll>
       {composerOpen && (
         <div
