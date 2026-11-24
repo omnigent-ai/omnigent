@@ -2,6 +2,7 @@
 
 import re
 from collections.abc import Iterator
+from contextlib import ExitStack
 
 import pytest
 from playwright.sync_api import Page, Route, expect
@@ -63,10 +64,22 @@ def test_settings_recover_identity_while_the_view_stays_open(
     expect(control).not_to_be_visible()
     page.evaluate("document.documentElement.dataset.identityRecoveryMarker = 'kept'")
 
-    with page.expect_response(
-        lambda response: response.url.endswith("/v1/me") and response.status == 200,
-        timeout=60_000,
-    ):
+    with ExitStack() as recovery:
+        recovery.enter_context(
+            page.expect_response(
+                lambda response: response.url.endswith("/v1/me") and response.status == 200,
+                timeout=60_000,
+            )
+        )
+        if settings_path == "policies":
+            recovery.enter_context(
+                page.expect_response(
+                    lambda response: (
+                        response.url.endswith("/v1/policies") and response.status == 200
+                    ),
+                    timeout=60_000,
+                )
+            )
         outage["active"] = False
 
     expect(control).to_be_visible(timeout=30_000)
