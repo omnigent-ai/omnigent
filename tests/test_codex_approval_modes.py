@@ -133,6 +133,47 @@ def test_preset_from_thread_settings_maps_each_popup_choice(settings: dict, expe
     assert codex_permission_preset_from_thread_settings(settings) == expected
 
 
+# Sandbox policies captured from codex-cli 0.158.0. ``thread/resume`` reports
+# them as ``sandbox``; ``thread/settings/updated`` as ``sandboxPolicy``.
+_WORKSPACE_WRITE_SANDBOX = {
+    "type": "workspaceWrite",
+    "writableRoots": [],
+    "networkAccess": False,
+    "excludeTmpdirEnvVar": False,
+    "excludeSlashTmp": False,
+}
+_READ_ONLY_SANDBOX = {"type": "readOnly", "networkAccess": False}
+
+
+@pytest.mark.parametrize("sandbox_key", ["sandboxPolicy", "sandbox"])
+@pytest.mark.parametrize(
+    ("approval_policy", "reviewer", "sandbox", "expected"),
+    [
+        ("never", "user", _WORKSPACE_WRITE_SANDBOX, None),
+        ("never", "auto_review", _WORKSPACE_WRITE_SANDBOX, None),
+        ("never", "user", _READ_ONLY_SANDBOX, "read-only"),
+        ("never", "user", {"type": "dangerFullAccess"}, "full-access"),
+        ("on-request", "user", _READ_ONLY_SANDBOX, "read-only"),
+    ],
+)
+def test_preset_from_thread_settings_follows_the_sandbox(
+    sandbox_key: str,
+    approval_policy: str,
+    reviewer: str,
+    sandbox: dict,
+    expected: str | None,
+) -> None:
+    """Only a full-access sandbox reads as Full Access, whatever the approval policy."""
+    settings = {
+        "approvalPolicy": approval_policy,
+        "approvalsReviewer": reviewer,
+        sandbox_key: sandbox,
+        "activePermissionProfile": None,
+    }
+
+    assert codex_permission_preset_from_thread_settings(settings) == expected
+
+
 def test_preset_from_thread_settings_none_for_unmapped() -> None:
     """A non-mapping / custom payload resolves to None rather than guessing."""
     assert codex_permission_preset_from_thread_settings(None) is None
