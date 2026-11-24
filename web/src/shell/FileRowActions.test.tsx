@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import userEvent from "@testing-library/user-event";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type * as RevealInFileManagerModule from "./RevealInFileManager";
 
 const { copyTextMock, downloadMock, revealMock, toastSuccessMock } = vi.hoisted(() => ({
   copyTextMock: vi.fn(() => Promise.resolve()),
@@ -13,7 +14,8 @@ const { copyTextMock, downloadMock, revealMock, toastSuccessMock } = vi.hoisted(
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 vi.mock("@/hooks/useFileContent", () => ({ downloadWorkspaceFile: downloadMock }));
 vi.mock("sonner", () => ({ toast: { success: toastSuccessMock, error: vi.fn() } }));
-vi.mock("./RevealInFileManager", () => ({
+vi.mock("./RevealInFileManager", async (importOriginal) => ({
+  ...(await importOriginal<typeof RevealInFileManagerModule>()),
   revealInFileManager: revealMock,
   revealLabel: (directory: boolean) => (directory ? "Open in Finder" : "Show in Finder"),
   useRevealTarget: (path: string | null) =>
