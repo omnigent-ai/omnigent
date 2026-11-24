@@ -492,17 +492,84 @@ describe("WorkflowDetailPage", () => {
     expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
   });
 
-  it("offers a newer proposal's steps as written, time limits included", async () => {
-    const oneHour = "The suite passes\n\n**Time limit:** 1 hour";
+  it("gives a proposal's new step its limit, and leaves a saved step's limit to the menu", async () => {
+    // A description saved after the proposal doesn't change what it offers.
     const patches = await workflowWithProposal(
       WORKFLOW.steps,
-      plan(50, [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: oneHour }]),
+      plan(5, [
+        WORKFLOW.steps[0]!,
+        { ...WORKFLOW.steps[1]!, goal: "The suite passes\n\n**Time limit:** 1 hour" },
+        { id: "report", name: "Report", goal: "**Time limit:** 30 minutes", depends_on: ["fix"] },
+      ]),
     );
     renderPage();
 
     fireEvent.click(await screen.findByRole("button", { name: "Save plan" }));
     await waitFor(() => expect(patches).toHaveLength(1));
-    expect(patches[0]!.steps[1]!.goal).toBe(oneHour);
+    expect(patches[0]!.steps.map((step) => step.goal)).toEqual([
+      null,
+      "The suite passes",
+      "**Time limit:** 30 minutes",
+    ]);
+  });
+
+  it("says when a time limit couldn't be saved, and keeps the saved one", async () => {
+    const twoHours = "The suite passes\n\n**Time limit:** 2 hours";
+    const saved = [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: twoHours }];
+    await workflowWithProposal(saved, plan(5, saved));
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) =>
+      options?.method === "PATCH"
+        ? new Response(JSON.stringify({ error: { message: "Try again", type: "server_error" } }), {
+            status: 500,
+          })
+        : new Response(JSON.stringify({ ...WORKFLOW, steps: saved, updated_at: 10 })),
+    );
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining("Couldn’t save the time limit."),
+      ),
+    );
+    expect(graphGoals()).toEqual([null, twoHours]);
+    expect(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeEnabled();
+  });
+
+  it("holds Save plan while a time limit is being saved", async () => {
+    let finishLimit: (response: Response) => void = () => {};
+    const withPlanner = { ...WORKFLOW, planning_session_id: "a".repeat(32) };
+    const saved = WORKFLOW.steps;
+    await workflowWithProposal(saved, plan(5, saved));
+    vi.mocked(authenticatedFetch).mockImplementation((_path, options) =>
+      options?.method === "PATCH"
+        ? new Promise<Response>((resolve) => {
+            finishLimit = resolve;
+          })
+        : Promise.resolve(new Response(JSON.stringify({ ...withPlanner, updated_at: 10 }))),
+    );
+    const view = renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+
+    // A proposal adding a step arrives while the limit is saving.
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [
+        plan(20, [...saved, { id: "report", name: "Report", goal: null, depends_on: ["fix"] }]),
+      ],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+      retry: vi.fn(),
+    });
+    view.rerender(<WorkflowDetailPage />);
+    expect(await screen.findByRole("button", { name: "Save plan" })).toBeDisabled();
+
+    await act(async () => {
+      finishLimit(new Response(JSON.stringify({ ...withPlanner, updated_at: 20 })));
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save plan" })).toBeEnabled());
   });
 
   it("offers time limits only to the owner, and not while a proposal is unsaved", () => {

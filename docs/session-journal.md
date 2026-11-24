@@ -187,19 +187,18 @@ resolves them or consolidates the remaining human question instead of sending
 the user to each worker. With the `sibling_sessions` feature on, these sessions
 are grouped with the session that started them.
 
-To hear when a step runs long, give it a time limit. On the workflow page,
-pick one from the timer on the step's box in the plan. Or ask the planning chat
-("tell me if opening the PRs takes over 2 hours") and save the plan. Either way
-the limit is a line in the step's description, such as `**Time limit:** 2
-hours`, so it shows on the step and carries into later runs. The newest write
-wins: a limit set on the page stands over an older planning-chat proposal, and
-a newer proposal shows its steps as written. A limit you ask for in a run's
-request applies to that run. A limit never stops the step. When a step with a limit
-starts, the agent sets a timer for it with `sys_timer_set`, or a background
-timer of its own without one, and cancels it when the step finishes. If the step is still going when the timer fires, the agent checks
-what it waits on and tells you once: with a question from
-`sys_workflow_request_input`, which marks the step Waiting for you, or, in an
-unattended run, with an Inbox item from `sys_user_inbox_post`.
+To hear when a step runs long, give it a time limit. On the workflow page, pick
+one from the timer on the step's box in the plan. The limit is a line in the
+step's description, such as `**Time limit:** 2 hours`, so it shows on the step
+and carries into later runs. The planning chat can write the line for steps it
+adds, and Save plan keeps the limits of saved steps, which change only from
+their timers. A limit you ask for in a run's request applies to that run. A
+limit never stops the step. When a step with a limit starts, the agent sets a
+timer for it with `sys_timer_set`, or a background timer of its own without
+one, and cancels it when the step finishes. If the step is still going when the
+timer fires, the agent checks what it waits on and tells you once: with a
+question from `sys_workflow_request_input`, which marks the step Waiting for
+you, or, in an unattended run, with an Inbox item from `sys_user_inbox_post`.
 
 ## Saving and reusing a workflow
 

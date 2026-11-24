@@ -111,7 +111,10 @@ export function StepTimeLimit({
         <DropdownMenuLabel>Time limit</DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={choice}
-          onValueChange={(value) => onChange({ stepId, limit: value === NO_LIMIT ? null : value })}
+          onValueChange={(value) => {
+            // Picking the checked option again would rewrite a limit worded at more length.
+            if (value !== choice) onChange({ stepId, limit: value === NO_LIMIT ? null : value });
+          }}
         >
           <DropdownMenuRadioItem value={NO_LIMIT}>No limit</DropdownMenuRadioItem>
           {TIME_LIMIT_CHOICES.map((option) => (

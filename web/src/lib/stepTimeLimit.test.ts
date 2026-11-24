@@ -26,6 +26,10 @@ describe("stepTimeLimit", () => {
     );
   });
 
+  it("reads a description whose lines break with CRLF", () => {
+    expect(stepTimeLimit("Fix it.\r\n\r\n**Time limit:** 1 hour\r\n")).toBe("1 hour");
+  });
+
   it("finds none without the line, or with nothing after it", () => {
     expect(stepTimeLimit(GOAL)).toBeNull();
     expect(stepTimeLimit(null)).toBeNull();
@@ -43,6 +47,7 @@ describe("timeLimitMinutes and shortTimeLimit", () => {
     ["1.5h, then tell me", 90, "1h 30m"],
     ["1 hour 30 minutes", 90, "1h 30m"],
     ["1h 30m", 90, "1h 30m"],
+    ["1h30m", 90, "1h 30m"],
     ["1 day and 2 hours", 1560, "26h"],
   ])("%s is %i minutes, %s", (limit, minutes, short) => {
     expect(timeLimitMinutes(limit)).toBe(minutes);
@@ -56,7 +61,8 @@ describe("timeLimitMinutes and shortTimeLimit", () => {
     expect(timeLimitLength("an afternoon")).toBeNull();
   });
 
-  it("has no length for words it can't read", () => {
+  it("has no length for words it can't read, or for none at all", () => {
+    expect(timeLimitMinutes("0 hours")).toBeNull();
     expect(timeLimitMinutes("an afternoon")).toBeNull();
     expect(timeLimitMinutes("2 months")).toBeNull();
     expect(shortTimeLimit("an afternoon")).toBeNull();
@@ -93,6 +99,15 @@ describe("withStepTimeLimit", () => {
     expect(withStepTimeLimit(withLimit, "4 hours")).toBe(
       "Fix it.\n\n**Time limit:** 4 hours\n\n**Details:** run it.",
     );
+  });
+
+  it("keeps one Time limit line, the first, when a description has several", () => {
+    const twice = "Fix it.\n\n**Time limit:** 1 hour\n\n**Time limit:** 2 hours\n\nShip it.";
+    expect(withStepTimeLimit(twice, "4 hours")).toBe(
+      "Fix it.\n\n**Time limit:** 4 hours\n\nShip it.",
+    );
+    expect(withStepTimeLimit(twice, null)).toBe("Fix it.\n\nShip it.");
+    expect(withStepTimeLimit("Fix it.\r\n\r\n**Time limit:** 1 hour", null)).toBe("Fix it.");
   });
 
   it("removes the line and one blank line around it, and leaves a description without one alone", () => {

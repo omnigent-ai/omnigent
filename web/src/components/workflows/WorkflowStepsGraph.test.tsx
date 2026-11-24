@@ -239,6 +239,12 @@ describe("a step's time limit", () => {
       "true",
     );
     expect(screen.queryAllByRole("menuitem")).toEqual([]);
+    // Picking the limit it has already changes nothing.
+    onTimeLimitChange.mockClear();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "2 hours" }));
+    expect(onTimeLimitChange).not.toHaveBeenCalled();
+
+    open("Time limit for Fix the test: 2 hours");
     fireEvent.click(screen.getByRole("menuitemradio", { name: "No limit" }));
     expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "fix", limit: null });
 

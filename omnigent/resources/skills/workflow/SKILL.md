@@ -481,9 +481,9 @@ restart after done or failed, or a Continue after Stop:
    and `note: "time limit: <step ID>"`. It's separate from the run's other
    timers.
 2. Note it on the step with `sys_journal_write_note` (`step`: its ID): the
-   limit, the time now from `date -u +"%m-%d %H:%MZ"`, and the `timer_id`,
-   such as `Time limit 2h from 11-24 14:05Z, timer 4f1c…`. That time names
-   this attempt below.
+   limit, the time now from `date -u +"%m-%d %H:%M:%SZ"`, and the
+   `timer_id`, such as `Time limit 2h from 11-24 14:05:09Z, timer 4f1c…`.
+   That time names this attempt below.
 3. Cancel it with `sys_timer_cancel` when the step is done or failed, or when
    you replan without it. On Stop, cancel it with the run's other timers.
 

@@ -175,13 +175,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const summary = { id: workflow.id, name: workflow.name, description: workflow.description };
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
-  // The newest write's time limits win: a proposal older than the workflow's last save, in whole
-  // seconds, takes the saved steps' limits, so a limit set or cleared on the page since stands.
-  const proposedSteps = proposal
-    ? proposal.created_at > (workflow.updated_at ?? 0)
-      ? planSteps(proposal)
-      : withSavedTimeLimits(planSteps(proposal), workflow.steps)
-    : null;
+  // A saved step's time limit is set from its menu, so a proposal leaves it alone.
+  const proposedSteps = proposal ? withSavedTimeLimits(planSteps(proposal), workflow.steps) : null;
   // Where the description's source sits in this journal: null when it came from another
   // planning chat, undefined until the server places it, which offers no description meanwhile.
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
@@ -397,7 +392,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             {hasChanges && (
               <Button
                 size="sm"
-                disabled={savePlan.isPending}
+                // A time limit save writes the steps too, so the two wait for each other.
+                disabled={savePlan.isPending || saveTimeLimit.isPending}
                 loading={savePlan.isPending}
                 onClick={() => {
                   if (!proposal || !proposedSteps) return;
@@ -441,7 +437,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               steps={proposedSteps ?? workflow.steps}
               title={workflow.name}
               onTimeLimitChange={!isViewer && !hasChanges ? changeTimeLimit : undefined}
-              timeLimitSaving={saveTimeLimit.isPending}
+              timeLimitSaving={saveTimeLimit.isPending || savePlan.isPending}
             />
           ) : (
             <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">
