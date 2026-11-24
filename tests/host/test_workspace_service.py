@@ -65,6 +65,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.workspace_git.ignored import DirectoryIgnores
 from omnigent.host.workspace_git.runner import Deadline, GitError, GitProblem, GitRepository
+from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_service import (
     _SERVED,
     WorkspaceService,
@@ -937,8 +938,11 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
     # SearchText is listed exactly where ripgrep is installed. The server's route passes
-    # the host's list on unchanged, optional features included.
-    assert set(response.capabilities) ^ (_RG_METHODS - _WITH_RG) == {
+    # the host's list on unchanged, optional features included. Only the server's route
+    # serves pull requests, which tests/host/test_workspace_api_pull_requests.py covers.
+    pull_requests = {name for name, method in WORKSPACE_METHODS.items() if method.pull_request}
+    listed = set(response.capabilities) - pull_requests
+    assert listed ^ (_RG_METHODS - _WITH_RG) == {
         "ListDirectory",
         "list_directory.collapse_single_child_directories",
         "gitignore",

@@ -1268,3 +1268,79 @@ async def test_workspace_api_follows_the_file_read_gate(
     # stream reports it in its body, a unary call as its status.
     assert resp.status_code == (200 if streaming else 503), resp.text
     assert b"unavailable" in resp.content
+
+
+_PR_BROWSE_READS = [
+    "ListPullRequestFiles",
+    "GetPullRequestDiff",
+    "ListPullRequestCommits",
+    "GetCommitDiff",
+    "ComparePullRequestRange",
+    "ListReviewThreads",
+]
+
+
+def _pull_request_read_passes(method: str, caller: str | None, session: str) -> int:
+    """The status a pull request read gets: 503 past the gate (no host here), else a refusal."""
+    if caller is None:
+        return 401
+    if caller == "manager@example.com" and session == "conv_open":
+        return 404  # No grant on this session: it isn't revealed.
+    if method == "GetPullRequest":
+        # Its overview carries the host account's identities: the owner grant only, no admin.
+        return 503 if caller == "real-owner@example.com" else 403
+    if method in _PR_BROWSE_READS and caller == "viewer@example.com" and session == "conv_share":
+        return 403
+    return 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize(
+    "caller",
+    [
+        "real-owner@example.com",
+        "owner@example.com",
+        "manager@example.com",
+        "viewer@example.com",
+        "admin@example.com",
+        None,
+    ],
+    ids=["owner", "editor", "manager", "viewer", "admin", "anonymous"],
+)
+@pytest.mark.parametrize(
+    "method", ["GetPullRequest", *_PR_BROWSE_READS, "ListReviewThreadComments"]
+)
+async def test_workspace_api_pull_request_reads_keep_their_rest_gates(
+    client: httpx.AsyncClient, session: str, caller: str | None, method: str
+) -> None:
+    """Each read has its REST route's gate; GetPullRequest is the owner's alone for now."""
+    headers = {"Content-Type": "application/json"}
+    if caller is not None:
+        headers["X-Forwarded-Email"] = caller
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers=headers,
+        content=b'{"prUrl": "https://github.com/example/app/pull/7"}',
+    )
+
+    assert resp.status_code == _pull_request_read_passes(method, caller, session), resp.text
+    if resp.status_code == 503:
+        assert b"unavailable" in resp.content
+
+
+@pytest.mark.asyncio
+async def test_workspace_api_refuses_a_method_it_has_no_gate_for(
+    client: httpx.AsyncClient,
+) -> None:
+    resp = await client.post(
+        "/v1/sessions/conv_open/workspace/omnigent.api.workspace.v1alpha1.WorkspaceService/Bogus",
+        headers={
+            "X-Forwarded-Email": "real-owner@example.com",
+            "Content-Type": "application/json",
+        },
+        content=b"{}",
+    )
+
+    assert resp.status_code == 404, resp.text
