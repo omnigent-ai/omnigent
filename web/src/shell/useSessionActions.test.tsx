@@ -79,6 +79,7 @@ function renderAt(path: string, onLeave: () => void) {
         <Routes>
           <Route path="/c/conv_a" element={<ListedRow onLeave={onLeave} />} />
           <Route path="/" element={<ListedRow onLeave={onLeave} />} />
+          <Route path="/projects/:projectName" element={<ListedRow onLeave={onLeave} />} />
           <Route path="*" element={null} />
         </Routes>
       </MemoryRouter>
@@ -122,6 +123,26 @@ describe("useSessionActions Leave", () => {
     const closeQuickView = vi.fn();
     renderAt("/", closeQuickView);
     fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
+    await act(async () => finishLeave());
+    expect(closeQuickView).toHaveBeenCalledOnce();
+  });
+
+  it("keeps another card's quick view, opened after the card left the board, when the Leave succeeds", async () => {
+    const closeQuickView = vi.fn();
+    renderAt("/projects/Payments?session=conv_a", closeQuickView);
+    fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
+    // A's card leaves the board (a filter, say) still holding its callback, then B opens.
+    act(() => dropRow());
+    act(() => goTo("/projects/Payments?session=conv_b"));
+    await act(async () => finishLeave());
+    expect(closeQuickView).not.toHaveBeenCalled();
+  });
+
+  it("closes the card's quick view when the Leave succeeds while it still shows", async () => {
+    const closeQuickView = vi.fn();
+    renderAt("/projects/Payments?session=conv_a", closeQuickView);
+    fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
+    act(() => dropRow());
     await act(async () => finishLeave());
     expect(closeQuickView).toHaveBeenCalledOnce();
   });

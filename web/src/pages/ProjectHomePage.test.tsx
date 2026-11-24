@@ -3,7 +3,10 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectHomePage } from "./ProjectHomePage";
 
-const mocks = vi.hoisted(() => ({ isMobile: false }));
+const mocks = vi.hoisted(() => ({
+  isMobile: false,
+  cardClose: undefined as (() => void) | undefined,
+}));
 
 vi.mock(import("@/hooks/useIsMobileViewport"), async (importOriginal) => ({
   ...(await importOriginal()),
@@ -18,15 +21,22 @@ vi.mock("@/projectHome/ProjectKanbanBoard", async () => {
     ProjectKanbanBoard: ({
       quickViewHref,
       selectedSessionId,
+      onCloseQuickView,
     }: {
       quickViewHref?: (conversationId: string) => string;
       selectedSessionId: string | null;
-    }) => (
-      <>
-        <output data-testid="selected-card">{selectedSessionId ?? "none"}</output>
-        {quickViewHref && <Link to={quickViewHref("session-1")}>Quick view</Link>}
-      </>
-    ),
+      onCloseQuickView?: () => void;
+    }) => {
+      // As a card holds it: the close from the render it last saw.
+      if (selectedSessionId !== null) mocks.cardClose ??= onCloseQuickView;
+      return (
+        <>
+          <output data-testid="selected-card">{selectedSessionId ?? "none"}</output>
+          {quickViewHref && <Link to={quickViewHref("session-1")}>Quick view</Link>}
+          <Link to="?session=session-1&lane=done">Filter</Link>
+        </>
+      );
+    },
   };
 });
 
@@ -56,6 +66,7 @@ function renderPage(entry: string) {
 
 beforeEach(() => {
   mocks.isMobile = false;
+  mocks.cardClose = undefined;
 });
 
 afterEach(cleanup);
@@ -80,6 +91,15 @@ describe("ProjectHomePage session quick view", () => {
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
     });
     expect(screen.queryByRole("button", { name: "Close session-1" })).toBeNull();
+  });
+
+  it("keeps params added since, when a close captured earlier runs late", () => {
+    renderPage("/projects/Payments");
+    fireEvent.click(screen.getByRole("link", { name: "Quick view" }));
+    fireEvent.click(screen.getByRole("link", { name: "Filter" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("lane=done");
+    act(() => mocks.cardClose?.());
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/projects\/Payments\?lane=done$/);
   });
 
   it("leaves phones on the full session page, with no quick view", () => {

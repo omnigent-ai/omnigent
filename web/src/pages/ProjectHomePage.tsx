@@ -1,4 +1,4 @@
-import { useCallback, useEffect, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from "react";
 import { PageScroll } from "@/components/PageScroll";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
@@ -38,11 +38,16 @@ export function ProjectHomePage() {
   const [searchParams] = useSearchParams();
   const panelSessionId = isMobile ? null : searchParams.get(PROJECT_PANEL_SESSION_PARAM);
   const replaceSearchParams = useReplaceSearchParams();
+  // A close that runs late, such as after a card's Leave settles, keeps the URL's newer params.
+  const latestSearchParams = useRef(searchParams);
+  useLayoutEffect(() => {
+    latestSearchParams.current = searchParams;
+  });
   const closePanel = useCallback(() => {
-    const next = new URLSearchParams(searchParams);
+    const next = new URLSearchParams(latestSearchParams.current);
     next.delete(PROJECT_PANEL_SESSION_PARAM);
     replaceSearchParams(next);
-  }, [searchParams, replaceSearchParams]);
+  }, [replaceSearchParams]);
   const { panelWidth, handleProps } = useResizablePanel(
     panelSessionId !== null,
     SESSION_PANEL_DEFAULT_WIDTH_VW,

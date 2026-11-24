@@ -5,6 +5,10 @@ import { useEffect } from "react";
 
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useLocation, useRebasePath } from "@/lib/routing";
+import {
+  PROJECT_PANEL_SESSION_PARAM,
+  projectNameFromHomePath,
+} from "@/projectHome/projectHomeNavigation";
 
 const NOTHING_OPEN: readonly (string | null)[] = [];
 let openSessionIds: readonly (string | null)[] = NOTHING_OPEN;
@@ -14,19 +18,24 @@ export function usePublishOpenSession(routedSessionId: string | null): void {
   const rootId = useActiveRootSessionId(routedSessionId);
   const location = useLocation();
   const rebasePath = useRebasePath();
-  const draftSourceId =
-    location.pathname === rebasePath("/")
-      ? new URLSearchParams(location.search).get("sibling")
+  const search = new URLSearchParams(location.search);
+  const draftSourceId = location.pathname === rebasePath("/") ? search.get("sibling") : null;
+  const quickViewId =
+    projectNameFromHomePath(location.pathname) !== null
+      ? search.get(PROJECT_PANEL_SESSION_PARAM)
       : null;
   useEffect(() => {
-    openSessionIds = [routedSessionId, rootId, draftSourceId];
+    openSessionIds = [routedSessionId, rootId, draftSourceId, quickViewId];
     return () => {
       openSessionIds = NOTHING_OPEN;
     };
-  }, [routedSessionId, rootId, draftSourceId]);
+  }, [routedSessionId, rootId, draftSourceId, quickViewId]);
 }
 
-/** Whether the page shows `sessionId` now, itself, as an open sub-agent's root or as a draft's source. */
+/**
+ * Whether the page shows `sessionId` now: itself, as an open sub-agent's root, as a draft's
+ * source, or in a project board's quick view.
+ */
 export function isOpenSession(sessionId: string): boolean {
   return openSessionIds.includes(sessionId);
 }

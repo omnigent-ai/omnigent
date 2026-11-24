@@ -45,6 +45,16 @@ describe("openSession", () => {
     expect(isOpenSession("source")).toBe(false);
   });
 
+  it("counts the session in a project board's quick view, only on the project's home", () => {
+    renderShell("/projects/Payments?session=card", null);
+    expect(isOpenSession("card")).toBe(true);
+    act(() => goTo("/projects/Payments?session=other"));
+    expect(isOpenSession("card")).toBe(false);
+    expect(isOpenSession("other")).toBe(true);
+    act(() => goTo("/settings?session=other"));
+    expect(isOpenSession("other")).toBe(false);
+  });
+
   it("follows a switch to another session and clears once the shell unmounts", () => {
     const view = renderShell("/c/first", "first");
     // The router keeps its first entries, so the switch navigates and the shell re-routes.
