@@ -562,10 +562,18 @@ class SessionOnlyModelSwitch:
         self.send("Enter")
 
     def draft_matches(self, pane: str, expected: str) -> bool:
-        if _draft(pane) is None:
+        physical = _draft(pane)
+        if physical is None:
             return False
         # Physical rows can match another draft containing explicit newlines.
-        return _draft(self.pane(join_wrapped=True)) == expected
+        joined = _draft(self.pane(join_wrapped=True))
+        if joined is None or joined != expected:
+            return False
+        # Application wrapping can leave padding without tmux soft-wrap markers.
+        # That padding cannot establish ownership of claimed literal whitespace.
+        return physical == joined or [row.rstrip(" ") for row in physical.split("\n")] != [
+            row.rstrip(" ") for row in joined.split("\n")
+        ]
 
     def clear_owned_draft(self, expected: str) -> None:
         pane = self.pane()

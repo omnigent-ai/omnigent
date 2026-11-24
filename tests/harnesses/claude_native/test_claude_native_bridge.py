@@ -13758,6 +13758,48 @@ def test_model_command_rechecks_an_owned_draft_before_clearing_it(
     assert composer.text == replacement
 
 
+@pytest.mark.parametrize("claimed_capture", ["raw", "joined"])
+@pytest.mark.parametrize("replace_after_first_observation", [False, True])
+def test_model_command_keeps_the_captured_application_wrapped_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claimed_capture: str,
+    replace_after_first_observation: bool,
+) -> None:
+    captured = json.loads(
+        (Path(__file__).parent / "fixtures" / "claude-composer-application-wrap.json").read_text()
+    )
+    claimed = claude_model_switch._draft(captured[claimed_capture])
+    assert isinstance(claimed, str) and claimed != captured["input"]
+    composer = _SessionModelComposer(
+        draft=claimed if replace_after_first_observation else captured["input"]
+    )
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    captures = 0
+
+    def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
+        nonlocal captures
+        if not join_wrapped:
+            captures += 1
+            if captures == 3 and replace_after_first_observation:
+                composer.text = captured["input"]
+        if composer.text == captured["input"]:
+            return captured["joined" if join_wrapped else "raw"]
+        return composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_model_command(
+            bridge_dir, model="private-glm[1m]", owned_draft=claimed
+        )
+
+    assert composer.sends == []
+    assert composer.submitted == []
+    assert composer.text == captured["input"]
+
+
 @pytest.mark.parametrize(
     ("expected", "actual", "reported_session", "matches"),
     [
