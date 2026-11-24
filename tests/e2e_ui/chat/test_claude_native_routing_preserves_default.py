@@ -15,7 +15,8 @@ import yaml
 from playwright.sync_api import Page, expect
 
 from omnigent.harnesses.claude_native import bridge
-from omnigent.runner.turn_routing import read_pending_replay
+from omnigent.harnesses.claude_native.model_switch import _draft
+from omnigent.runner.turn_routing import read_pending_replay, turn_routing_marker_present
 from tests._helpers.host import isolated_host
 from tests._helpers.live_server import isolated_local_server
 from tests._helpers.polling import poll_until
@@ -270,17 +271,43 @@ def test_claude_routing_preserves_default_and_delivers_once(
                     if pending is not None
                     else None
                 ),
+                "routing_marker_present": turn_routing_marker_present(bridge_dir, session_id),
+                "active_session_id": bridge.read_active_session_id(bridge_dir),
+                "native_session_id": bridge.read_claude_session_id(bridge_dir),
+                "user_prompt_pending": bridge.has_pending_user_prompt(bridge_dir),
             }
+            with contextlib.suppress(Exception):
+                info = bridge.read_tmux_target(bridge_dir)
+                if info is not None:
+                    joined = bridge._capture_pane(
+                        info["socket_path"], info["tmux_target"], join_wrapped=True
+                    )
+                    evidence["joined_pane"] = joined
+                    evidence["physical_draft"] = _draft(evidence["pane"])
+                    evidence["joined_draft"] = _draft(joined)
+            with contextlib.suppress(Exception):
+                items = client.get(f"/v1/sessions/{session_id}/items")
+                items.raise_for_status()
+                evidence["public_items"] = items.json()
             raw = json.loads((bridge_dir / bridge.CONTEXT_RAW_FILE).read_text())
             evidence["native_context"] = {
                 key: raw.get(key)
                 for key in ("version", "session_id", "prompt_id", "model", "context_window")
             }
-            for relative in ("host/host.log", "server/server.log"):
-                evidence[relative] = [
+            for log_path in tmp_path.rglob("*.log"):
+                evidence[str(log_path.relative_to(tmp_path))] = [
                     line
-                    for line in (tmp_path / relative).read_text(errors="replace").splitlines()
-                    if "route-turn:" in line or "model switch" in line
+                    for line in log_path.read_text(errors="replace").splitlines()
+                    if any(
+                        signal in line
+                        for signal in (
+                            "route-turn:",
+                            "model switch",
+                            "ClaudeModelSwitchRefused",
+                            "ClaudeInputBoxOccupied",
+                            "ClaudeComposerNotCleared",
+                        )
+                    )
                 ]
             destination = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
             destination.mkdir(parents=True, exist_ok=True)

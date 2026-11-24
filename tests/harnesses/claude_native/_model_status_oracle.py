@@ -26,15 +26,18 @@ def _status_model_matches(
         return False
     sync_raw_status_context(bridge_dir, None)
     actual = bridge.read_claude_status_model(bridge_dir)
-    if expected_status is not None:
-        if expected_status != expected:
-            window = raw.get("context_window")
-            if (
-                not expected.endswith("[1m]")
-                or expected_status != expected.removesuffix("[1m]")
-                or not isinstance(window, dict)
-                or window.get("context_window_size") != 1_000_000
-            ):
-                return False
-        return actual == expected_status
-    return actual in (expected, native_claude_wire_model(expected))
+    status_model = (
+        expected_status if expected_status is not None else native_claude_wire_model(expected)
+    )
+    if actual == expected and expected_status is None:
+        return True
+    if status_model != expected:
+        window = raw.get("context_window")
+        if (
+            not expected.endswith("[1m]")
+            or status_model != expected.removesuffix("[1m]")
+            or not isinstance(window, dict)
+            or window.get("context_window_size") != 1_000_000
+        ):
+            return False
+    return actual == status_model

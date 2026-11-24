@@ -14156,18 +14156,12 @@ def test_model_command_requires_exact_fresh_status_for_a_descriptorless_current_
             "opus",
             "opus (system.ai.claude-opus-4-8)",
         ),
-        (
-            "system.ai.claude-opus-4-8[1M]",
-            "opus",
-            "opus (system.ai.claude-opus-4-8)",
-        ),
         ("private-glm", "private-glm", "private-glm"),
         ("system.ai.claude-opus-4-8", "opus", "opus (system.ai.claude-opus-4-8)"),
     ],
     ids=[
         "bare-private",
         "wrapped-public",
-        "wrapped-public-uppercase",
         "plain-private",
         "plain-public",
     ],

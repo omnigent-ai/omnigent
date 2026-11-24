@@ -5788,6 +5788,16 @@ def _inject_legacy_model_command_locked(
         transaction.submitted = True
         transaction.commit_attempted = True
 
+    command = f"/model {model_arg}"
+
+    def pasting() -> None:
+        revalidate_version()
+        transaction.info = {"socket_path": origin.socket_path, "tmux_target": origin.tmux_target}
+        transaction.active_session = origin.active_session_id
+        transaction.session = origin.session_id or ""
+        transaction.legacy_pane = origin
+        transaction.command_draft = command
+
     revalidate_version()
     current = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
     reported = current.get("model")
@@ -5852,10 +5862,11 @@ def _inject_legacy_model_command_locked(
     try:
         _inject_slash_command_locked(
             bridge_dir,
-            command=f"/model {model_arg}",
+            command=command,
             timeout_s=transaction.deadline.remaining_s(),
             ready_timeout_s=transaction.ready_timeout_s,
             before_edit=revalidate_version,
+            before_paste=pasting,
             before_submit=submitting,
         )
         until = min(time.monotonic() + _CONFIRM_DIALOG_TIMEOUT_S, transaction.deadline.at)
@@ -5872,6 +5883,7 @@ def _inject_legacy_model_command_locked(
                 "Claude's legacy model command may have changed the model and saved default. "
                 "Check the terminal before retrying; the dependent prompt was not sent."
             ) from exc
+        transaction.cleanup_owned_control()
         raise
 
 
@@ -6077,6 +6089,7 @@ def _inject_slash_command_locked(
     confirm_hint: str | None = None,
     ready_timeout_s: float | None = None,
     before_edit: Callable[[], None] | None = None,
+    before_paste: Callable[[], None] | None = None,
     before_submit: Callable[[], None] | None = None,
 ) -> None:
     """Submit a slash command while the caller owns both bridge injection locks."""
@@ -6113,6 +6126,8 @@ def _inject_slash_command_locked(
     # Clear the user's draft so the command is not appended to it.
     # Unlike Escape, this leaves an in-flight generation running.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    if before_paste is not None:
+        before_paste()
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
     # A dropped Enter can leave the command drafted: wait for rendering, submit,

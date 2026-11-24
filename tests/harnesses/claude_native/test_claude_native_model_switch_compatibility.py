@@ -239,7 +239,9 @@ def test_legacy_model_switch_keeps_composer_height_recovery(
     assert [command for command in composer.submitted if command] == ["/model private-glm[1m]"]
 
 
-@pytest.mark.parametrize("publication", ["lock-wait", "readiness-wait"])
+@pytest.mark.parametrize(
+    "publication", ["lock-wait", "readiness-wait", "paste-wait", "paste-wait-legacy-version"]
+)
 def test_legacy_model_switch_rechecks_the_version_after_lock_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, publication: str
 ) -> None:
@@ -272,12 +274,130 @@ def test_legacy_model_switch_rechecks_the_version_after_lock_wait(
             path.write_text(json.dumps(raw))
 
         monkeypatch.setattr(bridge, "_reclaim_and_wait_for_prompt", ready)
+    elif publication.startswith("paste-wait"):
 
-    with pytest.raises(bridge.ClaudeModelSwitchRefused, match="version changed"):
+        def send(socket_path: str, *args: str) -> None:
+            composer._run_tmux(socket_path, *args)
+            if args[-1] == "/model private-glm[1m]":
+                path = bridge_dir / bridge.CONTEXT_RAW_FILE
+                raw = json.loads(path.read_text())
+                raw["version"] = "2.1.311" if publication.endswith("legacy-version") else "2.1.323"
+                path.write_text(json.dumps(raw))
+
+        monkeypatch.setattr(bridge, "_run_tmux", send)
+
+    with pytest.raises(bridge.ClaudeModelSwitchRefused) as caught:
         bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
 
-    assert composer.sends == []
+    assert not caught.value.command_submitted
+    assert not caught.value.model_may_have_changed
+    if not publication.startswith("paste-wait"):
+        assert "version changed" in str(caught.value)
+        assert composer.sends == []
+    assert composer.submitted == []
+    assert composer.text == ""
     assert composer.saved_default == composer.options[0]
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "draft",
+        "joined-draft",
+        "dialog",
+        "advertisement",
+        "target",
+        "owner",
+        "session",
+        "capture-session",
+    ],
+)
+def test_refused_legacy_model_switch_preserves_replaced_input_or_recipient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    composer = _SessionModelComposer(cache_cost_label="Choice 1")
+    composer.version = "2.1.322"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    command = "/model private-glm[1m]"
+    after_paste: list[tuple[str, ...]] = []
+    captures_after_paste = 0
+
+    def send(socket_path: str, *args: str) -> None:
+        composer._run_tmux(socket_path, *args)
+        if args[-1] != command:
+            return
+        path = bridge_dir / bridge.CONTEXT_RAW_FILE
+        raw = json.loads(path.read_text())
+        raw["version"] = "2.1.323"
+        path.write_text(json.dumps(raw))
+        if replacement == "draft":
+            composer.text += " replacement"
+            composer.cursor = len(composer.text)
+        elif replacement == "dialog":
+            composer.overlay = "cache-cost"
+        elif replacement in {"advertisement", "target"}:
+            info = bridge.read_tmux_target(bridge_dir)
+            assert info is not None
+            bridge.write_tmux_target(
+                bridge_dir,
+                socket_path=Path(info["socket_path"]),
+                tmux_target="replacement:0.0" if replacement == "target" else info["tmux_target"],
+            )
+        elif replacement == "owner":
+            bridge.write_active_session_id(bridge_dir, "replacement-web-session")
+        elif replacement == "session":
+            (bridge_dir / "state.json").write_text(
+                '{"claude_session_id":"replacement-native-session"}'
+            )
+        after_paste.extend(composer.sends)
+
+    def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
+        nonlocal captures_after_paste
+        pane = composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
+        if replacement == "capture-session" and after_paste:
+            captures_after_paste += 1
+            if captures_after_paste == 2:
+                (bridge_dir / "state.json").write_text(
+                    '{"claude_session_id":"replacement-native-session"}'
+                )
+        if replacement == "joined-draft" and join_wrapped:
+            return pane.replace(command, command + " replacement")
+        return pane
+
+    monkeypatch.setattr(bridge, "_run_tmux", send)
+    monkeypatch.setattr(bridge, "_capture_pane", capture)
+    with pytest.raises(bridge.ClaudeModelSwitchRefused):
+        bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert after_paste
+    assert composer.sends == after_paste
+    assert composer.text == command + (" replacement" if replacement == "draft" else "")
+    assert composer.overlay == ("cache-cost" if replacement == "dialog" else None)
+    assert composer.submitted == []
+    assert composer.saved_default == composer.options[0]
+
+
+def test_failed_legacy_preparation_does_not_claim_an_unpasted_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer()
+    composer.version = "2.1.322"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    command = "/model private-glm[1m]"
+
+    def clear(*args: object, **kwargs: object) -> None:
+        composer.text = command
+        composer.cursor = len(command)
+        raise RuntimeError("Composer preparation failed")
+
+    monkeypatch.setattr(bridge, "_clear_composer", clear)
+    with pytest.raises(RuntimeError, match="Composer preparation failed"):
+        bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert composer.text == command
+    assert composer.sends == composer.submitted == []
 
 
 @pytest.mark.parametrize("version", ["2.1.322", "2.1.323"])
@@ -345,7 +465,13 @@ def test_legacy_failure_never_authorizes_a_dependent_prompt(
     if failure == "cancelled":
         cancelled.set()
     if failure == "after-submission":
-        monkeypatch.setattr(bridge, "_verify_submit_accepted", Mock(return_value=False))
+
+        def unconfirmed(*args: object, **kwargs: object) -> bool:
+            composer.text = "/model private-glm[1m]"
+            composer.cursor = len(composer.text)
+            return False
+
+        monkeypatch.setattr(bridge, "_verify_submit_accepted", unconfirmed)
     target = {
         "unsupported-model": "absent-private-model",
         "literal-space": "private model",
@@ -368,6 +494,7 @@ def test_legacy_failure_never_authorizes_a_dependent_prompt(
         assert "legacy" in str(caught.value)
         assert "saved default" in str(caught.value)
         assert composer.model == composer.saved_default == "private-glm[1m]"
+        assert composer.text == "/model private-glm[1m]"
     else:
         assert composer.sends == []
         assert composer.submitted == []

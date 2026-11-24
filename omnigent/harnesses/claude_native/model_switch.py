@@ -6,7 +6,7 @@ import contextlib
 import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 
@@ -487,6 +487,7 @@ class SessionOnlyModelSwitch:
         self.commit_attempted = False
         self.confirmation_attempted = False
         self.info: dict[str, str] = {}
+        self.legacy_pane: ClaudeLegacyModelPane | None = None
         self.active_session: str | None = None
         self.session = ""
         self.version = ""
@@ -507,6 +508,16 @@ class SessionOnlyModelSwitch:
 
     def check(self) -> None:
         self.bridge._check_injection_cancelled()
+        if self.legacy_pane is not None:
+            current = self.bridge._legacy_model_pane(self.bridge_dir)
+            if (
+                current is None
+                or replace(current, version=self.legacy_pane.version) != self.legacy_pane
+            ):
+                raise self.refuse(
+                    "The Claude terminal or session changed during model selection. "
+                    "Retry explicitly."
+                )
         if self.info and self.bridge.read_tmux_target(self.bridge_dir) != self.info:
             raise self.refuse(
                 "The Claude terminal changed during model selection. Retry explicitly."
@@ -630,7 +641,9 @@ class SessionOnlyModelSwitch:
         if not (self.command_draft or self.owned_picker or self.owned_status):
             return
         original_deadline = self.deadline
-        self.deadline = ModelSwitchDeadline(1.0, None, original_deadline.clock)
+        # Legacy input cleanup must stay within the original observation budget.
+        parent = original_deadline if self.legacy_pane is not None else None
+        self.deadline = ModelSwitchDeadline(1.0, parent, original_deadline.clock)
         try:
             with self.bridge.cancellable_injection(self.deadline):
                 self._cleanup_owned_control()

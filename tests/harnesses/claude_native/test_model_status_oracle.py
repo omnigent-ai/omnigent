@@ -147,6 +147,22 @@ from tests.harnesses.claude_native._model_switch_support import (
             1_000_000,
             False,
         ),
+        (
+            "system.ai.claude-opus-4-8[1m]",
+            "system.ai.claude-opus-4-8",
+            "native-session",
+            None,
+            200_000,
+            False,
+        ),
+        (
+            "system.ai.claude-opus-4-8[1m]",
+            "system.ai.claude-opus-4-8",
+            "native-session",
+            None,
+            None,
+            False,
+        ),
     ],
     ids=[
         "documented-native-context-spelling",
@@ -168,6 +184,8 @@ from tests.harnesses.claude_native._model_switch_support import (
         "declared-spelling-needs-the-same-native-session",
         "declared-plain-spelling-remains-literal",
         "declared-spelling-cannot-add-context",
+        "implicit-context-needs-million-token-window",
+        "implicit-context-needs-window-evidence",
     ],
 )
 def test_managed_model_status_check_preserves_exact_context_identity(

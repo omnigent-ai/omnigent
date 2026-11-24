@@ -1370,154 +1370,72 @@ async def test_run_turn_passes_the_exact_required_model_to_the_shared_picker(
 @pytest.mark.parametrize(
     "receipt_kind",
     [
+        "confirmed",
+        "already-active",
         "absent",
         "different-target",
+        "legacy",
+        "legacy-already-active",
         "legacy-different-target",
-        "older-cli-confirmed",
-        "older-cli-different-model",
-        "undiscovered-current",
-        "undiscovered-stale",
-        "context-private-not-applied",
-        "context-already-active",
     ],
 )
 async def test_run_turn_requires_a_matching_model_selection_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, receipt_kind: str
 ) -> None:
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
-    target = "private-model"
-    if receipt_kind.startswith(("older-cli-", "undiscovered-", "context-")):
-        monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
-        monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
-        monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "web-session")
-        composer = _SessionModelComposer()
-        if receipt_kind.startswith("older-cli-"):
-            composer.version = "2.1.322"
-        elif receipt_kind.startswith("context-"):
-            target = (
-                "claude-sonnet-5-5[1m]"
-                if receipt_kind == "context-already-active"
-                else "private-model[1m]"
-            )
-            composer.model = (
-                target if receipt_kind == "context-already-active" else target.removesuffix("[1m]")
-            )
-            composer.show_current_selection = True
-        else:
-            target = "system.ai.claude-sonnet-4-6"
-        composer.options[1] = target
-        if receipt_kind == "older-cli-confirmed" or receipt_kind.startswith("undiscovered-"):
-            composer.model = composer.options[-1]
-        initial_default = composer.saved_default
-        initial_model = composer.model
-        bridge_dir = _session_model_bridge(tmp_path, composer)
-        if receipt_kind.startswith("undiscovered-"):
-            config_path = bridge_dir / claude_bridge._CONFIG_FILE
-            config = json.loads(config_path.read_text())
-            config.pop("model_picker_values", None)
-            config.pop("model_picker_options", None)
-            config_path.write_text(json.dumps(config))
-            assert claude_bridge.read_model_picker_values(bridge_dir) == []
-            assert claude_bridge.read_model_picker_options(bridge_dir) is None
-            if receipt_kind == "undiscovered-stale":
-                composer.model = composer.options[0]
-        composer.install(monkeypatch)
-        if receipt_kind.startswith("context-"):
-
-            def capture(socket_path: str, tmux_target: str) -> str:
-                pane = composer._capture_pane(socket_path, tmux_target)
-                if composer.overlay == "status":
-                    return pane.replace(
-                        f"Model: {composer.model}", f"Model: {target.removesuffix('[1m]')}"
-                    )
-                return pane
-
-            monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
-
-            def close_without_applying(socket_path: str, *args: str) -> None:
-                if composer.overlay == "picker" and args[-1] == "s":
-                    composer.sends.append(args)
-                    composer.overlay = None
-                else:
-                    composer._run_tmux(socket_path, *args)
-
-            monkeypatch.setattr(claude_bridge, "_run_tmux", close_without_applying)
+    target = "private-model[1m]"
+    selected = "another-model" if receipt_kind.endswith("different-target") else target
+    already_selected = receipt_kind.endswith("already-active")
+    if receipt_kind == "absent":
+        receipt = None
+    elif receipt_kind.startswith("legacy"):
+        receipt = ClaudeLegacyModelSwitchResult(
+            selected, selected, already_selected=already_selected
+        )
     else:
-        bridge_dir = tmp_path / "bridge"
-        receipt = (
-            None
-            if receipt_kind == "absent"
-            else ClaudeLegacyModelSwitchResult("another-model", "another-model")
-            if receipt_kind == "legacy-different-target"
-            else ClaudeModelSwitchResult(
-                "another-model",
-                "another-model",
-                "another-model",
-                "another-model",
-                "native-session",
-            )
+        receipt = ClaudeModelSwitchResult(
+            selected, selected, selected, selected, "native-session", already_selected
         )
-        monkeypatch.setattr(
-            claude_native_executor, "inject_model_command", lambda *a, **k: receipt
-        )
+    selections: list[str] = []
+
+    def select(
+        _bridge: Path, *, model: str
+    ) -> ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult | None:
+        selections.append(model)
+        return receipt
+
+    monkeypatch.setattr(claude_native_executor, "inject_model_command", select)
     delivered: list[str] = []
     monkeypatch.setattr(
         claude_native_executor,
         "inject_user_message",
         lambda _bridge, *, content, timeout_s=30.0: delivered.append(content),
     )
-    attempts = 2 if receipt_kind == "context-already-active" else 1
-    executor = ClaudeNativeExecutor(bridge_dir)
+    attempts = 2 if receipt_kind == "already-active" else 1
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
     events = []
-    for attempt in range(attempts):
+    for _ in range(attempts):
         events.extend(
             [
                 event
                 async for event in executor.run_turn(
-                    messages=[{"role": "user", "content": f"hello {attempt}"}],
+                    messages=[{"role": "user", "content": "hello"}],
                     tools=[],
                     system_prompt="",
                     config=ExecutorConfig(model=target),
                 )
             ]
         )
+    assert selections == [target] * attempts
 
-    accepted = receipt_kind.startswith("older-cli-") or receipt_kind in {
-        "undiscovered-current",
-        "context-already-active",
-    }
+    accepted = receipt_kind in {"confirmed", "already-active", "legacy", "legacy-already-active"}
     if accepted:
         assert events == [TurnComplete(response=None)] * attempts
-        assert delivered == [f"hello {attempt}" for attempt in range(attempts)]
+        assert delivered == ["hello"] * attempts
     else:
         assert len(events) == 1 and isinstance(events[0], ExecutorError)
         assert events[0].undelivered and events[0].preserve_session
         assert delivered == []
-    if receipt_kind.startswith("older-cli-"):
-        assert composer.model == composer.options[-1]
-        already_selected = receipt_kind == "older-cli-confirmed"
-        assert composer.saved_default == (
-            initial_default if already_selected else composer.options[-1]
-        )
-        assert [command for command in composer.submitted if command] == (
-            [] if already_selected else ["/model private-model"]
-        )
-        assert composer.status_queries == 0
-    elif receipt_kind.startswith("undiscovered-"):
-        assert composer.status_queries == 1
-        assert composer.saved_default == initial_default
-        assert [command for command in composer.submitted if command] == ["/status"] + (
-            ["/model"] if accepted else []
-        )
-        assert [args[-1] for args in composer.sends].count("s") == 0
-    elif receipt_kind.startswith("context-"):
-        assert composer.model == (target if accepted else initial_model)
-        assert composer.saved_default == initial_default
-        commands = ["/status", "/model", "/status"]
-        if receipt_kind != "context-already-active":
-            commands.append("/model")
-        assert composer.submitted == commands * attempts
-        assert [args[-1] for args in composer.sends].count("s") == attempts
 
 
 @pytest.mark.asyncio

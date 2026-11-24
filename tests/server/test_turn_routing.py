@@ -1096,11 +1096,6 @@ async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_tr
 
 
 @pytest.mark.parametrize(
-    ("notification_fails", "notice_attempts"),
-    [(False, 1), (True, 2)],
-    ids=["notice-succeeds", "notice-exhausts"],
-)
-@pytest.mark.parametrize(
     ("refusal", "unsupported"),
     [
         ("No exact picker choice", False),
@@ -1126,8 +1121,6 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     monkeypatch: pytest.MonkeyPatch,
     refusal: str,
     unsupported: bool,
-    notification_fails: bool,
-    notice_attempts: int,
 ) -> None:
     """Refusal exposes the exact unsent text and only explicit rescheduling delivers it."""
     from omnigent.harnesses.claude_native.bridge import (
@@ -1174,7 +1167,7 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
         bridge_dir, session_id="conv_1", prompt=prompt, blocked_turn_id=None, model="private-model"
     )
     pending_before = (bridge_dir / turn_routing.PENDING_FILE).read_bytes()
-    client = _FakeServerClient(fail=notification_fails)
+    client = _FakeServerClient()
     refusing = True
     attempts = 0
     expected_refusal = refusal
@@ -1224,48 +1217,43 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
         assert prompt not in composer.submitted
     notice_id = client.posts[0][1]["data"]["source_id"]
     assert notice_id.startswith("turn-routing-pending-")
-    assert (
-        client.posts
-        == [
-            (
-                "/v1/sessions/conv_1/events",
-                {
-                    "type": "external_conversation_item",
-                    "data": {
-                        "source_id": notice_id,
-                        "response_id": notice_id,
-                        "item_type": "error",
-                        "item_data": {
-                            "source": "harness",
-                            "code": "turn_routing_replay_pending",
-                            "level": "info",
-                            "title": "Your message is saved and has not been sent",
-                            "message": (
-                                "Smart Routing could not confirm the requested model. "
-                                + expected_refusal
-                            ),
-                            "remediation": (
-                                "Open Terminal to check the current model and resolve the "
-                                "refusal, then copy and send your saved message below. "
-                                "The saved message will not retry automatically.\n\n"
-                                "Saved message:\n" + prompt
-                            ),
-                        },
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_1/events",
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "source_id": notice_id,
+                    "response_id": notice_id,
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "harness",
+                        "code": "turn_routing_replay_pending",
+                        "level": "info",
+                        "title": "Your message is saved and has not been sent",
+                        "message": (
+                            "Smart Routing could not confirm the requested model. "
+                            + expected_refusal
+                        ),
+                        "remediation": (
+                            "Open Terminal to check the current model and resolve the "
+                            "refusal, then copy and send your saved message below. "
+                            "The saved message will not retry automatically.\n\n"
+                            "Saved message:\n" + prompt
+                        ),
                     },
                 },
-            )
-        ]
-        * notice_attempts
-    )
+            },
+        )
+    ]
     if collision or padding:
         # The person explicitly clears the input before resubmitting the saved text.
         composer.text = ""
         composer.cursor = 0
     refusing = False
-    client.fail = False
     await replay()
     assert attempts == 2
-    assert len(client.posts) == notice_attempts + 1
+    assert len(client.posts) == 2
     assert client.messages == [
         (
             "/v1/sessions/conv_1/events",
@@ -1282,7 +1270,9 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     assert turn_routing.read_pending_replay(bridge_dir) is None
 
 
-@pytest.mark.parametrize("outcome", ["recovers", "replaced", "marker-removed", "cancelled"])
+@pytest.mark.parametrize(
+    "outcome", ["recovers", "exhausted", "replaced", "marker-removed", "cancelled"]
+)
 async def test_refused_replay_retries_only_its_notice_while_it_still_owns_the_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
@@ -1322,6 +1312,8 @@ async def test_refused_replay_retries_only_its_notice_while_it_still_owns_the_pr
                 (tmp_path / MARKER_FILE).unlink()
             notice_attempted.set()
             raise RuntimeError("notice acknowledgement was lost")
+        if outcome == "exhausted":
+            raise RuntimeError("notice acknowledgement was lost again")
         return response
 
     monkeypatch.setattr(turn_routing, "_apply_routed_model", refuse)
@@ -1351,7 +1343,7 @@ async def test_refused_replay_retries_only_its_notice_while_it_still_owns_the_pr
 
     assert selections == 1
     assert not client.messages
-    if outcome == "recovers":
+    if outcome in {"recovers", "exhausted"}:
         assert len(client.posts) == 2
         assert client.posts[0] == client.posts[1]
         data = client.posts[0][1]["data"]
