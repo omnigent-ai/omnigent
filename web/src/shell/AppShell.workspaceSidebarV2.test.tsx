@@ -231,13 +231,16 @@ const viewportListeners = new Map<(event: { matches: boolean }) => void, string>
 /** The window is `width` wide: below 1181px the shell shows the sidebar as a drawer. */
 function setViewport(width: number, pointer: "fine" | "coarse" = "fine") {
   vi.spyOn(window, "matchMedia").mockImplementation((query: string) => {
-    const max = /max-width:\s*([\d.]+)px/.exec(query);
-    const min = /min-width:\s*([\d.]+)px/.exec(query);
+    // A media query's rem is the browser's default font size, 16px here.
+    const pixels = (bound: RegExpExecArray | null) =>
+      bound === null ? null : Number(bound[1]) * (bound[2] === "rem" ? 16 : 1);
+    const max = pixels(/max-width:\s*([\d.]+)(px|rem)/.exec(query));
+    const min = pixels(/min-width:\s*([\d.]+)(px|rem)/.exec(query));
     const pointerQuery = /pointer:\s*(\w+)/.exec(query);
     const matches =
       pointerQuery !== null
         ? pointerQuery[1] === pointer
-        : (max === null || width <= Number(max[1])) && (min === null || width >= Number(min[1]));
+        : (max === null || width <= max) && (min === null || width >= min);
     return {
       matches,
       media: query,
