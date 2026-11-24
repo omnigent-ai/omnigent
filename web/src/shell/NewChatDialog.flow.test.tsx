@@ -20,6 +20,7 @@ import {
   onFirstInputAccepted,
   onSessionCreatedHere,
   onSessionCreationAttempt,
+  resetSessionCreations,
 } from "@/lib/sessionCreations";
 import { REVIEW_PLAN_FIRST } from "@/lib/workflow";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
@@ -664,6 +665,8 @@ describe("NewChatLandingScreen in the floating panel", () => {
       ok: true,
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
+    // Earlier cases created conv_new too; this tab forgets them.
+    resetSessionCreations();
     // The panel has the session but hasn't sent its first message, or the send fails.
     const panel = floatingPanel();
     const outcomes: string[] = [];
