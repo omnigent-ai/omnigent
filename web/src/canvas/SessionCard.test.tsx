@@ -107,6 +107,22 @@ describe("SessionCard", () => {
     },
   );
 
+  it("labels a Claude session with only background shells left as such", () => {
+    seedReadState([{ id: "conv_1", viewer_last_seen: 100, updated_at: 100 }]);
+    const { card } = renderCard({
+      conversation: conversation({
+        status: "idle",
+        background_work_running: true,
+        harness: "claude-native",
+        updated_at: 100,
+      }),
+    });
+    expect(card).toHaveAttribute("data-state", "running");
+    expect(screen.getByText("Background shell running")).toBeInTheDocument();
+    expect(screen.getByTestId("background-shell-icon")).toBeInTheDocument();
+    expect(screen.queryByTestId("running-dot")).toBeNull();
+  });
+
   it("falls back to idle and failed labels", () => {
     renderCard({ conversation: conversation({ status: "idle" }) });
     expect(screen.getByTestId("session-card")).toHaveAttribute("data-state", "idle");

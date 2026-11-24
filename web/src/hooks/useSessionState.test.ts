@@ -5,7 +5,7 @@ import type { LatestSessionError } from "@/lib/sessionError";
 
 type SessionFields = Pick<
   Conversation,
-  "status" | "pending_elicitations_count" | "background_work_running" | "blocked_on"
+  "status" | "pending_elicitations_count" | "background_work_running" | "blocked_on" | "harness"
 >;
 
 function conv(partial: Partial<SessionFields>): SessionFields {
@@ -66,6 +66,28 @@ describe("getSessionState — priority composition", () => {
       ),
     ).toEqual({ kind: "running", background: true });
   });
+
+  it.each(["claude-native", "native-claude"])(
+    "marks a %s session's background work as shells only",
+    (harness) => {
+      expect(
+        getSessionState(conv({ status: "idle", background_work_running: true, harness })),
+      ).toEqual({ kind: "running", background: true, shell: true });
+      // The agent's own turn still wins over its shells.
+      expect(
+        getSessionState(conv({ status: "running", background_work_running: true, harness })),
+      ).toEqual({ kind: "running" });
+    },
+  );
+
+  it.each([["codex-native"], [null]])(
+    "keeps background work on a %s session as working, since it can be an active goal",
+    (harness) => {
+      expect(
+        getSessionState(conv({ status: "idle", background_work_running: true, harness })),
+      ).toEqual({ kind: "running", background: true });
+    },
+  );
 
   it("ranks prompts, turns, disconnects and errors ahead of background shells", () => {
     const shells = { background_work_running: true };
@@ -157,6 +179,16 @@ describe("withUnreadState — the unread dot against derived states", () => {
       background: true,
     });
     expect(badge({ status: "idle" }, false)).toBeNull();
+  });
+
+  it("shows unread output over background shells, then the shells once seen", () => {
+    const shells = {
+      status: "idle",
+      background_work_running: true,
+      harness: "claude-native",
+    } as const;
+    expect(badge(shells, true)).toEqual({ kind: "unseen" });
+    expect(badge(shells, false)).toEqual({ kind: "running", background: true, shell: true });
   });
 
   it("keeps running turns, prompts, disconnects and errors ahead of unread output", () => {

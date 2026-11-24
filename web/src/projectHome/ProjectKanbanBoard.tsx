@@ -678,7 +678,8 @@ function KanbanCardBody({
     getSessionState(conversation),
     showsUnreadFor(conversation, isUnseen(conversation)),
   );
-  const working = state?.kind === "running";
+  // Only background shells left running: the badge says so instead of the Working spinner.
+  const working = state?.kind === "running" && !state.shell;
   const nestedCount = members.length - 1;
   const responsePreview = useLastResponsePreview(conversation);
   const show = useOptionalSidebarShow();

@@ -9,7 +9,7 @@ import type { SessionState } from "@/hooks/useSessionState";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { cn } from "@/lib/utils";
 import type { ReactElement } from "react";
-import { CircleAlertIcon } from "lucide-react";
+import { CircleAlertIcon, SquareTerminalIcon } from "lucide-react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
@@ -58,6 +58,24 @@ function describe(state: SessionState, inSidebar: boolean): Visual {
       };
     }
     case "running": {
+      if (state.shell) {
+        // Static, and the composer's background-task icon: a dev server or watcher left
+        // running must not read as the agent still working on a reply.
+        const tooltip = "Agent idle, background shell still running";
+        return {
+          kind: state.kind,
+          ariaLabel: tooltip,
+          tooltip,
+          render: () => (
+            <SquareTerminalIcon
+              aria-hidden
+              data-testid="background-shell-icon"
+              strokeWidth={1.5}
+              className="size-3.5 shrink-0 text-muted-foreground"
+            />
+          ),
+        };
+      }
       const tooltip = state.background ? "Working in the background" : "Session running";
       return {
         kind: state.kind,

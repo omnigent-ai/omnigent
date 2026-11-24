@@ -11,13 +11,15 @@
 // and the failed lifecycle status.
 
 import type { Conversation } from "@/hooks/useConversations";
+import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
 import type { LatestSessionError } from "@/lib/sessionError";
 
 export type SessionState =
   // `terminalReason`: no web card; the agent is parked on a prompt in its terminal.
   | { kind: "awaiting"; count: number; terminalReason?: string }
   // `background`: the turn ended but work outlives it (a background shell or a Codex goal).
-  | { kind: "running"; background?: true }
+  // `shell`: that work is only background shells, so the agent itself is idle.
+  | { kind: "running"; background?: true; shell?: true }
   | { kind: "error" }
   | { kind: "disconnected" }
   | { kind: "unseen" }
@@ -31,7 +33,11 @@ export function getSessionState(
   conversation:
     | Pick<
         Conversation,
-        "status" | "pending_elicitations_count" | "background_work_running" | "blocked_on"
+        | "status"
+        | "pending_elicitations_count"
+        | "background_work_running"
+        | "blocked_on"
+        | "harness"
       >
     | undefined
     | null,
@@ -46,7 +52,13 @@ export function getSessionState(
   if (latestError === "disconnected") return { kind: "disconnected" };
   const failed = conversation?.status === "failed" || latestError === "error";
   if (failed && latestError !== "recovered_disconnect") return { kind: "error" };
-  if (conversation?.background_work_running) return { kind: "running", background: true };
+  if (conversation?.background_work_running) {
+    // Claude sets the flag only for its background shells; Codex also sets it for an
+    // active goal, which is the agent working, so only Claude's reads as shells.
+    return canonicalNativeHarness(conversation.harness ?? "") === "claude-native"
+      ? { kind: "running", background: true, shell: true }
+      : { kind: "running", background: true };
+  }
   return null;
 }
 

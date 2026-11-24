@@ -158,8 +158,12 @@ implements them separately, so a fix for one harness does not reach the others.
     system error that Codex reports outside a turn; during a turn, the turn's
     own outcome decides.
   - Background work shows the working spinner with the tooltip "Working in the
-    background". Output from the ended turn that the viewer hasn't seen shows the
-    unread dot instead until the session is opened. The composer lists running
+    background". A Claude session whose only remaining work is background
+    shells shows a static terminal icon instead, labelled "Agent idle,
+    background shell still running" (the tooltip on its Canvas card); it stays
+    in the Working group. Output from
+    the ended turn that the viewer hasn't seen shows the unread dot instead until
+    the session is opened. The composer lists running
     Claude background shells and Codex background terminals as "1 background
     task" with each one's command. Claude's list changes when a turn ends;
     Codex's changes within a few seconds of a terminal starting or stopping.
