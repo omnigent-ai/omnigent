@@ -193,6 +193,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._errors import agent_removed as _agent_removed
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._session_create_validation import (
+    create_labels,
     validate_session_agent,
     validate_session_model_metadata,
 )
@@ -12834,7 +12835,7 @@ async def _inherited_mcp_labels(
     state = request.app.state
     deployment = getattr(state, "sandbox_config", None)
     services = session_mcp_services(deployment, created_by.labels)
-    if not services or session_mcp_services(deployment, body.labels or {}) or spec is None:
+    if not services or session_mcp_services(deployment, create_labels(body)) or spec is None:
         return {}
     new_sandbox = body.host_type == "managed"
     host_id = body.host_id
