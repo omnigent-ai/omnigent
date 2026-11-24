@@ -1,7 +1,5 @@
-// The session the page shows, as the app shell last published it: the routed session, its
-// sub-agents' root, or the session a new sibling is being drafted from. A request that settles
-// after its row unmounted, such as a Leave, reads it then and acts only on the session still
-// shown, whatever the row's callback captured.
+// The sessions the page shows now, as the app shell publishes them, so a request that settles
+// after its row unmounted, such as a Leave, acts only on a session still shown.
 
 import { useEffect } from "react";
 

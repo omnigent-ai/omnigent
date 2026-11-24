@@ -47,8 +47,10 @@ describe("openSession", () => {
 
   it("follows a switch to another session and clears once the shell unmounts", () => {
     const view = renderShell("/c/first", "first");
+    // The router keeps its first entries, so the switch navigates and the shell re-routes.
+    act(() => goTo("/c/second"));
     view.rerender(
-      <MemoryRouter initialEntries={["/c/second"]}>
+      <MemoryRouter initialEntries={["/c/first"]}>
         <Shell routed="second" />
       </MemoryRouter>,
     );
