@@ -38,6 +38,7 @@ import {
   supportsArcaConnect,
   supportsBrowser,
   supportsWidenWindowForRightSidebar,
+  trustedRemoteHostsBridge,
   switchServer,
   takeOnboardingRunner,
 } from "./nativeBridge";
@@ -392,6 +393,29 @@ describe("supportsBrowser", () => {
   it("is false under a non-Electron native shell (iOS)", () => {
     setIOS(true);
     expect(supportsBrowser()).toBe(false);
+  });
+});
+
+describe("trustedRemoteHostsBridge", () => {
+  it("is null in a plain browser and on a shell too old for the bridge", () => {
+    setElectron(false);
+    expect(trustedRemoteHostsBridge()).toBeNull();
+    setElectron(true);
+    expect(trustedRemoteHostsBridge()).toBeNull();
+  });
+
+  it("exposes list, add, and remove when the shell offers them", async () => {
+    const list = vi.fn().mockResolvedValue({ ok: true, hosts: [] });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      getTrustedRemoteHosts: list,
+      addTrustedRemoteHost: vi.fn(),
+      removeTrustedRemoteHost: vi.fn(),
+    };
+    const bridge = trustedRemoteHostsBridge();
+    expect(bridge).not.toBeNull();
+    await bridge!.list();
+    expect(list).toHaveBeenCalledOnce();
   });
 });
 

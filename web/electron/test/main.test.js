@@ -8074,6 +8074,82 @@ describe("settings-based remote previews", () => {
     assert.match(hint("http://localhost:5173", true, {}), /web app.*Update it/);
     assert.doesNotMatch(hint("http://localhost:5173", true, {}), /trusted_remote_hosts/);
   });
+
+  it("lists, adds, and removes trusted hosts through IPC, canonicalising entries", async (t) => {
+    const server = "https://server.example.com";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const list = h.ipc.get("omnigent:get-trusted-remote-hosts");
+    const add = h.ipc.get("omnigent:add-trusted-remote-host");
+    const remove = h.ipc.get("omnigent:remove-trusted-remote-host");
+    // IPC results cross a vm boundary, so compare plain JSON copies.
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+    assert.deepEqual(plain(await list(event)), { ok: true, hosts: [] });
+    const added = plain(await add(event, `${server}/`, "ABC123"));
+    assert.equal(added.ok, true);
+    assert.deepEqual(added.hosts, [{ server_url: `${server}/`, host_id: "abc123" }]);
+    assert.deepEqual(plain((await list(event)).hosts), added.hosts);
+    assert.equal((await add(event, server, "abc123")).ok, false);
+    assert.equal((await add(event, "not a url", "abc123")).ok, false);
+    const removed = plain(await remove(event, server, "ABC123"));
+    assert.equal(removed.removed, true);
+    assert.deepEqual(removed.hosts, []);
+    assert.equal((await remove(event, server, "abc123")).ok, false);
+  });
+
+  it("trusts a host from the native dialog and holds a decline until restart", async (t) => {
+    const server = "https://server.example.com";
+    const host = "sandbox-host";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const deps = h.browserIpcDeps();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const opts = { sourceHostId: host, sessionHostProtocol: 1, trustedRemotePreviewProtocol: 1 };
+    let prompts = 0;
+    h.electron.dialog.showMessageBox = async (_win, options) => {
+      prompts += 1;
+      assert.match(options.message, /Let sessions on/);
+      assert.match(options.detail, /remote host/);
+      return { response: prompts === 1 ? 1 : 0 };
+    };
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", opts),
+      true,
+    );
+    assert.equal(prompts, 1);
+    assert.equal(deps.getAgentContextForEvent(event, opts).hostIsTrustedRemotePreview, true);
+    assert.equal(
+      h.browserRegistryDeps().allowsLocalhost(deps.getAgentContextForEvent(event, opts)),
+      true,
+    );
+    // A second host is asked once, declined, and not asked again this run.
+    const other = { ...opts, sourceHostId: "other-host" };
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", other),
+      false,
+    );
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", other),
+      false,
+    );
+    assert.equal(prompts, 2);
+    assert.match(
+      deps.getAgentNavigationHintForEvent(
+        event,
+        "http://localhost:5173",
+        "other-host",
+        undefined,
+        false,
+        true,
+        1,
+      ),
+      /restart Omnigent/,
+    );
+  });
 });
 
 describe("desktop notifications", () => {

@@ -84,7 +84,14 @@ const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
-const { isTrustedRemoteContext, readTrustedRemoteHosts } = require("./trustedRemoteHosts");
+const {
+  addTrustedRemoteHost,
+  isTrustedRemoteContext,
+  readTrustedRemoteHosts,
+  removeTrustedRemoteHost,
+  serializeTrustedRemoteHosts,
+} = require("./trustedRemoteHosts");
+const { createTrustedRemoteHostRequests } = require("./trustedRemoteHostRequests");
 const { normalizedServerTarget } = require("./hostStatusIdentity");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const {
@@ -433,6 +440,51 @@ async function approveSshPreviewHost(win, serverUrl, destination, needsVerificat
       `Allow only if you recognize "${destination}".`,
   });
   return win.isDestroyed() || windows.get(win)?.serverUrl !== serverUrl ? null : response === 1;
+}
+
+/** Persisted trusted remote hosts, reread on each check so hand edits apply. */
+const trustedRemoteHostRequests = createTrustedRemoteHostRequests({
+  isTrusted: (serverUrl, hostId) =>
+    isTrustedRemoteContext(
+      readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+      { serverTarget: serverUrl, sourceHostId: hostId },
+      serverUrl,
+    ),
+  add: (serverUrl, hostId) => {
+    const settings = loadSettings();
+    const result = addTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
+    settings.trusted_remote_hosts = result.entries;
+    saveSettings(settings);
+    return result.added;
+  },
+});
+
+/**
+ * Ask, in a dialog the page can't draw over, before sessions on a remote host
+ * may open this computer's localhost pages. The grant is written to settings
+ * on approval, so it survives restarts until removed. Null when there is no
+ * window to ask in.
+ */
+async function approveTrustedRemoteHost(win, serverUrl, hostId) {
+  if (!win || win.isDestroyed()) return null;
+  let serverHost = serverUrl;
+  try {
+    serverHost = new URL(serverUrl).host;
+  } catch {
+    /* keep the raw server value in the prompt */
+  }
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Trust this host"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Let sessions on "${serverHost}" open localhost pages?`,
+    detail:
+      `${serverHost} says this session runs on a remote host (${hostId}). ` +
+      "Sessions there, and their agents, could then open localhost, 127.0.0.1 and *.localhost pages in the Browser pane. Those are this computer's own ports, including any you forward from that host. Trust stays in place until you remove it in Settings, and the host's port must already be forwarded to this computer.\n\n" +
+      `Trust only if you recognize "${serverHost}".`,
+  });
+  return win.isDestroyed() ? null : response === 1;
 }
 
 /**
@@ -6117,6 +6169,48 @@ function registerIpc() {
     };
   });
 
+  // SPA → list, add, and remove trusted remote hosts for localhost previews.
+  // The list is the settings file, canonicalised; add/remove rewrite it.
+  // A host id is stable across restarts, so a grant normally needs no renewal.
+  const trustedRemoteHostsResult = (event) => {
+    if (!isPinnedOriginSender(event)) {
+      return {
+        ok: false,
+        error: "trusted remote hosts are only available to a connected server page",
+      };
+    }
+    return { ok: true, hosts: serializeTrustedRemoteHosts(loadSettings().trusted_remote_hosts) };
+  };
+  ipcMain.handle("omnigent:get-trusted-remote-hosts", (event) => trustedRemoteHostsResult(event));
+  ipcMain.handle("omnigent:add-trusted-remote-host", (event, serverUrl, hostId) => {
+    const listed = trustedRemoteHostsResult(event);
+    if (!listed.ok) return listed;
+    const settings = loadSettings();
+    const result = addTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
+    if (!result.added) {
+      return {
+        ok: false,
+        error: "That server and host id did not form a valid trusted entry.",
+        hosts: result.entries,
+      };
+    }
+    settings.trusted_remote_hosts = result.entries;
+    saveSettings(settings);
+    return { ok: true, added: true, hosts: result.entries };
+  });
+  ipcMain.handle("omnigent:remove-trusted-remote-host", (event, serverUrl, hostId) => {
+    const listed = trustedRemoteHostsResult(event);
+    if (!listed.ok) return listed;
+    const settings = loadSettings();
+    const result = removeTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
+    if (!result.removed) {
+      return { ok: false, error: "That trusted host was not listed.", hosts: result.entries };
+    }
+    settings.trusted_remote_hosts = result.entries;
+    saveSettings(settings);
+    return { ok: true, removed: true, hosts: result.entries };
+  });
+
   // SPA → a workspace API call on a session host's local socket. The socket and
   // call shape are checked in workspaceSocket.js; the host checks the token.
   ipcMain.handle("omnigent:workspace-socket-request", (event, request) => {
@@ -6449,6 +6543,25 @@ function registerIpc() {
         opts?.sourceSshTarget,
       );
     },
+    requestTrustedRemoteHostForEvent: async (event, url, opts) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const sourceHostId = opts?.sourceHostId;
+      if (
+        !win ||
+        opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
+        opts?.trustedRemotePreviewProtocol !== TRUSTED_REMOTE_PREVIEW_PROTOCOL ||
+        win.isDestroyed() ||
+        !isPinnedOriginSender(event) ||
+        !isLoopbackPreviewUrl(url)
+      ) {
+        return false;
+      }
+      const serverUrl = normalizedServerTarget(senderServerUrl(event));
+      if (!serverUrl) return false;
+      return trustedRemoteHostRequests.request(serverUrl, sourceHostId, () =>
+        approveTrustedRemoteHost(win, serverUrl, sourceHostId),
+      );
+    },
     getAgentNavigationHintForEvent: (
       event,
       url,
@@ -6470,8 +6583,10 @@ function registerIpc() {
         }
         const serverUrl = normalizedServerTarget(senderServerUrl(event));
         if (!serverUrl) return null;
+        const declinedHint = trustedRemoteHostRequests.hint(serverUrl, sourceHostId);
+        if (declinedHint) return declinedHint;
         const entry = JSON.stringify({ server_url: serverUrl, host_id: sourceHostId });
-        return `To allow localhost previews from this session's host, add ${entry} to trusted_remote_hosts in the desktop settings.json, then retry the preview.`;
+        return `To allow localhost previews from this session's host, trust it in Settings, or add ${entry} to trusted_remote_hosts in the desktop settings.json, then retry the preview.`;
       }
       if (typeof rememberedArcaHostId !== "string") {
         return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";

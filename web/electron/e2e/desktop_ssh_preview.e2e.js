@@ -247,16 +247,14 @@ for (const trustSource of trustSources) {
           );
         };
         if (settingsTrust) {
-          await desktop.window.getByText(/navigation blocked:.*loopback\/internal host/).waitFor();
-          const denied = await agentNavigate(backend.sessionId, url);
-          assert.equal(denied.ok, false, JSON.stringify(denied));
-          assert.match(denied.error, /trusted_remote_hosts/);
-          assert.equal(requests.length, 0);
-          evidence.denied = denied;
-          await hold();
-          setTrusted([{ server_url: backend.serverUrl, host_id: HOST }]);
+          // Trust is offered in the native dialog, not by hand-editing the
+          // settings file: answering it writes the entry, then retries.
+          await answer(1, details);
           evidence.settingsSavedAt = new Date().toISOString();
-          await navigate(url);
+          const saved = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+          assert.deepEqual(saved.trusted_remote_hosts, [
+            { server_url: backend.serverUrl, host_id: HOST },
+          ]);
         } else {
           await answer(1, details);
         }
@@ -306,10 +304,7 @@ for (const trustSource of trustSources) {
           assert.equal(screenshot.ok, true, JSON.stringify(screenshot));
           assert.match(screenshot.data_url, /^data:image\/png;base64,/);
         }
-        assert.equal(
-          (await desktop.electronApp.evaluate(() => global.previewPrompts)).length,
-          settingsTrust ? 0 : 1,
-        );
+        assert.equal((await desktop.electronApp.evaluate(() => global.previewPrompts)).length, 1);
         await hold();
 
         if (settingsTrust) {

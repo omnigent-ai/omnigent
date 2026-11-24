@@ -313,6 +313,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {"start" | "stop" | "restart"} action
    */
   controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
+  /** Remote hosts trusted for localhost previews, as `{ server_url, host_id }` entries. */
+  getTrustedRemoteHosts: () => ipcRenderer.invoke("omnigent:get-trusted-remote-hosts"),
+  /** Trust one remote host for localhost previews; resolves `{ ok, hosts?, error? }`. */
+  addTrustedRemoteHost: (serverUrl, hostId) =>
+    ipcRenderer.invoke("omnigent:add-trusted-remote-host", serverUrl, hostId),
+  /** Remove one trusted remote host; resolves `{ ok, hosts?, error? }`. */
+  removeTrustedRemoteHost: (serverUrl, hostId) =>
+    ipcRenderer.invoke("omnigent:remove-trusted-remote-host", serverUrl, hostId),
   /**
    * Desktop feature gates the server can't know about: currently
    * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped
