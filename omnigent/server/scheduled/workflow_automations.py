@@ -132,10 +132,17 @@ def saved_workflow_run(prompt: str) -> SavedWorkflowRun | None:
 def task_workflow_id(task: ScheduledTask) -> str | None:
     """The saved workflow every run of *task* starts as a run of, or None.
 
-    A task saved before automations stored ``workflow_id``, or by an older server, names
-    the workflow only in its prompt, in the exact form that runs it.
+    The server saves a stored ``workflow_id`` with the prompt that runs it, so the two
+    agree. A prompt that runs another workflow, or none, is a later edit by a server that
+    doesn't store workflows, so the prompt decides, as for a task saved before they were.
     """
-    return task.workflow_id or saved_workflow_id(task.prompt)
+    return saved_workflow_id(task.prompt)
+
+
+def is_bare_saved_workflow_run(prompt: str) -> bool:
+    """Whether *prompt* is a saved workflow's run message alone, which the server can
+    rewrite, rather than one inside a trigger header or template text."""
+    return _SAVED_WORKFLOW_RUN.fullmatch(prompt.strip(_JS_WHITESPACE)) is not None
 
 
 def workflow_skill_prefix(harness: str | None) -> str:

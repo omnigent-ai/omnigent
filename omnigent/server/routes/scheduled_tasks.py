@@ -96,6 +96,7 @@ from omnigent.server.scheduled.schedule import (
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.scheduled.workflow_automations import (
     CONTINUED_SESSION_MESSAGE,
+    is_bare_saved_workflow_run,
     saved_workflow_id,
     saved_workflow_run,
     saved_workflow_run_message,
@@ -157,6 +158,11 @@ _WORKFLOW_PROMPT_OWNED_MSG = (
     "stop running the workflow"
 )
 _WORKFLOW_CHANGED_MSG = "The automation's prompt or saved workflow changed. Reload and try again."
+_WORKFLOW_PROMPT_WRAPPED_MSG = (
+    "this automation's prompt runs its saved workflow inside other text, so the server "
+    "can't rewrite its specifics: send the whole prompt as it should run, or send "
+    "workflow_id null with a new prompt"
+)
 _STOP_WORKFLOW_NEEDS_PROMPT_MSG = (
     "workflow_id null stops running the saved workflow, so it needs a new prompt that runs none"
 )
@@ -341,10 +347,7 @@ def _task_workflow(task: ScheduledTask) -> tuple[str | None, str | None]:
     :returns: ``(workflow_id, details)``, or ``(None, None)`` for a task without one.
     """
     run = saved_workflow_run(task.prompt)
-    workflow_id = task.workflow_id or (run.workflow_id if run is not None else None)
-    if workflow_id is None:
-        return None, None
-    return workflow_id, run.details if run is not None else ""
+    return (None, None) if run is None else (run.workflow_id, run.details)
 
 
 def _hides_trigger_rrule(request: Request) -> bool:
@@ -583,6 +586,22 @@ def _breaks_workflow_prompt(locked: ScheduledTask, fields: dict[str, Any]) -> bo
         return False
     prompt = fields["prompt"] if fields.get("prompt") is not None else locked.prompt
     return saved_workflow_id(prompt) != workflow_id
+
+
+def _align_stored_workflow(existing: ScheduledTask, fields: dict[str, Any]) -> bool:
+    """Store the workflow the prompt an update leaves runs, if the update sets none and the
+    stored one differs, as after a server that doesn't store workflows rewrote the prompt.
+
+    :returns: Whether *fields* now sets ``workflow_id``, read from the snapshot.
+    """
+    if "workflow_id" in fields:
+        return False
+    prompt = fields["prompt"] if fields.get("prompt") is not None else existing.prompt
+    workflow_id = saved_workflow_id(prompt)
+    if workflow_id == existing.workflow_id:
+        return False
+    fields["workflow_id"] = workflow_id
+    return True
 
 
 _AGENT_AUTOMATION_ACTION = "Agent automation changes"
@@ -1296,8 +1315,10 @@ def create_scheduled_tasks_router(
         if "workflow_id" in fields and fields["workflow_id"] is None:
             if details_given:
                 raise OmnigentError(_DETAILS_WITHOUT_WORKFLOW_MSG, code=ErrorCode.INVALID_INPUT)
-            if current is not None and (
-                not prompt_changed or await asyncio.to_thread(saved_workflow_id, prompt)
+            if (current is not None and not prompt_changed) or (
+                prompt is not None
+                and prompt_changed
+                and await asyncio.to_thread(saved_workflow_id, prompt)
             ):
                 raise OmnigentError(_STOP_WORKFLOW_NEEDS_PROMPT_MSG, code=ErrorCode.INVALID_INPUT)
             return False
@@ -1308,6 +1329,8 @@ def create_scheduled_tasks_router(
             if prompt_changed:
                 raise OmnigentError(_PROMPT_WITH_WORKFLOW_MSG, code=ErrorCode.INVALID_INPUT)
             if target != current or (details_given and details != saved_details):
+                if target == current and not is_bare_saved_workflow_run(existing.prompt):
+                    raise OmnigentError(_WORKFLOW_PROMPT_WRAPPED_MSG, code=ErrorCode.INVALID_INPUT)
                 workflow = await _runnable_workflow(request, target, owner)
                 agent = await _target_agent(existing, fields, owner)
                 derived = "workflow_id" not in fields or not details_given
@@ -1322,6 +1345,7 @@ def create_scheduled_tasks_router(
             saved_run is not None
             and not prompt_changed
             and fields.get("agent_id") not in (None, existing.agent_id)
+            and is_bare_saved_workflow_run(existing.prompt)
         ):
             # Another harness may invoke the workflow skill with another prefix.
             harness = await scheduled_agent_harness(
@@ -2145,6 +2169,8 @@ def create_scheduled_tasks_router(
         if fields.get("mcp_services") is None:
             fields.pop("mcp_services", None)
         derives_workflow_prompt = await _apply_workflow_update(request, existing, fields, owner)
+        if await asyncio.to_thread(_align_stored_workflow, existing, fields):
+            derives_workflow_prompt = True
         target_session_mode = fields.get("session_mode", existing.session_mode)
         # The caller's own changes, before the ones derived below.
         requested_session = {
@@ -2357,13 +2383,10 @@ def create_scheduled_tasks_router(
         def guard(locked: ScheduledTask) -> None:
             if shared_target_guard is not None:
                 shared_target_guard(locked)
-            # The prompt was checked on the snapshot; a workflow attached since then owns it.
-            if _breaks_workflow_prompt(locked, fields):
-                raise OmnigentError(_WORKFLOW_CHANGED_MSG, code=ErrorCode.CONFLICT)
-            # A prompt derived from the snapshot can't land on a prompt or workflow changed since.
-            if derives_workflow_prompt and (locked.prompt, locked.workflow_id) != (
-                existing.prompt,
-                existing.workflow_id,
+            # Checked on the snapshot: if the prompt or workflow changed since, refuse what
+            # the snapshot decided, and a write that would split the workflow from its prompt.
+            if (locked.prompt, locked.workflow_id) != (existing.prompt, existing.workflow_id) and (
+                derives_workflow_prompt or _breaks_workflow_prompt(locked, fields)
             ):
                 raise OmnigentError(_WORKFLOW_CHANGED_MSG, code=ErrorCode.CONFLICT)
             # Another update may have changed the prompt or session mode since the snapshot.

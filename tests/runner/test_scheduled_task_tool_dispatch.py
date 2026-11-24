@@ -470,25 +470,21 @@ async def test_a_saved_workflow_reaches_a_server_that_writes_its_prompt() -> Non
 
 
 @pytest.mark.asyncio
-async def test_an_update_forwards_explicit_nulls_that_stop_a_saved_workflow() -> None:
+@pytest.mark.parametrize(
+    "field", ["workflow_id", "workflow_details"], ids=["stop-the-workflow", "clear-details"]
+)
+async def test_an_update_forwards_an_explicit_null_workflow_field(field: str) -> None:
     client = _RecordingClient(
         _Resp(body={"id": _TASK_ID}), info=_Resp(body={"scheduled_task_workflow_id": True})
     )
     await _execute_scheduled_task_tool(
         "sys_scheduled_task_update",
-        json.dumps(
-            {
-                **_REVIEW_FIELDS,
-                "scheduled_task_id": _TASK_ID,
-                "workflow_id": None,
-                "workflow_details": None,
-            }
-        ),
+        json.dumps({**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, field: None}),
         server_client=client,
     )
     verb, url, body = client.calls[-1]
     assert verb == "PATCH" and url.endswith(_TASK_ID)
-    assert (body["workflow_id"], body["workflow_details"]) == (None, None)
+    assert body[field] is None
     assert body["prompt"] == _REVIEW_FIELDS["prompt"]
 
 

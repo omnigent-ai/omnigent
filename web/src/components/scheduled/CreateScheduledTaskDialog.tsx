@@ -649,7 +649,7 @@ export function CreateScheduledTaskDialog({
         workflowsEnabled && editingTask?.workflowId
           ? {
               id: editingTask.workflowId,
-              name: parsedRun?.name ?? "",
+              name: parsedRun?.name ?? "Saved workflow",
               details: editingTask.workflowDetails ?? "",
             }
           : parsedRun;
