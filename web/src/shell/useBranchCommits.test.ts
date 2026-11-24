@@ -65,7 +65,9 @@ describe("useBranchCommits", () => {
 
   it.each([
     ["session", { sessionId: "s2" }],
-    ["workspace", { workspace: { hostId: "host_2", root: "/other" } }],
+    // The host and the root each name the workspace on their own.
+    ["host", { workspace: { ...WORKSPACE, hostId: "host_2" } }],
+    ["workspace root", { workspace: { ...WORKSPACE, root: "/other" } }],
   ])("lists the branch, not the last range, for one commit in another %s", async (_name, next) => {
     const { rerender } = renderCommits(TYPED);
     await waitFor(() => expect(ranges()).toEqual([TYPED]));
