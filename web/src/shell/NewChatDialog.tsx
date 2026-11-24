@@ -6563,7 +6563,7 @@ function NewChatLandingContent({
         noteSessionCreatedHere(data.id, initialPrompt, creationAttempt);
         creationNoted = true;
         // A create that carried the first message is its acceptance; otherwise the first send is.
-        if (serverOwnsInitialInput) noteFirstInputAccepted(data.id);
+        if (serverOwnsInitialInput) noteFirstInputAccepted(data.id, initialPrompt);
         // Clear pending agent after successful creation.
         setPendingAgent(null);
       } else {
@@ -6789,7 +6789,7 @@ function NewChatLandingContent({
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
         noteSessionCreatedHere(created.id, initialPrompt, creationAttempt);
         creationNoted = true;
-        if (serverOwnsInitialInput) noteFirstInputAccepted(created.id);
+        if (serverOwnsInitialInput) noteFirstInputAccepted(created.id, initialPrompt);
         if (sandboxSelected) {
           const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
           markSandboxLaunch(created.id, {

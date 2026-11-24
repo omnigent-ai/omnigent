@@ -7,6 +7,7 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { BridgeError } from "./gadgetBridge";
 import {
   acknowledgeStartedGadgetInput,
+  recordGadgetDeliveries,
   adoptStartedGadgetSession,
   forgetGadgetSessionStarts,
   onSessionGadgetsChanged,
@@ -581,6 +582,51 @@ describe("gadget session", () => {
     });
     expect(deliveries).toEqual([]);
   });
+
+  it("counts nothing delivered when the accepted first message is a different one, and keeps the requests queued", async () => {
+    const deliveries: string[] = [];
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: null, version: null })),
+      ),
+      rest.put(`${API}/app-1/sessions/:sessionId`, (_req, res, ctx) =>
+        res(ctx.json({ items: [] })),
+      ),
+      rest.post(`${API}/app-1/actions/:actionId/delivery`, (req, res, ctx) => {
+        deliveries.push((req as { path: string }).path.split("/actions/")[1].split("/")[0]);
+        return res(ctx.json({ items: [] }));
+      }),
+    );
+    await requestGadgetAction(EDITOR, { action: "run_card", params: { cardId: "c1" } }, navigate);
+    expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+    // Its first send failed; the viewer took the request out and sent something else.
+    expect(await acknowledgeStartedGadgetInput("app-1", "s_new", "Just say hi")).toEqual([]);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(deliveries).toEqual([]);
+    // Still queued: the next session started for the gadget carries it.
+    navigate.mockClear();
+    await requestGadgetAction(EDITOR, { action: "run_card", params: { cardId: "c1" } }, navigate);
+    const prompt = parse(navigate.mock.calls[0][0]).searchParams.get("prompt") ?? "";
+    expect(prompt).toContain('"action_id":"act1"');
+  });
+
+  it("returns the deliveries it couldn't record, after trying each again", async () => {
+    let tries = 0;
+    server.use(
+      rest.post(`${API}/app-1/actions/act1/delivery`, (_req, res, ctx) => {
+        tries += 1;
+        return res(ctx.status(503), ctx.json({ error: { message: "busy" } }));
+      }),
+      rest.post(`${API}/app-1/actions/act2/delivery`, (_req, res, ctx) =>
+        res(ctx.json({ items: [] })),
+      ),
+    );
+    expect(await recordGadgetDeliveries("app-1", "s_new", ["act1", "act2"])).toEqual(["act1"]);
+    expect(tries).toBe(3);
+  }, 10_000);
 
   it("sends actions and quotes to the session the gadget is shown beside", async () => {
     server.use(

@@ -1,7 +1,7 @@
 // Links a gadget to the session this tab creates from its New session (`gadget_start`), and
 // only that one: the create that begins while that New session is open is the gadget's
 // attempt, and only the session it makes is linked. Its requests count as delivered only once
-// the server accepted that session's first message.
+// the session is linked and the server accepted a first message that carries them.
 // An existing session, a session another create made, or a create that failed stays unlinked.
 // A gadget made only to be built there is deleted again if New session is left unsent.
 import { useEffect } from "react";
@@ -16,9 +16,10 @@ import {
   adoptStartedGadgetSession,
   isStartedSessionId,
   gadgetRailKey,
+  recordGadgetDeliveries,
 } from "@/gadgets/host/gadgetSession";
 import {
-  firstInputAccepted,
+  acceptedFirstInput,
   onFirstInputAccepted,
   onSessionCreatedHere,
   onSessionCreationAttempt,
@@ -34,13 +35,16 @@ let starting: { gadgetId: string } | null = null;
 const attempts = new Map<number, { gadgetId: string; fullScreen: boolean; wasUnbuilt: boolean }>();
 // Sessions an attempt made for a gadget, by session ID, until linking them succeeds; a page
 // that shows the session again retries a link that failed.
-const madeFor = new Map<
+const madeFor = new Map<string, { gadgetId: string; fullScreen: boolean }>();
+// Sessions an attempt made for a gadget whose requests aren't counted delivered yet: that
+// waits for both the link to the gadget (the server takes deliveries only for its gadget
+// session) and the server accepting a first message, whose text says which requests it had.
+const awaitingInput = new Map<
   string,
-  { gadgetId: string; firstMessage: string | null; fullScreen: boolean }
+  { gadgetId: string; linked: boolean; accepted: string | null | undefined }
 >();
-// Sessions an attempt made for a gadget whose first message the server hasn't accepted yet:
-// the requests that message carries count as delivered only once it has.
-const awaitingInput = new Map<string, { gadgetId: string; firstMessage: string | null }>();
+// Deliveries that couldn't be recorded, by session: tried again when the session shows.
+const unrecorded = new Map<string, { gadgetId: string; actionIds: string[] }>();
 // Gadget and session pairs linked or being linked, so a page that sees the session again does
 // nothing.
 const adopted = new Set<string>();
@@ -119,6 +123,7 @@ export function resetGadgetStarts(): void {
   fullScreenStarts.clear();
   discarding.clear();
   awaitingInput.clear();
+  unrecorded.clear();
 }
 
 function beginGadgetStart(gadgetId: string, queryClient: QueryClient): void {
@@ -145,12 +150,7 @@ function onAttempt(attempt: number, outcome: "begun" | "failed"): void {
   attempts.set(attempt, { gadgetId, fullScreen: fullScreenStarts.has(gadgetId), wasUnbuilt });
 }
 
-function adopt(
-  gadgetId: string,
-  sessionId: string,
-  firstMessage: string | null,
-  fullScreen: boolean,
-) {
+function adopt(gadgetId: string, sessionId: string, fullScreen: boolean) {
   const pair = `${gadgetId}\n${sessionId}`;
   if (adopted.has(pair)) return;
   adopted.add(pair);
@@ -158,12 +158,21 @@ function adopt(
   unbuilt.delete(gadgetId);
   stopDiscard(gadgetId);
   fullScreenStarts.delete(gadgetId);
-  madeFor.set(sessionId, { gadgetId, firstMessage, fullScreen });
-  awaitingInput.set(sessionId, { gadgetId, firstMessage });
-  if (firstInputAccepted(sessionId)) onAccepted(sessionId);
+  madeFor.set(sessionId, { gadgetId, fullScreen });
+  // A link tried again keeps what the first try learned of the session's first message.
+  if (!awaitingInput.has(sessionId)) {
+    awaitingInput.set(sessionId, {
+      gadgetId,
+      linked: false,
+      accepted: acceptedFirstInput(sessionId),
+    });
+  }
   adoptStartedGadgetSession(gadgetId, sessionId)
     .then(() => {
       madeFor.delete(sessionId);
+      const waiting = awaitingInput.get(sessionId);
+      if (waiting !== undefined) waiting.linked = true;
+      acknowledgeIfReady(sessionId);
       const key = gadgetRailKey(gadgetId);
       // Started beside a full screen gadget: it stays full screen, the sidebar as it was.
       if (fullScreen) requestGadgetRailTab(sessionId, key, { maximize: true, keepSidebar: true });
@@ -177,20 +186,44 @@ function adopt(
     });
 }
 
-// The first message of a session made for a gadget was accepted: its requests were delivered.
-function onAccepted(sessionId: string): void {
+// The first message of a session made for a gadget was accepted, with `text`.
+function onAccepted(sessionId: string, text: string | null): void {
   const waiting = awaitingInput.get(sessionId);
   if (waiting === undefined) return;
+  waiting.accepted = text;
+  acknowledgeIfReady(sessionId);
+}
+
+// Linked and its first message accepted: the requests that message carried were delivered.
+function acknowledgeIfReady(sessionId: string): void {
+  const waiting = awaitingInput.get(sessionId);
+  if (waiting === undefined || !waiting.linked || waiting.accepted === undefined) return;
   awaitingInput.delete(sessionId);
-  void acknowledgeStartedGadgetInput(waiting.gadgetId, sessionId, waiting.firstMessage).catch(
+  void acknowledgeStartedGadgetInput(waiting.gadgetId, sessionId, waiting.accepted).then(
+    (failed) => keepUnrecorded(waiting.gadgetId, sessionId, failed),
     () => undefined,
+  );
+}
+
+function keepUnrecorded(gadgetId: string, sessionId: string, actionIds: string[]): void {
+  if (actionIds.length > 0) unrecorded.set(sessionId, { gadgetId, actionIds });
+  else unrecorded.delete(sessionId);
+}
+
+function recordAgain(sessionId: string): void {
+  const left = unrecorded.get(sessionId);
+  if (left === undefined) return;
+  unrecorded.delete(sessionId);
+  void recordGadgetDeliveries(left.gadgetId, sessionId, left.actionIds).then(
+    (failed) => keepUnrecorded(left.gadgetId, sessionId, failed),
+    () => keepUnrecorded(left.gadgetId, sessionId, left.actionIds),
   );
 }
 
 // A session this tab created: the gadget's when the create that made it was the gadget's.
 function onCreated(
   sessionId: string,
-  firstMessage: string | null,
+  _firstMessage: string | null,
   _seq: number,
   attempt: number | null,
 ): void {
@@ -198,7 +231,7 @@ function onCreated(
   const claim = attempts.get(attempt);
   if (claim === undefined) return;
   attempts.delete(attempt);
-  adopt(claim.gadgetId, sessionId, firstMessage, claim.fullScreen);
+  adopt(claim.gadgetId, sessionId, claim.fullScreen);
 }
 
 export function useAdoptStartedGadgetSession(): void {
@@ -232,10 +265,12 @@ export function useAdoptStartedGadgetSession(): void {
       params.delete(GADGET_START_PARAM);
       replaceSearchParams(params);
     }
+    // Deliveries whose records failed earlier: try them again now the session shows.
+    recordAgain(sessionId);
     const made = madeFor.get(sessionId);
     if (made !== undefined) {
       // A link that failed earlier: try it again now the session shows.
-      adopt(made.gadgetId, sessionId, made.firstMessage, made.fullScreen);
+      adopt(made.gadgetId, sessionId, made.fullScreen);
       return;
     }
     const gadgetId = marked ?? starting?.gadgetId ?? null;

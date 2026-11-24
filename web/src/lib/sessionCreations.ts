@@ -2,7 +2,7 @@
 // `beginSessionCreation` numbers it, and it ends as a created session
 // (`noteSessionCreatedHere`) or a failure (`noteSessionCreationFailed`). A page can bind its
 // work to the attempt it saw begin. That a session exists is not that its first message was
-// taken: `noteFirstInputAccepted` reports that, once the server accepted it.
+// taken: `noteFirstInputAccepted` reports that, with the text the server accepted.
 type CreatedListener = (
   sessionId: string,
   firstMessage: string | null,
@@ -12,9 +12,9 @@ type CreatedListener = (
 const created = new Map<string, { firstMessage: string | null; seq: number }>();
 const listeners = new Set<CreatedListener>();
 const attemptListeners = new Set<(attempt: number, outcome: "begun" | "failed") => void>();
-// Created sessions whose first message the server accepted.
-const accepted = new Set<string>();
-const acceptedListeners = new Set<(sessionId: string) => void>();
+// Created sessions whose first message the server accepted, with that message's text.
+const accepted = new Map<string, string | null>();
+const acceptedListeners = new Set<(sessionId: string, text: string | null) => void>();
 let lastSeq = 0;
 let lastAttempt = 0;
 // Enough for any session a page in this tab is still waiting on.
@@ -71,12 +71,14 @@ export function noteSessionCreatedHere(
 
 /**
  * Records that the server accepted the first message of `sessionId`, a session this tab
- * created: a create that carried it, or the first send to it. Later calls do nothing.
+ * created, with `text`, the message it accepted: a create that carried it, or the first send
+ * to it. That may differ from the text the session was created with, as when a first send
+ * failed and the viewer sent something else. Later calls do nothing.
  */
-export function noteFirstInputAccepted(sessionId: string): void {
+export function noteFirstInputAccepted(sessionId: string, text: string | null): void {
   if (!created.has(sessionId) || accepted.has(sessionId)) return;
-  accepted.add(sessionId);
-  for (const listener of [...acceptedListeners]) listener(sessionId);
+  accepted.set(sessionId, text);
+  for (const listener of [...acceptedListeners]) listener(sessionId, text);
 }
 
 /** Whether the server accepted the first message of `sessionId`, a session this tab created. */
@@ -84,8 +86,18 @@ export function firstInputAccepted(sessionId: string): boolean {
   return accepted.has(sessionId);
 }
 
-/** Calls `listener` as created sessions' first messages are accepted. Returns an unsubscribe. */
-export function onFirstInputAccepted(listener: (sessionId: string) => void): () => void {
+/** The first message the server accepted for `sessionId`, or `undefined` before it did. */
+export function acceptedFirstInput(sessionId: string): string | null | undefined {
+  return accepted.has(sessionId) ? accepted.get(sessionId) : undefined;
+}
+
+/**
+ * Calls `listener` as created sessions' first messages are accepted, with the text accepted.
+ * Returns an unsubscribe.
+ */
+export function onFirstInputAccepted(
+  listener: (sessionId: string, text: string | null) => void,
+): () => void {
   acceptedListeners.add(listener);
   return () => acceptedListeners.delete(listener);
 }

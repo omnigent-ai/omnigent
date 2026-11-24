@@ -219,10 +219,45 @@ async function deliverMessage(
 }
 
 async function recordDelivery(appId: string, actionId: string, sessionId: string): Promise<void> {
+  // The message reached the session, so it isn't sent again; a record that still fails
+  // leaves its progress showing as not delivered.
+  await recordGadgetDeliveries(appId, sessionId, [actionId]);
+}
+
+const RECORD_ATTEMPTS = 3;
+const RECORD_RETRY_MS = 500;
+
+/**
+ * Records `actionIds` as delivered to `sessionId`, trying each a few times. Returns the ones
+ * still not recorded, for the caller to try again later: the session has their requests, so
+ * sending them again would repeat the work.
+ */
+export async function recordGadgetDeliveries(
+  appId: string,
+  sessionId: string,
+  actionIds: readonly string[],
+): Promise<string[]> {
+  const recorded = await Promise.all(
+    actionIds.map((actionId) => recordWithRetries(appId, actionId, sessionId, 0)),
+  );
+  return actionIds.filter((_actionId, index) => !recorded[index]);
+}
+
+async function recordWithRetries(
+  appId: string,
+  actionId: string,
+  sessionId: string,
+  attempt: number,
+): Promise<boolean> {
   try {
     await recordGadgetActionDelivery(appId, actionId, sessionId);
+    return true;
   } catch {
-    // The message reached the session; without the record its progress shows as not delivered.
+    if (attempt + 1 >= RECORD_ATTEMPTS) return false;
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, RECORD_RETRY_MS * 2 ** attempt);
+    });
+    return recordWithRetries(appId, actionId, sessionId, attempt + 1);
   }
 }
 
@@ -244,29 +279,42 @@ export async function adoptStartedGadgetSession(
 }
 
 /**
- * Counts as delivered the requests carried in `firstMessage`, the first message of the session
- * New session started for the gadget, once the server accepted that message: their actions
- * are recorded delivered and their `onDelivered` callbacks run (Address all marks its comments
- * addressed). Requests not in it stay queued.
+ * Counts as delivered the requests carried in `acceptedText`, the first message the server
+ * accepted for the session New session started for the gadget, once that session is the
+ * gadget's: their actions are recorded delivered and their `onDelivered` callbacks run
+ * (Address all marks its comments addressed). The accepted text decides, not the text New
+ * session started with: a first send that failed, followed by a different message, carried
+ * none of them. Requests not in it stay queued for the next session started there. Returns
+ * the carried actions whose delivery couldn't be recorded, to try again
+ * ({@link recordGadgetDeliveries}).
  */
 export async function acknowledgeStartedGadgetInput(
   appId: string,
   sessionId: string,
-  firstMessage: string | null,
-): Promise<void> {
+  acceptedText: string | null,
+): Promise<string[]> {
   const started = pendingStarts.get(appId);
-  if (started === undefined || Date.now() - started.at > PENDING_TTL_MS) return;
-  pendingStarts.delete(appId);
-  const carried = (message: string) => firstMessage !== null && firstMessage.includes(message);
-  const sent = started.actionIds.filter((actionId) =>
-    started.messages.some(
-      (message) => message.includes(`"action_id":${JSON.stringify(actionId)}`) && carried(message),
-    ),
-  );
-  await Promise.all(sent.map((actionId) => recordDelivery(appId, actionId, sessionId)));
+  if (started === undefined || Date.now() - started.at > PENDING_TTL_MS) return [];
+  const carried = (message: string) => acceptedText !== null && acceptedText.includes(message);
+  const actionMessage = (actionId: string) =>
+    started.messages.find((message) => message.includes(`"action_id":${JSON.stringify(actionId)}`));
+  const sent = started.actionIds.filter((actionId) => {
+    const message = actionMessage(actionId);
+    return message !== undefined && carried(message);
+  });
+  const left = {
+    at: started.at,
+    actionIds: started.actionIds.filter((actionId) => !sent.includes(actionId)),
+    messages: started.messages.filter((message) => !carried(message)),
+    onDelivered: started.onDelivered.filter(({ message }) => !carried(message)),
+  };
+  if (left.messages.length > 0) pendingStarts.set(appId, left);
+  else pendingStarts.delete(appId);
+  const failed = await recordGadgetDeliveries(appId, sessionId, sent);
   for (const { message, callback } of started.onDelivered) {
     if (carried(message)) callback(sessionId);
   }
+  return failed;
 }
 
 /** Whether `sessionId` is a created session's ID, not the temporary one New session shows first. */

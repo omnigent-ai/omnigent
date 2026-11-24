@@ -11,6 +11,7 @@ import { deleteGadget, getGadget, getGadgetGadgetSession } from "@/gadgets/api/g
 import {
   acknowledgeStartedGadgetInput,
   adoptStartedGadgetSession,
+  recordGadgetDeliveries,
 } from "@/gadgets/host/gadgetSession";
 import {
   noteGadgetStartFullScreen,
@@ -32,7 +33,8 @@ import type * as GadgetSessionModule from "@/gadgets/host/gadgetSession";
 vi.mock("@/gadgets/host/gadgetSession", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetSessionModule>()),
   adoptStartedGadgetSession: vi.fn(async () => true),
-  acknowledgeStartedGadgetInput: vi.fn(async () => undefined),
+  acknowledgeStartedGadgetInput: vi.fn(async (): Promise<string[]> => []),
+  recordGadgetDeliveries: vi.fn(async (): Promise<string[]> => []),
 }));
 vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetApiModule>()),
@@ -88,6 +90,9 @@ function Shell() {
       </button>
       <button type="button" onClick={() => navigate("/tasks")}>
         Elsewhere
+      </button>
+      <button type="button" onClick={() => navigate("/c/conv_9")}>
+        Session again
       </button>
       <button type="button" onClick={() => navigate("/c/conv_old")}>
         Existing session
@@ -148,10 +153,93 @@ describe("a session started beside a gadget", () => {
     });
     expect(acknowledgeStartedGadgetInput).not.toHaveBeenCalled();
 
-    noteFirstInputAccepted("conv_9");
-    expect(acknowledgeStartedGadgetInput).toHaveBeenCalledWith("board", "conv_9", "Build");
-    noteFirstInputAccepted("conv_9");
+    noteFirstInputAccepted("conv_9", "Build");
+    await waitFor(() =>
+      expect(acknowledgeStartedGadgetInput).toHaveBeenCalledWith("board", "conv_9", "Build"),
+    );
+    noteFirstInputAccepted("conv_9", "Build");
     expect(acknowledgeStartedGadgetInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts requests delivered by the message the server accepted, not the one created with", async () => {
+    // The first send failed; the viewer removed the requests and sent something else.
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    noteFirstInputAccepted("conv_9", "Something else");
+    await waitFor(() =>
+      expect(acknowledgeStartedGadgetInput).toHaveBeenCalledWith(
+        "board",
+        "conv_9",
+        "Something else",
+      ),
+    );
+  });
+
+  it("waits for the gadget's link before counting anything delivered", async () => {
+    // The server takes deliveries only for the gadget's session, so an accepted first message
+    // waits for the link to finish.
+    let link: (() => void) | null = null;
+    vi.mocked(adoptStartedGadgetSession).mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          link = () => resolve(true);
+        }),
+    );
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    noteFirstInputAccepted("conv_9", "Build");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(acknowledgeStartedGadgetInput).not.toHaveBeenCalled();
+    expect(link).not.toBeNull();
+    link!();
+    await waitFor(() =>
+      expect(acknowledgeStartedGadgetInput).toHaveBeenCalledWith("board", "conv_9", "Build"),
+    );
+  });
+
+  it("counts the requests delivered once a link that failed succeeds on the next visit", async () => {
+    vi.mocked(adoptStartedGadgetSession).mockRejectedValueOnce(new Error("offline"));
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    noteFirstInputAccepted("conv_9", "Build");
+    await waitFor(() => expect(adoptStartedGadgetSession).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(acknowledgeStartedGadgetInput).not.toHaveBeenCalled();
+
+    // The viewer comes back to the session: the link is tried again, and the accepted first
+    // message counts once it succeeds.
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    fireEvent.click(screen.getByRole("button", { name: "Session again" }));
+    await waitFor(() => expect(adoptStartedGadgetSession).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(acknowledgeStartedGadgetInput).toHaveBeenCalledWith("board", "conv_9", "Build"),
+    );
+    expect(acknowledgeStartedGadgetInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("tries again to record deliveries that failed when the session shows again", async () => {
+    vi.mocked(acknowledgeStartedGadgetInput).mockResolvedValueOnce(["act1"]);
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    noteFirstInputAccepted("conv_9", "Build");
+    await waitFor(() => expect(acknowledgeStartedGadgetInput).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(recordGadgetDeliveries).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    fireEvent.click(screen.getByRole("button", { name: "Session again" }));
+    await waitFor(() =>
+      expect(recordGadgetDeliveries).toHaveBeenCalledWith("board", "conv_9", ["act1"]),
+    );
   });
 
   it("keeps a gadget full screen in the session started beside it in full screen", async () => {

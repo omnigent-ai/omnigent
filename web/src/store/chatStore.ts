@@ -3229,7 +3229,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
       } else {
         endPlanStop();
-        noteFirstInputAccepted(sessionId);
+        noteFirstInputAccepted(sessionId, text);
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
         // non-native: already persisted). Mark the bubble settled — that is
