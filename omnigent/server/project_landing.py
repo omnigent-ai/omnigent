@@ -12,7 +12,7 @@ runs. Any git, build or restart failure stops the queue for that project and
 escalates to the lead. The queue never pushes, resets or forces.
 
 An approval carries to another SHA only as the identical patch: the same commits by
-``git patch-id --stable``, in order, with the same trailers, fast-forwarding the tip.
+``git patch-id --verbatim``, in order, with the same trailers, fast-forwarding the tip.
 When an approved SHA no longer fast-forwards, the queue cherry-picks it onto the tip
 in a scratch worktree. A carried approval lands only after ``tsc`` and ``oxlint``
 (when ``web/`` changed) and the ticket's ``targeted-tests`` pass on the new SHA.
@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -146,7 +147,7 @@ def _is_ancestor(checkout: Path, ancestor: str, descendant: str) -> bool:
 def _patch_id(checkout: Path, commit: str) -> str | None:
     diff = _git(checkout, "diff-tree", "--patch", "--no-color", "--full-index", commit).stdout
     result = subprocess.run(
-        ["git", "-C", str(checkout), "patch-id", "--stable"],
+        ["git", "-C", str(checkout), "patch-id", "--verbatim"],
         input=diff,
         capture_output=True,
         text=True,
@@ -169,8 +170,8 @@ def patch_identity_problem(checkout: Path, source: str, candidate: str, onto: st
     """Why *candidate* isn't the approved *source* re-applied commit for commit, else None.
 
     Each branch's commits are taken from where it forked from *onto* (the integration
-    tip). A carry needs the same count, the same ``git patch-id --stable`` in order,
-    and the same trailers on each commit.
+    tip). A carry needs the same count, the same ``git patch-id --verbatim`` in order
+    (whitespace counts: indentation can change behavior), and the same trailers.
     """
     old = _branch_commits(checkout, source, onto)
     new = _branch_commits(checkout, candidate, onto)
@@ -251,10 +252,26 @@ def targeted_tests(ticket: dict[str, Any]) -> list[str] | None:
     return tests
 
 
-def _run(command: list[str], cwd: Path, timeout: float) -> str | None:
+def _isolated_env(home: Path) -> dict[str, str]:
+    """The server's environment without ``OMNIGENT_*``, with a throwaway HOME and TMPDIR.
+
+    Checks run branch code; it must not see the server's database, data dirs or runner ids.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("OMNIGENT_")}
+    (home / "tmp").mkdir(parents=True, exist_ok=True)
+    return {**env, "HOME": str(home), "TMPDIR": str(home / "tmp")}
+
+
+def _run(command: list[str], cwd: Path, timeout: float, env: dict[str, str]) -> str | None:
     try:
         result = subprocess.run(
-            command, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return f"`{' '.join(command)}`: {str(exc)[:200]}"
@@ -273,19 +290,25 @@ def safety_net(checkout: Path, sha: str, tip: str, tests: list[str]) -> str | No
     )
     if not web_changed and not tests:
         return None
-    with _scratch_worktree(checkout, sha) as scratch:
+    with _scratch_worktree(checkout, sha) as scratch, tempfile.TemporaryDirectory() as home:
+        env = _isolated_env(Path(home))
         if web_changed:
             modules = checkout / "web" / "node_modules"
             if not modules.is_dir():
                 return "web/node_modules is missing in the landing checkout"
             (scratch / "web" / "node_modules").symlink_to(modules)
             for script in ("type-check", "lint"):
-                error = _run(["npm", "run", "--silent", script], scratch / "web", _BUILD_TIMEOUT_S)
+                error = _run(
+                    ["npm", "run", "--silent", script], scratch / "web", _BUILD_TIMEOUT_S, env
+                )
                 if error:
                     return error
         if tests:
             return _run(
-                [sys.executable, "-m", "pytest", "-q", "-x", *tests], scratch, _TEST_TIMEOUT_S
+                [sys.executable, "-m", "pytest", "-q", "-x", *tests],
+                scratch,
+                _TEST_TIMEOUT_S,
+                env,
             )
     return None
 

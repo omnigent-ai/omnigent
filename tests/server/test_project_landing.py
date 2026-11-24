@@ -371,6 +371,7 @@ async def test_the_queue_rebases_a_stale_approved_sha_itself(world) -> None:
     ("change", "reason"),
     [
         ({"a.txt": "a, changed", "b.txt": "b"}, "different patch"),
+        ({"a.txt": "  a", "b.txt": "b"}, "different patch"),  # indentation-only
         ({"a.txt": "a", "b.txt": "b", "c.txt": "c"}, "3 commit"),  # an added commit
         ({"b.txt": "b"}, "1 commit"),  # a dropped commit
     ],
@@ -444,3 +445,15 @@ def test_pure_rebase_detection_and_uncounted_review_rounds(world) -> None:
     assert routes._review_rounds.get("t-rounds", 0) == 0
     routes._count_review_round("t-rounds")
     assert routes._review_rounds["t-rounds"] == 1
+
+
+def test_the_safety_net_hides_the_servers_environment(world, monkeypatch) -> None:
+    monkeypatch.setenv("OMNIGENT_DATABASE_URI", "sqlite:///must-not-leak.db")
+    probe = (
+        "import os\n\ndef test_env():\n"
+        "    assert not any(k.startswith('OMNIGENT_') for k in os.environ)\n"
+        f"    assert os.environ['HOME'] != {str(Path.home())!r}\n"
+    )
+    _, rebased = approve_then_rebase(world, {"tests/test_env.py": probe})
+    tip = git(world.repo, "rev-parse", BRANCH)
+    assert landing.safety_net(world.repo, rebased, tip, ["tests/test_env.py"]) is None
