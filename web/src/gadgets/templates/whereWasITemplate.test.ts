@@ -29,13 +29,14 @@ const RADAR = {
   window_days: 3,
   sessions_read: 9,
   headline: "Two efforts are moving and one review blocks a fix.",
-  areas: [
+  tasks: [
     {
       id: "rollout",
       title: "Checkout flag rollout",
       state: "active",
-      related: ["reviews"],
-      items: [{ id: "ramp", title: "Ramp to 5%", state: "done" }],
+      stage: "post_merge",
+      step: "flag_rollout",
+      depends_on: ["reviews"],
       next_steps: [
         {
           id: "ramp-10",
@@ -52,13 +53,14 @@ const RADAR = {
       id: "reviews",
       title: "Reviews",
       state: "blocked",
+      stage: "post_pr",
       next_steps: [
         { id: "review-fix", label: "Review the cache fix", kind: "act", confidence: 0.9 },
       ],
     },
   ],
   sessions: [
-    { id: "s1", title: "Ramp checkout flag", area: "rollout", why: "Watch errors", status: "idle" },
+    { id: "s1", title: "Ramp checkout flag", task: "rollout", why: "Watch errors", status: "idle" },
   ],
 };
 
@@ -83,9 +85,9 @@ const LANES_VIEW = withView(
   ".lane { display: block; }",
   `Radar.view({ name: 'Lanes', render: function (root, model, kit) {
     var lanes = root.firstChild || root.appendChild(kit.el('div', { class: 'lanes' }));
-    kit.keyed(lanes, model.areas, function (area) { return area.id; }, function (area) {
-      return kit.el('section', { class: 'lane', id: 'lane-' + area.id }, [kit.el('h3', { text: area.title })]
-        .concat(kit.openSteps(area).map(function (step) { return kit.stepButton(area, step); })));
+    kit.keyed(lanes, model.tasks, function (task) { return task.id; }, function (task) {
+      return kit.el('section', { class: 'lane', id: 'lane-' + task.id }, [kit.el('h3', { text: task.title }), kit.track(task)]
+        .concat(kit.openSteps(task).map(function (step) { return kit.stepButton(task, step); })));
     });
   } });`,
 );
@@ -225,9 +227,10 @@ describe("where was I template", () => {
     // The example shows its sure steps with why now, what it learned, and a hit ratio.
     await waitFor(() => expect(byId("hit").hidden).toBe(false));
     const shown = [...byId("next-items").children].map((item) => item.id);
-    expect(shown).toEqual(["next-ramp-10", "next-checkout-telemetry", "next-review-cache"]);
-    expect(byId("next-checkout-telemetry").textContent).toContain("Easy to forget.");
-    expect(byId("learned-list").textContent).toContain("Remove the flag (often forgotten)");
+    expect(shown).toEqual(["next-ramp-25", "next-rerun-ci"]);
+    expect(byId("next-ramp-25").textContent).toContain("Due now.");
+    expect(byId("next-ramp-25").textContent).toContain("How search-service ships: Flagged change");
+    expect(byId("learned-list").textContent).toContain("Impact report (often forgotten)");
   });
 
   it("draws the plain view, ranks blocked work first and runs a next step", async () => {
@@ -241,9 +244,9 @@ describe("where was I template", () => {
       (chip) => chip.textContent,
     );
     expect(chips[0]).toContain("Review the cache fix");
-    const cards = [...document.querySelectorAll("#view .area")].map((card) => card.id);
+    const cards = [...document.querySelectorAll("#view .task")].map((card) => card.id);
     expect(cards).toEqual(["card-reviews", "card-rollout"]);
-    // Next up owns its steps, so the area cards do not repeat them.
+    // Next up owns its steps, so the task rows do not repeat them.
     expect(byId("card-rollout").textContent).toContain("Ramp checkout flag");
     expect(byId("card-rollout").textContent).not.toContain("Ramp the flag to 10%");
 
@@ -252,7 +255,7 @@ describe("where was I template", () => {
     expect(requests).toEqual([
       {
         action: "do_next_step",
-        params: { next_step: "ramp-10", label: "Ramp the flag to 10%", area: "rollout" },
+        params: { next_step: "ramp-10", label: "Ramp the flag to 10%", task: "rollout" },
       },
     ]);
 
@@ -284,12 +287,12 @@ describe("where was I template", () => {
         version: "v1",
         value: {
           ...RADAR,
-          areas: [
+          tasks: [
             {
               id: "constructor",
               title: "Builder cleanup",
               state: "constructor",
-              related: ["toString"],
+              depends_on: ["toString"],
               next_steps: [
                 {
                   id: "constructor",
@@ -314,7 +317,7 @@ describe("where was I template", () => {
     expect(requests).toEqual([
       {
         action: "do_next_step",
-        params: { next_step: "constructor", label: "Delete the old builder", area: "constructor" },
+        params: { next_step: "constructor", label: "Delete the old builder", task: "constructor" },
       },
     ]);
   });
@@ -366,7 +369,7 @@ describe("where was I template", () => {
     expect(button("Scanning")?.disabled).toBe(true);
 
     emitActions([
-      { id: "a0", action: "scan", params: { window_days: 3 }, status: "done", summary: "4 areas" },
+      { id: "a0", action: "scan", params: { window_days: 3 }, status: "done", summary: "4 tasks" },
       { id: "a1", action: "scan", params: { window_days: 3 }, status: "done", summary: "Merged" },
     ]);
     await waitFor(() => expect(byId("run").textContent).toBe("Scan done"));
@@ -376,14 +379,14 @@ describe("where was I template", () => {
     const { emit, emitActions, ready } = startRadar();
     await waitFor(() => expect(ready()).toBe(true));
     emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
-    const step = { next_step: "ramp-10", label: "Ramp the flag to 10%", area: "rollout" };
+    const step = { next_step: "ramp-10", label: "Ramp the flag to 10%", task: "rollout" };
     emitActions([{ id: "a1", action: "do_next_step", params: step, status: "running" }]);
     await waitFor(() => expect(byId("next-ramp-10").textContent).toContain("Working on it"));
 
     // The session reports the action and rewrites the radar without the step, and writes no run.
-    const rollout = { ...RADAR.areas[0], next_steps: RADAR.areas[0].next_steps.slice(1) };
+    const rollout = { ...RADAR.tasks[0], next_steps: RADAR.tasks[0].next_steps.slice(1) };
     emit("radar", [
-      { id: "current", version: "v2", value: { ...RADAR, areas: [rollout, RADAR.areas[1]] } },
+      { id: "current", version: "v2", value: { ...RADAR, tasks: [rollout, RADAR.tasks[1]] } },
     ]);
     emitActions([
       { id: "a1", action: "do_next_step", params: step, status: "done", summary: "At 10%." },
@@ -403,12 +406,12 @@ describe("where was I template", () => {
     const { emit, emitActions, ready } = startRadar();
     await waitFor(() => expect(ready()).toBe(true));
     emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
-    const step = { next_step: "ramp-10", label: "Ramp the flag to 10%", area: "rollout" };
+    const step = { next_step: "ramp-10", label: "Ramp the flag to 10%", task: "rollout" };
     emit("step_runs", [
       {
         id: "ramp-10",
         version: "v1",
-        value: { label: step.label, area: "rollout", state: "running" },
+        value: { label: step.label, task: "rollout", state: "running" },
       },
     ]);
     emitActions([{ id: "a1", action: "do_next_step", params: step, status: "running" }]);
@@ -452,16 +455,16 @@ describe("where was I template", () => {
     const { emit, ready } = startRadar({ html: LANES_VIEW });
     await waitFor(() => expect(ready()).toBe(true));
     const quoted = {
-      ...RADAR.areas[0],
+      ...RADAR.tasks[0],
       next_steps: [
         {
-          ...RADAR.areas[0].next_steps[0],
+          ...RADAR.tasks[0].next_steps[0],
           evidence: { session_id: "s1", quote: "Choose **approve** or `request changes`" },
         },
       ],
     };
     emit("radar", [
-      { id: "current", version: "v1", value: { ...RADAR, areas: [quoted, RADAR.areas[1]] } },
+      { id: "current", version: "v1", value: { ...RADAR, tasks: [quoted, RADAR.tasks[1]] } },
     ]);
     emit("layout", [
       { id: "current", version: "v1", value: { ...LAYOUT, change_note: "Grouped by goals." } },
@@ -473,7 +476,7 @@ describe("where was I template", () => {
     const plainView = startRadar();
     await waitFor(() => expect(plainView.ready()).toBe(true));
     plainView.emit("radar", [
-      { id: "current", version: "v1", value: { ...RADAR, areas: [quoted, RADAR.areas[1]] } },
+      { id: "current", version: "v1", value: { ...RADAR, tasks: [quoted, RADAR.tasks[1]] } },
     ]);
     await waitFor(() =>
       expect(byId("next-ramp-10").textContent).toContain("“Choose approve or request changes”"),
@@ -589,12 +592,18 @@ const PATTERNS = {
   ],
 };
 
-/** A radar whose one area has these next steps. */
+/** A radar whose one task has these next steps. */
 function radarWith(nextSteps: Record<string, unknown>[]) {
   return {
     ...RADAR,
-    areas: [
-      { id: "rollout", title: "Checkout flag rollout", state: "active", next_steps: nextSteps },
+    tasks: [
+      {
+        id: "rollout",
+        title: "Checkout flag rollout",
+        state: "active",
+        stage: "post_merge",
+        next_steps: nextSteps,
+      },
     ],
   };
 }
@@ -824,7 +833,7 @@ describe("where was I next up", () => {
     expect(byId("hit").textContent).toContain(
       "Next up hit ratio, last 30 days: 2 of 4 clicked (50%)",
     );
-    // The page's headline area carries no ratio; it sits under the page.
+    // The page's headline carries no ratio; it sits under the page.
     expect(byId("headline").textContent).not.toContain("hit ratio");
     expect(byId("learned-list").textContent).toContain("Next up hits: 2 of 2");
 
@@ -835,11 +844,169 @@ describe("where was I next up", () => {
       params: {
         next_step: "cleanup",
         label: "Remove the flag",
-        area: "rollout",
+        task: "rollout",
         pattern: "flag-rollout",
       },
     });
     await waitFor(() => expect(byId("hit").textContent).toContain("3 of 5 clicked (60%)"));
+  });
+});
+
+const TRACKED = {
+  scanned_at: "2026-11-19T10:00:00Z",
+  window_days: 3,
+  sessions_read: 6,
+  tasks: [
+    {
+      id: "cache-fix",
+      title: "Cache warm-up fix",
+      state: "waiting",
+      stage: "post_pr",
+      step: "merge_deps",
+      depends_on: ["client"],
+      links: [{ kind: "pr", label: "PR #1490", url: "https://example.com/pr/1490" }],
+      track: [
+        { id: "commit", label: "Commit and push", stage: "pre_pr", status: "done" },
+        { id: "approval", label: "Get approval", stage: "post_pr", status: "done" },
+        { id: "merge_deps", label: "Merge dependencies", stage: "post_pr", status: "blocked" },
+        { id: "merge", label: "Merge", stage: "post_pr", status: "todo" },
+        { id: "flag_rollout", label: "Ramp the flag", stage: "post_merge", status: "na" },
+        { id: "metrics", label: "Check metrics and errors", stage: "post_rollout", status: "na" },
+      ],
+    },
+    {
+      id: "client",
+      title: "Client 4.2 release",
+      state: "active",
+      stage: "post_pr",
+      step: "ci",
+      next_steps: [
+        {
+          id: "rerun-ci",
+          label: "Rerun the UI shard",
+          kind: "act",
+          confidence: 0.8,
+          track_step: "ci",
+        },
+      ],
+    },
+    { id: "docs", title: "Docs fix", state: "done", stage: "done" },
+  ],
+  sessions: [
+    { id: "s1", title: "Cache warm-up", task: "cache-fix", status: "idle" },
+    { id: "s2", title: "Client CI", task: "client", status: "idle" },
+    { id: "s3", title: "Read about indexes", other: "Research", status: "idle" },
+    { id: "s4", title: "Orphan session", task: "gone", status: "idle" },
+  ],
+};
+
+describe("where was I tasks", () => {
+  it("lays every task on the same four stages, with done, blocked and not-needed steps", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: TRACKED }]);
+
+    await waitFor(() => expect(byId("card-cache-fix")).toBeTruthy());
+    const stages = (taskId: string) =>
+      [...byId(`card-${taskId}`).querySelectorAll(".track-stage")].map((stage) =>
+        stage.getAttribute("data-stage"),
+      );
+    expect(stages("cache-fix")).toEqual(["pre_pr", "post_pr", "post_merge", "post_rollout"]);
+    expect(stages("client")).toEqual(["pre_pr", "post_pr", "post_merge", "post_rollout"]);
+    const dots = [...byId("card-cache-fix").querySelectorAll(".track-dot")].map((dot) =>
+      dot.getAttribute("data-s"),
+    );
+    expect(dots).toEqual(["done", "done", "blocked", "todo", "na", "na"]);
+    expect(byId("card-cache-fix").querySelector(".track")?.getAttribute("aria-label")).toBe(
+      "Commit and push done, Get approval done, Merge dependencies blocked, Merge to do",
+    );
+    // A stage with only steps it doesn't need reads as empty, not as work to do.
+    expect(
+      byId("card-cache-fix")
+        .querySelector('.track-stage[data-stage="post_merge"]')
+        ?.getAttribute("data-empty"),
+    ).toBe("true");
+    expect(byId("card-cache-fix").querySelector(".task-now")?.textContent).toBe(
+      "Post PR: Merge dependencies",
+    );
+    expect(byId("card-cache-fix").textContent).toContain("PR #1490");
+  });
+
+  it("builds a track from the default lifecycle when the session wrote none", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: TRACKED }]);
+
+    await waitFor(() => expect(byId("card-client")).toBeTruthy());
+    const dots = [...byId("card-client").querySelectorAll(".track-dot")].map((dot) =>
+      dot.getAttribute("data-s"),
+    );
+    // Commit, open PR, request review, address review, approval done; CI now; the rest to do.
+    expect(dots.slice(0, 7)).toEqual(["done", "done", "done", "done", "done", "current", "todo"]);
+    expect(byId("card-client").querySelector(".task-now")?.textContent).toBe("Post PR: Pass CI");
+    // Shipped work has every step done and comes last.
+    expect(
+      [...byId("card-docs").querySelectorAll(".track-dot")].every(
+        (dot) => dot.getAttribute("data-s") === "done",
+      ),
+    ).toBe(true);
+    const order = [...document.querySelectorAll("#view .task")].map((card) => card.id);
+    expect(order).toEqual(["card-client", "card-cache-fix", "card-docs"]);
+  });
+
+  it("shows what waits on what, and jumps to the task it waits on", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: TRACKED }]);
+
+    await waitFor(() => expect(byId("card-cache-fix")).toBeTruthy());
+    const waits = byId("card-cache-fix").querySelector('.chip[data-kind="waits"]') as HTMLElement;
+    expect(waits.textContent).toBe("Waits on Client 4.2 release");
+    expect(byId("card-client").querySelector('.chip[data-kind="blocks"]')?.textContent).toBe(
+      "Blocks Cache warm-up fix",
+    );
+    const scrolled: Element[] = [];
+    const scrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this);
+    };
+    try {
+      waits.click();
+    } finally {
+      Element.prototype.scrollIntoView = scrollIntoView;
+    }
+    expect(scrolled).toEqual([byId("card-client")]);
+    expect(byId("card-client").getAttribute("data-focused")).toBe("true");
+  });
+
+  it("lists every session the scan kept, under its task or among the others", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: TRACKED }]);
+
+    await waitFor(() => expect(byId("others").hidden).toBe(false));
+    expect(byId("card-cache-fix").textContent).toContain("Cache warm-up");
+    expect(byId("card-client").textContent).toContain("Client CI");
+    // Not a change, and filed under a task the radar no longer has: both still show.
+    expect(byId("others-count").textContent).toBe("2 other sessions");
+    expect(byId("others-list").textContent).toContain("Read about indexes");
+    expect(byId("others-list").textContent).toContain("Research");
+    expect(byId("others-list").textContent).toContain("Orphan session");
+  });
+
+  it("names where a next step sits on its task's track", async () => {
+    const { emit, requests, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: TRACKED }]);
+
+    await waitFor(() => expect(byId("next-rerun-ci")).toBeTruthy());
+    const chip = byId("next-rerun-ci").querySelector(".next-chip") as HTMLButtonElement;
+    expect(chip.textContent).toContain("Client 4.2 release · Post PR: Pass CI");
+    chip.click();
+    expect(requests.at(-1)).toEqual({
+      action: "do_next_step",
+      params: { next_step: "rerun-ci", label: "Rerun the UI shard", task: "client" },
+    });
   });
 });
 
@@ -851,7 +1018,7 @@ describe("where was I designs", () => {
     emit("layout", [{ id: "current", version: "v1", value: LAYOUT }]);
 
     await waitFor(() => expect(byId("lane-rollout")).toBeTruthy());
-    expect(document.querySelector("#view .area")).toBeNull();
+    expect(document.querySelector("#view .task")).toBeNull();
     // Next up stays the kit's.
     expect(byId("next-items").querySelectorAll(".next-chip").length).toBeGreaterThan(0);
     await waitFor(() =>
