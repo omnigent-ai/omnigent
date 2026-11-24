@@ -4839,6 +4839,30 @@ def create_runner_app(
         if known:
             _publish_turn_status(conv_id, "idle")
 
+    async def _settle_codex_native_stop(conv_id: str) -> None:
+        """
+        Publish ``idle`` once a Stop has ended a Codex-native turn that Codex itself never ran.
+
+        Codex's own turn events close a Codex session's ``running`` edge, so a turn
+        stopped before its message reached Codex (held while Codex was starting) has
+        nothing else to close it. A turn Codex accepted keeps its own lifecycle.
+
+        :param conv_id: Session whose turn the Stop ended.
+        """
+        if _session_harness_name(conv_id) != "codex-native":
+            return
+        state = await _codex_native_bridge_state_for_session(
+            conv_id, action="stop", missing_state_log_level=logging.DEBUG
+        )
+        if state is not None and state.active_turn_id is not None:
+            return
+        # Checked after the await, with no await before the publish: a turn that
+        # started meanwhile keeps its own status.
+        if conv_id in _active_turns or _session_message_buffers.get(conv_id):
+            return
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        resource_registry.note_external_session_status(conv_id, "idle")
+
     def _on_proxy_stream_end(
         conv_id: str,
         *,
@@ -8525,6 +8549,8 @@ def create_runner_app(
             )
             if not _had_live_turn:
                 _settle_stop_without_turn(conversation_id)
+            else:
+                await _settle_codex_native_stop(conversation_id)
             return Response(status_code=204)
 
         if body_type == "external_session_status":
@@ -8716,6 +8742,8 @@ def create_runner_app(
             )
             if not _had_live_turn:
                 _settle_stop_without_turn(conversation_id)
+            else:
+                await _settle_codex_native_stop(conversation_id)
             return Response(status_code=204)
 
         if body_type == "effort_change":
