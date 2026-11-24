@@ -21,11 +21,24 @@ describe("plain", () => {
   });
 });
 
-type Doc = { id: string; version: string; value: unknown };
-type Page = { items: Doc[]; nextCursor: string | null };
-type Snapshot = { status: string; items: Doc[]; nextCursor: string | null };
+interface Doc {
+  id: string;
+  version: string;
+  value: unknown;
+}
+interface Page {
+  items: Doc[];
+  nextCursor: string | null;
+}
+interface Snapshot {
+  status: string;
+  items: Doc[];
+  nextCursor: string | null;
+}
 
-const kit = new Function(`${GADGET_KIT_HELPERS}; return { watchEveryPage, MAX_EXTRA_PAGES };`)() as {
+const kit = new Function(
+  `${GADGET_KIT_HELPERS}; return { watchEveryPage, MAX_EXTRA_PAGES };`,
+)() as {
   watchEveryPage: (
     collection: unknown,
     handler: (items: Doc[], complete: boolean) => void,

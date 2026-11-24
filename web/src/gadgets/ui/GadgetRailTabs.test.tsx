@@ -533,7 +533,9 @@ describe("the gadget beside New session", () => {
     await act(async () => {
       await queryClient.refetchQueries();
       // The query notifies its observers after a tick.
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 20);
+      });
     });
     expect(queryClient.getQueryState(gadgetKey("1"))?.status).toBe("error");
     expect(screen.getByText("shows Board")).toBeInTheDocument();
