@@ -3234,8 +3234,15 @@ describe("useMoveToNest", () => {
       );
       expect(withMoveTombstone(head)).toMatchObject({ family });
       expect(queryClient.getQueryData(headBackfillKey)).toMatchObject({ family });
-      // A streamed frame for the open head re-applies its tombstone before the PATCH answers.
-      queryClient.setQueryData(headBackfillKey, withMoveTombstone({ ...head, updated_at: 200 }));
+      // A streamed frame for the open head lands, tombstone applied, before the PATCH answers.
+      const streamed = {
+        ...head,
+        project_id: null,
+        title: "Renamed head",
+        status: "running",
+        updated_at: 200,
+      };
+      queryClient.setQueryData(headBackfillKey, withMoveTombstone(streamed));
       respond(
         rejected
           ? mockResponse(
@@ -3248,7 +3255,8 @@ describe("useMoveToNest", () => {
       expect(result.current.isError).toBe(rejected);
       if (rejected) {
         expect(queryClient.getQueryData(key)).toEqual(original);
-        expect(queryClient.getQueryData(headBackfillKey)).toEqual(head);
+        // Only the move's family is undone; the streamed fields stay.
+        expect(queryClient.getQueryData(headBackfillKey)).toEqual(streamed);
       }
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", head.id] });
       expect(withMoveTombstone(head)).toEqual(head);

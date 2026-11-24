@@ -25,7 +25,8 @@ the header menu), and each place is a separate entry point.
   owned active session, by dragging onto that row's center or choosing
   **Move session → Nests** in the sidebar menu. A standalone destination leads the
   new nest, and the moved session takes its project. Nests are one level deep, so
-  dropping onto a nested member joins its nest. Choose a searchable
+  dropping onto a nested member joins its nest. In **Pinned**, dropping on a standalone
+  pin still reorders or pins; nest under a pinned session from the menu. Choose a searchable
   destination, or **Remove from nest** to detach just that session. Dragging a
   nested member into the session list above or below a nest removes it; a floating
   **Remove from nest** target is also available without shifting rows.

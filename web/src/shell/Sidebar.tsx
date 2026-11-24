@@ -501,7 +501,7 @@ function isNestDestination(
     !row.provisional &&
     !row.nested_draft_source_id &&
     !row.parent_session_id &&
-    row.labels[SIDE_CHAT_LABEL_KEY] === undefined &&
+    row.labels?.[SIDE_CHAT_LABEL_KEY] === undefined &&
     isOwnedByViewer(row, viewerId)
   );
 }
@@ -6353,11 +6353,17 @@ function ConversationRowImpl({
   const canReorder = reorderGroup !== undefined && isOwner && !isArchived;
   const nestMoves = useContext(NestMoveContext);
   const canMoveNest = !!nestMoves && isOwner && !isArchived && !conversation.parent_session_id;
+  // In the Pinned section each row is also a reorder target for other pins.
+  const pinOrder = useContext(PinOrderContext);
+  const isPinOrderTarget = !!pinOrder && isPinned && pinOrder.ids.includes(conversation.id);
   const { setNodeRef: setNestNodeRef, isOver: isNestTarget } = useDroppable({
     id: `nest:${conversation.id}`,
     data: { type: "session-nest", destination: conversation },
+    // A standalone pin's center keeps reordering pins; nest under it from the row menu.
     disabled:
-      !canMoveNest || !isNestDestination(conversation, viewerId, nestMoves?.standalone === true),
+      !canMoveNest ||
+      !isNestDestination(conversation, viewerId, nestMoves?.standalone === true) ||
+      (isPinOrderTarget && !conversation.family),
   });
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -6408,12 +6414,10 @@ function ConversationRowImpl({
     const from = reorderDrag?.data.current?.reorderIndex as number;
     reorderInsertion = from < reorderIndex ? "after" : "before";
   }
-  // In the Pinned section each row is also a reorder target for other pins.
-  const pinOrder = useContext(PinOrderContext);
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
     id: `pin-order:${conversation.id}`,
     data: { type: "pin-order", id: conversation.id },
-    disabled: !pinOrder || !isPinned || !pinOrder.ids.includes(conversation.id),
+    disabled: !isPinOrderTarget,
   });
   // A pin dragged down lands below this row and one dragged up above it; a new
   // pin lands on the side of the row the pointer is on.

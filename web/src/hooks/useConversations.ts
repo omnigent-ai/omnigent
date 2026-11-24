@@ -2717,8 +2717,7 @@ export function useMoveToNest() {
       if (previous.head?.markedId) unmarkSessionMoving(previous.head.markedId, previous.move);
       for (const [key, data] of previous.queries) if (data) queryClient.setQueryData(key, data);
       restoreOpenSessionRow(queryClient, id, previous.backfill);
-      if (previous.head)
-        restoreOpenSessionRow(queryClient, previous.head.row.id, previous.head.backfill);
+      if (previous.head) restoreNestHeadFamily(queryClient, previous.head);
       queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, previous.pins);
     },
     onSuccess: (updated, _variables, previous) => {
@@ -2769,8 +2768,8 @@ interface NestHeadPaint {
   markedId: string | null;
   /** The head's row as it looks leading the nest. */
   row: Conversation;
-  /** The head's open-session row before the move, restored if the move fails. */
-  backfill: Conversation | null | undefined;
+  /** The head's family before the move, restored on its open-session row if the move fails. */
+  previousFamily: Conversation["family"];
 }
 
 /**
@@ -2788,9 +2787,17 @@ function paintNestHead(
   const cached = findCachedConversationRow(queryClient, destination.id) ?? destination;
   const row = { ...withMoveTombstone(cached), family: move.family };
   const backfillKey = ["conversation-backfill", destination.id];
-  const backfill = queryClient.getQueryData<Conversation | null>(backfillKey);
-  if (backfill) queryClient.setQueryData(backfillKey, row);
-  return { markedId, row, backfill };
+  if (queryClient.getQueryData<Conversation | null>(backfillKey)) {
+    queryClient.setQueryData(backfillKey, row);
+  }
+  return { markedId, row, previousFamily: cached.family };
+}
+
+/** Undo a failed move's family on the head's open-session row, keeping newer streamed fields. */
+function restoreNestHeadFamily(queryClient: QueryClient, head: NestHeadPaint): void {
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", head.row.id], (row) =>
+    row ? { ...row, family: head.previousFamily } : row,
+  );
 }
 
 /**

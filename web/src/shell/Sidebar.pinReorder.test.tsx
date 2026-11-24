@@ -249,6 +249,10 @@ it("starts a nest at a standalone row's center, but not over the dragged row its
   });
   await dropOnto("conv_c", "conv_c", { expectTarget: false });
   await dropOnto("conv_c", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 - 2 });
+  // A standalone pin's center still pins into that slot instead of nesting.
+  mocks.pinFn.mockResolvedValue({});
+  await dropOnto("conv_c", "conv_a");
+  expect(mocks.pinFn).toHaveBeenCalledOnce();
   expect(mocks.moveNest).not.toHaveBeenCalled();
   await dropOnto("conv_c", "conv_d", { expectTarget: false });
   expect(mocks.moveNest).toHaveBeenCalledExactlyOnceWith({ id: "conv_c", destination: head });
