@@ -312,6 +312,11 @@ Run `omp login` to use OMP's own authentication, or select a managed provider
 in `omnigent setup`. The `omp` provider-default scope is independent of `pi`;
 OMP never borrows a Pi CLI login. Managed Anthropic/OpenAI-compatible providers
 and Databricks connections use the same routing as other native harnesses.
+Model discovery forwards only recognized OMP provider environment variables and
+runtime settings. For custom providers that depend on other shell environment
+variables, use OMP's own stored credentials or configure a managed provider
+instead. Package and model-scoping probes do not receive provider environment
+credentials.
 
 Bridge and session-specific configuration live under `~/.omnigent/omp-native`.
 OMP's original profile settings and authentication database remain OMP-owned.

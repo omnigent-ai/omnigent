@@ -277,6 +277,9 @@ def test_own_catalog_uses_supported_omp_command_and_sqlite_owned_auth(
         ],
         scoped_indices=[1],
     )
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-credential")
+    monkeypatch.setenv("GITHUB_TOKEN", "unrelated-credential")
+    monkeypatch.setenv("PI_PACKAGE_DIR", str(tmp_path / "omp-package"))
     (tmp_path / "auth.json").write_text("Pi legacy auth must not be read")
     (tmp_path / "config.yml").write_text("enabledModels: [custom/**]\n")
     options = creds.omp_own_login_model_options(tmp_path)
@@ -295,6 +298,11 @@ def test_own_catalog_uses_supported_omp_command_and_sqlite_owned_auth(
     ]
     assert calls[0]["env"]["PI_CODING_AGENT_DIR"] == str(tmp_path)
     assert calls[0]["env"]["OMP_PROFILE"] == ""
+    assert calls[0]["env"]["OPENAI_API_KEY"] == "provider-credential"
+    assert "OPENAI_API_KEY" not in calls[1]["env"]
+    assert "GITHUB_TOKEN" not in calls[0]["env"]
+    assert "GITHUB_TOKEN" not in calls[1]["env"]
+    assert calls[1]["env"]["PI_PACKAGE_DIR"] == str(tmp_path / "omp-package")
     assert creds.omp_own_login_serves_reference("openai-codex/gpt-5.6-sol", tmp_path)
 
 

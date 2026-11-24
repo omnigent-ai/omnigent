@@ -39,12 +39,56 @@ from omnigent.inner.pi_settings import _relocate_resource_settings
 from omnigent.onboarding.provider_config import load_config
 
 if TYPE_CHECKING:
-    import httpx
+    from httpx import BaseTransport
 
     from omnigent.spec.types import ExecutorAuth
 
 _LOGGER = logging.getLogger(__name__)
 AUTH_DIR_ENV = "OMNIGENT_OMP_NATIVE_AUTH_DIR"
+
+# Runtime and OMP profile settings only; metadata probes do not need provider keys.
+_OMP_PROBE_ENV = """
+    PATH HOME USERPROFILE SYSTEMROOT WINDIR PATHEXT TMPDIR TEMP TMP
+    XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME BUN_INSTALL
+    PI_CONFIG_DIR PI_PACKAGE_DIR OMP_PROFILE PI_PROFILE
+""".split()  # noqa: SIM905 - keep environment names grouped by role.
+
+# Explicit OMP provider catalog and credential-chain inputs. Do not forward
+# arbitrary *_KEY or *_TOKEN variables from the runner.
+_OMP_CATALOG_AUTH_ENV = """
+    ABLITERATION_API_KEY ABLIT_KEY AIAND_API_KEY AIMLAPI_API_KEY AI_GATEWAY_API_KEY
+    ALIBABA_CODING_PLAN_API_KEY ALIBABA_TOKEN_PLAN_API_KEY BAILIAN_TOKEN_PLAN_API_KEY
+    ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN ANTHROPIC_FOUNDRY_API_KEY CLAUDE_CODE_USE_FOUNDRY
+    AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE
+    AWS_REGION AWS_DEFAULT_REGION AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE
+    AWS_BEARER_TOKEN_BEDROCK AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME
+    AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_CONTAINER_CREDENTIALS_FULL_URI
+    AWS_CONTAINER_AUTHORIZATION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE AWS_BEDROCK_SKIP_AUTH
+    AZURE_OPENAI_API_KEY BASETEN_API_KEY BIFROST_API_KEY CEREBRAS_API_KEY CHARM_HYPER_API_KEY
+    HYPER_API_KEY CHUTES_API_KEY CLINE_API_KEY CLOUDFLARE_AI_GATEWAY_API_KEY CLOUDFLARE_API_TOKEN
+    CLOUDFLARE_AUTH_TOKEN COMMAND_CODE_API_KEY COMMANDCODE_API_KEY COPILOT_GITHUB_TOKEN
+    CORAL_API_KEY CORALBRICKS_API_KEY COREWEAVE_API_KEY WANDB_API_KEY CURSOR_ACCESS_TOKEN
+    CURSOR_API_KEY DEEPINFRA_API_KEY DEEPSEEK_API_KEY DEVIN_API_KEY FIREPASS_API_KEY
+    FIREWORKS_API_KEY GEMINI_API_KEY GITLAB_TOKEN GMI_API_KEY GROQ_API_KEY HELMCODE_API_KEY
+    HUGGINGFACE_HUB_TOKEN HF_TOKEN INCEPTION_API_KEY KILO_API_KEY LIQUID_API_KEY LITELLM_API_KEY
+    LLAMA_CPP_API_KEY LM_STUDIO_API_KEY MINIMAX_API_KEY
+    MINIMAX_CODE_API_KEY MINIMAX_CODE_CN_API_KEY
+    MISTRAL_API_KEY MODAL_PROXY_TOKEN MODEL_API_KEY META_API_KEY MODULAR_API_KEY MOONSHOT_API_KEY
+    KIMI_API_KEY NACE_API_KEY NANO_GPT_API_KEY NOVITA_API_KEY NVIDIA_API_KEY OLLAMA_API_KEY
+    OLLAMA_CLOUD_API_KEY OPENAI_API_KEY OPENAI_CODEX_OAUTH_TOKEN
+    OPENCODE_API_KEY OPENROUTER_API_KEY
+    OTARI_API_KEY PARALLEL_API_KEY QIANFAN_API_KEY QWEN_OAUTH_TOKEN QWEN_PORTAL_API_KEY
+    SAKANA_API_KEY FUGU_API_KEY SAMBANOVA_API_KEY SCW_SECRET_KEY SCW_API_KEY SILICONFLOW_API_KEY
+    SILICONFLOW_CN_API_KEY SINGULARITYAPI_DEV_API_KEY SINGULARITYAPI_TECH_API_KEY SNOWFLAKE_PAT
+    STENCIL_API_KEY STENCIL_AUTH_URL STENCIL_BASE_URL STEPFUN_API_KEY SYNTHETIC_API_KEY
+    TOGETHER_API_KEY TYPESAFE_API_KEY UMANS_AI_CODING_PLAN_API_KEY VENICE_API_KEY
+    VERCEL_AI_GATEWAY_API_KEY VLLM_API_KEY WAFER_SERVERLESS_API_KEY XAI_API_KEY XAI_OAUTH_TOKEN
+    XIAOMI_API_KEY XIAOMI_TOKEN_PLAN_AMS_API_KEY XIAOMI_TOKEN_PLAN_CN_API_KEY
+    XIAOMI_TOKEN_PLAN_SGP_API_KEY YOLO_AUTO_API_KEY ZAI_API_KEY ZENMUX_API_KEY ZHIPU_API_KEY
+    GOOGLE_APPLICATION_CREDENTIALS GOOGLE_CLOUD_API_KEY GOOGLE_CLOUD_PROJECT GCP_PROJECT
+    GCLOUD_PROJECT GOOGLE_VERTEX_LOCATION GOOGLE_CLOUD_LOCATION VERTEX_LOCATION
+""".split()  # noqa: SIM905 - keep vendor credential aliases together.
+
 # OMP discovers these resources in its own agent root. Authentication databases
 # and provider configuration are deliberately not linked into managed sessions.
 _OMP_RESOURCES = (
@@ -101,6 +145,15 @@ def _read_omp_settings(root: Path) -> dict[str, object]:
     return {}
 
 
+def _omp_probe_environment(
+    env: Mapping[str, str], *, catalog_auth: bool = False
+) -> dict[str, str]:
+    keys = (*_OMP_PROBE_ENV, PI_CODING_AGENT_DIR_ENV_VAR)
+    if catalog_auth:
+        keys += tuple(_OMP_CATALOG_AUTH_ENV)
+    return {key: value for key in keys if (value := env.get(key)) is not None}
+
+
 def _omp_own_login_models(
     agent_dir: Path | None = None,
     *,
@@ -112,9 +165,10 @@ def _omp_own_login_models(
     ``omp models --json`` uses OMP's AuthStorage (agent.db), environment keys,
     custom YAML providers and extension models through the supported registry.
     """
-    child_env = dict(os.environ if env is None else env)
-    executable = child_env.get("OMNIGENT_OMP_PATH") or shutil.which(
-        "omp", path=child_env.get("PATH")
+    source_env = os.environ if env is None else env
+    child_env = _omp_probe_environment(source_env, catalog_auth=True)
+    executable = source_env.get("OMNIGENT_OMP_PATH") or shutil.which(
+        "omp", path=child_env.get("PATH", os.defpath)
     )
     if not executable:
         return []
@@ -172,9 +226,12 @@ def _omp_native_metadata(
     env: Mapping[str, str] | None = None,
 ) -> object:
     """Resolve metadata inside OMP's loader, independent of executable layout."""
-    child_env = dict(os.environ if env is None else env)
-    executable = executable or child_env.get("OMNIGENT_OMP_PATH") or shutil.which(
-        "omp", path=child_env.get("PATH")
+    source_env = os.environ if env is None else env
+    child_env = _omp_probe_environment(source_env)
+    executable = (
+        executable
+        or source_env.get("OMNIGENT_OMP_PATH")
+        or shutil.which("omp", path=child_env.get("PATH", os.defpath))
     )
     if not executable:
         return None
@@ -302,7 +359,7 @@ def resolve_omp_native_provider(
 def omp_native_model_options(
     *,
     config_loader: Callable[[], dict[str, object]] | None = None,
-    transport: httpx.BaseTransport | None = None,
+    transport: BaseTransport | None = None,
 ) -> list[dict[str, object]]:
     """Return managed provider choices, or the real OMP own-login catalog."""
     provider = (
