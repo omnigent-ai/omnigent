@@ -3259,6 +3259,7 @@ describe("useMoveToNest", () => {
         expect(queryClient.getQueryData(headBackfillKey)).toEqual(streamed);
       }
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", head.id] });
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: headBackfillKey });
       expect(withMoveTombstone(head)).toEqual(head);
       expect(withMoveTombstone(row)).toEqual(row);
     },
@@ -3288,6 +3289,37 @@ describe("useMoveToNest", () => {
         ?.map((member) => member.id),
     ).toEqual(["left"]);
     expect(withMoveTombstone(row).family ?? null).toBeNull();
+  });
+
+  it("keeps an open head's new nest when its earlier backfill fetch answers late", async () => {
+    const row = conversation({ id: "moved" });
+    const head = conversation({ id: "head", title: "Head" });
+    fetchMock.mockReturnValue(new Promise<Response>(() => {}));
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(["conversations", "", false], infinitePage([row]));
+    const backfillKey = ["conversation-backfill", head.id];
+    queryClient.setQueryData(backfillKey, head);
+    // The open head's backfill refetch is in flight when the move starts.
+    let answer!: (value: Conversation) => void;
+    void queryClient.prefetchQuery({
+      queryKey: backfillKey,
+      queryFn: () =>
+        new Promise<Conversation>((done) => {
+          answer = done;
+        }),
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToNest(), { wrapper });
+    result.current.mutate({ id: row.id, destination: head });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    // It answers with the pre-move row, which has no nest.
+    await act(async () => {
+      answer(head);
+    });
+    expect(queryClient.getQueryData(backfillKey)).toMatchObject({
+      family: { id: "head", representative_id: "head" },
+    });
   });
 
   it("leaves a head's own in-flight move tombstone in place", async () => {

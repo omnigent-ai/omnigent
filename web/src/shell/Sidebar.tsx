@@ -6359,11 +6359,12 @@ function ConversationRowImpl({
   const { setNodeRef: setNestNodeRef, isOver: isNestTarget } = useDroppable({
     id: `nest:${conversation.id}`,
     data: { type: "session-nest", destination: conversation },
-    // A standalone pin's center keeps reordering pins; nest under it from the row menu.
+    // A standalone pin's center keeps reordering pins, even while a pin write holds those
+    // drops; nest under it from the row menu.
     disabled:
       !canMoveNest ||
       !isNestDestination(conversation, viewerId, nestMoves?.standalone === true) ||
-      (isPinOrderTarget && !conversation.family),
+      (isPinned && !conversation.family),
   });
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /

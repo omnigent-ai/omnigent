@@ -392,29 +392,46 @@ describe("dropping an unpinned session onto a pinned row", () => {
     expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 
-  it("ignores a second drop while the first pin is saving, and still renumbers for the first", async () => {
-    let resolveFirst!: () => void;
-    mocks.pinFn.mockImplementation(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveFirst = resolve;
-        }),
-    );
-    renderSidebar();
+  it.each([false, true])(
+    "ignores a second drop while the first pin is saving, and still renumbers for the first (standalone nests=%s)",
+    async (standaloneNests) => {
+      let resolveFirst!: () => void;
+      mocks.pinFn.mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      );
+      renderSidebar(
+        standaloneNests
+          ? {
+              info: {
+                ...FALLBACK_SERVER_INFO,
+                sibling_sessions: true,
+                session_nest_moves: true,
+                session_nest_standalone_destinations: true,
+              },
+            }
+          : undefined,
+      );
 
-    await dropOnto("conv_c", "conv_b");
-    await waitFor(() => expect(mocks.pinFn).toHaveBeenCalledOnce());
-    // Pinned rows take no drops while a pin write is saving.
-    await dropOnto("conv_d", "conv_a", { expectTarget: false });
-    expect(mocks.pinFn).toHaveBeenCalledOnce();
+      await dropOnto("conv_c", "conv_b");
+      await waitFor(() => expect(mocks.pinFn).toHaveBeenCalledOnce());
+      // Pinned rows take no drops while a pin write is saving, not even as nests.
+      await dropOnto("conv_d", "conv_a", { expectTarget: false });
+      expect(mocks.pinFn).toHaveBeenCalledOnce();
+      expect(mocks.moveNest).not.toHaveBeenCalled();
 
-    await act(async () => {
-      resolveFirst();
-    });
-    await waitFor(() =>
-      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_b", pinnedAt: 1002 }]),
-    );
-  });
+      await act(async () => {
+        resolveFirst();
+      });
+      await waitFor(() =>
+        expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([
+          { id: "conv_b", pinnedAt: 1002 },
+        ]),
+      );
+    },
+  );
 
   it("offers no pinned-row reordering when the server can't store pins", async () => {
     mocks.filterHonored = false;

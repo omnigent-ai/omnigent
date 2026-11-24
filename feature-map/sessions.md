@@ -45,8 +45,9 @@ the header menu), and each place is a separate entry point.
   row pins it above or below that row, by the half it's released over, and
   releasing it just below the last pin pins it at the bottom. Only standalone
   sessions and family representatives can be pinned or reordered this way.
-- `custom-order`: with `sidebar_grouping_ui` (on by default), drop one of your sessions onto
-  another row of the same list, project or group (or use Move up/down) to switch
+- `custom-order`: with `sidebar_grouping_ui` (on by default), drop one of your sessions on
+  the upper or lower edge of another row of the same list, project or group (its center
+  nests instead), or use Move up/down, to switch
   Ordering to Custom. Positions are saved on this device and new sessions appear
   above them; a drop on another project's row still files the session there.
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
@@ -470,7 +471,8 @@ just below the last pin to pin it at the bottom. Only standalone sessions and
 family representatives can be dragged to pin or reorder a pin.
 
 **Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
-another row in the same list, project or group and release it; a line like the
+the upper or lower edge of another row in the same list, project or group and release it
+(the row's center nests it instead); a line like the
 Pinned section's marks where it lands. Move up and Move down in the row menu or
 right-click menu do the same. On mobile, press and hold a row in the sidebar
 drawer, then drag it. Ordering → Custom in the filter menu keeps the order shown.

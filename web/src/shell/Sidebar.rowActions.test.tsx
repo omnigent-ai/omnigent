@@ -1206,7 +1206,10 @@ describe("two-step move menu", () => {
     view.unmount();
     // A server without standalone destinations still offers existing nests.
     mocks.searchRows = [];
-    renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
+    const fallback = renderSidebar(
+      undefined,
+      serverInfo({ sibling_sessions: true, session_nest_moves: true }),
+    );
     fireEvent.pointerDown(
       within(
         document.querySelector('li[data-sidebar-session-id="conv_1"]') as HTMLElement,
@@ -1219,6 +1222,32 @@ describe("two-step move menu", () => {
     expect(screen.queryByRole("menuitem", { name: "Standalone session" })).toBeNull();
     fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from nest" }));
     expect(mocks.moveToNest.mutate).toHaveBeenLastCalledWith({ id: CONV.id, destination: null });
+    fallback.unmount();
+    // A pinned standalone session keeps pin drops, so the keyboard picker is how to nest under it.
+    mocks.pinnedStore.set([standalone.id]);
+    renderSidebar(
+      undefined,
+      serverInfo({
+        sibling_sessions: true,
+        session_nest_moves: true,
+        session_nest_standalone_destinations: true,
+      }),
+    );
+    fireEvent.pointerDown(
+      within(
+        document.querySelector('li[data-sidebar-session-id="conv_1"]') as HTMLElement,
+      ).getByTestId("conversation-actions"),
+      { button: 0 },
+    );
+    await open(screen.getByTestId("move-to-project"));
+    await open(await screen.findByRole("menuitem", { name: "Nests" }));
+    const pinnedHead = await screen.findByRole("menuitem", { name: "Standalone session" });
+    pinnedHead.focus();
+    fireEvent.keyDown(pinnedHead, { key: "Enter" });
+    expect(mocks.moveToNest.mutate).toHaveBeenLastCalledWith({
+      id: CONV.id,
+      destination: standalone,
+    });
   });
 });
 

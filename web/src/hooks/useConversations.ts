@@ -2641,9 +2641,14 @@ export function useMoveToNest() {
       return (await response.json()) as Conversation;
     },
     onMutate: async ({ id, destination }) => {
+      // Open-session rows refetch without tombstones, so an answer in flight would undo them.
+      const backfills = [id, ...(destination ? [destination.id] : [])].map((rowId) => [
+        "conversation-backfill",
+        rowId,
+      ]);
       await Promise.all(
-        ["conversations", "project-sessions"].map((key) =>
-          queryClient.cancelQueries({ queryKey: [key] }),
+        [["conversations"], ["project-sessions"], ...backfills].map((queryKey) =>
+          queryClient.cancelQueries({ queryKey }),
         ),
       );
       const row = findCachedConversationRow(queryClient, id);
@@ -2740,7 +2745,12 @@ export function useMoveToNest() {
           ["project-sessions"],
           ["projects"],
           ["session", id],
-          ...(previous?.head ? [["session", previous.head.row.id]] : []),
+          ...(previous?.head
+            ? [
+                ["session", previous.head.row.id],
+                ["conversation-backfill", previous.head.row.id],
+              ]
+            : []),
           PINNED_CONVERSATIONS_KEY,
         ].map((queryKey) => queryClient.invalidateQueries({ queryKey })),
       );
