@@ -1,9 +1,13 @@
-"""Filter construction contracts without loading filters or starting processes."""
+"""Filter construction and cBPF export without installing filters."""
 
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import errno
+import struct
+import sys
+import tempfile
 from unittest.mock import MagicMock
 
 import pytest
@@ -181,3 +185,23 @@ def test_export_rejects_a_descriptor_that_cannot_reach_the_c_abi(
     with pytest.raises(ValueError, match="file descriptor"):
         seccomp.export_seccomp_filter(_RULES, descriptor)
     filter_library.seccomp_init.assert_not_called()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="libseccomp is Linux-only")
+def test_export_writes_real_bpf_to_a_caller_owned_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    if ctypes.util.find_library("seccomp") is None:
+        pytest.skip("libseccomp is not installed")
+    library = seccomp._load_libseccomp()
+    load = MagicMock(side_effect=AssertionError("An export must never install a filter"))
+    monkeypatch.setattr(library, "seccomp_load", load)
+    monkeypatch.setattr(seccomp, "_load_libseccomp", lambda: library)
+
+    with tempfile.TemporaryFile() as output:
+        descriptor = output.fileno()
+        seccomp.export_seccomp_filter(_RULES, descriptor)
+        written = output.tell()
+        assert written > 0 and written % struct.calcsize("=HBBI") == 0
+        output.seek(0)
+        assert len(output.read()) == written
+        assert output.fileno() == descriptor
+    load.assert_not_called()
