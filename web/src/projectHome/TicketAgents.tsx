@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { ChevronRightIcon, MessageSquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -8,6 +8,8 @@ import { Link } from "@/lib/routing";
 import { projectOrchestratorPath } from "./projectHomeNavigation";
 import { TicketError } from "./TicketControls";
 import { TicketSessionLink } from "./TicketSessionLink";
+import { ticketPersonaAgents } from "./ticketPersonaAgents";
+import { useProjectIdentities } from "./useProjectIdentities";
 import { useTicketEvents, useTicketSessions } from "./useProjectTickets";
 
 export function TicketAgents({
@@ -34,6 +36,30 @@ export function TicketAgents({
   const sessions = query.data?.pages.flatMap((page) => page.data) ?? [];
   const orchestratorId = project.sessionId;
   const orchestrator = sessions.find((session) => session.session_id === orchestratorId);
+  const identities = useProjectIdentities(projectId).data;
+  const personaNames = useMemo(
+    () =>
+      new Map(
+        (identities ?? []).flatMap((identity) =>
+          identity.active_session_id ? [[identity.active_session_id, identity.name] as const] : [],
+        ),
+      ),
+    [identities],
+  );
+  // Personas get work through labels and routed turns, so they're often never linked.
+  const personaAgents = ticketPersonaAgents({
+    identities: identities ?? [],
+    labels: ticket.labels,
+    eventSessionIds: new Set(
+      (activity.data?.pages ?? []).flatMap((page) =>
+        page.data.flatMap((event) => (event.session_id ? [event.session_id] : [])),
+      ),
+    ),
+    excludeSessionIds: new Set([
+      ...(orchestratorId ? [orchestratorId] : []),
+      ...sessions.map((session) => session.session_id),
+    ]),
+  });
   return (
     <section aria-label="Agents" className="space-y-2">
       <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Agents</h3>
@@ -79,9 +105,21 @@ export function TicketAgents({
                 showStatus
                 needsResponse={responseSession === session.session_id}
                 involvement={session.involvement}
+                label={personaNames.get(session.session_id)}
               />
             </li>
           ))}
+        {personaAgents.map((agent) => (
+          <li key={agent.sessionId}>
+            <TicketSessionLink
+              sessionId={agent.sessionId}
+              showStatus
+              needsResponse={responseSession === agent.sessionId}
+              involvement={agent.involvement}
+              label={agent.name}
+            />
+          </li>
+        ))}
       </ul>
       {query.isPending && <Spinner aria-label="Loading agents" />}
       {query.hasNextPage && (
