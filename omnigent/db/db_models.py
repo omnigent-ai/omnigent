@@ -223,6 +223,9 @@ class SqlAgent(OmnigentBase):
     # the owner; NULL for server agents and pre-migration rows (an unowned
     # user agent is admin-only).
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Project scope: set on a project role's agent (a ``kind = user`` row owned
+    # by the project owner); NULL for every other agent.
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_agents_kind"),
@@ -242,6 +245,17 @@ class SqlAgent(OmnigentBase):
             "workspace_id",
             "kind",
             "created_by",
+            "created_at",
+            "id",
+        ),
+        # One owner's agents split by project: "my agents" (project_id IS NULL)
+        # and a project's agents, each in creation order.
+        Index(
+            "ix_agents_owner_project_created",
+            "workspace_id",
+            "kind",
+            "created_by",
+            "project_id",
             "created_at",
             "id",
         ),
@@ -1005,6 +1019,10 @@ class SqlProjectIdentity(OmnigentBase):
     # The agent session that created it; NULL for owner-made identities, which
     # agents may not edit.
     created_by_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # The seat's project agent (an ``agents`` row scoped to this project). NULL
+    # until the role is converted; ``agent_id``, ``instructions``, ``model`` and
+    # ``effort`` keep their meaning so older binaries still run the role.
+    project_agent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
