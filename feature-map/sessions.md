@@ -354,6 +354,14 @@ the header menu), and each place is a separate entry point.
   Server admins configure the available targets under Settings → Admin → General →
   **Nested agent destinations**.
 
+- To move a conversation from the browser to the desktop app, open its link
+  (`/c/<id>`) in a desktop browser while the app is running and connected to
+  that server. The first time, a toast asks **Open conversations in the
+  Omnigent desktop app?**; **Open in app** opens it there and makes later links
+  move on their own. Turn it on or off under Settings → General → Conversation
+  links → **Open conversations in the desktop app**. Links to a file or to
+  Canvas stay in the browser.
+
 **Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
@@ -752,7 +760,10 @@ after stopping; this relaunches the parent and both use one runner. Sending to
 an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
-chat with its tab's close button; the parent and sibling chats keep running.
+chat with its tab's close button or its tab menu's Close; the parent and sibling
+chats keep running. Close other tabs and Close all tabs, in the tab menu or the
+rail's panel picker (⌄), stop every side chat they close, while sub-agent tabs
+they close are only hidden.
 On another device, open the same parent: saved side chats appear in the existing
 Workspace tab strip or mobile Side chats drawer. Discovery fetches up to 20 chats
 without changing the active panel or tab. Tabs closed on this device stay closed

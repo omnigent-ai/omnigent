@@ -181,6 +181,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       sessionArchived: state?.sessionArchived === true,
     });
   },
+  /**
+   * Report the conversation this page is showing, once it has loaded for the
+   * signed-in user; null when it shows none. Fire-and-forget.
+   * @param {string | null} conversationId
+   */
+  reportConversationShown: (conversationId) => {
+    ipcRenderer.send(
+      "omnigent:conversation-shown",
+      typeof conversationId === "string" ? conversationId : null,
+    );
+  },
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */

@@ -26,7 +26,7 @@ from sqlalchemy.schema import CreateIndex
 from omnigent.db.db_models import SqlGadgetShare, gadget_grantee_key
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 
-_PREVIOUS = "bf30d7cbda61"
+_PREVIOUS = "47d3e8fc3e25"
 _REVISION = "e4c7a91b2d3f"
 _TABLE = "gadget_shares"
 _KEY_INDEX = "ix_gadget_shares_gadget_user_key"
