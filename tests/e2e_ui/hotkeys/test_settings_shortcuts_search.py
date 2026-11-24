@@ -49,7 +49,7 @@ def test_keyboard_shortcuts_search_filters_the_table(page: Page, live_server: st
     filter_field.fill("cmd+k" if sys.platform == "darwin" else "ctrl+k")
     expect(rows).to_have_count(1)
     expect(rows.first).to_contain_text("Open command palette")
-    # So does a chord the page shows for a row the registry doesn't bind.
+    # So does a chord only a browser tab shows.
     filter_field.fill("cmd+shift+o" if sys.platform == "darwin" else "ctrl+shift+o")
     expect(rows).to_have_count(1)
     expect(rows.first).to_contain_text("Start a new session")
@@ -67,6 +67,12 @@ def test_keyboard_shortcuts_search_filters_the_table(page: Page, live_server: st
     page.keyboard.press("Enter")
     expect(filter_field).to_have_value("")
     _expect_revealed(page, "shortcut.palette.commands")
+
+    # Every row the page lists is a search result, the composer's own keys included.
+    _search_field(page).fill("Send message")
+    expect(page.get_by_role("option").first).to_contain_text("Send message")
+    page.keyboard.press("Enter")
+    _expect_revealed(page, "shortcut.composer.send")
 
 
 def test_flag_off_keeps_the_shortcuts_page_without_a_field(page: Page, live_server: str) -> None:
