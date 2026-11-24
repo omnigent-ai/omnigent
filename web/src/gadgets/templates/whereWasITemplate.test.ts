@@ -274,6 +274,21 @@ describe("where was I template", () => {
     expect(byId("next-list").textContent).toContain("Done");
   });
 
+  it("says when a scan's page budget ended before every session was listed", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [
+      { id: "current", version: "v1", value: { ...RADAR, sessions_unchecked: true } },
+    ]);
+    await waitFor(() =>
+      expect(byId("meta").textContent).toContain("older sessions not all checked"),
+    );
+    // Sessions are listed by creation, so the guide reads a fixed number of pages by activity
+    // instead of stopping at the first page created before the window.
+    expect(WHERE_WAS_I_GUIDE).toContain("at most 4 pages");
+    expect(WHERE_WAS_I_GUIDE).not.toContain("until rows were created before the window");
+  });
+
   it("asks the viewer to start the gadget session when a scan waits for it", async () => {
     const { emit, ready } = startRadar({ delivery: "starting" });
     await waitFor(() => expect(ready()).toBe(true));

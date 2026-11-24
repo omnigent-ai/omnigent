@@ -47,6 +47,7 @@ export const WHERE_WAS_I_SCHEMA = {
     scanned_at: time,
     window_days: { type: "integer", minimum: 1, maximum: 30 },
     sessions_read: { type: "integer", minimum: 0, maximum: 500 },
+    sessions_unchecked: { type: "boolean" },
     headline: text(240),
     example: { type: "boolean" },
     areas: {
@@ -1058,6 +1059,7 @@ ${GADGET_KIT_HELPERS}
       else if (value.scanned_at) parts.push('Scanned ' + ago(value.scanned_at));
       parts.push('last ' + value.window_days + (value.window_days === 1 ? ' day' : ' days'));
       if (typeof value.sessions_read === 'number') parts.push(value.sessions_read + (value.sessions_read === 1 ? ' session read' : ' sessions read'));
+      if (value.sessions_unchecked) parts.push('older sessions not all checked');
     }
     $('meta').textContent = parts.join(' · ');
     $('headline').textContent = (value && value.headline) || '';
@@ -1619,7 +1621,7 @@ export const WHERE_WAS_I_GUIDE = [
   "",
   "## The radar record",
   "",
-  "- `scanned_at` (ISO 8601 UTC), `window_days`, `sessions_read`, and `headline`: one plain sentence on where the work stands.",
+  "- `scanned_at` (ISO 8601 UTC), `window_days`, `sessions_read`, `sessions_unchecked` (true when the page budget ended before every session was listed), and `headline`: one plain sentence on where the work stands.",
   "- `areas` (up to 12): `{id, title, summary, state, kind, related, items, next_steps}`. `id` is a stable lowercase slug (`[a-z0-9][a-z0-9_-]*`, at most 64). `state` is `active`, `blocked`, `waiting` (on someone or something else) or `done`. `kind` is a word such as rollout, investigation, review, bug, incident or project. `related` lists IDs of areas that depend on or inform this one.",
   "- `items` (up to 8 per area): the threads of work in it, `{id, title, summary, state, session_ids}`.",
   "- `next_steps` (up to 5 per area): `{id, label, kind, why_now, confidence, pattern, pattern_step, nudge, session_id, evidence: {session_id, quote}}`. `kind` is `act` or `monitor`. `id` is a stable slug, unique across the radar, which also names its `step_runs` and `dismissed` records. `confidence` (0 to 1) is your estimate that the viewer clicks it: the page shows a step only at or above its pattern's `bar` (0.7 without one) and never one without `confidence`. `pattern` and `pattern_step` are IDs from the patterns record. `nudge` is `forgotten` (a step they usually skip or do late), `overdue` (past its usual time) or `due`.",
@@ -1655,7 +1657,7 @@ export const WHERE_WAS_I_GUIDE = [
   "The Scan button requests the `scan` action with `window_days`. A chat request to scan, or an automation's prompt, works the same way.",
   "",
   "1. Read the `layout` record, and the `render_reports` record whose ID is the published revision from `sys_gadget_get`. If it says `failed`, restore the previous look first (Restoring). Do not read the page's HTML on a scan unless you are about to change the page.",
-  "2. List sessions with `sys_session_list` (visibility `mine`). Each row has `last_activity_at` in Unix seconds: keep the sessions active within `window_days` of now, at most 25, most recently active first. Rows are ordered by creation, so page on with `cursor` until rows were created before the window. Skip this gadget session, sessions you started for this gadget's next steps, and trivial ones.",
+  "2. List sessions with `sys_session_list` (visibility `mine`). Rows are ordered by creation, not activity, so a session created long ago can be active today: read at most 4 pages with `cursor`, and keep from all of them the sessions whose `last_activity_at` (Unix seconds) is within `window_days` of now, at most 25, most recently active first. Don't stop at a page of sessions created before the window. When pages remain after the fourth, set `sessions_unchecked` true in the radar so the page says older sessions were not all checked. Skip this gadget session, sessions you started for this gadget's next steps, and trivial ones.",
   "3. For each kept session read only a little: its title and status, then its journal with `sys_journal_read` and its `conversation_id` when that tool is available, else `sys_session_get_history` limited to its last few items. Journal tools are optional; never ask a session to start a journal, and never read whole transcripts. On a rescan, read again only the sessions active since the radar's `scanned_at` and keep what the radar already says about the others.",
   "4. Group by goal: several sessions about one rollout are one area; one session can feed several areas. Name each area by what the viewer is trying to get done.",
   "5. Update the patterns record and choose next steps (Patterns, Next up). Leave out steps in `dismissed`; drop steps whose `step_runs` say done, and give the pattern's following step a new ID when it becomes due.",
