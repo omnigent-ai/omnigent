@@ -839,6 +839,9 @@ describe("NewChatLandingScreen in the floating panel", () => {
       "aria-keyshortcuts",
       `${ARIA_MOD_KEY}+Enter`,
     );
+    // The prompt sits under the panel's top edge, so suggestions open below it.
+    typeMessage("/");
+    expect(await screen.findByTestId("slash-command-menu")).toHaveClass("top-11");
   });
 
   it("keeps the main window's composer card, with no chord hint", async () => {
@@ -851,6 +854,8 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(screen.getByTestId("new-chat-landing-actions")).not.toHaveClass("border-t");
     expect(screen.queryByTestId("new-chat-landing-send-shortcut")).not.toBeInTheDocument();
     expect(screen.getByTestId("new-chat-landing-submit")).not.toHaveAttribute("aria-keyshortcuts");
+    typeMessage("/");
+    expect(await screen.findByTestId("slash-command-menu")).toHaveClass("bottom-full");
   });
 
   it("tells the panel when the native file picker opens and closes", async () => {
