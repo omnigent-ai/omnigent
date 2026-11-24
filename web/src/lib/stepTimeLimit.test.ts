@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   shortTimeLimit,
+  splitTimeLimit,
   stepTimeLimit,
   timeLimitLength,
   timeLimitMinutes,
@@ -40,6 +41,9 @@ describe("timeLimitMinutes and shortTimeLimit", () => {
     ["1 day", 1440, "24h"],
     ["90 min", 90, "1h 30m"],
     ["1.5h, then tell me", 90, "1h 30m"],
+    ["1 hour 30 minutes", 90, "1h 30m"],
+    ["1h 30m", 90, "1h 30m"],
+    ["1 day and 2 hours", 1560, "26h"],
   ])("%s is %i minutes, %s", (limit, minutes, short) => {
     expect(timeLimitMinutes(limit)).toBe(minutes);
     expect(shortTimeLimit(limit)).toBe(short);
@@ -47,6 +51,8 @@ describe("timeLimitMinutes and shortTimeLimit", () => {
 
   it("reads the length a limit worded at more length starts with", () => {
     expect(timeLimitLength("2 hours. Tell me if it runs longer.")).toBe("2 hours");
+    expect(timeLimitLength("1 hour 30 minutes, then tell me")).toBe("1 hour 30 minutes");
+    expect(timeLimitLength("2 hours and then tell me")).toBe("2 hours");
     expect(timeLimitLength("an afternoon")).toBeNull();
   });
 
@@ -99,23 +105,31 @@ describe("withStepTimeLimit", () => {
 
 describe("withSavedTimeLimits", () => {
   const saved = [
-    { id: "fix", name: "Fix", goal: withStepTimeLimit(GOAL, "2 hours"), depends_on: [] },
-    { id: "ship", name: "Ship", goal: "**Time limit:** 1 hour", depends_on: ["fix"] },
+    { id: "fix", name: "Fix", goal: withStepTimeLimit(GOAL, "4 hours"), depends_on: [] },
+    { id: "ship", name: "Ship", goal: "Ship it.", depends_on: ["fix"] },
+    { id: "tell", name: "Tell", goal: "**Time limit:** 1 hour", depends_on: ["ship"] },
   ];
 
-  it("keeps a saved step's limit in a proposal that doesn't word one", () => {
+  it("gives an older proposal the saved limits, set, changed or cleared since", () => {
     const proposed = [
-      { ...saved[0]!, goal: GOAL },
-      { ...saved[1]!, goal: null },
+      { ...saved[0]!, goal: withStepTimeLimit(GOAL, "2 hours") },
+      { ...saved[1]!, goal: "Ship it.\n\n**Time limit:** 2 hours" },
+      { ...saved[2]!, goal: null },
     ];
     expect(withSavedTimeLimits(proposed, saved)).toEqual(saved);
   });
 
-  it("keeps the proposal's own limit, and adds none to a step that wasn't saved", () => {
-    const proposed = [
-      { ...saved[0]!, goal: withStepTimeLimit(GOAL, "4 hours") },
-      { id: "report", name: "Report", goal: null, depends_on: [] },
-    ];
-    expect(withSavedTimeLimits(proposed, saved)).toEqual(proposed);
+  it("leaves a step the saved workflow doesn't have as proposed", () => {
+    const report = { id: "report", name: "Report", goal: "**Time limit:** 1 day", depends_on: [] };
+    expect(withSavedTimeLimits([report], saved)).toEqual([report]);
+  });
+});
+
+describe("splitTimeLimit", () => {
+  it("separates the limit from the rest of the description, wherever its line sits", () => {
+    const after = `${GOAL}\n\n**Time limit:** 2 hours`;
+    expect(splitTimeLimit(after)).toEqual(splitTimeLimit(withStepTimeLimit(GOAL, "2 hours")));
+    expect(splitTimeLimit(after)).toEqual([GOAL, "2 hours"]);
+    expect(splitTimeLimit(null)).toEqual([null, null]);
   });
 });

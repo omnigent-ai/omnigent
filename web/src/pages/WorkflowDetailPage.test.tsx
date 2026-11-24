@@ -126,12 +126,17 @@ vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
         {steps.map((step) => step.name).join(", ")}
       </div>
       {onTimeLimitChange && (
-        <button
-          type="button"
-          onClick={() => onTimeLimitChange({ stepId: "fix", limit: "2 hours" })}
-        >
-          Limit Fix the test to 2 hours
-        </button>
+        <>
+          <button
+            type="button"
+            onClick={() => onTimeLimitChange({ stepId: "fix", limit: "4 hours" })}
+          >
+            Limit Fix the test to 4 hours
+          </button>
+          <button type="button" onClick={() => onTimeLimitChange({ stepId: "fix", limit: null })}>
+            Clear Fix the test's limit
+          </button>
+        </>
       )}
     </>
   ),
@@ -417,32 +422,27 @@ describe("WorkflowDetailPage", () => {
     },
   );
 
-  it("saves a step's time limit into its description, which an older proposal keeps", async () => {
+  /** A saved workflow whose planning chat holds *proposal*; each PATCH stores its steps. */
+  async function workflowWithProposal(saved: WorkflowStep[], proposal: JournalEntry) {
     vi.mocked(useServerInfo).mockReturnValue(FALLBACK_SERVER_INFO);
     const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
     vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
     mockRuns([]);
-    let stored: WorkflowDetail = { ...WORKFLOW, planning_session_id: "a".repeat(32) };
+    let stored: WorkflowDetail = {
+      ...WORKFLOW,
+      steps: saved,
+      planning_session_id: "a".repeat(32),
+      updated_at: 10,
+    };
     const patches: { steps: WorkflowStep[] }[] = [];
     vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
       if (options?.method === "PATCH") {
         const body = JSON.parse(String(options.body)) as { steps: WorkflowStep[] };
         patches.push(body);
-        stored = { ...stored, steps: body.steps };
+        stored = { ...stored, steps: body.steps, updated_at: (stored.updated_at ?? 0) + 10 };
       }
       return new Response(JSON.stringify(stored));
     });
-    // The planning chat's last proposal is the saved plan, from before the limit.
-    const proposal: JournalEntry = {
-      id: "proposal",
-      position: 1,
-      created_at: 1,
-      scheduled_task_run_id: null,
-      step: null,
-      author: { type: "agent" },
-      kind: "plan",
-      content: { steps: WORKFLOW.steps },
-    };
     vi.mocked(useSessionJournal).mockReturnValue({
       entries: [proposal],
       isLoading: false,
@@ -452,38 +452,57 @@ describe("WorkflowDetailPage", () => {
       loadOlder: vi.fn(),
       retry: vi.fn(),
     });
+    return patches;
+  }
+
+  function plan(createdAt: number, steps: WorkflowStep[]): JournalEntry {
+    return {
+      id: `proposal-${createdAt}`,
+      position: 1,
+      created_at: createdAt,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      content: { steps },
+    };
+  }
+
+  const graphGoals = () => JSON.parse(screen.getByTestId("workflow-steps-graph").dataset.goals!);
+
+  it("keeps a limit set or cleared from the menu over the proposal it was saved from", async () => {
+    // The planning chat's proposal set 2 hours, and Save plan saved it.
+    const twoHours = "The suite passes\n\n**Time limit:** 2 hours";
+    const saved = [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: twoHours }];
+    const patches = await workflowWithProposal(saved, plan(5, saved));
     renderPage();
 
-    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 2 hours" }));
-    const limited = "The suite passes\n\n**Time limit:** 2 hours";
-    await waitFor(() =>
-      expect(patches).toEqual([
-        { steps: [WORKFLOW.steps[0], { ...WORKFLOW.steps[1], goal: limited }] },
-      ]),
-    );
-    // The proposal without the limit keeps it, so it isn't offered as a change.
-    await waitFor(() =>
-      expect(JSON.parse(screen.getByTestId("workflow-steps-graph").dataset.goals!)).toEqual([
-        null,
-        limited,
-      ]),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    const fourHours = "The suite passes\n\n**Time limit:** 4 hours";
+    await waitFor(() => expect(graphGoals()).toEqual([null, fourHours]));
+    expect(patches.at(-1)!.steps[1]!.goal).toBe(fourHours);
     expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
     expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
+    expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
 
-    // A later proposal that changes a step keeps the limit when it's saved.
-    proposal.content = {
-      steps: [WORKFLOW.steps[0], { ...WORKFLOW.steps[1], name: "Fix the flaky test" }],
-    };
-    cleanup();
+    fireEvent.click(screen.getByRole("button", { name: "Clear Fix the test's limit" }));
+    await waitFor(() => expect(graphGoals()).toEqual([null, "The suite passes"]));
+    expect(patches.at(-1)!.steps[1]!.goal).toBe("The suite passes");
+    expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
+    expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+  });
+
+  it("offers a newer proposal's steps as written, time limits included", async () => {
+    const oneHour = "The suite passes\n\n**Time limit:** 1 hour";
+    const patches = await workflowWithProposal(
+      WORKFLOW.steps,
+      plan(50, [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: oneHour }]),
+    );
     renderPage();
+
     fireEvent.click(await screen.findByRole("button", { name: "Save plan" }));
-    await waitFor(() => expect(patches).toHaveLength(2));
-    expect(patches[1]!.steps[1]).toEqual({
-      ...WORKFLOW.steps[1],
-      name: "Fix the flaky test",
-      goal: limited,
-    });
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]!.steps[1]!.goal).toBe(oneHour);
   });
 
   it("offers time limits only to the owner, and not while a proposal is unsaved", () => {
@@ -491,7 +510,7 @@ describe("WorkflowDetailPage", () => {
     mockWorkflow({ data: { ...WORKFLOW, viewer_role: "viewer" } });
     renderPage();
     expect(screen.getByTestId("workflow-steps-graph")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Limit Fix the test to 2 hours" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeNull();
 
     cleanup();
     mockWorkflow({ data: { ...WORKFLOW, planning_session_id: "a".repeat(32) } });
@@ -517,7 +536,7 @@ describe("WorkflowDetailPage", () => {
     });
     renderPage();
     expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Limit Fix the test to 2 hours" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeNull();
   });
 
   it("expands the planner over the page in place, on wide screens only", () => {

@@ -60,7 +60,7 @@ import { UNSHAREABLE_WORKFLOW_MESSAGE, workflowSharingAvailable } from "@/lib/pe
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { currentPlan, planDescription, planSteps } from "@/lib/sessionJournal";
-import { withSavedTimeLimits, withStepTimeLimit } from "@/lib/stepTimeLimit";
+import { splitTimeLimit, withSavedTimeLimits, withStepTimeLimit } from "@/lib/stepTimeLimit";
 import { ApiError } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 
@@ -175,8 +175,13 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const summary = { id: workflow.id, name: workflow.name, description: workflow.description };
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
-  // A step keeps the time limit set on the saved workflow unless the proposal words its own.
-  const proposedSteps = proposal ? withSavedTimeLimits(planSteps(proposal), workflow.steps) : null;
+  // The newest write's time limits win: a proposal older than the workflow's last save, in whole
+  // seconds, takes the saved steps' limits, so a limit set or cleared on the page since stands.
+  const proposedSteps = proposal
+    ? proposal.created_at > (workflow.updated_at ?? 0)
+      ? planSteps(proposal)
+      : withSavedTimeLimits(planSteps(proposal), workflow.steps)
+    : null;
   // Where the description's source sits in this journal: null when it came from another
   // planning chat, undefined until the server places it, which offers no description meanwhile.
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
@@ -194,9 +199,15 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
       ? proposedDescription
       : null;
   const proposedChosen = newDescription !== null && acceptedProposalId === proposal?.id;
+  // A time limit compares by its value, wherever its line sits in the description.
   const stepSignature = (steps: typeof workflow.steps) =>
     JSON.stringify(
-      steps.map(({ id, name, goal, depends_on }) => [id, name, goal ?? null, depends_on]),
+      steps.map(({ id, name, goal, depends_on }) => [
+        id,
+        name,
+        ...splitTimeLimit(goal),
+        depends_on,
+      ]),
     );
   const hasChanges =
     !!proposedSteps?.length &&
