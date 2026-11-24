@@ -1751,11 +1751,8 @@ describe("grid cell composer shares its session's draft", () => {
     writeAlwaysSteer(false);
     const shot = new File(["a"], "shot.png", { type: "image/png" });
     const text = "Look at @shot.png";
-    const sharedDraft = {
-      text,
-      files: [],
-      mentions: { files: [], sessions: [], attachments: [{ token: "@shot.png", file: shot }] },
-    };
+    // A chip leaves the main composer as a tray file, so the shared draft carries its file.
+    const sharedDraft = { text, files: [shot] };
     conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
     bridgedCell(sharedDraft);
     fireEvent.click(screen.getByTestId("side-chat-send"));
@@ -1814,11 +1811,7 @@ describe("grid cell composer shares its session's draft", () => {
   it("renames a tray file pasted into a cell when a chip already has its name", () => {
     const chipShot = new File(["c"], "image.png", { type: "image/png" });
     const traySource = new File(["t"], "image.png", { type: "image/png" });
-    bridgedCell({
-      text: "Look @image.png",
-      files: [],
-      mentions: { files: [], sessions: [], attachments: [{ token: "@image.png", file: chipShot }] },
-    });
+    bridgedCell({ text: "Look @image.png", files: [chipShot] });
     fireEvent.paste(screen.getByTestId("side-chat-input"), {
       clipboardData: {
         items: [{ kind: "file", type: traySource.type, getAsFile: () => traySource }],
@@ -1827,8 +1820,8 @@ describe("grid cell composer shares its session's draft", () => {
     fireEvent.click(screen.getByTestId("side-chat-send"));
     const sent = send.mock.calls[0]!;
     expect(sent[0]).toBe("Look @image.png");
-    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["image (2).png", "image.png"]);
-    expect((sent[2] as File[])[1]).toBe(chipShot);
+    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["image.png", "image (2).png"]);
+    expect((sent[2] as File[])[0]).toBe(chipShot);
   });
 
   it("sends a tagged skill command as an ordinary message, not as a local command", () => {

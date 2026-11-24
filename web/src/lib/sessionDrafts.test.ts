@@ -145,36 +145,13 @@ describe("session drafts", () => {
     expect(getSessionDraft("conversation")).toBeUndefined();
   });
 
-  it("keeps a draft's pasted chips in memory when they are its only tags", async () => {
-    const { getSessionDraft, setSessionDraft, setSessionMentions } =
-      await import("./sessionDrafts");
-    setSessionDraft("conversation", { text: "@a.png", files: [] });
-    const file = new File(["x"], "a.png", { type: "image/png" });
-    setSessionMentions("conversation", {
-      files: [],
-      sessions: [],
-      attachments: [{ token: "@a.png", file }],
-    });
-    expect(getSessionDraft("conversation")?.mentions?.attachments).toEqual([
-      { token: "@a.png", file },
-    ]);
-  });
-
-  it("keeps a pasted chip's text but not its file across a reload, as tray files are", async () => {
+  it("keeps a draft's text but not its tray files across a reload", async () => {
     const { setSessionDraft } = await import("./sessionDrafts");
     const file = new File(["x"], "pasted-text.txt", { type: "text/plain" });
-    setSessionDraft("conversation", {
-      text: "Read @pasted-text.txt",
-      files: [],
-      mentions: { files: [], sessions: [], attachments: [{ token: "@pasted-text.txt", file }] },
-    });
-    expect(sessionStorage.getItem(key)).not.toContain("attachments");
+    setSessionDraft("conversation", { text: "Read @pasted-text.txt", files: [file] });
     vi.resetModules();
     const { getSessionDraft } = await import("./sessionDrafts");
-    expect(getSessionDraft("conversation")).toEqual({
-      text: "Read @pasted-text.txt",
-      files: [],
-    });
+    expect(getSessionDraft("conversation")).toEqual({ text: "Read @pasted-text.txt", files: [] });
   });
 
   it("keeps plain drafts backwards-compatible and removes empty drafts", async () => {
@@ -202,96 +179,70 @@ describe("session drafts", () => {
     expect(sessionDraftRevision("conversation")).toBe(0);
   });
 
-  // Failed-draft recovery merges two drafts' chips and tray files. Recovery never edits typed text,
-  // so a row's message is what the drafts typed (chips merged into a new name aside). Each row checks
-  // unique filenames in send order (tray, then chips), chips naming their own file, and that every
-  // tagged token in the message still expands to its own target.
-  type Chips = [string, File][];
-  type Sessions = { token: string; id: string; title: string }[];
-  type FileTags = { token: string; path: string }[];
+  // Failed-draft recovery merges two drafts' tags and tray files. A pasted chip has already left
+  // its composer as a tray file, so it is one here. Recovery never edits typed text: each row's
+  // message is what the drafts typed. Each row checks unique filenames in send order (tray files, in
+  // order), and that every tagged token in the message still expands to its own target.
   interface Side {
     message: string;
     files: File[];
-    chips: Chips;
-    sessions?: Sessions;
-    fileTags?: FileTags;
+    sessions?: { token: string; id: string; title: string }[];
+    fileTags?: { token: string; path: string }[];
   }
-  const recoveryRows: [
-    string,
-    Side,
-    Side,
-    { message: string; names: string[]; chipTokens: string[] },
-  ][] = [
+  const recoveryRows: [string, Side, Side, { message: string; names: string[] }][] = [
     [
-      "a tray file that repeats a chip's name is renamed",
-      { message: "", files: [], chips: [["@a.png", new File(["a"], "a.png")]] },
-      { message: "see @a.png", files: [new File(["b"], "a.png")], chips: [] },
-      { message: "see @a.png", names: ["a (2).png", "a.png"], chipTokens: ["@a.png"] },
+      "a tray file that repeats a file's name is renamed",
+      { message: "", files: [new File(["a"], "a.png")] },
+      { message: "see @a.png", files: [new File(["b"], "a.png")] },
+      { message: "see @a.png", names: ["a.png", "a (2).png"] },
     ],
     [
-      "a chip that repeats another chip's name avoids a spelling already typed",
-      {
-        message: "use @image (2).png",
-        files: [],
-        chips: [["@image.png", new File(["a"], "image.png")]],
-      },
-      {
-        message: "look @image.png",
-        files: [],
-        chips: [["@image.png", new File(["b"], "image.png")]],
-      },
-      {
-        message: "use @image (2).png\n\nlook @image (3).png",
-        names: ["image.png", "image (3).png"],
-        chipTokens: ["@image.png", "@image (3).png"],
-      },
+      "a file from each draft that repeats a name keeps the names distinct",
+      { message: "use @image (2).png", files: [new File(["a"], "image.png")] },
+      { message: "look @image.png", files: [new File(["b"], "image.png")] },
+      { message: "use @image (2).png\n\nlook @image.png", names: ["image.png", "image (2).png"] },
     ],
     [
       "two incoming files collide, and each reference keeps its own file",
-      { message: "", files: [], chips: [["@a.png", new File(["a"], "a.png")]] },
+      { message: "", files: [new File(["a"], "a.png")] },
       {
         message: "First @a.png then second @a (2).png",
         files: [new File(["b"], "a.png"), new File(["c"], "a (2).png")],
-        chips: [],
       },
       {
         message: "First @a.png then second @a (2).png",
-        names: ["a (3).png", "a (2).png", "a.png"],
-        chipTokens: ["@a.png"],
+        names: ["a.png", "a (3).png", "a (2).png"],
       },
     ],
     [
       "a renamed tray file leaves a workspace tag with the same name in place",
-      { message: "", files: [new File(["a"], "README.md")], chips: [] },
+      { message: "", files: [new File(["a"], "README.md")] },
       {
         message: "Open @README.md",
         files: [new File(["b"], "README.md")],
-        chips: [],
         fileTags: [{ token: "@README.md", path: "README.md" }],
       },
-      { message: "Open @README.md", names: ["README.md", "README (2).md"], chipTokens: [] },
+      { message: "Open @README.md", names: ["README.md", "README (2).md"] },
     ],
     [
       "a renamed tray file leaves a longer session tag that contains its name as typed",
-      { message: "", files: [new File(["a"], "a.png")], chips: [] },
+      { message: "", files: [new File(["a"], "a.png")] },
       {
         message: "Use @a.png and @a (2).png plan",
         files: [new File(["b"], "a.png")],
-        chips: [],
         sessions: [{ token: "@a (2).png plan", id: "s_plan", title: "a (2).png plan" }],
       },
-      { message: "Use @a.png and @a (2).png plan", names: ["a.png", "a (2).png"], chipTokens: [] },
+      { message: "Use @a.png and @a (2).png plan", names: ["a.png", "a (2).png"] },
     ],
     [
       "a session tag that is a prefix of a renamed file's name is left as typed",
-      { message: "", files: [new File(["a"], "a.png")], chips: [] },
+      { message: "", files: [new File(["a"], "a.png")] },
       {
         message: "Check @a and @a.png",
         files: [new File(["b"], "a.png")],
-        chips: [],
         sessions: [{ token: "@a", id: "s_a", title: "a" }],
       },
-      { message: "Check @a and @a.png", names: ["a.png", "a (2).png"], chipTokens: [] },
+      { message: "Check @a and @a.png", names: ["a.png", "a (2).png"] },
     ],
   ];
 
@@ -305,10 +256,8 @@ describe("session drafts", () => {
       const mentionsOf = (side: Side) => ({
         files: (side.fileTags ?? []).map(({ token, path }) => ({ token, path, isDir: false })),
         sessions: (side.sessions ?? []).map((session) => ({ ...session, isSubagent: false })),
-        attachments: side.chips.map(([token, file]) => ({ token, file })),
       });
-      const tempHasMentions =
-        temp.chips.length + (temp.sessions ?? []).length + (temp.fileTags ?? []).length > 0;
+      const tempHasMentions = (temp.sessions ?? []).length + (temp.fileTags ?? []).length > 0;
       setSessionDraft("temp:rows", {
         text: temp.message,
         files: temp.files,
@@ -318,12 +267,9 @@ describe("session drafts", () => {
         { message: original.message, files: original.files, mentions: mentionsOf(original) },
         "temp:rows",
       );
-      const chips = recovered.mentions?.attachments ?? [];
-      const names = [...recovered.files, ...chips.map((chip) => chip.file)].map(attachmentFilename);
+      const names = recovered.files.map(attachmentFilename);
       expect(new Set(names).size).toBe(names.length);
       expect(names).toEqual(want.names);
-      expect(chips.map((chip) => chip.token)).toEqual(want.chipTokens);
-      for (const chip of chips) expect(chip.file.name).toBe(chip.token.slice(1));
       expect(recovered.message).toBe(want.message);
       // Every tagged token still in the message expands to its own target.
       const inline = composerInlineMentions(

@@ -1459,14 +1459,16 @@ describe("Composer pasted chips", () => {
     expect(screen.getByText(/"setup.exe" can't be attached/)).toBeInTheDocument();
   });
 
-  it("keeps a chip and its file when the composer remounts with the saved draft", async () => {
+  it("keeps a chip's file as a tray file when the composer remounts with the saved draft", async () => {
     const onSend = await renderCodeMirrorComposer();
     typeAt("Look ");
     paste({ files: [new File(["a"], "shot.png", { type: "image/png" })] });
     cleanup();
 
+    // A saved draft carries the chip's file as a tray file, and its text as plain literal text.
     await renderCodeMirrorComposer(onSend);
-    expect(tokens()).toEqual(["@shot.png"]);
+    expect(tokens()).toEqual([]);
+    expect(valueOf()).toBe("Look @shot.png ");
     fireEvent.submit(composerInput().closest("form")!);
     expect(sentFiles(onSend)!.map((file) => file.name)).toEqual(["shot.png"]);
   });
@@ -1541,6 +1543,7 @@ describe("Composer pasted chips", () => {
     | { pick: string }
     | { type: string }
     | { backspace: string }
+    | { remount: true }
     | "undo"
     | "redo";
   const attachmentSequences: [string, AttachmentStep[], { text: string; names: string[] }][] = [
@@ -1570,6 +1573,16 @@ describe("Composer pasted chips", () => {
       { text: "look @b.png @b (2).png", names: ["b (2).png"] },
     ],
     [
+      "a chip that crosses a draft boundary sends as a tray file, with its text as typed",
+      [{ type: "look " }, { paste: "a.png" }, { remount: true }],
+      { text: "look @a.png", names: ["a.png"] },
+    ],
+    [
+      "a name a chip left as a tray file is kept when a later pick repeats it",
+      [{ type: "look " }, { paste: "a.png" }, { remount: true }, { pick: "a.png" }],
+      { text: "look @a.png", names: ["a.png", "a (2).png"] },
+    ],
+    [
       "a deleted first chip leaves the second chip's name as it was",
       [{ paste: "a.png" }, { paste: "a.png" }, { backspace: "@a.png" }],
       { text: " @a (2).png", names: ["a (2).png"] },
@@ -1594,6 +1607,10 @@ describe("Composer pasted chips", () => {
           fireEvent.change(picker, {
             target: { files: [new File(["y"], step.pick, { type: "image/png" })] },
           });
+        } else if ("remount" in step) {
+          cleanup();
+          // oxlint-disable-next-line no-await-in-loop -- steps run in order, each after the last.
+          await renderCodeMirrorComposer(onSend);
         } else if ("type" in step) typeAt(step.type);
         else {
           const token = step.backspace;

@@ -1,3 +1,4 @@
+import { peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -2277,6 +2278,57 @@ describe("NewChatLandingScreen create flow", () => {
         expect.objectContaining({ files: [shot] }),
       ),
     );
+  });
+
+  it("carries a pasted chip's file into a new session from an unavailable sibling", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    searchParams = new URLSearchParams("sibling=source");
+    let sourceGone = false;
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      if (String(url).startsWith("/v1/sessions/source?")) {
+        if (sourceGone)
+          return new Response(JSON.stringify({ detail: "Not found" }), { status: 404 });
+        return new Response(
+          JSON.stringify({
+            id: "source",
+            title: "Source",
+            host_id: "host_1",
+            workspace: SEEDED_WORKSPACE,
+            agent_id: "ag_hello",
+            permission_level: 4,
+            labels: {},
+            items: [],
+          }),
+        );
+      }
+      return new Promise<Response>(() => {});
+    });
+    const info = { features: { chat_composer_codemirror: true }, sibling_sessions: true };
+    renderLanding([], info);
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      },
+    });
+    // Leaving the unsubmitted sibling launcher keeps its draft, chip included, for the source.
+    cleanup();
+
+    sourceGone = true;
+    renderLanding([], info);
+    fireEvent.click(await screen.findByRole("button", { name: "Continue in a new session" }));
+
+    const handoffUrl = String(navigateMock.mock.calls.at(-1)![0]);
+    const token = new URL(handoffUrl, "http://localhost").searchParams.get("handoff");
+    expect(token).not.toBeNull();
+    expect(peekNewSessionHandoff(token)!.files).toEqual([shot]);
+    expect(peekNewSessionHandoff(token)!.files[0]!.name).toBe("shot.png");
   });
 
   it("stashes the first prompt as the session's optimistic label", async () => {

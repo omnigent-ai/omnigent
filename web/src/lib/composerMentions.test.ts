@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   detectMentionAt,
-  mergeTaggedDrafts,
   recallFileMentions,
   recallSessionMentions,
   composerInlineMentions,
@@ -149,54 +148,6 @@ describe("token boundaries", () => {
   });
 });
 
-describe("merging pasted chips", () => {
-  const chip = (token: string, file: File) => ({ token, file });
-  const shot = (name = "a.png") => new File(["a"], name, { type: "image/png" });
-
-  it("gives a merged chip a name no tray file of either draft uses", () => {
-    const merged = mergeTaggedDrafts(
-      undefined,
-      {
-        text: "see @a.png",
-        mentions: { files: [], sessions: [], attachments: [chip("@a.png", shot())] },
-      },
-      { trayNames: ["a.png"] },
-    );
-    expect(merged.text).toBe("see @a (2).png");
-    expect(merged.mentions!.attachments!.map((attachment) => attachment.file.name)).toEqual([
-      "a (2).png",
-    ]);
-  });
-
-  it("does not give a merged chip a spelling the first draft already typed", () => {
-    const merged = mergeTaggedDrafts(
-      undefined,
-      {
-        text: "see @a.png",
-        mentions: { files: [], sessions: [], attachments: [chip("@a.png", shot())] },
-      },
-      { texts: ["use @a.png"] },
-    );
-    expect(merged.text).toBe("see @a (2).png");
-    expect(merged.mentions!.attachments!.map((attachment) => attachment.token)).toEqual([
-      "@a (2).png",
-    ]);
-  });
-
-  it("keeps one chip when both drafts hold the same File", () => {
-    const file = shot();
-    const merged = mergeTaggedDrafts(
-      { files: [], sessions: [], attachments: [chip("@a.png", file)] },
-      {
-        text: "see @a.png",
-        mentions: { files: [], sessions: [], attachments: [chip("@a.png", file)] },
-      },
-    );
-    expect(merged.mentions!.attachments!).toHaveLength(1);
-    expect(merged.text).toBe("see @a.png");
-  });
-});
-
 describe("pasted chips in the token scan", () => {
   it("keeps a pasted chip whole when a session token is a prefix of its name", () => {
     const file = new File(["p"], "Plan.png", { type: "image/png" });
@@ -209,9 +160,6 @@ describe("pasted chips in the token scan", () => {
     expect(expandMentionTokens("Ask @Plan @Plan.png", mentions)).toBe(
       'Ask [Session: "Plan" id=s_plan subagent=no] @Plan.png',
     );
-    expect(presentTaggedMentions(tags, ["Ask @Plan @Plan.png"])?.attachments).toEqual([
-      { token: "@Plan.png", file },
-    ]);
   });
 });
 
@@ -429,26 +377,5 @@ describe("harnessSupportsFileMentions", () => {
 
   it("is false before the session's harness is known", () => {
     expect(harnessSupportsFileMentions(null, declared)).toBe(false);
-  });
-});
-
-describe("mergeTaggedDrafts with pasted chips", () => {
-  it("renames a colliding chip and its file so the sent filename still matches the token", () => {
-    const first = {
-      files: [],
-      sessions: [],
-      attachments: [{ token: "@image.png", file: new File(["a"], "image.png") }],
-    };
-    const incoming = new File(["b"], "image.png", { type: "image/png" });
-    const merged = mergeTaggedDrafts(first, {
-      text: "see @image.png",
-      mentions: { files: [], sessions: [], attachments: [{ token: "@image.png", file: incoming }] },
-    });
-    expect(merged.text).toBe("see @image (2).png");
-    expect(merged.mentions!.attachments!.map((attachment) => attachment.token)).toEqual([
-      "@image.png",
-      "@image (2).png",
-    ]);
-    expect(merged.mentions!.attachments![1]!.file.name).toBe("image (2).png");
   });
 });

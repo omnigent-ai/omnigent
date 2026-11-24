@@ -137,11 +137,7 @@ export function setSessionMentions(
   conversationId: string,
   mentions: TaggedMentions | undefined,
 ): void {
-  const tagged =
-    mentions &&
-    (mentions.files.length > 0 ||
-      mentions.sessions.length > 0 ||
-      (mentions.attachments?.length ?? 0) > 0);
+  const tagged = mentions && (mentions.files.length > 0 || mentions.sessions.length > 0);
   const draft = sessionDrafts.get(conversationId) ?? { text: "", files: [] };
   setSessionDraft(conversationId, { ...draft, mentions: tagged ? mentions : undefined });
 }
@@ -166,11 +162,7 @@ export function recoverFailedSessionDraft<
   if (temporaryDraft === undefined) return originalDraft;
   // The two composers allocate tokens independently; reconcile them so a shared
   // token can't make one draft's tag expand to the other's target.
-  const trayNames = [...originalDraft.files, ...temporaryDraft.files].map(attachmentFilename);
-  const merged = mergeTaggedDrafts(originalDraft.mentions, temporaryDraft, {
-    texts: [originalDraft.message],
-    trayNames,
-  });
+  const merged = mergeTaggedDrafts(originalDraft.mentions, temporaryDraft);
   // The temporary draft's tray files are the incoming ones: each takes a name no tag or earlier
   // tray file uses.
   // Every incoming name is reserved before any is chosen, so a rename never takes a name a later

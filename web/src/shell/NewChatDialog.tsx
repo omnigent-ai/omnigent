@@ -5643,11 +5643,7 @@ function NewChatLandingContent({
   });
   clearTaggedMentionsRef.current = resetMentions;
   // The draft snapshot is built above the hook; add the tags it owns.
-  draftRef.current.mentions = {
-    files: mentionedItems,
-    sessions: mentionedSessions,
-    attachments: mentionedAttachments,
-  };
+  draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
   attachPastedFilesRef.current = attachPastedFiles;
   tagTokensRef.current = ownedMentionTokens;
   // Pasted chips send their files with the tray's; a chip's file goes only while its token is in the message.
@@ -5655,6 +5651,8 @@ function NewChatLandingContent({
     ...files,
     ...presentMentions(mentionedAttachments, [message]).map((attachment) => attachment.file),
   ];
+  // The draft a sibling or new session picks up carries live chips as tray files.
+  draftRef.current.files = attachedFiles;
   const skillCommandNames = useMemo(() => Object.keys(skillCommands), [skillCommands]);
   const taggedMentions = useMemo(
     () =>
@@ -6231,15 +6229,7 @@ function NewChatLandingContent({
     // The relinquished message's pasted chips go with its tray files: the temporary draft holds the same Files.
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
-        ? {
-            ...draftRef.current,
-            message: "",
-            files: [],
-            mentions: draftRef.current.mentions && {
-              ...draftRef.current.mentions,
-              attachments: [],
-            },
-          }
+        ? { ...draftRef.current, message: "", files: [] }
         : draftRef.current;
     const returnedDraft = recoverFailedSessionDraft(originalDraft, temporaryConversationId);
     if (onScreenRef.current) {

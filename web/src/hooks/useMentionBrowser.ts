@@ -21,6 +21,7 @@ import {
   type PastedAttachment,
   type SessionMention,
   sessionMentionToken,
+  type LiveMentions,
   type TaggedMentions,
   nameAttachmentFile,
 } from "@/lib/composerMentions";
@@ -28,7 +29,7 @@ import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
 const NO_FILE_ENTRIES: WorkspaceFile[] = [];
-const NO_TAGS: TaggedMentions = { files: [], sessions: [] };
+const NO_TAGS: LiveMentions = { files: [], sessions: [] };
 
 function sessionTagToken(session: SessionMention): string {
   return session.token ?? `@${session.title}`;
@@ -36,11 +37,11 @@ function sessionTagToken(session: SessionMention): string {
 
 const NO_ATTACHMENTS: PastedAttachment[] = [];
 
-function attachmentsOf(tags: TaggedMentions): PastedAttachment[] {
+function attachmentsOf(tags: LiveMentions): readonly PastedAttachment[] {
   return tags.attachments ?? NO_ATTACHMENTS;
 }
 
-function tagTokens(tags: TaggedMentions): string[] {
+function tagTokens(tags: LiveMentions): string[] {
   return [
     ...tags.files.map(fileMentionToken),
     ...tags.sessions.map(sessionTagToken),
@@ -66,7 +67,7 @@ function tokensIn(segments: readonly string[], tokens: readonly string[]): Set<s
 }
 
 /** `tags` without anything `removed` names by token. */
-function withoutTags(tags: TaggedMentions, removed: TaggedMentions): Required<TaggedMentions> {
+function withoutTags(tags: LiveMentions, removed: LiveMentions): Required<LiveMentions> {
   const gone = new Set(tagTokens(removed));
   return {
     files: tags.files.filter((it) => !gone.has(fileMentionToken(it))),
@@ -76,7 +77,7 @@ function withoutTags(tags: TaggedMentions, removed: TaggedMentions): Required<Ta
 }
 
 /** `tags` plus `added`, which replace any with the same tokens. */
-function mergeTags(tags: TaggedMentions, added: TaggedMentions): Required<TaggedMentions> {
+function mergeTags(tags: LiveMentions, added: LiveMentions): Required<LiveMentions> {
   const kept = withoutTags(tags, added);
   return {
     files: [...kept.files, ...added.files],
@@ -219,12 +220,11 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const [localSessions, setLocalSessions] = useState<SessionMention[]>(
     () => initialMentions?.sessions ?? [],
   );
-  const [localAttachments, setLocalAttachments] = useState<PastedAttachment[]>(
-    () => initialMentions?.attachments ?? [],
-  );
+  // Pasted chips live only in this composer: a draft that leaves it carries their files as tray files.
+  const [localAttachments, setLocalAttachments] = useState<PastedAttachment[]>([]);
   const mentionedItems = tags ? tags.mentions.files : localItems;
   const mentionedSessions = tags ? tags.mentions.sessions : localSessions;
-  const mentionedAttachments = tags ? attachmentsOf(tags.mentions) : localAttachments;
+  const mentionedAttachments = localAttachments;
   const setMentionedItems: React.Dispatch<React.SetStateAction<MentionItem[]>> = tags
     ? (update) =>
         tags.updateMentions((current) => ({
@@ -240,14 +240,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
         }))
     : setLocalSessions;
   // A caller's draft gains an attachments key only once a chip exists, so its stored shape is unchanged.
-  const setMentionedAttachments: React.Dispatch<React.SetStateAction<PastedAttachment[]>> = tags
-    ? (update) =>
-        tags.updateMentions((current) => {
-          const attachments = resolveUpdate(update, attachmentsOf(current));
-          if (attachments.length === 0 && current.attachments === undefined) return current;
-          return { ...current, attachments };
-        })
-    : setLocalAttachments;
+  const setMentionedAttachments = setLocalAttachments;
   // An opened list stays open for the "@" token it was opened from.
   const [browse, setBrowse] = useState<{ start: number; level: SessionMenuLevel } | null>(null);
   if (browse !== null && mention?.start !== browse.start) setBrowse(null);
@@ -305,11 +298,11 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
 
   // Tags whose tokens left the draft. They keep their tokens, so no other target is given
   // one while an undo could still bring it back; a reset forgets them.
-  const releasedRef = useRef<TaggedMentions>(NO_TAGS);
+  const releasedRef = useRef<LiveMentions>(NO_TAGS);
   // Restore points by token: where a token was last removed, for an undo to bring it back.
   const restorePointsRef = useRef(new Map<string, RestorePoint>());
   // The latest tags, for callers that run outside a render (the file viewer's drain).
-  const activeRef = useRef<TaggedMentions>({
+  const activeRef = useRef<LiveMentions>({
     files: mentionedItems,
     sessions: mentionedSessions,
     attachments: mentionedAttachments,
@@ -358,7 +351,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   }, [segmentsKey, mentionedItems, mentionedSessions, mentionedAttachments]);
 
   // Take released tags back as active ones, and drop the restore points they used.
-  const reclaim = (restored: TaggedMentions) => {
+  const reclaim = (restored: LiveMentions) => {
     const restoredAttachments = attachmentsOf(restored);
     if (
       restored.files.length === 0 &&
@@ -437,7 +430,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     restorePointsRef.current.clear();
     setMentionedItems(mentions?.files ?? []);
     setMentionedSessions(mentions?.sessions ?? []);
-    setMentionedAttachments(attachmentsOf(mentions ?? NO_TAGS));
+    setMentionedAttachments([]);
   };
 
   const placeCaret = (caret: number) =>

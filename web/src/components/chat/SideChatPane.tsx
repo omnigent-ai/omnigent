@@ -1166,11 +1166,7 @@ function SideChatComposer({
     text,
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
-  // A chip's file goes out with the tray's. shortcut: a chip that was undone in the main composer is not in this shared draft, so a tray file picked here can share its name until redo.
-  const attachedFiles = [
-    ...files,
-    ...(sharedTags?.attachments ?? []).map((attachment) => attachment.file),
-  ];
+  const attachedFiles = files;
   const canSend =
     serializeReplyDraft({ quotes, text }).trim().length > 0 ||
     (!pending && attachedFiles.length > 0) ||

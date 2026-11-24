@@ -250,7 +250,7 @@ export interface InlineMention {
  * in the longest-token scan, which keeps a shorter token from splitting it.
  */
 export function composerInlineMentions(
-  tags: TaggedMentions,
+  tags: LiveMentions,
   harness: string | null,
 ): InlineMention[] {
   return [
@@ -262,7 +262,7 @@ export function composerInlineMentions(
       token: session.token ?? `@${cleanSessionTitle(session.title)}`,
       marker: sessionMentionMarker(session),
     })),
-    ...attachmentsOf(tags).map((attachment) => ({
+    ...(tags.attachments ?? []).map((attachment) => ({
       token: attachment.token,
       marker: attachment.token,
     })),
@@ -345,22 +345,11 @@ export function presentTaggedMentions(
   const inline = composerInlineMentions(mentions, null);
   const present = new Set(presentMentions(inline, texts).map((mention) => mention.token));
   const fileCount = mentions.files.length;
-  const sessionCount = mentions.sessions.length;
   const files = mentions.files.filter((_, index) => present.has(inline[index]!.token));
   const sessions = mentions.sessions.filter((_, index) =>
     present.has(inline[fileCount + index]!.token),
   );
-  const attachments = attachmentsOf(mentions).filter((_, index) =>
-    present.has(inline[fileCount + sessionCount + index]!.token),
-  );
-  if (files.length === 0 && sessions.length === 0 && attachments.length === 0) return undefined;
-  return attachments.length > 0 ? { files, sessions, attachments } : { files, sessions };
-}
-
-const NO_ATTACHMENTS: PastedAttachment[] = [];
-
-function attachmentsOf(tags: TaggedMentions): PastedAttachment[] {
-  return tags.attachments ?? NO_ATTACHMENTS;
+  return files.length > 0 || sessions.length > 0 ? { files, sessions } : undefined;
 }
 
 /** Replace each token in ``text`` with its marker, in place. */
@@ -540,12 +529,18 @@ export interface PastedAttachment {
   file: File;
 }
 
-/** Everything tagged in one composer draft, saved and restored with its text. */
+/**
+ * Everything tagged in one composer draft, saved and restored with its text. Pasted chips are not
+ * tags here: a draft that leaves the live composer carries their Files as tray files.
+ */
 export interface TaggedMentions {
   files: MentionItem[];
   sessions: SessionMention[];
-  /** In-memory only: a File cannot be saved with the draft, so a reload drops these chips. */
-  attachments?: PastedAttachment[];
+}
+
+/** The tags of a live composer, including its pasted chips, which exist only while it is open. */
+export interface LiveMentions extends TaggedMentions {
+  attachments?: readonly PastedAttachment[];
 }
 
 // A tagged file's identity: the same path, kind and line range.
@@ -585,25 +580,12 @@ export function nameAttachmentFile(file: File, namespace: AttachmentNamespace): 
 }
 
 /** The tag tokens of ``tags``, live and released alike, for an allocation namespace. */
-export function tagTokensOf(tags: TaggedMentions | undefined): string[] {
+export function tagTokensOf(tags: LiveMentions | undefined): string[] {
   return [
     ...(tags?.files ?? []).map(fileMentionToken),
     ...(tags?.sessions ?? []).map(sessionTokenOf),
     ...(tags?.attachments ?? []).map((it) => it.token),
   ];
-}
-
-// ``text`` with every occurrence of ``token`` blanked out, so a chip's own reference is not
-// mistaken for a typed spelling of its name.
-function withoutToken(text: string, token: string): string {
-  let blanked = text;
-  for (const range of findMentionTokens(text, [token]).reverse()) {
-    blanked =
-      blanked.slice(0, range.start) +
-      " ".repeat(range.end - range.start) +
-      blanked.slice(range.end);
-  }
-  return blanked;
 }
 
 /**
@@ -621,23 +603,14 @@ function withoutToken(text: string, token: string): string {
 export function mergeTaggedDrafts(
   first: TaggedMentions | undefined,
   second: { text: string; mentions?: TaggedMentions },
-  options: { texts?: readonly string[]; trayNames?: readonly string[] } = {},
 ): { text: string; mentions: TaggedMentions | undefined } {
   if (!second.mentions) return { text: second.text, mentions: first };
-  const trayNames = options.trayNames ?? [];
-  const firstTexts = options.texts ?? [];
   const files = [...(first?.files ?? [])];
   const sessions = [...(first?.sessions ?? [])];
-  const attachments = [...(first?.attachments ?? [])];
-  const taken = [
-    ...files.map(fileMentionToken),
-    ...sessions.map(sessionTokenOf),
-    ...attachments.map((it) => it.token),
-  ];
+  const taken = [...files.map(fileMentionToken), ...sessions.map(sessionTokenOf)];
   const secondTokens = [
     ...second.mentions.files.map(fileMentionToken),
     ...second.mentions.sessions.map(sessionTokenOf),
-    ...(second.mentions.attachments ?? []).map((it) => it.token),
   ];
   // A new token must not collide with a later tag of ``second`` either.
   const avoid = (own: string) => [...taken, ...secondTokens.filter((t) => t !== own)];
@@ -668,34 +641,13 @@ export function mergeTaggedDrafts(
     sessions.push({ ...session, token: next });
     claim(token, next);
   }
-  for (const attachment of second.mentions.attachments ?? []) {
-    const token = attachment.token;
-    // The same File is the same attachment, so it keeps its token rather than doubling up.
-    const same = attachments.find((it) => it.file === attachment.file);
-    if (same) {
-      claim(token, same.token);
-      continue;
-    }
-    // The chip's file keeps or takes a name the namespace allows; the token follows the name.
-    const file = nameAttachmentFile(attachment.file, {
-      tokens: avoid(token),
-      trayNames,
-      text: [...firstTexts, withoutToken(second.text, token)],
-    });
-    const next = `@${file.name}`;
-    attachments.push({ token: next, file });
-    claim(token, next);
-  }
   // Scan every token of ``second`` so a longer one is never split by a shorter rename.
   let text = second.text;
   for (const range of findMentionTokens(text, secondTokens).reverse()) {
     const next = renamed.get(range.token);
     if (next !== undefined) text = text.slice(0, range.start) + next + text.slice(range.end);
   }
-  return {
-    text,
-    mentions: attachments.length > 0 ? { files, sessions, attachments } : { files, sessions },
-  };
+  return { text, mentions: { files, sessions } };
 }
 
 function sessionTokenOf(session: SessionMention): string {
