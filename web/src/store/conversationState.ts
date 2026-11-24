@@ -150,3 +150,24 @@ export function createInitialConversationState(): ConversationState {
     awaitingSideChatFor: null,
   };
 }
+
+/**
+ * The unsent work a conversation rebuild or rekey must carry over: sends the server has not
+ * acknowledged, and uploads parked on their bubbles. Every site that drops or rebuilds an entry
+ * uses this, so no path can carry one list and miss the other.
+ */
+export function unsentWorkOf(
+  state: Pick<ConversationState, "pendingUserMessages" | "failedUploads">,
+): Pick<ConversationState, "pendingUserMessages" | "failedUploads"> {
+  return {
+    pendingUserMessages: state.pendingUserMessages.filter((p) => p.posted !== true),
+    failedUploads: state.failedUploads,
+  };
+}
+
+/** Whether a carried set of unsent work holds anything. */
+export function hasUnsentWorkToCarry(
+  carried: Pick<ConversationState, "pendingUserMessages" | "failedUploads">,
+): boolean {
+  return carried.pendingUserMessages.length > 0 || carried.failedUploads.length > 0;
+}

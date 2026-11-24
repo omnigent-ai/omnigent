@@ -366,6 +366,12 @@ function sendSequence(message: PendingUserMessage): number {
   return match ? Number(match[1]) : 0;
 }
 
+/** Whether `later` was submitted after `earlier`: send time first, then the sequence within a second. */
+function sendsAfter(earlier: PendingUserMessage, later: PendingUserMessage): boolean {
+  const byTime = (later.createdAtS ?? 0) - (earlier.createdAtS ?? 0);
+  return byTime > 0 || (byTime === 0 && sendSequence(later) > sendSequence(earlier));
+}
+
 /**
  * Add a conversation's uncommitted user messages to its committed bubbles: the
  * undelivered startup messages, and the optimistic sends they don't replace.
@@ -387,10 +393,12 @@ export function withUncommittedUserBubbles(
     committed,
     buildUndeliveredBubbles(failedInputs, selfAuthor),
   );
-  const uncommitted = [
-    ...withoutFailedInputs(pendingUserMessages, failedInputs),
-    ...failedUploads,
-  ].sort((a, b) => (a.createdAtS ?? 0) - (b.createdAtS ?? 0) || sendSequence(a) - sendSequence(b));
+  // Pending sends keep their own order; each parked upload goes where its send time falls.
+  const uncommitted = [...withoutFailedInputs(pendingUserMessages, failedInputs)];
+  for (const failed of failedUploads) {
+    const at = uncommitted.findIndex((p) => sendsAfter(failed, p));
+    uncommitted.splice(at === -1 ? uncommitted.length : at, 0, failed);
+  }
   if (uncommitted.length === 0) return withUndelivered;
   return mergePendingBubbles(withUndelivered, buildPendingBubbles(uncommitted, selfAuthor));
 }

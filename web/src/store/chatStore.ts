@@ -102,7 +102,12 @@ import { awaitReconnectDelay } from "@/lib/reconnectBackoff";
 import { describeSendFailure } from "@/lib/sendFailure";
 import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
-import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import {
+  createInitialConversationState,
+  hasUnsentWorkToCarry,
+  isConversationStateKey,
+  unsentWorkOf,
+} from "./conversationState";
 import { fetchConversationSnapshot } from "./conversationSnapshot";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
@@ -288,10 +293,10 @@ export interface SendOptions {
   /** Asked once uploads are done, just before posting: a reason given fails the send unposted. */
   beforePost?: () => Promise<string | null>;
   /**
-   * A parked upload's Retry: its message isn't the composer's, so the composer's restored-send
-   * tracker (its retry id and delivery watch) stays as it is.
+   * A parked upload's Retry. Its message is not the composer's: the composer's restored-send
+   * tracker stays as it is, and a failure parks the message again instead of restoring the draft.
    */
-  keepComposerRetryState?: boolean;
+  retryOfParkedUpload?: boolean;
 }
 
 // Who hears of each send the runner takes, by its committed item's id and by the pending
@@ -2038,6 +2043,8 @@ export interface UploadBatchGuard {
   /** Told when each file's upload begins, so a failure can name the file. */
   onFileStart?: (file: File) => void;
   onProgress?: (file: File, loaded: number, total: number | null) => void;
+  /** Told of each resource this batch created; a reused cache hit is not reported. */
+  onUploaded?: (file: File, fileId: string) => void;
 }
 
 /** Keep new uploads private to their batch until every file succeeds. */
@@ -2059,6 +2066,7 @@ async function uploadFileBlock(
     ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
     : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
   newUploads.set(file, block);
+  guard.onUploaded?.(file, block.file_id);
   return block;
 }
 
@@ -2883,7 +2891,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Submitting consumes what the composer held, a restored failed send
     // included: drop its tracker too, or delivery evidence for that send could
     // later retract a NEW draft that merely repeats the same text.
-    if ((retryId !== null || restoredDraft !== null) && opts?.keepComposerRetryState !== true) {
+    if ((retryId !== null || restoredDraft !== null) && opts?.retryOfParkedUpload !== true) {
       pinnedSetter({ pendingRetryStableId: null, restoredSendDraft: null });
     }
     // A restored failed send keeps its stable id only when resent untouched:
@@ -3091,7 +3099,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Composer sends only: Cancel stops the upload and, before the fence below, parks the message.
     const interactive = !opts?.external;
     const uploadAbort = new AbortController();
-    const uploads = { uploading: false, cancelled: false, file: undefined as File | undefined };
+    const uploads = {
+      uploading: false,
+      cancelled: false,
+      file: undefined as File | undefined,
+      /** Resources this attempt's batch created, which Remove may delete; reuses are not included. */
+      owned: [] as { file: File; fileId: string }[],
+    };
     const uploadKeyOf = (file: File) => uploadProgressKey(tempId, pendingFileIdOf(file));
     const cancelUpload = () => {
       if (posting) return;
@@ -3156,6 +3170,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           signal: uploadAbort.signal,
           onFileStart: (file) => {
             uploads.file = file;
+          },
+          onUploaded: (file, fileId) => {
+            uploads.owned.push({ file, fileId });
           },
           onProgress: (file, loaded, total) =>
             reportUploadProgress(uploadKeyOf(file), loaded, total),
@@ -3295,6 +3312,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // real failure must not replace that failure's reason.
       const cancelled =
         uploads.cancelled && (err as { name?: unknown } | null)?.name === "AbortError";
+      // A failed batch has already removed what it created.
+      if (uploads.uploading) uploads.owned = [];
       if (opts?.external && !posting) {
         // Never posted (held back, or its upload failed or was stopped): drop only this
         // attempt's bubble and latch. A turn seen starting since isn't this send's to end.
@@ -3369,14 +3388,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // A send whose owner already handles failure (its onError, a held first message, an
       // external send) keeps the ordinary failure path. Any other send stopped during its upload
       // (failed, or cancelled) keeps its message on its bubble until the user retries or removes it.
+      const retrying = opts?.retryOfParkedUpload === true;
       const owned =
         opts?.onError !== undefined ||
-        heldForHost ||
+        (heldForHost && !retrying) ||
         opts?.external === true ||
         (initialDraft !== undefined && !initialDispatched);
+      // A retry re-parks any failure: its message is still the user's, and the composer is not.
       const parkable =
         !owned &&
-        (cancelled || (uploads.uploading && opts?.signal?.aborted !== true)) &&
+        (cancelled ||
+          (uploads.uploading && opts?.signal?.aborted !== true) ||
+          (retrying && inFlightSends.get(stableId) !== true)) &&
         draftSessionId !== null &&
         (files?.length ?? 0) > 0;
       const parkedEntry = parkable
@@ -3471,6 +3494,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // Retry and Remove each act once, whichever comes first.
         let settled = false;
         const failedFile = uploads.file;
+        const ownedUploads = [...uploads.owned];
         parked = {
           ...parkedEntry,
           initialDraft: undefined,
@@ -3487,7 +3511,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 stableId,
                 replyDraft: opts?.replyDraft,
                 pinnedConversationId: parkedIn,
-                keepComposerRetryState: true,
+                retryOfParkedUpload: true,
               });
             },
             remove: () => {
@@ -3497,12 +3521,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
               }));
               forgetUnsentSend(parkedIn, stableId);
-              // The files already stored for this message would otherwise stay on the session.
-              for (const file of files ?? []) {
-                const stored = uploadedFileBlockCache.get(file)?.get(parkedIn);
-                if (stored === undefined) continue;
-                uploadedFileBlockCache.get(file)?.delete(parkedIn);
-                deleteSessionFile(parkedIn, stored.file_id).catch((error: unknown) =>
+              // Only resources this attempt created: a reused one may belong to a delivered message.
+              for (const { file, fileId } of ownedUploads) {
+                if (uploadedFileBlockCache.get(file)?.get(parkedIn)?.file_id === fileId) {
+                  uploadedFileBlockCache.get(file)?.delete(parkedIn);
+                }
+                deleteSessionFile(parkedIn, fileId).catch((error: unknown) =>
                   console.warn("Couldn't remove a removed message's upload", error),
                 );
               }
@@ -3836,7 +3860,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
 
     // Sends the server hasn't acknowledged, carried across the re-bind below.
-    let unsentOnRebind: PendingUserMessage[] = [];
+    let unsentOnRebind: ReturnType<typeof unsentWorkOf> = {
+      pendingUserMessages: [],
+      failedUploads: [],
+    };
     if (!wasLive) {
       // Drop any retained-but-dead entry so `acquire` builds a fresh one. A
       // re-bind has to start from the initial state: `bindStream` PREPENDS its
@@ -3844,11 +3871,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // entry's stale transcript would duplicate and mis-order it. Unsent
       // bubbles are the one thing worth keeping — the server can't replay what
       // it was never told about.
-      unsentOnRebind =
-        conversationRegistry
-          .peek(conversationId)
-          ?.getState()
-          .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
+      const deadEntry = conversationRegistry.peek(conversationId)?.getState();
+      if (deadEntry !== undefined) unsentOnRebind = unsentWorkOf(deadEntry);
       conversationRegistry.release(conversationId);
     }
     const entry = conversationRegistry.acquire(conversationId);
@@ -3861,7 +3885,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // placeholder, is the whole point of keeping streams open.
       entry.setState({
         loadingConversation: true,
-        ...(unsentOnRebind.length > 0 ? { pendingUserMessages: unsentOnRebind } : {}),
+        ...(hasUnsentWorkToCarry(unsentOnRebind) ? unsentOnRebind : {}),
       });
     }
     // Paint whatever the entry already holds. For a live entry that is the
@@ -4906,6 +4930,8 @@ function mirrorActiveEntry(): void {
 export async function ensureConversationStreamed(id: string): Promise<void> {
   if (id === "" || isTempConvId(id)) return;
   const existing = conversationRegistry.peek(id);
+  // A dead entry's unsent work is carried into the rebuilt one, as `switchTo` does.
+  let carried: ReturnType<typeof unsentWorkOf> | null = null;
   if (existing !== undefined) {
     // Reuse only while a load is in flight (guards a double-bind) or the stream
     // is actually live. A non-reconnectable `server_closed` tears down the
@@ -4914,10 +4940,15 @@ export async function ensureConversationStreamed(id: string): Promise<void> {
     // mirrors switchTo's `isConversationStreamCurrent` liveness gate.
     if (existing.getState().loadingConversation || isConversationStreamCurrent(id)) return;
     // Dead or failed: drop the entry so the acquire below rebinds.
+    carried = unsentWorkOf(existing.getState());
     conversationRegistry.release(id);
   }
   const entry = conversationRegistry.acquire(id);
-  entry.setState({ loadingConversation: true, conversationLoadError: null });
+  entry.setState({
+    loadingConversation: true,
+    conversationLoadError: null,
+    ...(carried !== null && hasUnsentWorkToCarry(carried) ? carried : {}),
+  });
   await bindStream(id, entrySetter(entry), entryGetter(entry), true);
 }
 

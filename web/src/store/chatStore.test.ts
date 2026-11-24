@@ -4958,6 +4958,39 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     });
   });
 
+  it("a parked upload survives switching away and the stream ending, and Retry still works", async () => {
+    seedSession("conv_other");
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const parked = await parkFailedUpload("read this", file);
+    const uploadsBefore = callsTo("/resources/files", "POST").length;
+
+    await useChatStore.getState().switchTo("conv_other");
+    const entry = conversationRegistry.peek(conversationId)!;
+    entry.getState().abortController?.abort();
+    entry.setState({ abortController: null });
+    await useChatStore.getState().switchTo(conversationId);
+
+    const back = useChatStore.getState().failedUploads;
+    expect(back).toHaveLength(1);
+    expect(back[0]!.uploadFailure!.message).toBe(parked.uploadFailure!.message);
+    expect(back[0]!.content).toContainEqual(expect.objectContaining({ type: "input_file" }));
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).endsWith("/resources/files")
+        ? mockResponse({ id: "file_back" })
+        : defaultFetchHandler(input, init),
+    );
+    back[0]!.uploadFailure!.retry();
+    await flush();
+    expect(callsTo("/resources/files", "POST").length).toBe(uploadsBefore + 1);
+    expect(postedContents()).toEqual([
+      [
+        { type: "input_file", file_id: "file_back", filename: "notes.txt" },
+        { type: "input_text", text: "read this" },
+      ],
+    ]);
+  });
+
   it("Remove drops the message and leaves the composer's own draft alone", async () => {
     const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
     const parked = await parkFailedUpload("read this", file);
@@ -4999,6 +5032,28 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
+  it("Retry that fails at the post parks again and never overwrites the composer's draft", async () => {
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const parked = await parkFailedUpload("read this", file);
+    const composerDraft = { conversationId, text: "typed since", files: [], serverRefused: false };
+    useChatStore.setState({ failedSendDraft: composerDraft });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/resources/files")) return mockResponse({ id: "file_retry" });
+      if (url.endsWith(eventsUrl) && init?.method === "POST") {
+        return mockResponse({ detail: "Runner offline" }, { ok: false, status: 503 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    parked.uploadFailure!.retry();
+    await flush();
+
+    expect(useChatStore.getState().failedSendDraft).toEqual(composerDraft);
+    expect(useChatStore.getState().failedUploads).toHaveLength(1);
+    expect(useChatStore.getState().failedUploads[0]!.uploadFailure!.message).toBe("Runner offline");
+  });
+
   it("Retry does not clear the composer's own restored-send tracker", async () => {
     const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
     const parked = await parkFailedUpload("read this", file);
@@ -5027,6 +5082,16 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     expect(peekUnsentSend(conversationId)).toBeNull();
   });
 
+  function callsTo(suffix: string, method: string) {
+    return fetchMock.mock.calls.filter(
+      ([input, init]) => String(input).endsWith(suffix) && init?.method === method,
+    );
+  }
+  function postedContents() {
+    return callsTo(eventsUrl, "POST").map(
+      ([, init]) => JSON.parse(init!.body as string).data.content,
+    );
+  }
   function callsToEvents() {
     return fetchMock.mock.calls.filter(
       ([input, init]) => String(input).endsWith(eventsUrl) && init?.method === "POST",
@@ -7608,6 +7673,8 @@ describe("chatStore — send (file attachments)", () => {
 
     await useChatStore.getState().send("first", "agent_xyz", [files[0]!]);
     await useChatStore.getState().send("second", "agent_xyz", files);
+    // Removing the parked batch must leave the delivered message's resource alone.
+    useChatStore.getState().failedUploads[0]!.uploadFailure!.remove();
     await useChatStore.getState().send("reuse posted", "agent_xyz", [files[0]!]);
 
     expect(uploaded).toEqual(["posted.zip", "new.zip", "rejected.zip"]);

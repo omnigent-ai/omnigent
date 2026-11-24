@@ -10,7 +10,11 @@
 
 import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import type { ConversationState } from "./chatStore";
-import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import {
+  createInitialConversationState,
+  isConversationStateKey,
+  unsentWorkOf,
+} from "./conversationState";
 
 /**
  * Whether the origin's transport multiplexes requests over one connection.
@@ -255,12 +259,18 @@ export class ConversationRegistry {
       const existingPendingIds = new Set(
         existingState.pendingUserMessages.map((item) => item.tempId),
       );
-      const missingPending = old
-        .getState()
-        .pendingUserMessages.filter((item) => !existingPendingIds.has(item.tempId));
-      if (missingPending.length > 0) {
+      const oldUnsent = unsentWorkOf(old.getState());
+      const missingPending = oldUnsent.pendingUserMessages.filter(
+        (item) => !existingPendingIds.has(item.tempId),
+      );
+      const existingFailedIds = new Set(existingState.failedUploads.map((item) => item.tempId));
+      const missingFailed = oldUnsent.failedUploads.filter(
+        (item) => !existingFailedIds.has(item.tempId),
+      );
+      if (missingPending.length > 0 || missingFailed.length > 0) {
         existing.setState({
           pendingUserMessages: [...missingPending, ...existingState.pendingUserMessages],
+          failedUploads: [...missingFailed, ...existingState.failedUploads],
         });
       }
       this.release(oldId);

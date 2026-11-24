@@ -1291,6 +1291,26 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
     expect(bubbles[1]).not.toHaveProperty("uploadFailure");
   });
 
+  it("keeps the order of pending sends that have no parked upload", () => {
+    const earlier = {
+      tempId: "pend_10",
+      content: [{ type: "input_text" as const, text: "first" }],
+      createdAtS: 100,
+    };
+    const later = {
+      tempId: "pend_9",
+      content: [{ type: "input_text" as const, text: "second" }],
+      createdAtS: 100,
+    };
+
+    const bubbles = withUncommittedUserBubbles([], [earlier, later], [], null, []);
+
+    expect(bubbles.map((bubble) => (bubble.kind === "user" ? bubble.itemId : null))).toEqual([
+      "pend_10",
+      "pend_9",
+    ]);
+  });
+
   it("keeps send order when a failed upload and a later message share a second", () => {
     const failed = {
       tempId: "pend_9",
