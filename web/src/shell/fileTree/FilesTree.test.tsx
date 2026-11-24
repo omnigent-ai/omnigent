@@ -84,6 +84,7 @@ describe("FilesTree rooted at a folder", () => {
             changedFiles={[]}
             sort="alpha"
             showHidden={false}
+            showIgnored
             refreshToken={0}
             onFileSelect={vi.fn()}
             reveal={null}

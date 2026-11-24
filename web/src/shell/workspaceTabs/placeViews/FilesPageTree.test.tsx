@@ -518,6 +518,7 @@ describe("FilesPageTree", () => {
           activePath="src/a.ts"
           sort="alpha"
           showHidden={false}
+          showIgnored
           onFileSelect={vi.fn()}
         />
       );
