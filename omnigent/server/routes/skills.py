@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
+    CAP_MEMORY_IMPORT_SKILL,
     CAP_WORKFLOWS,
     HostSkillsFrame,
     HostSkillsResultFrame,
@@ -183,11 +184,14 @@ def create_skills_router(
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
             # The stored spec doesn't know whether this server has memory; the runner's
-            # copy turns the memory group off the same way.
+            # copy turns the memory group off the same way. An older host's runner
+            # has no memory skill to load, so it is listed only for hosts that ship it.
             memory_available = getattr(request.app.state, "memory_available", None)
             framework_spec = (
                 spec
-                if memory_available is not None and memory_available()
+                if memory_available is not None
+                and memory_available()
+                and CAP_MEMORY_IMPORT_SKILL in conn.hello.capabilities
                 else without_memory_tools(spec)
             )
             # Framework skills come last, as in resolve_session_skills.

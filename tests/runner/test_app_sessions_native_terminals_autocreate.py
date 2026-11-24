@@ -2651,6 +2651,69 @@ async def test_auto_create_claude_terminal_offers_its_own_notes_on_the_first_lau
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_offers_the_notes_of_a_wrapper_set_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``env`` wrapper's ``CLAUDE_CONFIG_DIR`` is offered and marked, not the runner's."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "runner-config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    wrapped = tmp_path / "wrapped-config"
+    for config_dir in (tmp_path / "runner-config", wrapped):
+        note = config_dir / "projects" / "-home-me-repo" / "memory" / "role.md"
+        note.parent.mkdir(parents=True)
+        note.write_text("---\nname: role\ntype: user\n---\nBody.\n")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        lambda _harness, cli_args, cfg=None: [
+            f"CLAUDE_CONFIG_DIR={wrapped}",
+            "claude",
+            *cli_args,
+        ],
+    )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": True})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json={"labels": {}})
+
+    captured: dict[str, Any] = {}
+    await _auto_create_claude_terminal(
+        "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=httpx.AsyncClient(
+            base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+        ),
+        agent_spec=AgentSpec(
+            spec_version=1,
+            name="claude-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+            tool_groups=ToolGroupsConfig(memory=True),
+        ),
+    )
+
+    args = captured["spec"].args
+    prompt = args[args.index("--append-system-prompt") + 1]
+    assert json.dumps(str(wrapped)) in prompt
+    assert str(tmp_path / "runner-config") not in prompt
+    markers = list((tmp_path / "omnigent-data" / "memory-import-offers").iterdir())
+    assert len(markers) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("server_memory", "spec_memory", "overrides"),
     [(True, True, ["features.memories=false"]), (False, True, []), (True, False, [])],

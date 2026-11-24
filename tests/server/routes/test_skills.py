@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_MEMORY_IMPORT_SKILL,
     CAP_WORKFLOWS,
     HostHelloFrame,
     HostSkillsFrame,
@@ -223,6 +224,7 @@ async def test_session_target_cannot_be_overridden(skills_app, overrides: dict[s
     "workflows_enabled,host_supports_workflows", [(False, True), (True, True), (True, False)]
 )
 @pytest.mark.parametrize("memory_on", [False, True])
+@pytest.mark.parametrize("host_ships_memory_skill", [True, False], ids=["host", "older-host"])
 async def test_presession_catalog_matches_filtered_invocations(
     presession_app,
     tmp_path: Path,
@@ -231,9 +233,15 @@ async def test_presession_catalog_matches_filtered_invocations(
     workflows_enabled: bool,
     host_supports_workflows: bool,
     memory_on: bool,
+    host_ships_memory_skill: bool,
 ) -> None:
     app, _, conn, _, agent, _ = presession_app
-    conn.hello.capabilities = [CAP_WORKFLOWS] if host_supports_workflows else []
+    conn.hello.capabilities = [
+        *([CAP_WORKFLOWS] if host_supports_workflows else []),
+        # An older host's runner has no import-memory skill to load.
+        *([CAP_MEMORY_IMPORT_SKILL] if host_ships_memory_skill else []),
+    ]
+    memory_listed = memory_on and host_ships_memory_skill
     app.state.feature_flags = resolve_feature_flags(
         {"OMNIGENT_FEATURES": "workflows" if workflows_enabled else ""}
     )
@@ -306,7 +314,7 @@ async def test_presession_catalog_matches_filtered_invocations(
     assert response.status_code == 200
     # Without memory on the server, the runner's copy of the spec has the memory group off.
     expected = resolve_session_skills(
-        spec if memory_on else without_memory_tools(spec),
+        spec if memory_listed else without_memory_tools(spec),
         (tmp_path,),
         None,
         workflows_enabled=workflows_enabled and host_supports_workflows,
@@ -316,7 +324,7 @@ async def test_presession_catalog_matches_filtered_invocations(
         for s in expected
     ]
     names = [s["name"] for s in response.json()["skills"]]
-    assert ("import-memory" in names) is memory_on
+    assert ("import-memory" in names) is memory_listed
     assert "hidden" not in set(names)
     assert response.json()["warnings"] == []
 

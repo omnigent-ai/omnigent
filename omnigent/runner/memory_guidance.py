@@ -39,7 +39,7 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.stores.memory_store import path_in_prefix, validate_path
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     import httpx
 
@@ -397,21 +397,23 @@ _CODEX_MEMORY_IMPORT_NOTE = (
 )
 
 
-def _claude_config_dir(workspace: str | Path | None) -> Path:
+def _claude_config_dir(cwd: Path, env: Mapping[str, str]) -> Path:
     """
-    The Claude Code config dir a native launch in *workspace* uses.
+    The Claude Code config dir a native launch uses.
 
-    The launch inherits the runner's ``CLAUDE_CONFIG_DIR``. A relative value is
-    relative to the launch's working directory, as Claude Code resolves it.
+    Read from the launch's own environment, which an ``env`` wrapper in the
+    configured launch command may have changed. A relative value is relative to
+    the launch's working directory, as Claude Code resolves it.
 
-    :param workspace: The launch's working directory, or ``None`` for this process's.
-    :returns: ``$CLAUDE_CONFIG_DIR`` or ``~/.claude``, e.g. ``Path("/home/me/.claude")``.
+    :param cwd: The launch's working directory, e.g. ``Path("/home/me/repo")``.
+    :param env: The launch's environment, e.g. ``{"HOME": "/home/me"}``.
+    :returns: ``$CLAUDE_CONFIG_DIR`` or ``$HOME/.claude``, e.g. ``Path("/home/me/.claude")``.
     """
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    configured = env.get("CLAUDE_CONFIG_DIR")
     if not configured:
-        return Path.home() / ".claude"
-    base = Path(workspace) if workspace is not None else Path.cwd()
-    return base / configured
+        home = env.get("HOME")
+        return (Path(home) if home else Path.home()) / ".claude"
+    return cwd / configured
 
 
 def _is_claude_note(entry: os.DirEntry[str]) -> bool:
@@ -520,7 +522,7 @@ async def _notes_to_offer(harness: str, notes_home: Path, count: Callable[[Path]
     return 0
 
 
-async def claude_memory_import_note(workspace: str | Path | None) -> str | None:
+async def claude_memory_import_note(cwd: Path, env: Mapping[str, str]) -> str | None:
     """
     The one-time offer to import Claude Code's own notes, for a native launch.
 
@@ -529,11 +531,13 @@ async def claude_memory_import_note(workspace: str | Path | None) -> str | None:
     it for that dir; making it records the marker. Never raises: any failure means
     no offer.
 
-    :param workspace: The launch's working directory, e.g. ``"/home/me/repo"``.
+    :param cwd: The launch's working directory, e.g. ``Path("/home/me/repo")``.
+    :param env: The launch's environment, after any ``env`` wrapper, e.g.
+        ``{"HOME": "/home/me", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
     :returns: Launch instructions naming the note count and config dir, or ``None``.
     """
     try:
-        config_dir = _claude_config_dir(workspace)
+        config_dir = _claude_config_dir(cwd, env)
         count = await _notes_to_offer("claude", config_dir, count_claude_memory_notes)
     except Exception:
         _logger.debug("Claude Code memory import offer unavailable", exc_info=True)

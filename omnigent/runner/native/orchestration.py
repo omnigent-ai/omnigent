@@ -10148,12 +10148,74 @@ async def _auto_create_claude_terminal(
             ),
         )
     claude_auto_memory_env = await _claude_auto_memory_env(agent_spec, server_client)
-    # Decided before the instructions are composed, since the offer goes into them.
-    claude_memory_import = (
-        await claude_memory_import_note(workspace)
-        if _CLAUDE_AUTO_MEMORY_OFF_ENV in claude_auto_memory_env
-        else None
+
+    # Apply the per-harness startup command/args override from config
+    # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
+    # downstream integration can wrap this managed-host launch — e.g. a wrapper
+    # such as ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
+    # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
+    # appends below, so the ``--`` stays first). Identity by default. This is
+    # the same resolver the local-CLI native launch uses (see cli_native.py), so
+    # both terminal-creation paths honour one config surface.
+    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
+    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+        resolve_harness_args,
+        resolve_harness_command,
     )
+
+    _harness_cfg = load_effective_config(workspace=workspace)
+    launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
+    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+
+    def claude_terminal_spec(
+        args: Sequence[str], env: dict[str, str], **extra: Any
+    ) -> TerminalEnvSpec:
+        # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+        # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+        # and ``parent_os_env`` at launch, launch_terminal falls back to
+        # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+        return TerminalEnvSpec(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+            ),
+            command=launch_command,
+            args=list(args),
+            env=env,
+            # Names to strip (see ``_claude_terminal_env_unset``). Dropping
+            # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
+            # inherit this env and several build ``WorkspaceClient`` without pinning
+            # ``auth_type``: a set profile makes the SDK prefer that profile's cached
+            # OAuth token over the MCP's explicit token, 400ing against the wrong
+            # workspace. Claude itself ignores the var (routing is
+            # ``ANTHROPIC_BASE_URL`` / ``apiKeyHelper``), so this affects only MCPs;
+            # ones needing a specific profile must set it in their own per-MCP env.
+            env_unset=claude_terminal_env_unset,
+            **extra,
+        )
+
+    # Decided before the instructions are composed, since the offer goes into them.
+    # The offer reads the config dir the launched Claude will use: an ``env``
+    # wrapper in the configured command can set its own ``CLAUDE_CONFIG_DIR`` or
+    # ``--chdir``. Augmentation only appends to the args, so the base args
+    # already give the wrapper's final shape. The pane env added at launch (Tool
+    # Search, gateway and relay variables) never sets the config dir or HOME.
+    claude_memory_import = None
+    if _CLAUDE_AUTO_MEMORY_OFF_ENV in claude_auto_memory_env:
+        offer_spec = claude_terminal_spec(
+            resolve_harness_args("claude-native", tuple(base_claude_args), cfg=_harness_cfg),
+            dict(claude_auto_memory_env),
+        )
+        try:
+            offer_cwd = _claude_terminal_launch_cwd(offer_spec, agent_os_env)
+        except OmnigentError:
+            # The launch itself will refuse below; make no offer.
+            offer_cwd = None
+        if offer_cwd is not None:
+            claude_memory_import = await claude_memory_import_note(
+                offer_cwd, _claude_terminal_launch_env(offer_spec)
+            )
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
@@ -10183,22 +10245,6 @@ async def _auto_create_claude_terminal(
     skill_overlay = claude_agents_skill_overlay(bridge_dir)
     trusted_added_dirs = (skill_overlay,) if str(skill_overlay) in claude_args else ()
 
-    # Apply the per-harness startup command/args override from config
-    # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
-    # downstream integration can wrap this managed-host launch — e.g. a wrapper
-    # such as ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
-    # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
-    # appended above, so the ``--`` stays first). Identity by default. This is
-    # the same resolver the local-CLI native launch uses (see cli_native.py), so
-    # both terminal-creation paths honour one config surface.
-    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
-        resolve_harness_args,
-        resolve_harness_command,
-    )
-
-    _harness_cfg = load_effective_config(workspace=workspace)
-    launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``
     # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
@@ -10209,24 +10255,12 @@ async def _auto_create_claude_terminal(
     if resolved_claude is not None:
         validate_claude_hook_interpreter_compatibility(resolved_claude)
 
-    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
-
-    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
-    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
-    # and ``parent_os_env`` below, launch_terminal falls back to
-    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    env_spec = TerminalEnvSpec(
-        os_env=OSEnvSpec(
-            type="caller_process",
-            cwd=workspace,
-            sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
-        ),
-        command=launch_command,
-        args=launch_args,
-        # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
-        # etc.) when derived. Empty provider config still forces
-        # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env={
+    env_spec = claude_terminal_spec(
+        launch_args,
+        # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL etc.) when
+        # derived. Empty provider config still forces ENABLE_TOOL_SEARCH=true so
+        # MCP schemas are loaded on demand.
+        {
             **build_native_claude_terminal_env(
                 claude_config,
                 client_surface=resource_registry.client_surface(session_id),
@@ -10234,15 +10268,6 @@ async def _auto_create_claude_terminal(
             **claude_terminal_relay_env(bridge_dir),
             **claude_auto_memory_env,
         },
-        # Names to strip (see ``_claude_terminal_env_unset``). Dropping
-        # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
-        # inherit this env and several build ``WorkspaceClient`` without pinning
-        # ``auth_type``: a set profile makes the SDK prefer that profile's cached
-        # OAuth token over the MCP's explicit token, 400ing against the wrong
-        # workspace. Claude itself ignores the var (routing is
-        # ``ANTHROPIC_BASE_URL`` / ``apiKeyHelper``), so this affects only MCPs;
-        # ones needing a specific profile must set it in their own per-MCP env.
-        env_unset=claude_terminal_env_unset,
         scrollback=50000,
         # Keep the private tmux server alive if the `claude` CLI exits (e.g. a
         # sub-agent worker whose CLI exits right after rendering its prompt on
