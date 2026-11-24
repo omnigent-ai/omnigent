@@ -28,21 +28,7 @@ export function getShareableSessionLink(
   filePath?: string,
 ): string {
   const path = rebasePath(getSessionSharePath(sessionId));
-  const transform = getOmnigentTransformShareLink();
-  const fallbackLink = `${window.location.origin}${withBasePath(path)}`;
-  const link = transform ? transform(path) : fallbackLink;
-  if (!filePath) return link;
-
-  let url: URL;
-  try {
-    url = new URL(link, window.location.origin);
-  } catch {
-    url = new URL(fallbackLink);
-  }
-  const target = url.hash.startsWith("#/") ? new URL(url.hash.slice(1), url.origin) : url;
-  for (const [key, value] of fileShareParams(filePath)) target.searchParams.set(key, value);
-  if (target !== url) url.hash = `${target.pathname}${target.search}${target.hash}`;
-  return url.toString();
+  return shareableLink(path, filePath ? fileShareParams(filePath) : undefined);
 }
 
 /**
@@ -53,7 +39,44 @@ export function getShareableProjectLink(
   projectName: string,
   rebasePath: (path: string) => string,
 ): string {
-  const path = rebasePath(`/projects/${encodeURIComponent(projectName)}`);
+  return shareableLink(rebasePath(projectPath(projectName)));
+}
+
+/** The absolute URL that opens a project's board with one ticket's detail panel. */
+export function getShareableTicketLink(
+  projectName: string,
+  ticketId: string,
+  rebasePath: (path: string) => string,
+): string {
+  return shareableLink(
+    rebasePath(projectPath(projectName)),
+    new URLSearchParams({ ticket: ticketId }),
+  );
+}
+
+function projectPath(projectName: string): string {
+  return `/projects/${encodeURIComponent(projectName)}`;
+}
+
+/**
+ * Turns a rebased in-app path into an absolute URL through the host's
+ * `transformShareLink`, or the page origin and deployment base path standalone.
+ * `params` go on the in-app route, inside a hash route when the host uses one.
+ */
+function shareableLink(path: string, params?: URLSearchParams): string {
   const transform = getOmnigentTransformShareLink();
-  return transform ? transform(path) : `${window.location.origin}${withBasePath(path)}`;
+  const fallbackLink = `${window.location.origin}${withBasePath(path)}`;
+  const link = transform ? transform(path) : fallbackLink;
+  if (!params) return link;
+
+  let url: URL;
+  try {
+    url = new URL(link, window.location.origin);
+  } catch {
+    url = new URL(fallbackLink);
+  }
+  const target = url.hash.startsWith("#/") ? new URL(url.hash.slice(1), url.origin) : url;
+  for (const [key, value] of params) target.searchParams.set(key, value);
+  if (target !== url) url.hash = `${target.pathname}${target.search}${target.hash}`;
+  return url.toString();
 }

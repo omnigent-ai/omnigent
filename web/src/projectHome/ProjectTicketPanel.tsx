@@ -53,6 +53,7 @@ import { getCurrentUserId } from "@/lib/identity";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
+import { TicketCopyLinkButton } from "./TicketCopyLinkButton";
 import { TicketCostSection } from "./ProjectCost";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { SessionImage } from "@/components/SessionImage";
@@ -92,6 +93,7 @@ function Panel({
   onClose,
   children,
   footer,
+  actions,
   expanded = false,
   onExpandedChange,
 }: {
@@ -99,6 +101,8 @@ function Panel({
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
+  /** Header buttons placed before expand and close. */
+  actions?: ReactNode;
 } & TicketExpansionProps) {
   const expansionLabel = expanded ? "Restore ticket panel" : "Expand ticket";
   return (
@@ -110,6 +114,7 @@ function Panel({
         <h2 title={title} className="min-w-0 flex-1 truncate text-ui font-medium">
           {title}
         </h2>
+        {actions}
         {onExpandedChange && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -402,6 +407,7 @@ function TicketDetails({
       >
         <Panel
           title={ticket.title}
+          actions={<TicketCopyLinkButton projectName={projectName} ticketId={ticketId} />}
           onClose={onClose}
           expanded={expanded}
           onExpandedChange={onExpandedChange}

@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as host from "@/lib/host";
 import { basenamedRouting, reactRouterRouting } from "@/lib/routing";
-import { getShareableProjectLink, getShareableSessionLink } from "./shareLink";
+import {
+  getShareableProjectLink,
+  getShareableSessionLink,
+  getShareableTicketLink,
+} from "./shareLink";
 
 vi.mock("@/lib/host", async (importOriginal) => ({
   ...(await importOriginal<typeof host>()),
@@ -129,5 +133,24 @@ describe("getShareableProjectLink", () => {
     expect(getShareableProjectLink("demo", embedded)).toBe(
       "https://host.example.com/ml/omnigent-embed/projects/demo?o=42",
     );
+  });
+});
+
+describe("getShareableTicketLink", () => {
+  it("opens the ticket's panel on the project board under the base path", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    expect(getShareableTicketLink("My project", "tkt 1", standalone)).toBe(
+      `${window.location.origin}/proxy/6767/projects/My%20project?ticket=tkt+1`,
+    );
+  });
+
+  it("keeps host query parameters and puts the ticket inside a hash route", () => {
+    vi.mocked(host.getOmnigentTransformShareLink).mockReturnValue(
+      (path: string) => `https://host.example.com/app?o=42#${path}`,
+    );
+    const url = new URL(getShareableTicketLink("demo", "tkt_1", embedded));
+
+    expect(url.searchParams.get("o")).toBe("42");
+    expect(url.hash).toBe("#/ml/omnigent-embed/projects/demo?ticket=tkt_1");
   });
 });

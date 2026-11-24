@@ -3,10 +3,10 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckIcon, LinkIcon, UsersIcon, XIcon } from "lucide-react";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { copyText } from "@/lib/clipboard";
+import { useCopyLink } from "@/hooks/useCopyLink";
 import {
   getProject,
   listProjectShares,
@@ -24,24 +24,8 @@ function sharesKey(projectId: string) {
 /** Copies the project's absolute URL; shows "Copied" for 2 seconds, or the URL when copying fails. */
 function CopyProjectLinkButton({ projectName }: { projectName: string }) {
   const rebasePath = useRebasePath();
-  const [status, setStatus] = useState<"idle" | "copied" | "failed">("idle");
+  const { status, copy } = useCopyLink();
   const url = getShareableProjectLink(projectName, rebasePath);
-
-  useEffect(() => {
-    if (status !== "copied") return;
-    const id = setTimeout(() => setStatus("idle"), 2000);
-    return () => clearTimeout(id);
-  }, [status]);
-
-  const copy = async () => {
-    try {
-      await copyText(url);
-      setStatus("copied");
-    } catch (error) {
-      console.warn("Failed to copy project link", error);
-      setStatus("failed");
-    }
-  };
 
   return (
     <>
@@ -51,7 +35,7 @@ function CopyProjectLinkButton({ projectName }: { projectName: string }) {
         size="sm"
         className="ml-auto gap-1.5 text-primary"
         data-testid="project-share-copy-link"
-        onClick={() => void copy()}
+        onClick={() => void copy(url)}
       >
         {status === "copied" ? (
           <CheckIcon className="size-3.5" />
