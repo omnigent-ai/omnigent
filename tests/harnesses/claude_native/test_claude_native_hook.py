@@ -1509,6 +1509,29 @@ def test_parked_permission_prompt_without_a_runner_refresh_mints_its_own_token(
     assert len(mints) == 1
 
 
+@pytest.mark.parametrize(
+    "started_from",
+    [None, {"Authorization": "Bearer old"}],
+    ids=["headers-from-argv", "snapshot-rewritten-at-startup"],
+)
+def test_permission_hook_reauth_takes_a_snapshot_the_hook_never_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, started_from: dict[str, str] | None
+) -> None:
+    """A runner token the hook hasn't used yet is taken on the first rejection, then minting."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_unsent")
+    monkeypatch.setattr(native_policy_hook, "policy_hook_reauth", lambda *_args: lambda: None)
+
+    reauth = claude_native_hook._permission_hook_reauth(
+        bridge_dir, "http://127.0.0.1:8787", {"Authorization": "Bearer old"}, started_from
+    )
+
+    renewed = reauth()
+    assert renewed is not None and renewed["Authorization"] == "Bearer xyz"
+    assert reauth() is None, "an unchanged snapshot falls back to minting"
+
+
 def _assert_chat_fallback(stdout: str) -> None:
     """
     Assert the hook denied a question with the ask-in-chat hint.

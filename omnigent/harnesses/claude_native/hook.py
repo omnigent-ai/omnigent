@@ -1057,7 +1057,7 @@ def _post_hook_with_reattach(
 
 
 def _permission_hook_reauth(
-    bridge_dir: Path, server_url: str, headers: dict[str, str]
+    bridge_dir: Path, server_url: str, headers: dict[str, str], started_from: object
 ) -> Callable[[], dict[str, str] | None]:
     """
     Renew the permission hook's auth from the runner's refreshed header snapshot.
@@ -1070,12 +1070,14 @@ def _permission_hook_reauth(
     :param bridge_dir: Bridge directory holding ``permission_hook.json``.
     :param server_url: Omnigent server URL the hook POSTs to.
     :param headers: Headers the hook started with.
+    :param started_from: The snapshot those headers came from, or ``None`` when
+        they did not come from ``permission_hook.json``.
     :returns: A reauth callable for :func:`_post_hook_with_reattach`.
     """
     from omnigent.native.native_policy_hook import policy_hook_reauth
 
     mint = policy_hook_reauth(server_url, headers)
-    seen = [read_permission_hook_config(bridge_dir).get("ap_auth_headers")]
+    seen = [started_from]
 
     def reauth() -> dict[str, str] | None:
         snapshot = read_permission_hook_config(bridge_dir).get("ap_auth_headers")
@@ -1123,10 +1125,12 @@ def _main_permission_request(argv: list[str]) -> int:
         print("omnigent claude permission hook: Omnigent server URL missing", file=sys.stderr)
         return 0
     headers = _parse_headers(args.omnigent_auth_headers_json)
+    started_from: object = None
     if not headers:
         raw_headers = config.get("ap_auth_headers")
         if isinstance(raw_headers, dict):
             headers = {str(key): str(value) for key, value in raw_headers.items()}
+            started_from = raw_headers
     # A permission request raises a web elicitation that parks in the pod-local
     # registry on the replica holding this session's runner tunnel; an unkeyed
     # POST lands elsewhere and the approval is silently lost. Key from the
@@ -1142,7 +1146,7 @@ def _main_permission_request(argv: list[str]) -> int:
         headers,
         payload,
         "claude permission",
-        reauth=_permission_hook_reauth(bridge_dir, ap_server_url, headers),
+        reauth=_permission_hook_reauth(bridge_dir, ap_server_url, headers, started_from),
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
         answer_window_s=(
             PRE_RESOLVED_ELICITATION_TTL_S - _QUESTION_ANSWER_WINDOW_MARGIN_S
