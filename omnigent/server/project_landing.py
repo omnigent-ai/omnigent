@@ -206,6 +206,40 @@ class LandingQueue:
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "stopped.json").write_text(json.dumps(self.stopped))
 
+    def _save_pending(self) -> None:
+        """Keep queued lands on disk so a restart inside the batch window can't drop them."""
+        directory = _state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        entries = [
+            {
+                "project_id": item.project.id,
+                "user_id": item.project.user_id,
+                "ticket_id": item.ticket["id"],
+                "sha": item.sha,
+                "submitter": item.submitter,
+            }
+            for item in self.pending
+        ]
+        (directory / "pending.json").write_text(json.dumps(entries))
+
+    async def _resume_pending(self, delay: float = 5.0) -> None:
+        await asyncio.sleep(delay)
+        try:
+            entries = json.loads((_state_dir() / "pending.json").read_text())
+        except (OSError, ValueError):
+            return
+        projects = self._notifications.projects
+        for entry in entries if isinstance(entries, list) else []:
+            project = await asyncio.to_thread(
+                projects.get, entry["project_id"], user_id=entry.get("user_id")
+            )
+            if project is not None:
+                self.pending.append(
+                    Item(project, {"id": entry["ticket_id"]}, entry["sha"], entry.get("submitter"))
+                )
+        if self.pending:
+            await self.run_batch()
+
     def _load_stopped(self) -> None:
         try:
             self.stopped = json.loads((_state_dir() / "stopped.json").read_text())
@@ -333,6 +367,7 @@ class LandingQueue:
         if any(item.ticket["id"] == ticket["id"] for item in self.pending):
             raise refuse("This ticket already has a landing queued")
         self.pending.append(Item(project, ticket, sha, who.session_id))
+        self._save_pending()
         await self._note(
             project,
             ticket["id"],
@@ -360,6 +395,7 @@ class LandingQueue:
     async def run_batch(self) -> None:
         async with self._lock:
             items, self.pending = self.pending, []
+            self._save_pending()
             if not items:
                 return
             landed: list[Item] = []
@@ -536,6 +572,8 @@ class LandingQueue:
 
     def start(self) -> None:
         self._load_stopped()
+        if (_state_dir() / "pending.json").exists():
+            self._spawn(self._resume_pending())
         if (_state_dir() / "batch.json").exists():
             self._spawn(self._report_restart())
 

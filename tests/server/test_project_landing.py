@@ -196,3 +196,13 @@ def test_a_target_outside_the_repository_is_refused(world, tmp_path: Path) -> No
     git(other, "init", "-q")
     with pytest.raises(OmnigentError, match="server's repository"):
         landing.resolve_target({"landing": {"enabled": True, "checkout": str(other)}})
+
+
+async def test_a_restart_inside_the_batch_window_keeps_the_queued_land(world) -> None:
+    sha = feature(world, "f4")
+    world.tickets.label("approved", sha)
+    await submit(world, sha)
+    # The server restarts before the batch runs: a new queue picks the land back up.
+    resumed = landing.LandingQueue(world.queue.app)
+    await resumed._resume_pending(delay=0)
+    assert git(world.repo, "rev-parse", BRANCH) == sha
