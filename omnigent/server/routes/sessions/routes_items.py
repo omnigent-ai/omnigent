@@ -62,7 +62,7 @@ from omnigent.server.schemas import (
     SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.conversation_store import runner_seen_is_fresh
+from omnigent.stores.conversation_store import SPAWN_TREE_READ_CAP, runner_seen_is_fresh
 from omnigent.stores.permission_store import PermissionStore
 
 # ``?descendants=true`` depth: the default matches the CLI tree and the web
@@ -71,7 +71,7 @@ _DEFAULT_DESCENDANT_DEPTH = 3
 _MAX_DESCENDANT_DEPTH = 10
 # ``?descendants=true`` reads at most this many sub-agents of one spawn tree;
 # a bigger tree gets the one-level listing instead, which clients walk.
-_SPAWN_TREE_READ_CAP = 2000
+_SPAWN_TREE_READ_CAP = SPAWN_TREE_READ_CAP
 # The item types ``GET /sessions/{id}/items`` can filter by.
 _ITEM_TYPE_PATTERN = f"^({'|'.join(ITEM_TYPE_TO_DATA_CLS)})$"
 
@@ -167,6 +167,7 @@ def register_items_routes(
             conversation_store=conversation_store,
             liveness_lookup=liveness_lookup,
             host_store=getattr(request.app.state, "host_store", None),
+            host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
             may_settle=lambda _conv: True,
         )
 

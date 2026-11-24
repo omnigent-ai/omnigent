@@ -18,6 +18,7 @@ import httpx
 from fastapi import (
     APIRouter,
     HTTPException,
+    Query,
     Request,
 )
 from fastapi.responses import StreamingResponse
@@ -42,6 +43,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
+from omnigent.harness_aliases import is_native_harness
 from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
@@ -73,6 +75,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
     diagnose_codex_provider_auth_failure,
+    diagnose_content_policy_refusal,
     turn_error_display_message,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
@@ -203,6 +206,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _delete_session_tree_files,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -264,6 +268,7 @@ from omnigent.server.routes._sessions.helpers import (
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _await_exit_report,
     _best_effort_stop,
     _cancel_runner_relays,
     _child_session_summaries_from_conversations,
@@ -1173,6 +1178,22 @@ def register_events_routes(
             )
         return user_id, conv
 
+    @event_router.post("/sessions/{session_id}/recovery/admit", include_in_schema=False)
+    async def admit_recovery_turn(
+        request: Request,
+        session_id: str,
+        recovery_id: str = Query(min_length=1, max_length=128),
+    ) -> dict[str, bool]:
+        _, conv = await _authorized_conversation(request, session_id, external_transcript=True)
+        reporting_runner = _reporting_runner_id(request)
+        if reporting_runner is not None and reporting_runner != conv.runner_id:
+            raise OmnigentError("session is not bound to this runner", code=ErrorCode.FORBIDDEN)
+        recoverer = getattr(request.app.state, "host_session_recoverer", None)
+        admitted = recoverer is not None and await asyncio.to_thread(
+            recoverer.admit_turn, session_id, recovery_id
+        )
+        return {"admitted": admitted}
+
     @event_router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -1320,6 +1341,42 @@ def register_events_routes(
         register_runner_ingest(ingest_runner_batch)
 
     pull_request_store = server_prs.open_store(conversation_store)
+
+    async def _end_run_pull_request_turn(
+        app: Any, session_id: str, labels: Mapping[str, str]
+    ) -> None:
+        """End the run's PR attribution because a person wrote to the session.
+
+        Also for a session the automation created, whose run label stays for its
+        journal. A prompt still being dispatched keeps its run unless that run
+        finished or its pending stamp went stale, as when clearing the label.
+        """
+        run_id = labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+        if not run_id or pull_request_store is None:
+            return
+        run_finished = False
+        if SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id in labels:
+            scheduled_store = getattr(getattr(app, "state", None), "scheduled_task_store", None)
+            run = (
+                await asyncio.to_thread(scheduled_store.get_run, run_id)
+                if scheduled_store is not None
+                else None
+            )
+            run_finished = run is not None and run.status not in {
+                "scheduled",
+                "starting",
+                "running",
+            }
+        try:
+            await asyncio.to_thread(
+                pull_request_store.end_run_turn, session_id, run_id, run_finished=run_finished
+            )
+        except Exception:  # PR attribution must not block the message.
+            _logger.warning(
+                "Could not end a run's pull request attribution",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
 
     async def _store_reported_pull_requests(session_id: str, body: SessionEventInput) -> None:
         """Merge the PRs a runner discovered; the runner retries until this succeeds."""
@@ -1487,18 +1544,21 @@ def register_events_routes(
             )
         start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"
-        interactive_run_id = (
-            conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
-            if isinstance(request, Request)
+        # A person writing to the session, not an agent, workflow or runner.
+        human_input = (
+            isinstance(request, Request)
             and not peer_message
             and body.workflow_run_id is None
             and not request.headers.get(ORCHESTRATION_SOURCE_HEADER)
             and not request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
-            and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
             and (
                 (body.type == "message" and body.data.get("role", "user") == "user")
                 or body.type == _SLASH_COMMAND_TYPE
             )
+        )
+        interactive_run_id = (
+            conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+            if human_input and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
             else None
         )
         if peer_message:
@@ -1675,14 +1735,15 @@ def register_events_routes(
                     f"Invalid data payload for event type {body.type!r}: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        # Set when this message sends a file outside the default extensions, which
+        # Set when this message sends a file outside the legacy extensions, which
         # the bound runtime must be able to deliver as a file.
         outgoing_needs_delivery_capability = False
         if body.type in ("message", _SLASH_COMMAND_TYPE):
             from omnigent.inner.native_attachments import (
+                CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                 DELIVERY_KEY,
+                filesystem_attachment_capability,
                 inline_filesystem_attachment_name,
-                requires_filesystem,
                 uses_filesystem_delivery,
             )
             from omnigent.runtime.content_resolver import attachment_delivery
@@ -1719,7 +1780,10 @@ def register_events_routes(
                         stored.filename, stored.source_metadata
                     ):
                         filesystem_name = filesystem_name or stored.filename
-                        if not requires_filesystem(stored.filename):
+                        if (
+                            filesystem_attachment_capability([stored.filename])
+                            == CAP_FILESYSTEM_ATTACHMENT_DELIVERY
+                        ):
                             outgoing_needs_delivery_capability = True
                 if filesystem_name is not None:
                     await _require_filesystem_attachment_harness(conv, filesystem_name)
@@ -1777,6 +1841,9 @@ def register_events_routes(
                 user_id=user_id,
                 permission_store=permission_store,
             )
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            if recoverer is not None:
+                await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
             if startup is not None and await startup.retry(session_id):
                 if conv.host_id is not None:
                     startup.host_changed(request.app, conv.host_id)
@@ -2125,6 +2192,9 @@ def register_events_routes(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
         if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            if recoverer is not None:
+                await asyncio.to_thread(recoverer.stop_recovery, conv)
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
                 await startup.cancel(session_id)
@@ -2297,6 +2367,9 @@ def register_events_routes(
                     stop_conv.runner_id,
                     stop_host_registry,
                     conversation_store,
+                    host_session_recoverer=getattr(
+                        request.app.state, "host_session_recoverer", None
+                    ),
                 )
                 if not host_stopped:
                     host_conn = (
@@ -2375,6 +2448,9 @@ def register_events_routes(
                         session_id,
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                        host_session_recoverer=getattr(
+                            request.app.state, "host_session_recoverer", None
+                        ),
                     )
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
@@ -2627,6 +2703,13 @@ def register_events_routes(
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+
+            async def _direct_input() -> None:
+                # Typed in a native terminal; read the label as the item lands.
+                current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                labels = current.labels if current is not None else conv.labels if conv else {}
+                await _end_run_pull_request_turn(getattr(request, "app", None), session_id, labels)
+
             item_id = await _persist_external_conversation_item(
                 session_id,
                 conv,
@@ -2635,6 +2718,7 @@ def register_events_routes(
                 created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
                 enabled=background_session_titles_enabled(request.headers),
+                on_direct_input=_direct_input,
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
@@ -2833,12 +2917,12 @@ def register_events_routes(
                 else:
                     error_code = "native_turn_error"
                 classified_code = classify_native_turn_error(error_code, output)
-                # The old-CLI refusal carries the versions, so the card can name the fix.
-                diagnosis = (
-                    diagnose_client_update_required(output)
-                    if classified_code == "client_update_required"
-                    else None
-                )
+                # Claude Code's refusal text identifies the cause, so the card can name the fix.
+                diagnosis = None
+                if classified_code == "client_update_required":
+                    diagnosis = diagnose_client_update_required(output)
+                elif classified_code == "content_policy_refusal":
+                    diagnosis = diagnose_content_policy_refusal(output)
                 if harness == "codex-native" and classified_code in {
                     "codex_turn_error",
                     "native_turn_error",
@@ -2876,6 +2960,34 @@ def register_events_routes(
             # A confirmed turn completion after a failure means a later turn
             # succeeded, so the earlier failure must not outlive it.
             turn_completed = status == "idle" and data.get("turn_completed") is True
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            recovery_terminal = turn_completed
+            if recoverer is not None and status == "idle":
+                harness = await asyncio.to_thread(
+                    _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                recovery_terminal = turn_completed or (
+                    is_native_harness(harness)
+                    and native_subagent_terminal_status(
+                        status,
+                        harness=harness,
+                        turn_outcome=data.get("turn_outcome"),
+                        turn_completed=data.get("turn_completed"),
+                    )
+                    is not None
+                )
+            if recoverer is not None and (
+                status in {"running", "failed", "waiting"} or recovery_terminal
+            ):
+                await asyncio.to_thread(
+                    recoverer.record_turn,
+                    session_id,
+                    conv.runner_id,
+                    response_id,
+                    finished=status in {"failed", "waiting"}
+                    or recovery_terminal
+                    or bool(blocked_on),
+                )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )
@@ -3771,6 +3883,9 @@ def register_events_routes(
             # runner is bound — item events can't, because that
             # would desync conversation store and harness state.
             if relaunched_runner_id:
+                # The wait can end on a dead status before the runner's exit report arrives.
+                if not relaunched_launch_refused:
+                    await _await_exit_report(relaunched_runner_id, runner_exit_reports)
                 # Name the failed phase to users and log a correlated ERROR.
                 exit_report = (
                     runner_exit_reports.get(relaunched_runner_id)
@@ -3873,6 +3988,8 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
+        if human_input:
+            await _end_run_pull_request_turn(request.app, session_id, conv.labels)
         # A human's next turn ends attribution from an earlier continuation.
         # Leave a newer fire or a prompt still being dispatched untouched.
         pending_run_finished = False
@@ -4422,34 +4539,12 @@ def register_events_routes(
                 exclude_conversation_id=conv.id,
                 fail_if_unavailable=True,
             )
-        # Session file cleanup. delete_all_for_session returns only the blob
-        # keys that became orphaned — a blob still shared by a fork in another
-        # session is not returned, so the fork's attachment survives.
+        # The subtree delete below also removes every sub-agent, so clean their
+        # files too; a blob a fork in another session still shares survives.
         if file_store is not None and artifact_store is not None:
-            orphaned_blob_keys = await asyncio.to_thread(
-                file_store.delete_all_for_session, session_id
+            await _delete_session_tree_files(
+                conversation_store, file_store, artifact_store, session_id
             )
-            # Best-effort: a backend failure on one blob must not abort the
-            # delete after the file rows are already gone.
-            failed_blob_count = 0
-            for blob_key in orphaned_blob_keys:
-                try:
-                    await asyncio.to_thread(artifact_store.delete, blob_key)
-                except Exception as exc:
-                    failed_blob_count += 1
-                    _logger.warning(
-                        "Failed to delete attachment blob %s for session %s: %s",
-                        blob_key,
-                        session_id,
-                        type(exc).__name__,
-                    )
-            if failed_blob_count:
-                _logger.warning(
-                    "Session %s deleted with %d of %d attachment blobs left behind",
-                    session_id,
-                    failed_blob_count,
-                    len(orphaned_blob_keys),
-                )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)

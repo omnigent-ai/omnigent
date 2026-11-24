@@ -8,6 +8,7 @@ import {
   matchesShortcut,
   SHORTCUT_BINDINGS,
   shortcutBinding,
+  shortcutKeys,
 } from "./registry";
 
 function press(init: Partial<KeyChordInput> & { key: string }): KeyChordInput {
@@ -124,6 +125,7 @@ describe("shortcut registry", () => {
     const comma = press({ key: "≤", code: "Comma", metaKey: true, altKey: true });
     expect(matchesShortcut(comma, "settings.open", mac)).toBe(true);
     expect(activeShortcutChords("settings.open", { desktopMenu: true })).toEqual([]);
+    expect(shortcutKeys("settings.open", { ...mac, desktopMenu: true })).toEqual([]);
     expect(matchesShortcut(comma, "settings.open", { ...mac, desktopMenu: true })).toBe(false);
   });
 

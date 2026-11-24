@@ -4,15 +4,21 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
+import { flushSync } from "react-dom";
 import * as DialogPrimitive from "radix-ui/dialog";
-import { XIcon, ZoomInIcon, ZoomOutIcon } from "lucide-react";
+import { DownloadIcon, XIcon, ZoomInIcon, ZoomOutIcon } from "lucide-react";
+import { toast } from "sonner";
 
 import { getEmbedRoot } from "@/lib/host";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { canDownloadImage, downloadImage } from "@/hooks/useFileContent";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 // Zoom bounds and step for the lightbox viewer. 1 = fit-to-card.
@@ -23,13 +29,77 @@ const ZOOM_STEP = 0.25;
 /** Pointer travel that separates a pan from a click, in CSS pixels. */
 const DRAG_SLOP_PX = 4;
 
+/** How far two fingers must spread over a chat image, as a multiple of their starting gap, to open it. */
+const PINCH_OPEN_RATIO = 1.2;
+
 function clampZoom(z: number) {
   return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+}
+
+function clampMagnitude(value: number, limit: number) {
+  return Math.min(limit, Math.max(-limit, value));
+}
+
+function fingerGap(touches: TouchList) {
+  return Math.hypot(
+    touches[1].clientX - touches[0].clientX,
+    touches[1].clientY - touches[0].clientY,
+  );
 }
 
 interface LightboxImage {
   src: string;
   alt: string;
+  /** Save-dialog name; defaults to `alt`. */
+  downloadName?: string;
+  /** App API path the image was read from, for sources the page can't save itself. */
+  downloadPath?: string;
+  /** The image's bytes; outlives an object URL its owner revokes while the preview is open. */
+  downloadBlob?: Blob;
+}
+
+function ImageDownloadButton({ image, className }: { image: LightboxImage; className?: string }) {
+  const [saving, setSaving] = useState(false);
+  // A ref, not state, so two clicks in one frame can't both pass the check.
+  const savingRef = useRef(false);
+  const name = image.downloadName || image.alt;
+  const save = () => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    downloadImage(image.src, name || "image", {
+      apiPath: image.downloadPath,
+      blob: image.downloadBlob,
+    })
+      .catch(() => toast.error("Download failed"))
+      .finally(() => {
+        savingRef.current = false;
+        setSaving(false);
+      });
+  };
+  return (
+    // Tests and stories render images without the app root's provider.
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={name ? `Download image: ${name}` : "Download image"}
+            className={className}
+            disabled={saving}
+            onClick={(e) => {
+              e.stopPropagation();
+              save();
+            }}
+          >
+            <DownloadIcon />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Download</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 interface LightboxContextValue {
@@ -52,6 +122,12 @@ export interface ZoomableImageProps extends React.ComponentProps<"img"> {
   alt: string;
   /** Optional sizing for the button around the image. */
   buttonClassName?: string;
+  /** Save-dialog name; setting it also shows a download button on hover. */
+  downloadName?: string;
+  /** App API path the image was read from, for sources the page can't save itself. */
+  downloadPath?: string;
+  /** The image's bytes, so a save survives its owner revoking `src`. */
+  downloadBlob?: Blob;
 }
 
 /**
@@ -67,11 +143,50 @@ export function ZoomableImage({
   alt,
   className,
   buttonClassName,
+  downloadName,
+  downloadPath,
+  downloadBlob,
   ...imgProps
 }: ZoomableImageProps) {
   const { open } = useLightbox();
-  return (
+  const buttonRef = useRef<HTMLButtonElement>(null);
+
+  // The native shells lock page zoom, so a pinch over the image opens the
+  // preview, which keeps zooming with the same fingers.
+  useEffect(() => {
+    const button = buttonRef.current;
+    if (!button || !src || !(isIOSShell() || isAndroidShell())) return;
+    let startGap: number | null = null;
+    const onTouch = (e: TouchEvent) => {
+      if (e.touches.length !== 2) {
+        startGap = null;
+        return;
+      }
+      if (e.cancelable) e.preventDefault();
+      const gap = fingerGap(e.touches);
+      if (startGap === null) {
+        startGap = gap;
+      } else if (gap >= startGap * PINCH_OPEN_RATIO) {
+        // Open once per pinch, and mount the preview before the next move arrives.
+        startGap = Infinity;
+        flushSync(() => open({ src, alt, downloadName, downloadPath, downloadBlob }));
+      }
+    };
+    button.addEventListener("touchstart", onTouch, { passive: false });
+    button.addEventListener("touchmove", onTouch, { passive: false });
+    button.addEventListener("touchend", onTouch);
+    button.addEventListener("touchcancel", onTouch);
+    return () => {
+      button.removeEventListener("touchstart", onTouch);
+      button.removeEventListener("touchmove", onTouch);
+      button.removeEventListener("touchend", onTouch);
+      button.removeEventListener("touchcancel", onTouch);
+    };
+  }, [open, src, alt, downloadName, downloadPath, downloadBlob]);
+
+  const zoom = (
     <button
+      ref={buttonRef}
       type="button"
       aria-label={alt ? `Zoom image: ${alt}` : "Zoom image"}
       className={cn(
@@ -79,11 +194,26 @@ export function ZoomableImage({
         buttonClassName,
       )}
       onClick={() => {
-        if (src) open({ src, alt });
+        if (src) open({ src, alt, downloadName, downloadPath, downloadBlob });
       }}
     >
       <img {...imgProps} src={src} alt={alt} className={className} />
     </button>
+  );
+  const source = { apiPath: downloadPath, blob: downloadBlob };
+  if (!downloadName || !src || !canDownloadImage(src, source)) return zoom;
+  return (
+    <span className="group/image relative inline-flex max-w-full">
+      {zoom}
+      <ImageDownloadButton
+        image={{ src, alt, downloadName, downloadPath, downloadBlob }}
+        className={cn(
+          "absolute top-1 right-1 bg-background/80 shadow-sm ring-1 ring-foreground/10 backdrop-blur-xs hover:bg-background/90",
+          // Touch screens never hover, so the hidden button must not take the zoom tap.
+          "pointer-events-none opacity-0 group-hover/image:pointer-events-auto group-hover/image:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100",
+        )}
+      />
+    </span>
   );
 }
 
@@ -91,14 +221,16 @@ export function ZoomableImage({
  * The zoomable image inside the lightbox card. Holds its own zoom/pan state and
  * is keyed by `src` in the provider so that state resets per image.
  *
- * Zoom: scroll wheel (anchored at the cursor), the +/- toolbar buttons, or
- * double-click to toggle between fit and 2x. Pan: drag while zoomed in. The
+ * Zoom: scroll wheel (anchored at the cursor), the +/- toolbar buttons,
+ * double-click to toggle between fit and 2x, or a two-finger pinch (anchored
+ * between the fingers). Pan: drag while zoomed in. The
  * image is `object-contain` within a fixed-size viewport that clips overflow,
  * so the zoomed image never escapes the card. A click on the empty stage
  * around the image dismisses the preview.
  */
 function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => void }) {
   const viewportRef = useRef<HTMLDivElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   // Active pointer drag (panning); null when not dragging.
@@ -111,6 +243,17 @@ function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => v
   } | null>(null);
   // Whether the current gesture panned, so its closing click isn't a dismiss.
   const pannedRef = useRef(false);
+  // Active two-finger pinch; the anchor is the image point between the fingers, at scale 1.
+  const pinchRef = useRef<{
+    startGap: number;
+    startZoom: number;
+    anchorX: number;
+    anchorY: number;
+  } | null>(null);
+  const viewRef = useRef({ zoom, offset });
+  useLayoutEffect(() => {
+    viewRef.current = { zoom, offset };
+  });
 
   const resetView = useCallback(() => {
     setZoom(1);
@@ -133,12 +276,67 @@ function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => v
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
+  // Pinch-to-zoom. Listens on the document, not the stage, so a pinch begun on
+  // a chat image carries on into the preview it opened.
+  useEffect(() => {
+    const onTouch = (e: TouchEvent) => {
+      const stage = viewportRef.current;
+      // A finger landing or lifting re-anchors the pinch on the current pair.
+      if (e.type !== "touchmove") pinchRef.current = null;
+      if (!stage || e.touches.length < 2) {
+        pinchRef.current = null;
+        return;
+      }
+      if (e.cancelable) e.preventDefault();
+      const rect = stage.getBoundingClientRect();
+      const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left - rect.width / 2;
+      const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top - rect.height / 2;
+      const gap = fingerGap(e.touches);
+      const pinch = pinchRef.current;
+      if (!pinch) {
+        const { zoom: startZoom, offset: startOffset } = viewRef.current;
+        // Fingers beside the image (or over the chat image that opened it) hold
+        // the nearest edge, so the zoom can't push the image off-screen.
+        const halfWidth = (imageRef.current?.offsetWidth ?? 0) / 2;
+        const halfHeight = (imageRef.current?.offsetHeight ?? 0) / 2;
+        // The pinch replaces any one-finger pan, and its release is not a dismiss.
+        dragRef.current = null;
+        pannedRef.current = true;
+        pinchRef.current = {
+          startGap: Math.max(gap, 1),
+          startZoom,
+          anchorX: clampMagnitude((midX - startOffset.x) / startZoom, halfWidth),
+          anchorY: clampMagnitude((midY - startOffset.y) / startZoom, halfHeight),
+        };
+        return;
+      }
+      const next = clampZoom((pinch.startZoom * gap) / pinch.startGap);
+      setZoom(next);
+      setOffset(
+        next === MIN_ZOOM
+          ? { x: 0, y: 0 }
+          : { x: midX - next * pinch.anchorX, y: midY - next * pinch.anchorY },
+      );
+    };
+    document.addEventListener("touchstart", onTouch, { passive: false });
+    document.addEventListener("touchmove", onTouch, { passive: false });
+    document.addEventListener("touchend", onTouch);
+    document.addEventListener("touchcancel", onTouch);
+    return () => {
+      document.removeEventListener("touchstart", onTouch);
+      document.removeEventListener("touchmove", onTouch);
+      document.removeEventListener("touchend", onTouch);
+      document.removeEventListener("touchcancel", onTouch);
+    };
+  }, []);
+
   // Drop pan offset whenever zoom returns to fit.
   useEffect(() => {
     if (zoom === MIN_ZOOM) setOffset({ x: 0, y: 0 });
   }, [zoom]);
 
   const onPointerDown = (e: React.PointerEvent) => {
+    if (pinchRef.current) return;
     pannedRef.current = false;
     if (zoom <= MIN_ZOOM) return;
     dragRef.current = {
@@ -177,7 +375,7 @@ function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => v
     <>
       <div
         ref={viewportRef}
-        className="absolute inset-0 flex items-center justify-center overflow-hidden"
+        className="absolute inset-0 flex touch-none items-center justify-center overflow-hidden"
         onClick={onStageClick}
         onDoubleClick={() => applyZoom(zoomed ? MIN_ZOOM : 2)}
         onPointerDown={onPointerDown}
@@ -187,15 +385,16 @@ function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => v
         style={{ cursor: zoomed ? (dragRef.current ? "grabbing" : "grab") : "zoom-in" }}
       >
         <img
+          ref={imageRef}
           src={image.src}
           alt={image.alt}
           draggable={false}
           className="max-h-[92vh] max-w-[94vw] origin-center object-contain select-none"
           style={{
             transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
-            // Don't fight the drag with a transition while panning, but ease
-            // discrete zoom steps.
-            transition: dragRef.current ? "none" : "transform 120ms ease-out",
+            // Don't fight a drag or pinch with a transition, but ease discrete
+            // zoom steps.
+            transition: dragRef.current || pinchRef.current ? "none" : "transform 120ms ease-out",
           }}
         />
       </div>
@@ -227,6 +426,9 @@ function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => v
         >
           <ZoomInIcon />
         </Button>
+        {canDownloadImage(image.src, { apiPath: image.downloadPath, blob: image.downloadBlob }) && (
+          <ImageDownloadButton image={image} />
+        )}
       </div>
     </>
   );

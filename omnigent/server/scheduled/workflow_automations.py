@@ -1,7 +1,8 @@
 """Keep an automation that runs a saved workflow from reusing a session.
 
 It reads the prompt a run sends, below any trigger header: a header can disagree with
-that prompt, and only the prompt runs.
+that prompt, and only the prompt runs. It also reads which saved workflow a message
+runs, so a session that opens with one is titled for it.
 """
 
 from __future__ import annotations
@@ -26,8 +27,9 @@ TASK_SESSION_MESSAGE = (
 # Keep in sync with SAVED_WORKFLOW_RUN in web/src/lib/savedWorkflowRun.ts. Like
 # JavaScript's ".", the name matches no line break.
 _WORKFLOW_RUN_OPENING = (
-    r'[/$]workflow Run the saved workflow "[^\n\r\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]+" '
-    r"\(ID [0-9a-f]{32}\)\."
+    r'[/$]workflow Run the saved workflow "'
+    r"(?P<name>[^\n\r\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}]+)"
+    r'" \(ID (?P<workflow_id>[0-9a-f]{32})\)\.'
 )
 _SAVED_WORKFLOW_RUN = re.compile(_WORKFLOW_RUN_OPENING + r"(?:\n\n[\s\S]*)?")
 # A run's first line, for instructions whose end the prompt doesn't mark. Keep in sync
@@ -75,6 +77,35 @@ def workflow_session_reuse_error(prompt: str, session_mode: str) -> str | None:
     if is_trigger_prompt(prompt):
         return TASK_SESSION_MESSAGE if task_session else None
     return CONTINUED_SESSION_MESSAGE if session_mode == "continue" else None
+
+
+def saved_workflow_id(prompt: str) -> str | None:
+    """The saved workflow a scheduled prompt runs, or None.
+
+    Each run of such a schedule starts as a run of that workflow. A trigger's prompt
+    runs none itself: the sessions it starts for its matches do.
+
+    :param prompt: The prompt a run sends, e.g.
+        ``'/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'``
+    :returns: The workflow's ID, e.g. ``"0123456789abcdef0123456789abcdef"``.
+    """
+    if is_trigger_prompt(prompt):
+        return None
+    instructions = _trigger_instructions(strip_trigger_header(prompt))
+    if instructions is None:
+        return None
+    match = _SAVED_WORKFLOW_RUN.fullmatch(instructions.strip(_JS_WHITESPACE))
+    return None if match is None else match["workflow_id"]
+
+
+def saved_workflow_run_name(text: str) -> str | None:
+    """The name of the saved workflow *text* opens by running, or None for other text.
+
+    :param text: A message, e.g. ``'/workflow Run the saved workflow "Release" (ID …).'``.
+    :returns: The workflow's name as the message gives it, e.g. ``"Release"``.
+    """
+    match = _SAVED_WORKFLOW_RUN_START.match(text.lstrip(_JS_WHITESPACE))
+    return match.group("name") if match else None
 
 
 def _workflow_reading(prompt: str) -> tuple[bool, bool]:

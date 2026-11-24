@@ -24,7 +24,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 
 from cachetools import TTLCache
 
@@ -61,6 +61,13 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalRegistry
 
 _logger = logging.getLogger(__name__)
+
+
+class _ProgramStatusLaunchArgs(TypedDict, total=False):
+    """Optional program-status arguments accepted by the terminal registry."""
+
+    program_status_app: str
+
 
 _DEFAULT_WORKSPACE_PARENT = os.environ.get("TMPDIR", None if IS_WINDOWS else "/tmp")
 
@@ -1676,7 +1683,7 @@ class SessionResourceRegistry:
         from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
         spec = replace(spec, env={**spec.env, **self.client_surface_env(session_id)})
-        program_status_args = (
+        program_status_args: _ProgramStatusLaunchArgs = (
             {"program_status_app": "claude-code"}
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             and self._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS)

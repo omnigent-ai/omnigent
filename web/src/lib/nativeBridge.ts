@@ -27,12 +27,29 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
-// Mirrors SESSION_HOST_PROTOCOL in electron/src/hostIdentity.js.
+// Mirrors the protocol versions in electron/src/hostIdentity.js.
 export const SESSION_HOST_PROTOCOL = 1;
+export const SSH_PREVIEW_PROTOCOL = 1;
+export const TRUSTED_REMOTE_PREVIEW_PROTOCOL = 1;
 
 export interface BrowserHostOptions {
   sourceHostId?: string | null;
   sessionHostProtocol?: number;
+  sshPreviewProtocol?: number;
+  trustedRemotePreviewProtocol?: number;
+  navigationRetryToken?: string;
+  sourceSshTarget?: string;
+}
+
+export interface BrowserNavigationResult {
+  ok: boolean;
+  created?: boolean;
+  hostIsThisMachine?: boolean;
+  sshPreviewHost?: boolean;
+  trustedRemotePreviewHost?: boolean;
+  retryWithFreshHost?: boolean;
+  navigationRetryToken?: string;
+  error?: string;
 }
 
 export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
@@ -251,7 +268,7 @@ interface ElectronDesktopApi extends NativeShellApi {
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
+  ) => Promise<BrowserNavigationResult>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -271,14 +288,16 @@ interface ElectronDesktopApi extends NativeShellApi {
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
   /**
    * Inspect the local Google Chrome profiles for cookies in the site tree the
-   * conversation's view is on. Metadata only (profile + per-scope counts): no
-   * Keychain access and no cookie values. Absent on shells predating the feature.
+   * conversation's view is on, and across every website. Metadata only (profile
+   * + counts): no Keychain access and no cookie values. Absent on shells
+   * predating the feature.
    */
   browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
   /**
-   * Copy that site's cookies out of one Chrome profile into the conversation's
-   * own in-memory browser session. Decrypts via the Keychain (system prompt on
-   * the first import); `expectedHost` must still match the view's current site.
+   * Copy one Chrome profile's cookies into the conversation's own in-memory
+   * browser session: every website's for {@link CHROME_COOKIE_ALL_SITES_SCOPE},
+   * else one site tree, for which `expectedHost` must still match the view's
+   * current site. Decrypts via the Keychain (system prompt on the first import).
    */
   browserChromeCookieImport?: (
     conversationId: string,
@@ -295,8 +314,12 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => () => void;
   /** Report which menu commands this page can run now (fire-and-forget). */
   setDesktopCommandState?: (state: DesktopCommandState) => void;
+  /** Report the conversation this page has loaded, or null for none (fire-and-forget). */
+  reportConversationShown?: (conversationId: string | null) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow?: () => Promise<boolean>;
+  /** Open a session in its own desktop window on this server. Resolves whether it opened. */
+  openSessionWindow?: (sessionId: string) => Promise<boolean>;
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
   confirmQuit?: (options: { dontAskAgain: boolean }) => Promise<boolean>;
   /**
@@ -304,15 +327,83 @@ interface ElectronDesktopApi extends NativeShellApi {
    * macOS shells expose it. Resolves whether the shell started it.
    */
   startSystemDictation?: () => Promise<boolean>;
-  /** The "Show Omnigent from anywhere" shortcut; absent on shells predating it. */
-  getGlobalShortcut?: () => Promise<GlobalShortcutStatus | null>;
+  /**
+   * A system-wide shortcut, "show" when no id is given; absent on shells predating it. Only
+   * shells reporting `floatingComposerShortcut` know an id other than "show".
+   */
+  getGlobalShortcut?: (id?: GlobalShortcutId) => Promise<GlobalShortcutStatus | null>;
   /** Saves the shortcut; resolves `{ ok: false, error }` when the shell refuses the chord. */
-  setGlobalShortcut?: (change: GlobalShortcutChange) => Promise<GlobalShortcutSaveResult>;
+  setGlobalShortcut?: (
+    change: GlobalShortcutChange,
+    id?: GlobalShortcutId,
+  ) => Promise<GlobalShortcutSaveResult>;
   /** Takes the next chord ahead of the page's shortcuts and the menu; null when cancelled. */
-  recordGlobalShortcut?: () => Promise<string | null>;
+  recordGlobalShortcut?: (id?: GlobalShortcutId) => Promise<string | null>;
   cancelGlobalShortcutRecording?: () => Promise<boolean>;
   /** The attached browser page's view id if it has keyboard focus; absent on older shells. */
   browserFocusedView?: () => Promise<string | null>;
+  /** "Widen window when opening the right sidebar"; absent on shells predating it. */
+  rightSidebarWindow?: RightSidebarWindowBridge;
+  /** The floating New Agent panel; absent on shells predating it. */
+  floatingComposer?: FloatingComposerBridge;
+}
+
+/** The shell's setting that widens the window for the right sidebar, and the page's reports. */
+export interface RightSidebarWindowBridge {
+  getWidensWindow: () => Promise<boolean>;
+  /** Resolves false when the shell couldn't save it. */
+  setWidensWindow: (enabled: boolean) => Promise<boolean>;
+  /** The user opened the right sidebar, `width` CSS px wide. */
+  opened: (width: number) => void;
+  /** The user closed the right sidebar. */
+  closed: () => void;
+  /** Forget the previous session's growth without resizing; absent on older shells. */
+  reset?: () => void;
+}
+
+/** Why the shell didn't open a path from the floating panel in a main window. */
+export type FloatingComposerOpenError = "not-composer" | "bad-path" | "window-loading";
+
+/** A panel launch's first message, handed to a main window that sends it. */
+export interface FloatingLaunchMessage {
+  text: string;
+  skill: { name: string; args: string } | null;
+  files: { name: string; type: string; bytes: Uint8Array<ArrayBuffer> }[];
+}
+
+/** A launch's first message the shell offers a main window to send itself. */
+export interface FloatingLaunchOffer {
+  offerId: number;
+  sessionId: string;
+}
+
+/** The desktop shell's floating New Agent panel. */
+export interface FloatingComposerBridge {
+  /** From a main window: this document can render the panel (version 1) for its server. */
+  announceSupport: (version: number) => void;
+  /** From the panel: hide it, keeping its draft. */
+  dismiss: () => void;
+  /** From the panel: show `/c/<id>` or an app page in a main window, then hide. */
+  openInMainWindow: (
+    path: string,
+    message?: FloatingLaunchMessage | null,
+  ) => Promise<{ ok: true; delivery?: "page" } | { ok: false; error: FloatingComposerOpenError }>;
+  /** From the panel: its native file picker opened or closed. */
+  filePicker: (state: "open" | "closed") => void;
+  /** From the panel: its composer rendered, so the shell shows it without a loading state. Newer shells only. */
+  ready?: () => void;
+  /** To the panel: it came on screen or took the keyboard again. Returns an unsubscribe. Newer shells only. */
+  onShown?: (callback: () => void) => () => void;
+  /** From the panel: whether a launch's message can go to a main window that sends it. Newer shells only. */
+  canHandOffLaunch?: () => Promise<boolean>;
+  /** From a main window: takes launches' first messages offered to it; returns an unsubscribe. Newer shells only. */
+  onLaunchOffer?: (callback: (offer: FloatingLaunchOffer) => void) => () => void;
+  /** From a main window: the offered message, once; null when it isn't ours. Newer shells only. */
+  takeLaunchOffer?: (offerId: number) => Promise<FloatingLaunchMessage | null>;
+  /** From a main window: whether the taken offer is still ours, so it may be sent. Newer shells only. */
+  confirmLaunchOffer?: (offerId: number) => Promise<boolean>;
+  /** From a main window: won't send the offer, so the panel delivers it now. Newer shells only. */
+  declineLaunchOffer?: (offerId: number) => Promise<boolean>;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
@@ -387,6 +478,16 @@ export interface ChromeCookieProfile {
   scopes?: ChromeCookieScopeCount[];
 }
 
+/** The import scope for every website in a Chrome profile, not one site tree. */
+export const CHROME_COOKIE_ALL_SITES_SCOPE = "*";
+
+/** One local Chrome profile and how many cookies it holds across every website. */
+export interface ChromeCookieAllSitesProfile {
+  id: string;
+  name: string;
+  cookieCount: number;
+}
+
 export interface ChromeCookiePreviewResult {
   ok: boolean;
   /** Host whose page asked for the import (main-derived from the real URL). */
@@ -396,6 +497,9 @@ export interface ChromeCookiePreviewResult {
   scopes?: string[];
   /** Profiles with at least one cookie for any scope; empty when none match. */
   profiles?: ChromeCookieProfile[];
+  /** Profiles with at least one cookie for any website. Absent on shells that
+   *  can only import one site. */
+  allSitesProfiles?: ChromeCookieAllSitesProfile[];
   error?: string;
 }
 
@@ -404,7 +508,7 @@ export interface ChromeCookieImportResult {
   /** The user declined the shell's own confirmation; nothing was read. */
   cancelled?: boolean;
   host?: string;
-  /** The site tree actually copied (the page's host unless the user widened it). */
+  /** The site tree actually copied, or {@link CHROME_COOKIE_ALL_SITES_SCOPE}. */
   scope?: string;
   profileId?: string;
   profileName?: string;
@@ -502,6 +606,13 @@ export interface DesktopFeatures {
   arcaPreviewRecovery?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
+  /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */
+  sshLocalhostPreview?: boolean;
+  trustedRemoteLocalhostPreview?: boolean;
+  /** This shell can show the floating New Agent panel (macOS). */
+  floatingComposer?: boolean;
+  /** This shell's shortcut calls take the "floatingComposer" id (macOS). */
+  floatingComposerShortcut?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -543,7 +654,10 @@ export interface HostActionResult {
   authError?: boolean;
 }
 
-/** The "Show Omnigent from anywhere" shortcut; `accelerator` is an Electron accelerator. */
+/** "Show Omnigent from anywhere", or the floating New Agent panel's shortcut. */
+export type GlobalShortcutId = "show" | "floatingComposer";
+
+/** A system-wide shortcut's setting; `accelerator` is an Electron accelerator. */
 export interface GlobalShortcutSetting {
   enabled: boolean;
   accelerator: string;
@@ -557,11 +671,17 @@ export interface GlobalShortcutSaveResult {
   ok: boolean;
   setting?: GlobalShortcutSetting;
   error?: string;
+  /** A free chord to offer in place of the one the shell couldn't register. */
+  suggestion?: string;
 }
 
-/** The saved shortcut, with `error` while it is on but the shell couldn't register it. */
+/**
+ * The saved shortcut, with `error` while it is on but the shell couldn't register it, and a
+ * `suggestion` free chord when there is one.
+ */
 export interface GlobalShortcutStatus extends GlobalShortcutSetting {
   error?: string;
+  suggestion?: string;
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";
@@ -752,6 +872,11 @@ export function updateBridge(): ElectronUpdateBridge | undefined {
   return electronApi()?.updates;
 }
 
+/** The floating New Agent panel bridge, or undefined outside Electron / older shells. */
+export function floatingComposerBridge(): FloatingComposerBridge | undefined {
+  return electronApi()?.floatingComposer;
+}
+
 /**
  * True when the desktop shell is new enough to host the embedded browser pane.
  * Older installed builds expose `omnigentDesktop` but predate the `browser*`
@@ -833,6 +958,20 @@ export function onDesktopCommand(callback: (event: DesktopCommandEvent) => void)
   }
 }
 
+/**
+ * Tell the shell which conversation this page has loaded for the signed-in
+ * user, or null when it shows none. A shell that predates this ignores it.
+ */
+export function reportConversationShown(conversationId: string | null): void {
+  const electron = electronApi();
+  if (!electron?.reportConversationShown) return;
+  try {
+    electron.reportConversationShown(conversationId);
+  } catch (err) {
+    console.warn("[nativeBridge] conversation report failed:", err);
+  }
+}
+
 /** Tell the shell which menu commands this page can run right now. */
 export function setDesktopCommandState(state: DesktopCommandState): void {
   const electron = electronApi();
@@ -852,6 +991,23 @@ export async function closeDesktopWindow(): Promise<boolean> {
     return (await electron.closeWindow()) === true;
   } catch (err) {
     console.warn("[nativeBridge] closeWindow failed:", err);
+    return false;
+  }
+}
+
+/** True when the desktop shell can open a session in its own app window. */
+export function supportsDesktopSessionWindows(): boolean {
+  return typeof electronApi()?.openSessionWindow === "function";
+}
+
+/** Ask the desktop shell to open ``sessionId`` in its own window; resolves whether it did. */
+export async function openDesktopSessionWindow(sessionId: string): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.openSessionWindow) return false;
+  try {
+    return (await electron.openSessionWindow(sessionId)) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] openSessionWindow failed:", err);
     return false;
   }
 }
@@ -900,12 +1056,19 @@ export function supportsGlobalShortcut(): boolean {
   );
 }
 
-/** The saved "Show Omnigent from anywhere" shortcut; `null` outside the shell or on failure. */
-export async function getGlobalShortcut(): Promise<GlobalShortcutStatus | null> {
+/** The id to pass the shell: none for "show", so that call is the one every shell takes. */
+function shortcutIdArgs(id: GlobalShortcutId): [] | [GlobalShortcutId] {
+  return id === "show" ? [] : [id];
+}
+
+/** The saved shortcut; `null` outside the shell or on failure. */
+export async function getGlobalShortcut(
+  id: GlobalShortcutId = "show",
+): Promise<GlobalShortcutStatus | null> {
   const electron = electronApi();
   if (!electron?.getGlobalShortcut) return null;
   try {
-    return await electron.getGlobalShortcut();
+    return await electron.getGlobalShortcut(...shortcutIdArgs(id));
   } catch (err) {
     console.warn("[nativeBridge] electron getGlobalShortcut failed:", err);
     return null;
@@ -918,11 +1081,12 @@ export async function getGlobalShortcut(): Promise<GlobalShortcutStatus | null> 
  */
 export async function setGlobalShortcut(
   change: GlobalShortcutChange,
+  id: GlobalShortcutId = "show",
 ): Promise<GlobalShortcutSaveResult> {
   const electron = electronApi();
   if (!electron?.setGlobalShortcut) return { ok: false, error: "Couldn't save the shortcut." };
   try {
-    return await electron.setGlobalShortcut(change);
+    return await electron.setGlobalShortcut(change, ...shortcutIdArgs(id));
   } catch (err) {
     console.warn("[nativeBridge] electron setGlobalShortcut failed:", err);
     return { ok: false, error: "Couldn't save the shortcut." };
@@ -935,9 +1099,9 @@ export function shellRecordsGlobalShortcut(): boolean {
 }
 
 /** The next chord, taken by the shell; null when recording was cancelled or failed. */
-export async function recordGlobalShortcut(): Promise<string | null> {
+export async function recordGlobalShortcut(id: GlobalShortcutId = "show"): Promise<string | null> {
   try {
-    return (await electronApi()?.recordGlobalShortcut?.()) ?? null;
+    return (await electronApi()?.recordGlobalShortcut?.(...shortcutIdArgs(id))) ?? null;
   } catch (err) {
     console.warn("[nativeBridge] electron recordGlobalShortcut failed:", err);
     return null;
@@ -948,6 +1112,60 @@ export function cancelGlobalShortcutRecording(): void {
   void electronApi()
     ?.cancelGlobalShortcutRecording?.()
     .catch(() => {});
+}
+
+/** Whether the shell can widen the window when the right sidebar opens. */
+export function supportsWidenWindowForRightSidebar(): boolean {
+  const bridge = electronApi()?.rightSidebarWindow;
+  return (
+    typeof bridge?.getWidensWindow === "function" &&
+    typeof bridge.setWidensWindow === "function" &&
+    typeof bridge.opened === "function" &&
+    typeof bridge.closed === "function"
+  );
+}
+
+/** Whether "Widen window when opening the right sidebar" is on; null outside the shell or on failure. */
+export async function getWidenWindowForRightSidebar(): Promise<boolean | null> {
+  if (!supportsWidenWindowForRightSidebar()) return null;
+  try {
+    return (await electronApi()?.rightSidebarWindow?.getWidensWindow()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron getWidensWindow failed:", err);
+    return null;
+  }
+}
+
+/** Saves the setting; resolves false when the shell is absent or couldn't save it. */
+export async function setWidenWindowForRightSidebar(enabled: boolean): Promise<boolean> {
+  if (!supportsWidenWindowForRightSidebar()) return false;
+  try {
+    return (await electronApi()?.rightSidebarWindow?.setWidensWindow(enabled)) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron setWidensWindow failed:", err);
+    return false;
+  }
+}
+
+/** A session switch starts fresh window-growth tracking without resizing the window. */
+export function resetRightSidebarWindowTracking(): void {
+  try {
+    electronApi()?.rightSidebarWindow?.reset?.();
+  } catch (err) {
+    console.warn("[nativeBridge] electron right sidebar reset failed:", err);
+  }
+}
+
+/** Tell a supporting shell the user opened (`width` CSS px) or closed the right sidebar. */
+export function reportRightSidebarVisibility(open: boolean, width: number): void {
+  if (!supportsWidenWindowForRightSidebar()) return;
+  const bridge = electronApi()?.rightSidebarWindow;
+  try {
+    if (open) bridge?.opened(width);
+    else bridge?.closed();
+  } catch (err) {
+    console.warn("[nativeBridge] electron right sidebar report failed:", err);
+  }
 }
 
 /** The browser page (its view id) that has keyboard focus in this window, if any. */

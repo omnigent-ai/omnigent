@@ -7,17 +7,22 @@ import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
-import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import {
+  type ReloadedWorkflows,
+  type SavedWorkflow,
+  useSavedWorkflows,
+} from "@/hooks/useSavedWorkflows";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { formatMessageTimestamp } from "@/lib/relativeTime";
+import { absoluteTime, formatMessageTimestamp } from "@/lib/relativeTime";
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { type MessageReceipt, trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   openTasksTab,
   registerContinuePlan,
@@ -160,6 +165,7 @@ beforeEach(() => {
     isLoading: false,
     isError: false,
     refresh: vi.fn(),
+    reload: vi.fn().mockResolvedValue({ workflows: [], hasMore: false, failed: false }),
     pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
   });
   conversationRegistry
@@ -173,7 +179,7 @@ afterEach(() => {
 });
 
 describe("TasksPanel", () => {
-  it("says where tasks come from, and links to starting a workflow when the composer can", () => {
+  it("says where tasks come from, and links to starting a workflow when the composer can", async () => {
     showJournal([]);
     renderPanel();
     expect(screen.getByText("No tasks yet")).toBeTruthy();
@@ -189,13 +195,117 @@ describe("TasksPanel", () => {
       expect(screen.getByText(/to-do list or you/).textContent).toBe(
         "Tasks show up here when the agent makes a to-do list or you run a workflow.",
       );
-      fireEvent.click(screen.getByRole("button", { name: "run a workflow" }));
+      fireEvent.pointerDown(screen.getByRole("button", { name: "run a workflow" }), { button: 0 });
+      await waitFor(() => expect(start).toHaveBeenCalled());
       expect(closeDrawer).toHaveBeenCalled();
-      expect(start).toHaveBeenCalled();
     } finally {
       act(withdraw);
     }
   });
+
+  it("offers the saved workflows to run, or a new one, as the composer's Run a workflow does", async () => {
+    showJournal([]);
+    const triage = {
+      id: "a".repeat(32),
+      name: "Triage flaky tests",
+      description: "Finds and fixes flaky tests.",
+    };
+    const draft = {
+      id: "b".repeat(32),
+      name: "Unfinished workflow",
+      description: "Still planning.",
+      is_draft: true,
+    };
+    const refresh = vi.fn();
+    vi.mocked(useSavedWorkflows).mockReturnValue({
+      workflows: [triage, draft],
+      isLoading: false,
+      isError: false,
+      refresh,
+      reload: vi.fn(),
+      pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
+    });
+    // The phone's drawer closes before the dialog opens over the chat.
+    const calls: string[] = [];
+    const start = vi.fn(() => void calls.push("start"));
+    const closeDrawer = vi.fn(() => void calls.push("close drawer"));
+    const withdraw = registerStartWorkflow("conv", start);
+    try {
+      renderPanel(closeDrawer);
+      const link = screen.getByRole("button", { name: "run a workflow" });
+      fireEvent.pointerDown(link, { button: 0 });
+      expect(
+        screen.queryAllByTestId("composer-saved-workflow").map((row) => row.textContent),
+      ).toEqual(["Triage flaky testsFinds and fixes flaky tests."]);
+      // A workflow saved since the list last loaded shows up.
+      expect(refresh).toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId("composer-saved-workflow"));
+      await waitFor(() => expect(start).toHaveBeenCalledWith("", triage));
+      expect(closeDrawer).toHaveBeenCalledOnce();
+
+      fireEvent.pointerDown(link, { button: 0 });
+      fireEvent.change(screen.getByLabelText("Search workflows"), {
+        target: { value: "Bump deps" },
+      });
+      fireEvent.click(screen.getByTestId("composer-describe-workflow"));
+      await waitFor(() => expect(start).toHaveBeenLastCalledWith("Bump deps"));
+      expect(calls).toEqual(["close drawer", "start", "close drawer", "start"]);
+    } finally {
+      act(withdraw);
+    }
+  });
+
+  it.each([
+    ["no workflow to run", []],
+    ["a workflow to run", [{ id: "a".repeat(32), name: "Triage flaky tests", description: "" }]],
+  ])(
+    "opens nothing in the next session when a check that finds %s ends after a switch",
+    async (_label, found) => {
+      showJournal([]);
+      let finishReload: (result: ReloadedWorkflows) => void = () => undefined;
+      const savedWorkflows = (workflows: SavedWorkflow[]) => ({
+        workflows,
+        isLoading: false,
+        isError: false,
+        refresh: vi.fn(),
+        reload: () =>
+          new Promise<ReloadedWorkflows>((resolve) => {
+            finishReload = resolve;
+          }),
+        pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
+      });
+      vi.mocked(useSavedWorkflows).mockReturnValue(savedWorkflows([]));
+      const startHere = vi.fn();
+      const startNext = vi.fn();
+      const withdrawHere = registerStartWorkflow("conv", startHere);
+      const withdrawNext = registerStartWorkflow("next", startNext);
+      const panel = (conversationId: string) => (
+        <MemoryRouter>
+          <TasksPanel conversationId={conversationId} active />
+        </MemoryRouter>
+      );
+      try {
+        const { rerender } = render(panel("conv"));
+        fireEvent.pointerDown(screen.getByRole("button", { name: "run a workflow" }), {
+          button: 0,
+        });
+        rerender(panel("next"));
+
+        // The check ends in the next session, with the list then holding what it found.
+        vi.mocked(useSavedWorkflows).mockReturnValue(savedWorkflows(found));
+        await act(async () => finishReload({ workflows: found, hasMore: false, failed: false }));
+        rerender(panel("next"));
+
+        expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
+        expect(startHere).not.toHaveBeenCalled();
+        expect(startNext).not.toHaveBeenCalled();
+        expect(screen.getByRole("button", { name: "run a workflow" })).toBeInTheDocument();
+      } finally {
+        act(withdrawHere);
+        act(withdrawNext);
+      }
+    },
+  );
 
   it("shows the agent's own task list when the session has no plan", () => {
     showJournal([]);
@@ -355,6 +465,7 @@ describe("TasksPanel", () => {
       isLoading: false,
       isError: false,
       refresh: vi.fn(),
+      reload: vi.fn(),
       pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     });
     showJournal([{ ...journalPlan(0, ["explore"]), workflow_id: workflowId }]);
@@ -393,6 +504,7 @@ describe("TasksPanel", () => {
       isLoading: false,
       isError: false,
       refresh: vi.fn(),
+      reload: vi.fn(),
       pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     });
     const renderWorkflowRuns = vi.fn((id: string) => <p data-testid="workflow-runs-slot">{id}</p>);
@@ -436,6 +548,10 @@ describe("TasksPanel", () => {
     expect(ready).toHaveTextContent("Task 2 of 3");
     expect(ready).toHaveTextContent("cache");
     expect(ready).toHaveTextContent("Ready to start");
+    // A long path or command wraps inside the card; a break-words inside would let it set
+    // its line's width past the card.
+    expect(ready).toHaveClass("wrap-anywhere");
+    expect(ready.querySelector(".break-words")).toBeNull();
     fireEvent.blur(segments[1]);
     fireEvent.focus(segments[2]);
     await waitFor(() =>
@@ -755,6 +871,72 @@ describe("TasksPanel", () => {
     }
   });
 
+  describe("after Stop", () => {
+    const named = journalPlan(0, ["baseline"], ["ship", ["baseline"]]);
+    named.content.name = "Ship the fix";
+
+    /** Registers the composer's Stop, whose message the session takes once `deliver` settles. */
+    function registerTrackedStop() {
+      let deliver!: (receipt: MessageReceipt | null) => void;
+      const withdraw = registerStopWork(
+        "conv",
+        () =>
+          void trackPlanStop(
+            "conv",
+            () =>
+              new Promise<MessageReceipt | null>((resolve) => {
+                deliver = resolve;
+              }),
+          ),
+      );
+      onTestFinished(() => act(withdraw));
+      onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+      return (taken: boolean) => act(async () => deliver(taken ? {} : null));
+    }
+
+    beforeEach(() => {
+      showJournal([named, status(1, "baseline", "started")]);
+      const withdrawContinue = registerContinuePlan("conv", vi.fn());
+      onTestFinished(() => act(withdrawContinue));
+    });
+
+    it("shows Stopping… until the agent and its background work stop, then Continue", async () => {
+      const deliver = registerTrackedStop();
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      expect(screen.getByTestId("tasks-row-menu")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("plan-stop"));
+
+      expect(screen.getByTestId("plan-stopping")).toBeDisabled();
+      expect(screen.getByTestId("plan-stopping")).toHaveTextContent("Stopping…");
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      // Its running task doesn't offer Stop again.
+      expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
+      await deliver(true);
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+
+      // The agent's turn ends while its background work still runs.
+      setSession({ sessionStatus: "idle", backgroundTaskCount: 1 });
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+      setSession({ backgroundTaskCount: 0 });
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+      expect(screen.getByTestId("tasks-paused")).toHaveTextContent("Stopped");
+    });
+
+    it("restores Stop when the session doesn't take the stop message", async () => {
+      const deliver = registerTrackedStop();
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      fireEvent.click(screen.getByTestId("plan-stop"));
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+
+      await deliver(false);
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-stop")).toBeEnabled();
+    });
+  });
+
   it("hides run controls after the final step finishes, even with unfinished earlier steps", () => {
     showJournal([
       journalPlan(0, ["explore"], ["work", ["explore"]], ["report", ["work"]]),
@@ -941,6 +1123,63 @@ describe("TasksPanel", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  describe("a task whose start the agent restates with each push", () => {
+    // The newest start is 32m 6s old; the first, 4h 7m.
+    const at = (seconds: number) => 1_762_534_860 + seconds;
+    const now = at(14_840);
+    const starts = [0, 4_534, 4_982, 6_440, 7_924, 11_124, 12_914].map((seconds, index) =>
+      journalEntry(index + 1, {
+        kind: "status",
+        step: "ci",
+        created_at: at(seconds),
+        content: { status: "started", text: `Pushed fix ${index + 1}` },
+      }),
+    );
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(now * 1000);
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("counts its time from the first start while it runs", () => {
+      showJournal([journalPlan(0, ["ci"]), ...starts]);
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      const elapsed = within(screen.getByTestId("tasks-row")).getByTitle(/^Started/);
+      expect([elapsed.textContent, elapsed.title]).toEqual([
+        "4h 7m",
+        `Started ${absoluteTime(at(0) * 1000)}`,
+      ]);
+    });
+
+    it("says it started at the first start once it stops", () => {
+      showJournal([journalPlan(0, ["ci"]), ...starts]);
+      renderPanel();
+      const row = screen.getByTestId("tasks-row");
+      expect(row).toHaveAttribute("data-state", "stopped");
+      expect(row).toHaveTextContent("Started 4h ago · Pushed fix 7");
+    });
+
+    it("spans its finished time from the first start", () => {
+      const done = journalEntry(starts.length + 1, {
+        kind: "status",
+        step: "ci",
+        created_at: now,
+        content: { status: "done", text: "CI is green" },
+      });
+      showJournal([journalPlan(0, ["ci"]), ...starts, done]);
+      renderPanel();
+      const clock = (seconds: number) =>
+        new Date(seconds * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      const ended = within(screen.getByTestId("tasks-row")).getByText(
+        formatMessageTimestamp(done.created_at),
+      );
+      expect(ended).toHaveAttribute("title", `${clock(at(0))} – ${clock(now)}`);
+    });
   });
 
   it("keeps Stop available while background work runs after the main turn ends", () => {
@@ -1167,6 +1406,77 @@ describe("TasksPanel", () => {
         .getAllByRole("listitem")
         .map((item) => item.textContent),
     ).toEqual([expect.stringMatching(/^Started/), expect.stringMatching(/^Failed · Reverted/)]);
+  });
+
+  it("previews a task's goal as plain text, and shows all of it as Markdown in its history", async () => {
+    const goal = [
+      "**Inputs:** the flaky test's name.",
+      "",
+      "**What it does:**",
+      "- Reruns it",
+      "- Fixes its cause",
+      "",
+      "**Outputs:** a passing run.",
+      "",
+      // Details past the preview's cutoff, which only the history shows.
+      `**Details:** ${"Check the logs. ".repeat(130)}Then run the sentinel-check command.`,
+    ].join("\n");
+    const preview =
+      "Inputs: the flaky test's name. What it does: Reruns it · Fixes its cause · Outputs: a passing run.";
+    showJournal([
+      journalEntry(0, {
+        kind: "plan",
+        content: {
+          name: "The plan",
+          version: 1,
+          source: "agent",
+          steps: [
+            { id: "rerun", name: "Rerun the test", goal, depends_on: [] },
+            { id: "fix", name: "Fix the test", goal, depends_on: ["rerun"] },
+          ],
+        },
+      }),
+    ]);
+    renderPanel();
+    const [ready, waiting] = screen.getAllByTestId("tasks-row");
+    expect(ready).toHaveTextContent(`Ready · ${preview}`);
+    expect(waiting).toHaveTextContent(preview);
+    fireEvent.focus(screen.getAllByTestId("tasks-progress-segment")[1]);
+    const card = await screen.findByTestId("tasks-progress-card");
+    expect(card).toHaveTextContent(preview);
+    for (const element of [ready, waiting, card]) {
+      expect(element.textContent).not.toContain("**");
+      expect(element.textContent).not.toContain("sentinel-check");
+    }
+
+    // The row shows only the start of the goal, so its history shows all of it.
+    fireEvent.click(within(waiting).getByTestId("tasks-row-history"));
+    expect(within(waiting).getByText("Inputs:")).toHaveAttribute("data-streamdown", "strong");
+    expect(
+      within(waiting)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["Reruns it", "Fixes its cause"]);
+    expect(within(waiting).getByText(/Then run the sentinel-check command\.$/)).toBeInTheDocument();
+  });
+
+  it("leaves a goal with no text out of a task's card, rather than an empty line", async () => {
+    showJournal([
+      journalEntry(0, {
+        kind: "plan",
+        content: {
+          name: "The plan",
+          version: 1,
+          source: "agent",
+          steps: [{ id: "rerun", name: "Rerun the test", goal: "---", depends_on: [] }],
+        },
+      }),
+    ]);
+    renderPanel();
+    fireEvent.focus(screen.getByTestId("tasks-progress-segment"));
+    const card = await screen.findByTestId("tasks-progress-card");
+    expect(card).toHaveTextContent("Ready to start");
+    expect(card.querySelector(".line-clamp-3")).toBeNull();
   });
 
   it("shows when a finished task ended, stamped the way chat messages are", async () => {

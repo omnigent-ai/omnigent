@@ -36,6 +36,11 @@ export interface ProjectConfig {
   /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Unset → default folder. */
   icon?: string;
   /**
+   * The owner muted every session in the project: no notifications, unread
+   * dots, or badge counts, as if each were muted. Unset = not muted.
+   */
+  muted?: boolean;
+  /**
    * Per-project worktree default. When `true`, a new session in a git workspace
    * starts in a fresh randomly-named worktree; when `false`, it starts directly
    * in the workspace. Both are meaningful: a set value overrides the user-global
@@ -179,4 +184,12 @@ export async function saveProjectOrder(ids: string[] | null): Promise<ProjectOrd
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as ProjectOrder;
+}
+
+/** The project was renamed, but some of its sessions weren't moved to the new name. */
+export class ProjectMembersNotMovedError extends Error {
+  constructor(reason: string) {
+    super(`Renamed the project, but some of its sessions weren't moved: ${reason}`);
+    this.name = "ProjectMembersNotMovedError";
+  }
 }

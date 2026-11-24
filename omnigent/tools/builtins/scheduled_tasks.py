@@ -36,6 +36,16 @@ _TOO_SOON = (
     f"A reminder must be at least {MIN_REMINDER_DELAY.seconds // 60} minutes in the future."
 )
 
+_WORKFLOW_PROMPT_DESC = (
+    "To run one of your saved workflows on the schedule, the prompt is exactly "
+    "'/workflow Run the saved workflow \"<name>\" (ID <id>).', with the ID from "
+    "sys_workflow_list, optionally followed by a blank line and this run's details. "
+    "Each run then starts as a run of that workflow: its saved steps are the new "
+    "session's plan, and the workflow's page lists the run. The workflow must exist "
+    "and be runnable by you; if it is deleted later, the next run fails and the task "
+    "is paused."
+)
+
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
@@ -87,7 +97,8 @@ class SysScheduledTaskCreateTool(Tool):
                         "prompt": {
                             "type": "string",
                             "description": (
-                                "The instruction dispatched to the agent on each firing."
+                                "The instruction dispatched to the agent on each firing. "
+                                + _WORKFLOW_PROMPT_DESC
                             ),
                         },
                         "rrule": {"type": "string", "description": _RRULE_DESC},
@@ -99,10 +110,14 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                         "timezone": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
                                 "IANA timezone the rule is evaluated in, e.g. "
-                                "'America/Los_Angeles'. Defaults to 'UTC'."
+                                "'America/Los_Angeles'. Use the zone the user names; "
+                                "otherwise omit it or send JSON null. Current runners "
+                                "request their recorded browser timezone, falling back "
+                                "to UTC when unavailable or unsupported. "
+                                "Do not infer a zone from the host or environment."
                             ),
                         },
                         "model_override": {
@@ -244,7 +259,11 @@ class SysScheduledTaskListTool(Tool):
     @classmethod
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
-        return "List your scheduled tasks (recurring agent runs) with their schedules and state."
+        return (
+            "List your scheduled tasks (recurring agent runs) with their schedules and state. "
+            "A trigger automation, which watches a service such as Jira or Slack for new "
+            "items, is listed with rrule null when the server decides when it polls."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """:returns: The OpenAI-format tool schema."""
@@ -299,7 +318,10 @@ class SysScheduledTaskUpdateTool(Tool):
                             "description": "The task to update (from sys_scheduled_task_list).",
                         },
                         "name": {"type": "string", "description": "New task name."},
-                        "prompt": {"type": "string", "description": "New prompt."},
+                        "prompt": {
+                            "type": "string",
+                            "description": f"New prompt. {_WORKFLOW_PROMPT_DESC}",
+                        },
                         "rrule": {"type": "string", "description": _RRULE_DESC},
                         "agent_id": {
                             "type": "string",
@@ -570,8 +592,8 @@ class SysReminderSetTool(Tool):
             "reminders; sys_scheduled_task_list does. Cancel one with "
             "sys_scheduled_task_delete and the returned "
             "scheduled_task_id. Works in top-level sessions you own on a "
-            "connected host, not in sub-agent sessions, side chats, managed sandboxes, or "
-            "sessions running in a permission mode that skips approval. For "
+            "connected host, not in sub-agent sessions, side chats or managed sandboxes, "
+            "and wakes the session in whatever permission mode it is in then. For "
             "a shorter wait inside an active turn, use sys_timer_set (when enabled)."
         )
 

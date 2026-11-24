@@ -69,6 +69,11 @@ def appearance_url(
     browser_contract.json(
         "/v1/projects/order", {"ordered_project_ids": None, "sort_mode": "alphabetical"}
     )
+    browser_contract.json(
+        "/v1/scheduled-tasks/default-timezone",
+        lambda request: request.post_data_json,
+        method="PUT",
+    )
     browser_contract.json("/v1/extensions", empty_list)
     browser_contract.json("/v1/harnesses", {"data": [], "setup_steps": {}})
     browser_contract.json("/v1/sessions/projects", [])
@@ -199,7 +204,7 @@ def test_family_chevron_keeps_top_level_rows_in_one_column(
     in_project: bool,
     show_harness: bool,
 ) -> None:
-    """A family's chevron sits left of the row, so only its members are indented."""
+    """Top-level rows share one column; the in-row chevron aligns a parent with its members."""
     project = "Example project"
     if show_harness:
         appearance_features["sidebar_grouping_ui"] = True
@@ -260,28 +265,31 @@ def test_family_chevron_keeps_top_level_rows_in_one_column(
             return left(row.get_by_test_id("session-row-harness"))
         return left(row.get_by_text(title, exact=True))
 
+    row_column = left(plain_before.get_by_role("link"))
     column = content_left(plain_before, "Plain before")
-    assert content_left(lead, "Lead") == column
+    family_column = content_left(member, "Member")
+    assert left(lead.get_by_role("link")) == row_column
+    assert content_left(lead, "Lead") == family_column
     assert content_left(plain_after, "Plain after") == column
-    assert content_left(member, "Member") >= column + 16
+    assert left(member.get_by_role("link")) >= row_column + 16
+    assert family_column >= column + 16
 
     chevron = lead.get_by_role("button", name="Collapse session family")
     chevron_box = chevron.bounding_box()
-    nav_box = lead.locator("xpath=ancestor::nav[1]").bounding_box()
-    assert chevron_box and nav_box
-    assert chevron_box["x"] + chevron_box["width"] <= left(lead.get_by_role("link"))
-    assert chevron_box["x"] >= nav_box["x"]
+    assert chevron_box
+    assert chevron_box["x"] >= row_column
+    assert chevron_box["x"] + chevron_box["width"] <= family_column
     chevron.click()
     expect(member).to_have_count(0)
     expand = lead.get_by_role("button", name="Expand session family")
     expect(expand).to_be_visible()
-    assert content_left(lead, "Lead") == column
+    assert content_left(lead, "Lead") == family_column
     assert content_left(plain_after, "Plain after") == column
 
     expand.click()
     expect(member.get_by_role("link")).to_be_visible()
-    assert content_left(lead, "Lead") == column
-    assert content_left(member, "Member") >= column + 16
+    assert content_left(lead, "Lead") == family_column
+    assert content_left(member, "Member") == family_column
 
 
 @pytest.fixture

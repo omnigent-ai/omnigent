@@ -116,7 +116,7 @@ def test_click_pinned_project_session_keeps_project_collapsed(
     folder_header = page.get_by_role("button", name=project, exact=True)
     expect(folder_header).to_be_visible()
     if folder_header.get_attribute("aria-expanded") == "true":
-        folder_header.click()
+        folder_header.locator("[data-section-toggle]").first.click()
     expect(folder_header).to_have_attribute("aria-expanded", "false")
     # The sibling is not rendered while the folder is collapsed.
     expect(_section(page, project).locator(f'a[href="/c/{session_b}"]')).to_have_count(0)
@@ -186,11 +186,11 @@ def test_collapsing_project_of_open_session_stays_collapsed(
     expect(page).to_have_url(re.compile(rf"/c/{pinned_id}$"))
 
     expect(_section(page, project).locator(f'a[href="/c/{member_id}"]')).to_have_count(0)
-    folder_header.click()
+    folder_header.locator("[data-section-toggle]").first.click()
     expect(folder_header).to_have_attribute("aria-expanded", "true")
     _section(page, project).locator(f'a[href="/c/{member_id}"]').click()
     expect(page).to_have_url(re.compile(rf"/c/{member_id}$"))
-    folder_header.click()
+    folder_header.locator("[data-section-toggle]").first.click()
     expect(folder_header).to_have_attribute("aria-expanded", "false")
 
     with httpx.Client(base_url=base_url) as client:

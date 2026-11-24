@@ -22,6 +22,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -33,6 +34,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
+from omnigent.db.account_authority import account_checks_scope
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import (
@@ -44,6 +46,7 @@ from omnigent.entities import (
 )
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.routes._host_worktree import (
     WORKTREE_ROOT_LABEL_KEY,
     worktree_root_fingerprint,
@@ -53,6 +56,7 @@ from omnigent.server.scheduled.fire import (
     BUSY_QUIET_SECONDS,
     BUSY_RECHECK_SECONDS,
     BUSY_SKIP_MAX_SECONDS,
+    CONTEXT_FULL_ERROR_CODE,
     FireDeps,
     build_busy_until,
     build_on_fire,
@@ -64,6 +68,8 @@ from omnigent.server.scheduled.source_session import (
     run_prompt_text,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.session_journal import open_store as open_journal_store
+from omnigent.server.workflows import open_store as open_workflow_store
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store import (
@@ -71,10 +77,13 @@ from omnigent.stores.conversation_store import (
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
 )
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import build_agent_bundle
 
 # The trigger form's saved state; see encodeTriggerPrompt in web/.../triggerTemplates.ts.
@@ -99,6 +108,7 @@ class _FakeConversation:
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
     terminal_launch_args: list[str] | None = None
+    title: str | None = None
 
     def __post_init__(self) -> None:
         self.root_conversation_id = self.root_conversation_id or self.id
@@ -466,6 +476,9 @@ class FakePermissionStore:
 
     def check_access(self, user_id: str | None, conversation_id: str, required_level: int) -> bool:
         return conversation_id not in self.unowned
+
+    def is_admin(self, user_id: str) -> bool:
+        return False
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())
@@ -1103,9 +1116,16 @@ async def test_a_task_saved_on_another_users_agent_moves_to_its_owners_copy(
 
 
 @pytest.mark.asyncio
-async def test_existing_owner_is_granted_without_ensure_user() -> None:
+@pytest.mark.parametrize(
+    ("checks_enabled", "owner_generation"), [(True, None), (False, "current")]
+)
+async def test_existing_owner_is_granted_without_ensure_user(
+    monkeypatch: pytest.MonkeyPatch, checks_enabled: bool, owner_generation: str | None
+) -> None:
     """A real owner's row is never (re)created by the fire path."""
     perm = FakePermissionStore(users={"alice"})
+    owner = replace(perm.get_user("alice"), account_generation=owner_generation)
+    monkeypatch.setattr(perm, "get_user", lambda _user_id: owner)
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
 
@@ -1116,8 +1136,9 @@ async def test_existing_owner_is_granted_without_ensure_user() -> None:
         _deps(store, permission_store=perm, conversation_store=conv_store),
         launch_dispatch=_launch,
     )
-    await on_fire(0, "task_1")
-    await _drain()
+    with account_checks_scope(checks_enabled):
+        await on_fire(0, "task_1")
+        await _drain()
 
     assert len(conv_store.created) == 1
     assert perm.ensured == []
@@ -1125,22 +1146,29 @@ async def test_existing_owner_is_granted_without_ensure_user() -> None:
 
 
 @pytest.mark.asyncio
-async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
+@pytest.mark.parametrize("dispatch_enabled", [False, True])
+async def test_deleted_owner_disables_task_and_records_failed_run(dispatch_enabled: bool) -> None:
     """A task whose owner no longer exists is disabled, not resurrected."""
     perm = FakePermissionStore(users=set())
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
+    scheduler = Mock()
+    app_state = SimpleNamespace(
+        scheduled_task_scheduler=scheduler,
+        scheduled_task_dispatch_enabled=dispatch_enabled,
+    )
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append(conv)
 
     on_fire = build_on_fire(
-        _deps(store, permission_store=perm, conversation_store=conv_store),
+        _deps(store, permission_store=perm, conversation_store=conv_store, app_state=app_state),
         launch_dispatch=_launch,
     )
-    await on_fire(0, "task_1")
-    await _drain()
+    with account_checks_scope(False):
+        await on_fire(0, "task_1")
+        await _drain()
 
     assert launched == []
     assert conv_store.created == []
@@ -1152,6 +1180,39 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_deleted"
     assert "alice" in store.runs[0]["error"]
+    if dispatch_enabled:
+        scheduler.remove.assert_not_called()
+    else:
+        scheduler.remove.assert_called_once_with("task_1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("checks_enabled", "task_generation", "owner_generation", "expected_deleted"),
+    [
+        (False, None, "current", False),
+        (True, None, "current", True),
+        (False, "current", "current", False),
+        (True, "current", "current", False),
+        (False, "old", "current", True),
+        (True, "old", "current", True),
+    ],
+)
+async def test_owner_generation_check(
+    monkeypatch: pytest.MonkeyPatch,
+    checks_enabled: bool,
+    task_generation: str | None,
+    owner_generation: str | None,
+    expected_deleted: bool,
+) -> None:
+    perm = FakePermissionStore(users={"alice"})
+    owner = replace(perm.get_user("alice"), account_generation=owner_generation)
+    monkeypatch.setattr(perm, "get_user", lambda _user_id: owner)
+    task = _task(user_id="alice", account_generation=task_generation)
+    deps = _deps(FakeScheduledTaskStore(), permission_store=perm)
+
+    with account_checks_scope(checks_enabled):
+        assert await fire_mod._owner_is_deleted(deps, task) is expected_deleted
 
 
 def _claude_agent_deps(
@@ -3206,7 +3267,7 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
         (_continued_session(agent_id="ag_other"), {}, "continued_session_incompatible"),
         (_continued_session(), {"base_branch": "HEAD"}, "continued_session_incompatible"),
         # A reused session keeps its own mode, so one switched to a mode that skips
-        # approval must not take prompts from a task that never selected such a mode.
+        # approval must not take prompts from a task that selected a mode asking for it.
         (
             _continued_session(
                 labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
@@ -3219,7 +3280,7 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
             _continued_session(
                 terminal_launch_args=["--dangerously-bypass-approvals-and-sandbox"]
             ),
-            {},
+            {"permission_mode": "auto"},
             "permission_mode_not_allowed",
         ),
         (
@@ -3347,12 +3408,25 @@ async def test_continue_never_replaces_an_unusable_session(
             ),
         ),
         ("full-access", _continued_session(labels={CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"})),
+        # A task without a mode, such as a reminder, wakes the session in its own mode.
+        (
+            None,
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+        ),
+        (
+            None,
+            _continued_session(
+                terminal_launch_args=["--dangerously-bypass-approvals-and-sandbox"]
+            ),
+        ),
     ],
 )
-async def test_continue_accepts_a_session_in_a_mode_the_task_selects(
-    task_mode: str, session: _FakeConversation
+async def test_continue_accepts_a_session_whose_mode_skips_approval(
+    task_mode: str | None, session: _FakeConversation
 ) -> None:
-    """A task that selects a mode skipping approval keeps sending into its session in one."""
+    """A task selecting no mode, or one skipping approval, keeps sending into such a session."""
     conv_store = _ExistingConversationStore(session)
     store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
 
@@ -3747,6 +3821,49 @@ async def test_continue_fails_when_the_owner_no_longer_owns_the_session() -> Non
     assert [(run["status"], run["error_code"]) for run in store.runs] == [
         ("failed", "continued_session_forbidden")
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "error_message", "context_full"),
+    [
+        ("context_length_exceeded", "Context limit reached", True),
+        # A gateway's request-size rejection is shown to the owner as a full context.
+        (
+            "native_turn_error",
+            "API Error: 400 Request size exceeds the maximum allowed limit",
+            True,
+        ),
+        ("native_turn_error", "Not logged in", False),
+        # Cleared labels: the session's next turn started.
+        ("", "", False),
+    ],
+    ids=["overflow", "request-size", "other-error", "cleared"],
+)
+async def test_continue_sends_nothing_while_the_session_context_is_full(
+    error_code: str, error_message: str, context_full: bool
+) -> None:
+    """A session whose last turn overflowed its context window gets no further prompt."""
+    conv_store = _ExistingConversationStore(
+        _continued_session(
+            labels={
+                "omnigent.last_task_error_code": error_code,
+                "omnigent.last_task_error_message": error_message,
+            }
+        )
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    [run] = store.runs
+    if context_full:
+        assert launched == []
+        assert (run["status"], run["error_code"]) == ("failed", CONTEXT_FULL_ERROR_CODE)
+        assert "/compact" in run["error"]
+    else:
+        assert [conv.id for conv in launched] == ["conv_prev"]
+        assert run["status"] == "succeeded"
 
 
 def _running_run(fired_at: int) -> ScheduledTaskRun:
@@ -4307,7 +4424,9 @@ async def test_random_worktree_is_created_per_new_session(
     )
     monkeypatch.setattr(_host_worktree, "create_worktree_on_host", create)
     for i in range(2):
-        conv = await fire_mod._create_session(deps, task, labels=fire_mod._session_labels(task))
+        conv = await fire_mod._create_session(
+            deps, task, labels=fire_mod._session_labels(task), workflow=None
+        )
         saved = deps.conversation_store.created[-1]
         assert saved["workspace"] == (f"/repo-worktrees/run-{i}/src" if enabled else source)
         assert saved["git_branch"] == (f"run-{i}" if enabled else None)
@@ -4375,6 +4494,7 @@ async def test_random_worktree_rolls_back_when_session_creation_fails(
             deps,
             _task(base_branch="HEAD", model_override="custom" if failure == "update" else None),
             labels=fire_mod._session_labels(_task()),
+            workflow=None,
         )
     assert deps.conversation_store.deleted == ([] if failure == "create" else ["conv_1"])
     assert remove.await_count == 1
@@ -4493,7 +4613,7 @@ async def test_cancelled_session_creation_waits_for_writes_before_cleanup(
     )
     task = _task(base_branch="HEAD")
     pending = asyncio.create_task(
-        fire_mod._create_session(deps, task, labels=fire_mod._session_labels(task))
+        fire_mod._create_session(deps, task, labels=fire_mod._session_labels(task), workflow=None)
     )
     try:
         await asyncio.wait_for(entered.wait(), 5)
@@ -4545,16 +4665,17 @@ async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fire
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("task_mode", "fires"),
-    [(None, False), ("auto", False), ("bypassPermissions", True)],
+    [(None, True), ("auto", False), ("bypassPermissions", True)],
 )
 async def test_sdk_agent_default_mode_gates_a_continued_session(
     task_mode: str | None, fires: bool
 ) -> None:
     """A continued session keeps the SDK spec's bypassPermissions default.
 
-    SDK agents take no task mode at save, so these tasks were saved while the agent ran a
-    native harness, and it was then reinstalled under the same id as this SDK agent.
-    Only a task selecting an approval-skipping mode may continue; ``auto`` is refused.
+    SDK agents take no task mode at save, so the tasks with a mode were saved while the
+    agent ran a native harness, and it was then reinstalled under the same id as this SDK
+    agent. A task without a mode wakes the session in that default, as does one selecting
+    an approval-skipping mode; ``auto`` asks for approval, so it is refused.
     """
     store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
     conv_store = _ExistingConversationStore(_continued_session())
@@ -5062,6 +5183,339 @@ async def test_a_deleted_source_session_fails_the_run_and_pauses_the_task() -> N
     (run,) = store.runs
     assert (run["status"], run.get("error_code")) == ("failed", "source_session_missing")
     assert {"id": "task_1", "state": "paused"} in store.updates
+
+
+_WORKFLOW_STEPS = [
+    {"id": "explore", "name": "Explore"},
+    {"id": "fix", "name": "Fix", "depends_on": ["explore"]},
+]
+
+
+def _workflows_on(enabled: bool = True) -> SimpleNamespace:
+    """An ``app.state`` whose server enables workflows, or disables them."""
+    features = "workflows" if enabled else "-workflows"
+    return SimpleNamespace(feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": features}))
+
+
+def _workflow_prompt(workflow_id: str) -> str:
+    return f'/workflow Run the saved workflow "Triage" (ID {workflow_id}).\n\nOnly bugs'
+
+
+_SQL_HOST_ID = "a" * 32
+
+
+def _sql_agent() -> FakeAgentStore:
+    """An agent store whose one agent has an ID the SQL conversation store accepts."""
+    agent_id = generate_agent_id()
+    return FakeAgentStore({agent_id: _FakeAgent(agent_id)})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+async def test_each_run_of_a_workflow_automation_starts_as_a_run_of_the_workflow(
+    db_uri: str, execution_target: str
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    workflow = open_workflow_store(conversations).create(
+        user_id=None, name="Triage", description="Triage the queue", steps=_WORKFLOW_STEPS
+    )
+    journal = open_journal_store(conversations)
+    assert journal is not None
+    agents = _sql_agent()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                prompt=_workflow_prompt(workflow.id),
+                execution_target=execution_target,
+                agent_id=next(iter(agents.agents)),
+                host_id=_SQL_HOST_ID,
+            )
+        }
+    )
+    plans_at_launch: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        plans_at_launch.append(journal.current_workflow_run(conv.id))
+
+    deps = _deps(
+        store,
+        agent_store=agents,
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({_SQL_HOST_ID}),
+        sandbox_config=_FakeSandboxConfig(),
+        app_state=_workflows_on(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+    await build_run_now(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # Each run, scheduled or run now, has its own session, which started as a run of the
+    # workflow before its prompt went in.
+    assert [run["status"] for run in store.runs] == ["running", "running"]
+    assert len({plan.conversation_id for plan in plans_at_launch}) == 2
+    for run, plan in zip(store.runs, plans_at_launch, strict=True):
+        session = conversations.get_conversation(plan.conversation_id)
+        assert session is not None
+        assert plan.workflow_id == workflow.id
+        assert (plan.content["name"], plan.content["source"]) == ("Triage", "workflow")
+        assert plan.content["steps"] == workflow.steps
+        assert plan.scheduled_task_run_id == session.labels[SCHEDULED_TASK_RUN_LABEL_KEY]
+        assert session.labels[SCHEDULED_TASK_RUN_LABEL_KEY] == run["run_id"]
+    # The workflow's page lists both runs.
+    listed = journal.list_workflow_runs(workflow.id, limit=10, before=None)
+    assert {plan.conversation_id for plan in listed.plans} == {
+        plan.conversation_id for plan in plans_at_launch
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("problem", "error_code", "paused"),
+    [
+        ("deleted", "workflow_missing", True),
+        ("disabled", "workflows_disabled", False),
+        ("draft", "workflow_invalid", False),
+        ("plan_write", "workflow_plan_failed", False),
+    ],
+)
+async def test_a_workflow_automation_that_cannot_start_its_workflow_fails_its_run(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    problem: str,
+    error_code: str,
+    paused: bool,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    workflows = open_workflow_store(conversations)
+    assert workflows is not None
+    workflow = workflows.create(
+        user_id=None,
+        name="Triage",
+        description="Triage the queue",
+        steps=[] if problem == "draft" else _WORKFLOW_STEPS,
+    )
+    if problem == "deleted":
+        assert workflows.delete(workflow.id, user_id=None)
+    if problem == "plan_write":
+        journal = open_journal_store(conversations)
+
+        def refuse_append(*args: Any, **kwargs: Any) -> None:
+            # A storage failure the journal doesn't translate into its own errors.
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(journal, "append", refuse_append)
+    agents = _sql_agent()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                prompt=_workflow_prompt(workflow.id),
+                agent_id=next(iter(agents.agents)),
+                host_id=_SQL_HOST_ID,
+            )
+        }
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        agent_store=agents,
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({_SQL_HOST_ID}),
+        app_state=_workflows_on(problem != "disabled"),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", error_code)
+    # The run's failure shows the owner no storage internals.
+    assert "database is locked" not in run["error"]
+    assert launched == []
+    # No session is left behind: none started, or the one whose plan failed is gone.
+    assert conversations.list_conversations(limit=10).data == []
+    assert ({"id": "task_1", "state": "paused"} in store.updates) is paused
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_automation_stops_once_its_shared_workflow_is_unshared(
+    db_uri: str,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for user_id in ("alice@example.com", "bob@example.com"):
+        permissions.ensure_user(user_id)
+    workflows = open_workflow_store(conversations)
+    assert workflows is not None
+    workflow = workflows.create(
+        user_id="alice@example.com",
+        name="Triage",
+        description="Triage the queue",
+        steps=_WORKFLOW_STEPS,
+    )
+    permissions.grant_for_workflow("bob@example.com", workflow.id, LEVEL_READ)
+    journal = open_journal_store(conversations)
+    assert journal is not None
+    agents = _sql_agent()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                prompt=_workflow_prompt(workflow.id),
+                user_id="bob@example.com",
+                agent_id=next(iter(agents.agents)),
+                host_id=_SQL_HOST_ID,
+            )
+        }
+    )
+    plans_at_launch: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        plans_at_launch.append(journal.current_workflow_run(conv.id))
+
+    deps = _deps(
+        store,
+        agent_store=agents,
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({_SQL_HOST_ID}),
+        permission_store=permissions,
+        app_state=_workflows_on(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+    assert permissions.revoke_for_workflow("bob@example.com", workflow.id)
+    await build_run_now(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # Bob ran Alice's shared workflow until she stopped sharing it.
+    shared_run, unshared_run = store.runs
+    assert shared_run["status"] == "running"
+    (plan,) = plans_at_launch
+    assert plan.workflow_id == workflow.id
+    assert (unshared_run["status"], unshared_run.get("error_code")) == (
+        "failed",
+        "workflow_missing",
+    )
+    assert {"id": "task_1", "state": "paused"} in store.updates
+
+
+@pytest.mark.asyncio
+async def test_an_automation_saved_continuing_a_session_runs_its_workflow_prompt_as_before(
+    db_uri: str,
+) -> None:
+    """Its replacement session starts without the workflow, even one since deleted."""
+    conversations = SqlAlchemyConversationStore(db_uri)
+    workflows = open_workflow_store(conversations)
+    assert workflows is not None
+    workflow = workflows.create(
+        user_id=None, name="Triage", description="Triage the queue", steps=_WORKFLOW_STEPS
+    )
+    assert workflows.delete(workflow.id, user_id=None)
+    agents = _sql_agent()
+    # The session it continued was deleted, so this run replaces it.
+    deleted_session = uuid.uuid4().hex
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                prompt=_workflow_prompt(workflow.id),
+                agent_id=next(iter(agents.agents)),
+                host_id=_SQL_HOST_ID,
+                session_mode="continue",
+                session_id=deleted_session,
+            )
+        }
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        agent_store=agents,
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({_SQL_HOST_ID}),
+        app_state=_workflows_on(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (run,) = store.runs
+    (session,) = launched
+    assert (run["status"], run.get("error_code")) == ("running", None)
+    assert session.id != deleted_session
+    assert open_journal_store(conversations).current_workflow_run(session.id) is None
+    assert not [update for update in store.updates if update.get("state") == "paused"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_copied_from_its_source_session_starts_as_a_run_of_the_workflow(
+    db_uri: str,
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    workflow = open_workflow_store(conversations).create(
+        user_id=None, name="Triage", description="Triage the queue", steps=_WORKFLOW_STEPS
+    )
+    agents = _sql_agent()
+    agent_id = next(iter(agents.agents))
+    source = conversations.create_conversation(
+        agent_id=agent_id, host_id=_SQL_HOST_ID, workspace="/repo"
+    )
+    conversations.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role=role, content=[{"type": part, "text": text}], agent=agent),
+            )
+            for role, part, text, agent in (
+                ("user", "input_text", "triage the queue", None),
+                ("assistant", "output_text", "two new issues", "claude-sdk"),
+            )
+        ],
+    )
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                prompt=_workflow_prompt(workflow.id),
+                agent_id=agent_id,
+                host_id=_SQL_HOST_ID,
+                source_session_id=source.id,
+            )
+        }
+    )
+    journal = open_journal_store(conversations)
+    assert journal is not None
+    plans_at_launch: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        plans_at_launch.append(journal.current_workflow_run(conv.id))
+
+    deps = _deps(
+        store,
+        agent_store=agents,
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({_SQL_HOST_ID}),
+        app_state=_workflows_on(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (run,) = store.runs
+    (plan,) = plans_at_launch
+    assert run["status"] == "running"
+    # The run's own copy, not the source, starts as the workflow run.
+    assert plan.conversation_id != source.id
+    copy = conversations.get_conversation(plan.conversation_id)
+    assert copy is not None and copy.labels[FORK_SOURCE_LABEL_KEY] == source.id
+    assert (plan.workflow_id, plan.scheduled_task_run_id) == (workflow.id, run["run_id"])
+    assert plan.content["steps"] == workflow.steps
+    assert journal.current_workflow_run(source.id) is None
 
 
 def test_a_run_on_another_agent_leaves_off_the_copys_mcp_picks() -> None:

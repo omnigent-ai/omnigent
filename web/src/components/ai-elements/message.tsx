@@ -118,7 +118,8 @@ export const MessageAction = ({
       type="button"
       variant={variant}
       className={cn(
-        "mobile-touch-target mobile-app:[&_svg]:size-5!",
+        // Full-height touch targets, narrowed so a row of actions sits closer together.
+        "mobile-touch-target mobile-app:min-w-8! mobile-app:[&_svg]:size-4!",
         "text-muted-foreground hover:text-foreground",
         className,
       )}
@@ -484,6 +485,7 @@ function ChatTable({ children, className, node: _node, ...props }: ChatTableProp
           aria-label="View fullscreen"
           aria-modal="true"
           className="fixed inset-0 z-50 flex flex-col bg-background"
+          data-fullscreen-overlay=""
           data-streamdown="table-fullscreen"
           onClick={closeFullscreen}
           role="dialog"

@@ -40,6 +40,11 @@ to customize.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, Linear, or PagerDuty (as an incident note). Sessions
   start whether it is checked or not.
+- `slack-thread-replies`: Slack **Message posted in a channel** triggers also send
+  later replies in a handled message's thread to the session that handled it, which
+  posts in the thread only when a reply needs it; no reply starts a session. The form
+  has no control for it. Threads are followed for 24 hours after their latest reply,
+  at most 10 at a time; DM triggers don't follow threads.
 - `task-session`: when creating a trigger, Advanced shows **Start a new session for
   each match**, on by default. Turning it off sends every match to one task session,
   titled after the automation and started on the first match; later matches arrive
@@ -67,7 +72,8 @@ to customize.
   update future worker instructions without rebinding the polling session.
   Permissions offers only modes that keep approval, and only on servers that advertise
   `session_create_permission_modes`. New templates give workers the automation's mode when
-  it keeps approval and the server supports it; otherwise workers use their agent's default.
+  it keeps approval and the server supports it; otherwise the server chooses their mode, as
+  `session-orchestration`'s `create` describes.
   Existing worker sessions retain their settings. Customized creation calls in a single
   Instructions field keep **Edit worker instructions**, which focuses that field. Edits
   that remove the template signature or add ambiguous section headings show a notice
@@ -154,6 +160,13 @@ to customize.
   Custom schedule remains available for other recurrence patterns.
   The shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
+- `rrule-editor`: the schedule picker opens with a Visual | RRULE toggle (RRULE needs
+  `automations_v2`). RRULE takes one rule line, seeded from the current schedule, with
+  the timezone below it and the end under Ends; the form checks only its shape, and the
+  server reports why a rule can't run on save. A saved rule the visual controls can't show,
+  such as hourly 9 AM to 5 PM on weekdays, opens on RRULE, and an edit that leaves it alone
+  saves it unchanged. Summaries show such rules as written. Rules with `COUNT=1` stay
+  unsupported in the form.
 - `capabilities`: Jira, Slack, GitHub, Linear, and PagerDuty templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `tools-note`: the form says which tools the agent needs where the task runs,
@@ -207,6 +220,10 @@ to customize.
   directory pin is cleared. Selecting
   another repository unlocks model/permission settings for a new session;
   restoring the saved selection locks them again.
+- **Slack thread follow-ups:** after a Slack **Message posted in a channel** trigger
+  answers a message in its thread, reply in that thread. At the next poll the
+  session that handled the message receives the reply and answers there if the
+  reply asks something; no session starts for the reply.
 - **Mobile web:** use the same tabs and creation paths after opening Automations.
 - **Managed embedded:** open Automations through the host navigation; tabs,
   gallery, and modal use the same components under the host's mount path.
@@ -238,6 +255,12 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   turning it on blocks saving until the interval reaches sixty.
   Repeat through the row menu and detail page. Without sub-hour support, the
   editor keeps the hourly minimum and displays saved minute rules without rewriting them.
+- `web/src/components/scheduled/triggerTemplates.test.ts` (`Slack thread replies`)
+  pins the thread-following prompt rules. To check them live, run a Slack channel
+  trigger on a host whose agent has a Slack MCP, post a top-level message, and
+  after its worker answers, reply in the thread: the worker's history gains a
+  `Slack … replies through …` message from the polling session, and the sessions
+  list gains no new session.
 - `web/src/pages/TasksPage.test.tsx` covers populated and empty lists, search and
   filter preservation, deep links with an embedded mount prefix, load failures,
   capability gating, and both creation buttons' paths.

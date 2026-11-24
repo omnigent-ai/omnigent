@@ -52,8 +52,8 @@ async def test_full_server_tool_call_and_policy_deny(databricks_profile: str) ->
         allowed = driver.tool_probe_turn(deny=False, timeout=180)
         denied = driver.tool_probe_turn(deny=True, timeout=180)
 
-    assert [tc["name"] for tc in allowed.tool_calls] == ["list_files"], (
-        f"expected a list_files call, got {allowed.tool_calls} ({allowed.error})"
+    assert [tc["name"] for tc in allowed.tool_calls] == ["sys_files_list"], (
+        f"expected a sys_files_list call, got {allowed.tool_calls} ({allowed.error})"
     )
     assert not allowed.tool_call_denied, "tool call was blocked without a deny policy"
 

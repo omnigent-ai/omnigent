@@ -16,6 +16,7 @@ import {
   readSidebarViewPreferences,
   sidebarBaseOrdering,
   writeSidebarViewPreferences,
+  type SidebarShowField,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
 import { parseProjectSessionsQueryKey, recentlyCreatedSessions } from "@/lib/sessionListCache";
@@ -88,9 +89,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
   const serverInfo = useServerInfo();
   const [storedView, setView] = useState(readSidebarViewPreferences);
-  const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
-    ? storedView
-    : DEFAULT_SIDEBAR_VIEW;
+  const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  const view = groupingUi ? storedView : DEFAULT_SIDEBAR_VIEW;
   const sortBy: SessionSortBy = sidebarSortBy(sidebarBaseOrdering(view));
   const customOrder = useMemo(
     () => (view.ordering === "custom" && view.custom ? customSortOrder(view.custom) : null),
@@ -287,12 +287,23 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       ...(sharedActive && shared.hasNextPage ? [fetchSharedPage()] : []),
     ]);
   }, [mine.hasNextPage, fetchMinePage, sharedActive, shared.hasNextPage, fetchSharedPage]);
-  const allData = useMemo(
+  const mixedData = useMemo(
     () =>
       mine.data || (sharedActive && shared.data)
         ? { pages: [sessionRowsPage(merged.rows, hasNextPage)], pageParams: [undefined] }
         : undefined,
     [mine.data, shared.data, sharedActive, merged.rows, hasNextPage],
+  );
+  // With Default grouping, All lists "Shared with me" above Sessions, so each
+  // section can show every row its scope loaded. Lists mixing both scopes (other
+  // groupings, the flag-off sidebar, the Inbox) stop where both are complete.
+  const splitShared = groupingUi && view.grouping === "default";
+  const allData = useMemo(
+    () =>
+      splitShared && mixedData
+        ? { pages: [sessionRowsPage(merged.loaded, hasNextPage)], pageParams: [undefined] }
+        : mixedData,
+    [splitShared, mixedData, merged.loaded, hasNextPage],
   );
   const all: SidebarListQuery = {
     data: allData,
@@ -306,6 +317,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     isError: mine.isError || (sharedActive && shared.isError),
     error: mine.error ?? (sharedActive ? shared.error : null),
   };
+  const mixed: SidebarListQuery = splitShared ? { ...all, data: mixedData } : all;
   const loadedData = useMemo(
     () =>
       mine.data !== undefined || (sharedActive && shared.data !== undefined)
@@ -330,7 +342,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     mine: mineView,
     shared: sharedView,
     all,
-    inbox: config.inboxIncludesShared ? all : mineView,
+    splitShared,
+    inbox: config.inboxIncludesShared ? mixed : mineView,
     pinned: { ...pinned, data: pinnedData },
     loadedRows,
     loadedData,
@@ -407,6 +420,11 @@ export function useLoadedConversations() {
 /** Loaded rows when a SidebarDataProvider is mounted, else ``undefined``. */
 export function useOptionalLoadedConversations() {
   return useContext(SidebarDataContext)?.loadedData;
+}
+
+/** The sidebar's "Show" row metadata when a SidebarDataProvider is mounted, else none. */
+export function useOptionalSidebarShow(): readonly SidebarShowField[] {
+  return useContext(SidebarDataContext)?.view.show ?? DEFAULT_SIDEBAR_VIEW.show;
 }
 
 /** The caller's own sessions when a SidebarDataProvider is mounted, else ``undefined``. */

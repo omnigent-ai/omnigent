@@ -128,7 +128,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   walkthrough, capability-dependent content, and browser-local dismissal.
 
 - [Pull request conversations](./pull-request-conversations.md) covers inline
-  GitHub threads and replies through Workspace, composer, mobile and Canvas.
+  GitHub threads and replies through Workspace, composer, mobile and Canvas, and
+  PR reference links in chat messages.
 
 - [Pull request review navigation](./pull-request-review-navigation.md) covers the
   Changes tab's path filter, find in the fetched patch, copy and open actions, and
@@ -157,7 +158,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   one-shot host launch, existing-session boundaries, and failure diagnostics.
 
 - [Composer](./composer.md) covers the session and new-session composers,
-  the model/effort pill, the configuration gear, and slash commands.
+  the model/effort pill, the configuration gear, slash commands, and the
+  native `!` shell mode.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
@@ -174,11 +176,16 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
+- [Data-file table preview](./data-table-preview.md) covers CSV, TSV, Excel and
+  Parquet files opening as a sortable, filterable table, its row bounds, and encodings.
 - [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
   counts, the expanded field, error and Raw views, and tool-run folding.
 - [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,
   desktop and mobile profile selection, and the boundary between browser
   request proof and live resource/network enforcement.
+- [Floating New Agent panel](./floating-new-agent.md) covers the macOS desktop
+  app's ⇧⌘Space panel: opening it from any app, hiding it with its draft, launching
+  on This Mac or a new sandbox, and its release flag.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
@@ -223,6 +230,7 @@ map an area, remove it here in the same change.
 - Web sign-in: `tests/e2e_ui/auth/`
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
+- Settings search and Appearance settings: `tests/e2e_ui/appearance/`
 - Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity,
   Claude and Codex shell-command settlement, refused-delivery persistence, and
   tool-run folding are mapped)

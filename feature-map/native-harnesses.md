@@ -39,6 +39,15 @@ implements them separately, so a fix for one harness does not reach the others.
 - `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
   Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
   and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
+- `pi-claude-plugins`: with `OMNIGENT_FEATURES=pi_claude_plugins` in the environment of
+  the host or runner process that launches Pi, managed Pi sessions (pi-native and the
+  Pi gateway executor) load the skills, `/<plugin>:<command>` (the command name is the
+  path under `commands/`, or the frontmatter `name` when set, as plugin command discovery
+  names them)
+  prompts and Pi packages of the Claude Code plugins enabled for the user. Disabled
+  plugins stay out, and a resource the user's Pi settings already list by the same
+  path is not added again. Excluding one resource of a plugin is not supported yet:
+  disable the plugin in Claude Code to drop it.
 - `claude-managed-mcp-relay`: on a machine with Claude Code's enterprise
   `managed-mcp.json`, Claude Code refuses `--mcp-config`, so Claude native
   sessions (web-launched and `omnigent claude`) reach Omnigent's tools through
@@ -148,11 +157,14 @@ implements them separately, so a fix for one harness does not reach the others.
     stopped by its usage or budget limit fails the session, and so does a
     system error that Codex reports outside a turn; during a turn, the turn's
     own outcome decides.
-  - Background work shows the working spinner with the tooltip "Working in the
-    background". The composer lists running Claude background shells and Codex
-    background terminals as "1 background task" with each one's command. Claude's
-    list changes when a turn ends; Codex's changes within a few seconds of a
-    terminal starting or stopping.
+  - Background work shows a static terminal icon, not the working spinner, with
+    the tooltip "Working in the background", so a dev server left running doesn't
+    read as a busy turn. Chat ends with the same icon and "1 background task
+    running". Output from the ended turn that the viewer hasn't seen shows the
+    unread dot instead until the session is opened. The composer lists running
+    Claude background shells and Codex background terminals as "1 background
+    task" with each one's command. Claude's list changes when a turn ends;
+    Codex's changes within a few seconds of a terminal starting or stopping.
   - Answering a prompt in Chat or the Inbox clears "Needs response" from the
     row, its status group, the dock badge and the Inbox count at once. If the
     answer fails to send, the prompt shows again. A session the sidebar had not
@@ -277,8 +289,8 @@ launched `omnigent claude` session is a separate launch path; inspect its linked
 Chat session as well as the local terminal.
 
 **Sidebar status rules:** keep the sidebar in view. In a Claude session, ask
-for `sleep 60` in a background shell and let the turn end: the row keeps its
-spinner until the sleep exits. In a Codex session, set a goal with several
+for `sleep 60` in a background shell and let the turn end: the row shows the
+terminal icon until the sleep exits. In a Codex session, set a goal with several
 steps, then have Codex start `python3 -m http.server 8765` in the background:
 the row stays working between turns and while the server runs, and goes idle
 once both end. While the server runs, the composer shows "1 background task"
@@ -1249,6 +1261,15 @@ Cross-harness journeys:
   `{"name": {"enabled": false}}` there turns it off. `~/.pi/agent` stays unchanged.
   A server whose env or headers use `${VAR}` connects only when the runner gets
   that variable, for example through `OMNIGENT_RUNNER_ENV_PASSTHROUGH=VAR`.
+- **`pi-claude-plugins`:** run `tests/inner/test_pi_claude_plugins.py` and
+  `tests/e2e/omnigent/test_pi_claude_plugins_e2e.py` (real Pi, mock model). Manually,
+  set `OMNIGENT_FEATURES=pi_claude_plugins` in the environment of the host or runner that
+  launches Pi (a server-only setting does not reach it), enable a marketplace
+  plugin with a skill and a command in Claude Code, then start `omnigent pi` with an
+  Omnigent provider. Run `/<plugin>:<command> focus`: the body expands with the
+  arguments. The skill is listed for the model and `/skill:<name>` works. Disable the
+  plugin in Claude Code and launch again: both are gone. `~/.pi/agent` stays unchanged.
+  Without the flag, nothing changes.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.

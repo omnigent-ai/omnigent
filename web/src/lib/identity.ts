@@ -23,13 +23,16 @@ import {
   hostFetch,
   isDatabricksWorkspace,
   isHostRoutingEnabled,
+  type UploadProgressListener,
 } from "./host";
 import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
 import {
   clearHostKeyless,
   getSessionHost,
+  getSessionHostRouting,
   isHostKeyless,
   markHostKeyless,
+  setSessionHost,
   updatesRoutingKey,
 } from "@/lib/sessionHost";
 
@@ -328,10 +331,10 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
   return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
 }
 
-const SCHEDULED_TASK_WRITE_RE = /\/v1\/scheduled-tasks(?:\/[^/?#]+)?(?:[?#]|$)/;
+const SCHEDULED_TASK_WRITE_RE = /\/v1\/scheduled-tasks(?:\/[^/?#]+(?:\/clone)?)?(?:[?#]|$)/;
 
-// A scheduled-task create or edit naming a connected host is validated against
-// that host's workspace over its tunnel, so it routes to the host's replica.
+// A scheduled-task create, edit or clone naming a connected host is validated
+// against that host's workspace over its tunnel, so it routes to the host's replica.
 function scheduledTaskHostId(url: string, init: RequestInit | undefined): string | null {
   const verb = (init?.method ?? "GET").toUpperCase();
   if ((verb !== "POST" && verb !== "PATCH") || typeof init?.body !== "string") return null;
@@ -359,6 +362,7 @@ const IDENTITY_RETRY_MAX_MS = 30_000;
 const identityListeners = new Set<() => void>();
 let identityRetryPending = false;
 let identityRetryDelayMs = IDENTITY_RETRY_INITIAL_MS;
+let identityRetryAfter = 0;
 let identityRetryTimer: ReturnType<typeof setTimeout> | null = null;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
@@ -423,12 +427,13 @@ function isOnLoginPath(): boolean {
 }
 
 /**
- * Whether a non-2xx `/v1/me` status may change on retry. A 401 or another
- * 4xx is the server's answer (signed out, route missing); 5xx, 408, and 429
- * come from an overloaded server or the gateway in front of it.
+ * Whether a non-2xx `/v1/me` status may change on retry. 5xx, 408, and 429
+ * come from an overloaded server or the gateway in front of it. The built-in
+ * handlers never return 403, so a 403 comes from the gateway and may be lifted.
+ * A 401 or any other 4xx is the server's answer (signed out, route missing).
  */
 function isTransientIdentityStatus(status: number): boolean {
-  return status >= 500 || status === 408 || status === 429;
+  return status >= 500 || status === 403 || status === 408 || status === 429;
 }
 
 /**
@@ -452,7 +457,7 @@ async function probeIdentity(): Promise<boolean> {
         };
         if (data.login_url) {
           serverLoginUrl = data.login_url;
-          if (!isOnLoginPath()) {
+          if (!getOmnigentHostConfig().fetcher && !isOnLoginPath()) {
             redirectToLogin(data.login_url);
           }
         }
@@ -487,20 +492,20 @@ function scheduleIdentityRetry(): void {
   if (!identityRetryPending || identityRetryTimer !== null || identityListeners.size === 0) {
     return;
   }
-  identityRetryTimer = setTimeout(() => {
-    identityRetryTimer = null;
-    // Grow the delay only when a retry runs; a cancelled timer made no request.
-    identityRetryDelayMs = Math.min(identityRetryDelayMs * 2, IDENTITY_RETRY_MAX_MS);
-    void resolveIdentity();
-  }, identityRetryDelayMs);
+  identityRetryTimer = setTimeout(
+    () => {
+      identityRetryTimer = null;
+      void resolveIdentity();
+    },
+    identityRetryAfter ? Math.max(0, identityRetryAfter - Date.now()) : identityRetryDelayMs,
+  );
 }
 
 /**
  * Fetch the current user identity from the server.
  * Called once on app load; subsequent calls return the cached value.
- * A transient failure resolves to null without being cached: the next
- * call probes again, and while {@link subscribeIdentity} has listeners
- * the probe is retried with backoff.
+ * A transient failure permits an immediate retry; repeated failures back off
+ * for direct callers and while {@link subscribeIdentity} has listeners.
  *
  * When the server returns 401 with a ``login_url`` (OIDC mode),
  * redirects the browser to the login page.
@@ -508,13 +513,23 @@ function scheduleIdentityRetry(): void {
 export async function resolveIdentity(): Promise<string | null> {
   if (identityResolved) return currentUserId;
   if (identityPromise) return identityPromise;
+  if (Date.now() < identityRetryAfter) {
+    scheduleIdentityRetry();
+    return currentUserId;
+  }
+  cancelIdentityRetry();
   const attempt = probeIdentity().then((final) => {
     identityPromise = null;
     if (final) {
       identityResolved = true;
       identityRetryPending = false;
+      identityRetryAfter = 0;
       cancelIdentityRetry();
     } else {
+      if (identityRetryPending) {
+        identityRetryDelayMs = Math.min(identityRetryDelayMs * 2, IDENTITY_RETRY_MAX_MS);
+        identityRetryAfter = Date.now() + identityRetryDelayMs;
+      }
       identityRetryPending = true;
       scheduleIdentityRetry();
     }
@@ -545,6 +560,36 @@ export function subscribeIdentity(listener: () => void): () => void {
 /** Return the cached user ID (null before resolveIdentity completes). */
 export function getCurrentUserId(): string | null {
   return currentUserId;
+}
+
+/** How long fetchSignedInUserId waits for the server's answer, its body included. */
+export const SIGNED_IN_TIMEOUT_MS = 10_000;
+
+/**
+ * Ask the server who is signed in now, bypassing the cache (another window can sign in
+ * as someone else). Null when signed out; undefined when the server can't say in time.
+ */
+export async function fetchSignedInUserId(): Promise<string | null | undefined> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve(undefined);
+    }, SIGNED_IN_TIMEOUT_MS);
+  });
+  const answer = (async () => {
+    const res = await hostFetch("/v1/me", { signal: controller.signal }, { hostless: true });
+    if (res.status === 401) return null;
+    if (!res.ok) return undefined;
+    const data = (await res.json()) as { user_id?: string | null };
+    return data.user_id ?? null;
+  })().catch(() => undefined);
+  try {
+    return await Promise.race([answer, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -581,29 +626,48 @@ export function getCurrentAuthorId(): string | null {
  * redirects to the login page.
  */
 /**
- * Whether a response is the server's wrong-replica signal
- * ({@link WRONG_REPLICA_CODE}). Gated on 400 first so the body is only read
- * on the rare failure; reads a CLONE so the original response body stays intact
- * for the caller when this returns false.
+ * The `error` object of the server's wrong-replica signal
+ * ({@link WRONG_REPLICA_CODE}), or `null` for any other response. Gated on 400
+ * first so the body is only read on the rare failure; reads a CLONE so the
+ * original response body stays intact for the caller.
  *
  * @param res The response to inspect.
- * @returns `true` when the JSON body carries `error.code === "wrong_replica"`.
+ * @returns The JSON body's `error` when it carries `code === "wrong_replica"`.
  */
-async function _isWrongReplica(res: Response): Promise<boolean> {
-  if (res.status !== 400) return false;
+async function _wrongReplicaError(res: Response): Promise<{ slice_key?: unknown } | null> {
+  if (res.status !== 400) return null;
   try {
-    const body = (await res.clone().json()) as { error?: { code?: string } };
-    return body.error?.code === WRONG_REPLICA_CODE;
+    const body = (await res.clone().json()) as {
+      error?: { code?: string; slice_key?: unknown };
+    };
+    return body.error?.code === WRONG_REPLICA_CODE ? body.error : null;
   } catch {
     // Non-JSON / empty body — not the structured wrong_replica error.
-    return false;
+    return null;
   }
+}
+
+async function _isWrongReplica(res: Response): Promise<boolean> {
+  return (await _wrongReplicaError(res)) !== null;
+}
+
+/** Return the nonempty host key named by a 400 wrong_replica response. */
+async function _wrongReplicaResendKey(res: Response): Promise<string | null> {
+  const sliceKey = (await _wrongReplicaError(res))?.slice_key;
+  return typeof sliceKey === "string" && sliceKey !== "" ? sliceKey : null;
+}
+
+/** A request through `authenticatedFetch`, with an optional upload-progress listener. */
+export interface AuthenticatedRequestInit extends RequestInit {
+  /** Told how much of the body each request this call sends has uploaded. */
+  onUploadProgress?: UploadProgressListener;
 }
 
 export async function authenticatedFetch(
   input: RequestInfo | URL,
-  init?: RequestInit,
+  options?: AuthenticatedRequestInit,
 ): Promise<Response> {
+  const { onUploadProgress, ...init } = options ?? {};
   const headers = new Headers(init?.headers);
   if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
     headers.set("X-Forwarded-Email", currentUserId);
@@ -612,6 +676,11 @@ export async function authenticatedFetch(
   // the modal host for cache affinity. An explicit caller header wins.
   // OSS ingress deployments opt in to this routing.
   const url = typeof input === "string" ? input : input.toString();
+  // A retried attempt re-sends the whole body, so its progress restarts from zero.
+  const retryAttempt = (requestInit: RequestInit, routing: { unkeyed?: boolean } = {}) => {
+    onUploadProgress?.(0, null);
+    return hostFetch(url, requestInit, { ...routing, onUploadProgress });
+  };
   // Resolve this session's host BEFORE deriving the slice key below, so a fresh
   // session sub-path request keys to the right replica on the first attempt
   // instead of guessing the modal host and self-healing via the keyless retry.
@@ -662,6 +731,8 @@ export async function authenticatedFetch(
       headers.set(SLICE_KEY_HEADER, clientRoutingKey());
     }
   }
+  const recoverySessionId = sessionIdForRecovery(url, init?.method);
+  const sentRouting = recoverySessionId === null ? null : getSessionHostRouting(recoverySessionId);
   // Bypass the browser HTTP cache for all API calls. Session
   // endpoints (GET /v1/sessions/{id}) carry volatile in-memory state
   // (pending_elicitations) that changes between fetches without any
@@ -675,8 +746,41 @@ export async function authenticatedFetch(
       headers,
       cache: "no-store",
     },
-    { unkeyed },
+    { unkeyed, onUploadProgress },
   );
+
+  // After a host switch this page can still key a session by its old host, which
+  // neither that key nor the default replica reaches; follow the host the refusal
+  // names. A managed launch stays keyed by the new host it launches.
+  const resendKey =
+    isDatabricksWorkspace() &&
+    !callerKeyed &&
+    recoverySessionId !== null &&
+    !isManagedLaunchRequest(url, init?.body)
+      ? await _wrongReplicaResendKey(res)
+      : null;
+  const sentKey = unkeyed ? null : headers.get(SLICE_KEY_HEADER);
+  if (recoverySessionId !== null && resendKey !== null && resendKey !== sentKey) {
+    init?.signal?.throwIfAborted();
+    // Correct only the original owner, preserving newer host and ancestry observations.
+    const currentRouting = getSessionHostRouting(recoverySessionId);
+    if (
+      sentRouting !== null &&
+      currentRouting.revision === sentRouting.revision &&
+      currentRouting.ownerId === sentRouting.ownerId
+    ) {
+      setSessionHost(sentRouting.ownerId ?? recoverySessionId, resendKey);
+    }
+    // A keyless miss shows the default replica doesn't hold this host; don't retry it.
+    if (sentKey === null) clearHostKeyless(resendKey);
+    const keyedHeaders = new Headers(headers);
+    keyedHeaders.set(SLICE_KEY_HEADER, resendKey);
+    res = await retryAttempt({ ...init, headers: keyedHeaders, cache: "no-store" }, {});
+    if (res.ok) clearHostKeyless(resendKey);
+    derivedHostId = resendKey;
+    stampedSliceKey = sentKey !== null;
+    unkeyed = false;
+  }
 
   // Wrong-replica fallback: a keyed request that reached the wrong replica comes
   // back 400 wrong_replica. Re-address ONCE with the key removed so it routes by
@@ -690,8 +794,7 @@ export async function authenticatedFetch(
     // (callers/tests hold it by reference).
     const retryHeaders = new Headers(headers);
     retryHeaders.delete(SLICE_KEY_HEADER);
-    res = await hostFetch(
-      url,
+    res = await retryAttempt(
       {
         ...init,
         headers: retryHeaders,
@@ -727,14 +830,13 @@ export async function authenticatedFetch(
       if (hostId !== null && !demoted) {
         const retryHeaders = new Headers(headers);
         retryHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, { ...init, headers: retryHeaders, cache: "no-store" });
+        res = await retryAttempt({ ...init, headers: retryHeaders, cache: "no-store" }, {});
       }
     }
     if (await _isWrongReplica(res)) {
       const retryHeaders = new Headers(headers);
       retryHeaders.delete(SLICE_KEY_HEADER);
-      res = await hostFetch(
-        url,
+      res = await retryAttempt(
         { ...init, headers: retryHeaders, cache: "no-store" },
         { unkeyed: true },
       );
@@ -745,7 +847,7 @@ export async function authenticatedFetch(
         clearHostKeyless(hostId);
         const keyedHeaders = new Headers(headers);
         keyedHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+        res = await retryAttempt({ ...init, headers: keyedHeaders, cache: "no-store" }, {});
       }
     }
   } else if (
