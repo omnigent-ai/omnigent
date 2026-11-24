@@ -172,11 +172,32 @@ describe("copying from the Markdown editor", () => {
     expect(copied).toBe(savedMarkdown(ed, true));
   });
 
+  it("copies the edited text after a text edit", () => {
+    const ed = makeEditor("# Title\n\n* one\n* two\n");
+    ed.view.dispatch(ed.state.tr.insertText("Edited ", textPosition(ed, "Title")));
+    // The unedited list keeps its `*` bullets.
+    expect(copySelection(ed, new AllSelection(ed.state.doc)).text).toBe(
+      "# Edited Title\n\n* one\n* two\n",
+    );
+  });
+
   it("copies the original source again once an edit is undone", () => {
-    const source = "# Title\n\n* one\n* two\n";
+    // CRLF and surplus blank lines, which Save would normalise, show the exact source returns.
+    const source = "# Title\r\n\r\n* one\r\n* two\r\n\r\n\r\n";
     const ed = makeEditor(source);
     ed.view.dispatch(ed.state.tr.insertText("Edited ", textPosition(ed, "Title")));
+    expect(copySelection(ed, new AllSelection(ed.state.doc)).text).not.toBe(source);
     ed.commands.undo();
+    expect(copySelection(ed, new AllSelection(ed.state.doc)).text).toBe(source);
+  });
+
+  it("treats empty paragraphs added at the end as unchanged, since Save drops them", () => {
+    const source = "x\r\n";
+    const ed = makeEditor(source);
+    ed.view.dispatch(
+      ed.state.tr.insert(ed.state.doc.content.size, ed.state.schema.nodes.paragraph.create()),
+    );
+    expect(savedMarkdown(ed, true)).toBe("x\n");
     expect(copySelection(ed, new AllSelection(ed.state.doc)).text).toBe(source);
   });
 
