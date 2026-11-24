@@ -263,8 +263,10 @@ class SysTicketUpdateTool(_TicketTool):
         "Optional comment is appended atomically. "
         "Labels replace the whole key/value list: use labels with key needs-human plus a comment "
         "with the exact ask and a link to the responsible worker's chat when a person must act, "
-        "in any stage, and remove that label only when its request is resolved. Set audience "
-        "human on that ask; other worker comments stay agent notes by default."
+        "in any stage, and remove that label only when its request is resolved. A comment from "
+        "a person the ask is routed to clears it automatically; add it back with a fresh "
+        "question if that comment did not resolve it. Set audience human on that ask; other "
+        "worker comments stay agent notes by default."
     )
     arguments = EditTicket
 

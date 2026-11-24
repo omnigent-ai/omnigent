@@ -172,15 +172,20 @@ export function useTicketActions(projectId: string) {
   const supported = useTicketStagesEnabled();
   const client = useQueryClient();
   const refresh = () => client.invalidateQueries({ queryKey: ["project-tickets", projectId] });
+  // A person's comment or label edit can answer a Needs response ask; drop it from the Inbox now.
+  const refreshWithAsks = () => {
+    void client.invalidateQueries({ queryKey: ["inbox-ticket-requests"] });
+    return refresh();
+  };
   const update = useMutation({
     mutationFn: ({ id, changes }: { id: string; changes: TicketChanges }) =>
       supported ? updateTicket(projectId, id, changes) : updateTicket(projectId, id, changes, true),
-    onSuccess: refresh,
+    onSuccess: refreshWithAsks,
   });
   const comment = useMutation({
     mutationFn: ({ id, body }: { id: string; body: TicketComment }) =>
       commentOnTicket(projectId, id, body),
-    onSuccess: refresh,
+    onSuccess: refreshWithAsks,
   });
   const link = useMutation({
     mutationFn: ({

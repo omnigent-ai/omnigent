@@ -63,6 +63,13 @@ def ticket_comment_for_worker_message(project_id: str, event: dict[str, Any]) ->
         "act on it if it asks for work. The orchestrator is only told in its digest once you "
         "reply. If it is meant for another agent, say so on the ticket and @mention that "
         "identity or message your coordinator."
+        + (
+            " Their comment cleared the ticket's needs-human label. If it does not resolve "
+            "your question, add needs-human back with sys_ticket_update, keeping the other "
+            "labels, and ask again exactly."
+            if event["payload"].get("cleared_needs_human")
+            else ""
+        )
     )
 
 

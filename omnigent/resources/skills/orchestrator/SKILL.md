@@ -106,7 +106,8 @@ Choose an appropriate unfinished stage for feedback or a changed approach;
 do not assume that Working or Planning exists. `sys_ticket_update` can append
 `comment` atomically with the change. Stage instructions describe work; they
 never authorize execution on entry, satisfy approval gates, or bypass prompts.
-Clear `needs-human` only when its request is resolved.
+Clear `needs-human` only when its request is resolved. The server clears it when a person
+the ask is routed to comments; the agent re-adds it if that comment didn't resolve it.
 
 ## Translate for the human
 

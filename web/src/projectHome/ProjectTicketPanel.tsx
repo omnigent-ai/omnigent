@@ -976,6 +976,7 @@ function ActivityChange({ event }: { event: TicketEvent }) {
         </Link>
       </>
     );
+  if (event.payload.cleared_by_comment === true) return <>cleared Needs response by commenting</>;
   const changes = event.payload.changes as Partial<ProjectTicket> | undefined;
   const stage = ticketEventStage(event);
   const fields = Object.keys(changes ?? {})

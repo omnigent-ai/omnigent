@@ -370,6 +370,7 @@ class ProjectTicketStore:
         payload: dict[str, Any],
         *,
         needs_human_changed: bool = False,
+        quiet: bool = False,
     ) -> None:
         own = actor.session_id is not None and actor.session_id == _orchestrator_session_id(
             session, project
@@ -388,7 +389,7 @@ class ProjectTicketStore:
                 .values(notification_state=NOTIFICATION_DIGEST)
             )
             answered = bool(result.rowcount)
-        if own:
+        if own or quiet:
             state = NOTIFICATION_SKIPPED
         elif (
             answered
@@ -485,6 +486,68 @@ class ProjectTicketStore:
             .order_by(SqlProjectTicketEvent.position)
         ).all()
         return _human_asks(builtins.list(rows))
+
+    def _answers_open_ask(
+        self, session: Session, project: SqlProject, ticket: SqlProjectTicket, actor: TicketActor
+    ) -> bool:
+        """Whether a person's comment answers the ticket's open needs-human ask.
+
+        Mirrors the Inbox: the commenter must be someone the ask is routed to, and a
+        person's follow-up on their own ask doesn't answer it.
+        """
+        from omnigent.server.product_approval import (
+            human_request_routing,
+            owner_sign_off_pending,
+        )
+
+        if actor.session_id is not None or actor.agent_id is not None:
+            return False
+        if not _has_needs_human(ticket.labels):
+            return False
+        routing_project = SimpleNamespace(
+            user_id=project.user_id, config=_decode_config(project.config)
+        )
+        _, responders = human_request_routing(routing_project, ticket.labels)
+        if owner_sign_off_pending(ticket.labels, ticket.requested_by):
+            responders = {project.user_id}
+        if actor.user_id not in responders:
+            return False
+        asks = self._human_asks(session, ticket)
+        if asks and asks[-1].end is None and asks[-1].session_id is None:
+            raised = session.scalar(
+                select(SqlProjectTicketEvent).where(
+                    SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+                    SqlProjectTicketEvent.project_id == ticket.project_id,
+                    SqlProjectTicketEvent.ticket_id == ticket.id,
+                    SqlProjectTicketEvent.position == asks[-1].start,
+                )
+            )
+            if raised is not None and raised.agent_id is None and raised.user_id == actor.user_id:
+                return False
+        return True
+
+    def _clear_answered_ask(
+        self, session: Session, project: SqlProject, ticket: SqlProjectTicket, actor: TicketActor
+    ) -> None:
+        """Drop needs-human after the comment that answered it; the agent can add it back.
+
+        The comment itself carries the notification, so the label change wakes no one.
+        """
+        labels = [
+            label
+            for label in ticket.labels or []
+            if not (isinstance(label, dict) and label.get("key") == NEEDS_HUMAN_LABEL)
+        ]
+        ticket.labels = labels
+        self._append(
+            session,
+            project,
+            ticket,
+            actor,
+            "updated",
+            {"changes": {"labels": labels}, "cleared_by_comment": True},
+            quiet=True,
+        )
 
     def _comment_audience(
         self,
@@ -1282,6 +1345,10 @@ class ProjectTicketStore:
                 )
                 if body.final:
                     audience = "human"
+                # An explicit label list is the person's own call on needs-human.
+                answers_ask = body.labels is None and self._answers_open_ask(
+                    session, project, row, actor
+                )
                 self._append(
                     session,
                     project,
@@ -1292,8 +1359,11 @@ class ProjectTicketStore:
                         "text": body.comment,
                         "audience": audience,
                         **({"final": True} if body.final else {}),
+                        **({"cleared_needs_human": True} if answers_ask else {}),
                     },
                 )
+                if answers_ask:
+                    self._clear_answered_ask(session, project, row, actor)
                 row.comment_count += 1
                 if audience == "human":
                     row.latest_update = body.comment[:300]
@@ -1327,7 +1397,14 @@ class ProjectTicketStore:
             if mentions:
                 # The personas this comment cc'd, as {"id", "name"}; shown and delivered.
                 payload["mentions"] = mentions
+            answers_ask = body.kind == "comment" and self._answers_open_ask(
+                session, project, row, actor
+            )
+            if answers_ask:
+                payload["cleared_needs_human"] = True
             self._append(session, project, row, actor, body.kind, payload)
+            if answers_ask:
+                self._clear_answered_ask(session, project, row, actor)
             for output in body.outputs:
                 self._append(session, project, row, actor, "output", output.model_dump())
             row.comment_count += 1
@@ -1704,7 +1781,16 @@ class ProjectTicketStore:
         with self._session("ticket_person_comment_context") as session:
             ticket = self._row(session, project_id, ticket_id)
             asks = self._human_asks(session, ticket)
-            open_ask = asks[-1] if asks and asks[-1].end is None else None
+            # The ask open when the person commented, even if their comment then cleared it.
+            open_ask = next(
+                (
+                    ask
+                    for ask in reversed(asks)
+                    if ask.start < before_position
+                    and (ask.end is None or ask.end > before_position)
+                ),
+                None,
+            )
             authors = session.scalars(
                 select(SqlProjectTicketEvent.session_id)
                 .where(
@@ -1721,9 +1807,7 @@ class ProjectTicketStore:
             return {
                 "labels": builtins.list(ticket.labels or []),
                 "stage_id": ticket.stage_id,
-                "asker": open_ask.session_id
-                if open_ask is not None and _has_needs_human(ticket.labels)
-                else None,
+                "asker": open_ask.session_id if open_ask is not None else None,
                 "commenters": builtins.list(dict.fromkeys(authors)),
             }
 

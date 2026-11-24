@@ -226,3 +226,12 @@ async def test_unavailable_role_lookup_does_not_silently_start_an_ordinary_worke
     ) as client:
         with pytest.raises(httpx.HTTPStatusError):
             await append_project_instructions("Author", client, "session", spec)
+
+
+def test_worker_turn_says_when_a_comment_cleared_needs_human():
+    from omnigent.server.project_orchestrator import ticket_comment_for_worker_message
+
+    event = {"ticket_id": "t1", "ticket_title": "Decide", "payload": {"text": "B"}}
+    assert "cleared" not in ticket_comment_for_worker_message("p1", event)
+    event["payload"]["cleared_needs_human"] = True
+    assert "add needs-human back" in ticket_comment_for_worker_message("p1", event)

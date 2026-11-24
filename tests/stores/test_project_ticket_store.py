@@ -1017,3 +1017,42 @@ def test_reliability_loop_notes_are_agent_notes_that_never_wake_anyone(board):
         if event["kind"] == "comment"
     ]
     assert [(event["urgent"], event["agent_id"]) for event in pending] == [(False, LOOP_AGENT_ID)]
+
+
+def test_a_routed_persons_comment_clears_needs_human_but_keeps_routing_to_the_asker(board):
+    tickets, _, project = board
+    worker = TicketActor("alice", uuid4().hex, uuid4().hex)
+    owner = TicketActor("alice")
+    ticket = tickets.create(project.id, CreateTicket(title="Decide"), worker)
+    tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(labels=[{"key": "kind", "value": "ux"}, {"key": "needs-human"}]),
+        worker,
+    )
+    # An agent's own comment leaves the ask open.
+    tickets.comment(project.id, ticket["id"], CommentOnTicket(text="Ship A or B?"), worker)
+    assert len(tickets.human_requests(user_id="alice")["data"]) == 1
+
+    answered = tickets.comment(project.id, ticket["id"], CommentOnTicket(text="B"), owner)
+
+    assert answered["labels"] == [{"key": "kind", "value": "ux"}]
+    assert tickets.human_requests(user_id="alice")["data"] == []
+    events = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
+    comment, cleared = events[-2], events[-1]
+    assert comment["payload"]["cleared_needs_human"] is True
+    assert cleared["payload"]["cleared_by_comment"] is True
+    context = tickets.person_comment_context(project.id, ticket["id"], comment["position"])
+    assert context["asker"] == worker.session_id
+
+    # A person's follow-up on an ask they raised themselves doesn't clear it.
+    tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(labels=[{"key": "needs-human"}], comment="Asking the team"),
+        owner,
+    )
+    tickets.comment(project.id, ticket["id"], CommentOnTicket(text="Any news?"), owner)
+    assert tickets.get(project.id, ticket["id"], user_id="alice")["labels"] == [
+        {"key": "needs-human"}
+    ]
