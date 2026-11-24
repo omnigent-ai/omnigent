@@ -109,6 +109,7 @@ import {
   ADMIN_VIEW_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
+  OPEN_IN_DESKTOP_APP_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
@@ -395,10 +396,16 @@ import {
   resetCliPath,
   supportsBrowser,
   supportsGlobalShortcut,
+  supportsWidenWindowForRightSidebar,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import {
+  desktopAppHandoffSupported,
+  readOpenInDesktopApp,
+  writeOpenInDesktopApp,
+} from "@/lib/desktopAppHandoff";
 import { readOpenLinksInApp, writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
 import { cn } from "@/lib/utils";
@@ -410,6 +417,7 @@ import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 import { GlobalShortcutControl } from "./settings/GlobalShortcutControl";
+import { WidenWindowForRightSidebarControl } from "./settings/WidenWindowForRightSidebarControl";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -2015,6 +2023,35 @@ function OpenLinksInAppControl() {
   );
 }
 
+/**
+ * Whether a conversation link opened in this browser moves to the running
+ * desktop app. Ordinary browsers only; off until the user accepts the page's offer.
+ */
+function OpenInDesktopAppControl() {
+  const [enabled, setEnabled] = useState(readOpenInDesktopApp);
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeOpenInDesktopApp(next);
+  }, []);
+
+  return (
+    <SettingsItem
+      entry={OPEN_IN_DESKTOP_APP_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={OPEN_IN_DESKTOP_APP_ENTRY} className="flex-1" />
+      <Switch
+        {...settingsControlProps(OPEN_IN_DESKTOP_APP_ENTRY)}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-in-desktop-app-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_in_desktop_app"
+      />
+    </SettingsItem>
+  );
+}
+
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
 
@@ -2175,6 +2212,8 @@ function ProactiveAgentGroup() {
 function GeneralSection() {
   const info = useServerInfo();
   const titleInstructions = info !== "loading" && info.session_title_instructions === true;
+  const globalShortcut = supportsGlobalShortcut();
+  const widenWindowForRightSidebar = supportsWidenWindowForRightSidebar();
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
       <div className="flex flex-col gap-6">
@@ -2209,14 +2248,24 @@ function GeneralSection() {
             <OpenLinksInAppControl />
           </SettingsGroup>
         )}
+        {desktopAppHandoffSupported() && (
+          <SettingsGroup title="Conversation links" testId="settings-group-conversation-links">
+            <OpenInDesktopAppControl />
+          </SettingsGroup>
+        )}
         <BrowserAgentToolsSettingsGroup />
-        {supportsGlobalShortcut() && (
+        {(globalShortcut || widenWindowForRightSidebar) && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
-            <GlobalShortcutControl />
-            {isFeatureEnabled(info, "floating_composer") && (
+            {globalShortcut && <GlobalShortcutControl />}
+            {globalShortcut && isFeatureEnabled(info, "floating_composer") && (
               // Empty, and hidden, unless the shell can change the panel's shortcut by id.
               <div className="mt-4 border-t border-border pt-4 empty:hidden">
                 <GlobalShortcutControl shortcutId="floatingComposer" />
+              </div>
+            )}
+            {widenWindowForRightSidebar && (
+              <div className={cn(globalShortcut && "mt-4 border-t border-border pt-4")}>
+                <WidenWindowForRightSidebarControl />
               </div>
             )}
           </SettingsGroup>

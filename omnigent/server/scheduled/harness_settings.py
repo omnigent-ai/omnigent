@@ -169,9 +169,9 @@ def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
     options = launch_args[: launch_args.index("--")] if "--" in launch_args else launch_args
     modes = PERMISSION_LAUNCH_ARGS.get(harness, {})
     if harness == "claude-native":
-        from omnigent.runner.native.orchestration import _claude_launch_permission_mode
+        from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
 
-        mode = _claude_launch_permission_mode(options)
+        mode = claude_launch_permission_mode(options)
         return mode if mode in modes else None
     if harness == "codex-native":
         from omnigent.harnesses.codex_native.launch_args import codex_config_profile

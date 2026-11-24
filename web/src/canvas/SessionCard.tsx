@@ -10,7 +10,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { getSessionState, withUnreadState, type SessionState } from "@/hooks/useSessionState";
 import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
-import { showsUnreadFor } from "@/lib/sessionMute";
+import { showsUnreadFor, useMutedProjects } from "@/lib/sessionMute";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { cn } from "@/lib/utils";
@@ -55,6 +55,7 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
     conversation.status,
   );
   // A muted session shows no unread state, matching its sidebar row.
+  useMutedProjects();
   const unread = showsUnreadFor(conversation, readState.unseen);
   const state: SessionState | null = withUnreadState(getSessionState(conversation), unread);
   const title = conversation.title || optimisticTitle || conversationDisplayLabel(conversation);

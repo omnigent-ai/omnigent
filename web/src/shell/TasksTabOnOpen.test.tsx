@@ -23,7 +23,7 @@ describe("TasksTabOnOpen", () => {
     useSessionTasksActions.setState({
       tasksTabToOpen: null,
       taskToShow: null,
-      tasksTabAutoOpen: false,
+      tasksTabRequestedBy: "click",
     });
     Object.assign(sessionTasks, { progress: [], loading: true });
     Object.assign(chat, { conversationId: null, loadingConversation: true });
@@ -42,11 +42,25 @@ describe("TasksTabOnOpen", () => {
 
     Object.assign(chat, { loadingConversation: false });
     rerender(<TasksTabOnOpen conversationId="a" skip={false} />);
-    // Beside the chat: a phone keeps the chat in view.
+    // Only the tab: the rail keeps its restored state, and a phone keeps the chat in view.
     expect(useSessionTasksActions.getState()).toMatchObject({
       tasksTabToOpen: "a",
-      tasksTabAutoOpen: true,
+      tasksTabRequestedBy: "session-open",
     });
+  });
+
+  it("keeps a click's request for the session it opens", () => {
+    const click = {
+      tasksTabToOpen: "a",
+      taskToShow: { conversationId: "a", stepId: "step-1" },
+      tasksTabRequestedBy: "click",
+    } as const;
+    useSessionTasksActions.setState(click);
+    Object.assign(sessionTasks, { progress: tasks(1), loading: false });
+    Object.assign(chat, { conversationId: "a", loadingConversation: false });
+    render(<TasksTabOnOpen conversationId="a" skip={false} />);
+
+    expect(useSessionTasksActions.getState()).toMatchObject(click);
   });
 
   it("leaves a session without tasks alone, even when tasks come later", () => {

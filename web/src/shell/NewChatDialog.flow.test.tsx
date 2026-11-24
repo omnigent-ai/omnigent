@@ -66,6 +66,13 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { ARIA_MOD_KEY, ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ComposerPresentationContext, type ComposerPresentation } from "./composerPresentation";
+import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
+import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import {
+  composerTargetOf,
+  isComposerTargetFocused,
+} from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -458,12 +465,98 @@ afterEach(() => {
 
 describe("NewChatLandingScreen in the floating panel", () => {
   function floatingPanel() {
+    const shownListeners = new Set<() => void>();
     return {
       kind: "floating" as const,
       launch: vi.fn(),
       onFilePicker: vi.fn(),
       openAppPage: vi.fn(),
+      subscribeShown: (listener: () => void) => {
+        shownListeners.add(listener);
+        return () => {
+          shownListeners.delete(listener);
+        };
+      },
+      /** The panel came on screen or took the keyboard again. */
+      shown: () =>
+        act(() => {
+          for (const listener of shownListeners) listener();
+        }),
     };
+  }
+
+  it("keeps the keyboard in the prompt when the CodeMirror editor arrives after the panel took it", async () => {
+    let loaded: (() => void) | undefined;
+    resetCodeMirrorComposerLoadForTests(
+      () =>
+        new Promise((resolve) => {
+          loaded = () => resolve(CodeMirrorModule);
+        }),
+    );
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    const panel = floatingPanel();
+    renderLanding([], { features: { chat_composer_codemirror: true } }, panel);
+    // The editor is still loading, so the textarea stands in and takes the keyboard.
+    typeMessage("early words");
+    panel.shown();
+    expect(document.activeElement).toBe(screen.getByTestId("new-chat-landing-input"));
+
+    // The import starts a moment after the flag asks for it.
+    await waitFor(() => expect(loaded).toBeTypeOf("function"));
+    await act(async () => loaded!());
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = composerTargetOf(screen.getByTestId("new-chat-landing-input"))!;
+    expect(isComposerTargetFocused(editor)).toBe(true);
+    expect(editor.value).toBe("early words");
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([11, 11]);
+  });
+
+  for (const engine of ["textarea", "codemirror"] as const) {
+    it(`gives the ${engine} prompt the keyboard each time the panel takes it, after the kept draft`, async () => {
+      if (engine === "codemirror") {
+        resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+        onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+      }
+      const panel = floatingPanel();
+      renderLanding(
+        [],
+        engine === "codemirror" ? { features: { chat_composer_codemirror: true } } : {},
+        panel,
+      );
+      if (engine === "codemirror") {
+        await waitFor(() =>
+          expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+        );
+      }
+      const target = () => composerTargetOf(screen.getByTestId("new-chat-landing-input"))!;
+      if (engine === "codemirror") act(() => insertComposerText(target(), "half a thought"));
+      else typeMessage("half a thought");
+      // The keyboard went elsewhere, with the caret back at the start.
+      act(() => {
+        target().setSelectionRange(0, 0);
+        target().blur();
+      });
+      expect(isComposerTargetFocused(target())).toBe(false);
+
+      panel.shown();
+
+      expect(isComposerTargetFocused(target())).toBe(true);
+      expect(target().value).toBe("half a thought");
+      expect([target().selectionStart, target().selectionEnd]).toEqual([14, 14]);
+
+      // Another control the user moves to keeps the keyboard, across renders, until the next show.
+      const other = screen.getByTestId("new-chat-landing-submit");
+      act(() => other.focus());
+      if (engine === "codemirror") act(() => insertComposerText(target(), "!"));
+      else typeMessage("half a thought!");
+      expect(document.activeElement).toBe(other);
+      panel.shown();
+      expect(isComposerTargetFocused(target())).toBe(true);
+      expect(target().value).toBe("half a thought!");
+      expect([target().selectionStart, target().selectionEnd]).toEqual([15, 15]);
+    });
   }
 
   /** The desktop shell answers which host is this Mac, as it does in the panel. */

@@ -31,7 +31,15 @@ export function removePaneFocusingNeighbor(
     if (!kept.has(survivor)) clearPaneStartFailure(conversationId, survivor);
   }
   onRemoved?.();
-  const nextFocus = split?.focusedKey ?? liveSurvivor;
+  giveNextPaneTheKeyboard(target, split?.focusedKey ?? liveSurvivor);
+}
+
+/** After ``target`` lost a pane, give ``nextFocus``'s pane the keyboard, as closing a pane does. */
+export function giveNextPaneTheKeyboard(
+  target: TerminalSplitTarget,
+  nextFocus: string | null,
+): void {
+  const { conversationId } = target;
   if (nextFocus === null) return;
   // A failed start's slot takes the keyboard itself, on its Try Again.
   const failed = isFailedPaneStart(conversationId, nextFocus);

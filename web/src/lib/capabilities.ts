@@ -78,7 +78,8 @@ export type FeatureKey =
   | "quick_pick_palette"
   | "floating_composer"
   | "workspace_sidebar_v2"
-  | "sidebar_saved_views";
+  | "sidebar_saved_views"
+  | "floating_panes";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -274,6 +275,12 @@ export interface ServerInfo {
    * offers Mute only when this is set. Fails to ``false``.
    */
   session_mute?: boolean;
+  /**
+   * True when ``GET /v1/sessions/projects`` reports each project's ``muted``.
+   * Older servers drop it, so a saved project mute would never read back and
+   * the client offers Mute project only when this is set. Fails to ``false``.
+   */
+  project_mute?: boolean;
   /**
    * True when scheduled tasks accept ``session_mode`` and ``session_id``.
    * Older servers reject the fields, so the automation dialog hides its
@@ -555,6 +562,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   automations_enabled: true,
   session_search_scope: false,
   session_mute: false,
+  project_mute: false,
   scheduled_task_session_modes: false,
   session_create_permission_modes: false,
   session_create_workflow_id: false,
@@ -747,6 +755,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
           session_mute: data.session_mute === true,
+          project_mute: data.project_mute === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           session_create_permission_modes: data.session_create_permission_modes === true,
           session_create_workflow_id: data.session_create_workflow_id === true,

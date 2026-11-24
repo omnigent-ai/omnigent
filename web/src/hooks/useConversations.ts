@@ -60,10 +60,11 @@ import {
   beginMuteSave,
   clearSessionMuteState,
   hasMuteEntries,
-  isConversationMuted,
+  isSessionMuted,
   muteReadMarker,
   MUTED_LABEL_KEY,
   reconcileMuteLabel,
+  setMutedProjects,
   settleMuteSave,
 } from "@/lib/sessionMute";
 import {
@@ -2383,7 +2384,7 @@ export function useSetConversationMuted() {
       return (await res.json()) as { labels?: Record<string, string> };
     },
     onMutate: ({ id, muted }) => {
-      const previous = isConversationMuted({
+      const previous = isSessionMuted({
         id,
         labels: findCachedConversationRow(queryClient, id)?.labels,
       });
@@ -2440,6 +2441,8 @@ export interface ProjectSummary {
   /** Chosen emoji icon (a unicode grapheme), or null/absent for the default
       folder glyph. Sourced from the project's `config.icon`. */
   icon?: string | null;
+  /** Whether the viewer muted every session in the project (`config.muted`). */
+  muted?: boolean;
 }
 
 /**
@@ -2458,6 +2461,16 @@ export function useProjects({ enabled = true }: { enabled?: boolean } = {}) {
     staleTime: 30_000,
     enabled,
   });
+}
+
+/** Feed the viewer's muted projects to the mute store every mute check reads. */
+export function useSyncMutedProjects(): void {
+  const { data } = useProjects();
+  const viewerId = useViewerId();
+  useEffect(() => {
+    // Mounted at the app root, so an unexpected reply must not throw.
+    if (Array.isArray(data)) setMutedProjects(data, viewerId);
+  }, [data, viewerId]);
 }
 
 /**
@@ -3305,7 +3318,12 @@ export function useUpdateProjectConfig() {
       // config to `{}` and drop the saved defaults on that first visit.
       queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
         if (!prev) return prev;
-        const summary = { id: project.id, name: project.name, icon: project.config?.icon };
+        const summary = {
+          id: project.id,
+          name: project.name,
+          icon: project.config?.icon,
+          muted: project.config?.muted === true,
+        };
         return prev.some((p) => p.name === project.name)
           ? prev.map((p) => (p.name === project.name ? summary : p))
           : [...prev, summary];

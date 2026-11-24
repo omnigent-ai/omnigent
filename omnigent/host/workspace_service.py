@@ -74,6 +74,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     StatPathRequest,
     StatPathResponse,
 )
+from omnigent.host import workspace_fuzzy
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
 from omnigent.host.workspace_git import comparison, context, working_copy
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
@@ -105,10 +106,13 @@ class _Served:
 
     :param features: Optional features it offers, e.g. ``"search_files.substring"``.
     :param tool: A program it needs on ``PATH``; without it, the method isn't listed.
+    :param optional_features: Returns the features this host can offer only when
+        a library they need loads.
     """
 
     features: tuple[str, ...] = ()
     tool: str | None = None
+    optional_features: Callable[[], tuple[str, ...]] | None = None
 
 
 # The methods this host answers. Only these, and GetCapabilities, are dispatched.
@@ -117,8 +121,12 @@ _SERVED: dict[str, _Served] = {
     "ReadFile": _Served(),
     "StatPath": _Served(),
     "ReadLinkText": _Served(),
-    "SearchFiles": _Served(features=("search_files.substring",), tool="git"),
-    "SearchText": _Served(tool="rg"),
+    "SearchFiles": _Served(
+        features=("search_files.substring",),
+        tool="git",
+        optional_features=workspace_fuzzy.features,
+    ),
+    "SearchText": _Served(features=("text_search_priority",), tool="rg"),
     "ResolveWorkingCopyBase": _Served(features=("revision_comparison",), tool="git"),
     "ListWorkingCopyChanges": _Served(tool="git"),
     "ReadBaseFile": _Served(tool="git"),
@@ -133,7 +141,8 @@ def capabilities() -> list[str]:
     names: list[str] = []
     for name, served in _SERVED.items():
         if served.tool is None or shutil.which(served.tool):
-            names += [name, *served.features]
+            optional = served.optional_features() if served.optional_features else ()
+            names += [name, *served.features, *optional]
     return names
 
 

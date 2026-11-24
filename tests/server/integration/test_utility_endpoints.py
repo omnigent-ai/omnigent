@@ -106,6 +106,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "project_repository_creation": True,
         "quick_pick_palette": False,
         "workspace_sidebar_v2": False,
+        # Off: it follows workspace_sidebar_v2 while no deployment names it.
+        "floating_panes": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
@@ -128,6 +130,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
     assert data["session_mute"] is True
+    assert data["project_mute"] is True
     # Lets sys_session_list scope archive-inclusive listings server-side.
     assert data["session_list_scoped_archives"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.

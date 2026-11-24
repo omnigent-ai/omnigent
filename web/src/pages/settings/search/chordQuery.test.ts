@@ -285,7 +285,9 @@ const PAGE_CONTEXT: ShortcutPageContext = {
 const SHOWN: SettingsAvailability = {
   globalShortcut: true,
   floatingComposerShortcut: true,
+  widenWindowForRightSidebar: true,
   inAppBrowser: true,
+  desktopAppHandoff: true,
   adminView: true,
   accountsEnabled: true,
   archiveWorktreeCleanup: true,

@@ -185,6 +185,7 @@ function loadNavigationHarness({
   oidc = {},
   acceptedSessions = new Set(),
   deepLinks = null,
+  desktopOpenServer = null,
   localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
   clipboardWriteText = async () => {},
   localHostNow = Date.now,
@@ -454,8 +455,9 @@ function loadNavigationHarness({
     clipboard: { writeText: (text) => clipboardWriteText(text) },
     dialog: {},
     globalShortcut: {
-      register: (accelerator) => {
+      register: (accelerator, press) => {
         (calls.globalShortcuts ??= []).push(["register", accelerator]);
+        (calls.presses ??= new Map()).set(accelerator, press);
         return true;
       },
       unregister: (accelerator) => (calls.globalShortcuts ??= []).push(["unregister", accelerator]),
@@ -735,6 +737,10 @@ function loadNavigationHarness({
     },
   };
 
+  if (desktopOpenServer) {
+    localRequires["./desktopOpenServer"] = { startDesktopOpenServer: desktopOpenServer };
+  }
+
   if (sshPreviewVerification) {
     localRequires["./sshPreviewIdentity"] = {
       verifySshPreviewIdentity: sshPreviewVerification,
@@ -763,8 +769,11 @@ function loadNavigationHarness({
   const source =
     fs.readFileSync(mainPath, "utf8") +
     "\nmodule.exports.sshHosts = sshHosts;" +
-    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt };" +
+    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt, openFloatingComposerFromShortcut, focusAfterBrowserSignIn };" +
     "\nmodule.exports.quitStarted = () => quitConfirmation.quitStarted();" +
+    "\nmodule.exports.startDesktopOpenListener = startDesktopOpenListener;" +
+    "\nmodule.exports.setBrowserHandoffTimeoutMs = (ms) => { browserHandoffTimeoutMs = ms; };" +
+    "\nmodule.exports.registerConversationShownReset = registerConversationShownReset;" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -799,6 +808,9 @@ function loadNavigationHarness({
   const api = module.exports.testApi;
   Object.assign(api, module.exports.panelTestApi);
   api.quitStarted = module.exports.quitStarted;
+  api.startDesktopOpenListener = module.exports.startDesktopOpenListener;
+  api.setBrowserHandoffTimeoutMs = module.exports.setBrowserHandoffTimeoutMs;
+  api.registerConversationShownReset = module.exports.registerConversationShownReset;
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
     serverUrl,
@@ -3810,6 +3822,146 @@ describe("CLI deep-link handoff", () => {
   }
 });
 
+describe("browser conversation handoff", () => {
+  it("trusts only servers the app is connected to, and queues what the listener accepts", async () => {
+    let options;
+    const h = loadNavigationHarness({
+      serverUrl: "http://localhost:6767/",
+      savedServerUrl: "https://saved.example.com/omnigent",
+      desktopOpenServer: async (given) => {
+        options = given;
+        return { port: 28417, close: async () => {} };
+      },
+    });
+
+    await h.api.startDesktopOpenListener();
+
+    // The window's current server, and one saved from an earlier connection.
+    assert.equal(options.isKnownOrigin("http://localhost:6767"), true);
+    assert.equal(options.isKnownOrigin("https://saved.example.com"), true);
+    assert.equal(options.isKnownOrigin("https://attacker.example"), false);
+    h.api.disposeAuth();
+  });
+
+  /** Start the listener with a short wait, and return what it hands to `openLink`. */
+  async function handoffListener(t, harnessOptions = {}) {
+    let options;
+    const h = loadNavigationHarness({
+      serverUrl: "http://localhost:6767/",
+      deepLinks: { ...require("../src/deepLink"), acceptCliDeepLink: async () => true },
+      desktopOpenServer: async (given) => {
+        options = given;
+        return { port: 28417, close: async () => {} };
+      },
+      ...harnessOptions,
+    });
+    t.after(() => h.api.disposeAuth());
+    h.electron.app.isReady = () => true;
+    h.api.registerIpc();
+    h.api.setBrowserHandoffTimeoutMs(300);
+    await h.api.startDesktopOpenListener();
+    return { h, openLink: options.openLink };
+  }
+
+  /** The window's page, at `url`, reports the conversation it has loaded (null for none). */
+  function pageReports(h, url, conversationId) {
+    h.webContents.getURL = () => url;
+    h.ipc.get("omnigent:conversation-shown")(
+      { sender: h.webContents, senderFrame: { url } },
+      conversationId,
+    );
+  }
+
+  it("reports success only once the page says it has loaded the conversation", async (t) => {
+    const { h, openLink } = await handoffListener(t);
+    const opening = openLink("omnigent://localhost:6767/c/conv_abc");
+    let settled = false;
+    void opening.then(() => (settled = true));
+
+    // On the conversation's address, signed in or not: that alone is not success.
+    h.webContents.getURL = () => "http://localhost:6767/c/conv_abc";
+    await new Promise((resolve) => {
+      setTimeout(resolve, 150);
+    });
+    assert.equal(settled, false);
+
+    pageReports(h, "http://localhost:6767/c/conv_abc", "conv_abc");
+    assert.equal(await opening, true);
+    assert.deepEqual(
+      h.calls.progress.filter(({ channel }) => channel === "omnigent:open-path"),
+      [{ channel: "omnigent:open-path", data: "/c/conv_abc" }],
+    );
+  });
+
+  it("reports failure when the page never loads the conversation", async (t) => {
+    const { h, openLink } = await handoffListener(t);
+    const link = "omnigent://localhost:6767/c/conv_abc";
+
+    // A signed-out page sits on the conversation's address, then goes to sign-in.
+    h.webContents.getURL = () => "http://localhost:6767/c/conv_abc";
+    const signedOut = openLink(link);
+    h.webContents.getURL = () => "http://localhost:6767/login?next=/c/conv_abc";
+    assert.equal(await signedOut, false);
+
+    // Another conversation's report, or a page too old to report, is not this one.
+    pageReports(h, "http://localhost:6767/c/conv_other", "conv_other");
+    assert.equal(await openLink(link), false);
+    // A report from a frame of another origin is ignored.
+    h.webContents.getURL = () => "http://localhost:6767/c/conv_abc";
+    h.ipc.get("omnigent:conversation-shown")(
+      { sender: h.webContents, senderFrame: { url: "https://attacker.example/" } },
+      "conv_abc",
+    );
+    assert.equal(await openLink(link), false);
+    assert.equal(await openLink("not a link"), false);
+  });
+
+  it("forgets what a page reported once the window loads a new document", async (t) => {
+    const { h, openLink } = await handoffListener(t);
+    h.api.registerConversationShownReset(h.win);
+    pageReports(h, "http://localhost:6767/c/conv_abc", "conv_abc");
+    assert.equal(await openLink("omnigent://localhost:6767/c/conv_abc"), true);
+
+    // A reload that succeeds: the window stays on its server, with nothing shown yet.
+    h.emit("did-navigate", "http://localhost:6767/c/conv_abc", 200, "OK");
+
+    const state = h.api.windows.get(h.win);
+    assert.equal(state.origin, "http://localhost:6767");
+    assert.equal(state.shownConversationId, null);
+    assert.equal(await openLink("omnigent://localhost:6767/c/conv_abc"), false);
+  });
+});
+
+/** Lets the harness window act as the panel the shell builds; returns its visible state. */
+function asPanelWindow(h) {
+  const panel = { visible: false, destroyed: false };
+  Object.assign(h.win, {
+    setAlwaysOnTop() {},
+    setVisibleOnAllWorkspaces() {},
+    setBounds() {},
+    getBounds: () => ({ x: 0, y: 0, width: 620, height: 360 }),
+    setOpacity() {},
+    moveTop() {},
+    showInactive: () => (panel.visible = true),
+    isVisible: () => panel.visible,
+    hide: () => (panel.visible = false),
+    isDestroyed: () => panel.destroyed,
+    destroy() {
+      panel.destroyed = true;
+      h.emitWindow("closed");
+    },
+  });
+  Object.assign(h.webContents, { isCrashed: () => false, focus() {}, isDestroyed: () => false });
+  const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
+  Object.assign(h.electron.screen, {
+    getAllDisplays: () => [display],
+    getCursorScreenPoint: () => ({ x: 10, y: 10 }),
+    getDisplayNearestPoint: () => display,
+  });
+  h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
+  return panel;
+}
+
 describe("floating panel wiring", () => {
   const chord = "CommandOrControl+Shift+Space";
   const serverUrl = "https://host.example/ml/omnigents";
@@ -3912,35 +4064,47 @@ describe("floating panel wiring", () => {
   });
 
   /** Turns the harness window into its server's panel, opened as ⇧⌘Space would. */
-  function openPanel(h) {
-    const panel = { visible: false, destroyed: false };
-    Object.assign(h.win, {
-      setAlwaysOnTop() {},
-      setVisibleOnAllWorkspaces() {},
-      setBounds() {},
-      getBounds: () => ({ x: 0, y: 0, width: 620, height: 360 }),
-      setOpacity() {},
-      moveTop() {},
-      showInactive: () => (panel.visible = true),
-      isVisible: () => panel.visible,
-      hide: () => (panel.visible = false),
-      isDestroyed: () => panel.destroyed,
-      destroy() {
-        panel.destroyed = true;
-        h.emitWindow("closed");
-      },
-    });
-    Object.assign(h.webContents, { isCrashed: () => false, focus() {} });
-    const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
-    Object.assign(h.electron.screen, {
-      getAllDisplays: () => [display],
-      getCursorScreenPoint: () => ({ x: 10, y: 10 }),
-      getDisplayNearestPoint: () => display,
-    });
-    h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
+  function openPanel(h, { ready = true } = {}) {
+    const panel = asPanelWindow(h);
     h.api.floatingComposer().show(serverUrl);
+    // Its page has loaded and rendered the composer.
+    if (ready) h.api.floatingComposer().markReady(h.win);
     return panel;
   }
+
+  it("shows the panel once its own top document on its panel page says it's ready", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const main = addMain(h);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    let shown = 0;
+    h.win.show = () => (shown += 1);
+    const panel = openPanel(h, { ready: false });
+    assert.equal(panel.visible, false, "its page is still loading");
+    const ready = (frame, { mainFrame = frame, sender = h.webContents } = {}) => {
+      sender.mainFrame = mainFrame;
+      h.ipc.get("omnigent:floating-composer:ready")({ sender, senderFrame: frame });
+    };
+    h.setUrl(`${serverUrl}/compose/floating`);
+    ready({ url: h.webContents.getURL() }, { mainFrame: { url: "top" } });
+    assert.equal(panel.visible, false, "a subframe can't speak for the panel");
+    ready({ url: main.url }, { sender: main.webContents });
+    assert.equal(panel.visible, false, "nor can a main window");
+    ready({ url: "https://evil.example/compose/floating" });
+    assert.equal(panel.visible, false, "nor a page from another origin");
+    h.setUrl(`${serverUrl}/`);
+    ready({ url: h.webContents.getURL() });
+    assert.equal(panel.visible, false, "nor a page that left the panel route");
+    h.setUrl(`${serverUrl}/compose/floating`);
+    ready({ url: h.webContents.getURL() });
+    assert.equal(panel.visible, true);
+    // It came on screen without activating the app or raising the main window.
+    assert.equal(shown, 0, "show() orders a window front with the app");
+    assert.deepEqual(steals, []);
+    assert.equal(main.focused, 0);
+  });
 
   /** A main window of the panel's server, beside it, whose page is at `url`. */
   function addMain(h, { url = `${serverUrl}/`, minimized = false } = {}) {
@@ -3953,6 +4117,7 @@ describe("floating panel wiring", () => {
       isMinimized: () => minimized,
       getPosition: () => [200, 200],
       restore: () => (main.restored += 1),
+      show: () => {},
       focus: () => (main.focused += 1),
       webContents: Object.assign(new EventEmitter(), {
         id: 9 + h.api.windows.size,
@@ -3970,27 +4135,141 @@ describe("floating panel wiring", () => {
     sender: h.webContents,
     senderFrame: { url: h.webContents.getURL() },
   });
+  /**
+   * The harness window as the panel, beside a separate main window of its server that announces
+   * support, on mocked timers.
+   */
+  function preloadScenario(t, { platform = "darwin" } = {}) {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const panel = asPanelWindow(h);
+    h.api.windows.get(h.win).role = "panel";
+    h.setUrl(`${serverUrl}/compose/floating`);
+    const main = addMain(h);
+    const announceFromMain = () => {
+      const frame = { url: main.url };
+      main.webContents.mainFrame = frame;
+      h.ipc.get("omnigent:floating-composer:announce")(
+        { sender: main.webContents, senderFrame: frame },
+        1,
+      );
+    };
+    const built = () => (h.calls.windowOptions ?? []).filter((o) => o.type === "panel").length;
+    return { h, panel, main, announceFromMain, built };
+  }
+
+  it("builds the panel hidden once the app is quiet after a page can render it", (t) => {
+    const { panel, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(2999);
+    assert.equal(built(), 0);
+    t.mock.timers.tick(1);
+    assert.equal(built(), 1);
+    assert.equal(panel.visible, false, "built out of sight");
+  });
+
+  it("builds nothing ahead while the user has turned the shortcut off", (t) => {
+    const { h, announceFromMain, built } = preloadScenario(t);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ floating_composer_shortcut: { enabled: false, accelerator: chord } }),
+    );
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 0);
+  });
+
+  it("builds nothing ahead off macOS", (t) => {
+    const { announceFromMain, built } = preloadScenario(t, { platform: "linux" });
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 0);
+  });
+
+  it("an early ⇧⌘Space builds the panel itself and calls off the build ahead", (t) => {
+    const { h, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(1000);
+    h.calls.presses.get(chord)();
+    assert.equal(built(), 1);
+    // A build ahead still pending would build the panel again once this one is gone.
+    h.api.floatingComposer().close(h.win);
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 1);
+  });
+
+  it("a crashed panel built ahead isn't rebuilt until ⇧⌘Space", (t) => {
+    const { h, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 1);
+    h.api.floatingComposer().markReady(h.win);
+    h.webContents.isCrashed = () => true;
+    h.webContents.emitWith("render-process-gone", {}, { reason: "crashed" });
+    t.mock.timers.tick(10_000);
+    assert.equal(built(), 1);
+    h.calls.presses.get(chord)();
+    assert.equal(built(), 2);
+  });
+
+  it("lets a panel built ahead go 3 s after its server's latest revoke, unless it announces again", (t) => {
+    const { panel, main, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 1);
+    // A reload: the old document goes, the new one announces a second later.
+    main.webContents.emit("did-navigate");
+    t.mock.timers.tick(1000);
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(panel.destroyed, false, "the announcement called the release off");
+    // Another reload, then the page goes again before its first release was due.
+    main.webContents.emit("did-navigate");
+    t.mock.timers.tick(1000);
+    announceFromMain();
+    t.mock.timers.tick(500);
+    main.webContents.emit("did-navigate");
+    t.mock.timers.tick(2999);
+    assert.equal(panel.destroyed, false, "the wait restarts from the latest revoke");
+    t.mock.timers.tick(1);
+    assert.equal(panel.destroyed, true);
+  });
+
   const openFromPanel = async (h, routePath) => ({
     ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(fromPanel(h), routePath)),
   });
 
-  for (const [routePath, comesForward] of [
-    ["/c/abc", false],
-    ["/settings/import", true],
-  ]) {
+  for (const routePath of ["/c/abc", "/settings/import"]) {
     it(`opens ${routePath} in its server's main window, then hides the panel`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
       const h = loadNavigationHarness({ platform: "darwin" });
       t.after(h.cleanup);
       h.api.registerIpc();
+      let hides = 0;
+      h.electron.app.hide = () => (hides += 1);
+      const steals = [];
+      h.electron.app.focus = (options) => steals.push(options);
+      // Opened over another app.
       const panel = openPanel(h);
       const main = addMain(h, { minimized: true });
       assert.equal(panel.visible, true);
       assert.deepEqual(await openFromPanel(h, routePath), { ok: true });
       assert.deepEqual(main.sent, [["omnigent:open-path", routePath]]);
-      // A linked page comes forward, restored; a launched session waits behind the app in front.
-      assert.equal(main.focused, comesForward ? 1 : 0);
-      assert.equal(main.restored, comesForward ? 1 : 0);
+      // What the panel launched or links to comes forward, restored, over the app in front.
+      assert.equal(main.focused, 1);
+      assert.equal(main.restored, 1);
+      assert.equal(steals.length, 1);
+      assert.equal(steals[0].steal, true);
       assert.equal(panel.visible, false);
+      // Putting the panel away now, at once or a tick later, hides nothing.
+      h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
+      t.mock.timers.tick(0);
+      h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
+      t.mock.timers.tick(0);
+      assert.equal(hides, 0);
+      assert.equal(main.focused, 1);
     });
   }
 
@@ -4072,14 +4351,59 @@ describe("floating panel wiring", () => {
     assert.equal(panel.visible, false);
   });
 
-  it("hides the panel when its page dismisses it", (t) => {
+  for (const platform of ["darwin", "linux"]) {
+    it(`on ${platform}, the close button puts away only the panel and raises nothing`, (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const h = loadNavigationHarness({ platform });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const main = addMain(h);
+      let hides = 0;
+      h.electron.app.hide = () => (hides += 1);
+      const steals = [];
+      h.electron.app.focus = (options) => steals.push(options);
+      // Opened over another app.
+      const panel = openPanel(h);
+      h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
+      t.mock.timers.tick(0);
+      assert.equal(panel.visible, false);
+      assert.equal(panel.destroyed, false, "the draft stays");
+      assert.equal(hides, 0, "Omnigent's other windows stay as they were");
+      assert.deepEqual(steals, []);
+      assert.equal(main.focused, 0);
+    });
+  }
+
+  it("⇧⌘Space while the panel is open goes back to it, never to raising a window", (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
     h.api.registerIpc();
     const panel = openPanel(h);
-    h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
-    assert.equal(panel.visible, false);
-    assert.equal(panel.destroyed, false);
+    // The most recent main window can't open the panel now (its page hasn't announced).
+    const main = addMain(h);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    h.api.openFloatingComposerFromShortcut();
+    assert.equal(panel.visible, true);
+    assert.equal(main.focused, 0);
+    assert.deepEqual(steals, []);
+  });
+
+  it("signing in brings a main window forward, never a panel", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    let shown = 0;
+    h.win.show = () => (shown += 1);
+    h.win.focus = () => {};
+    h.api.focusAfterBrowserSignIn(h.win);
+    assert.equal(shown, 1);
+    assert.equal(steals.length, 1);
+    h.api.windows.get(h.win).role = "panel";
+    h.api.focusAfterBrowserSignIn(h.win);
+    assert.equal(shown, 1);
+    assert.equal(steals.length, 1);
   });
 
   it("closes the panel when any main window of its server lands on its sign-in page", (t) => {
@@ -7276,5 +7600,18 @@ describe("New Window keeps its source's server (src/main.js)", () => {
     h.api.buildMenu();
     h.calls.appMenu.getMenuItemById("new_window").click();
     assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
+  });
+});
+
+describe("floating panel loading", () => {
+  it("shows no connection overlay over a panel, which loads out of sight", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin", loadServer: async () => {} });
+    t.after(h.cleanup);
+    h.api.windows.get(h.win).role = "panel";
+    await h.api.loadServerUrl(h.win, "https://example.com/");
+    assert.equal(
+      (h.calls.loading ?? []).some((call) => call.action === "show"),
+      false,
+    );
   });
 });

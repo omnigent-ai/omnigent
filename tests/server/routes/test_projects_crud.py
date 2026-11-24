@@ -294,9 +294,9 @@ async def test_session_projects_unions_first_class_and_labels(
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": both["id"], "name": "Both", "icon": None},
-        {"id": empty["id"], "name": "Empty FC", "icon": None},
-        {"id": None, "name": "Label Only", "icon": None},
+        {"id": both["id"], "name": "Both", "icon": None, "muted": False},
+        {"id": empty["id"], "name": "Empty FC", "icon": None, "muted": False},
+        {"id": None, "name": "Label Only", "icon": None, "muted": False},
     ]
 
 
@@ -318,8 +318,28 @@ async def test_session_projects_surfaces_config_icon(
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": fire["id"], "name": "Fire", "icon": "🔥"},
-        {"id": plain["id"], "name": "Plain", "icon": None},
+        {"id": fire["id"], "name": "Fire", "icon": "🔥", "muted": False},
+        {"id": plain["id"], "name": "Plain", "icon": None, "muted": False},
+    ]
+
+
+async def test_session_projects_surfaces_config_muted(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Only a literal ``config.muted: true`` marks the sidebar folder muted."""
+    muted = (
+        await project_client.post("/v1/projects", json={"name": "A", "config": {"muted": True}})
+    ).json()
+    # A non-boolean value someone else wrote into the opaque config doesn't mute.
+    truthy = (
+        await project_client.post("/v1/projects", json={"name": "B", "config": {"muted": "yes"}})
+    ).json()
+
+    resp = await project_client.get("/v1/sessions/projects")
+    assert resp.status_code == 200
+    assert resp.json() == [
+        {"id": muted["id"], "name": "A", "icon": None, "muted": True},
+        {"id": truthy["id"], "name": "B", "icon": None, "muted": False},
     ]
 
 

@@ -171,7 +171,8 @@ the header menu), and each place is a separate entry point.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
   For a native target, the fork dialog also offers model, reasoning effort,
-  and permission mode pickers. A long model list from several creators (Pi)
+  and permission mode pickers. Forking onto a new sandbox lists the sandbox's
+  models as New Chat does. A long model list from several creators (Pi)
   shows creator headings; it has no search or collapsible groups.
   Closing the dialog mid-clone keeps the clone running: a toast reports it
   (with **Open** on success), and reopening the dialog shows it again.
@@ -336,6 +337,14 @@ the header menu), and each place is a separate entry point.
   Server admins configure the available targets under Settings → Admin → General →
   **Nested agent destinations**.
 
+- To move a conversation from the browser to the desktop app, open its link
+  (`/c/<id>`) in a desktop browser while the app is running and connected to
+  that server. The first time, a toast asks **Open conversations in the
+  Omnigent desktop app?**; **Open in app** opens it there and makes later links
+  move on their own. Turn it on or off under Settings → General → Conversation
+  links → **Open conversations in the desktop app**. Links to a file or to
+  Canvas stay in the browser.
+
 **Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
@@ -433,6 +442,14 @@ Choose Unmute to undo. The item appears only on servers that advertise
 Failed output from a muted automation session is also hidden from Unread;
 its failure remains visible on the automation card and in run history.
 Automation failures that never created a session keep their separate Inbox cards.
+
+**Mute a project:** in the project folder's menu (three-dot or right-click) or
+the project home's menu, choose Mute project. Every session filed in the
+project, including ones added later and workers its sessions start, then
+behaves as muted above, and the folder header shows a muted bell. A member
+session's own menu reads Muted with project; choose Unmute project to undo.
+Sessions outside the project, such as one coordinating it, still notify.
+The item appears only on servers that advertise `project_mute` in `/v1/info`.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens. Delete project
@@ -726,7 +743,10 @@ after stopping; this relaunches the parent and both use one runner. Sending to
 an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
-chat with its tab's close button; the parent and sibling chats keep running.
+chat with its tab's close button or its tab menu's Close; the parent and sibling
+chats keep running. Close other tabs and Close all tabs, in the tab menu or the
+rail's panel picker (⌄), stop every side chat they close, while sub-agent tabs
+they close are only hidden.
 On another device, open the same parent: saved side chats appear in the existing
 Workspace tab strip or mobile Side chats drawer. Discovery fetches up to 20 chats
 without changing the active panel or tab. Tabs closed on this device stay closed
@@ -744,6 +764,13 @@ screen** link opens the sub-agent's own page. Claude Code sub-agents and closed
 sub-agents other than Codex side chats are read-only there too. Closing a
 sub-agent tab only hides it; the sub-agent keeps running. Covered by
 `tests/e2e_ui/agents/test_subagent_side_panel.py`.
+In the desktop app, Settings → General → Desktop app → **Widen window when
+opening the right sidebar** (off by default) widens the window by the sidebar's
+width when the session's Workspace panel opens, so the chat keeps its width, and
+shrinks it back on close. It moves left or caps at the screen edge, leaves
+maximized and full-screen windows alone (closing there shrinks once restored),
+and does not apply to the grid's shared panel. Covered by
+`web/electron/e2e/desktop_right_sidebar_widens_window.e2e.js`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
@@ -979,6 +1006,11 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/fork_session/test_fork_switch_agent.py::test_fork_switch_agent_carries_history`.
   Its SDK-to-SDK target is a built-in agent that only the test's own server
   loads; run it with plain `uv run pytest` so that target is available.
+- **`fork`, models on a new sandbox:**
+  `tests/e2e_ui/fork_session/test_fork_sandbox_gateway_models.py::test_fork_onto_new_sandbox_lists_its_gateway_models`
+  forks a hostless Claude Code session from a message onto a new sandbox whose
+  gateway lists the models, keeping Claude Code and switching to Codex. The
+  server and its model discovery are real; nothing is provisioned.
 - **`fork`, sidebar row while the session list lags:**
   `tests/e2e_ui/fork_session/test_fork_appears_in_sidebar.py::test_fork_row_while_list_lags_and_push_misses_fork`
   hides the fork from list reads and pushes; the row must appear after Clone and

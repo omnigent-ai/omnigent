@@ -56,4 +56,5 @@ change their layout and type syntax, plus one renamed local variable.
   drawn outside a tree, such as on a workspace tab.
 - Middle truncation of long names, splitting before the extension as
   upstream's `MiddleTruncate` does, with each part's ellipsis drawn by the
-  browser instead of upstream's markers.
+  browser instead of upstream's markers. `splitNameForTruncation` is exported
+  so a name outside a tree can split the same way.

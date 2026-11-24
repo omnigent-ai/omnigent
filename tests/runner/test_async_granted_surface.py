@@ -222,6 +222,24 @@ async def test_granted_tool_names_cached_per_spec_instance() -> None:
     assert "sys_os_shell" not in native
 
 
+async def test_granted_tool_names_follow_a_routing_flip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cached surface tracks the routing answer without anyone clearing it.
+
+    ``sys_advise_models`` is granted only while routing answers, so a cached
+    surface from before a flip would refuse the advisor call it now advertises.
+    """
+    from omnigent.runtime import _globals, set_remote_routing_available
+    from omnigent.runtime.caps import RuntimeCaps
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps())
+    spec = AgentSpec(spec_version=1, spawn=True)
+    assert "sys_advise_models" not in tool_dispatch._granted_tool_names(spec)
+    set_remote_routing_available(True)
+    assert "sys_advise_models" in tool_dispatch._granted_tool_names(spec)
+    set_remote_routing_available(False)
+    assert "sys_advise_models" not in tool_dispatch._granted_tool_names(spec)
+
+
 async def test_native_override_on_os_env_spec_refuses_sys_os_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

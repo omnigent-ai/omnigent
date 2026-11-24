@@ -244,15 +244,26 @@ def failure(output: GitOutput, command: str) -> GitError:
     return GitError(GitProblem.FAILED, summary or f"git {command} exited with {output.returncode}")
 
 
-async def _read_capped(stream: asyncio.StreamReader, limit: int) -> tuple[bytes, bool]:
-    """Read to the end, or until more than ``limit`` bytes arrived."""
+async def _read_capped(
+    stream: asyncio.StreamReader, limit: int, sink: Callable[[bytes], None] | None = None
+) -> tuple[bytes, bool]:
+    """Read to the end, or until more than ``limit`` bytes arrived.
+
+    :param sink: Takes each chunk as it arrives, instead of it being kept.
+    """
     kept = bytearray()
+    received = 0
     while chunk := await stream.read(_READ_CHUNK):
-        room = limit - len(kept)
-        if len(chunk) > room:
-            kept += chunk[:room]
+        overflowed = len(chunk) > limit - received
+        if overflowed:
+            chunk = chunk[: limit - received]
+        received += len(chunk)
+        if sink is None:
+            kept += chunk
+        else:
+            sink(chunk)
+        if overflowed:
             return bytes(kept), True
-        kept += chunk
     return bytes(kept), False
 
 
@@ -470,6 +481,7 @@ async def _run(
     stdin: bytes | None = None,
     stdout_bytes: int = SMALL_OUTPUT_BYTES,
     allow_partial: bool = False,
+    stdout_sink: Callable[[bytes], None] | None = None,
 ) -> GitOutput:
     """Start one Git child once ``slots`` allow it, and clean up its process group."""
     if deadline.expired():
@@ -496,7 +508,7 @@ async def _run(
         draining = asyncio.ensure_future(_drain(process.stderr))
         try:
             async with asyncio.timeout(deadline.remaining()):
-                stdout, overflowed = await _read_capped(process.stdout, stdout_bytes)
+                stdout, overflowed = await _read_capped(process.stdout, stdout_bytes, stdout_sink)
                 if overflowed and not allow_partial:
                     raise GitError(GitProblem.OUTPUT_TOO_LARGE)
                 if overflowed:
@@ -697,11 +709,14 @@ class GitRepository:
         stdin: bytes | None = None,
         stdout_bytes: int = SMALL_OUTPUT_BYTES,
         allow_partial: bool = False,
+        stdout_sink: Callable[[bytes], None] | None = None,
     ) -> GitOutput:
         """Run a command on this repository and return its output whatever its exit status.
 
         :param allow_partial: Keep the output up to the cap, with ``overflowed``
             set, instead of failing with OUTPUT_TOO_LARGE.
+        :param stdout_sink: Takes the output in chunks as it arrives, up to the cap,
+            so a large listing is never held whole; ``stdout`` is then empty.
         """
         assert self._slots is not None
         subcommand, *rest = arguments
@@ -721,4 +736,5 @@ class GitRepository:
             stdin=stdin,
             stdout_bytes=stdout_bytes,
             allow_partial=allow_partial,
+            stdout_sink=stdout_sink,
         )

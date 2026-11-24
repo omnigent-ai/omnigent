@@ -653,6 +653,32 @@ describe("SettingsPage", () => {
     expect(getGlobalShortcut).toHaveBeenCalledWith("floatingComposer");
   });
 
+  it("offers the right sidebar window setting in Desktop app only on shells that have it", async () => {
+    const name = { name: "Widen window when opening the right sidebar" };
+    const newAgent = { name: "Open New Agent from anywhere" };
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    const rightSidebarWindow = {
+      getWidensWindow: vi.fn().mockResolvedValue(false),
+      setWidensWindow: vi.fn().mockResolvedValue(true),
+      opened: vi.fn(),
+      closed: vi.fn(),
+    };
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      rightSidebarWindow,
+    };
+    // A shell without global shortcuts still gets the Desktop app group for this setting.
+    renderPage("/settings/general");
+    const group = screen.getByTestId("settings-group-desktop-app");
+    await waitFor(() => expect(within(group).getByRole("switch", name)).toBeEnabled());
+    expect(within(group).queryByRole("switch", newAgent)).toBeNull();
+  });
+
   it("offers the kanban board switch under Composer only when the server has the board", () => {
     renderPage("/settings/general");
     expect(screen.queryByTestId("settings-group-projects")).toBeNull();

@@ -330,6 +330,9 @@ class ServerInfoResponse(BaseModel):
     # PATCH stores the ``omnigent.muted`` label per viewer; older servers would
     # store it as an ordinary label every collaborator sees.
     session_mute: bool = True
+    # GET /v1/sessions/projects reports ``config.muted``; older servers drop it,
+    # so a saved project mute would never read back.
+    project_mute: bool = True
     # GET /v1/sessions applies ``include_archived`` to ``visibility=mine`` and
     # ``shared``; older servers drop archived rows there.
     session_list_scoped_archives: bool = True
@@ -449,6 +452,9 @@ class ServerInfoResponse(BaseModel):
     # Every other agent-tool organizing write checks it too: session title, pin
     # and archive, and project rename, icon and delete.
     session_organize_source_checks: bool = False
+    # Sub-agent archives check runner ownership and route through inherited hosts;
+    # runner tools require this capability before archiving a sub-agent.
+    session_archive_runner_checks: bool = False
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
@@ -4183,6 +4189,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_mute": True,
+                "project_mute": True,
                 "session_list_scoped_archives": True,
                 "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
@@ -4227,6 +4234,7 @@ def create_app(
                 "session_timers": bool(app.state.session_timers_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
+                "session_archive_runner_checks": True,
                 "sibling_other_project_standalone": True,
                 "memory": app.state.memory_available(),
                 "automations_enabled": automations_enabled,
@@ -4505,6 +4513,7 @@ def create_app(
             conversation_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            scheduled_task_store=scheduled_task_store,
         ),
         prefix="/v1",
         tags=["workflows"],

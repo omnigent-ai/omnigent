@@ -79,7 +79,8 @@ from tests.server.routes.test_shell_permission_gate import _StubAgentStore, _Stu
 
 pytestmark = pytest.mark.asyncio
 
-_WITH_RG = {"SearchText"} if shutil.which("rg") else set()
+_RG_METHODS = {"SearchText", "text_search_priority"}
+_WITH_RG = _RG_METHODS if shutil.which("rg") else set()
 PROTOCOLS = pytest.mark.parametrize("protocol", [ProtocolType.CONNECT, ProtocolType.GRPC_WEB])
 _SESSION = "conv_ws"
 _SERVER_BASE = f"http://server/v1/sessions/{_SESSION}/workspace"
@@ -622,14 +623,17 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
     # SearchText is listed exactly where ripgrep is installed.
-    assert set(response.capabilities) ^ ({"SearchText"} - _WITH_RG) == {
+    assert set(response.capabilities) ^ (_RG_METHODS - _WITH_RG) == {
         "ListDirectory",
         "ReadFile",
         "StatPath",
         "ReadLinkText",
         "SearchFiles",
         "search_files.substring",
+        "search_files.fuzzy",
+        "search_files.browse",
         "SearchText",
+        "text_search_priority",
         "ResolveWorkingCopyBase",
         "revision_comparison",
         "ListWorkingCopyChanges",
@@ -653,10 +657,23 @@ async def test_capabilities_leave_out_methods_whose_tool_is_missing(
     assert set(response.capabilities) == {"ListDirectory", "ReadFile", "StatPath", "ReadLinkText"}
 
 
+async def test_capabilities_leave_out_fuzzy_search_where_paths_cant_be_ranked(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.host.workspace_fuzzy._frizbee", lambda: None)
+    client = client_for(tmp_path)
+
+    response = await client.get_capabilities(GetCapabilitiesRequest())
+
+    assert "search_files.substring" in response.capabilities
+    assert not {"search_files.fuzzy", "search_files.browse"} & set(response.capabilities)
+
+
 async def test_a_search_mode_not_served_answers_unimplemented(
-    tmp_path: Path, client_for: ClientFor
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A client that skips GetCapabilities still gets a code it can fall back on."""
+    monkeypatch.setattr("omnigent.host.workspace_fuzzy._frizbee", lambda: None)
     client = client_for(tmp_path)
 
     with pytest.raises(ConnectError) as fuzzy:

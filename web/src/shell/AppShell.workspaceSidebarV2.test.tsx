@@ -15,7 +15,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useContext } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
@@ -190,6 +190,7 @@ vi.mock("./TerminalsPanel", () => ({ TerminalsPanel: () => null }));
 import { useSessionAgent } from "@/hooks/useAgents";
 import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
+import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
 import { AppShell } from "./AppShell";
 import { FileViewerContext, useOpenGithubTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
@@ -456,6 +457,35 @@ describe("workspace_sidebar_v2", () => {
     );
     expect(await screen.findByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
+
+  it.each([
+    ["keeps it collapsed when the session opens", "session-open", "Expand right panel"],
+    ["reveals it for a click", "click", "Collapse right panel"],
+  ] as const)(
+    "shows the Tasks page in a collapsed sidebar, and %s",
+    async (_, requestedBy, toggle) => {
+      writeWorkspacePanelDefault("collapsed");
+      const initialChatState = useChatStore.getState();
+      useChatStore.setState({
+        todos: [{ content: "Only item", status: "pending", activeForm: "" }],
+      });
+      onTestFinished(() => useChatStore.setState(initialChatState));
+      setViewport(DESKTOP);
+      renderShell(withFlag(true));
+      expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+
+      act(() =>
+        requestedBy === "click"
+          ? openTasksTab("conv_ws")
+          : showTasksTabBesideChat("conv_ws", requestedBy),
+      );
+
+      await waitFor(() =>
+        expect(workspaceTabsSessions.openWorkspacePage).toHaveBeenCalledWith("conv_ws", "tasks"),
+      );
+      expect(await screen.findByRole("button", { name: toggle })).toBeInTheDocument();
+    },
+  );
 
   it("shows the tabs in the Workspace drawer in a narrow desktop window", async () => {
     setViewport(NARROW_DESKTOP);
