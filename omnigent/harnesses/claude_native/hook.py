@@ -1064,14 +1064,15 @@ def _permission_hook_reauth(
 
     The hook cannot mint a token itself (the runner keeps its credential from
     child processes), so a prompt parked past its token's lifetime takes the
-    headers the runner last wrote to ``permission_hook.json``. Only when that
-    snapshot has not changed does it fall back to minting one.
+    headers the runner last wrote to ``permission_hook.json``. It mints instead
+    when the hook did not start from that snapshot, the snapshot is for another
+    server, or it has not changed.
 
     :param bridge_dir: Bridge directory holding ``permission_hook.json``.
     :param server_url: Omnigent server URL the hook POSTs to.
     :param headers: Headers the hook started with.
     :param started_from: The snapshot those headers came from, or ``None`` when
-        they did not come from ``permission_hook.json``.
+        they did not come from ``permission_hook.json``; ``None`` always mints.
     :returns: A reauth callable for :func:`_post_hook_with_reattach`.
     """
     from omnigent.native.native_policy_hook import policy_hook_reauth
@@ -1080,8 +1081,16 @@ def _permission_hook_reauth(
     seen = [started_from]
 
     def reauth() -> dict[str, str] | None:
-        snapshot = read_permission_hook_config(bridge_dir).get("ap_auth_headers")
-        if isinstance(snapshot, dict) and snapshot and snapshot != seen[0]:
+        if started_from is None:
+            return mint()
+        config = read_permission_hook_config(bridge_dir)
+        snapshot = config.get("ap_auth_headers")
+        if (
+            config.get("ap_server_url") == server_url
+            and isinstance(snapshot, dict)
+            and snapshot
+            and snapshot != seen[0]
+        ):
             seen[0] = snapshot
             fresh = {str(key): str(value) for key, value in snapshot.items()}
             _merge_identity_headers(fresh, server_url)

@@ -1394,8 +1394,8 @@ def test_parked_permission_prompt_takes_the_runner_refreshed_token(
     """
     A prompt parked past its token's lifetime re-parks with the runner's new token.
 
-    The hook cannot mint a token of its own, so before the fix it kept sending
-    the expired one, the server dropped the card and the answer never arrived.
+    The hook cannot mint a token of its own, and resending the expired bearer
+    would lose the approval answer.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
@@ -1510,26 +1510,38 @@ def test_parked_permission_prompt_without_a_runner_refresh_mints_its_own_token(
 
 
 @pytest.mark.parametrize(
-    "started_from",
-    [None, {"Authorization": "Bearer old"}],
-    ids=["headers-from-argv", "snapshot-rewritten-at-startup"],
+    ("started_from", "server_url", "renewed_with"),
+    [
+        ({"Authorization": "Bearer old"}, "http://127.0.0.1:8787", "Bearer xyz"),
+        (None, "http://127.0.0.1:8787", "Bearer minted"),
+        ({"Authorization": "Bearer old"}, "https://other.example.com", "Bearer minted"),
+    ],
+    ids=["snapshot-rewritten-at-startup", "headers-from-argv", "snapshot-for-another-server"],
 )
-def test_permission_hook_reauth_takes_a_snapshot_the_hook_never_sent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, started_from: dict[str, str] | None
+def test_permission_hook_reauth_takes_only_a_matching_unsent_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    started_from: dict[str, str] | None,
+    server_url: str,
+    renewed_with: str,
 ) -> None:
-    """A runner token the hook hasn't used yet is taken on the first rejection, then minting."""
+    """The runner's snapshot renews only a hook that started from it, for its own server."""
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = _prepare_permission_bridge(tmp_path, "conv_unsent")
-    monkeypatch.setattr(native_policy_hook, "policy_hook_reauth", lambda *_args: lambda: None)
+    monkeypatch.setattr(
+        native_policy_hook,
+        "policy_hook_reauth",
+        lambda *_args: lambda: {"Authorization": "Bearer minted"},
+    )
 
     reauth = claude_native_hook._permission_hook_reauth(
-        bridge_dir, "http://127.0.0.1:8787", {"Authorization": "Bearer old"}, started_from
+        bridge_dir, server_url, {"Authorization": "Bearer old"}, started_from
     )
 
     renewed = reauth()
-    assert renewed is not None and renewed["Authorization"] == "Bearer xyz"
-    assert reauth() is None, "an unchanged snapshot falls back to minting"
+    assert renewed is not None and renewed["Authorization"] == renewed_with
+    assert reauth() == {"Authorization": "Bearer minted"}, "an unchanged snapshot mints"
 
 
 def _assert_chat_fallback(stdout: str) -> None:
