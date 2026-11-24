@@ -217,6 +217,7 @@ import {
 } from "@/hooks/useConversations";
 import { fetchConversationById, useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { ProjectMembersNotMovedError } from "@/lib/projectsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -1993,6 +1994,11 @@ function ProjectFolder({
       await renameProject.mutateAsync({ id: projectId, oldName: name, newName });
       onProjectRenamed?.(name, newName);
     } catch (error) {
+      if (error instanceof ProjectMembersNotMovedError) {
+        onProjectRenamed?.(name, newName);
+        showToast(error.message);
+        return;
+      }
       setPendingName(null);
       const message = error instanceof Error ? error.message : String(error);
       showToast(`Couldn't rename the project: ${message}`);
@@ -7596,10 +7602,13 @@ export function useProjectFolderMenu(
                     config: next,
                   });
                 }
-              } catch {
+              } catch (error) {
                 // Errors surface via the mutation state below. A rename that
-                // lands before a failed icon write is already persisted; only
-                // the icon needs retrying.
+                // lands before a failed icon write or member move is already
+                // persisted; only the rest needs retrying.
+                if (error instanceof ProjectMembersNotMovedError) {
+                  onRenamed?.(projectName, newName);
+                }
                 return;
               }
               setRenameOpen(false);

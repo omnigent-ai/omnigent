@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
+import { ProjectMembersNotMovedError } from "@/lib/projectsApi";
 import * as identity from "@/lib/identity";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
@@ -765,7 +766,7 @@ describe("useRenameProject", () => {
     const invalidate = vi.spyOn(queryClient, "invalidateQueries");
     await expect(
       result.current.mutateAsync({ id: "proj_1", oldName: "old", newName: "Renamed" }),
-    ).rejects.toThrow(/500/);
+    ).rejects.toThrow(ProjectMembersNotMovedError);
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });

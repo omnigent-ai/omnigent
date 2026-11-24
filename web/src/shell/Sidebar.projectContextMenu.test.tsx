@@ -75,8 +75,14 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { clearSessionMuteState, MUTED_LABEL_KEY, setMutedProjects } from "@/lib/sessionMute";
+import { ProjectMembersNotMovedError } from "@/lib/projectsApi";
 
 const useConversationsMock = vi.mocked(useConversations);
+
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location">{location.pathname + location.search}</div>;
+}
 
 const FILED_CONVERSATION: Conversation = {
   id: "conv_1",
@@ -575,10 +581,6 @@ describe("project folder inline rename", () => {
   });
 
   it("moves an open project home to the new name and keeps its query", async () => {
-    function LocationProbe() {
-      const location = useLocation();
-      return <div data-testid="location">{location.pathname + location.search}</div>;
-    }
     renderSidebar({
       route: `/projects/${encodeURIComponent(PROJECT_NAME)}?session=conv_1`,
       features: { project_kanban: true },
@@ -595,6 +597,47 @@ describe("project folder inline rename", () => {
         `${projectHomePath("Sprint 43")}?session=conv_1`,
       ),
     );
+  });
+
+  it.each([
+    [
+      "inline",
+      () => {
+        fireEvent.doubleClick(folderHeader());
+        fireEvent.change(inlineInput(), { target: { value: "Sprint 43" } });
+        fireEvent.keyDown(inlineInput(), { key: "Enter" });
+      },
+    ],
+    [
+      "dialog",
+      () => {
+        fireEvent.contextMenu(folderHeader());
+        fireEvent.click(screen.getByTestId("rename-project"));
+        fireEvent.change(screen.getByDisplayValue(PROJECT_NAME), {
+          target: { value: "Sprint 43" },
+        });
+        fireEvent.click(screen.getByTestId("rename-project-confirm"));
+      },
+    ],
+  ])("follows the %s rename when some sessions weren't moved", async (path, rename) => {
+    const error = new ProjectMembersNotMovedError("500 Internal Server Error");
+    mocks.renameProject.mutateAsync.mockRejectedValueOnce(error);
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([PROJECT_NAME]));
+    renderSidebar({
+      route: `/projects/${encodeURIComponent(PROJECT_NAME)}`,
+      features: { project_kanban: true },
+      children: <LocationProbe />,
+    });
+
+    rename();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("location")).toHaveTextContent(projectHomePath("Sprint 43")),
+    );
+    expect(JSON.parse(localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY)!)).toEqual([
+      "Sprint 43",
+    ]);
+    if (path === "inline") expect(mocks.showToast).toHaveBeenCalledWith(error.message);
   });
 
   it("cancels on Escape without renaming", () => {
