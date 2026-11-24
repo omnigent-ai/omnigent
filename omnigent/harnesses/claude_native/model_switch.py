@@ -142,35 +142,34 @@ _MIN_PICKER_VERSION = (2, 1, 323)
 _IMMEDIATE_PICKER_TIMEOUT_S = 2.0
 
 
-def _control_tail_matches(pane: str, title_start: int, footer_end: int) -> bool:
-    tail = pane[footer_end:]
-    if not tail.strip():
-        return True
+def _active_control_region(pane: str, title_start: int, title_end: int) -> str | None:
     from omnigent.harnesses.claude_native import bridge
 
     # Active turns keep a framed control panel above the empty composer.
     before_title = pane[:title_start].rstrip().splitlines()
-    lines = tail.splitlines()
+    region = pane[title_end:]
+    lines = region.splitlines(keepends=True)
     rules = bridge._composer_frame_rule_indices(lines)
-    return bool(
+    if (
         before_title
         and bridge._is_box_rule(before_title[-1])
         and len(rules) == 2
-        and not any(line.strip() for line in lines[: rules[0]])
-        and _draft(tail) == ""
-        and bridge._permission_mode_from_pane(tail) is not None
-    )
+        and _draft(region) == ""
+        and bridge._permission_mode_from_pane(region) is not None
+    ):
+        return "".join(lines[: rules[0]])
+    return None
 
 
 def _picker(pane: str) -> _Picker | None:
     titles = list(_PICKER_TITLE.finditer(pane))
     if not titles:
         return None
-    region = pane[titles[-1].end() :]
+    region = _active_control_region(pane, titles[-1].start(), titles[-1].end())
+    if region is None:
+        region = pane[titles[-1].end() :]
     footer = _PICKER_FOOTER.search(region)
-    if footer is None or not _control_tail_matches(
-        pane, titles[-1].start(), titles[-1].end() + footer.end()
-    ):
+    if footer is None or region[footer.end() :].strip():
         return None
     rows: list[_PickerRow] = []
     for line in region[: footer.start()].splitlines():
@@ -199,11 +198,11 @@ def _status(pane: str) -> dict[str, str] | None:
     tabs = list(_STATUS_TABS.finditer(pane))
     if not tabs:
         return None
-    region = pane[tabs[-1].end() :]
+    region = _active_control_region(pane, tabs[-1].start(), tabs[-1].end())
+    if region is None:
+        region = pane[tabs[-1].end() :]
     footer = _STATUS_ESCAPE.search(region)
-    if footer is None or not _control_tail_matches(
-        pane, tabs[-1].start(), tabs[-1].end() + footer.end()
-    ):
+    if footer is None or region[footer.end() :].strip():
         return None
     fields: dict[str, str] = {}
     for line in region[: footer.start()].splitlines():
@@ -264,7 +263,10 @@ def _cache_cost_confirmation(pane: str, label: str, *, yes_selected: bool = True
         if yes_selected
         else f"1. Yes, switch to {label} ❯ 2. No, go back"
     )
-    return " ".join(pane[titles[0].end() :].split()) == (
+    region = _active_control_region(pane, titles[0].start(), titles[0].end())
+    if region is None:
+        region = pane[titles[0].end() :]
+    return " ".join(region.split()) == (
         "Your next response will be slower and use more tokens "
         "This conversation is cached for the current model. "
         f"Switching to {label} means the full history gets re-read. "
@@ -278,6 +280,12 @@ def _model_control_surface(pane: str) -> str | None:
         return "the model picker"
     if _status(pane) is not None:
         return "the status view"
+    titles = list(_CACHE_COST_TITLE.finditer(pane))
+    if (
+        len(titles) == 1
+        and _active_control_region(pane, titles[0].start(), titles[0].end()) is not None
+    ):
+        return "a model-switch confirmation"
     choice = re.search(r"(?m)^[ \t]*(❯[ \t]+)?1\. Yes, switch to (.+?)[ \t]*$", pane)
     if choice is not None and _cache_cost_confirmation(
         pane, choice[2], yes_selected=choice[1] is not None
@@ -704,7 +712,7 @@ class SessionOnlyModelSwitch:
 
     def finish_commit(self) -> None:
         def settled(pane: str) -> bool:
-            if _draft(pane) == "" and _picker(pane) is None:
+            if _draft(pane) == "" and _model_control_surface(pane) is None:
                 return True
             label = self.choice.confirmation_label
             picker = self.owned_picker

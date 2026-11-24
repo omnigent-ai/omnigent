@@ -34,6 +34,7 @@ from tests._helpers.host import isolated_host
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests.e2e.conftest import get_mock_message_requests
+from tests.e2e.routing._helpers import claude_settings_snapshot, claude_user_settings_path
 from tests.e2e_ui.conftest import (
     configure_mock_llm,
     fetch_with_retry,
@@ -1325,6 +1326,10 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     assert all(catalog.get(alias) == model for alias, model in _PINNED_CLAUDE_MODELS.items()), (
         f"The native catalog did not preserve its configured pins: {catalog!r}"
     )
+    saved_settings_path = claude_user_settings_path(
+        tmp_path / "workspace", {"CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config")}
+    )
+    saved_settings = claude_settings_snapshot(saved_settings_path)
     reset_mock_llm(mock_llm_server_url)
 
     # The second Opus pick keeps the same resolved model; the following Sonnet
@@ -1380,6 +1385,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             mock_llm_server_url, marker, model, native_session=native_session, user_text=user_text
         )
         expect(page.get_by_test_id("error-headline")).to_have_count(0)
+        assert claude_settings_snapshot(saved_settings_path) == saved_settings
 
     _open_terminal_view(page)
     _wait_terminal_connected(page)
@@ -1459,6 +1465,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             preserved = bridge._composer_box(bridge._capture_pane(advert["socket_path"], target))
             assert preserved is not None and preserved.framed
             assert preserved.rows == box.rows
+            assert claude_settings_snapshot(saved_settings_path) == saved_settings
             assert all(
                 marker not in json.dumps(request)
                 for request in get_mock_message_requests(mock_llm_server_url)
@@ -1542,6 +1549,9 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
                         ),
                         "status": response.status_code,
                         "provider_still_held": pending,
+                        "saved_settings_unchanged": (
+                            claude_settings_snapshot(saved_settings_path) == saved_settings
+                        ),
                         "terminal": bridge._capture_pane(advert["socket_path"], target),
                     },
                     indent=2,
@@ -1549,6 +1559,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             )
             assert response.status_code == 200, response.text
             assert pending, "The model control must complete before releasing the active turn"
+            assert claude_settings_snapshot(saved_settings_path) == saved_settings
             poll_until(
                 lambda: (
                     _live_claude_snapshot(base_url, session_id).get("llm_model")
@@ -1607,6 +1618,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     _assert_mock_claude_turn(
         mock_llm_server_url, marker, model, native_session=native_session, user_text=user_text
     )
+    assert claude_settings_snapshot(saved_settings_path) == saved_settings
 
 
 @pytest.mark.nightly

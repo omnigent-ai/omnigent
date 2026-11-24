@@ -15220,6 +15220,7 @@ def test_model_command_confirms_cache_cost_at_most_once(
         ),
     ],
 )
+@pytest.mark.parametrize("busy", [False, True], ids=["idle", "active-turn"])
 def test_model_command_confirms_versioned_cache_cost_for_managed_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -15228,8 +15229,10 @@ def test_model_command_confirms_versioned_cache_cost_for_managed_row(
     picker_value: str,
     resolved_model: str,
     disabled_collision: bool,
+    busy: bool,
 ) -> None:
     composer, bridge_dir = bridge_factory(tmp_path, monkeypatch)
+    composer.busy = busy
     if disabled_collision:
         config_path = bridge_dir / "bridge.json"
         config = json.loads(config_path.read_text())
@@ -15319,8 +15322,9 @@ def test_cache_cost_model_label_requires_an_exact_versioned_claude_id(
         ("private", "unselected-label"),
     ],
 )
+@pytest.mark.parametrize("busy", [False, True], ids=["idle", "active-turn"])
 def test_model_command_does_not_confirm_an_unproven_cache_cost_target(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str, guard: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str, guard: str, busy: bool
 ) -> None:
     if scenario == "dated":
         pane = _CAPTURED_DATED_MODEL_CONFIRMATION
@@ -15337,6 +15341,7 @@ def test_model_command_does_not_confirm_an_unproven_cache_cost_target(
     else:
         composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
         model = "system.ai.claude-sonnet-5-5"
+    composer.busy = busy
     config_path = bridge_dir / "bridge.json"
     config = json.loads(config_path.read_text())
     options = config["model_picker_options"]
@@ -15889,16 +15894,24 @@ def test_model_control_parsers_refuse_partial_duplicate_and_closed_overlays(
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("layout", ["standalone", "active-turn"])
 def test_model_control_parser_recognizes_the_captured_cache_cost_confirmation(
     wrapped: bool,
+    layout: str,
 ) -> None:
-    pane = _cache_cost_confirmation_pane("Sonnet 5.5")
+    label = "Sonnet 5.5"
+    pane = _cache_cost_confirmation_pane(label)
+    if layout == "active-turn":
+        pane = json.loads(
+            (Path(__file__).parent / "fixtures" / "claude-status-active-turn.json").read_text()
+        )["cache_cost"]["pane"]
+        label = "Opus 4.8"
     if wrapped:
-        pane = pane.replace("Switching to Sonnet", "Switching to\n   Sonnet").replace(
+        pane = pane.replace(f"Switching to {label}", f"Switching to\n   {label}").replace(
             "full history gets re-read.", "full history\n   gets re-read."
         )
 
-    assert claude_model_switch._cache_cost_confirmation(pane, "Sonnet 5.5")
+    assert claude_model_switch._cache_cost_confirmation(pane, label)
     assert not claude_model_switch._cache_cost_confirmation(pane, "Choice 1")
 
 
@@ -15925,10 +15938,13 @@ def test_model_control_parser_recognizes_the_captured_cache_cost_confirmation(
         ),
     ],
 )
+@pytest.mark.parametrize("busy", [False, True], ids=["standalone", "active-turn"])
 def test_model_control_parser_refuses_unowned_or_incomplete_cache_cost_confirmations(
-    old: str, new: str
+    old: str, new: str, busy: bool
 ) -> None:
-    pane = _cache_cost_confirmation_pane("Sonnet 5.5").replace(old, new)
+    composer = _SessionModelComposer(cache_cost_label="Sonnet 5.5", busy=busy)
+    composer.overlay = "cache-cost"
+    pane = composer._capture_pane("ignored", "ignored").replace(old, new)
 
     assert not claude_model_switch._cache_cost_confirmation(pane, "Sonnet 5.5")
 

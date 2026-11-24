@@ -322,8 +322,8 @@ class _SessionModelComposer(_EditableComposer):
             self.overlay = "cache-cost"
         if self.overlay == "cache-cost":
             assert self.cache_cost_label is not None
-            return _cache_cost_confirmation_pane(self.cache_cost_label)
-        if self.overlay == "picker":
+            pane = _cache_cost_confirmation_pane(self.cache_cost_label)
+        elif self.overlay == "picker":
             rows = []
             for index, model in enumerate(self.options):
                 current = (
