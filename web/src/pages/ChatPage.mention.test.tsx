@@ -1612,6 +1612,11 @@ describe("Composer pasted chips", () => {
       { text: "look @a.png", names: ["a.png"] },
     ],
     [
+      "a chip that crossed a draft boundary and a chip pasted later keep distinct names",
+      [{ type: "look " }, { paste: "a.png" }, { remount: true }, { paste: "a.png" }],
+      { text: "look @a.png @a (2).png", names: ["a.png", "a (2).png"] },
+    ],
+    [
       "a name a chip left as a tray file is kept when a later pick repeats it",
       [{ type: "look " }, { paste: "a.png" }, { remount: true }, { pick: "a.png" }],
       { text: "look @a.png", names: ["a.png", "a (2).png"] },

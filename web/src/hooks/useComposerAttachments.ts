@@ -167,9 +167,10 @@ export function useComposerAttachments({
     setFiles(restored);
   }, []);
 
-  // Adds files a composer's chips leave behind, as they are: they were validated when pasted.
+  // Adds files a composer's chips leave behind, as they are: they were validated when pasted. A File
+  // the tray already holds is kept once, so a restored draft and a reset can both report it.
   const appendFiles = useCallback((demoted: File[]) => {
-    setFiles((prev) => [...prev, ...demoted]);
+    setFiles((prev) => [...prev, ...demoted.filter((file) => !prev.includes(file))]);
   }, []);
 
   const onPaste = useCallback(

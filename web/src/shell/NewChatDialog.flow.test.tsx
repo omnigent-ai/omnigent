@@ -2280,6 +2280,38 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("keeps one file per pasted chip when creation fails with the launcher still mounted", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    // No temporary conversation: the failure returns the draft to the launcher that is still mounted.
+    beginLocalConversationMock.mockReturnValue(null);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      json: async () => ({ detail: "host unavailable" }),
+    } as unknown as Response);
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getAllByAltText("shot.png").length).toBeGreaterThan(0));
+    // The restored draft keeps the typed @shot.png text and one tray file for the chip.
+    expect(composerTargetOf(screen.getByTestId("new-chat-landing-input"))!.value.trim()).toBe(
+      "@shot.png",
+    );
+    expect(screen.getAllByAltText("shot.png")).toHaveLength(1);
+  });
+
   it("carries a pasted chip's file into a new session from an unavailable sibling", async () => {
     resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
     onTestFinished(() => resetCodeMirrorComposerLoadForTests());
