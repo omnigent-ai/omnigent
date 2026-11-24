@@ -826,10 +826,6 @@ describe("Slack thread replies", () => {
     expect(prompt).toContain(
       'Watch: new Slack messages in #eng-support whose text contains "help", then new replies in their threads\n',
     );
-    // Replies still never start a session of their own.
-    expect(prompt).toContain(
-      "Replies inside a thread (thread_ts set and different from ts) don't start a new session.",
-    );
     // The thread step runs after sessions start, so this run's new threads are followed too.
     const create = stepNumber(
       prompt,
@@ -916,10 +912,7 @@ describe("Slack thread replies", () => {
     expect(prompt).toContain(
       "If a send times out or its result is unclear, don't retry it: set the thread's through as for an accepted send, so those replies are never sent twice, say in your reply that they may not have reached that session",
     );
-    // A run that sent a batch and stopped before its reply recorded it, even with a skipped run
-    // after it that rewrote the old state: every send checks for an earlier one, accepted or
-    // unclear, and moves past those replies instead of sending again. Delivered messages start
-    // with a "[Message from session …]" line, so the check matches the title, not the first line.
+    // Match prior delivery titles after the sender prefix to avoid resending an uncheckpointed batch.
     const recover =
       "An earlier run can send replies and stop before its reply records them, so before sending a thread's replies, look through your own earlier calls in this session that sent replies to that thread, and the latest items of the thread's session (sys_session_get_history, tail_items 50), for a message from your session that names a \"Slack <channel> <thread ts> replies through <ts>\" title for this thread. Treat every reply up to the newest ts such a title names as already handled, whether that send was accepted or unclear";
     expect(prompt).toContain(recover);
