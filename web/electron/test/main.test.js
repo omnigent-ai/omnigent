@@ -903,6 +903,7 @@ describe("Arca extend IPC", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,
+        trustedRemoteLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -5820,6 +5821,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,
+        trustedRemoteLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
