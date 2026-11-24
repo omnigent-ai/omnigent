@@ -3106,7 +3106,9 @@ def test_inject_slash_command_types_literally_and_submits(
     monkeypatch.setattr(_mod, "_PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr(_mod, "_TMUX_POLL_INTERVAL_S", 0.0)
 
-    _mod.inject_slash_command(tmp_path, command="/effort xhigh", timeout_s=1.0)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _mod.inject_slash_command(bridge_dir, command="/effort xhigh", timeout_s=1.0)
 
     assert ("send-keys", "-t", "main", "C-a") in tmux_calls
     assert ("send-keys", "-t", "main", "C-k") in tmux_calls
@@ -3119,8 +3121,9 @@ def test_inject_slash_command_types_literally_and_submits(
 )
 def test_inject_slash_command_rejects_invalid_commands(tmp_path: Path, bad_command: str) -> None:
     """Slash commands must start with '/' and be single-line."""
+    bridge_dir = tmp_path / "bridge"
     with pytest.raises(ValueError):
-        _mod.inject_slash_command(tmp_path, command=bad_command, timeout_s=0.1)
+        _mod.inject_slash_command(bridge_dir, command=bad_command, timeout_s=0.1)
 
 
 def test_inject_slash_command_fails_fast_when_tui_exited(
@@ -3135,5 +3138,20 @@ def test_inject_slash_command_fails_fast_when_tui_exited(
     )
     monkeypatch.setattr(_mod, "_session_alive", lambda sock, target: False)
 
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
     with pytest.raises(RuntimeError, match="no longer running"):
-        _mod.inject_slash_command(tmp_path, command="/effort max", timeout_s=0.1)
+        _mod.inject_slash_command(bridge_dir, command="/effort max", timeout_s=0.1)
+
+
+def test_inject_slash_command_times_out_when_bridge_lock_held(tmp_path: Path) -> None:
+    """A contended bridge injection lock raises RuntimeError within timeout_s."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    lock = _mod._bridge_injection_lock(bridge_dir)
+    assert lock.acquire(blocking=False)
+    try:
+        with pytest.raises(RuntimeError, match="timed out waiting"):
+            _mod.inject_slash_command(bridge_dir, command="/effort high", timeout_s=0.05)
+    finally:
+        lock.release()

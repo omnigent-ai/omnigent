@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
 from omnigent.install_ledger import atomic_write_json
 from omnigent.native import native_bridge_common
@@ -1679,16 +1680,37 @@ def _bridge_injection_lock(bridge_dir: Path) -> threading.Lock:
 
 def _bridge_injection_file_lock(bridge_dir: Path) -> FileLock:
     """Coordinate agy tmux pane writes between the runner and harness processes."""
-    lock_dir = bridge_dir.parent / ".locks"
+    resolved = Path(os.path.abspath(os.fspath(bridge_dir)))
+    lock_dir = resolved.parent / ".locks"
     lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return FileLock(str(lock_dir / f"{bridge_dir.name}.injection.lock"), mode=0o600)
+    return FileLock(str(lock_dir / f"{resolved.name}.injection.lock"), mode=0o600)
 
 
 @contextlib.contextmanager
-def _bridge_injection_guard(bridge_dir: Path) -> Iterator[None]:
-    """Serialize tmux pane writes across threads and processes for one bridge."""
-    with _bridge_injection_lock(bridge_dir), _bridge_injection_file_lock(bridge_dir):
-        yield
+def _bridge_injection_guard(bridge_dir: Path, *, timeout_s: float) -> Iterator[None]:
+    """Serialize tmux pane writes across threads and processes within *timeout_s*."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    thread_lock = _bridge_injection_lock(bridge_dir)
+    if not thread_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise RuntimeError("timed out waiting for another agy terminal injection to finish")
+    try:
+        try:
+            file_lock = _bridge_injection_file_lock(bridge_dir)
+            file_lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+        except FileLockTimeout as exc:
+            raise RuntimeError(
+                "timed out waiting for another agy terminal injection to finish"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not acquire agy bridge injection lock for {bridge_dir}: {exc}"
+            ) from exc
+        try:
+            yield
+        finally:
+            file_lock.release()
+    finally:
+        thread_lock.release()
 
 
 def _submit_and_verify(
@@ -1945,9 +1967,9 @@ def inject_user_message_via_tui(
     # only the budget the tmux-target gate did not consume, capping total
     # readiness latency at timeout_s (the gates were previously each given a full
     # timeout_s, so a stuck launch cost 2x before delivery even began).
-    with _bridge_injection_guard(bridge_dir):
-        deadline = time.monotonic() + timeout_s
-        info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    deadline = time.monotonic() + timeout_s
+    with _bridge_injection_guard(bridge_dir, timeout_s=max(0.0, deadline - time.monotonic())):
+        info = _wait_for_tmux_info(bridge_dir, timeout_s=max(0.0, deadline - time.monotonic()))
         socket_path = info["socket_path"]
         tmux_target = info["tmux_target"]
         # Fast-fail if the TUI already exited: otherwise the readiness gate polls a
@@ -2006,9 +2028,9 @@ def inject_slash_command(
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command or "\r" in command:
         raise ValueError("slash command must be a single line")
-    with _bridge_injection_guard(bridge_dir):
-        deadline = time.monotonic() + timeout_s
-        info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    deadline = time.monotonic() + timeout_s
+    with _bridge_injection_guard(bridge_dir, timeout_s=max(0.0, deadline - time.monotonic())):
+        info = _wait_for_tmux_info(bridge_dir, timeout_s=max(0.0, deadline - time.monotonic()))
         socket_path = info["socket_path"]
         tmux_target = info["tmux_target"]
         if not _session_alive(socket_path, tmux_target):

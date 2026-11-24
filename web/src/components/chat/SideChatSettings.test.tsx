@@ -18,7 +18,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   useHarnessEffortFamilies: () => ({
     "claude-sdk": "anthropic",
     codex: "openai",
-    "antigravity-native": "gemini",
+    "antigravity-native": "antigravity-native",
   }),
 }));
 
