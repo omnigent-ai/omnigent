@@ -122,8 +122,10 @@ async def resolve_github_credential(
         "login": connection.github_login if connection is not None else None,
     }
     # The client can be absent where no token refresh is possible (a
-    # non-expiring token); that path is github.com-only, as before.
-    github_host = client.github.host if client is not None else DEFAULT_HOST
+    # non-expiring token), or a duck-typed stand-in without a host (embedding
+    # deployments and test doubles inject their own); both mean github.com,
+    # as before.
+    github_host = getattr(getattr(client, "github", None), "host", None) or DEFAULT_HOST
     if github_host != DEFAULT_HOST:
         payload["host"] = github_host
     return payload
