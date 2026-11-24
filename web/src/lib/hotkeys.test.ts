@@ -45,9 +45,19 @@ describe("messageStepDirection", () => {
     );
   });
 
-  it("leaves AltGr arrows alone, which some layouts report as Ctrl+Alt", () => {
+  it("leaves AltGr arrows alone on Windows and Linux, which report AltGr as Ctrl+Alt", () => {
+    // The same event on both: AltGr held, reported with Ctrl and Alt.
     const altGraphDown = press("ArrowDown", { ctrlKey: true, altKey: true }, true);
     expect(messageStepDirection(altGraphDown, false)).toBeNull();
+    const altGraphUp = press("ArrowUp", { ctrlKey: true, altKey: true }, true);
+    expect(messageStepDirection(altGraphUp, false)).toBeNull();
+  });
+
+  it("still steps with ⌘⌥ on macOS, where Firefox reports Option as AltGr", () => {
+    const optionUp = press("ArrowUp", { metaKey: true, altKey: true }, true);
+    expect(messageStepDirection(optionUp, true)).toBe("previous");
+    const optionDown = press("ArrowDown", { metaKey: true, altKey: true }, true);
+    expect(messageStepDirection(optionDown, true)).toBe("next");
   });
 });
 

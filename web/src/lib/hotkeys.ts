@@ -37,8 +37,9 @@ export function messageStepDirection(
   isMac: boolean = isMacPlatform(),
 ): "previous" | "next" | null {
   if (!hasCommandModifier(e, isMac) || !e.altKey) return null;
-  // AltGr reports as Ctrl+Alt on some layouts; its arrows aren't this chord.
-  if (e.getModifierState?.("AltGraph")) return null;
+  // Off macOS, AltGr reports as Ctrl+Alt, and its arrows aren't this chord. On macOS, Firefox
+  // reports Option as AltGr, so ⌘⌥ keeps stepping.
+  if (!isMac && e.getModifierState?.("AltGraph")) return null;
   if (e.key === "ArrowUp") return "previous";
   if (e.key === "ArrowDown") return "next";
   return null;
