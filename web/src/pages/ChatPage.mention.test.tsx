@@ -1369,6 +1369,36 @@ describe.each(["textarea", "codemirror"] as const)(
       },
     );
 
+    it.runIf(engine === "textarea")(
+      "routes a paste that reaches beforeinput with its text, and leaves a drop native",
+      async () => {
+        const props = composerProps();
+        await renderComposer(props);
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        const paste = new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          inputType: "insertFromPaste",
+        });
+        Object.defineProperty(paste, "dataTransfer", {
+          value: { getData: (kind: string) => (kind === "text/plain" ? "x" : "") },
+        });
+        expect(composerInput().dispatchEvent(paste)).toBe(false);
+        expect(valueOf()).toBe("Read @readme.md x ");
+        expect(tokens()).toEqual(["@readme.md"]);
+
+        const drop = new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          inputType: "insertFromDrop",
+          data: "y",
+        });
+        expect(composerInput().dispatchEvent(drop)).toBe(true);
+      },
+    );
+
     it.runIf(engine === "textarea").each([
       ["unavailable", undefined],
       ["failing", () => false],

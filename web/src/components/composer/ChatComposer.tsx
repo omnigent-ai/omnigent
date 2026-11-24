@@ -684,13 +684,15 @@ export const ComposerTextarea = forwardRef<
       (value, insert) => adjustRef.current?.(value, insert) ?? null,
     );
     const onBeforeInput = (event: InputEvent) => {
-      // An input that can't be cancelled inserts natively, so it can't be rewritten here.
-      if (!event.cancelable || event.isComposing || event.inputType !== "insertText") return;
-      if (event.data === null) return;
+      // Only inserts at the selection: a drop or a spell correction targets another range.
+      if (!event.cancelable || event.isComposing) return;
+      if (event.inputType !== "insertText" && event.inputType !== "insertFromPaste") return;
+      const text = event.data ?? event.dataTransfer?.getData("text/plain") ?? "";
+      if (text === "") return;
       const { selectionStart: start, selectionEnd: end, value } = element;
-      if (!adjustRef.current?.(value, { start, end, text: event.data })) return;
+      if (!adjustRef.current?.(value, { start, end, text })) return;
       event.preventDefault();
-      insertComposerText(element, event.data, start, end, { separateUndo: true });
+      insertComposerText(element, text, start, end, { separateUndo: true });
     };
     element.addEventListener("beforeinput", onBeforeInput);
     return () => {
