@@ -64,6 +64,9 @@ def server(monkeypatch: pytest.MonkeyPatch) -> Iterator[_FakeServer]:
         host_ids.append(host_id)
         return {"X-Routed-Host": host_id or ""}
 
+    # No local-server pidfile, so the printed URL has no --base-path prefix even when
+    # another test in the worker left one behind.
+    monkeypatch.setattr("omnigent.host.local_server._read_local_server_pid_file", lambda: None)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr("omnigent.cli._ensure_backend", lambda server: _BASE)
     monkeypatch.setattr("omnigent.cli._resolve_attach_server", lambda server, configured: _BASE)
