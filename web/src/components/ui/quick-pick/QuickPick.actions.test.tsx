@@ -24,19 +24,21 @@ function Picker({ query: initialQuery = "", ...props }: PickerProps) {
 
 function renderPicker(props: Partial<PickerProps> = {}) {
   const onAccept = vi.fn();
-  render(
+  const picker = (next: Partial<PickerProps>) => (
     <TooltipProvider>
       <Picker
         label="Things"
         segments={segments}
         onAccept={onAccept}
         emptyMessage="No things"
-        {...props}
+        {...next}
       />
-    </TooltipProvider>,
+    </TooltipProvider>
   );
+  const view = render(picker(props));
   const input = screen.getByRole("combobox", { name: "Things" }) as HTMLInputElement;
-  return { input, onAccept };
+  const rerender = (next: Partial<PickerProps>) => view.rerender(picker(next));
+  return { input, onAccept, rerender };
 }
 describe("QuickPick row buttons", () => {
   const closeChord = { ctrl: true, key: "Backspace" } as const;
@@ -354,16 +356,24 @@ describe("QuickPick group headings", () => {
           : new DOMRect(0, 0, 180, 32);
       });
     try {
-      renderPicker({
+      const summary = vi.fn(() => "3 results");
+      const props: Partial<PickerProps> = {
         segments: grouped,
         groupCounts: true,
+        summary,
         groupActions: (group) =>
           group === "Files" ? [{ id: "close-all", label: "Close all", run: () => {} }] : [],
-      });
-      const headings = [
+      };
+      const { rerender } = renderPicker(props);
+      const headings = () => [
         ...document.querySelectorAll<HTMLElement>("[data-slot=quick-pick-group-heading]"),
       ];
-      expect(headings.map((heading) => heading.style.paddingRight)).toEqual(["188px", ""]);
+      expect(headings().map((heading) => heading.style.paddingRight)).toEqual(["188px", ""]);
+      // Measuring the same buttons again after a render asks for no further render.
+      const settled = summary.mock.calls.length;
+      rerender({ ...props, placeholder: "Search" });
+      expect(summary.mock.calls.length - settled).toBe(1);
+      expect(headings().map((heading) => heading.style.paddingRight)).toEqual(["188px", ""]);
     } finally {
       measure.mockRestore();
     }
