@@ -1014,6 +1014,7 @@ async def _launch_and_record(
             seed_isolated_agy_home,
             bridge_dir,
             trusted_workspace=Path.cwd().resolve(),
+            launch_model=model,
         ),
     }
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn

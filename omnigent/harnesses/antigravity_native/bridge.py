@@ -634,6 +634,7 @@ def seed_isolated_agy_home(
     bridge_dir: Path,
     *,
     trusted_workspace: Path | str | None = None,
+    launch_model: str | None = None,
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
@@ -655,6 +656,9 @@ def seed_isolated_agy_home(
         "Do you trust this project?" TUI gate for host-spawned sessions, mirroring
         ``ensure_claude_workspace_trusted`` while keeping trust scoped to this
         bridge-owned ``--gemini_dir``.
+    :param launch_model: Model passed to agy via ``--model``, if any. agy does
+        not persist that flag, so a seeded ``model`` setting is dropped to keep
+        the isolated settings from naming a stale model.
     :returns: Env overrides to layer onto the agy launch environment. Currently
         empty because ``HOME`` must stay real for platform auth.
     """
@@ -676,6 +680,8 @@ def seed_isolated_agy_home(
             os.chmod(dst, 0o600)
 
     _seed_isolated_agy_settings(real_home, iso_gemini)
+    if launch_model:
+        _drop_isolated_agy_settings_model(iso_gemini)
     _seed_isolated_agy_onboarding_marker(real_home, iso_gemini)
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
@@ -712,6 +718,25 @@ def _seed_isolated_agy_settings(real_home: Path, iso_gemini: Path) -> None:
         with contextlib.suppress(OSError):
             iso_settings.write_bytes(real_settings.read_bytes())
             os.chmod(iso_settings, 0o600)
+
+
+def _drop_isolated_agy_settings_model(iso_gemini: Path) -> None:
+    """Remove the ``model`` key from the isolated agy ``settings.json``.
+
+    Best-effort: an absent, unreadable or non-object file is left untouched.
+
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    settings_path = iso_gemini / "antigravity-cli" / "settings.json"
+    try:
+        loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(loaded, dict) or "model" not in loaded:
+        return
+    del loaded["model"]
+    with contextlib.suppress(OSError):
+        atomic_write_json(settings_path, loaded)
 
 
 def _seed_isolated_agy_onboarding_marker(real_home: Path, iso_gemini: Path) -> None:

@@ -7383,6 +7383,7 @@ async def _auto_create_antigravity_terminal(
             seed_isolated_agy_home,
             bridge_dir,
             trusted_workspace=workspace,
+            launch_model=model,
         ),
     }
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
