@@ -4649,6 +4649,9 @@ def create_app(
                 conversation_store=conversation_store,
                 permission_store=permission_store,
                 create_session=app.state.project_session_create,
+                register_mention_targets=lambda targets: setattr(
+                    app.state, "persona_mention_targets", targets
+                ),
             ),
             prefix="/v1",
             tags=["projects"],

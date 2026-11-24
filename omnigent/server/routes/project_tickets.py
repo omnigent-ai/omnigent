@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,14 @@ from omnigent.runtime.project_ticket_instructions import (
 )
 from omnigent.server import session_live_state
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
+from omnigent.server.persona_mentions import (
+    ORCHESTRATOR_MENTION_ID,
+    Mention,
+    MentionRateLimiter,
+    PersonaMentionTargets,
+    deliver_mentions,
+    find_mentions,
+)
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
 from omnigent.server.routes._sessions.helpers import (
@@ -134,6 +143,66 @@ def _has_running_agents(
         if status not in ("idle", "waiting", "failed"):
             unknown = True
     return None if unknown else False
+
+
+_logger = logging.getLogger(__name__)
+_mention_limiter = MentionRateLimiter()
+_mention_tasks: set[asyncio.Task[None]] = set()
+
+
+def _spawn_mention_delivery(
+    request: Request,
+    targets: PersonaMentionTargets,
+    project: Any,
+    ticket: dict[str, Any],
+    text: str,
+    mentions: list[Mention],
+    who: TicketActor,
+) -> None:
+    """Wake each cc'd persona in the background, so posting never waits on a restore."""
+    app = request.app
+    notifications = getattr(app.state, "project_ticket_notifications", None)
+    if notifications is None:
+        return
+    # A human comment already wakes the Orchestrator through the ticket update itself.
+    if who.session_id is None:
+        mentions = [entry for entry in mentions if entry.id != ORCHESTRATOR_MENTION_ID]
+    if not mentions:
+        return
+
+    async def deliver(session_id: str, stable_id: str, message: str) -> bool:
+        return await notifications.deliver_to_session(
+            app, project, session_id, stable_id=stable_id, text=message
+        )
+
+    async def run() -> None:
+        # A person's comment already reaches the ticket's linked sessions as worker routing.
+        linked = (
+            frozenset(
+                await asyncio.to_thread(
+                    notifications.tickets.ticket_session_ids, project.id, ticket["id"]
+                )
+            )
+            if who.session_id is None
+            else frozenset()
+        )
+        outcomes = await deliver_mentions(
+            project,
+            ticket,
+            text,
+            mentions,
+            event_id=f"{ticket['id']}:{ticket['comment_count']}",
+            author_session_id=who.session_id,
+            open_session=lambda mention: targets.open(request, project, mention),
+            deliver=deliver,
+            limiter=_mention_limiter,
+            already_notified=linked,
+        )
+        _logger.info("Ticket %s mentions: %s", ticket["id"], outcomes)
+
+    task = asyncio.create_task(run(), name=f"ticket-mentions-{ticket['id']}")
+    _mention_tasks.add(task)
+    task.add_done_callback(_mention_tasks.discard)
 
 
 def create_project_tickets_router(
@@ -393,9 +462,25 @@ def create_project_tickets_router(
         request: Request, project_id: str, ticket_id: str, body: CommentOnTicket
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
+        targets: PersonaMentionTargets | None = getattr(
+            request.app.state, "persona_mention_targets", None
+        )
+        project = mentions = None
+        if targets is not None and body.kind == "comment" and "@" in body.text:
+            project = await targets.project(project_id, who.user_id)
+            mentions = find_mentions(body.text, await targets.personas(project))
         with _storage_errors():
-            ticket = await asyncio.to_thread(store.comment, project_id, ticket_id, body, who)
+            ticket = await asyncio.to_thread(
+                store.comment,
+                project_id,
+                ticket_id,
+                body,
+                who,
+                mentions=[{"id": entry.id, "name": entry.name} for entry in mentions or []],
+            )
         wake(request)
+        if targets is not None and project is not None and mentions:
+            _spawn_mention_delivery(request, targets, project, ticket, body.text, mentions, who)
         return ticket
 
     @router.get("/{ticket_id}/events")

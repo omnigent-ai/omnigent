@@ -52,6 +52,8 @@ import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCostSection } from "./ProjectCost";
+import { MentionTextarea } from "./MentionTextarea";
+import { payloadMentions } from "./personaMentions";
 import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketFileLinks } from "./TicketFileLinks";
 import { TicketMarkdown, useTicketImageUpload } from "./ticketImages";
@@ -567,7 +569,8 @@ function TicketCommentComposer({
       }}
     >
       <div className="rounded-xl border border-input bg-background focus-within:border-ring">
-        <Textarea
+        <MentionTextarea
+          projectId={projectId}
           name="comment"
           aria-label="Add a comment"
           required
@@ -576,11 +579,11 @@ function TicketCommentComposer({
           className="max-h-36 min-h-16 resize-none rounded-none border-0 px-3 shadow-none focus-visible:ring-0"
           value={text}
           disabled={comment.isPending}
-          onChange={(event) => setText(event.target.value)}
+          onValueChange={setText}
           onPaste={images.onPaste}
           onDragOver={images.onDragOver}
           onDrop={images.onDrop}
-          placeholder="Add a comment… (paste or drop images)"
+          placeholder="Add a comment… type @ to cc a persona"
         />
         {attaching && (
           <div className="flex flex-wrap items-center gap-2 border-t border-border/60 p-2">
@@ -1213,7 +1216,7 @@ function TicketActivityItem({
         )}
         {body && (
           <TicketFileLinks sessionId={event.session_id ?? fallbackSessionId}>
-            <TicketCommentBody body={body} />
+            <TicketCommentBody body={body} mentions={payloadMentions(event.payload)} />
           </TicketFileLinks>
         )}
       </div>

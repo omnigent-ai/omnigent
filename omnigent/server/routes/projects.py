@@ -19,6 +19,7 @@ import contextlib
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -34,6 +35,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server import session_live_state
 from omnigent.server.auth import AuthProvider
+from omnigent.server.persona_mentions import Mention, PersonaMentionTargets
 from omnigent.server.project_identities import (
     ORCHESTRATOR_IDENTITY_ID,
     identity_response,
@@ -134,6 +136,7 @@ def create_projects_router(
     conversation_store: ConversationStore | None = None,
     permission_store: PermissionStore | None = None,
     create_session: ProjectSessionCreator | None = None,
+    register_mention_targets: Callable[[PersonaMentionTargets], None] | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
 
@@ -814,5 +817,31 @@ def create_projects_router(
         # Drop the folder from the owner's other connected clients live.
         announce_projects_changed(user_id)
         return {"id": project_id, "object": "project.deleted", "deleted": True}
+
+    async def mention_personas(project: Project) -> list[Mention]:
+        identities = await asyncio.to_thread(
+            project_store.list_identities, project.id, user_id=project.user_id
+        )
+        return [Mention(ORCHESTRATOR_IDENTITY_ID, "Orchestrator")] + [
+            Mention(identity.id, identity.name) for identity in identities
+        ]
+
+    async def open_mention_session(
+        request: Request, project: Project, mention: Mention
+    ) -> str | None:
+        """The persona's current session, restored first if it was lost."""
+        if mention.id == ORCHESTRATOR_IDENTITY_ID:
+            healed = await heal_main_session(request, project)
+            state = await main_session_state(healed, conversation_store, permission_store)
+            return healed.main_session_id if state == "active" else None
+        identity, _ = await ensure_identity_session(request, project, mention.id)
+        return identity.active_session_id
+
+    if register_mention_targets is not None:
+        register_mention_targets(
+            PersonaMentionTargets(
+                project=_owned_project, personas=mention_personas, open=open_mention_session
+            )
+        )
 
     return router

@@ -591,6 +591,46 @@ async def test_a_deleted_orchestrator_comes_back_but_an_archived_one_waits(
     )
 
 
+async def test_a_comment_ccing_a_persona_reaches_only_that_personas_session(
+    project_client: httpx.AsyncClient, project_app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@PM in a comment is recorded and delivered to PM's session; Designer isn't woken."""
+    from omnigent.server.persona_mentions import mention_stable_id
+    from omnigent.server.routes import project_tickets
+
+    delivered: list[tuple[str, str, str]] = []
+
+    async def deliver_to_session(app, project, session_id, *, stable_id, text) -> bool:
+        delivered.append((session_id, stable_id, text))
+        return True
+
+    monkeypatch.setattr(
+        project_app.state.project_ticket_notifications,
+        "deliver_to_session",
+        deliver_to_session,
+        raising=False,
+    )
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    identities = f"/v1/projects/{created['id']}/identities"
+    pm = (await project_client.post(identities, json={"name": "PM", "instructions": "x"})).json()
+    await project_client.post(identities, json={"name": "Designer", "instructions": "y"})
+    tickets = f"/v1/projects/{created['id']}/tickets"
+    ticket = (await project_client.post(tickets, json={"title": "Stuck"})).json()
+    posted = await project_client.post(
+        f"{tickets}/{ticket['id']}/comments", json={"text": "cc @pm can you scope this?"}
+    )
+    assert posted.status_code == 201
+    await asyncio.gather(*project_tickets._mention_tasks)
+    assert [(session, stable) for session, stable, _ in delivered] == [
+        (pm["active_session_id"], mention_stable_id(f"{ticket['id']}:1", pm["id"]))
+    ]
+    assert 'ticket "Stuck"' in delivered[0][2] and "cc @pm can you scope this?" in delivered[0][2]
+    events = (
+        await project_client.get(f"{tickets}/{ticket['id']}/events", params={"kind": "comment"})
+    ).json()["data"]
+    assert events[-1]["payload"]["mentions"] == [{"id": pm["id"], "name": "PM"}]
+
+
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     """DELETE removes the project; a second delete 404s."""
     created = (await project_client.post("/v1/projects", json={"name": "Doomed"})).json()

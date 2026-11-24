@@ -2,9 +2,11 @@ import { useId, useMemo, useState } from "react";
 import { parseMarkdownIntoBlocks } from "streamdown";
 import { Button } from "@/components/ui/button";
 import { markdownPreviewText } from "@/lib/markdownPreviewText";
+import { emphasizeMentions, type PersonaMention } from "./personaMentions";
 import { TicketMarkdown } from "./ticketImages";
 
 const PREVIEW_CHARACTERS = 600;
+const NO_MENTIONS: PersonaMention[] = [];
 const PREVIEW_LINES = 8;
 
 /** A presentation excerpt, never a replacement for the author's full comment. */
@@ -41,9 +43,16 @@ function commentPreview(body: string): { text: string; markdown: boolean } | nul
   return { text: text || "…", markdown: false };
 }
 
-export function TicketCommentBody({ body }: { body: string }) {
+export function TicketCommentBody({
+  body: text,
+  mentions = NO_MENTIONS,
+}: {
+  body: string;
+  mentions?: PersonaMention[];
+}) {
   const [expanded, setExpanded] = useState(false);
   const contentId = useId();
+  const body = useMemo(() => emphasizeMentions(text, mentions), [text, mentions]);
   const preview = useMemo(() => commentPreview(body), [body]);
   const visible = !expanded && preview ? preview : { text: body, markdown: true };
   return (
@@ -57,6 +66,20 @@ export function TicketCommentBody({ body }: { body: string }) {
           <p className="text-ui leading-relaxed wrap-anywhere">{visible.text}</p>
         )}
       </div>
+      {mentions.length > 0 && (
+        <p className="flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
+          cc
+          {mentions.map((mention) => (
+            <span
+              key={mention.id}
+              data-testid="ticket-comment-mention"
+              className="rounded-full bg-primary/10 px-1.5 py-0.5 font-medium text-primary"
+            >
+              @{mention.name}
+            </span>
+          ))}
+        </p>
+      )}
       {preview && (
         <Button
           type="button"

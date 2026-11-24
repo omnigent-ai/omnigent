@@ -199,6 +199,10 @@ left for rollover to replace.
   to report back. The tool returns the identity's one session, starting it with
   its persona only when it has none. Link that session to the ticket with
   `sys_session_link_ticket`.
+- To pull an identity into a ticket without handing it the workstream, mention it
+  as `@Name` in a ticket comment. The server delivers that comment to the
+  identity's session. Agent mentions of one identity are rate-limited, so don't
+  use them for back-and-forth.
 - Never use `sys_session_create` for an identity, and never start a second
   session for one that already has a live session. Keep talking to it with
   `sys_session_message` on the returned session ID. When it is busy, leave its

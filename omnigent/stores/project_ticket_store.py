@@ -923,7 +923,13 @@ class ProjectTicketStore:
         return run_write_transaction(self._write, "update_ticket", write)
 
     def comment(
-        self, project_id: str, ticket_id: str, body: CommentOnTicket, actor: TicketActor
+        self,
+        project_id: str,
+        ticket_id: str,
+        body: CommentOnTicket,
+        actor: TicketActor,
+        *,
+        mentions: builtins.list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
@@ -939,6 +945,9 @@ class ProjectTicketStore:
             payload: dict[str, Any] = {"text": body.text, "audience": audience}
             if body.final:
                 payload["final"] = True
+            if mentions:
+                # The personas this comment cc'd, as {"id", "name"}; shown and delivered.
+                payload["mentions"] = mentions
             self._append(session, project, row, actor, body.kind, payload)
             for output in body.outputs:
                 self._append(session, project, row, actor, "output", output.model_dump())
