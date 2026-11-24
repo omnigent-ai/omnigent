@@ -219,6 +219,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   },
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
+  /** Open a session in its own window on this server. Resolves whether it opened. */
+  openSessionWindow: (sessionId) => ipcRenderer.invoke("omnigent:open-session-window", sessionId),
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
   confirmQuit: (options) =>
     ipcRenderer.invoke("omnigent:confirm-quit", { dontAskAgain: options?.dontAskAgain === true }),

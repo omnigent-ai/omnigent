@@ -315,6 +315,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   reportConversationShown?: (conversationId: string | null) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow?: () => Promise<boolean>;
+  /** Open a session in its own desktop window on this server. Resolves whether it opened. */
+  openSessionWindow?: (sessionId: string) => Promise<boolean>;
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
   confirmQuit?: (options: { dontAskAgain: boolean }) => Promise<boolean>;
   /**
@@ -985,6 +987,23 @@ export async function closeDesktopWindow(): Promise<boolean> {
     return (await electron.closeWindow()) === true;
   } catch (err) {
     console.warn("[nativeBridge] closeWindow failed:", err);
+    return false;
+  }
+}
+
+/** True when the desktop shell can open a session in its own app window. */
+export function supportsDesktopSessionWindows(): boolean {
+  return typeof electronApi()?.openSessionWindow === "function";
+}
+
+/** Ask the desktop shell to open ``sessionId`` in its own window; resolves whether it did. */
+export async function openDesktopSessionWindow(sessionId: string): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.openSessionWindow) return false;
+  try {
+    return (await electron.openSessionWindow(sessionId)) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] openSessionWindow failed:", err);
     return false;
   }
 }

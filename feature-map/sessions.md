@@ -345,6 +345,18 @@ the header menu), and each place is a separate entry point.
   links → **Open conversations in the desktop app**. Links to a file or to
   Canvas stay in the browser.
 
+**Pop out a session (desktop layouts):** open a session's header ⋯ menu, or a
+sidebar row's menu or right-click menu, and choose **Open in new window**. A
+browser opens a 960×820 popup on that session; it keeps the desktop layout and
+starts with the sidebar collapsed (the sidebar toggle reopens it). A blocked
+popup shows a toast asking to allow pop-ups. Browser pop-outs stay in the browser
+even when automatic desktop handoff is enabled. The desktop app opens another app
+window on the same server instead of the system browser; that window doesn't
+replace the main window's saved size and position. Choosing it again for a
+session that's already popped out brings its window forward. Mobile viewports,
+the iOS/Android apps, embedding host pages, and desktop builds that predate the
+feature don't offer it.
+
 **Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again

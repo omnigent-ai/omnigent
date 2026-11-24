@@ -159,6 +159,12 @@ const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
+const {
+  SESSION_WINDOW_SIZE,
+  findSessionWindow,
+  sessionWindowPath,
+  withoutSessionWindowQuery,
+} = require("./sessionWindows");
 const omnigentCli = require("./omnigent_cli");
 const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
@@ -2997,6 +3003,7 @@ function registerNavigationFallbacks(win) {
  *   path?: string,
  *   role?: string,
  *   windowOptions?: Electron.BrowserWindowConstructorOptions,
+ *   sessionWindowId?: string,
  * }} [opts]
  *   ``ephemeral: true`` creates a debug multi-server window: it opens on the
  *   setup page (ignoring the saved server) and a URL connected from it is
@@ -3005,16 +3012,21 @@ function registerNavigationFallbacks(win) {
  *   A ``role`` other than ``"main"`` builds a panel from ``windowOptions``: it
  *   loads and signs in like any window, but skips the main window's saved
  *   bounds, placement and update overlay, and app-level actions skip it.
+ *   ``sessionWindowId`` marks a main window popped out for one session: it
+ *   opens at the session-window size and never saves its bounds as the main
+ *   window's.
  * @returns {BrowserWindow}
  */
 function createWindow(targetUrl, opts = {}) {
   const ephemeral = opts.ephemeral === true;
   const role = opts.role ?? "main";
   const isMain = role === "main";
-  const savedBounds = isMain ? loadSavedWindowBounds() : null;
+  const sessionWindowId = isMain ? opts.sessionWindowId : undefined;
+  const savedBounds = isMain && !sessionWindowId ? loadSavedWindowBounds() : null;
+  const defaultSize = sessionWindowId ? SESSION_WINDOW_SIZE : { width: 1280, height: 860 };
   const mainWindowOptions = {
-    width: savedBounds?.width ?? 1280,
-    height: savedBounds?.height ?? 860,
+    width: savedBounds?.width ?? defaultSize.width,
+    height: savedBounds?.height ?? defaultSize.height,
     // Without saved coordinates Electron centers the window.
     ...(savedBounds ? { x: savedBounds.x, y: savedBounds.y } : {}),
     minWidth: 720,
@@ -3110,6 +3122,7 @@ function createWindow(targetUrl, opts = {}) {
     serverUrl: destination ? serverUrl : null,
     ephemeral,
     role,
+    ...(sessionWindowId ? { sessionWindowId } : {}),
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
@@ -3290,7 +3303,7 @@ function createWindow(targetUrl, opts = {}) {
   if (isMain) {
     cascadeIfCovering(win);
     if (savedBounds?.maximized) win.maximize();
-    trackWindowBounds(win);
+    if (!sessionWindowId) trackWindowBounds(win);
     closePanelsOnSignIn(win);
   }
   return win;
@@ -3566,7 +3579,7 @@ function isFindBarSender(event) {
  */
 function newWindow() {
   const win = activeWindow();
-  const current = win?.webContents.getURL();
+  const current = withoutSessionWindowQuery(win?.webContents.getURL());
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
   // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).
@@ -5402,6 +5415,27 @@ function registerIpc() {
   ipcMain.handle("omnigent:close-window", (event) => {
     if (!isPinnedOriginSender(event)) return false;
     BrowserWindow.fromWebContents(event.sender)?.close();
+    return true;
+  });
+
+  // "Open in new window": the session in its own window on the sender's server. The server
+  // comes from main's window state, never the page; a session already popped out comes forward.
+  ipcMain.handle("omnigent:open-session-window", (event, sessionId) => {
+    if (!isPinnedOriginSender(event)) return false;
+    const routePath = sessionWindowPath(sessionId);
+    const state = windows.get(BrowserWindow.fromWebContents(event.sender));
+    if (routePath === null || !state?.serverUrl) return false;
+    const existing = findSessionWindow(windows, { serverUrl: state.serverUrl, sessionId });
+    if (existing) {
+      focusAndRestore(existing);
+      return true;
+    }
+    createWindow(undefined, {
+      serverUrl: state.serverUrl,
+      path: routePath,
+      ephemeral: state.ephemeral === true,
+      sessionWindowId: sessionId,
+    });
     return true;
   });
 
