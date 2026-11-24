@@ -1,8 +1,10 @@
 """Git credential helper that fetches the session's GitHub token from the server.
 
 Installed in a managed sandbox as git's ``credential.helper`` for
-``github.com``. On each HTTPS auth challenge git runs this with ``get`` and the
-request on stdin; the helper calls the server's host-facing credential endpoint
+``github.com``, or for the GitHub Enterprise Server host the server names in the
+broker payload (``host``; see :mod:`omnigent.git_providers.github_host`). On each
+HTTPS auth challenge git runs this with ``get`` and the request on stdin; the
+helper calls the server's host-facing credential endpoint
 (:mod:`omnigent.server.routes.host_credentials`, with ``provider=github``) over
 the sandbox's existing authenticated channel and prints back ``username`` /
 ``password``.
@@ -53,6 +55,7 @@ from pathlib import Path
 import httpx
 import yaml
 
+from omnigent.git_providers.github_host import DEFAULT_HOST, normalize_host
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR as _HOST_TOKEN_ENV_VAR
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.host.identity_env import in_managed_sandbox
@@ -127,6 +130,21 @@ def _fetch_credential(server: str, host_id: str, host_token: str) -> tuple[str, 
     return str(data.get("username") or "x-access-token"), str(data["token"])
 
 
+def _payload_host(data: dict | None) -> str:
+    """The GitHub host a broker payload names, defaulting to ``github.com``.
+
+    Only a server configured for GitHub Enterprise Server sends ``host``; an
+    inconclusive probe, a github.com server, an older server, or a value that
+    isn't a bare host name all mean github.com.
+    """
+    return normalize_host(str((data or {}).get("host") or "")) or DEFAULT_HOST
+
+
+def _helper_key(github_host: str) -> str:
+    """The git config key scoping a credential helper to *github_host*."""
+    return f"credential.https://{github_host}.helper"
+
+
 def _git_config(*args: str) -> None:
     """Run ``git config --global`` best-effort (never raises; git may be absent)."""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
@@ -138,8 +156,10 @@ def _git_config(*args: str) -> None:
         )
 
 
-def _install_broker_helper(server_url: str, host_id: str, token: str) -> None:
-    """Make the per-user broker the sole github.com credential helper.
+def _install_broker_helper(
+    server_url: str, host_id: str, token: str, github_host: str = DEFAULT_HOST
+) -> None:
+    """Make the per-user broker the sole credential helper for *github_host*.
 
     Bakes the (lesser, expiring) launch token into the helper invocation so it
     works regardless of whether the agent's process inherited the env; the GitHub
@@ -155,14 +175,20 @@ def _install_broker_helper(server_url: str, host_id: str, token: str) -> None:
     host both wire the broker into the same shared ~/.gitconfig (and the host
     re-runs on every resume). A plain set can't overwrite the 2+ values that
     leaves, so without ``--replace-all`` broker entries would pile up.
+
+    For a GitHub Enterprise Server *github_host* the helper is scoped to that
+    host and told it with ``--github-host``, so it vends only there.
     """
     helper = (
         "!python3 -m omnigent.git_credential_github "
         f"--server {shlex.quote(server_url)} --host-id {shlex.quote(host_id)} "
         f"--host-token {shlex.quote(token)}"
     )
-    _git_config("--replace-all", "credential.https://github.com.helper", "")
-    _git_config("--add", "credential.https://github.com.helper", helper)
+    if github_host != DEFAULT_HOST:
+        helper += f" --github-host {shlex.quote(github_host)}"
+    key = _helper_key(github_host)
+    _git_config("--replace-all", key, "")
+    _git_config("--add", key, helper)
 
 
 def configure_host_git(server_url: str, host_id: str) -> None:
@@ -194,15 +220,16 @@ def configure_host_git(server_url: str, host_id: str) -> None:
     if not token:
         return
     data = _fetch(server_url, host_id, token)
+    github_host = _payload_host(data)
     if data is not None and not data.get("connected"):
         # Confirmed not linked: actively clear any broker helper a prior
         # (inconclusive) clone probe installed. Just returning would leave that
         # helper — and the chain reset it wrote — in place, stranding in-session
         # git behind a broker that now declines. Unsetting restores the ambient
         # shared-``$GIT_TOKEN`` helper.
-        _git_config("--unset-all", "credential.https://github.com.helper")
+        _git_config("--unset-all", _helper_key(github_host))
         return
-    _install_broker_helper(server_url, host_id, token)
+    _install_broker_helper(server_url, host_id, token, github_host)
     owner = str((data or {}).get("owner") or "")
     if data and data.get("connected") and "@" in owner:
         _git_config("user.email", owner)
@@ -218,14 +245,15 @@ def _gh_config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "gh"
 
 
-def _write_gh_hosts(login: str, token: str) -> bool:
-    """Materialize the owner's ``github.com`` auth into gh's ``hosts.yml``.
+def _write_gh_hosts(login: str, token: str, github_host: str = DEFAULT_HOST) -> bool:
+    """Materialize the owner's auth for *github_host* into gh's ``hosts.yml``.
 
     The gh CLI does not consult git's ``credential.helper`` for its own API
     calls (``gh api`` / ``gh pr`` / ``gh issue``); it reads ``oauth_token`` from
     ``hosts.yml`` (or ``GH_TOKEN``).
 
-    Writes **only the** ``github.com`` **key, merging** into any existing
+    Writes **only the** *github_host* key (``github.com`` unless the server
+    named a GitHub Enterprise Server host), **merging** into any existing
     document so a user's other hosts survive (``hosts.yml`` is a multi-host map —
     a GitHub Enterprise entry, a second account). This matters because the host's
     ``GH_CONFIG_DIR`` is not always a throwaway sandbox one: a local ``omnigent
@@ -254,11 +282,11 @@ def _write_gh_hosts(login: str, token: str) -> bool:
         loaded = yaml.safe_load(hosts_path.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
             hosts = loaded
-    entry = hosts.get("github.com")
+    entry = hosts.get(github_host)
     if not isinstance(entry, dict):
         entry = {}
     entry.update({"oauth_token": token, "user": login, "git_protocol": "https"})
-    hosts["github.com"] = entry
+    hosts[github_host] = entry
 
     tmp: str | None = None
     try:
@@ -305,7 +333,7 @@ def configure_host_gh(server_url: str, host_id: str) -> bool:
         return False
     gh_token = str(data["token"])
     login = str(data.get("login") or data.get("username") or "x-access-token")
-    return _write_gh_hosts(login, gh_token)
+    return _write_gh_hosts(login, gh_token, _payload_host(data))
 
 
 # How often the background refresher re-materializes gh's hosts.yml, in seconds.
@@ -391,7 +419,7 @@ def configure_clone_credentials(server_url: str, host_id: str) -> bool:
     data = _fetch(server_url, host_id, token)
     if data is not None and not data.get("connected"):
         return False
-    _install_broker_helper(server_url, host_id, token)
+    _install_broker_helper(server_url, host_id, token, _payload_host(data))
     return True
 
 
@@ -400,6 +428,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--server", required=True)
     parser.add_argument("--host-id", required=True)
     parser.add_argument("--host-token", required=True)
+    # The GitHub host this helper may vend for; github.com unless the server is
+    # configured for GitHub Enterprise Server.
+    parser.add_argument("--github-host", default=DEFAULT_HOST)
     # git passes the operation (get/store/erase) as the first positional arg.
     parser.add_argument("operation", nargs="?", default="get")
     args, _ = parser.parse_known_args(argv)
@@ -410,11 +441,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     request = _read_git_request()
-    # Fail closed: only vend for github.com over https. A missing/empty host, a
-    # different host, or a non-https protocol declines (return 0, no output) so
-    # git falls through to the next helper — the brokered token can never leak
-    # to another host even if this is ever wired as a global credential helper.
-    if request.get("host") != "github.com" or request.get("protocol") != "https":
+    # Fail closed: only vend for the configured GitHub host (github.com by
+    # default) over https. A missing/empty host, a different host, or a
+    # non-https protocol declines (return 0, no output) so git falls through to
+    # the next helper — the brokered token can never leak to another host even
+    # if this is ever wired as a global credential helper.
+    if request.get("host") != args.github_host or request.get("protocol") != "https":
         return 0
 
     cred = _fetch_credential(args.server, args.host_id, args.host_token)

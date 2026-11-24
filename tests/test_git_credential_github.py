@@ -410,3 +410,85 @@ def test_start_host_gh_refresh_rewrites_hosts_on_tick(
     assert t is not None
     assert refreshed.wait(timeout=5), "refresher never re-materialized hosts.yml"
     assert calls == [("http://srv", "host1")]
+
+
+# ── GitHub Enterprise Server host ───────────────────────────────
+
+
+def test_get_vends_only_for_the_configured_enterprise_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cred = {"connected": True, "username": "x-access-token", "token": "T"}
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: cred)
+    argv = ["--server", "http://s", "--host-id", "hid", "--host-token", "tok"]
+    argv += ["--github-host", "ghe.example.com", "get"]
+    for host, vends in (("ghe.example.com", True), ("github.com", False)):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(f"protocol=https\nhost={host}\n\n"))
+        out = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", out)
+        assert h.main(argv) == 0
+        assert ("password=T" in out.getvalue()) is vends
+
+
+def test_configure_host_git_scopes_helper_to_enterprise_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    cred = {"connected": True, "owner": "alice@example.com", "login": "octo"}
+    cred["host"] = "ghe.example.com"
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: cred)
+    h.configure_host_git("http://srv", "host1")
+    key = "credential.https://ghe.example.com.helper"
+    adds = [c for c in calls if c[:5] == ["git", "config", "--global", "--add", key]]
+    assert len(adds) == 1
+    assert adds[0][-1].endswith(" --github-host ghe.example.com")
+    flat = [" ".join(c) for c in calls]
+    assert not any("credential.https://github.com.helper" in c for c in flat)
+
+
+def test_default_helper_command_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": True})
+    h.configure_host_git("http://srv", "host1")
+    key = "credential.https://github.com.helper"
+    adds = [c for c in calls if c[:5] == ["git", "config", "--global", "--add", key]]
+    assert adds[0][-1] == (
+        "!python3 -m omnigent.git_credential_github "
+        "--server http://srv --host-id host1 --host-token launch-tok"
+    )
+
+
+def test_payload_host_ignores_values_that_are_not_hosts() -> None:
+    assert h._payload_host(None) == "github.com"
+    assert h._payload_host({"host": "https://evil.example.com/x"}) == "github.com"
+    assert h._payload_host({"host": "GHE.example.com"}) == "ghe.example.com"
+
+
+def test_configure_host_gh_writes_enterprise_host_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
+    cred = {"connected": True, "token": "gho_user", "login": "octo", "host": "ghe.example.com"}
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: cred)
+    assert h.configure_host_gh("http://srv", "host1") is True
+    written = yaml.safe_load((tmp_path / "gh" / "hosts.yml").read_text())
+    assert set(written) == {"ghe.example.com"}
+    assert written["ghe.example.com"]["oauth_token"] == "gho_user"
+
+
+def test_configure_clone_credentials_scopes_enterprise_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    installed: list[tuple] = []
+    monkeypatch.setattr(h, "_install_broker_helper", lambda *a: installed.append(a))
+    monkeypatch.setattr(
+        h, "_fetch", lambda *a, **k: {"connected": True, "host": "ghe.example.com"}
+    )
+    assert h.configure_clone_credentials("http://srv", "host1") is True
+    assert installed == [("http://srv", "host1", "launch-tok", "ghe.example.com")]
