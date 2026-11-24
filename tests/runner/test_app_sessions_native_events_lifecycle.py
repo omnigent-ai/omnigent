@@ -3330,20 +3330,24 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     assert int_resp.status_code == 204, int_resp.text
 
 
-@pytest.mark.parametrize("bridge_published", [False, True], ids=["no-thread", "idle-thread"])
+@pytest.mark.parametrize("stop_event", ["interrupt", "stop_session"])
+@pytest.mark.parametrize("codex_state", ["no-thread", "idle-thread", "mcp-starting"])
 @pytest.mark.asyncio
 async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_held_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    bridge_published: bool,
+    codex_state: str,
+    stop_event: str,
 ) -> None:
     """
     Stop reaches the runner's turn while its message is not yet in Codex.
 
     Before Codex has a thread, or once it has one but no turn yet (the thread
-    started while the message was still waiting to be submitted), there is no
-    Codex turn to interrupt: the message is in the runner's own turn. Stop must
-    interrupt and cancel that turn, or the message would still be sent.
+    started while the message was still waiting to be submitted, possibly with
+    its MCP servers still starting), there is no Codex turn to interrupt: the
+    message is in the runner's own turn. Stop must interrupt and cancel that
+    turn, or the message would still be sent; a pending MCP startup is still
+    stopped as before.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner import app as runner_app_module
@@ -3352,6 +3356,7 @@ async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_he
 
     conv_id = "7a4e2c9b1d3f4e6a8c0b2d4f6a8c0e1b"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
 
     async def _fail_launch_config(**kwargs: Any) -> None:
         """Keep Codex from starting, so the session has no bridge state."""
@@ -3359,6 +3364,12 @@ async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_he
         raise RuntimeError("launch config disabled in test")
 
     monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    app_server = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43214", client_name="omnigent-codex-native-runner"
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda transport, **_: app_server
+    )
 
     class _HarnessEndingOnInterrupt(_BlockingHarnessClient):
         """Hold the turn's stream open until interrupted, then end it cancelled."""
@@ -3407,24 +3418,23 @@ async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_he
         turn = app.state.active_turns[conv_id]
         queue = _session_event_queues_ref.get(conv_id)
         _drain_session_event_queue(queue)
-        if bridge_published:
+        if codex_state != "no-thread":
             codex_native_bridge.write_bridge_state(
-                codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
+                bridge_dir,
                 codex_native_bridge.CodexNativeBridgeState(
                     session_id=conv_id,
-                    socket_path="ws://127.0.0.1:43214",
+                    socket_path=app_server.transport,
                     thread_id="thread_codex_started",
                     codex_home=str(tmp_path / "codex-home"),
                     active_turn_id=None,
                 ),
             )
+        if codex_state == "mcp-starting":
+            codex_native_bridge.update_mcp_server_startup(
+                bridge_dir, "storage-console", "starting"
+            )
 
-            def _no_app_server(transport: str, *, client_name: str = "omnigent") -> None:
-                raise AssertionError(f"no Codex turn to interrupt at {transport!r}")
-
-            monkeypatch.setattr(codex_native_app_server, "client_for_transport", _no_app_server)
-
-        stopped = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"})
+        stopped = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": stop_event})
         assert stopped.status_code == 204, stopped.text
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.wait_for(turn, timeout=5)
@@ -3437,6 +3447,16 @@ async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_he
     # No Codex turn will close the turn's ``running`` edge, so the runner does.
     statuses = [e.get("status") for e in events if e.get("type") == "session.status"]
     assert statuses == ["idle"], events
+    if codex_state == "mcp-starting":
+        # The MCP startup is still stopped: its servers cancelled and the startup interrupt sent.
+        assert codex_native_bridge.read_mcp_startup(bridge_dir) == {
+            "storage-console": {"status": "cancelled", "error": None}
+        }
+        assert app_server.requests == [
+            ("turn/interrupt", {"threadId": "thread_codex_started", "turnId": ""})
+        ]
+    else:
+        assert app_server.requests == []
 
 
 class _StaleTurnCodexAppServerClient(_RecordingCodexAppServerClient):
