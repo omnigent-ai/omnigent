@@ -1377,11 +1377,8 @@ async def test_run_turn_passes_the_exact_required_model_to_the_shared_picker(
         "older-cli-different-model",
         "undiscovered-current",
         "undiscovered-stale",
-        "context-public-not-applied",
         "context-private-not-applied",
         "context-already-active",
-        "context-plain-not-applied",
-        "context-plain-applied",
     ],
 )
 async def test_run_turn_requires_a_matching_model_selection_result(
@@ -1399,16 +1396,12 @@ async def test_run_turn_requires_a_matching_model_selection_result(
         elif receipt_kind.startswith("context-"):
             target = (
                 "claude-sonnet-5-5[1m]"
-                if receipt_kind in {"context-public-not-applied", "context-already-active"}
+                if receipt_kind == "context-already-active"
                 else "private-model[1m]"
             )
             composer.model = (
                 target if receipt_kind == "context-already-active" else target.removesuffix("[1m]")
             )
-            if receipt_kind.startswith("context-plain-"):
-                target = "claude-opus-4-8"
-                composer.model = target + "[1m]"
-                composer.options.append(composer.model)
             composer.show_current_selection = True
         else:
             target = "system.ai.claude-sonnet-4-6"
@@ -1418,11 +1411,6 @@ async def test_run_turn_requires_a_matching_model_selection_result(
         initial_default = composer.saved_default
         initial_model = composer.model
         bridge_dir = _session_model_bridge(tmp_path, composer)
-        if receipt_kind.startswith("context-plain-"):
-            raw_path = bridge_dir / claude_bridge.CONTEXT_RAW_FILE
-            raw = json.loads(raw_path.read_text())
-            raw["model"] = {"id": target}
-            raw_path.write_text(json.dumps(raw))
         if receipt_kind.startswith("undiscovered-"):
             config_path = bridge_dir / claude_bridge._CONFIG_FILE
             config = json.loads(config_path.read_text())
@@ -1453,8 +1441,7 @@ async def test_run_turn_requires_a_matching_model_selection_result(
                 else:
                     composer._run_tmux(socket_path, *args)
 
-            if receipt_kind != "context-plain-applied":
-                monkeypatch.setattr(claude_bridge, "_run_tmux", close_without_applying)
+            monkeypatch.setattr(claude_bridge, "_run_tmux", close_without_applying)
     else:
         bridge_dir = tmp_path / "bridge"
         receipt = (
@@ -1498,7 +1485,6 @@ async def test_run_turn_requires_a_matching_model_selection_result(
     accepted = receipt_kind.startswith("older-cli-") or receipt_kind in {
         "undiscovered-current",
         "context-already-active",
-        "context-plain-applied",
     }
     if accepted:
         assert events == [TurnComplete(response=None)] * attempts

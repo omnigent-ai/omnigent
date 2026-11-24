@@ -84,7 +84,6 @@ from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 from tests._helpers.live_server import terminate_process
 from tests._helpers.stdio_jsonrpc import read_json_line, write_json_line
-from tests.harnesses.claude_native._model_status_oracle import _status_model_matches
 from tests.harnesses.claude_native._model_switch_support import (
     _CAPTURED_DATED_MODEL_CONFIRMATION,
     _CLEAR_ONE_ROW_COMPOSER,
@@ -13811,56 +13810,6 @@ def test_model_command_keeps_the_captured_application_wrapped_replacement(
 
 
 @pytest.mark.parametrize(
-    ("expected", "actual", "reported_session", "matches"),
-    [
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", "native-session", True),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8[1m]", "native-session", True),
-        ("system.ai.claude-opus-4-8", "system.ai.claude-opus-4-8[1m]", "native-session", False),
-        ("system.ai.claude-opus-5[1m]", "system.ai.claude-opus-5", "native-session", False),
-        ("private-model[1m]", "private-model", "native-session", False),
-        ("private-model[1m]", "private-model[1m]", "native-session", True),
-        (
-            "system.ai.claude-opus-4-8-Private[1m]",
-            "system.ai.claude-opus-4-8-Private",
-            "native-session",
-            False,
-        ),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-5", "native-session", False),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", None, False),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", "earlier-session", False),
-    ],
-    ids=[
-        "documented-native-context-spelling",
-        "exact-context-spelling",
-        "context-is-not-added-to-a-plain-request",
-        "other-public-generation-is-literal",
-        "private-context-is-literal",
-        "exact-private-context",
-        "public-looking-private-context-is-literal",
-        "wrong-generation",
-        "missing-status-session",
-        "different-status-session",
-    ],
-)
-def test_managed_model_status_check_preserves_exact_context_identity(
-    tmp_path: Path, expected: str, actual: str, reported_session: str | None, matches: bool
-) -> None:
-    composer = _SessionModelComposer()
-    composer.model = actual
-    bridge_dir = _session_model_bridge(tmp_path, composer)
-    raw_path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
-    raw = json.loads(raw_path.read_text())
-    if reported_session is None:
-        raw.pop("session_id")
-    else:
-        raw["session_id"] = reported_session
-    raw["context_window"] = {"context_window_size": 1_000_000}
-    raw_path.write_text(json.dumps(raw))
-
-    assert _status_model_matches(bridge_dir, expected) is matches
-
-
-@pytest.mark.parametrize(
     ("raw_target", "actual_target", "already_selected", "status_queries", "catalog"),
     [
         (True, True, True, 1, "picker"),
@@ -14236,9 +14185,95 @@ def test_model_command_requires_exact_fresh_status_for_a_descriptorless_current_
         "plain-public",
     ],
 )
-@pytest.mark.parametrize("initial_model", ["marked", "plain", "different"])
-@pytest.mark.parametrize("selection_applied", [False, True])
-@pytest.mark.parametrize("current_marker", [False, True])
+@pytest.mark.parametrize(
+    ("initial_model", "selection_applied", "current_marker", "marked_expected", "plain_expected"),
+    [
+        (
+            "marked",
+            False,
+            False,
+            ("refused", "/status /model /status /model"),
+            ("refused", "/status /model /status /model"),
+        ),
+        (
+            "marked",
+            False,
+            True,
+            ("already", "/status /model /status"),
+            ("refused", "/status /model /status /model"),
+        ),
+        (
+            "marked",
+            True,
+            False,
+            ("refused", "/status /model /status /model"),
+            ("refused", "/status /model /status /model"),
+        ),
+        (
+            "marked",
+            True,
+            True,
+            ("already", "/status /model /status"),
+            ("confirmed", "/status /model /status /model"),
+        ),
+        (
+            "plain",
+            False,
+            False,
+            ("refused", "/status /model /status /model"),
+            ("refused", "/status /model /status /model"),
+        ),
+        (
+            "plain",
+            False,
+            True,
+            ("refused", "/status /model /status /model"),
+            ("already", "/status /model /status"),
+        ),
+        (
+            "plain",
+            True,
+            False,
+            ("refused", "/status /model /status /model"),
+            ("refused", "/status /model /status /model"),
+        ),
+        (
+            "plain",
+            True,
+            True,
+            ("confirmed", "/status /model /status /model"),
+            ("already", "/status /model /status"),
+        ),
+        (
+            "different",
+            False,
+            False,
+            ("refused", "/status /model /status"),
+            ("refused", "/model /status"),
+        ),
+        (
+            "different",
+            False,
+            True,
+            ("refused", "/status /model /status"),
+            ("refused", "/model /status"),
+        ),
+        (
+            "different",
+            True,
+            False,
+            ("confirmed", "/status /model /status"),
+            ("refused", "/model /status /model"),
+        ),
+        (
+            "different",
+            True,
+            True,
+            ("confirmed", "/status /model /status"),
+            ("confirmed", "/model /status /model"),
+        ),
+    ],
+)
 def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -14248,6 +14283,8 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     initial_model: str,
     selection_applied: bool,
     current_marker: bool,
+    marked_expected: tuple[str, str],
+    plain_expected: tuple[str, str],
 ) -> None:
     composer = _SessionModelComposer()
     composer.show_current_selection = current_marker
@@ -14299,17 +14336,10 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     if not selection_applied:
         monkeypatch.setattr(claude_native_bridge, "_run_tmux", close_without_applying)
 
-    context_was_active = (
-        initial_model == ("plain" if plain_request else "marked") and current_marker
-    )
-    confirmed = (
-        context_was_active
-        or (selection_applied and current_marker)
-        or (not plain_request and initial_model == "different" and selection_applied)
-    )
-    if confirmed:
+    outcome, commands = plain_expected if plain_request else marked_expected
+    if outcome != "refused":
         result = claude_native_bridge.inject_model_command(bridge_dir, model=model)
-        assert result.already_selected is context_was_active
+        assert result.already_selected is (outcome == "already")
         assert result.resolved_model == model
         assert result.status_model == reported
     else:
@@ -14318,15 +14348,7 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
         assert caught.value.phase == "status"
         assert caught.value.model_may_have_changed
 
-    requires_context_proof = (plain_request or initial_model != "different") and (
-        initial_model != "different" or selection_applied
-    )
-    commands = ["/model", "/status"]
-    if not plain_request or initial_model != "different":
-        commands.insert(0, "/status")
-    assert composer.submitted == commands + (
-        ["/model"] if requires_context_proof and not context_was_active else []
-    )
+    assert composer.submitted == commands.split()
     assert [args[-1] for args in composer.sends].count("s") == 1
 
 

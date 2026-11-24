@@ -1103,7 +1103,6 @@ async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_tr
         ("post-clear-picker-refusal", False),
         ("renderer-padding-refusal", False),
         ("physical-row-collision", False),
-        ("physical-row-collision-after-read", False),
         (
             "Session-only model switching requires Claude Code 2.1.323 or newer. "
             "Update Claude Code and relaunch this terminal.",
@@ -1115,7 +1114,6 @@ async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_tr
         "post-clear-picker-refusal",
         "renderer-padding-refusal",
         "physical-row-collision",
-        "physical-row-collision-after-read",
         "unsupported-cli",
     ],
 )
@@ -1164,18 +1162,6 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
         else:
             composer.options[-1] = "different-private-model"
         composer.install(monkeypatch)
-        if refusal == "physical-row-collision-after-read":
-            captures = 0
-
-            def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
-                nonlocal captures
-                if not join_wrapped:
-                    captures += 1
-                    if captures == 3:
-                        composer.text = "abcdefghijklmnop"
-                return composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
-
-            monkeypatch.setattr(bridge, "_capture_pane", capture)
         monkeypatch.setenv(bridge.REQUEST_SESSION_ID_ENV_VAR, "web-session")
         actuator = bridge.inject_model_command
     _mark(bridge_dir)

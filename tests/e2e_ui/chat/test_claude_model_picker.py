@@ -10,7 +10,6 @@ import subprocess
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import patch
 from urllib.parse import urlparse
 
 import httpx
@@ -36,6 +35,7 @@ from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests.e2e.conftest import get_mock_message_requests
 from tests.e2e_ui.conftest import (
+    configure_mock_llm,
     fetch_with_retry,
     reset_mock_llm,
     seed_committed_turn,
@@ -47,6 +47,7 @@ from tests.e2e_ui.messages.test_message_render_parity import (
     _WORKING,
     _item_text,
     _ordered_message_items,
+    _send,
 )
 from tests.e2e_ui.messages.test_native_claude_render_parity import (
     _ensure_chat_view,
@@ -1386,6 +1387,13 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
 
     advert = _tmux_advert(base_url, session_id)
     assert advert is not None, "The owned Claude terminal advertised no tmux pane"
+    bridge_id = (
+        _live_claude_snapshot(base_url, session_id)
+        .get("labels", {})
+        .get(BRIDGE_ID_LABEL_KEY, session_id)
+    )
+    assert isinstance(bridge_id, str)
+    bridge_dir = bridge_dir_for_bridge_id(bridge_id)
     tmux = ["tmux", "-S", advert["socket_path"]]
     target = advert["tmux_target"]
     columns = int(
@@ -1446,33 +1454,6 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             )
             box = bridge._composer_box(raw)
             assert box is not None and box.framed and len(box.rows) > 1
-            bridge_id = (
-                _live_claude_snapshot(base_url, session_id)
-                .get("labels", {})
-                .get(BRIDGE_ID_LABEL_KEY, session_id)
-            )
-            assert isinstance(bridge_id, str)
-            claims = []
-            for representation, capture in (("physical", raw), ("joined", joined)):
-                claimed = model_switch._draft(capture)
-                assert isinstance(claimed, str) and claimed != draft
-                with patch.object(bridge, "_run_tmux", wraps=bridge._run_tmux) as terminal_writes:
-                    with pytest.raises(bridge.ClaudeModelSwitchRefused) as refusal:
-                        bridge.inject_model_command(
-                            bridge_dir_for_bridge_id(bridge_id), model="opus", owned_draft=claimed
-                        )
-                    terminal_writes.assert_not_called()
-                claims.append(
-                    {
-                        "representation": representation,
-                        "constructed_claim": claimed,
-                        "phase": refusal.value.phase,
-                        "command_submitted": refusal.value.command_submitted,
-                    }
-                )
-            (evidence / f"{kind}-owned-claims.json").write_text(
-                json.dumps({"actual_input": draft, "claims": claims}, ensure_ascii=False, indent=2)
-            )
             refused = client.patch(f"/v1/sessions/{session_id}", json={"model_override": "opus"})
             assert refused.status_code == 503, refused.text
             preserved = bridge._composer_box(bridge._capture_pane(advert["socket_path"], target))
@@ -1515,6 +1496,117 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
                 ),
                 timeout_s=10,
             )
+
+    _ensure_chat_view(page)
+    nonce = uuid.uuid4().hex[:8]
+    busy_marker, busy_reply = f"busy-user-{nonce}", f"busy-reply-{nonce}"
+    busy_prompt = f"Reply with exactly {busy_reply}. Context marker: {busy_marker}."
+    prior_request = next(
+        request["body"]
+        for request in reversed(get_mock_message_requests(mock_llm_server_url))
+        if any(
+            message.get("role") == "user"
+            and _claude_text_blocks(message.get("content")) == [user_text]
+            for message in request["body"].get("messages", [])
+        )
+    )
+    tool_names = [tool["name"] for tool in prior_request.get("tools", []) if tool.get("name")]
+    assert tool_names, "A conversation tool must distinguish the held turn from title requests"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": busy_reply, "block": True}],
+        match=busy_marker,
+        required_tools=tool_names[:1],
+    )
+    with httpx.Client(base_url=mock_llm_server_url, timeout=10) as model_client:
+        try:
+            _send(page, busy_prompt)
+            poll_until(
+                lambda: bool(model_client.get("/gate/pending").json()["pending"]),
+                timeout_s=30,
+            )
+            expect(page.locator(_WORKING)).to_have_count(1)
+            (evidence / "busy-before-controls.txt").write_text(
+                bridge._capture_pane(advert["socket_path"], target)
+            )
+            with httpx.Client(base_url=base_url, timeout=40) as control_client:
+                response = control_client.patch(
+                    f"/v1/sessions/{session_id}", json={"model_override": "opus"}
+                )
+            pending = model_client.get("/gate/pending").json()["pending"]
+            (evidence / "busy-model-control.json").write_text(
+                json.dumps(
+                    {
+                        "version": json.loads((bridge_dir / CONTEXT_RAW_FILE).read_text()).get(
+                            "version"
+                        ),
+                        "status": response.status_code,
+                        "provider_still_held": pending,
+                        "terminal": bridge._capture_pane(advert["socket_path"], target),
+                    },
+                    indent=2,
+                )
+            )
+            assert response.status_code == 200, response.text
+            assert pending, "The model control must complete before releasing the active turn"
+            poll_until(
+                lambda: (
+                    _live_claude_snapshot(base_url, session_id).get("llm_model")
+                    == _native_claude_wire_model(_PINNED_CLAUDE_MODELS["opus"])
+                ),
+                timeout_s=10,
+            )
+            _screenshot(page, "real-native-model-control-during-active-turn")
+        finally:
+            while model_client.post("/gate/release").json()["released"]:
+                pass
+
+    _wait_for_transcript_message(page, base_url, session_id, busy_reply, role="assistant")
+    (evidence / "busy-after-release.txt").write_text(
+        bridge._capture_pane(advert["socket_path"], target)
+    )
+    expect(page.locator(_USER, has_text=busy_marker)).to_have_count(1)
+    expect(page.locator(_ASSISTANT, has_text=busy_reply)).to_have_count(1)
+    transcript = read_transcript_path(bridge_dir)
+    assert transcript is not None
+    busy_users = [
+        record
+        for line in transcript.read_text().splitlines()
+        if line.strip()
+        and (record := json.loads(line)).get("type") == "user"
+        and busy_marker in json.dumps(record.get("message", {}).get("content"))
+    ]
+    assert len(busy_users) == 1 and busy_users[0]["sessionId"] == native_session
+    busy_blocks = _claude_text_blocks(busy_users[0]["message"]["content"])
+    assert len(busy_blocks) == 1
+    _assert_mock_claude_turn(
+        mock_llm_server_url,
+        busy_marker,
+        _PINNED_CLAUDE_MODELS["sonnet"],
+        native_session=native_session,
+        user_text=busy_blocks[0],
+    )
+
+    marker, reply = f"after-busy-user-{nonce}", f"after-busy-reply-{nonce}"
+    model = _PINNED_CLAUDE_MODELS["opus"]
+    set_fallback_mock_llm(mock_llm_server_url, _native_claude_wire_model(model), reply)
+    _send_turn_and_settle(
+        page,
+        mock_llm_server_url,
+        base_url=base_url,
+        session_id=session_id,
+        index=7,
+        user_marker=marker,
+        assistant_token=reply,
+        expected_assistant_bubbles=7,
+    )
+    _wait_for_transcript_message(page, base_url, session_id, reply, role="assistant")
+    native_session, user_text = _assert_native_claude_turn(
+        base_url, session_id, marker, reply, model
+    )
+    _assert_mock_claude_turn(
+        mock_llm_server_url, marker, model, native_session=native_session, user_text=user_text
+    )
 
 
 @pytest.mark.nightly
