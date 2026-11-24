@@ -78,19 +78,26 @@ async def _forward_events(
 ) -> None:
     """Drive Codex events through the real forwarder into the live server."""
     tracker = codex_native_forwarder._CodexElicitationTaskTracker()
-    async with httpx.AsyncClient(base_url=base_url) as client:
-        for event in events:
-            await codex_native_forwarder._handle_event(
-                client,
-                session_id=session_id,
-                bridge_dir=Path(),
-                event=event,
-                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(client, session_id),
-                elicitation_tracker=tracker,
-                expected_thread_id=_PARENT_THREAD,
-                forwarder_state=state,
-            )
-    await tracker.close()
+    try:
+        async with httpx.AsyncClient(base_url=base_url) as client:
+            try:
+                for event in events:
+                    await codex_native_forwarder._handle_event(
+                        client,
+                        session_id=session_id,
+                        bridge_dir=Path(),
+                        event=event,
+                        usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
+                            client, session_id
+                        ),
+                        elicitation_tracker=tracker,
+                        expected_thread_id=_PARENT_THREAD,
+                        forwarder_state=state,
+                    )
+            finally:
+                await state.close_child_streams()
+    finally:
+        await tracker.close()
 
 
 def _forward_events_sync(
