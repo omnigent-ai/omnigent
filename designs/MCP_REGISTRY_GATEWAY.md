@@ -341,10 +341,11 @@ finish. A refresh cannot recreate a connection deleted while it was in progress.
 An OAuth callback already exchanging its code can still save a connection after
 disconnect; cancellation of that in-flight exchange remains a prototype limit.
 
-KMS-backed connections must fit within 4096 bytes after JSON serialization and
-UTF-8 encoding, including both access and refresh tokens. Oversized credentials
-are rejected before encryption with an operator-facing message; use the existing
-Vault Transit backend for larger grants. OAuth connection failures return to the
+KMS-backed connections larger than 4096 bytes after JSON serialization and
+UTF-8 encoding, including both access and refresh tokens, are envelope-encrypted
+with a KMS data key (see `CREDENTIAL_STORE.md`), which needs the
+`kms:GenerateDataKey` permission; smaller ones keep the single `kms:Encrypt`
+call. OAuth connection failures return to the
 UI as sign-in errors, with the storage-limit diagnosis in the server log.
 
 ## Gateway versus credential broker

@@ -77,11 +77,20 @@ path. The store depends on this port, not on a concrete backend, so the KMS
 implementation can be swapped for GCP/Azure KMS or Vault Transit without a
 schema change.
 
-`KmsSecretCipher` is the implementation: `encrypt` is one `kms:Encrypt` call
-under the configured key with `context` as the KMS encryption context; the
-returned ciphertext blob is stored base64. Blobs are small (a token JSON
-object), well under the 4 KB `Encrypt` limit, so no envelope/data-key layer is
-needed. `decrypt` is `kms:Decrypt` with the same context.
+`KmsSecretCipher` is the implementation. A secret up to 4096 serialized bytes
+is one `kms:Encrypt` call under the configured key with `context` as the KMS
+encryption context, and the returned ciphertext blob is stored base64. A larger
+secret, such as an OAuth access and refresh token pair from some providers,
+exceeds the `Encrypt` limit and is envelope-encrypted instead:
+`kms:GenerateDataKey` (AES-256) under the same key and context returns a data
+key, the secret is sealed locally with AES-256-GCM using the canonical context
+as associated data, and the row stores
+`kms-envelope-v1:<b64 encrypted data key>:<b64 nonce>:<b64 ciphertext>`.
+`decrypt` recognises the prefix: envelopes are opened with `kms:Decrypt` of the
+data key under the same context, and anything else is a direct blob decrypted
+as before, so rows written before envelopes existed keep working. Only
+deployments that store large secrets need the `kms:GenerateDataKey`
+permission.
 
 `build_secret_cipher()` is the single seam where a deployment selects the
 backend; it reads the **store-level** key `OMNIGENT_CREDENTIAL_KMS_KEY_ID` (id,
