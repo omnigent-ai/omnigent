@@ -4745,32 +4745,57 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     store.set_pending_elicitation_count(session_id, 0)
 
 
-async def test_get_session_repairs_stale_pending_count_while_holding_the_runner(
+@pytest.mark.parametrize(
+    ("holds_runner", "child_counts_prompt", "expected_count"),
+    [
+        pytest.param(True, False, 0, id="repairs-on-runner-replica"),
+        pytest.param(False, False, 1, id="keeps-count-off-runner-replica"),
+        pytest.param(True, True, 1, id="keeps-child-prompt-from-another-replica"),
+    ],
+)
+async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
     app: FastAPI,
     client: httpx.AsyncClient,
     db_uri: str,
+    holds_runner: bool,
+    child_counts_prompt: bool,
+    expected_count: int,
 ) -> None:
-    """Opening a session repairs a stored pending count its runner's replica does not hold.
+    """Opening a session repairs its stored pending count only from a complete index.
 
     A prompt recorded on one replica and resolved on another leaves the stored
     count at 1, so the list keeps showing a prompt the snapshot no longer has.
-    The replica holding the session's runner has the authoritative index, so
-    its snapshot read rewrites the stored count.
+    The replica holding the session's runner repairs the count, unless a child
+    counts a prompt: another replica may have recorded that prompt and mirrored
+    it into this session's count. A replica without the runner leaves it alone.
 
     :param app: The app behind ``client``; its tunnel registry gets the runner.
     :param client: Test HTTP client backed by the real app.
-    :param db_uri: The app's DB, opened directly to seed the stale row.
+    :param db_uri: The app's DB, opened directly to seed the stored counts.
+    :param holds_runner: Whether this replica holds the session's runner.
+    :param child_counts_prompt: Whether a child counts a prompt held elsewhere.
+    :param expected_count: The listed count once the session has been opened.
     """
     from omnigent.runtime import pending_elicitations
+    from omnigent.server import session_live_state
 
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     session_id = session["id"]
     pending_elicitations.reset_for_tests()
-    register_test_runner(app, "runner_stale_pending")
+    if holds_runner:
+        register_test_runner(app, "runner_stale_pending")
     store = SqlAlchemyConversationStore(db_uri)
     assert store.set_runner_id(session_id, "runner_stale_pending")
     store.set_pending_elicitation_count(session_id, 1)
+    if child_counts_prompt:
+        child = store.create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=session_id,
+            agent_id=agent["id"],
+            runner_id="runner_child_replica",
+        )
+        store.set_pending_elicitation_count(child.id, 1)
 
     async def listed_count() -> int:
         resp = await client.get("/v1/sessions")
@@ -4787,12 +4812,9 @@ async def test_get_session_repairs_stale_pending_count_while_holding_the_runner(
     )
     assert resp.status_code == 200
     assert resp.json()["pending_elicitations"] == []
-
-    for _ in range(400):
-        if await listed_count() == 0:
-            break
-        await asyncio.sleep(0.025)
-    assert await listed_count() == 0
+    # One worker applies live-state writes in order, so this lands after any repair.
+    await asyncio.wrap_future(session_live_state.submit("test barrier", lambda: None))
+    assert await listed_count() == expected_count
 
 
 async def test_get_session_includes_runner_online(
