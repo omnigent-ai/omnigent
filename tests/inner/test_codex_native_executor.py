@@ -21,8 +21,11 @@ import omnigent.inner.codex_native_executor as codex_native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
+    CODEX_STARTUP_PENDING_CODE,
     CodexNativeBridgeState,
     clear_active_turn_id_if_matches,
+    clear_bridge_startup_error,
+    end_startup_pending,
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
@@ -36,8 +39,10 @@ from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
+    ExecutorWait,
     InjectionDeliveryAmbiguous,
     NativeTurnAcceptance,
+    TextChunk,
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_cache_dir
@@ -3929,6 +3934,94 @@ def test_run_turn_surfaces_coded_startup_failure(
     assert "HQ7M-2KPD" not in str(record.attributes)
 
 
+def _publish_started_thread(bridge_dir: Path) -> None:
+    """Publish bridge state, then clear the record, in the runner's thread-start order."""
+    _start_state(bridge_dir)
+    clear_bridge_startup_error(bridge_dir)
+
+
+def _record_sign_in_prompt(bridge_dir: Path) -> None:
+    """Replace the still-starting record with the one a later sign-in prompt leaves."""
+    write_bridge_startup_error(
+        bridge_dir,
+        "Codex is waiting for a sign-in in this session's terminal.",
+        code="databricks_sign_in_pending",
+        title="Codex can't start until you sign in to Databricks",
+        remediation="Open the sign-in link and sign in.",
+    )
+
+
+@pytest.mark.parametrize(
+    ("startup_outcome", "expected_error_code"),
+    [
+        (_publish_started_thread, None),
+        (_record_sign_in_prompt, "databricks_sign_in_pending"),
+        (end_startup_pending, "codex_app_server_stopped"),
+    ],
+    ids=["thread-started", "sign-in-prompt", "launch-ended"],
+)
+def test_run_turn_holds_the_message_while_codex_is_still_starting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    startup_outcome: Callable[[Path], None],
+    expected_error_code: str | None,
+) -> None:
+    """
+    A still-starting record holds the message until startup resolves, instead of failing it.
+
+    The runner records that Codex is still starting when its pane outlives the
+    thread-start budget, then keeps waiting. The turn says once why the message
+    waits and keeps polling: a thread start delivers the message exactly once,
+    while a sign-in prompt or the launch ending fails it, undelivered, with that cause.
+    """
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    hold_polls: list[float] = []
+
+    async def _resolve_startup_on_second_poll(seconds: float) -> None:
+        hold_polls.append(seconds)
+        if len(hold_polls) == 2:
+            startup_outcome(tmp_path)
+
+    monkeypatch.setattr(asyncio, "sleep", _resolve_startup_on_second_poll)
+    write_bridge_startup_error(
+        tmp_path,
+        "Codex is still starting in this session's terminal.",
+        code=CODEX_STARTUP_PENDING_CODE,
+        title="Codex is still starting",
+    )
+    write_bridge_startup_timeout(tmp_path, 120.0)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    notice, *waits, outcome = events
+    assert isinstance(notice, TextChunk)
+    assert "your message will be sent once it's ready" in notice.text.lower()
+    # A keep-alive per check refreshes only the idle watchdog while the message waits.
+    assert [type(event) for event in waits] == [ExecutorWait, ExecutorWait]
+    assert hold_polls == [0.25, 0.25]
+    if expected_error_code is None:
+        assert isinstance(outcome, TurnComplete)
+        assert _FakeCodexNativeClient.requests == [
+            (
+                "turn/start",
+                {
+                    "threadId": "thread_123",
+                    "input": [{"type": "text", "text": "hello"}],
+                    "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
+                },
+            )
+        ]
+    else:
+        assert isinstance(outcome, ExecutorError)
+        assert outcome.code == expected_error_code
+        assert outcome.undelivered is True
+        assert _FakeCodexNativeClient.requests == []
+
+
 class _UnreachableClient(_FakeCodexNativeClient):
     """Fail the connect the way a vanished app-server does; ``error`` says how."""
 
@@ -4420,24 +4513,36 @@ def test_bridge_state_polling_backs_off_after_fast_window(
     assert isinstance(events[0], ExecutorError)
 
 
+@pytest.mark.parametrize("startup_pending", [False, True], ids=["bounded-wait", "startup-hold"])
 @pytest.mark.asyncio
-async def test_cancelled_bridge_polling_wait_exits_cleanly(tmp_path: Path) -> None:
-    """Cancelling a queued first turn interrupts its polling sleep."""
+async def test_cancelled_bridge_polling_wait_exits_cleanly(
+    tmp_path: Path, startup_pending: bool
+) -> None:
+    """Cancelling a queued first turn interrupts its polling sleep, also while Codex starts."""
+    if startup_pending:
+        write_bridge_startup_error(
+            tmp_path, "Codex is still starting.", code=CODEX_STARTUP_PENDING_CODE
+        )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    events: list[object] = []
 
     async def _drive() -> None:
-        async for _event in executor.run_turn(
+        async for event in executor.run_turn(
             [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
             [],
             "",
         ):
-            pass
+            events.append(event)
 
     task = asyncio.create_task(_drive())
     await asyncio.sleep(0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    # A held message ends with its notice alone: nothing failed and nothing was sent.
+    assert [type(event) for event in events] == (
+        [TextChunk, ExecutorWait] if startup_pending else []
+    )
 
 
 @pytest.mark.parametrize(

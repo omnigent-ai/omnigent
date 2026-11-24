@@ -4783,6 +4783,185 @@ async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_before
     assert record_at_forwarding == [None]
 
 
+class _ScriptedCodexPane:
+    """A live Codex pane whose screen text the test changes as the launcher moves on."""
+
+    diagnostic_id = "terminal-1"
+
+    def __init__(self, screen: str) -> None:
+        self.screen = screen
+
+    async def is_alive(self) -> bool:
+        return True
+
+    async def read(self, scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        del scrollback, join_wrapped
+        return {"screen": self.screen}
+
+
+class _ClosableStub:
+    """The discovery wait's event client and app-server, closed on teardown."""
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_after_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A sign-in prompt the pane shows after the still-starting record replaces that record.
+
+    A chat turn waits on the still-starting record rather than failing, so the
+    wait keeps watching the pane: a launcher that only later asks for a sign-in
+    must still turn the waiting message into the sign-in card. Once the thread
+    starts, the bridge state is published before the record is cleared, so a
+    waiting turn always sees one or the other.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+    from omnigent.runner.native import orchestration
+
+    pane = _ScriptedCodexPane("launcher: login failed, retrying in 6 seconds...\n")
+    wait_calls: list[dict[str, object]] = []
+    records_seen: list[str | None] = []
+    state_published_at_clear: list[bool] = []
+    real_clear = codex_native_bridge.clear_bridge_startup_error
+
+    async def _fake_wait(*_args: object, **kwargs: object) -> str:
+        wait_calls.append(kwargs)
+        if len(wait_calls) == 1:
+            raise TimeoutError
+        failure = codex_native_bridge.read_bridge_startup_failure(tmp_path)
+        records_seen.append(failure.code if failure is not None else None)
+        if len(wait_calls) == 2:
+            pane.screen = (
+                "launcher: Sign in to continue:\n"
+                "  https://signin.example.com/device\n  code: HQ7M-2KPD\nwaiting for sign-in...\n"
+            )
+            await asyncio.sleep(3600.0)
+        return "019e96aa-abcd-7343-8d3b-6f914d60936b"
+
+    def _record_clear(bridge_dir: Path) -> None:
+        state_published_at_clear.append(
+            codex_native_bridge.read_bridge_state(bridge_dir) is not None
+        )
+        real_clear(bridge_dir)
+
+    async def _fake_supervise(**_kwargs: object) -> None:
+        records_seen.append(codex_native_bridge.read_bridge_startup_error(tmp_path))
+
+    real_async_client = httpx.AsyncClient
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(orchestration, "_CODEX_SIGN_IN_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setattr(codex_native_bridge, "clear_bridge_startup_error", _record_clear)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
+
+    session_id = "5e2c1f6a8d0b4c4e9a3f7d1b2c4e6a8f"
+    app_server = _ClosableStub()
+    _AUTO_CODEX_APP_SERVERS[session_id] = app_server  # type: ignore[assignment]
+    try:
+        await asyncio.wait_for(
+            _codex_discover_thread_and_forward(
+                session_id=session_id,
+                bridge_dir=tmp_path,
+                codex_ws_url="ws://127.0.0.1:1",
+                codex_home=tmp_path / "codex-home",
+                workspace=str(tmp_path / "workspace"),
+                event_client=_ClosableStub(),  # type: ignore[arg-type]
+                routing_summary="provider 'test' (model=gpt-test)",
+                app_server=app_server,  # type: ignore[arg-type]
+                terminal_instance=pane,  # type: ignore[arg-type]
+                thread_start_timeout_seconds=120.0,
+            ),
+            timeout=10.0,
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    assert wait_calls == [{"timeout": 120.0}, {"timeout": None}, {"timeout": None}]
+    # Still starting, then the sign-in prompt, then cleared by the time forwarding starts.
+    assert records_seen == ["agent_startup_pending", "databricks_sign_in_pending", None]
+    assert state_published_at_clear == [True]
+
+
+@pytest.mark.asyncio
+async def test_codex_discover_thread_and_forward_ends_a_still_starting_record_on_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A launch torn down while Codex is still starting leaves a record that ends a waiting turn.
+
+    Only the thread start clears the still-starting record, and a chat turn
+    waits on it. When the pane is closed or the session ends first, the record
+    says the app-server stopped, so that turn fails instead of waiting on.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    still_starting = asyncio.Event()
+
+    async def _fake_wait(*_args: object, **kwargs: object) -> str:
+        if kwargs["timeout"] is not None:
+            raise TimeoutError
+        still_starting.set()
+        await asyncio.sleep(3600.0)
+        raise AssertionError("the launch is torn down before Codex starts")
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+
+    session_id = "6f3d2a7b9e1c4d5fa4b8c2e3d5f7a9b1"
+    app_server = _ClosableStub()
+    _AUTO_CODEX_APP_SERVERS[session_id] = app_server  # type: ignore[assignment]
+    try:
+        discovery = asyncio.create_task(
+            _codex_discover_thread_and_forward(
+                session_id=session_id,
+                bridge_dir=tmp_path,
+                codex_ws_url="ws://127.0.0.1:1",
+                codex_home=tmp_path / "codex-home",
+                workspace=str(tmp_path / "workspace"),
+                event_client=_ClosableStub(),  # type: ignore[arg-type]
+                routing_summary="provider 'test' (model=gpt-test)",
+                app_server=app_server,  # type: ignore[arg-type]
+                terminal_instance=_ScriptedCodexPane("Loading configuration...\n"),  # type: ignore[arg-type]
+                thread_start_timeout_seconds=120.0,
+            )
+        )
+        await asyncio.wait_for(still_starting.wait(), timeout=10.0)
+        assert codex_native_bridge.read_bridge_startup_failure(tmp_path).code == (
+            "agent_startup_pending"
+        )
+        discovery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await discovery
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    failure = codex_native_bridge.read_bridge_startup_failure(tmp_path)
+    assert failure == codex_native_bridge.CODEX_APP_SERVER_STOPPED
+
+
 @pytest.mark.parametrize(
     ("role", "backend_alive", "startup_error", "expected"),
     [
