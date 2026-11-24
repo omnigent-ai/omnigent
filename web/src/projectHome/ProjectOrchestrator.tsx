@@ -197,7 +197,7 @@ export function ProjectPersonaChat({
 
 function OrchestratorChat({ sessionId }: { sessionId: string }) {
   const agent = useSessionAgent(sessionId);
-  const presentation = useAgentChatPresentation(agent.isError ? undefined : agent.data);
+  const presentation = useAgentChatPresentation(agent.isError ? undefined : agent.data, "Lead");
   return (
     <RenderErrorBoundary name="chat" resetKey={sessionId}>
       <FullSessionChat

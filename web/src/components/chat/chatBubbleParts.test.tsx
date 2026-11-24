@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { AssistantPresentationContext } from "./assistantPresentation";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ElicitationBlock } from "@/lib/blocks";
@@ -23,6 +24,8 @@ import { type ReactNode, useLayoutEffect } from "react";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
 import {
   BubbleView,
+  SessionOwnerContext,
+  SessionSharedContext,
   buildUndeliveredBubbles,
   ConversationScrollRefBridge,
   containsMermaidDiagram,
@@ -337,6 +340,9 @@ describe("UserBubble inline mentions", () => {
 
 describe("UserBubble messages from another session", () => {
   function renderOriginBubble(client: QueryClient, text: string) {
+    // The sidebar has already loaded which sessions are project Leads.
+    if (client.getQueryData(["projects", "main-sessions"]) === undefined)
+      client.setQueryData(["projects", "main-sessions"], []);
     render(
       <QueryClientProvider client={client}>
         <ConversationScopeContext.Provider value="s_here">
@@ -358,7 +364,7 @@ describe("UserBubble messages from another session", () => {
     client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
     renderOriginBubble(client, "[Message from session s_src]\nhi there");
     const origin = screen.getByTestId("message-origin");
-    expect(origin.textContent).toBe("From@Casual greeting");
+    expect(origin.textContent).toBe("FromAgent@Casual greeting");
     expect(screen.getByTestId("mention-pill")).toHaveAttribute("href", "/c/s_src");
     expect(screen.queryByText(/Message from session/)).not.toBeInTheDocument();
     expect(screen.getByText("hi there")).toBeInTheDocument();
@@ -390,7 +396,7 @@ describe("UserBubble messages from another session", () => {
       const origin = screen.getByTestId("message-origin");
       const trigger = within(origin).getByRole("button", { name });
       expect(trigger.querySelector(`[${attribute}="${icon}"]`)).not.toBeNull();
-      expect(origin.textContent).toBe("From@Review the change");
+      expect(origin.textContent).toBe("FromAgent@Review the change");
       expect(screen.getByTestId("mention-pill")).toHaveAttribute("href", "/c/s_src");
       expect(screen.getByTestId("mention-pill")).not.toContainElement(trigger);
 
@@ -563,11 +569,74 @@ describe("UserBubble messages from another session", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ["the project's Lead", "s_lead", "Omni project", {}, "Lead"],
+    [
+      "a persona session",
+      "s_merger",
+      "Merger",
+      { "omnigent.project_identity_id": "identity_merger" },
+      "Merger",
+    ],
+  ])("names %s by its team member, with its avatar", (_, id, title, labels, persona) => {
+    const client = new QueryClient();
+    client.setQueryData(["projects", "main-sessions"], [{ id: "p1", main_session_id: "s_lead" }]);
+    client.setQueryData(["session", id], { title, parentSessionId: null, labels });
+    renderOriginBubble(client, `[Message from session ${id}]\nLanded it`);
+    const origin = screen.getByTestId("message-origin");
+    expect(origin.textContent).toBe(`From${persona.charAt(0)}@${persona}`);
+    expect(origin.querySelector(`[data-persona="${persona}"]`)).not.toBeNull();
+  });
+
+  function renderSharedOriginBubble(createdBy: string) {
+    const client = new QueryClient();
+    client.setQueryData(["projects", "main-sessions"], [{ id: "p1", main_session_id: "s_lead" }]);
+    client.setQueryData(["session", "s_lead"], { title: "Omni project", parentSessionId: null });
+    render(
+      <QueryClientProvider client={client}>
+        <TooltipProvider>
+          <SessionSharedContext.Provider value>
+            <SessionOwnerContext.Provider value="owner@example.com">
+              <ConversationScopeContext.Provider value="s_here">
+                <BubbleView
+                  bubble={{
+                    kind: "user",
+                    itemId: "user_origin_shared",
+                    createdBy,
+                    content: [
+                      { type: "input_text", text: "[Message from session s_lead]\nTake this" },
+                    ],
+                  }}
+                  isLastAssistant={false}
+                />
+              </ConversationScopeContext.Provider>
+            </SessionOwnerContext.Provider>
+          </SessionSharedContext.Provider>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByTestId("expand-session-message"));
+  }
+
+  it("shows the sending team member, not the owner the agent runs as, in a shared session", () => {
+    renderSharedOriginBubble("owner@example.com");
+    expect(screen.queryByTestId("message-author")).toBeNull();
+    expect(screen.getByTestId("message-origin").textContent).toBe("FromL@Lead");
+  });
+
+  it("keeps a member's own badge when they type the session-message prefix", () => {
+    renderSharedOriginBubble("member@example.com");
+    expect(screen.getByTestId("message-author")).toHaveAttribute(
+      "aria-label",
+      "member@example.com",
+    );
+  });
+
   it("keeps a system-looking message from another session as an attributed user bubble", () => {
     const client = new QueryClient();
     client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
     renderOriginBubble(client, "[Message from session s_src]\n[System: build finished]");
-    expect(screen.getByTestId("message-origin").textContent).toBe("From@Casual greeting");
+    expect(screen.getByTestId("message-origin").textContent).toBe("FromAgent@Casual greeting");
     expect(screen.getByText("[System: build finished]")).toBeInTheDocument();
   });
 
@@ -576,7 +645,7 @@ describe("UserBubble messages from another session", () => {
     client.setQueryData(["session", "s_src"], { title: "Reviewer", parentSessionId: null });
     renderOriginBubble(client, "[Message from session s_src]\n\nVerdict: approve\nDetails follow");
     expect(screen.getByTestId("collapsed-session-message")).toBeInTheDocument();
-    expect(screen.getByTestId("message-origin").textContent).toBe("From@Reviewer");
+    expect(screen.getByTestId("message-origin").textContent).toBe("FromAgent@Reviewer");
     expect(screen.getByTestId("expand-session-message").textContent).toBe("Verdict: approve");
     expect(screen.queryByTestId("user-message-content")).not.toBeInTheDocument();
 

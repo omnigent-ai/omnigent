@@ -8,6 +8,7 @@ import type { ChatPresentation } from "./assistantPresentation";
 /** The same bound-agent identity in project Chat and the full session transcript. */
 export function useAgentChatPresentation(
   agent: Pick<Agent, "name" | "harness" | "description"> | undefined,
+  persona: string | null = null,
 ): ChatPresentation {
   return useMemo<ChatPresentation>(() => {
     const identity = agent
@@ -17,7 +18,7 @@ export function useAgentChatPresentation(
     return {
       header: () => (
         <div className="flex shrink-0 justify-center">
-          <AgentChatIdentity agent={agent} compact />
+          <AgentChatIdentity agent={agent} persona={persona} compact />
         </div>
       ),
       assistant: {
@@ -25,5 +26,5 @@ export function useAgentChatPresentation(
         icon: <ComposerAgentIcon agent={identity} />,
       },
     };
-  }, [agent]);
+  }, [agent, persona]);
 }

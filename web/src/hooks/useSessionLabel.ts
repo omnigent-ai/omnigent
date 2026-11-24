@@ -11,6 +11,8 @@ export interface SessionLabel {
   title: string;
   isSubagent: boolean;
   agent: SessionAgentIdentity | null;
+  /** Session labels, e.g. the project identity a persona session works for. */
+  labels?: Record<string, string>;
 }
 
 /**
@@ -58,17 +60,20 @@ export function useSessionLabel(
         harness: row.harness ?? session?.harness,
         labels: row.labels,
       }),
+      labels: row.labels ?? session?.labels,
     };
   if (child)
     return {
       title: childPrimaryLabel(child),
       isSubagent: true,
       agent: sessionAgentIdentity({ ...session, labels: child.labels }),
+      labels: child.labels,
     };
   if (!session) return null;
   return {
     title: session.title || "Untitled session",
     isSubagent: !!session.parentSessionId,
     agent: sessionAgentIdentity(session),
+    labels: session.labels,
   };
 }

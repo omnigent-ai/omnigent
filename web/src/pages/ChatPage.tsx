@@ -205,6 +205,7 @@ export {
 export type { ConversationScroller } from "@/components/chat/chatBubbleParts";
 import {
   type ConversationScroller,
+  SessionOwnerContext,
   SessionSharedContext,
   computeIsTurnActive,
   computeIsWorking,
@@ -336,6 +337,7 @@ import {
 import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
 import { useAgentChatPresentation } from "@/components/chat/useAgentChatPresentation";
+import { useSessionPersona } from "@/hooks/useSessionPersona";
 
 /**
  * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
@@ -1300,44 +1302,46 @@ export function ChatPage() {
 
   return (
     <SessionSharedContext.Provider value={isSessionShared}>
-      <SessionLayout mainAgent={mainAgent} />
-      <ReconnectSessionDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
-        localReconnect={localReconnect}
-        arcaReconnect={arcaReconnect}
-        conversationId={urlConvId}
-        serverUrl={getCliServerUrl()}
-        wrapper={activeConv?.labels?.["omnigent.wrapper"]}
-        harness={activeSession?.harness}
-        state={reconnectState}
-        isOwner={reconnectIsOwner}
-        // Source prefill for the Clone tab's fork form. Mirrors AppShell's
-        // ForkSessionDialog wiring; the title additionally falls back to the
-        // sidebar row, which ChatPage has at hand.
-        sourceTitle={activeConv?.title ?? activeSession?.title}
-        sourceWorkspace={activeSession?.workspace}
-        sourceHostId={activeSession?.hostId}
-        sourceGitBranch={activeSession?.gitBranch}
-      />
-      {((isUnboundFork && forkSourceId) || canResumeOnLocalHost) && (
-        <ResumeWithDirectoryDialog
-          open={resumeDirDialogOpen}
-          onOpenChange={setResumeDirDialogOpen}
-          sessionId={urlConvId}
-          // Fork clone prefills from its source; a host-less session has none
-          // and prefills from its own recorded host/workspace/branch instead.
-          sourceSessionId={isUnboundFork ? forkSourceId : null}
-          prefill={{
-            hostId: activeSession?.hostId ?? null,
-            workspace: activeSession?.workspace ?? null,
-            gitBranch: activeSession?.gitBranch ?? null,
-          }}
+      <SessionOwnerContext.Provider value={sessionOwner}>
+        <SessionLayout mainAgent={mainAgent} />
+        <ReconnectSessionDialog
+          open={dialogOpen}
+          onOpenChange={setDialogOpen}
+          localReconnect={localReconnect}
+          arcaReconnect={arcaReconnect}
+          conversationId={urlConvId}
           serverUrl={getCliServerUrl()}
           wrapper={activeConv?.labels?.["omnigent.wrapper"]}
           harness={activeSession?.harness}
+          state={reconnectState}
+          isOwner={reconnectIsOwner}
+          // Source prefill for the Clone tab's fork form. Mirrors AppShell's
+          // ForkSessionDialog wiring; the title additionally falls back to the
+          // sidebar row, which ChatPage has at hand.
+          sourceTitle={activeConv?.title ?? activeSession?.title}
+          sourceWorkspace={activeSession?.workspace}
+          sourceHostId={activeSession?.hostId}
+          sourceGitBranch={activeSession?.gitBranch}
         />
-      )}
+        {((isUnboundFork && forkSourceId) || canResumeOnLocalHost) && (
+          <ResumeWithDirectoryDialog
+            open={resumeDirDialogOpen}
+            onOpenChange={setResumeDirDialogOpen}
+            sessionId={urlConvId}
+            // Fork clone prefills from its source; a host-less session has none
+            // and prefills from its own recorded host/workspace/branch instead.
+            sourceSessionId={isUnboundFork ? forkSourceId : null}
+            prefill={{
+              hostId: activeSession?.hostId ?? null,
+              workspace: activeSession?.workspace ?? null,
+              gitBranch: activeSession?.gitBranch ?? null,
+            }}
+            serverUrl={getCliServerUrl()}
+            wrapper={activeConv?.labels?.["omnigent.wrapper"]}
+            harness={activeSession?.harness}
+          />
+        )}
+      </SessionOwnerContext.Provider>
     </SessionSharedContext.Provider>
   );
 }
@@ -1614,8 +1618,10 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  const { persona } = useSessionPersona(conversationId ?? null, null);
   const presentation = useAgentChatPresentation(
     agents?.find((agent) => agent.id === selectedAgentId),
+    persona,
   );
   // Streaming-hot subscriptions and the bubble pipeline live in <Transcript>.
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden

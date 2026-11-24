@@ -74,7 +74,8 @@ import { cn } from "@/lib/utils";
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
-import { useSessionLabel } from "@/hooks/useSessionLabel";
+import { useSessionPersona } from "@/hooks/useSessionPersona";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
@@ -131,6 +132,8 @@ function sliceByCodePoint(str: string, limit: number): string {
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
 export const SessionSharedContext = createContext(false);
+/** The session's owner: the identity its agents, and their messages, run as. */
+export const SessionOwnerContext = createContext<string | null>(null);
 
 /** A user message's raw text, minus runtime context and any sender prefix. */
 function userMessageBody(content: MessageContentBlock[]): string {
@@ -153,7 +156,7 @@ function userMarkdownText(content: MessageContentBlock[]): string {
   return replaceSentMentions(userMessageBody(content), mentionPillMarkdown).trimEnd();
 }
 
-/** "From @<sender>" above a message another session sent with ``sys_session_message``. */
+/** "From <team member>" above a message another session sent with ``sys_session_message``. */
 function SessionMessageOriginLine({
   sourceId,
   currentSessionId,
@@ -163,7 +166,7 @@ function SessionMessageOriginLine({
   currentSessionId: string | null;
   className?: string;
 }) {
-  const label = useSessionLabel(sourceId, currentSessionId);
+  const { label, persona } = useSessionPersona(sourceId, currentSessionId);
   return (
     <div
       data-testid="message-origin"
@@ -171,10 +174,15 @@ function SessionMessageOriginLine({
     >
       <CornerDownRightIcon className="size-3 shrink-0" />
       <span>From</span>
-      {label?.agent && <SessionAgentIcon agent={label.agent} />}
+      {persona ? (
+        <PersonaAvatar name={persona} size="xs" />
+      ) : (
+        label?.agent && <SessionAgentIcon agent={label.agent} />
+      )}
+      {label && !persona && <span>Agent</span>}
       {label ? (
         <SessionMentionPill id={sourceId} isSubagent={label.isSubagent}>
-          @{label.title}
+          @{persona ?? label.title}
         </SessionMentionPill>
       ) : (
         <span>another session</span>
@@ -1101,6 +1109,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useScopedConversationId();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  const sessionOwner = useContext(SessionOwnerContext);
   const editSentMessage = useContext(EditSentMessageContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
   //   imported inline data URI, an in-flight upload chip, or a placeholder
@@ -1168,7 +1177,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   }
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
-  const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
+  // An agent's message runs as the session owner, so its From line names the sender
+  // instead. The prefix is only text: anyone else who types it keeps their badge.
+  const sentByAgent = origin !== null && (author === undefined || author === sessionOwner);
+  const showAuthorBadge =
+    !sentByAgent && shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
   // Edit copies the text of a message you sent, shared session or not; single-user
   // messages carry no author. A pending message counts once the server has it.
   const canEdit =
