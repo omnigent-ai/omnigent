@@ -274,6 +274,11 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
             id="archived_parent",
         ),
         pytest.param(
+            "closed_parent",
+            "Session {receiver} belongs to a closed session; use another session",
+            id="closed_parent",
+        ),
+        pytest.param(
             "archived_sender",
             "Session {sender} is archived; unarchive it or use another session",
             id="archived_sender",
@@ -290,13 +295,16 @@ async def test_archived_or_closed_session_refusal_says_why(
 ):
     source, receiver, captured = peers
     store = SqlAlchemyConversationStore(db_uri)
-    if state == "archived_parent":
+    if state in {"archived_parent", "closed_parent"}:
         response = await auth_client.post(
             "/v1/sessions",
             json={"agent_id": receiver["agent_id"], "parent_session_id": receiver["id"]},
         )
         assert response.status_code == 201, response.text
-        store.update_conversation(receiver["id"], archived=True)
+        if state == "archived_parent":
+            store.update_conversation(receiver["id"], archived=True)
+        else:
+            store.set_labels(receiver["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
         receiver = response.json()
     elif state == "archived_other_owner":
         receiver = await _create_session_as(auth_client, "", "bob")
