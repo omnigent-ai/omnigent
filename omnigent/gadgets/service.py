@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
@@ -70,8 +71,11 @@ from omnigent.stores.gadget_store import (
     Gadget,
     GadgetFiles,
     GadgetStore,
+    StoreError,
     is_gadget_id,
 )
+
+_log = logging.getLogger(__name__)
 
 MAX_HTML_BYTES = 1024 * 1024
 MAX_NAMESPACE_ENTRIES = 1024
@@ -1468,6 +1472,12 @@ class GadgetService:
                 operation_id,
             )
         actor = self.viewer.user_id
+        # Rules published again later must count this write: the state they would reuse
+        # never saw it. Marked before the write, so a write the mark can't follow is refused
+        # before anything changes; marked again after it (below) in case rules rebuilt in
+        # between.
+        stale_marker = guard or ConstraintGuard(files, "data/_guard", store, [], actor)
+        stale_marker.mark_stale(unguarded_write=True)
         if method == "data.v1.create":
             result = store.create(collection, record_id, params.get("value"), operation_id, actor)
         elif method == "data.v1.replace":
@@ -1477,9 +1487,10 @@ class GadgetService:
             )
         else:
             result = store.delete(collection, record_id, cast(str, version), operation_id, actor)
-        # Rules published again later must count this write: the state they would reuse
-        # never saw it.
-        (guard or ConstraintGuard(files, "data/_guard", store, [], actor)).mark_stale(
-            unguarded_write=True
-        )
+        try:
+            stale_marker.mark_stale(unguarded_write=True)
+        except StoreError:
+            # The write landed and the state was already marked before it; only a rebuild
+            # racing this write is left uncounted, and that one saw the write's collection.
+            _log.warning("could not mark a gadget's rule state stale after a write", exc_info=True)
         return result.to_dict()

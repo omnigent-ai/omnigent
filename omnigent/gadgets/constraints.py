@@ -510,12 +510,20 @@ class ConstraintGuard:
                     continue
                 for kind, target in (("ref_remove", before), ("ref_add", after)):
                     if target is not None:
-                        operations.append(
-                            {
-                                "kind": kind,
-                                "path": self._index_path(rule, generation, target, changed_id),
-                            }
-                        )
+                        operation = {
+                            "kind": kind,
+                            "path": self._index_path(rule, generation, target, changed_id),
+                        }
+                        if kind == "ref_remove":
+                            # What a remover checks before deleting, so it never deletes
+                            # the entry of a record that names the target again.
+                            operation.update(
+                                collection=changed_collection,
+                                id=changed_id,
+                                field=rule["field"],
+                                target=target,
+                            )
+                        operations.append(operation)
         return operations
 
     @staticmethod
@@ -617,9 +625,13 @@ class ConstraintGuard:
                 stale += 1
                 if stale > MAX_STALE_INDEX_ENTRIES:
                     raise _IndexNeedsRebuild()
-                if self.files.supports_delete:
-                    with contextlib.suppress(NotFound):
-                        self.files.delete_tree(f"{directory}/{name}")
+                self._drop_entry(
+                    f"{directory}/{name}",
+                    rule["collection"] if _IDENTIFIER.fullmatch(name) else None,
+                    name,
+                    rule["field"],
+                    target_id,
+                )
             if not more:
                 return found
         return found
@@ -634,9 +646,17 @@ class ConstraintGuard:
                 self.files.create_json(path, {})
             return {}
         if operation["kind"] == "ref_remove":
-            # A store that cannot delete keeps the entry; lookups check it against the record.
-            if self.files.supports_delete:
-                self.files.delete_tree(operation["path"])
+            if "id" in operation:
+                self._drop_entry(
+                    operation["path"],
+                    operation["collection"],
+                    operation["id"],
+                    operation["field"],
+                    operation["target"],
+                )
+            elif self.files.supports_delete:  # A plan saved before entries named their record.
+                with contextlib.suppress(NotFound):
+                    self.files.delete_tree(operation["path"])
             return {}
         kind, collection, record_id = operation["kind"], operation["collection"], operation["id"]
         actor, operation_id = operation["actor"], operation["operation_id"]
@@ -653,6 +673,9 @@ class ConstraintGuard:
                 operation_id,
                 actor,
             ).to_dict()
+        # A rule's update of a dependent (a cascade delete or an unset) whose dependent is
+        # gone, or whose planned version was reclaimed, is settled against the record as it
+        # is now: a removed dependent needs nothing more.
         if kind == "delete":
             try:
                 return self.data.delete(
@@ -660,10 +683,17 @@ class ConstraintGuard:
                 ).to_dict()
             except Conflict:
                 return self._apply_again(operation)
+            except NotFound:
+                if not operation.get("targets"):
+                    raise
+                return self._apply_again(operation)
         # Derived from the immutable version the plan saw, so a repeat sends the same request.
-        source = self.data.get_version(collection, record_id, operation["if_version"])
+        try:
+            source = self.data.get_version(collection, record_id, operation["if_version"])
+        except (InvalidInput, NotFound):
+            return self._apply_again(operation)
         if source is None:
-            raise NotFound("The record to update was deleted")
+            return self._apply_again(operation)
         # Older pending plans named one field.
         fields = set(operation.get("fields") or [operation["field"]])
         value = {key: item for key, item in source.value.items() if key not in fields}
@@ -671,8 +701,34 @@ class ConstraintGuard:
             return self.data.replace(
                 collection, record_id, value, operation["if_version"], operation_id, actor
             ).to_dict()
-        except Conflict:
+        except (Conflict, NotFound):
             return self._apply_again(operation)
+
+    def _drop_entry(
+        self, path: str, collection: str | None, record_id: str, field: str, target_id: str
+    ) -> None:
+        """Deletes the index entry at *path* unless its record names *target_id* again.
+
+        Checked and deleted under the record's lock, which every write of the record holds:
+        a record moved away and back has its entry added again after its write, so a remover
+        that saw it away, or that replays an old plan, never deletes the entry it needs now.
+        A store that cannot delete, or a lock not taken, keeps the entry; lookups check
+        entries against their records.
+        """
+        if not self.files.supports_delete:
+            return
+        if collection is None:  # Not a record ID: nothing could need the entry.
+            with contextlib.suppress(NotFound):
+                self.files.delete_tree(path)
+            return
+        with self.data.record_lock(collection, record_id) as held:
+            if not held:
+                return
+            current = self.data.get(collection, record_id)
+            if current is not None and current.value.get(field) == target_id:
+                return
+            with contextlib.suppress(NotFound):
+                self.files.delete_tree(path)
 
     def _apply_again(self, operation: dict) -> dict:
         """A rule's update of a dependent that changed after the plan: done against its
@@ -681,9 +737,13 @@ class ConstraintGuard:
         Only derived updates carry ``targets``; a primary write's conflict stands.
         """
         targets = operation.get("targets")
-        if not targets:
-            raise Conflict("record changed before it could be updated", reason="concurrent_write")
         collection, record_id = operation["collection"], operation["id"]
+        if not targets:
+            # An unset saved by an older plan, without its targets: done once the record is
+            # gone. A primary write's conflict stands.
+            if operation["kind"] == "unset" and self.data.get(collection, record_id) is None:
+                return {}
+            raise Conflict("record changed before it could be updated", reason="concurrent_write")
         current = self.data.get(collection, record_id)
         if current is None:
             return {}
@@ -765,8 +825,9 @@ class ConstraintGuard:
         rules again must recount it, even when those rules match the digest the state last
         saw. State derived for this guard's own rules is left alone then, because they don't
         cover the collection written and any other rules differ from it and rebuild anyway.
-        Any change left pending is finished first. A gadget that never had rules has no state,
-        and nothing is written.
+        A change left pending stays pending: the next guarded writer finishes it before it
+        rebuilds, so a change that can't finish yet never fails this. A gadget that never had
+        rules has no state, and nothing is written.
         """
         if not self._epochs():
             return
@@ -777,9 +838,6 @@ class ConstraintGuard:
                 unguarded_write and current.get("rules") == self.digest
             ):
                 return
-            if current.get("pending") is not None:
-                self._finish(epoch, state)
-                continue
             try:
                 self.guard.replace(
                     _GUARD_COLLECTION,

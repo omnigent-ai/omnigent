@@ -884,6 +884,208 @@ def test_a_dependent_changed_after_the_plan_is_updated_from_its_current_version(
     assert rpc(service, app, "get", collection="runs", id="r1")["value"] == {"state": "again"}
 
 
+_RESTRICT_RUN_CARD = {**_UNSET_RUN_CARD, "on_delete": "restrict"}
+
+
+def _run(service: GadgetService, app: dict, record_id: str) -> dict:
+    return rpc(service, app, "get", collection="runs", id=record_id)
+
+
+def _point_run(service: GadgetService, app: dict, record_id: str, card_id: str, op: str) -> dict:
+    current = _run(service, app, record_id)
+    return rpc(
+        service,
+        app,
+        "replace",
+        collection="runs",
+        id=record_id,
+        value={"cardId": card_id, "state": "done"},
+        if_version=current["version"],
+        operation_id=op,
+    )
+
+
+def test_pruning_a_stale_index_entry_never_drops_one_its_record_needs_again(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A delete finds an index entry whose run has moved to another card and drops it. If the
+    # run moves back between that check and the drop, the entry is needed again: dropping it
+    # would let a restricted delete through while the run still names the card.
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_RESTRICT_RUN_CARD])
+    target = card(service, app, "x", "todo")
+    card(service, app, "y", "todo")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="d",
+        value={"cardId": "x", "state": "done"},
+        operation_id="d",
+    )
+    # Moved to y by a store that can't delete: its entry under x stays behind, stale.
+    with monkeypatch.context() as patch:
+        patch.setattr(HookedFiles, "supports_delete", property(lambda self: False))
+        _point_run(service, app, "d", "y", "d-to-y")
+
+    real_get = documents_module.ImmutableDocumentStore.get
+    moved: list[str] = []
+
+    def get(self, collection, record_id):
+        found = real_get(self, collection, record_id)
+        if collection == "runs" and record_id == "d" and not moved and found is not None:
+            # Another writer points the run back at x right after the delete read it.
+            moved.append(record_id)
+            _point_run(gadgets.service(), app, "d", "x", "d-back")
+        return found
+
+    monkeypatch.setattr(documents_module.ImmutableDocumentStore, "get", get)
+    with pytest.raises(ConstraintViolation):
+        rpc(service, app, "delete", id="x", if_version=target["version"], operation_id="d-x")
+    assert moved == ["d"]
+    monkeypatch.setattr(documents_module.ImmutableDocumentStore, "get", real_get)
+    assert rpc(service, app, "get", id="x") is not None
+    assert _run(service, app, "d")["value"]["cardId"] == "x"
+
+
+def test_a_late_index_removal_from_a_finished_change_keeps_a_newer_entry(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A writer moves a run from x to y and stops before dropping its entry under x. Another
+    # writer finishes that change, and the run then moves back to x. When the first writer
+    # resumes and drops the entry it planned to, the run needs that entry again.
+    import threading
+
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_RESTRICT_RUN_CARD])
+    target = card(service, app, "x", "todo")
+    card(service, app, "y", "todo")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="d",
+        value={"cardId": "x", "state": "done"},
+        operation_id="d",
+    )
+    real_apply = ConstraintGuard._apply
+    paused = threading.Event()
+    resume = threading.Event()
+    late = threading.current_thread()
+
+    def apply(self, operation):
+        if (
+            operation["kind"] == "ref_remove"
+            and threading.current_thread() is not late
+            and not paused.is_set()
+        ):
+            paused.set()
+            assert resume.wait(10)
+        return real_apply(self, operation)
+
+    monkeypatch.setattr(ConstraintGuard, "_apply", apply)
+    late_writer = gadgets.service()
+    with ThreadPoolExecutor(1) as pool:
+        stopped = pool.submit(_point_run, late_writer, app, "d", "y", "d-to-y")
+        assert paused.wait(10)
+        # Another writer finishes the change, then points the run back at x.
+        card(service, app, "z", "todo")
+        _point_run(service, app, "d", "x", "d-back")
+        resume.set()
+        stopped.result(10)
+    with pytest.raises(ConstraintViolation):
+        rpc(service, app, "delete", id="x", if_version=target["version"], operation_id="d-x")
+    assert _run(service, app, "d")["value"]["cardId"] == "x"
+
+
+@pytest.mark.parametrize("gone", ["deleted", "version_reclaimed"])
+def test_a_dependent_removed_while_its_rule_update_waited_counts_as_done(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch, gone: str
+) -> None:
+    # An unset is planned and paused; a revision without the rule is published, and the run is
+    # deleted straight through the records. Finishing the change finds the run gone: that is
+    # its work done, not a failure that keeps the gadget busy.
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_UNSET_RUN_CARD])
+    ruled = app["published_revision"]
+    target = card(service, app, "a", "todo")
+    run = rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="r1",
+        value={"cardId": "a", "state": "done"},
+        operation_id="r1",
+    )
+    original_run = ConstraintGuard._run
+
+    def stop_after_recording(self, epoch, started):
+        raise RuntimeError("writer stopped")
+
+    monkeypatch.setattr(ConstraintGuard, "_run", stop_after_recording)
+    with pytest.raises(RuntimeError):
+        rpc(service, app, "delete", id="a", if_version=target["version"], operation_id="d-a")
+    monkeypatch.setattr(ConstraintGuard, "_run", original_run)
+
+    app = _republish(service, app, ruled_revision(service, app["id"], []))
+    rpc(
+        service,
+        app,
+        "delete",
+        collection="runs",
+        id="r1",
+        if_version=run["version"],
+        operation_id="d-r1",
+    )
+    if gone == "version_reclaimed":
+        real_get_version = documents_module.ImmutableDocumentStore.get_version
+
+        def get_version(self, collection, record_id, version):
+            if collection == "runs":
+                raise InvalidInput("The requested version does not exist")
+            return real_get_version(self, collection, record_id, version)
+
+        monkeypatch.setattr(documents_module.ImmutableDocumentStore, "get_version", get_version)
+
+    app = _republish(service, app, ruled)
+    # The next guarded write finishes the change and goes through.
+    assert card(gadgets.service(), app, "b", "todo")
+    assert rpc(service, app, "get", id="a") is None
+    assert _run(service, app, "r1") is None
+
+
+def test_marking_the_rule_state_stale_never_fails_a_write_that_landed(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_UNSET_RUN_CARD])
+    app = _republish(service, app, ruled_revision(service, app["id"], []))
+    real_mark = ConstraintGuard.mark_stale
+    calls: list[int] = []
+
+    def mark_stale(self, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise Conflict("The gadget's rule state is busy; try again", reason="busy")
+        return real_mark(self, **kwargs)
+
+    monkeypatch.setattr(ConstraintGuard, "mark_stale", mark_stale)
+    # Marked before the write and again after it: the second mark failing leaves the write.
+    assert card(service, app, "a", "todo")
+    assert rpc(service, app, "get", id="a") is not None
+
+    calls.clear()
+    calls.append(1)  # The next mark to run is the one before the write; make it fail.
+    with pytest.raises(Conflict):
+        card(service, app, "b", "todo")
+    # Refused before anything was written.
+    monkeypatch.setattr(ConstraintGuard, "mark_stale", real_mark)
+    assert rpc(service, app, "get", id="b") is None
+
+
 def test_a_rule_update_that_fails_when_resumed_stays_pending_for_the_next_writer(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

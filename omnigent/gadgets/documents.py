@@ -921,6 +921,12 @@ class ImmutableDocumentStore:
         return self._result(ref, self._parse_revision(ref, body, number))
 
     @contextlib.contextmanager
+    def record_lock(self, collection: str, id: str) -> Iterator[bool]:
+        """The lock every write of the record holds; yields whether it was taken."""
+        with self._record_lock(self._ref(collection, id)) as held:
+            yield held
+
+    @contextlib.contextmanager
     def _record_lock(self, ref: _Ref) -> Iterator[bool]:
         """The lock every writer, remover and claim release of the record holds."""
         with self._files.exclusive(
