@@ -3448,7 +3448,7 @@ async def _relaunch_terminal_on_forwarder_thread(
     :param forwarder_state: Forwarder state recording the thread it started.
     :param session_id: Omnigent session now owning the thread, e.g. ``"conv_new"``.
     :param thread_id: Newly subscribed Codex thread id, e.g. ``"thread_fresh"``.
-    :returns: None. Relaunch failures are logged, leaving the old TUI in place.
+    :returns: None. Relaunch failures are logged and do not stop forwarding.
     """
     if forwarder_state.forwarder_started_thread_id != thread_id:
         return

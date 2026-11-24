@@ -16,7 +16,7 @@ import httpx
 import pyte
 import pytest
 from playwright.sync_api import Page, expect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidHandshake
 from websockets.sync.client import connect as ws_connect
 
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
@@ -52,15 +52,18 @@ def _pane_text(base_url: str, session_id: str, terminal_id: str, seconds: float 
     )
     raw = bytearray()
     deadline = time.monotonic() + seconds
-    with contextlib.suppress(ConnectionClosed, OSError):
-        with ws_connect(url, open_timeout=15, max_size=None) as websocket:
-            while time.monotonic() < deadline:
-                try:
-                    frame = websocket.recv(timeout=max(0.1, deadline - time.monotonic()))
-                except TimeoutError:
-                    break
-                if isinstance(frame, bytes):
-                    raw.extend(frame)
+    try:
+        websocket = ws_connect(url, open_timeout=15, max_size=None)
+    except (InvalidHandshake, OSError) as exc:
+        return f"<attach failed: {exc!r}>"
+    with contextlib.suppress(ConnectionClosed, OSError), websocket:
+        while time.monotonic() < deadline:
+            try:
+                frame = websocket.recv(timeout=max(0.1, deadline - time.monotonic()))
+            except TimeoutError:
+                break
+            if isinstance(frame, bytes):
+                raw.extend(frame)
     screen = pyte.Screen(200, 60)
     pyte.ByteStream(screen).feed(bytes(raw))
     return "\n".join(line.rstrip() for line in screen.display if line.strip())

@@ -6037,9 +6037,10 @@ class _RecordingCodexRegistry:
 
     terminal_registry = None
 
-    def __init__(self, captured: dict[str, Any]) -> None:
+    def __init__(self, captured: dict[str, Any], launch_error: Exception | None = None) -> None:
         self.captured = captured
         self.captured["calls"] = []
+        self.launch_error = launch_error
 
     async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
         """Record the close and report the terminal closed."""
@@ -6060,6 +6061,8 @@ class _RecordingCodexRegistry:
         del terminal_name, session_key, resource_role, parent_os_env
         self.captured["calls"].append(("launch", session_id))
         self.captured["spec"] = spec
+        if self.launch_error is not None:
+            raise self.launch_error
         return SessionResourceView(
             id="terminal_codex_main", type="terminal", session_id=session_id, name="codex:main"
         )
@@ -6166,6 +6169,55 @@ async def test_codex_tui_relaunch_on_thread_replaces_the_pane_on_its_app_server(
         "thread_fresh",
     ]
     assert published == [("conv_new", "session.resource.created")]
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_relaunch_failure_retracts_the_closed_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed replacement launch tells the UI the closed pane is gone, then re-raises."""
+    from omnigent.runner.native.orchestration import _relaunch_codex_native_tui_on_thread
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (tmp_path / "config-home").mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    app_server, launch_config = _recorded_codex_launch_inputs(
+        tmp_path, workspace=workspace, codex_cli_version=None
+    )
+    captured: dict[str, Any] = {}
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    with pytest.raises(RuntimeError, match="tmux spawn failed"):
+        await _relaunch_codex_native_tui_on_thread(
+            "conv_new",
+            "thread_fresh",
+            resource_registry=_RecordingCodexRegistry(  # type: ignore[arg-type]
+                captured, launch_error=RuntimeError("tmux spawn failed")
+            ),
+            publish_event=lambda session_id, event: published.append((session_id, event)),
+            app_server=app_server,
+            launch_config=launch_config,
+            bridge_dir=tmp_path / "bridge",
+            agent_spec=None,
+        )
+
+    assert captured["calls"] == [
+        ("close", "conv_new", "terminal_codex_main"),
+        ("launch", "conv_new"),
+    ]
+    assert published == [
+        (
+            "conv_new",
+            {
+                "type": "session.resource.deleted",
+                "resource_id": "terminal_codex_main",
+                "resource_type": "terminal",
+                "session_id": "conv_new",
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

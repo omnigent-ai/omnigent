@@ -5376,23 +5376,36 @@ async def _relaunch_codex_native_tui_on_thread(
     :param bridge_dir: Native Codex bridge directory.
     :param agent_spec: Agent spec for the terminal's OS environment.
     :returns: None.
+    :raises Exception: If the replacement fails to launch, after retracting the closed
+        pane so the native-terminal ensure path can recreate it.
     """
+    from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+
     # Resolve before closing so the session spends as little time as possible without a TUI.
     terminal_cli = await _resolve_codex_terminal_cli(
         workspace=str(launch_config.workspace), app_server=app_server, resume=True
     )
     await resource_registry.close_terminal(session_id, terminal_resource_id("codex", "main"))
-    await _launch_codex_native_tui(
-        session_id,
-        resource_registry,
-        publish_event,
-        app_server=app_server,
-        launch_config=launch_config,
-        bridge_dir=bridge_dir,
-        thread_id=thread_id,
-        agent_spec=agent_spec,
-        terminal_cli=terminal_cli,
-    )
+    try:
+        await _launch_codex_native_tui(
+            session_id,
+            resource_registry,
+            publish_event,
+            app_server=app_server,
+            launch_config=launch_config,
+            bridge_dir=bridge_dir,
+            thread_id=thread_id,
+            agent_spec=agent_spec,
+            terminal_cli=terminal_cli,
+        )
+    except Exception:
+        _publish_terminal_deleted_event(
+            conversation_id=session_id,
+            terminal_name="codex",
+            session_key="main",
+            publish_event=publish_event,
+        )
+        raise
 
 
 #: Waits between ``thread/resume`` retries when codex finds no rollout for a
