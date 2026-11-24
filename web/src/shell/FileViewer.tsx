@@ -1397,6 +1397,8 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
+    /** Called when `menu` opens, inline or in the collapsed "⋯" overflow. */
+    onMenuOpen?: () => void;
     /** Keep the default action directly available beside its app picker. */
     splitMenu?: boolean;
   }
@@ -1651,6 +1653,8 @@ function FileViewerBody({
     tooltip: "View settings",
     icon: <MoreHorizontalIcon className="size-4" />,
     menu: settingsMenu,
+    // A push, commit or checkout since the last read changes where Open in GitHub goes.
+    onMenuOpen: repositoryContext.refresh,
   });
   toolbarActions.push({
     key: "copy-link",
@@ -1751,7 +1755,12 @@ function FileViewerBody({
         // A settings menu: one trigger opening a list of independent items
         // (toggles + actions). Toggles carry `keepOpen` so the menu stays open
         // as the user flips them; actions close it on select.
-        <DropdownMenu key={action.key}>
+        <DropdownMenu
+          key={action.key}
+          onOpenChange={(isOpen) => {
+            if (isOpen) action.onMenuOpen?.();
+          }}
+        >
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -2002,7 +2011,12 @@ function FileViewerBody({
           <div className="flex items-center justify-end gap-1">
             {toolbarCollapsed ? (
               <>
-                <DropdownMenu>
+                <DropdownMenu
+                  onOpenChange={(isOpen) => {
+                    // The overflow shows every menu's items, so each one opening applies.
+                    if (isOpen) for (const action of toolbarActions) action.onMenuOpen?.();
+                  }}
+                >
                   <DropdownMenuTrigger asChild>
                     <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
                       <MoreHorizontalIcon className="size-4" />

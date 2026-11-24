@@ -2505,6 +2505,34 @@ describe("FileViewer view-settings menu", () => {
       expect(item).not.toHaveAttribute("href");
     });
 
+    it("reads the context again when the menu reopens, so a push made meanwhile links", async () => {
+      let current = repositoryContext({ push: { ...pushTarget, trackingSha: "" } });
+      const resolve = vi.fn(() => Promise.resolve(current));
+      setWorkspaceSidebarSourceForTests({
+        ...DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
+        resolveRepositoryContext: resolve,
+      });
+      render(viewerTree({ open: true }));
+      openSettingsMenu();
+      expect(await screen.findByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+      // The agent pushes while the viewer stays mounted and the page keeps focus.
+      current = repositoryContext();
+      const reads = resolve.mock.calls.length;
+      openSettingsMenu();
+      expect(resolve.mock.calls.length).toBeGreaterThan(reads);
+      await waitFor(() =>
+        expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+          "href",
+          `https://github.com/acme/app/blob/${pushed}/web/file1.py`,
+        ),
+      );
+    });
+
     it("leaves the item out of a workspace that isn't a repository", async () => {
       answering(
         repositoryContext({
