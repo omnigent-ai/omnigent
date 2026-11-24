@@ -108,6 +108,7 @@ OMNIGENT_HARNESSES = frozenset(
         "opencode-native",
         "pi",
         "pi-native",
+        "omp-native",
         "qwen",
         "qwen-native",
     },
@@ -118,6 +119,8 @@ OMNIGENT_HARNESS_ALIASES = frozenset(
         "claude",
         "native-kiro",
         "native-pi",
+        "omp",
+        "native-omp",
         "native-antigravity",
         "native-goose",
         "openai-agents-sdk",
@@ -188,26 +191,27 @@ def validate_omnigent_executor(
     if "context_files" in spec.executor.config:
         if not isinstance(spec.executor.config["context_files"], bool):
             result.add("executor.config.context_files", "must be a boolean")
-        if harness not in ("pi", "pi-native"):
+        if harness not in ("pi", "pi-native", "omp-native"):
             result.add(
-                "executor.config.context_files", "only supported with harness 'pi' or 'pi-native'"
+                "executor.config.context_files",
+                "only supported with harness 'pi', 'pi-native' or 'omp-native'",
             )
     if "system_prompt_mode" in spec.executor.config:
         if spec.executor.config["system_prompt_mode"] not in ("append", "replace"):
             result.add("executor.config.system_prompt_mode", "must be 'append' or 'replace'")
-        if harness not in ("pi", "pi-native"):
+        if harness not in ("pi", "pi-native", "omp-native"):
             result.add(
                 "executor.config.system_prompt_mode",
-                "only supported with harness 'pi' or 'pi-native'",
+                "only supported with harness 'pi', 'pi-native' or 'omp-native'",
             )
         elif (
-            harness == "pi-native"
+            harness in ("pi-native", "omp-native")
             and spec.executor.config["system_prompt_mode"] == "replace"
             and not (spec.instructions or "").strip()
         ):
             result.add(
                 "instructions",
-                "pi-native system_prompt_mode='replace' requires non-empty authored instructions",
+                f"{harness} system_prompt_mode='replace' requires non-empty authored instructions",
             )
     if not harness:
         result.add(

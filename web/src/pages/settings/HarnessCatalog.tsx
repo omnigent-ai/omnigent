@@ -115,9 +115,8 @@ export function BackButton({
 }
 
 /**
- * MCP servers / Skills / Plugins tabs of a harness, listed from the host, plus a
- * Settings tab showing `settings`. Opening a plugin replaces the page (header
- * included) with its skills and MCP servers; Back returns to the Plugins tab.
+ * MCP servers, Skills and (where supported) Plugins from the host, plus a Settings tab.
+ * Opening a plugin replaces the page with its skills and MCP servers; Back returns to Plugins.
  */
 export function HarnessCatalog({
   header,
@@ -150,7 +149,7 @@ export function HarnessCatalog({
   // A later navigation to a row on one of the tabs, such as a search result picked while this
   // page is open, shows that tab; clicking a tab doesn't navigate, so it's left alone.
   const handledNavigation = useRef(location.key);
-  const pageOpen = selectedSkill !== null ? entries.skill?.id : open ? entries.plugin.id : null;
+  const pageOpen = selectedSkill !== null ? entries.skill?.id : open ? entries.plugin?.id : null;
   useEffect(() => {
     if (location.key === handledNavigation.current) return;
     handledNavigation.current = location.key;
@@ -229,7 +228,7 @@ export function HarnessCatalog({
         }}
       />
     );
-  if (open)
+  if (open && entries.plugin)
     return (
       <PluginPage
         host={host}
@@ -278,16 +277,18 @@ export function HarnessCatalog({
           className="w-full justify-start border-b border-border px-0"
           {...settingsControlProps(HARNESS_DETAIL_ENTRIES.entry(entries.harness), "tab")}
         >
-          {KINDS.map((k) => (
-            <TabsTrigger
-              key={k.id}
-              value={k.id}
-              className="flex-none"
-              data-testid={`harness-tab-${k.id}`}
-            >
-              {loading ? k.label : `${k.label}${INVENTORY_COUNT_SEPARATOR}${own[k.id].length}`}
-            </TabsTrigger>
-          ))}
+          {KINDS.map((k) =>
+            k.id === "plugins" && !entries.plugin ? null : (
+              <TabsTrigger
+                key={k.id}
+                value={k.id}
+                className="flex-none"
+                data-testid={`harness-tab-${k.id}`}
+              >
+                {loading ? k.label : `${k.label}${INVENTORY_COUNT_SEPARATOR}${own[k.id].length}`}
+              </TabsTrigger>
+            ),
+          )}
           <TabsTrigger value="settings" className="flex-none" data-testid="harness-tab-settings">
             Settings
           </TabsTrigger>
@@ -324,33 +325,35 @@ export function HarnessCatalog({
             </SettingsDataRegion>,
           )}
         </TabsContent>
-        <TabsContent value="plugins">
-          {ownList(
-            "plugins",
-            own.plugins.length,
-            <SettingsDataRegion
-              entry={HARNESS_DETAIL_ENTRIES.entry(entries.harness)}
-              region="plugins"
-            >
-              <ul className="flex flex-col gap-2">
-                {own.plugins.map((plugin) => {
-                  const mcps = pluginMcps(plugin);
-                  return (
-                    <CatalogRow
-                      key={plugin.id}
-                      icon={<PlugIcon className="size-4 text-muted-foreground" />}
-                      name={plugin.name}
-                      detail={[pluginDetail(plugin, mcps.length), plugin.description]
-                        .filter(Boolean)
-                        .join(" · ")}
-                      onOpen={() => setOpen(plugin)}
-                    />
-                  );
-                })}
-              </ul>
-            </SettingsDataRegion>,
-          )}
-        </TabsContent>
+        {entries.plugin && (
+          <TabsContent value="plugins">
+            {ownList(
+              "plugins",
+              own.plugins.length,
+              <SettingsDataRegion
+                entry={HARNESS_DETAIL_ENTRIES.entry(entries.harness)}
+                region="plugins"
+              >
+                <ul className="flex flex-col gap-2">
+                  {own.plugins.map((plugin) => {
+                    const mcps = pluginMcps(plugin);
+                    return (
+                      <CatalogRow
+                        key={plugin.id}
+                        icon={<PlugIcon className="size-4 text-muted-foreground" />}
+                        name={plugin.name}
+                        detail={[pluginDetail(plugin, mcps.length), plugin.description]
+                          .filter(Boolean)
+                          .join(" · ")}
+                        onOpen={() => setOpen(plugin)}
+                      />
+                    );
+                  })}
+                </ul>
+              </SettingsDataRegion>,
+            )}
+          </TabsContent>
+        )}
       </Tabs>
     </>
   );

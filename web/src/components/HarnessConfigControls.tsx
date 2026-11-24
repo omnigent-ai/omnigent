@@ -182,7 +182,7 @@ export function nativeEffortOptions(
   model: string | null | undefined,
 ): { value: string; label: string }[] | null {
   if (harness === "claude-native") return CLAUDE_NATIVE_EFFORTS;
-  if (harness === "pi-native") return PI_NATIVE_EFFORTS;
+  if (harness === "pi-native" || harness === "omp-native") return PI_NATIVE_EFFORTS;
   if (harness !== "codex-native" && harness !== "devin-native") return null;
   const effortModel = model || modelOptions.find((option) => option.isDefault)?.id;
   return codexEffortLevelsForModel(modelOptions, effortModel).map((value) => ({

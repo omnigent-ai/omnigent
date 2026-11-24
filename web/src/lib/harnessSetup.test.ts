@@ -40,6 +40,7 @@ describe("missingHarnessCredentialCopy", () => {
     ["codex-native", "Codex", "No ChatGPT account or API key on laptop"],
     ["native-claude", "Claude Code", "No Claude subscription or API key on laptop"],
     ["pi-native", "Pi", "No API key or gateway credential on laptop"],
+    ["omp-native", "OMP", "No OMP login, API key or gateway credential on laptop"],
     ["cursor-native", "Cursor", "No credentials on laptop"],
   ])("uses the credential wording for %s", (harness, harnessName, expectedStart) => {
     expect(missingHarnessCredentialCopy(harness, harnessName, "laptop")).toBe(
@@ -353,6 +354,14 @@ describe("harnessCredentialFamily", () => {
     // Pi resolves to its preferred anthropic fallback family.
     expect(harnessCredentialFamily("pi")).toBe("anthropic");
     expect(harnessCredentialFamily("pi-native")).toBe("anthropic");
+  });
+
+  it.each(["omp-native", "omp", "native-omp"])("supports managed credentials for %s", (harness) => {
+    expect(harnessCredentialFamily(harness)).toBe("anthropic");
+    expect(harnessCredentialAdoptFamilies(harness)).toEqual(["anthropic", "openai"]);
+    expect(harnessAuthableOnHost(info(), harness, hostWith({ "omp-native": "needs-auth" }))).toBe(
+      true,
+    );
   });
 
   it("returns null for harnesses the UI can't authenticate", () => {

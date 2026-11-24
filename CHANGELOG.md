@@ -5,6 +5,10 @@ This file is generated at release time from each PR's `## Changelog` section
 PRs and author credits. The concise, curated highlights live on the website
 under `/releases`.
 
+## Unreleased
+
+- [Feature] Add the native OMP (Oh My Pi) TUI harness, `omnigent omp`, official OMP branding, independent provider setup, centralized tool approvals, session controls, and native child-session isolation.
+
 ## [v0.23.0] — 2026-11-18
 
 - [Bug fix] Native Antigravity sessions now mirror replies after a slow startup instead of remaining stuck on the startup placeholder. ([#8288](https://github.com/omnigent-ai/omnigent/pull/8288), [@omni-resolve-agent[bot]](https://github.com/apps/omni-resolve-agent))

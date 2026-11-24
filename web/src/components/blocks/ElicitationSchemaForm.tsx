@@ -24,6 +24,7 @@ import { CheckIcon, XIcon } from "lucide-react";
 import { useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 
 /** One value MCP allows in an ``ElicitResult.content`` map. */
 export type ElicitValue = string | number | boolean;
@@ -42,6 +43,16 @@ interface SchemaProperty {
   default?: unknown;
   title?: string;
   description?: string;
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+  "x-input-type"?: string;
+  "x-multiline"?: boolean;
+  "x-preserve-empty"?: boolean;
+  "x-disabled"?: boolean;
+  "x-disabled-enum"?: string[];
 }
 
 /** A property paired with the name it is keyed under. */
@@ -149,7 +160,7 @@ export function isComplete(fields: SchemaField[], answers: ElicitationDraft): bo
     // An optional field may be left alone, but not filled in wrongly: dropping
     // what someone typed while reporting success is the worse of the two.
     if (blank) return !field.required;
-    return numberOrNull(field, value) !== null;
+    return validationError(field, value) === null;
   });
 }
 
@@ -171,6 +182,68 @@ function numberOrNull(field: SchemaField, value: ElicitValue): number | null {
   return parsed;
 }
 
+const INPUT_TYPES: Record<string, true> = {
+  text: true,
+  search: true,
+  password: true,
+  tel: true,
+  email: true,
+  url: true,
+  date: true,
+  "datetime-local": true,
+  month: true,
+  week: true,
+  time: true,
+  color: true,
+  number: true,
+};
+
+/** Only inert, editable input types may come from a remote form schema. */
+export function schemaInputType(prop: SchemaProperty): string {
+  if (prop.type === "number" || prop.type === "integer") return "number";
+  const requested = prop["x-input-type"];
+  return typeof requested === "string" && INPUT_TYPES[requested] === true ? requested : "text";
+}
+
+function finite(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function validationError(field: SchemaField, value: ElicitValue): string | null {
+  const numeric = numberOrNull(field, value);
+  if (numeric === null) return "Enter a valid number";
+  const { prop } = field;
+  if (prop.type === "number" || prop.type === "integer") {
+    if (finite(prop.minimum) !== undefined && numeric < prop.minimum!)
+      return `Must be at least ${prop.minimum}`;
+    if (finite(prop.maximum) !== undefined && numeric > prop.maximum!)
+      return `Must be at most ${prop.maximum}`;
+  }
+  const text = String(value);
+  if (finite(prop.minLength) !== undefined && text.length < prop.minLength!)
+    return `Needs at least ${prop.minLength} characters`;
+  if (finite(prop.maxLength) !== undefined && text.length > prop.maxLength!)
+    return `At most ${prop.maxLength} characters`;
+  if (schemaInputType(prop) === "email" && !/^[^\s@]+@[^\s@]+$/.test(text))
+    return "Enter an email address";
+  if (schemaInputType(prop) === "url") {
+    try {
+      new URL(text);
+    } catch {
+      return "Enter a full URL";
+    }
+  }
+  if (typeof prop.pattern === "string") {
+    try {
+      if (!new RegExp(`^(?:${prop.pattern})$`).test(text))
+        return "Does not match the required pattern";
+    } catch {
+      // Native HTML forms also ignore a malformed model-authored pattern.
+    }
+  }
+  return null;
+}
+
 /**
  * Drop blank optional fields and coerce numbers before submitting.
  *
@@ -187,6 +260,10 @@ export function toContent(fields: SchemaField[], answers: ElicitationDraft): Eli
       continue;
     }
     const text = String(value);
+    if (field.prop["x-preserve-empty"] === true && text.trim().length === 0) {
+      content[field.name] = text;
+      continue;
+    }
     if (text.trim().length === 0) continue;
     const numeric = field.prop.type === "number" || field.prop.type === "integer";
     if (numeric) {
@@ -235,6 +312,8 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
         const value = answers[name];
         const controlId = `${scope}-${name}`;
         const describedBy = asText(prop.description) ? `${controlId}-description` : undefined;
+        const error =
+          value !== undefined && String(value).trim() ? validationError(field, value) : null;
         return (
           <div key={name} className="flex flex-col gap-1" data-testid={`elicit-field-${name}`}>
             <label htmlFor={controlId} className="text-ui text-foreground">
@@ -258,7 +337,14 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
               >
                 <option value="">Choose…</option>
                 {options.map((option, index) => (
-                  <option key={option} value={option}>
+                  <option
+                    key={option}
+                    value={option}
+                    disabled={
+                      Array.isArray(prop["x-disabled-enum"]) &&
+                      prop["x-disabled-enum"].includes(option)
+                    }
+                  >
                     {enumLabel(prop, index, option)}
                   </option>
                 ))}
@@ -271,18 +357,43 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
                 aria-required={required}
                 aria-describedby={describedBy}
                 checked={value === true}
+                disabled={prop["x-disabled"] === true}
                 onChange={(e) => set(name, e.target.checked)}
+              />
+            ) : prop["x-multiline"] === true ? (
+              <Textarea
+                id={controlId}
+                required={required}
+                aria-required={required}
+                aria-describedby={describedBy}
+                aria-invalid={error !== null}
+                minLength={finite(prop.minLength)}
+                maxLength={finite(prop.maxLength)}
+                value={String(value ?? "")}
+                onChange={(e) => set(name, e.target.value)}
               />
             ) : (
               <Input
                 id={controlId}
-                type={prop.type === "number" || prop.type === "integer" ? "number" : "text"}
+                type={schemaInputType(prop)}
+                step={prop.type === "number" ? "any" : undefined}
+                min={finite(prop.minimum)}
+                max={finite(prop.maximum)}
+                minLength={finite(prop.minLength)}
+                maxLength={finite(prop.maxLength)}
+                pattern={typeof prop.pattern === "string" ? prop.pattern : undefined}
+                aria-invalid={error !== null}
                 required={required}
                 aria-required={required}
                 aria-describedby={describedBy}
                 value={String(value ?? "")}
                 onChange={(e) => set(name, e.target.value)}
               />
+            )}
+            {error && (
+              <span className="text-sm text-destructive" role="alert">
+                {error}
+              </span>
             )}
           </div>
         );

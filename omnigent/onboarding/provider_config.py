@@ -96,6 +96,7 @@ _PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 # pi default wins; otherwise pi falls back to the anthropic then openai family
 # default, skipping the non-pi kinds (see :func:`default_provider_for_harness`).
 PI_SURFACE = "pi"
+OMP_SURFACE = "omp"
 
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
 # ``chat`` is Chat Completions. Only meaningful for the ``openai`` family
@@ -871,7 +872,9 @@ def _parse_default_families(
     # "pi"]`` at parse time (parity with how a subscription's pi scope is
     # rejected), rather than failing loudly only at pi launch.
     pi_ok = pi_capable and (bool(served & frozenset(_PI_FALLBACK_FAMILIES)) or not served)
-    allowed = served | {PI_SURFACE} if pi_ok else served
+    # A family-backed provider serves both runtimes; Pi original auth serves only Pi.
+    native_scopes = {PI_SURFACE, OMP_SURFACE} if served else {PI_SURFACE}
+    allowed = served | native_scopes if pi_ok else served
     invalid = requested - allowed
     if invalid:
         raise OmnigentError(
@@ -901,7 +904,10 @@ def _default_raw_value(default_families: frozenset[str], served: set[str]) -> ob
     # the pi scope (see _parse_default_families), so a default set that
     # includes pi must stay explicit — rendering it as ``True`` would drop
     # the pi scope on the next parse.
-    if PI_SURFACE not in default_families and default_families == frozenset(served) - {PI_SURFACE}:
+    native_surfaces = {PI_SURFACE, OMP_SURFACE}
+    if not (native_surfaces & default_families) and default_families == (
+        frozenset(served) - native_surfaces
+    ):
         return True
     if len(default_families) == 1:
         return next(iter(default_families))
@@ -959,6 +965,8 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             if cli_raw == "claude"
             else ({OPENAI_FAMILY} if cli_raw == "codex" else set())
         )
+        if cli_raw == OMP_SURFACE:
+            served = {OMP_SURFACE}
         # claude/codex subscriptions are locked to their own CLIs and cannot
         # drive pi. A pi subscription explicitly opts into Pi's own native auth
         # and may default the pi surface (pi_capable=True, served={}).
@@ -1280,7 +1288,7 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         # break pi launch. A multi-family key keeps pi via its anthropic/openai
         # family.
         if served & frozenset(_PI_FALLBACK_FAMILIES):
-            return served | {PI_SURFACE}
+            return served | {PI_SURFACE, OMP_SURFACE}
         return served
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
@@ -1289,6 +1297,8 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             # A pi subscription signals "use Pi's own native auth" — it serves
             # only the pi scope (no model family directly).
             return frozenset({PI_SURFACE})
+        if entry.cli == OMP_SURFACE:
+            return frozenset({OMP_SURFACE})
         if entry.cli == "codex":
             # A codex *cli-config* provider may ALSO serve pi: a Databricks AI
             # Gateway exposes an Anthropic Messages surface Pi speaks natively
@@ -1304,11 +1314,11 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             # falls back gracefully when it is not. A codex *subscription* never
             # serves pi — a CLI login is unusable outside its own CLI.
             if entry.kind == CLI_CONFIG_KIND:
-                return frozenset({OPENAI_FAMILY, PI_SURFACE})
+                return frozenset({OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE})
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
-        served = frozenset(_PI_FALLBACK_FAMILIES) | {PI_SURFACE}
+        served = frozenset(_PI_FALLBACK_FAMILIES) | {PI_SURFACE, OMP_SURFACE}
         return frozenset({GEMINI_FAMILY}) if entry.native_gemini else served
     return frozenset()
 
@@ -1397,8 +1407,9 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     family = _HARNESS_FAMILY.get(harness)
     if family is not None:
         return get_default_provider(config, family)
-    # Unmapped (e.g. pi): an explicit pi-scope default is authoritative.
-    explicit = get_default_provider(config, PI_SURFACE)
+    # Original-auth defaults are isolated: an OMP session never adopts Pi's login.
+    surface = OMP_SURFACE if harness in {"omp", "omp-native", "native-omp"} else PI_SURFACE
+    explicit = get_default_provider(config, surface)
     if explicit is not None:
         return explicit
     # Fall back across the pi-capable surfaces — prefer anthropic's default,
@@ -1447,8 +1458,8 @@ def surface_default_provider(config: dict[str, object], surface: str) -> Provide
     :raises OmnigentError: If a provider is malformed, or more than one
         default serves a scope.
     """
-    if surface == PI_SURFACE:
-        return default_provider_for_harness(config, PI_SURFACE)
+    if surface in {PI_SURFACE, OMP_SURFACE}:
+        return default_provider_for_harness(config, surface)
     return get_default_provider(config, surface)
 
 
@@ -1467,7 +1478,7 @@ def surface_default_model(entry: ProviderEntry, surface: str) -> str | None:
         ``subscription`` / ``databricks`` kinds, always — the CLI /
         profile picks the model).
     """
-    if surface != PI_SURFACE:
+    if surface not in {PI_SURFACE, OMP_SURFACE}:
         return entry.family_default_model(surface)
     for family_name in _PI_FALLBACK_FAMILIES:
         if family_name in entry.families:

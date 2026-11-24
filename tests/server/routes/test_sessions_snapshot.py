@@ -2117,11 +2117,13 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_serves_pi_model_options_from_extension_push(
+@pytest.mark.parametrize("wrapper", ["pi-native-ui", "omp-native-ui", "omp-native-ui-subagent"])
+async def test_session_snapshot_serves_model_options_from_extension_push(
     monkeypatch: pytest.MonkeyPatch,
+    wrapper: str,
 ) -> None:
     """
-    Pi-native model options come from the extension-PUSHED cache, not a fetch.
+    Pi-native and OMP-native serve model options pushed by their extensions.
 
     Pi's picker catalog is reported by the resident extension (its live
     ``ctx.modelRegistry``) via ``external_model_options``, landing in
@@ -2164,7 +2166,7 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
         root_conversation_id="conv_pi_options",
         agent_id="ag_test",
         labels={
-            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE,
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: wrapper,
         },
     )
     conv_store = _ConversationStore(

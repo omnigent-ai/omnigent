@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from omnigent.harnesses.pi_native.bridge import (
     PI_NATIVE_BRIDGE_DIR_ENV_VAR,
     PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     enqueue_model_change,
+    enqueue_thinking_level_change,
     enqueue_user_message,
     refresh_config_auth_headers,
 )
@@ -25,6 +26,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.util.json_types import JsonObject
 
 
 class PiNativeExecutor(Executor):
@@ -46,9 +48,17 @@ class PiNativeExecutor(Executor):
     the Claude Code native hook uses.
     """
 
-    def __init__(self, bridge_dir: Path | None = None) -> None:
-        self._bridge_dir = bridge_dir or _bridge_dir_from_env()
-        self._request_session_id = _request_session_id_from_env()
+    def __init__(
+        self,
+        bridge_dir: Path | None = None,
+        *,
+        bridge_env_var: str = PI_NATIVE_BRIDGE_DIR_ENV_VAR,
+        session_env_var: str = PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+        display_name: str = "Pi",
+    ) -> None:
+        self._bridge_dir = bridge_dir or _bridge_dir_from_env(bridge_env_var)
+        self._request_session_id = _request_session_id_from_env(session_env_var)
+        self._display_name = display_name
         # Turns and live steering share one cached executor and yield while
         # minting, so serialize refresh + enqueue to keep the inbox in arrival order.
         self._enqueue_lock = asyncio.Lock()
@@ -71,7 +81,7 @@ class PiNativeExecutor(Executor):
         :returns: ``True`` when the message was queued.
         """
         del session_key
-        text = _content_to_text(content, self._bridge_dir)
+        text = self._bridge_content(content)
         if not text:
             return False
         async with self._enqueue_lock:
@@ -104,17 +114,31 @@ class PiNativeExecutor(Executor):
             :class:`ExecutorError` when no user text can be sent.
         """
         del tools, system_prompt
-        text = _latest_user_text(messages, self._bridge_dir)
+        text = _latest_user_text(messages, self._bridge_dir, normalize=self._bridge_content)
         if not text:
-            yield ExecutorError(message="Pi native turn had no user text to send")
+            yield ExecutorError(
+                message=f"{self._display_name} native turn had no user text to send"
+            )
             return
         model = config.model if config is not None else None
+        effort = config.extra.get("reasoning_effort") if config is not None else None
+        from omnigent.util.reasoning_effort import to_pi_thinking_level
+
+        thinking = to_pi_thinking_level(effort) if isinstance(effort, str) and effort else None
         async with self._enqueue_lock:
             await asyncio.to_thread(self._refresh_auth_headers)
             if model:
-                enqueue_model_change(self._bridge_dir, model)
+                if thinking is not None:
+                    enqueue_model_change(self._bridge_dir, model, thinking_level=thinking)
+                else:
+                    enqueue_model_change(self._bridge_dir, model)
+            elif thinking:
+                enqueue_thinking_level_change(self._bridge_dir, thinking)
             enqueue_user_message(self._bridge_dir, text)
         yield TurnComplete(response=None)
+
+    def _bridge_content(self, content: EnqueuedContent) -> str | list[JsonObject]:
+        return _content_to_text(content, self._bridge_dir)
 
     def _refresh_auth_headers(self) -> None:
         """
@@ -157,30 +181,37 @@ class PiNativeExecutor(Executor):
             pass
 
 
-def _bridge_dir_from_env() -> Path:
+def _bridge_dir_from_env(env_var: str = PI_NATIVE_BRIDGE_DIR_ENV_VAR) -> Path:
     """
     Resolve the native Pi bridge directory from harness spawn env.
 
     :returns: Bridge directory path.
     :raises RuntimeError: If the env var is missing.
     """
-    raw = os.environ.get(PI_NATIVE_BRIDGE_DIR_ENV_VAR, "").strip()
+    raw = os.environ.get(env_var, "").strip()
     if not raw:
-        raise RuntimeError(f"{PI_NATIVE_BRIDGE_DIR_ENV_VAR} is required for pi-native harness")
+        raise RuntimeError(f"{env_var} is required for the native harness")
     return Path(raw)
 
 
-def _request_session_id_from_env() -> str | None:
+def _request_session_id_from_env(
+    env_var: str = PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+) -> str | None:
     """
     Resolve the Omnigent session id that requested this harness process.
 
     :returns: Omnigent session id, e.g. ``"conv_abc123"``, or ``None``.
     """
-    raw = os.environ.get(PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "").strip()
+    raw = os.environ.get(env_var, "").strip()
     return raw or None
 
 
-def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
+def _latest_user_text(
+    messages: list[Message],
+    bridge_dir: Path,
+    *,
+    normalize: Callable[[EnqueuedContent], str | list[JsonObject]] | None = None,
+) -> str | list[JsonObject]:
     """
     Return the latest user text from executor messages.
 
@@ -190,7 +221,12 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     """
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_text(message.get("content"), bridge_dir)
+            content = message.get("content")
+            return (
+                normalize(content)
+                if normalize is not None
+                else _content_to_text(content, bridge_dir)
+            )
     return ""
 
 

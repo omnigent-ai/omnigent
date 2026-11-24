@@ -838,7 +838,9 @@ export function ChatPage() {
         ? "codex-native"
         : fallbackPickerKind === "pi"
           ? "pi-native"
-          : null;
+          : fallbackPickerKind === "omp"
+            ? "omp-native"
+            : null;
   const sandboxPreviewOptions = useSandboxLaunchModelOptions(
     sandboxStatus,
     activeSession?.hostId ?? null,
@@ -3420,12 +3422,14 @@ function ComposerImpl(
         if (
           (sessionHarness === "codex-native" ||
             sessionHarness === "claude-sdk" ||
-            sessionHarness === "pi-native") &&
+            sessionHarness === "pi-native" ||
+            sessionHarness === "omp-native") &&
           arg
         ) {
           const harnessName = {
             "codex-native": "Codex",
             "pi-native": "Pi",
+            "omp-native": "OMP",
             "claude-sdk": "Claude SDK",
           }[sessionHarness];
           setCommandError(`/compact does not accept arguments for ${harnessName}`);
@@ -3453,9 +3457,10 @@ function ComposerImpl(
           sessionHarness === "claude-native" ||
           sessionHarness === "claude-sdk" ||
           sessionHarness === "codex-native" ||
-          sessionHarness === "pi-native"
+          sessionHarness === "pi-native" ||
+          sessionHarness === "omp-native"
         ) {
-          // Use the message queue; the store dispatches SDK, Codex and Pi as controls.
+          // Use the message queue; the store dispatches these harnesses as controls.
           const command = arg ? `/compact ${arg}` : "/compact";
           appendEntry(command);
           onSend(command);

@@ -16,6 +16,7 @@ export const BUILTIN_AGENTS = new Set([
   "codex-native-ui", // Codex
   "opencode-native-ui", // OpenCode
   "pi-native-ui", // Pi
+  "omp-native-ui", // OMP
   "cursor-native-ui", // Cursor
   "kiro-native-ui", // Kiro
   "antigravity-native-ui", // Antigravity

@@ -460,7 +460,9 @@ function credentialPresentation(
   override?: HarnessCredentialKind,
 ) {
   if (override === "personal") {
-    return HARNESS_CREDENTIAL_COPY.personal;
+    return harnessAccountKey(harness) === "omp"
+      ? { label: "OMP login", description: "Uses OMP’s own provider accounts on this host" }
+      : HARNESS_CREDENTIAL_COPY.personal;
   }
   if (override === "isaac" || host?.gateway_inference?.[harness] === true) {
     return HARNESS_CREDENTIAL_COPY.isaac;
@@ -478,7 +480,7 @@ function credentialPresentation(
     }
     if (account.kind === "chatgpt" || account.kind === "subscription") {
       return {
-        label: "Personal subscription",
+        label: harnessAccountKey(harness) === "omp" ? "OMP login" : "Personal subscription",
         description: accountDetails(account),
       };
     }

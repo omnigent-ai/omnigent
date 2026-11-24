@@ -20,6 +20,7 @@ describe("nativeEffortOptions", () => {
   it("returns the fixed Claude Code and Pi ladders", () => {
     expect(nativeEffortOptions("claude-native", [], null)).toBe(CLAUDE_NATIVE_EFFORTS);
     expect(nativeEffortOptions("pi-native", [], "any")).toBe(PI_NATIVE_EFFORTS);
+    expect(nativeEffortOptions("omp-native", [], "provider/model")).toBe(PI_NATIVE_EFFORTS);
   });
 
   it("reads Codex levels from the pinned model, else the catalog default", () => {

@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 # the product the login authenticates, not the CLI name (the codex CLI logs in
 # a ChatGPT subscription). Keyed by the ambient detection name; these are the
 # only two subscription CLIs ambient detection emits.
-_CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT"}
+_CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT", "omp": "OMP"}
 
 
 def _load_global_config() -> dict[str, Any]:  # type: ignore[explicit-any]
@@ -491,12 +491,13 @@ def _credential_source_hint(entry: ProviderEntry, family: str) -> str | None:
     """
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
+        OMP_SURFACE,
         OPENAI_FAMILY,
         PI_SURFACE,
     )
 
     raw = entry.families.get(family)
-    if raw is None and family == PI_SURFACE:
+    if raw is None and family in {PI_SURFACE, OMP_SURFACE}:
         # The pi surface carries no family block of its own — pi consumes
         # the credential of whichever family it routes through (anthropic
         # preferred), so describe that family's source instead.
@@ -575,6 +576,26 @@ def _family_credential_label(  # type: ignore[explicit-any]  # config is a yaml-
     return f"{base} ({hint})" if hint else base
 
 
+def _prompt_databricks_workspace_url() -> str:
+    """Read a workspace URL and reduce it to the origin used for authentication."""
+    from omnigent.onboarding.databricks_config import normalize_workspace_url
+    from omnigent.onboarding.interactive import console, prompt_text
+
+    workspace_url = prompt_text(
+        "Databricks workspace URL (e.g. https://workspace.example)"
+    ).strip()
+    if not workspace_url:
+        return ""
+    if not workspace_url.startswith(("http://", "https://")):
+        workspace_url = f"https://{workspace_url}"
+    normalized = normalize_workspace_url(workspace_url)
+    if normalized != workspace_url.rstrip("/"):
+        console.print(
+            f"  [dim]Using {normalized} — ignored the extra path from the pasted URL.[/dim]"
+        )
+    return normalized
+
+
 def _configure_harness_add(family: str | None = None) -> str | None:
     """Run the interactive ``add a provider`` flow and persist the entry.
 
@@ -618,6 +639,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         CLI_CONFIG_KIND,
         DATABRICKS_KIND,
         GEMINI_FAMILY,
+        OMP_SURFACE,
         OPENAI_FAMILY,
         PI_SURFACE,
         RESPONSES_WIRE_API,
@@ -684,6 +706,21 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     # _ConfigValue would trip dict invariance against those. Matches the
     # cli.py yaml-boundary convention.
     entry: dict[str, Any]  # type: ignore[explicit-any]
+
+    if kind == DATABRICKS_KIND and family != GEMINI_FAMILY:
+        # Check the runtime dependency before signing the user into a workspace.
+        from omnigent.onboarding.databricks_config import (
+            DATABRICKS_EXTRA_INSTALL_HINT,
+            databricks_sdk_installed,
+        )
+
+        if not databricks_sdk_installed():
+            from rich.markup import escape as _rich_escape
+
+            return (
+                "✗ Databricks routing needs the databricks extra — "
+                f"{_rich_escape(DATABRICKS_EXTRA_INSTALL_HINT)}"
+            )
 
     if kind == CLI_CONFIG_KIND:
         # One detected-config row was appended per cli_config_dets entry, in
@@ -846,7 +883,11 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         if cli_name in _CLI_LOGIN_BRAND:
             from omnigent.onboarding.harness_install import harness_install_spec, harness_login
 
-            login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(cli_name)
+            login_family = {
+                "claude": ANTHROPIC_FAMILY,
+                "codex": OPENAI_FAMILY,
+                "omp": OMP_SURFACE,
+            }.get(cli_name)
             if login_family is None:
                 raise click.ClickException(f"internal: no login family for cli {cli_name!r}")
             spec = harness_install_spec(login_family)
@@ -1043,43 +1084,24 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         entry = {**build_databricks_provider_entry(profile), "native_gemini": True}
         console.print("  Gemini model availability is checked when agy starts.")
 
-    else:  # databricks
-        # Gate on the `databricks` extra: a `kind: databricks` provider mints
-        # workspace OAuth tokens via databricks-sdk at runtime
-        # (omnigent/runtime/credentials/databricks.py), and the SDK is no
-        # longer a default dependency. Abort before any side effect (the
-        # `databricks auth login` browser flow, `ucode configure`) so the
-        # user isn't signed into a workspace that routing then can't use.
-        from omnigent.onboarding.databricks_config import (
-            DATABRICKS_EXTRA_INSTALL_HINT,
-            databricks_sdk_installed,
+    elif kind == DATABRICKS_KIND and family == OMP_SURFACE:
+        from omnigent.onboarding.interactive import clear_screen
+        from omnigent.onboarding.setup import login_databricks_workspace
+
+        console.print(
+            "  [dim]Routes OMP through this workspace's native model gateway "
+            "using your Databricks login, without changing another CLI's config.[/dim]"
         )
+        workspace_url = _prompt_databricks_workspace_url()
+        if not workspace_url:
+            return None
+        profile = login_databricks_workspace(workspace_url, console=console)
+        clear_screen()
+        name = "databricks"
+        entry = build_databricks_provider_entry(profile)
 
-        if not databricks_sdk_installed():
-            from rich.markup import escape as _rich_escape
-
-            # The status renders through Text.from_markup, where the literal
-            # `[databricks]` in the install command would parse as a tag.
-            return (
-                "✗ Databricks routing needs the databricks extra — "
-                f"{_rich_escape(DATABRICKS_EXTRA_INSTALL_HINT)}"
-            )
-
-        # The intro + URL prompt render inline, exactly like every other add
-        # flow (the add-menu picker already erased its own frame on exit via
-        # `clear_on_exit`) — entering the Databricks option should NOT blank the
-        # whole screen. The one clear we keep is *after* the subprocess (below):
-        # `databricks auth login` + `ucode configure` print a lot, and the
-        # in-place menu redraw we return to can only erase its own frame, so we
-        # wipe that leftover output once the login finishes.
-        # Ask only for the workspace URL — never a profile name. The flow
-        # below authenticates that one workspace and runs `ucode configure`
-        # against it, scoped to the harness the user drilled into. This is
-        # the one place Omnigent triggers a Databricks CLI / ucode login;
-        # it never happens on a bare `run`, so a user who only wants their
-        # own provider is never routed through Databricks unexpectedly.
+    else:  # databricks with external gateway configuration
         from omnigent.onboarding.configure_models import family_label
-        from omnigent.onboarding.databricks_config import normalize_workspace_url
         from omnigent.onboarding.interactive import clear_screen
         from omnigent.onboarding.setup import login_databricks_workspace
         from omnigent.onboarding.ucode_setup import (
@@ -1087,36 +1109,16 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             ucode_workspace_exists,
         )
 
-        _routed = f"{family_label(family)}'s" if family is not None else "your harnesses'"
+        routed = f"{family_label(family)}'s" if family is not None else "your harnesses'"
         console.print(
-            f"  [dim]Routes {_routed} model calls through this workspace's "
-            "Databricks Unity Gateway (via ucode), so usage is governed and "
-            "billed there. This signs you into the workspace and runs "
-            "`ucode configure` for it.[/dim]"
+            f"  [dim]Routes {routed} model calls through this workspace's "
+            "Databricks Unity Gateway, so usage is governed and billed there. "
+            "This signs you into the workspace and configures the gateway for it.[/dim]"
         )
-        workspace_url = prompt_text(
-            "Databricks workspace URL (e.g. https://example.cloud.databricks.com)"
-        ).strip()
-        if not workspace_url:  # blank — abort the add
+        workspace_url = _prompt_databricks_workspace_url()
+        if not workspace_url:
             return None
-        if not workspace_url.startswith(("http://", "https://")):
-            workspace_url = f"https://{workspace_url}"
-        # Reduce to scheme://host. Users paste the URL from a browser address
-        # bar, whose `/browse?o=...` path breaks both the saved profile host
-        # and `ucode configure` (the Databricks CLI keys OAuth tokens by host,
-        # so a path-laden value yields "no access token").
-        normalized_workspace_url = normalize_workspace_url(workspace_url)
-        if normalized_workspace_url != workspace_url.rstrip("/"):
-            console.print(
-                f"  [dim]Using {normalized_workspace_url} — ignored the extra "
-                "path from the pasted URL.[/dim]"
-            )
-        workspace_url = normalized_workspace_url
 
-        # 1. Authenticate the workspace (returns the ~/.databrickscfg profile
-        #    name) and 2. run `ucode configure` against it for model serving —
-        #    scoped to the harness the user drilled into (or both when added
-        #    from the un-scoped menu), so ucode configures only what's needed.
         if family is not None:
             ucode_agents = [_FAMILY_UCODE_AGENT[family]]
         else:
@@ -1441,6 +1443,8 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
             return gateway
     if entry.kind == SUBSCRIPTION_KIND and entry.cli == "pi":
         return "Pi original auth"
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "omp":
+        return "OMP original auth"
     return credential_label(
         entry.kind, name, profile=entry.profile, display_name=entry.display_name
     )
@@ -3845,6 +3849,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
         GEMINI_FAMILY,
+        OMP_SURFACE,
         OPENAI_FAMILY,
         PI_SURFACE,
         surface_default_provider,
@@ -3911,7 +3916,7 @@ def _run_configure_harnesses_interactive() -> None:
     _ACP_ADD = "\x00acp-add"
     _ACP_AGENT_PREFIX = "\x00acp-agent:"
     _ACP_CLI_PREFIX = "\x00acp-cli:"
-    families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
+    families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE]
 
     # Status glyph + Rich color per readiness kind: "ready" is a configured,
     # launchable harness (green ✓); "missing" is an absent CLI/SDK (red ✗);
@@ -3977,6 +3982,11 @@ def _run_configure_harnesses_interactive() -> None:
             )
         default = surface_default_provider(config, fam)
         if default is None:
+            if fam == OMP_SURFACE:
+                from omnigent.harnesses.omp_native.credentials import omp_native_model_options
+
+                if omp_native_model_options():
+                    return (fam, name, "OMP CLI login", "ready", "")
             return (fam, name, "Not configured", "warn", "Open to add a credential.")
         label = _family_credential_label(config, fam, default.name, default)
         return (fam, name, label, "ready", "")
@@ -4088,6 +4098,7 @@ def _run_configure_harnesses_interactive() -> None:
             )
 
         rows.append(_family_row(PI_SURFACE))
+        rows.append(_family_row(OMP_SURFACE))
 
         # Native providers resolve independently of the SDK's legacy API key.
         from omnigent.harnesses.antigravity_native.credentials import antigravity_credentials_ready

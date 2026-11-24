@@ -63,10 +63,12 @@ def _family(provider: ProviderEntry, harness: str, model: str | None = None) -> 
         "opencode-native",
     }:
         family = "openai"
-    elif canonical in {"pi", "pi-native", "acp"}:
+    elif canonical in {"pi", "pi-native", "omp-native", "acp"}:
         preferred = (
             ("openai", "anthropic")
-            if canonical in {"pi", "pi-native"} and model and "claude" not in model.lower()
+            if canonical in {"pi", "pi-native", "omp-native"}
+            and model
+            and "claude" not in model.lower()
             else ("anthropic", "openai")
         )
         family = next((name for name in preferred if name in provider.families), "")
@@ -131,7 +133,7 @@ def _resolve_alias(provider: ProviderEntry, harness: str, model: str) -> str:
     canonical = canonicalize_harness(normalize_inference_harness(harness))
     families = (
         [name for name in ("anthropic", "openai") if name in provider.families]
-        if canonical in {"pi", "pi-native", "acp"}
+        if canonical in {"pi", "pi-native", "omp-native", "acp"}
         else [_family(provider, harness)]
     )
     resolved = {

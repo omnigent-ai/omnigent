@@ -36,7 +36,15 @@ import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engin
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as renderTestingLibrary,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -407,8 +415,8 @@ function activeRow(): HTMLElement | null {
   return document.querySelector('[data-active="true"]');
 }
 
-function renderWithTooltips(ui: ReactElement) {
-  return render(<TooltipProvider>{ui}</TooltipProvider>);
+function render(ui: ReactElement) {
+  return renderTestingLibrary(ui, { wrapper: TooltipProvider });
 }
 
 function tooltipKeys(tooltip: HTMLElement): string[] {
@@ -877,9 +885,7 @@ describe("Composer send shortcut", () => {
       });
 
       try {
-        renderWithTooltips(
-          <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
-        );
+        render(<Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />);
         if (alternate) {
           fireEvent.change(textarea(), { target: { value: "normal draft" } });
           fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true });
@@ -1037,7 +1043,7 @@ describe("Composer Claude goal control", () => {
   it("sends the completion condition as a Claude /goal command", async () => {
     const onSend = vi.fn();
     useChatStore.setState({ conversationId: "conv_polly" });
-    renderWithTooltips(<Composer {...composerProps({ onSend, showClaudeGoalControl: true })} />);
+    render(<Composer {...composerProps({ onSend, showClaudeGoalControl: true })} />);
 
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     fireEvent.click(screen.getByTestId("composer-goal-action"));
@@ -1075,9 +1081,7 @@ describe("Composer goal slash command", () => {
       const onSend = vi.fn();
       const onSendSlashCommand = vi.fn();
       useChatStore.setState({ sessionHarness });
-      renderWithTooltips(
-        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
-      );
+      render(<Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />);
       fireEvent.change(textarea(), { target: { value: "/goal" } });
       fireEvent.click(screen.getByRole("button", { name: "Send" }));
       expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
@@ -1100,9 +1104,7 @@ describe("Composer goal slash command", () => {
         sessionHarness,
         skills: [{ name, description: "Project goal skill", display_name: "Project goal" }],
       });
-      renderWithTooltips(
-        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
-      );
+      render(<Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />);
       fireEvent.change(textarea(), { target: { value: "/go" } });
       if (sessionHarness === "codex-native") {
         expect(
@@ -1139,9 +1141,7 @@ describe("Composer goal slash command", () => {
       const onSend = vi.fn();
       const onSendSlashCommand = vi.fn();
       useChatStore.setState({ sessionHarness });
-      renderWithTooltips(
-        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
-      );
+      render(<Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />);
       fireEvent.change(textarea(), {
         target: { value: text },
       });
@@ -1165,7 +1165,7 @@ describe("Composer goal slash command", () => {
       sessionHarness: "codex",
       skills: [{ name, description: "Project goal skill" }],
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({ onSend, onSendSlashCommand, showPollyCodexGoalControl: true })}
       />,
@@ -1189,7 +1189,7 @@ describe("Composer goal slash command", () => {
       sessionHarness: "codex",
       skills: [{ name: "goal fix", description: "Project goal skill" }],
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({ onSend, onSendSlashCommand, showPollyCodexGoalControl: true })}
       />,
@@ -1206,7 +1206,7 @@ describe("Composer goal slash command", () => {
     "keeps an attached %s draft on the ordinary message path",
     (text) => {
       const onSend = vi.fn();
-      renderWithTooltips(<Composer {...composerProps({ onSend, showGoalControl: true })} />);
+      render(<Composer {...composerProps({ onSend, showGoalControl: true })} />);
       fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
         target: { files: [new File(["hello"], "notes.txt", { type: "text/plain" })] },
       });
@@ -1230,7 +1230,7 @@ describe("Composer goal slash command", () => {
       sessionHarness: "claude-sdk",
       skills: [{ name: "goal", description: "Project goal skill" }],
     });
-    renderWithTooltips(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
     fireEvent.change(textarea(), { target: { value: text } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     expect(onSendSlashCommand).toHaveBeenCalledWith("goal", args);
@@ -1248,9 +1248,7 @@ describe("Composer Codex goal control", () => {
   it("sends the completion condition as a Codex /goal command", async () => {
     const onSend = vi.fn();
     useChatStore.setState({ conversationId: "conv_polly" });
-    renderWithTooltips(
-      <Composer {...composerProps({ onSend, showPollyCodexGoalControl: true })} />,
-    );
+    render(<Composer {...composerProps({ onSend, showPollyCodexGoalControl: true })} />);
 
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     fireEvent.click(screen.getByTestId("composer-goal-action"));
@@ -1293,7 +1291,7 @@ describe("Composer native goal state", () => {
       const onSend = vi.fn();
       setComposerState({ conversationId: "conv_goal", sessionHarness: "codex-native", skills: [] });
       const props = composerProps({ showGoalControl: true, runnerOnline: true, onSend });
-      const { rerender } = renderWithTooltips(<Composer {...props} />);
+      const { rerender } = render(<Composer {...props} />);
       await act(async () => {});
       /* oxlint-disable no-await-in-loop */
       for (const delay of [10_000, 20_000, 40_000]) {
@@ -1308,11 +1306,7 @@ describe("Composer native goal state", () => {
         fireEvent.click(screen.getByRole("button", { name: "Send" }));
         expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation", undefined);
       } else {
-        rerender(
-          <TooltipProvider>
-            <Composer {...props} isWorking={true} status="streaming" />
-          </TooltipProvider>,
-        );
+        rerender(<Composer {...props} isWorking={true} status="streaming" />);
         expect(onSend).not.toHaveBeenCalled();
       }
       await act(async () => {});
@@ -1345,7 +1339,7 @@ describe("Composer native goal state", () => {
         .mockResolvedValueOnce({ goal: updatedGoal });
       useChatStore.setState({ conversationId: "conv_goal" });
 
-      const { rerender } = renderWithTooltips(
+      const { rerender } = render(
         <Composer {...composerProps({ showGoalControl: true, runnerOnline })} />,
       );
       expect(mockGetGoal).not.toHaveBeenCalled();
@@ -1360,14 +1354,12 @@ describe("Composer native goal state", () => {
       expect(screen.queryByText(/Could not read goal/)).toBeNull();
 
       rerender(
-        <TooltipProvider>
-          <Composer
-            {...composerProps({
-              showGoalControl: true,
-              runnerOnline: runnerOnline === false ? undefined : false,
-            })}
-          />
-        </TooltipProvider>,
+        <Composer
+          {...composerProps({
+            showGoalControl: true,
+            runnerOnline: runnerOnline === false ? undefined : false,
+          })}
+        />,
       );
       expect(mockGetGoal).toHaveBeenCalledTimes(1);
       expect(screen.getByTestId("goal-current")).toHaveTextContent(goal.objective);
@@ -1389,11 +1381,7 @@ describe("Composer native goal state", () => {
       );
 
       mockGetGoal.mockResolvedValue({ goal: updatedGoal });
-      rerender(
-        <TooltipProvider>
-          <Composer {...composerProps({ showGoalControl: true, runnerOnline: true })} />
-        </TooltipProvider>,
-      );
+      rerender(<Composer {...composerProps({ showGoalControl: true, runnerOnline: true })} />);
 
       await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(3));
       expect(mockGetGoal.mock.calls.slice(1)).toEqual(
@@ -1499,6 +1487,9 @@ describe("Composer slash-command menu", () => {
     ["pi-native", "/compact", "idle"],
     ["pi-native", "/compact instructions", "idle"],
     ["pi-native", "/compact", "running"],
+    ["omp-native", "/compact", "idle"],
+    ["omp-native", "/compact instructions", "idle"],
+    ["omp-native", "/compact", "running"],
     ["opencode-native", "/compact", "idle"],
   ] as const)("%s handles %s (status: %s)", (harness, command, turnStatus) => {
     const { sessionHarness, status, sessionStatus } = useChatStore.getState();
@@ -1527,13 +1518,17 @@ describe("Composer slash-command menu", () => {
     fireEvent.change(textarea(), { target: { value: command + " " } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     if (
-      (harness === "codex-native" || harness === "claude-sdk" || harness === "pi-native") &&
+      (harness === "codex-native" ||
+        harness === "claude-sdk" ||
+        harness === "pi-native" ||
+        harness === "omp-native") &&
       command !== "/compact"
     ) {
       expect(textarea()).toHaveValue(command + " ");
       const harnessName = {
         "codex-native": "Codex",
         "pi-native": "Pi",
+        "omp-native": "OMP",
         "claude-sdk": "Claude SDK",
       }[harness];
       expect(
@@ -2289,7 +2284,7 @@ describe("Composer slash-command submit routing", () => {
     const setModel = vi.fn().mockResolvedValue(undefined);
     const onSend = vi.fn();
     useChatStore.setState({ setModel, sessionHarness: "harness" in row ? row.harness : null });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           onSend,
@@ -2768,7 +2763,7 @@ describe("Composer cached model labels", () => {
   });
 
   it("uses host names for the label and menu until session metadata arrives", async () => {
-    const view = renderWithTooltips(<Composer {...props()} />);
+    const view = render(<Composer {...props()} />);
     const trigger = screen.getByTestId("composer-config-gear");
     expect(screen.queryByRole("status", { name: "Loading model" })).toBeNull();
     expect(trigger).toBeEnabled();
@@ -2785,25 +2780,23 @@ describe("Composer cached model labels", () => {
     expect(await screen.findByTestId("composer-agent-model-alias-a")).toBeEnabled();
 
     view.rerender(
-      <TooltipProvider>
-        <Composer
-          {...props()}
-          modelLabelOptions={[{ ...catalog[0], displayName: "Session name" }]}
-        />
-      </TooltipProvider>,
+      <Composer
+        {...props()}
+        modelLabelOptions={[{ ...catalog[0], displayName: "Session name" }]}
+      />,
     );
     expect(screen.queryByTestId("composer-model-loading")).toBeNull();
     expect(trigger).toHaveTextContent("Session name");
   });
 
   it("uses the cached session display name immediately on remount, not a newer host probe", async () => {
-    const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    const first = render(<Composer {...props()} modelLabelOptions={catalog} />);
     expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(scope, model))).toBe(
       "Team model",
     );
     first.unmount();
     useChatStore.setState({ sessionHostId: null });
-    renderWithTooltips(
+    render(
       <Composer {...props()} codexModelOptions={[{ ...catalog[0], displayName: "Host name" }]} />,
     );
     const trigger = screen.getByTestId("composer-config-gear");
@@ -2819,7 +2812,7 @@ describe("Composer cached model labels", () => {
       sessionHarness: "codex-native",
       sessionModelOverride: "another-model",
     });
-    renderWithTooltips(<Composer {...props()} modelPickerKind="codex" />);
+    render(<Composer {...props()} modelPickerKind="codex" />);
     expect(screen.getByTestId("composer-config-gear")).toHaveTextContent("Team model");
     expect(screen.queryByTestId("composer-model-loading")).toBeNull();
     await openSessionModels();
@@ -2832,7 +2825,7 @@ describe("Composer cached model labels", () => {
   });
 
   it("uses a loading label for the synthetic current row without a catalog", async () => {
-    renderWithTooltips(<Composer {...props()} codexModelOptions={[]} />);
+    render(<Composer {...props()} codexModelOptions={[]} />);
     await openSessionModels();
     expect(
       screen.getByRole("menuitemcheckbox", { name: "Loading model… (current)" }),
@@ -2841,20 +2834,16 @@ describe("Composer cached model labels", () => {
   });
 
   it("does not reuse the creation host's cache after the snapshot host changes", () => {
-    const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    const first = render(<Composer {...props()} modelLabelOptions={catalog} />);
     composerSessionSnapshot.hostId = "new-host";
-    first.rerender(
-      <TooltipProvider>
-        <Composer {...props()} codexModelOptions={[]} />
-      </TooltipProvider>,
-    );
+    first.rerender(<Composer {...props()} codexModelOptions={[]} />);
     expect(screen.getByTestId("composer-model-loading")).toBeInTheDocument();
     expect(screen.getByTestId("composer-config-gear")).not.toHaveTextContent("Team model");
   });
 
   it("does not cache an optimistic creation seed until the runner confirms it", () => {
     useChatStore.setState({ sessionModelSeeded: true, sessionModelOverride: model });
-    renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
+    render(<Composer {...props()} modelLabelOptions={catalog} />);
     const key = getSessionModelLabelCacheKey(scope, model);
     expect(readSessionModelLabelCache(key)).toBeNull();
     act(() => useChatStore.setState({ sessionModelSeeded: false }));
@@ -2863,7 +2852,7 @@ describe("Composer cached model labels", () => {
 
   it("keeps Smart Routing visible without a label-loading spinner", () => {
     useChatStore.setState({ costControlModeOverride: "on" });
-    renderWithTooltips(<Composer {...props()} costRoutingEligible />);
+    render(<Composer {...props()} costRoutingEligible />);
     expect(screen.getByTestId("composer-config-gear")).toHaveTextContent("Smart Routing");
     expect(screen.queryByTestId("composer-model-loading")).toBeNull();
   });
@@ -2898,7 +2887,7 @@ describe("Composer model/effort label", () => {
       sessionHarness: "claude-native",
       sessionReasoningEffort: "xhigh",
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           modelPickerKind: "claude",
@@ -2932,7 +2921,7 @@ describe("Composer model/effort label", () => {
     // The chip renders the harness's reported model (`llmModel`), never the
     // sticky preference or the request.
     useChatStore.setState({ llmModel: "opus", sessionReasoningEffort: "high" });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -2957,7 +2946,7 @@ describe("Composer model/effort label", () => {
       llmModel: "opus",
       sessionReasoningEffort: null,
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -2985,7 +2974,7 @@ describe("Composer model/effort label", () => {
       ...option,
       source: { kind: "subscription", label: "Subscription", name: "claude" },
     }));
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -3013,7 +3002,7 @@ describe("Composer model/effort label", () => {
       sessionReasoningEffort: null,
       llmModel: "haiku",
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -3046,7 +3035,7 @@ describe("Composer model/effort label", () => {
         pendingModelChange: "alternate",
         sessionModelSeeded: false,
       });
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showEffort: false,
@@ -3085,7 +3074,7 @@ describe("Composer model/effort label", () => {
       sessionModelOverride: null,
       llmModel: "system.ai.claude-sonnet-5",
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -3111,7 +3100,7 @@ describe("Composer model/effort label", () => {
       sessionReasoningEffort: null,
       llmModel: null,
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -3138,7 +3127,7 @@ describe("Composer model/effort label", () => {
       llmModel: null,
       sessionHarness: "pi",
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "polly" }],
@@ -3161,7 +3150,7 @@ describe("Composer model/effort label", () => {
       llmModel: null,
       sessionHarness: "grok",
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "pinned" }],
@@ -3189,7 +3178,7 @@ describe("Composer model/effort label", () => {
       sessionHarness: "claude-native",
       subAgentName: "general-purpose",
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude-native-ui" }],
@@ -3216,7 +3205,7 @@ describe("Composer model/effort label", () => {
       sessionReasoningEffort: null,
       llmModel: null,
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -3242,7 +3231,7 @@ describe("Composer model/effort label", () => {
       sessionReasoningEffort: "low",
       llmModel: "fable", // meaningless vendor default — must not surface
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "cursor" }],
@@ -3271,7 +3260,7 @@ describe("Composer model/effort label", () => {
       sessionReasoningEffort: null,
       llmModel: null,
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "polly" }],
@@ -3290,7 +3279,7 @@ describe("Composer model/effort label", () => {
       sessionReasoningEffort: "high",
       llmModel: null,
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "polly" }],
@@ -3314,7 +3303,7 @@ describe("Composer model/effort label", () => {
       llmModel: null,
       codexModelOptions: [], // cleared by `switchTo`, refilled when the snapshot lands
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -3334,7 +3323,7 @@ describe("Composer model/effort label", () => {
     // The pill-wide hover highlight advertises one clickable control, so the
     // label half must perform the same action as the gear beside it.
     useChatStore.setState({ llmModel: "opus", sessionReasoningEffort: "high" });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -3357,7 +3346,7 @@ describe("Composer model/effort label", () => {
     // from either pill half, and aria-disabled drops the pill's hover
     // highlight so no dead affordance is advertised.
     useChatStore.setState({ llmModel: "opus", sessionReasoningEffort: "high" });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "claude" }],
@@ -3384,7 +3373,7 @@ describe("Composer model/effort label", () => {
       llmModel: null,
       sessionHarness: "pi",
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           agents: [{ id: "a1", name: "polly" }],
@@ -3434,7 +3423,7 @@ describe("Composer shared visible controls", () => {
       llmModel: null,
       sessionReasoningEffort: null,
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showCodexApprovalMode: true,
@@ -3498,7 +3487,7 @@ describe("Composer shared visible controls", () => {
       ],
     });
     openGithubTabMock.mockClear();
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
     fireEvent.click(screen.getByTestId("composer-pr-link"));
     expect(openGithubTabMock.mock.calls).toEqual([args]);
   });
@@ -3514,7 +3503,7 @@ describe("Composer shared visible controls", () => {
       prCount: 1,
       prNumber: 42,
     });
-    const view = renderWithTooltips(<Composer {...composerProps()} />);
+    const view = render(<Composer {...composerProps()} />);
     expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("#42");
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature/shared-composer");
 
@@ -3528,36 +3517,24 @@ describe("Composer shared visible controls", () => {
       prCount: 0,
       prNumber: null,
     });
-    view.rerender(
-      <TooltipProvider>
-        <Composer {...composerProps()} />
-      </TooltipProvider>,
-    );
+    view.rerender(<Composer {...composerProps()} />);
     expect(screen.queryByTestId("composer-pr-link")).toBeNull();
     expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
 
     setComposerGitStatus({ githubState: "loading", repoNameWithOwner: null });
-    view.rerender(
-      <TooltipProvider>
-        <Composer {...composerProps()} />
-      </TooltipProvider>,
-    );
+    view.rerender(<Composer {...composerProps()} />);
     expect(screen.queryByTestId("composer-pr-loading")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
 
     setComposerGitStatus({ githubState: "unknown" });
-    view.rerender(
-      <TooltipProvider>
-        <Composer {...composerProps()} />
-      </TooltipProvider>,
-    );
+    view.rerender(<Composer {...composerProps()} />);
     expect(screen.queryByTestId("composer-pr-unknown")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
   });
 
   it("marks the PR number with the prefix of the PR's provider", () => {
     setComposerGitStatus({ prCount: 1, prNumber: 7, prNumberPrefix: "!" });
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
     expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("!7");
     expect(screen.getByTestId("composer-pr-link")).toHaveAccessibleName("!7");
   });
@@ -3573,7 +3550,7 @@ describe("Composer shared visible controls", () => {
       prCount: 1,
       prNumber: 42,
     });
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
     const pr = screen.getByTestId("composer-pr-link");
     const worktree = screen.getByTestId("composer-git-branch");
     expect(worktree.compareDocumentPosition(pr) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
@@ -3606,9 +3583,7 @@ describe("Composer shared visible controls", () => {
 
     render(
       <MemoryRouter initialEntries={["/c/conv_parent?file=README.md&debug=1"]}>
-        <TooltipProvider>
-          <Composer {...composerProps()} />
-        </TooltipProvider>
+        <Composer {...composerProps()} />
       </MemoryRouter>,
     );
 
@@ -3638,7 +3613,7 @@ describe("Composer shared visible controls", () => {
     // page threads the actual session identity through useComposerGitStatus.
     composerGitStatusArgsSpy.mockClear();
     useChatStore.setState({ conversationId: "conv_git_args", gitBranch: "feature/x" });
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
     expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionId: "conv_git_args",
@@ -3669,7 +3644,7 @@ describe("Composer shared visible controls", () => {
     });
     useChatStore.setState({ conversationId: "conv_worktree", gitBranch: "source-branch" });
 
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
 
     expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -3696,7 +3671,7 @@ describe("Composer shared visible controls", () => {
     });
     useChatStore.setState({ conversationId: "conv_legacy_workspace", gitBranch: null });
 
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
 
     expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
       expect.objectContaining({ workspace: "/home/alice/legacy-repo" }),
@@ -3714,7 +3689,7 @@ describe("Composer shared visible controls", () => {
     const setApproval = vi
       .spyOn(useChatStore.getState(), "setCodexApprovalMode")
       .mockResolvedValue(undefined);
-    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    render(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
     fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
     fireEvent.click(screen.getByTestId("composer-permission-option-full-access"));
     await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
@@ -3734,9 +3709,7 @@ describe("Composer shared visible controls", () => {
       const setApproval = vi
         .spyOn(useChatStore.getState(), "setCodexApprovalMode")
         .mockResolvedValue(undefined);
-      renderWithTooltips(
-        <Composer {...composerProps({ showCodexApprovalMode: true, permissionLevel })} />,
-      );
+      render(<Composer {...composerProps({ showCodexApprovalMode: true, permissionLevel })} />);
       const chip = screen.getByTestId("composer-permission-chip");
       if (enabled) {
         expect(chip).toBeEnabled();
@@ -3758,7 +3731,7 @@ describe("Composer shared visible controls", () => {
       conversationId: "codex-no-read-only",
       codexApprovalMode: "read-only",
     });
-    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    render(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
     const chip = screen.getByTestId("composer-permission-chip");
     // A session launched read-only still shows its live mode on the chip.
     expect(chip).toHaveTextContent("Read Only");
@@ -3821,7 +3794,7 @@ describe("Composer permission-mode shortcut", () => {
       sessionHarness: "claude-native",
       claudePermissionMode: mode,
     });
-    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    render(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
     return textarea();
   }
   const chip = () => screen.getByTestId("composer-permission-chip");
@@ -3845,9 +3818,7 @@ describe("Composer permission-mode shortcut", () => {
         sessionHarness: "claude-native",
         claudePermissionMode: "default",
       });
-      renderWithTooltips(
-        <Composer {...composerProps({ showClaudePermissionMode: true, disabled })} />,
-      );
+      render(<Composer {...composerProps({ showClaudePermissionMode: true, disabled })} />);
       fireEvent.pointerMove(chip(), { pointerType: "mouse" });
       expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual(keys);
     },
@@ -3972,7 +3943,7 @@ describe("Composer permission-mode shortcut", () => {
       .mockImplementation(async (mode) => {
         useChatStore.setState({ codexApprovalMode: mode });
       });
-    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    render(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
 
     await cycleTo("Full Access");
     await cycleTo("Ask for approval");
@@ -3997,7 +3968,7 @@ describe("Composer permission-mode shortcut", () => {
         if (call++ === 0) throw new ApiError("Runner refused", 503, "runner_unavailable");
         useChatStore.setState({ codexApprovalMode: mode });
       });
-    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    render(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
 
     pressShiftTab(textarea());
     await screen.findByText("Runner refused");
@@ -4019,7 +3990,7 @@ describe("Composer permission-mode shortcut", () => {
     });
     const setMode = spyClaudeSetter();
     const setApproval = vi.spyOn(useChatStore.getState(), "setCodexApprovalMode");
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps(
           session.codex ? { showCodexApprovalMode: true } : { showClaudePermissionMode: true },
@@ -4040,7 +4011,7 @@ describe("Composer permission-mode shortcut", () => {
       claudePermissionMode: "smart",
     });
     const setMode = spyClaudeSetter();
-    renderWithTooltips(
+    render(
       <Composer {...composerProps({ showClaudePermissionMode: true, modelPickerKind: "devin" })} />,
     );
 
@@ -4085,7 +4056,7 @@ describe("Composer permission-mode shortcut", () => {
       claudePermissionMode: "default",
     });
     const setMode = spyClaudeSetter();
-    renderWithTooltips(<Composer {...composerProps(props)} />);
+    render(<Composer {...composerProps(props)} />);
 
     expect(textarea()).not.toHaveAttribute("aria-keyshortcuts");
     expect(pressShiftTab(textarea())).toBe(true);
@@ -4101,7 +4072,7 @@ describe("Composer permission-mode shortcut", () => {
         codexApprovalMode: "ask-for-approval",
       });
       const onSend = vi.fn();
-      renderWithTooltips(<Composer {...composerProps({ onSend, ...props })} />);
+      render(<Composer {...composerProps({ onSend, ...props })} />);
       return onSend;
     }
     const renderCodexSession = (props: Parameters<typeof composerProps>[0] = {}) =>
@@ -4265,7 +4236,7 @@ describe("Composer background tasks", () => {
           },
         ],
       });
-      renderWithTooltips(
+      render(
         <MobileHeaderControlsProvider>
           <MobileHeaderControlsSlot sessionId="conv_background_tasks" />
           <Composer {...composerProps()} />
@@ -4290,7 +4261,7 @@ describe("Composer background tasks", () => {
   );
 
   it("shows live task counts and removes the control when all tasks finish", () => {
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
     expect(screen.queryByTestId("background-task-pill")).toBeNull();
 
     act(() => useChatStore.setState({ backgroundTaskCount: 2 }));
@@ -4306,7 +4277,7 @@ describe("Composer background tasks", () => {
     const user = userEvent.setup();
     const props = composerProps();
     useChatStore.setState({ backgroundTaskCount: 1 });
-    renderWithTooltips(<Composer {...props} />);
+    render(<Composer {...props} />);
 
     await user.click(screen.getByRole("button", { name: "1 background task still running" }));
     expect(screen.getByRole("dialog", { name: "1 background task" })).toBeVisible();
@@ -5340,7 +5311,7 @@ describe("Composer Codex Plan-mode control", () => {
     const setCodexPlanMode = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ setCodexPlanMode });
 
-    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+    render(<Composer {...composerProps({ showCodexPlanMode: true })} />);
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     fireEvent.click(screen.getByTestId("composer-plan-action"));
 
@@ -5350,7 +5321,7 @@ describe("Composer Codex Plan-mode control", () => {
   it("shows active Plan mode in the shared action menu", () => {
     useChatStore.setState({ codexPlanMode: true });
 
-    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+    render(<Composer {...composerProps({ showCodexPlanMode: true })} />);
 
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     const button = screen.getByTestId("composer-plan-action");
@@ -5359,7 +5330,7 @@ describe("Composer Codex Plan-mode control", () => {
   });
 
   it("keeps Plan in the shared menu instead of a separate toolbar button", () => {
-    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+    render(<Composer {...composerProps({ showCodexPlanMode: true })} />);
 
     expect(screen.queryByRole("button", { name: "Enter Plan mode" })).toBeNull();
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
@@ -6728,7 +6699,7 @@ describe("Composer reply quotes", () => {
   });
 
   it("shows Esc in the Interrupt button tooltip while a turn is running", async () => {
-    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
     fireEvent.pointerMove(screen.getByRole("button", { name: "Interrupt" }), {
       pointerType: "mouse",
     });
@@ -6758,7 +6729,7 @@ describe("Composer reply quotes", () => {
       vi.unstubAllGlobals();
     });
     const props = composerProps({ status: "streaming", isWorking: true });
-    renderWithTooltips(<Composer {...props} />);
+    render(<Composer {...props} />);
     fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
     act(() => recognizer.start?.());
     fireEvent.pointerMove(screen.getByRole("button", { name: "Interrupt" }), {
@@ -6773,7 +6744,7 @@ describe("Composer reply quotes", () => {
   });
 
   it("drops Esc from the Interrupt tooltip while the composer is disabled", async () => {
-    renderWithTooltips(
+    render(
       <Composer {...composerProps({ status: "streaming", isWorking: true, disabled: true })} />,
     );
     expect(textarea()).toBeDisabled();
@@ -6794,7 +6765,7 @@ describe("Composer reply quotes", () => {
         { queueId: "q_2", conversationId: "conv_test", text: "second queued" },
       ],
     });
-    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
     const edits = screen.getAllByRole("button", { name: "Edit queued message" });
     fireEvent.pointerMove(edits[1]!, { pointerType: "mouse" });
     expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual(["↑"]);
@@ -6806,7 +6777,7 @@ describe("Composer reply quotes", () => {
       sessionStatus: "running",
       queuedMessages: [{ queueId: "q_1", conversationId: "conv_test", text: "queued" }],
     });
-    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
     fireEvent.change(textarea(), { target: { value: "typing" } });
     fireEvent.pointerMove(screen.getByRole("button", { name: "Edit queued message" }), {
       pointerType: "mouse",
@@ -6820,7 +6791,7 @@ describe("Composer reply quotes", () => {
       sessionStatus: "running",
       queuedMessages: [{ queueId: "q_1", conversationId: "conv_test", text: "queued" }],
     });
-    renderWithTooltips(
+    render(
       <Composer {...composerProps({ status: "streaming", isWorking: true, disabled: true })} />,
     );
     expect(textarea()).toBeDisabled();
@@ -7141,9 +7112,7 @@ describe("Composer reply quotes", () => {
   it("does not clear a new identical draft after submitting an edited restored send", async () => {
     const stableId = "f".repeat(32);
     // Submit through the store: the queued path is what a mid-turn Enter takes.
-    renderWithTooltips(
-      <Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />,
-    );
+    render(<Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />);
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
@@ -7195,7 +7164,7 @@ describe("Composer reply quotes", () => {
         ],
       });
       const props = composerProps({ status: "streaming", isWorking: true });
-      renderWithTooltips(<Composer {...props} />);
+      render(<Composer {...props} />);
       fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
       expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(structured ? 1 : 0);
       expect(textarea()).toHaveValue(structured ? "Answer" : text);
@@ -7486,7 +7455,7 @@ describe("Composer side-chat entry points", () => {
         .mockReturnValueOnce(creation)
         .mockResolvedValue({ childSessionId: "conv_next" });
       const error = vi.spyOn(toast, "error");
-      renderWithTooltips(<Composer {...composerProps()} />);
+      render(<Composer {...composerProps()} />);
       fireEvent.change(textarea(), { target: { value: "/side question" } });
 
       act(() => {
@@ -7537,7 +7506,7 @@ describe("Composer side-chat entry points", () => {
           finishCreation.set(sourceId, () => resolve({ childSessionId: `side_${sourceId}` }));
         }),
     );
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "/side first question" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
 
@@ -7573,7 +7542,7 @@ describe("Composer side-chat entry points", () => {
     [false, false],
   ])("follow the server's side_chat_allowed=%s at owner level", (allowed, offered) => {
     composerSessionSnapshot.sideChatAllowed = allowed;
-    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    render(<Composer {...composerProps({ permissionLevel: 4 })} />);
 
     fireEvent.change(textarea(), { target: { value: "/side" } });
     expect(screen.queryByTestId("slash-menu-item-side") !== null).toBe(offered);
@@ -7587,7 +7556,7 @@ describe("Composer side-chat entry points", () => {
       .spyOn(identity, "authenticatedFetch")
       .mockImplementation(() => new Promise<Response>(() => {}));
     composerSessionSnapshot.sideChatAllowed = true;
-    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    render(<Composer {...composerProps({ permissionLevel: 4 })} />);
 
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     fireEvent.click(screen.getByTestId("composer-side-chat-action"));
@@ -7606,7 +7575,7 @@ describe("Composer side-chat entry points", () => {
 
   it("does not open a side chat after its parent changes while the menu closes", async () => {
     composerSessionSnapshot.sideChatAllowed = true;
-    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    render(<Composer {...composerProps({ permissionLevel: 4 })} />);
     const trigger = screen.getByRole("button", { name: "Add" });
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     const restoredTriggerFocus = vi.fn();
@@ -7634,7 +7603,7 @@ describe("Composer side-chat entry points", () => {
     const user = userEvent.setup();
     useChatStore.setState({ sessionHarness: "codex-native" });
     composerSessionSnapshot.sideChatAllowed = true;
-    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    render(<Composer {...composerProps({ permissionLevel: 4 })} />);
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     fireEvent.click(screen.getByTestId("composer-side-chat-action"));
 
@@ -7649,7 +7618,7 @@ describe("Composer workflow entry point", () => {
   afterEach(cleanup);
 
   function renderWithWorkflows(ui: ReactElement, enabled = true) {
-    return renderWithTooltips(
+    return render(
       <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features: { workflows: enabled } }}>
         {ui}
       </CapabilitiesProvider>,
@@ -7786,11 +7755,7 @@ describe("Composer workflow entry point", () => {
     taskAction("proceed", "Approve the deploy");
     expect(onSend).toHaveBeenLastCalledWith(taskActionMessage("proceed", "Approve the deploy"));
 
-    rerender(
-      <TooltipProvider>
-        <Composer {...composerProps({ onSend, unreachable: true })} />
-      </TooltipProvider>,
-    );
+    rerender(<Composer {...composerProps({ onSend, unreachable: true })} />);
     taskAction("run", "Ship it");
     expect(error).toHaveBeenCalledWith("The session is offline. Reconnect it to run the task.");
     taskAction("proceed", "Approve the deploy");
@@ -7812,11 +7777,7 @@ describe("Composer workflow entry point", () => {
     continuePlan("Ship the fix");
     expect(onSend).toHaveBeenLastCalledWith(continuePlanMessage("Ship the fix"));
 
-    rerender(
-      <TooltipProvider>
-        <Composer {...composerProps({ onSend, unreachable: true })} />
-      </TooltipProvider>,
-    );
+    rerender(<Composer {...composerProps({ onSend, unreachable: true })} />);
     continuePlan(null);
     expect(error).toHaveBeenCalledWith(
       "The session is offline. Reconnect it to continue the plan.",
@@ -7884,11 +7845,7 @@ describe("Composer workflow entry point", () => {
       expect(onStop).not.toHaveBeenCalled();
       expect(textarea().value).toBe("An unsent note");
 
-      rerender(
-        <TooltipProvider>
-          <Composer {...composerProps({ onStop, onSend, isWorking, unreachable: true })} />
-        </TooltipProvider>,
-      );
+      rerender(<Composer {...composerProps({ onStop, onSend, isWorking, unreachable: true })} />);
       act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
       expect(error).toHaveBeenCalledWith(
         "The session is offline. Reconnect it to stop the workflow.",
@@ -8507,7 +8464,7 @@ describe("Composer sub-agent tray", () => {
       skills: [],
       queuedMessages: [{ queueId: "q_1", text: "held follow-up", conversationId: "conv_test" }],
     });
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
     expect(screen.getByTestId("composer-workspace-controls")).toHaveClass(
       "rounded-t-none",
       "border-t-0",
@@ -8546,7 +8503,7 @@ describe("Composer trays dock onto the workspace bar", () => {
       queuedMessages: [{ queueId: "q_1", text: "held follow-up", conversationId: "conv_test" }],
     });
     // Tooltip provider for the strip's per-row steer/edit/delete buttons.
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
     const strip = document.querySelector('[data-testid="composer-queued-strip"]');
     expect(strip).not.toBeNull();
     expect(workspaceBarParent()).not.toBeNull();
@@ -8591,20 +8548,14 @@ describe("Composer — queued-message flush gating", () => {
       });
 
       // Idle + a waiting head, but unreachable → the effect must not flush.
-      // Wrapped in TooltipProvider since the queued-message strip renders the
-      // steer button's tooltip.
-      const { rerender } = renderWithTooltips(
+      const { rerender } = render(
         <Composer {...composerProps({ unreachable: true, sendReconnectsArca })} />,
       );
       await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
       expect(useChatStore.getState().queuedMessages).toHaveLength(1);
 
       // Becomes reachable → the effect re-fires and drains the head.
-      rerender(
-        <TooltipProvider>
-          <Composer {...composerProps({ unreachable: false })} />
-        </TooltipProvider>,
-      );
+      rerender(<Composer {...composerProps({ unreachable: false })} />);
       await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
       expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
       expect(useChatStore.getState().queuedMessages).toHaveLength(0);
@@ -8642,7 +8593,7 @@ describe("Composer — editing queued messages", () => {
   it("dequeues the recalled message so re-sending can't duplicate it", async () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
     const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
-    renderWithTooltips(<Composer {...props} />);
+    render(<Composer {...props} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
 
@@ -8669,7 +8620,7 @@ describe("Composer — editing queued messages", () => {
         appendPromptHistoryEntry("First follow-up", CONV);
         appendPromptHistoryEntry(QUEUED_TEXT, CONV);
       }
-      renderWithTooltips(<Composer {...composerProps()} />);
+      render(<Composer {...composerProps()} />);
 
       fireEvent.keyDown(textarea(), { key: "ArrowUp" });
       expect(textarea()).toHaveValue(QUEUED_TEXT);
@@ -8694,7 +8645,7 @@ describe("Composer — editing queued messages", () => {
       queuedMessages: [{ queueId: "q_1", text: QUEUED_TEXT, conversationId: CONV, files: [file] }],
     });
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
 
@@ -8715,7 +8666,7 @@ describe("Composer — editing queued messages", () => {
       queuedMessages: [{ queueId: "q_image", text, conversationId: CONV, files: [file] }],
     });
     const onSend = vi.fn(useChatStore.getState().enqueueMessage);
-    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    render(<Composer {...composerProps({ onSend })} />);
 
     const strip = screen.getByTestId("composer-queued-strip");
     expect(strip).toHaveTextContent(displayName);
@@ -8755,7 +8706,7 @@ describe("Composer — editing queued messages", () => {
     });
     appendPromptHistoryEntry(text, CONV, replyDraft);
     const props = composerProps();
-    renderWithTooltips(<Composer {...props} />);
+    render(<Composer {...props} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
 
@@ -8770,7 +8721,7 @@ describe("Composer — editing queued messages", () => {
     useChatStore.setState({ queuedMessages: [], sessionHarness: "codex-native" });
     const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
     const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...props} ref={ref} />);
+    render(<Composer {...props} ref={ref} />);
     act(() =>
       useChatStore.setState({
         pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
@@ -8805,7 +8756,7 @@ describe("Composer — editing queued messages", () => {
       queuedMessages: [{ queueId: "q_reply", text, replyDraft, conversationId: CONV }],
     });
     appendPromptHistoryEntry(text, CONV);
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
 
@@ -8819,7 +8770,7 @@ describe("Composer — editing queued messages", () => {
     setSessionDraft(CONV, { text: "", files: [file] });
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
     const props = composerProps();
-    renderWithTooltips(<Composer {...props} />);
+    render(<Composer {...props} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
 
@@ -8833,7 +8784,7 @@ describe("Composer — editing queued messages", () => {
     "ArrowUp preserves the draft %j and leaves the queued row alone",
     (draft) => {
       appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-      renderWithTooltips(<Composer {...composerProps()} />);
+      render(<Composer {...composerProps()} />);
 
       const ta = textarea();
       fireEvent.change(ta, { target: { value: draft } });
@@ -8848,7 +8799,7 @@ describe("Composer — editing queued messages", () => {
 
   it("keeps a recalled queued message as an editable draft", () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
 
     const ta = textarea();
     fireEvent.keyDown(ta, { key: "ArrowUp" });
@@ -8868,7 +8819,7 @@ describe("Composer — editing queued messages", () => {
       queuedMessages: [{ queueId: "q_other", text: QUEUED_TEXT, conversationId: "conv_other" }],
     });
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-    renderWithTooltips(<Composer {...composerProps()} />);
+    render(<Composer {...composerProps()} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
 
@@ -8905,7 +8856,7 @@ describe("Composer — editing a sent message", () => {
   it("copies the text and @-tags into an empty composer and sends it as a new message", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const props = composerProps({ isWorking: true });
-    renderWithTooltips(<Composer {...props} ref={ref} />);
+    render(<Composer {...props} ref={ref} />);
 
     act(() => ref.current?.editSentMessage(sentMessage));
 
@@ -8930,7 +8881,7 @@ describe("Composer — editing a sent message", () => {
   it("keeps a file and a session with the same name as separate tags", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const props = composerProps();
-    renderWithTooltips(<Composer {...props} ref={ref} />);
+    render(<Composer {...props} ref={ref} />);
     const session = '[Session: "README.md" id=sess_readme subagent=no]';
     const sent = withSessionMentionHint(`compare [Attached: README.md] with ${session}`, true);
 
@@ -8945,7 +8896,7 @@ describe("Composer — editing a sent message", () => {
 
   it("asks before replacing a draft, keeping it unless the user confirms", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    render(<Composer {...composerProps()} ref={ref} />);
     fireEvent.change(textarea(), { target: { value: "half-written thought" } });
 
     act(() => ref.current?.editSentMessage(sentMessage));
@@ -8968,7 +8919,7 @@ describe("Composer — editing a sent message", () => {
 
   it("treats an attachment-only draft as a draft, and replacing it drops the attachment", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    render(<Composer {...composerProps()} ref={ref} />);
     const draftFile = new File(["draft"], "draft.txt", { type: "text/plain" });
     fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
       target: { files: [draftFile] },
@@ -8984,7 +8935,7 @@ describe("Composer — editing a sent message", () => {
 
   it("dismisses a pending confirmation when the conversation changes", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    render(<Composer {...composerProps()} ref={ref} />);
     fireEvent.change(textarea(), { target: { value: "half-written thought" } });
     act(() => ref.current?.editSentMessage(sentMessage));
     await screen.findByRole("dialog", { name: "Replace your draft?" });
@@ -8999,16 +8950,12 @@ describe("Composer — editing a sent message", () => {
 
   it("says so when the composer stops taking input before Replace draft", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
-    const { rerender } = renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    const { rerender } = render(<Composer {...composerProps()} ref={ref} />);
     fireEvent.change(textarea(), { target: { value: "half-written thought" } });
     act(() => ref.current?.editSentMessage(sentMessage));
     const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
 
-    rerender(
-      <TooltipProvider>
-        <Composer {...composerProps({ disabled: true })} ref={ref} />
-      </TooltipProvider>,
-    );
+    rerender(<Composer {...composerProps({ disabled: true })} ref={ref} />);
     fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
@@ -9018,7 +8965,7 @@ describe("Composer — editing a sent message", () => {
 
   it("ignores Edit while the composer is disabled", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps({ disabled: true })} ref={ref} />);
+    render(<Composer {...composerProps({ disabled: true })} ref={ref} />);
 
     act(() => ref.current?.editSentMessage(sentMessage));
 
@@ -9082,7 +9029,7 @@ describe("Composer config gear", () => {
       async (confirmation) => {
         const composer = props();
         const { setModel, setEffort } = useChatStore.getState();
-        renderWithTooltips(<Composer {...composer} />);
+        render(<Composer {...composer} />);
         const input = textarea();
         fireEvent.change(input, { target: { value: "unfinished follow-up" } });
         act(() => input.focus());
@@ -9117,7 +9064,7 @@ describe("Composer config gear", () => {
       async (action) => {
         const composer = props();
         const { setModel, setEffort } = useChatStore.getState();
-        const view = renderWithTooltips(<Composer {...composer} />);
+        const view = render(<Composer {...composer} />);
         act(() => textarea().focus());
         cycle();
         if (action === "wrap") {
@@ -9136,13 +9083,11 @@ describe("Composer config gear", () => {
           act(() => useChatStore.setState({ conversationId: "another-session" }));
         } else if (action === "read-only" || action === "unreachable") {
           view.rerender(
-            <TooltipProvider>
-              <Composer
-                {...composer}
-                permissionLevel={action === "read-only" ? 1 : null}
-                unreachable={action === "unreachable"}
-              />
-            </TooltipProvider>,
+            <Composer
+              {...composer}
+              permissionLevel={action === "read-only" ? 1 : null}
+              unreachable={action === "unreachable"}
+            />,
           );
           expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
         } else {
@@ -9188,9 +9133,7 @@ describe("Composer config gear", () => {
           llmModel: "primary",
           codexModelOptions: options,
         });
-        renderWithTooltips(
-          <Composer {...props()} modelPickerKind="codex" codexModelOptions={options} />,
-        );
+        render(<Composer {...props()} modelPickerKind="codex" codexModelOptions={options} />);
         cycle();
         cycle("KeyE");
         cycle("KeyE");
@@ -9225,7 +9168,7 @@ describe("Composer config gear", () => {
       const setModel = vi.fn();
       const setEffort = vi.fn();
       useChatStore.setState({ setModel, setEffort });
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showModels: true,
@@ -9244,13 +9187,13 @@ describe("Composer config gear", () => {
   );
 
   it("renders when the session has a switchable knob (effort)", () => {
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
+    render(<Composer {...composerProps({ showEffort: true })} />);
     expect(gear()).not.toBeNull();
   });
 
   it("keeps the shared trigger disabled when there is nothing to configure", () => {
     // No models, no effort, not routable → nothing to configure.
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({ showEffort: false, showModels: false, costRoutingEligible: false })}
       />,
@@ -9259,7 +9202,7 @@ describe("Composer config gear", () => {
   });
 
   it("soft-disables the gear on a read-only session (aria-disabled, click no-ops)", () => {
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true, permissionLevel: 1 })} />);
+    render(<Composer {...composerProps({ showEffort: true, permissionLevel: 1 })} />);
     expect(gear()).toHaveAttribute("aria-disabled", "true");
     // Soft-disable, not native `disabled`: the click is guarded but the button
     // stays hover-able so its config tooltip still shows.
@@ -9271,7 +9214,7 @@ describe("Composer config gear", () => {
   it("soft-disables the gear when the session is unreachable (host offline / stranded)", () => {
     // No message can wake an unreachable session, so a config change has
     // nothing to apply to — the gear is inert like the composer.
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true, unreachable: true })} />);
+    render(<Composer {...composerProps({ showEffort: true, unreachable: true })} />);
     expect(gear()).toHaveAttribute("aria-disabled", "true");
     openSessionConfig();
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
@@ -9281,7 +9224,7 @@ describe("Composer config gear", () => {
     // Asleep/starting/unknown sessions accept sends (which wake the runner),
     // and a config PATCH persists server-side and applies on the next
     // wake/turn — so the gear stays live wherever the composer does.
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
+    render(<Composer {...composerProps({ showEffort: true })} />);
     expect(gear()).toHaveAttribute("aria-disabled", "false");
     openSessionConfig();
     expect(screen.queryByTestId("composer-agent-menu")).not.toBeNull();
@@ -9289,7 +9232,7 @@ describe("Composer config gear", () => {
 
   it("still shows the config tooltip on a disabled gear (soft-disable preserves hover)", async () => {
     useChatStore.setState({ sessionReasoningEffort: "high", sessionHarness: "claude-sdk" });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showEffort: true,
@@ -9307,7 +9250,7 @@ describe("Composer config gear", () => {
 
   it("shows a hover summary with Harness/Model/Effort rows and no Permissions row", async () => {
     useChatStore.setState({ sessionReasoningEffort: "high", sessionHarness: "claude-sdk" });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showEffort: true,
@@ -9330,7 +9273,7 @@ describe("Composer config gear", () => {
 
   it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {
     useChatStore.setState({ costControlModeOverride: "on" });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showModels: true,
@@ -9346,7 +9289,7 @@ describe("Composer config gear", () => {
 
   it("omits the Effort row from the summary when routing is on (router owns effort)", async () => {
     useChatStore.setState({ costControlModeOverride: "on", sessionReasoningEffort: "high" });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showModels: true,
@@ -9370,7 +9313,7 @@ describe("Composer config gear", () => {
   ])(
     "hides unavailable Smart Routing and its separator ($costRoutingEligible, $showModels)",
     async ({ costRoutingEligible, showModels }) => {
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({ costRoutingEligible, showModels, modelPickerKind: "claude" })}
         />,
@@ -9391,7 +9334,7 @@ describe("Composer config gear", () => {
     "shows available Smart Routing only in the Model submenu when routing is %s",
     async (costControlModeOverride) => {
       useChatStore.setState({ costControlModeOverride });
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             costRoutingEligible: true,
@@ -9423,7 +9366,7 @@ describe("Composer config gear", () => {
   );
 
   it("omits Advanced settings and its trailing separator from the picker", () => {
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({ showEffort: true, showModels: true, modelPickerKind: "claude" })}
       />,
@@ -9438,9 +9381,7 @@ describe("Composer config gear", () => {
 
   it("opens the combined Model and Effort flyout on hover and returns to typing on outside click", async () => {
     const user = userEvent.setup();
-    renderWithTooltips(
-      <Composer {...composerProps({ showModels: true, modelPickerKind: "claude" })} />,
-    );
+    render(<Composer {...composerProps({ showModels: true, modelPickerKind: "claude" })} />);
     await user.click(screen.getByTestId("composer-config-gear"));
     await user.hover(screen.getByTestId("composer-agent-edit"));
     expect(await screen.findByTestId("composer-agent-models")).toBeVisible();
@@ -9457,7 +9398,7 @@ describe("Composer config gear", () => {
       matches: query.includes("max-width"),
     })) as typeof window.matchMedia;
     try {
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showModels: true,
@@ -9488,7 +9429,7 @@ describe("Composer config gear", () => {
       sessionHarness: "claude-native",
       llmModel: "opus",
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showEffort: true,
@@ -9521,7 +9462,7 @@ describe("Composer config gear", () => {
         costRoutingEligible: true,
         codexModelOptions: [],
       });
-      const { rerender } = render(<Composer {...props} />, { wrapper: TooltipProvider });
+      const { rerender } = render(<Composer {...props} />);
       await openSessionModels();
       const models = screen.getByTestId("composer-agent-models");
       expect(within(models).getByRole("status")).toHaveTextContent(
@@ -9550,7 +9491,7 @@ describe("Composer config gear", () => {
       { id: "auto", displayName: "Automatic", isDefault: false },
       { id: "provider-latest", displayName: "Latest", isDefault: false },
     ];
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showEffort: false,
@@ -9575,6 +9516,7 @@ describe("Composer config gear", () => {
     "kiro",
     "opencode",
     "pi",
+    "omp",
     "devin",
     "acp",
     "configured",
@@ -9585,7 +9527,7 @@ describe("Composer config gear", () => {
     ];
     const setModel = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ setModel, codexModelOptions: options });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showEffort: false,
@@ -9635,7 +9577,7 @@ describe("Composer config gear", () => {
         llmModel: null,
         sessionModelOverride: null,
       });
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showEffort: false,
@@ -9675,7 +9617,7 @@ describe("Composer config gear", () => {
     "renders %s catalog metadata verbatim in the model row",
     async (modelPickerKind, id, displayName) => {
       useChatStore.setState({ llmModel: id, sessionModelOverride: id });
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showEffort: false,
@@ -9699,7 +9641,7 @@ describe("Composer config gear", () => {
       sessionModelOverride: null,
       sessionModelSeeded: false,
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showEffort: false,
@@ -9725,7 +9667,7 @@ describe("Composer config gear", () => {
       { id: "gpt-5.6-sol", displayName: "GPT-5.6-Sol" },
       { id: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", isDefault: true },
     ];
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showEffort: false,
@@ -9757,7 +9699,7 @@ describe("Composer config gear", () => {
         isDefault: true,
       },
     ];
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showEffort: false,
@@ -9778,7 +9720,7 @@ describe("Composer config gear", () => {
     // inert, so the nonce must NOT open a modal that can't apply a change.
     const options = [{ id: "opus", model: "opus", displayName: "Opus" }] as never;
     useChatStore.setState({ codexModelOptions: options });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showModels: true,
@@ -9799,7 +9741,7 @@ describe("Composer config gear", () => {
   it("keeps Codex models in the primary picker alongside Smart Routing", async () => {
     // Regression: Codex has a Model dropdown, so Smart Routing must be an option
     // inside it (like Claude) — NOT a separate switch alongside the dropdown.
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showModels: true,
@@ -9840,7 +9782,7 @@ describe("Composer config gear", () => {
       sessionReasoningEffort: "high",
       codexModelOptions: options,
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showModels: true,
@@ -9905,7 +9847,7 @@ describe("Composer config gear", () => {
         isNativeTerminalSession: true,
         codexModelOptions: options,
       });
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showModels: true,
@@ -9945,7 +9887,7 @@ describe("Composer config gear", () => {
         { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
       ] as never;
       useChatStore.setState({ setModel, codexModelOptions: options, llmModel: "opus" });
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showModels: true,
@@ -10023,7 +9965,7 @@ describe("Composer config gear", () => {
       codexModelOptions: codexOptions,
       refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showModels: true,
@@ -10080,7 +10022,7 @@ describe("Composer config gear", () => {
       sessionModelOverride: null,
       codexModelOptions: options,
     });
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showModels: true,
@@ -10102,7 +10044,7 @@ describe("Composer config gear", () => {
   });
 
   it("keeps Claude models in the primary picker alongside Smart Routing", async () => {
-    renderWithTooltips(
+    render(
       <Composer
         {...composerProps({
           showModels: true,
@@ -10138,7 +10080,7 @@ describe("Composer config gear", () => {
         // Routing pinned the model; the session's own routing switch is unset.
         costControlModeOverride: null,
       });
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showModels: true,
@@ -10243,7 +10185,7 @@ describe("saved sandbox inference policy", () => {
     "offers the saved shortlist with the known model %s checked",
     async (llmModel) => {
       useChatStore.setState({ llmModel });
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showModels: true,
@@ -10286,7 +10228,7 @@ describe("saved sandbox inference policy", () => {
   ])(
     "disables reset when the saved catalog is unavailable ($error, $options)",
     async ({ error, options }) => {
-      renderWithTooltips(
+      render(
         <Composer
           {...composerProps({
             showModels: true,
@@ -10415,16 +10357,14 @@ describe("Composer model and effort in ⌘K", () => {
       <CapabilitiesProvider
         info={{ ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: quickPickPalette } }}
       >
-        <TooltipProvider>
-          <Composer
-            {...composerProps({
-              showModels: true,
-              showEffort: true,
-              modelPickerKind: "claude",
-              codexModelOptions: CLAUDE_MODEL_OPTIONS,
-            })}
-          />
-        </TooltipProvider>
+        <Composer
+          {...composerProps({
+            showModels: true,
+            showEffort: true,
+            modelPickerKind: "claude",
+            codexModelOptions: CLAUDE_MODEL_OPTIONS,
+          })}
+        />
       </CapabilitiesProvider>,
     );
   }

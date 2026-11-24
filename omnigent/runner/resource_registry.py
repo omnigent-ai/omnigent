@@ -74,6 +74,7 @@ _DEFAULT_WORKSPACE_PARENT = os.environ.get("TMPDIR", None if IS_WINDOWS else "/t
 CODEX_NATIVE_TERMINAL_ROLE = "codex-native"
 CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
 PI_NATIVE_TERMINAL_ROLE = "pi-native"
+OMP_NATIVE_TERMINAL_ROLE = "omp-native"
 OPENCODE_NATIVE_TERMINAL_ROLE = "opencode-native"
 CURSOR_NATIVE_TERMINAL_ROLE = "cursor-native"
 KIRO_NATIVE_TERMINAL_ROLE = "kiro-native"

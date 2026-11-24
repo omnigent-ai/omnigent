@@ -342,7 +342,7 @@ export function SessionHarnessPicker({
     onSelect: (effort: string) => void,
   ): ComposerConfigSection => ({
     testId: "composer-agent-efforts",
-    header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
+    header: modelPickerKind === "pi" || modelPickerKind === "omp" ? "Thinking level" : "Effort",
     choices: levels.map((effort) => ({
       key: effort,
       label: formatStatusEffortLabel(effort) ?? effort,
@@ -713,6 +713,7 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
+    modelPickerKind === "omp" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "devin" ||
     modelPickerKind === "acp" ||
@@ -744,7 +745,10 @@ function useResolvedComposerModel(
     : nativeVendorOwnsModel
       ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
         ? sessionModelOverride
-        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
+        : modelPickerKind === "opencode" ||
+            modelPickerKind === "pi" ||
+            modelPickerKind === "omp" ||
+            modelPickerKind === "devin"
           ? (sessionModelOverride ?? llmModel)
           : null
       : isReportedModelPicker

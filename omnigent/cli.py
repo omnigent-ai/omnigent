@@ -2192,6 +2192,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "kiro",
         "lakebox",
         "login",
+        "omp",
         "opencode",
         "pane-picker",
         "pane-split",
@@ -8370,6 +8371,11 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
     "pi": _NativeTerminalDispatchSpec(
         module="omnigent.harnesses.pi_native.main",
         function="run_pi_native",
+        args_param="extra_args",
+    ),
+    "omp": _NativeTerminalDispatchSpec(
+        module="omnigent.harnesses.omp_native.main",
+        function="run_omp_native",
         args_param="extra_args",
     ),
     "opencode": _NativeTerminalDispatchSpec(

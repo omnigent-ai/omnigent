@@ -345,6 +345,7 @@ export function ForkRunConfig({
   // the modelPicker capability (mirrors the new-session dialog).
   const isCodex = targetHarness === "codex-native";
   const showModel = hasModelPicker || isCodex;
+  const hasThinkingLevel = targetHarness === "omp-native";
 
   // Live model catalog for the target harness on the picked host. Only the
   // native harnesses that expose a picker resolve a catalog; others pass a
@@ -630,7 +631,7 @@ export function ForkRunConfig({
       )}
 
       {showEffort && (
-        <ForkConfigRow label="Effort">
+        <ForkConfigRow label={hasThinkingLevel ? "Thinking level" : "Effort"}>
           <Select
             value={selectedEffort}
             onValueChange={changeEffort}

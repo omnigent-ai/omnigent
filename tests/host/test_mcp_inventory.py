@@ -28,6 +28,8 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    for variable in ("OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"):
+        monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(mcp_inventory, "_warned_auth_status", None)
     # A real managed config or status-file override on the dev machine must not leak in.
     monkeypatch.setattr(mcp_inventory, "_managed_mcp_paths", tuple)
@@ -234,8 +236,68 @@ def test_honors_pi_coding_agent_dir(
     _write_json(home / ".pi" / "agent" / "mcp.json", {"mcpServers": {"wrong-dir": _stdio()}})
     _write_json(pi_dir / "mcp.json", {"mcpServers": {"right-dir": _stdio()}})
 
-    assert [(s["harness"], s["name"]) for s in discover_mcp_servers()] == [("pi", "right-dir")]
+    # Both CLIs explicitly honor PI_CODING_AGENT_DIR; their default roots differ.
+    assert [(s["harness"], s["name"]) for s in discover_mcp_servers()] == [
+        ("pi", "right-dir"), ("omp", "right-dir")
+    ]
 
+
+
+def test_omp_inventory_uses_native_user_files_and_enabled_precedence(home: Path) -> None:
+    root = home / ".omp" / "agent"
+    _write_json(root / "mcp.json", {
+        "mcpServers": {
+            "shell": _stdio(),
+            "remote": {
+                "url": f"https://user:{_SECRET}@mcp.example.com/path?token={_SECRET}",
+                "headers": {"Authorization": _SECRET},
+            },
+            "disabled": _stdio(enabled="FALSE"),
+            "forced": _stdio(enabled=False),
+            "denied": _stdio(),
+            "omnigent": _stdio(),
+        },
+        "disabledServers": ["denied"],
+        "enabledServers": ["forced", "denied"],
+    })
+    _write_json(root / ".mcp.json", {
+        "mcpServers": {
+            "shell": {"url": "https://shadowed.example.com"},
+            "fallback": _stdio(),
+            "disabled": _stdio(),
+        },
+    })
+    # The host inventory is user-scoped: a home-level project config is not loaded.
+    _write_json(home / ".omp" / "mcp.json", {"mcpServers": {"project-only": _stdio()}})
+    servers = discover_mcp_servers()
+    assert servers == [
+        {"name": "shell", "harness": "omp", "transport": "stdio", "scope": "user"},
+        {"name": "remote", "harness": "omp", "transport": "http", "scope": "user", "url_host": "mcp.example.com"},
+        {"name": "forced", "harness": "omp", "transport": "stdio", "scope": "user"},
+        {"name": "fallback", "harness": "omp", "transport": "stdio", "scope": "user"},
+    ]
+    assert _SECRET not in json.dumps(servers)
+    assert "/usr/bin/tool" not in json.dumps(servers)
+    assert all("enabled" not in server for server in HostMcpInventory().discover())
+
+
+def test_omp_inventory_honors_active_profile_without_reading_pi(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMP_PROFILE", "work")
+    _write_json(home / ".omp" / "profiles" / "work" / "agent" / "mcp.json", {"mcpServers": {"work": _stdio()}})
+    _write_json(home / ".omp" / "agent" / "mcp.json", {"mcpServers": {"default": _stdio()}})
+    _write_json(home / ".pi" / "agent" / "mcp.json", {"mcpServers": {"pi": _stdio()}})
+    assert [(server["harness"], server["name"]) for server in discover_mcp_servers()] == [
+        ("pi", "pi"), ("omp", "work")
+    ]
+
+
+def test_malformed_omp_mcp_file_does_not_hide_other_configs(home: Path, caplog: pytest.LogCaptureFixture) -> None:
+    root = home / ".omp" / "agent"
+    root.mkdir(parents=True)
+    (root / "mcp.json").write_text("{bad json")
+    _write_json(root / ".mcp.json", {"mcpServers": {"fallback": _stdio()}})
+    assert [server["name"] for server in discover_mcp_servers()] == ["fallback"]
+    assert "Skipping unreadable omp MCP config" in caplog.text
 
 def test_missing_and_malformed_configs_do_not_fail(
     home: Path, caplog: pytest.LogCaptureFixture

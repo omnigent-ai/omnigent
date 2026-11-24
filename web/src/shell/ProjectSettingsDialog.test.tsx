@@ -503,12 +503,15 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude" }));
   });
 
-  it("offers Pi's own effort ladder and stores a Pi-only level", async () => {
+  it.each([
+    ["pi-native", "Pi"],
+    ["omp-native", "OMP"],
+  ])("offers %s's thinking ladder and stores a native-only level", async (harness, displayName) => {
     const piAgent = pickerAgent({
       id: "ag_pi",
-      name: "pi-native-ui",
-      display_name: "Pi",
-      harness: "pi-native",
+      name: `${harness}-ui`,
+      display_name: displayName,
+      harness,
     });
     availableAgentsMock.mockReturnValue({ data: [piAgent] });
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_pi" } });

@@ -653,6 +653,46 @@ def register_native_commands(cli: click.Group) -> None:
             auto_open_conversation=auto_open_conversation,
         )
 
+    @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+    @click.option(
+        "--server",
+        default=None,
+        help='Omnigent URL; pass --server "" to start a persistent local backend.',
+    )
+    @click.option(
+        "-r",
+        "--resume",
+        is_flag=False,
+        flag_value=_RESUME_PICKER_SENTINEL,
+        default=None,
+        help="Resume an OMP conversation, or open its picker when no ID is given.",
+    )
+    @click.argument("omp_args", nargs=-1, type=click.UNPROCESSED)
+    def omp(
+        server: str | None,
+        resume: str | None,
+        omp_args: tuple[str, ...],
+    ) -> None:
+        """Launch the OMP TUI with Omnigent conversation and policy synchronization."""
+        _reject_native_on_windows("omp")
+        from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.omp_native.main import run_omp_native
+
+        choice = _split_resume_value(resume)
+        cfg = _load_effective_config()
+        command = resolve_harness_command("omp-native", default="", explicit=None, cfg=cfg)
+        if command:
+            os.environ["OMNIGENT_OMP_PATH"] = command
+        if server is None:
+            server = cfg.get("server")
+        run_omp_native(
+            server=_ensure_backend(server),
+            session_id=choice.conversation_id,
+            resume_picker=choice.picker,
+            extra_args=_resolve_harness_startup_args(cfg, "omp-native", omp_args),
+            auto_open_conversation=_resolve_auto_open_conversation_from_config(cfg),
+        )
+
     @cli.command(
         context_settings={
             "ignore_unknown_options": True,

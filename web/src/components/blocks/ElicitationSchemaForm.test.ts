@@ -6,8 +6,12 @@
 // the fields it declared. These pin the reading of the schema and the shape
 // of what goes back on the wire.
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import {
+  ElicitationSchemaForm,
+  schemaInputType,
   type ElicitationDraft,
   enumLabel,
   isComplete,
@@ -225,5 +229,128 @@ describe("shapes the form must not claim", () => {
       required: ["answer", "reason"],
     };
     expect(schemaFields(withReason).map((f) => f.name)).toEqual(["answer", "reason"]);
+  });
+});
+
+afterEach(cleanup);
+
+describe("native form constraints", () => {
+  it("enforces native numeric ranges, lengths, anchored patterns and email/url formats", () => {
+    const fields = schemaFields({
+      properties: {
+        count: { type: "number", minimum: 1, maximum: 4 },
+        code: { type: "string", minLength: 2, maxLength: 4, pattern: "[A-Z]+" },
+        email: { type: "string", "x-input-type": "email" },
+        url: { type: "string", "x-input-type": "url" },
+      },
+    });
+    const valid = { count: 2, code: "AB", email: "a@example.test", url: "https://example.test/" };
+    expect(isComplete(fields, valid)).toBe(true);
+    for (const invalid of [
+      { count: 0 },
+      { count: 5 },
+      { code: "A" },
+      { code: "ABCDE" },
+      { code: "ab" },
+      { email: "not an email" },
+      { url: "relative-path" },
+    ])
+      expect(isComplete(fields, { ...valid, ...invalid })).toBe(false);
+    expect(
+      isComplete(schemaFields({ properties: { value: { type: "string", pattern: "[" } } }), {
+        value: "native ignores invalid patterns",
+      }),
+    ).toBe(true);
+  });
+
+  it("only opts native fields into preserving exact empty and whitespace text", () => {
+    const fields = schemaFields({
+      properties: {
+        native: { type: "string", "x-preserve-empty": true },
+        blankNumber: { type: "number", "x-preserve-empty": true },
+        ordinary: { type: "string" },
+      },
+    });
+    expect(toContent(fields, { native: "  \n", blankNumber: "", ordinary: "" })).toEqual({
+      native: "  \n",
+      blankNumber: "",
+    });
+  });
+
+  it("does not accept active or unsupported remote HTML input types", () => {
+    for (const type of ["file", "image", "submit", "button", "__proto__", "constructor"]) {
+      expect(schemaInputType({ type: "string", "x-input-type": type })).toBe("text");
+    }
+  });
+});
+
+describe("safe native form rendering", () => {
+  it("renders multiline, typed, disabled and preselected controls without interpreting HTML", () => {
+    const submit = vi.fn();
+    const fields = schemaFields({
+      properties: {
+        notes: {
+          type: "string",
+          title: "Notes",
+          default: "first\nlast",
+          "x-multiline": true,
+          "x-preserve-empty": true,
+        },
+        workers: { type: "number", title: "Workers", default: 2, minimum: 1, maximum: 4 },
+        email: { type: "string", title: "Email", "x-input-type": "email" },
+        password: { type: "string", title: "Password", "x-input-type": "password" },
+        disabledChoice: {
+          type: "boolean",
+          title: "Unavailable feature",
+          default: true,
+          "x-disabled": true,
+        },
+        choice: {
+          type: "string",
+          title: "Region",
+          enum: ["0", "1"],
+          enumNames: ["Available", "Unavailable"],
+          default: "0",
+          "x-disabled-enum": ["1"],
+        },
+        inert: {
+          type: "string",
+          title: "<script>window.evil=true</script>",
+          "x-input-type": "file",
+        },
+      },
+      required: ["workers"],
+    });
+    const view = render(
+      createElement(ElicitationSchemaForm, { fields, onSubmit: submit, onReject: vi.fn() }),
+    );
+    const notes = view.getByLabelText("Notes") as HTMLTextAreaElement;
+    expect(notes.tagName).toBe("TEXTAREA");
+    expect(notes.value).toBe("first\nlast");
+    expect((view.getByLabelText("Email") as HTMLInputElement).type).toBe("email");
+    expect((view.getByLabelText("Password") as HTMLInputElement).type).toBe("password");
+    expect((view.getByLabelText("Unavailable feature") as HTMLInputElement).disabled).toBe(true);
+    expect((view.getByLabelText("Unavailable feature") as HTMLInputElement).checked).toBe(true);
+    expect((view.getByRole("option", { name: "Unavailable" }) as HTMLOptionElement).disabled).toBe(
+      true,
+    );
+    expect(
+      (view.getByLabelText("<script>window.evil=true</script>") as HTMLInputElement).type,
+    ).toBe("text");
+    expect(view.container.querySelector("script")).toBeNull();
+    fireEvent.change(notes, { target: { value: "next\n\n" } });
+    fireEvent.change(view.getByLabelText("Workers", { exact: false }), { target: { value: "9" } });
+    expect((view.getByRole("button", { name: "Submit" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(view.getByRole("alert").textContent).toContain("Must be at most 4");
+    fireEvent.change(view.getByLabelText("Workers", { exact: false }), { target: { value: "4" } });
+    fireEvent.change(view.getByLabelText("Email"), { target: { value: "person@example.test" } });
+    fireEvent.click(view.getByRole("button", { name: "Submit" }));
+    expect(submit).toHaveBeenCalledWith({
+      notes: "next\n\n",
+      workers: 4,
+      email: "person@example.test",
+      disabledChoice: true,
+      choice: "0",
+    });
   });
 });

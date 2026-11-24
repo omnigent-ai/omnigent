@@ -125,6 +125,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
       (step) => step.kind === "auth",
     )?.command;
     if (accountKey === "claude") return configuredCommand ?? "claude auth login --claudeai";
+    if (accountKey === "omp") return configuredCommand ?? "omp login";
     return configuredCommand ?? null;
   }, [accountKey, canonicalHarness, setupSteps]);
   const isaacSupported =
@@ -134,7 +135,8 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
       detectedCredentials.data?.some((credential) => credential.family === "databricks") === true);
   const credentialDecisionPending = credentialFamily !== null && detectedCredentials.isPending;
   const personalSupported =
-    loginCommand !== null && (accountKey === "codex" || accountKey === "claude");
+    loginCommand !== null &&
+    (accountKey === "codex" || accountKey === "claude" || accountKey === "omp");
   const hasCredentialCards = isaacSupported || personalSupported;
   const canUseCredentialForm = harnessAuthableOnHost(info, harness, host);
   const credentialChoicePhase: Phase =
@@ -647,6 +649,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               harnessLabel={harnessLabel}
               isaacSupported={isaacSupported}
               personalSupported={personalSupported}
+              ownLogin={accountKey === "omp"}
               canUseCredentialForm={mode !== "install" && canUseCredentialForm}
               onUseCredentialForm={() => setPhase("credentials")}
             />
@@ -1047,6 +1050,7 @@ function ChooseCredential({
   harnessLabel,
   isaacSupported,
   personalSupported,
+  ownLogin,
   canUseCredentialForm,
   onUseCredentialForm,
 }: {
@@ -1056,6 +1060,7 @@ function ChooseCredential({
   harnessLabel: string;
   isaacSupported: boolean;
   personalSupported: boolean;
+  ownLogin: boolean;
   canUseCredentialForm: boolean;
   onUseCredentialForm: () => void;
 }) {
@@ -1084,8 +1089,12 @@ function ChooseCredential({
         {personalSupported && (
           <CredentialCard
             selected={choice === "personal"}
-            title={HARNESS_CREDENTIAL_COPY.personal.label}
-            description={HARNESS_CREDENTIAL_COPY.personal.description}
+            title={ownLogin ? "OMP login" : HARNESS_CREDENTIAL_COPY.personal.label}
+            description={
+              ownLogin
+                ? "Sign in using OMP’s own provider accounts"
+                : HARNESS_CREDENTIAL_COPY.personal.description
+            }
             onClick={() => onChoice("personal")}
           />
         )}

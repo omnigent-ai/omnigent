@@ -14,9 +14,9 @@ import type { SkillSummary } from "@/lib/types";
  * Families the host inventory covers. Pi has no brand glyph, so onboarding import
  * keeps to `BRAND_HARNESSES`; Settings lists every family here.
  */
-export type InventoryHarness = BrandHarness | "pi";
+export type InventoryHarness = BrandHarness | "pi" | "omp";
 
-export const INVENTORY_HARNESSES: readonly InventoryHarness[] = [...BRAND_HARNESSES, "pi"];
+export const INVENTORY_HARNESSES: readonly InventoryHarness[] = [...BRAND_HARNESSES, "pi", "omp"];
 
 /** The native spelling each family reports readiness and skills under. */
 export const INVENTORY_HARNESS_IDS: Record<InventoryHarness, string> = {
@@ -24,6 +24,7 @@ export const INVENTORY_HARNESS_IDS: Record<InventoryHarness, string> = {
   codex: "codex-native",
   cursor: "cursor-native",
   pi: "pi-native",
+  omp: "omp-native",
 };
 
 export interface InventoryCredential {

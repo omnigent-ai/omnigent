@@ -27,6 +27,7 @@ export const HARNESS_DESCRIPTIONS: Readonly<Record<NativeHarnessId, string>> = {
   "opencode-native": "An open-source coding agent for terminal, IDE, and desktop.",
   "cursor-native": "An AI editor with agents for navigating and editing code.",
   "pi-native": "A minimal, extensible terminal coding agent.",
+  "omp-native": "An extensible terminal coding agent powered by Oh My Pi.",
   "devin-native": "Cognition’s autonomous coding agent.",
   "antigravity-native": "Google’s agent platform for software development.",
   "kiro-native": "An agentic IDE for spec-driven development.",
@@ -199,11 +200,11 @@ export type HarnessPluginEntry = SettingsEntry & {
 /** A harness's skill page, reached from its Skills tab or from a plugin: the skill's document. */
 export type HarnessSkillEntry = SettingsEntry;
 
-/** The entries of one inventory harness's pages; only the families with skill contents have `skill`. */
+/** The entries of one inventory harness's pages, including any supported nested pages. */
 export interface InventoryPageEntries {
   readonly family: InventoryHarness;
   readonly harness: InventoryPageHarnessId;
-  readonly plugin: HarnessPluginEntry;
+  readonly plugin?: HarnessPluginEntry;
   readonly skill?: HarnessSkillEntry;
   readonly mcp: SettingsEntry;
 }
@@ -218,8 +219,8 @@ export function harnessInventoryPage(harness: NativeHarnessId): InventoryPageEnt
   return {
     family,
     harness,
-    plugin: HARNESS_PLUGIN_ENTRIES.entry(harness),
-    skill: hasSkillPage(family) ? HARNESS_SKILL_ENTRIES.entry(harness) : undefined,
+    plugin: hasPluginPage(harness) ? HARNESS_PLUGIN_ENTRIES.entry(harness) : undefined,
+    skill: isSkillPageHarness(harness) ? HARNESS_SKILL_ENTRIES.entry(harness) : undefined,
     mcp: MCP_SERVER_LIST_ENTRIES.entry(harness),
   };
 }
@@ -249,10 +250,6 @@ export const SKILL_PAGE_FAMILIES = [
   "cursor",
 ] as const satisfies readonly InventoryHarness[];
 
-function hasSkillPage(family: InventoryHarness): boolean {
-  return (SKILL_PAGE_FAMILIES as readonly InventoryHarness[]).includes(family);
-}
-
 /** The skill-page harnesses by native id, which their skill entries are built for. */
 export const SKILL_PAGE_HARNESSES = [
   "claude-native",
@@ -272,6 +269,7 @@ export const INVENTORY_PAGE_HARNESSES = [
   "codex-native",
   "cursor-native",
   "pi-native",
+  "omp-native",
 ] as const satisfies readonly NativeHarnessId[];
 
 export type InventoryPageHarnessId = (typeof INVENTORY_PAGE_HARNESSES)[number];
@@ -285,6 +283,11 @@ export function isInventoryPageHarness(harness: string): harness is InventoryPag
   return (INVENTORY_PAGE_HARNESSES as readonly string[]).includes(harness);
 }
 
+// OMP reports its native skills and MCP servers, but not a plugin inventory.
+function hasPluginPage(harness: InventoryPageHarnessId): boolean {
+  return harness !== "omp-native";
+}
+
 /**
  * Each harness's own page, named by its title. Its setup warning's button is "Set up", or, by
  * what the host needs, Install, Update, Reconfigure or Set up tmux. A page whose harness has an
@@ -295,14 +298,15 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
   members: NATIVE_HARNESS_IDS,
   build: (harness): HarnessDetailEntry => {
     const name = harnessName(harness);
-    const hasInventory = inventoryFamilyOf(harness) !== undefined;
+    const hasInventory = isInventoryPageHarness(harness);
+    const hasPlugins = hasInventory && hasPluginPage(harness);
     const page = {
       id: `harness-${harness}-detail`,
       section: "harnesses" as const,
       harness,
       label: name,
       description: hasInventory
-        ? `${name} on a machine: its MCP servers, skills and plugins, and its setup.`
+        ? `${name} on a machine: its MCP servers${hasPlugins ? ", skills and plugins" : " and skills"}, and its setup.`
         : `${name} on a machine, and how to set it up.`,
       keywords: ["harness", "agent", "setup"],
       parts: { back: "Back to Harnesses", fixAction: "Set up", ...FIX_DIALOG_PARTS },
@@ -320,14 +324,17 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
       overlays: { fixAction: FIX_DIALOG_OVERLAY },
     };
     if (!hasInventory) return settingsEntry(page);
+    const inventoryKinds = hasPlugins
+      ? INVENTORY_KINDS
+      : [INVENTORY_KIND_LABELS.mcps, INVENTORY_KIND_LABELS.skills];
     return settingsEntry({
       ...page,
       parts: { ...page.parts, tab: `${name} view` },
-      partChoices: { ...page.partChoices, tab: [...INVENTORY_KINDS, "Settings"] },
+      partChoices: { ...page.partChoices, tab: [...inventoryKinds, "Settings"] },
       // While the inventory loads, a tab shows its plain name; once loaded, its count.
       choiceTemplates: {
         tab: Object.fromEntries(
-          INVENTORY_KINDS.map((kind) => [
+          inventoryKinds.map((kind) => [
             kind,
             { before: `${kind}${INVENTORY_COUNT_SEPARATOR}`, count: true },
           ]),
@@ -335,7 +342,9 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
       },
       presence: { ...page.presence, tab: { states: ["lists its inventory"] } },
       // Each plugin and skill row opens its own page, where its harness has one.
-      regions: { plugins: OPENS_BY_NAME, skills: OPENS_BY_NAME },
+      regions: hasPlugins
+        ? { plugins: OPENS_BY_NAME, skills: OPENS_BY_NAME }
+        : { skills: OPENS_BY_NAME },
     }) as InventoryHarnessDetailEntry;
   },
 });
@@ -372,19 +381,12 @@ export const HARNESS_CREDENTIAL_ENTRIES = settingsEntryFamily({
     }),
 });
 
-const INVENTORY_NATIVE_IDS = NATIVE_HARNESS_IDS.filter(
-  (harness) => inventoryFamilyOf(harness) !== undefined,
-);
-const SKILL_PAGE_NATIVE_IDS = INVENTORY_NATIVE_IDS.filter((harness) =>
-  hasSkillPage(inventoryFamilyOf(harness)!),
-);
-
 const PLUGIN_KINDS = ["Skills", "MCPs"] as const;
 
-/** Each inventory harness's plugin page, named by its own tabs; a link to it lands on the Plugins tab. */
+/** Each supported plugin page, named by its own tabs; a link to it lands on the Plugins tab. */
 export const HARNESS_PLUGIN_ENTRIES = settingsEntryFamily({
   key: "harness-plugins",
-  members: INVENTORY_NATIVE_IDS,
+  members: INVENTORY_PAGE_HARNESSES.filter(hasPluginPage),
   build: (harness): HarnessPluginEntry =>
     settingsEntry({
       id: `harness-${harness}-plugin`,
@@ -408,7 +410,7 @@ export const HARNESS_PLUGIN_ENTRIES = settingsEntryFamily({
 /** Each skill-page family's skill page: the skill's own document, whose links are its content. */
 export const HARNESS_SKILL_ENTRIES = settingsEntryFamily({
   key: "harness-skills",
-  members: SKILL_PAGE_NATIVE_IDS,
+  members: SKILL_PAGE_HARNESSES,
   build: (harness): HarnessSkillEntry =>
     settingsEntry({
       id: `harness-${harness}-skill`,
@@ -438,7 +440,7 @@ const MCP_SERVER_REGIONS = {
  */
 export const MCP_SERVER_LIST_ENTRIES = settingsEntryFamily({
   key: "mcp-server-lists",
-  members: INVENTORY_NATIVE_IDS,
+  members: INVENTORY_PAGE_HARNESSES,
   build: (harness): SettingsEntry => {
     const name = harnessName(harness);
     const family = inventoryFamilyOf(harness)!;

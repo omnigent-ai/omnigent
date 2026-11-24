@@ -237,8 +237,44 @@ def _pi_servers(env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
     ]
 
 
+def _omp_servers(env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
+    """Read OMP's active user profile, not Pi config or project-level MCP files."""
+    from omnigent.harnesses.omp_native.credentials import global_omp_agent_dir
+
+    root = global_omp_agent_dir(env=env)
+    primary = _read_config(root / "mcp.json", "omp")
+    disabled = primary.get("disabledServers") if primary is not None else None
+    forced = primary.get("enabledServers") if primary is not None else None
+    disabled_names = (
+        {name for name in disabled if isinstance(name, str)}
+        if isinstance(disabled, list)
+        else set()
+    )
+    forced_names = (
+        {name for name in forced if isinstance(name, str)} if isinstance(forced, list) else set()
+    )
+    seen: set[str] = set()
+    out: list[ConfiguredMcpServer] = []
+    for data in (primary, _read_config(root / ".mcp.json", "omp")):
+        for name, raw in _servers_in(data).items():
+            if name in seen or not isinstance(raw, Mapping):
+                continue
+            seen.add(name)
+            enabled = raw.get("enabled")
+            disabled_entry = enabled is False or (
+                isinstance(enabled, str) and enabled.lower() in {"false", "0"}
+            )
+            if name in disabled_names or (disabled_entry and name not in forced_names):
+                continue
+            config = {**raw, "enabled": True}
+            summary = _summary(name, config, "omp")
+            if summary is not None:
+                out.append(ConfiguredMcpServer(summary, config))
+    return out
+
+
 def configured_mcp_servers() -> list[ConfiguredMcpServer]:
-    """List user-level MCP servers across Claude, Codex, Cursor, and Pi on this host.
+    """List user-level MCP servers across Claude, Codex, Cursor, Pi, and OMP.
 
     Each harness is read independently, so a missing or broken config for one
     never hides another's servers.
@@ -249,6 +285,7 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
         ("codex", _codex_servers),
         ("cursor", lambda: _cursor_servers(home)),
         ("pi", lambda: _pi_servers(os.environ)),
+        ("omp", lambda: _omp_servers(os.environ)),
     )
     out: list[ConfiguredMcpServer] = []
     for harness, read in readers:

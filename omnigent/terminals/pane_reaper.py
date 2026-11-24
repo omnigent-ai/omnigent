@@ -80,6 +80,7 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
         "kiro",
         "qwen",
         "pi",
+        "omp",
         "antigravity",
         "opencode",
     }

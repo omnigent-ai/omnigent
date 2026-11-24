@@ -261,6 +261,9 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     this matrix to drive. Its coverage is the dedicated devin-native
     bridge/forwarder/executor unit tests plus the Devin picker e2e_ui suite.
 
+    ``omp-native`` runs a terminal-first TUI via ``omni omp``. Its tmux-backed
+    happy path is covered by ``tests/e2e/test_omp_native_e2e.py``.
+
     Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
     for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
     spawn env carries no gateway/profile probe vars for this matrix to drive.
@@ -272,6 +275,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "claude-native",
         "codex-native",
         "pi-native",
+        "omp-native",
         "opencode-native",
         "cursor",
         "cursor-native",
