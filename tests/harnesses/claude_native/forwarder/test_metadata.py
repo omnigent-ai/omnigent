@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import time
@@ -1067,12 +1068,17 @@ def _claude_pane(status_row: str) -> str:
 
 
 def _fake_tmux_pane(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, failed_send_keys: int = 0
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    failed_send_keys: int = 0,
+    on_send_keys: Callable[[], None] | None = None,
 ) -> tuple[Path, list[str], list[list[str]]]:
     """
     Advertise a tmux pane whose capture returns the last entry of ``panes``.
 
     :param failed_send_keys: Number of initial ``send-keys`` calls that fail.
+    :param on_send_keys: Observe each attempted keystroke before its result.
     :returns: The bridge directory, the mutable ``panes`` list and the
         recorded successful ``send-keys`` commands.
     """
@@ -1093,6 +1099,8 @@ def _fake_tmux_pane(
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=panes[-1], stderr="")
         if "send-keys" in cmd:
+            if on_send_keys is not None:
+                on_send_keys()
             send_keys_attempts += 1
             if send_keys_attempts <= failed_send_keys:
                 return SimpleNamespace(returncode=1, stdout="", stderr="no client")
@@ -1228,8 +1236,10 @@ async def test_forward_pane_signals_leaves_other_api_retries_running(
     assert sent_keys == []
 
 
+@pytest.mark.parametrize("during_report", ["unchanged", "stopped", "followup", "identical-retry"])
 @pytest.mark.asyncio
 async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_reporting_it(
+    during_report: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1237,25 +1247,51 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
     An unreported rejection is not interrupted; the next poll reports it, then interrupts.
 
     The Escape's trailing idle would otherwise settle the turn without the
-    error, leaving the web with no explanation for the stopped reply. A failed
-    Escape is retried on the next poll without reporting the rejection again.
+    error. A failed Escape is retried without reposting, but a turn replaced
+    during the report must never receive the old turn's Escape.
     """
-    bridge_dir, panes, sent_keys = _fake_tmux_pane(monkeypatch, tmp_path, failed_send_keys=1)
+    timeline: list[str] = []
+    bridge_dir, panes, sent_keys = _fake_tmux_pane(
+        monkeypatch,
+        tmp_path,
+        failed_send_keys=1,
+        on_send_keys=lambda: timeline.append("escape"),
+    )
     panes.append(_claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 2s · attempt 3/10"))
     calls: list[dict[str, Any]] = []
+    report_started = asyncio.Event()
+    finish_report = asyncio.Event()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """Record each POST, rejecting the first session-status report."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Reject the first failure report and suspend the successful retry."""
         body = json.loads(request.content.decode("utf-8"))
         calls.append(body)
-        if _failed_status_posts([body]) and len(_failed_status_posts(calls)) == 1:
-            return httpx.Response(503, json={})
+        if _failed_status_posts([body]):
+            if len(_failed_status_posts(calls)) == 1:
+                timeline.append("report_failed")
+                return httpx.Response(503, json={})
+            timeline.append("report_started")
+            report_started.set()
+            await finish_report.wait()
+            timeline.append("report_completed")
         return httpx.Response(200, json={})
 
     dedupe = forwarder._ForwardDedupeState()
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
+        record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv1",
+            bridge_dir=bridge_dir,
+            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
 
         async def _poll() -> None:
             await forwarder._forward_pane_signals(
@@ -1270,11 +1306,26 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
         assert len(_failed_status_posts(calls)) == 1
         assert sent_keys == []
 
-        await _poll()
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(_poll())
+            try:
+                await asyncio.wait_for(report_started.wait(), timeout=5.0)
+                assert timeline == ["report_failed", "report_started"]
+                if during_report in {"stopped", "followup"}:
+                    panes.append(
+                        _claude_pane("✻ Billowing…" if during_report == "followup" else "")
+                    )
+                if during_report in {"followup", "identical-retry"}:
+                    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
+                    assert dedupe.prompt_submit_cursor == 1
+            finally:
+                finish_report.set()
         assert len(_failed_status_posts(calls)) == 2
         assert sent_keys == []
 
         await _poll()
 
     assert [post["response_id"] for post in _failed_status_posts(calls)] == ["resp_1", "resp_1"]
-    assert len(sent_keys) == 1
+    expected_escapes = ["escape", "escape"] if during_report == "unchanged" else []
+    assert timeline == ["report_failed", "report_started", "report_completed", *expected_escapes]
+    assert len(sent_keys) == (1 if during_report == "unchanged" else 0)

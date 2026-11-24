@@ -6486,7 +6486,7 @@ async def _forward_pane_signals(
     response_id: str | None = None,
 ) -> None:
     """
-    Capture the Claude pane ONCE per window and relay every footer signal.
+    Share one throttled Claude pane capture across the pane-signal relays.
 
     Neither the permission mode nor a ``/btw`` side-chat is observable to
     Omnigent through the transcript, deltas, or hooks — both live only in the
@@ -6494,7 +6494,7 @@ async def _forward_pane_signals(
     subprocess, this reads the pane a single time (throttled to
     :data:`_PANE_POLL_INTERVAL_S`) and hands the one snapshot to each relay,
     so the always-on cost is one subprocess per window regardless of how many
-    signals are parsed.
+    signals are parsed. Rejected retries are recaptured before interruption.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -6539,6 +6539,8 @@ async def _stop_rejected_api_retry(
     after its last attempt, minutes later. The ``failed`` status is posted
     before the Escape so the interrupt's trailing idle cannot settle the turn
     first. A failed post or keystroke is retried on the next capture.
+    The pane and parent hooks are rechecked after reporting to avoid
+    interrupting a turn that replaced the rejected request during the post.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -6593,7 +6595,12 @@ async def _stop_rejected_api_retry(
             return
         dedupe.api_retry_reported = True
     try:
-        await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
+        dedupe.api_retry_interrupted = await asyncio.to_thread(
+            _interrupt_api_retry_if_current,
+            bridge_dir,
+            retry=retry,
+            prompt_submit_cursor=dedupe.api_retry_prompt_cursor,
+        )
     except RuntimeError:
         _logger.warning(
             "Failed to interrupt Claude Code's rejected API retry; session=%s",
@@ -6602,7 +6609,25 @@ async def _stop_rejected_api_retry(
             extra={"session_id": session_id},
         )
         return
-    dedupe.api_retry_interrupted = True
+
+
+def _interrupt_api_retry_if_current(
+    bridge_dir: Path, *, retry: ApiRetry, prompt_submit_cursor: int | None
+) -> bool:
+    """Recheck the pane and on-disk turn hooks immediately before sending Escape."""
+    if read_pane_signals(bridge_dir).api_retry != retry:
+        return False
+    cursor = prompt_submit_cursor or 0
+    hooks = read_hook_events_since_with_position(bridge_dir, cursor)
+    parent_ids = read_seen_claude_session_ids(bridge_dir)
+    if hooks.event_cursor < cursor or any(
+        record.event_name in {"UserPromptSubmit", "SessionStart", "Stop", "StopFailure"}
+        and not _is_subagent_hook_record(record, parent_claude_session_ids=parent_ids)
+        for record in hooks.records
+    ):
+        return False
+    inject_interrupt(bridge_dir, timeout_s=1.0)
+    return True
 
 
 async def _relay_permission_mode(
