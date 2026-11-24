@@ -206,10 +206,11 @@ describe("session drafts", () => {
   // result: unique filenames in send order (tray, then chips), chips that name their own file, and
   // typed text that keeps its meaning.
   type Chips = [string, File][];
+  type Sessions = { token: string; id: string; title: string }[];
   const recoveryRows: [
     string,
-    { message: string; files: File[]; chips: Chips },
-    { text: string; files: File[]; chips: Chips },
+    { message: string; files: File[]; chips: Chips; sessions?: Sessions },
+    { text: string; files: File[]; chips: Chips; sessions?: Sessions },
     { message: string; names: string[]; chipTokens: string[] },
   ][] = [
     [
@@ -233,6 +234,36 @@ describe("session drafts", () => {
       },
     ],
     [
+      "a renamed file's spelling inside a longer session tag is left as typed",
+      { message: "", files: [new File(["a"], "a.png")], chips: [] },
+      {
+        text: "Use @a.png plan and inspect @a.png",
+        files: [new File(["b"], "a.png")],
+        chips: [],
+        sessions: [{ token: "@a.png plan", id: "s_plan", title: "a.png plan" }],
+      },
+      {
+        message: "Use @a.png plan and inspect @a (2).png",
+        names: ["a.png", "a (2).png"],
+        chipTokens: [],
+      },
+    ],
+    [
+      "a session tag that is a prefix of a renamed file's name is left as typed",
+      { message: "", files: [new File(["a"], "a.png")], chips: [] },
+      {
+        text: "Check @a and @a.png",
+        files: [new File(["b"], "a.png")],
+        chips: [],
+        sessions: [{ token: "@a", id: "s_a", title: "a" }],
+      },
+      {
+        message: "Check @a and @a (2).png",
+        names: ["a.png", "a (2).png"],
+        chipTokens: [],
+      },
+    ],
+    [
       "two incoming files collide, and each reference keeps its own file",
       { message: "", files: [], chips: [["@a.png", new File(["a"], "a.png")]] },
       {
@@ -253,18 +284,23 @@ describe("session drafts", () => {
     async (_, original, temp, want) => {
       const { recoverFailedSessionDraft, setSessionDraft } = await import("./sessionDrafts");
       const { attachmentFilename } = await import("./attachments");
-      const mentionsOf = (chips: Chips) => ({
+      const mentionsOf = (chips: Chips, sessions: Sessions = []) => ({
         files: [],
-        sessions: [],
+        sessions: sessions.map((session) => ({ ...session, isSubagent: false })),
         attachments: chips.map(([token, file]) => ({ token, file })),
       });
+      const tempHasMentions = temp.chips.length > 0 || (temp.sessions ?? []).length > 0;
       setSessionDraft("temp:rows", {
         text: temp.text,
         files: temp.files,
-        mentions: temp.chips.length > 0 ? mentionsOf(temp.chips) : undefined,
+        mentions: tempHasMentions ? mentionsOf(temp.chips, temp.sessions) : undefined,
       });
       const recovered = recoverFailedSessionDraft(
-        { message: original.message, files: original.files, mentions: mentionsOf(original.chips) },
+        {
+          message: original.message,
+          files: original.files,
+          mentions: mentionsOf(original.chips, original.sessions),
+        },
         "temp:rows",
       );
       const chips = recovered.mentions?.attachments ?? [];

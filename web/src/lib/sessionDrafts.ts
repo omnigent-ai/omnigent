@@ -195,7 +195,12 @@ export function recoverFailedSessionDraft<
       ? []
       : [[`@${file.name}`, `@${incoming[index]!.name}`] as const],
   );
-  const mergedText = respellMentions(merged.text, renames);
+  const namespace = [
+    ...tagTokensOf(merged.mentions),
+    ...tagTokensOf(originalDraft.mentions),
+    ...tagTokensOf(temporaryDraft.mentions),
+  ];
+  const mergedText = respellMentions(merged.text, renames, namespace);
   const message = [originalDraft.message, mergedText]
     .filter((part) => part.trim() !== "")
     .join("\n\n");
@@ -208,16 +213,23 @@ export function recoverFailedSessionDraft<
 }
 
 /**
- * ``text`` with each whole mention in ``renames`` spelled as its new name, in one pass: a replaced
- * spelling is never scanned again, so one rename cannot rewrite another's result.
+ * ``text`` with each mention in ``renames`` spelled as its new name. The scan is the composer's
+ * longest-first one over every token in ``namespace``, so a longer tag that contains a renamed
+ * spelling (``@a.png plan``) is matched whole and left alone.
  */
-function respellMentions(text: string, renames: readonly (readonly [string, string])[]): string {
+function respellMentions(
+  text: string,
+  renames: readonly (readonly [string, string])[],
+  namespace: readonly string[],
+): string {
   if (renames.length === 0) return text;
   const spelled = new Map(renames);
   let out = "";
   let at = 0;
-  for (const range of findMentionTokens(text, [...spelled.keys()])) {
-    out += text.slice(at, range.start) + spelled.get(range.token);
+  for (const range of findMentionTokens(text, [...namespace, ...spelled.keys()])) {
+    const next = spelled.get(range.token);
+    if (next === undefined) continue;
+    out += text.slice(at, range.start) + next;
     at = range.end;
   }
   return out + text.slice(at);
