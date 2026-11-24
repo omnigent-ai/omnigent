@@ -1724,7 +1724,7 @@ module.exports = function (pi) {
   let turnStatusResponseId = null;
   let turnResult = null;
   let turnOutcomeController = new AbortController();
-  // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
+  // Dedicated loop-state flag, set on agent_start / cleared on agent_settled. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
   // !activeResponseId: agent_start resets activeResponseId to null and only
   // turn_start assigns it, so an interrupt landing in that gap (after
@@ -2041,7 +2041,6 @@ module.exports = function (pi) {
     if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
     const postKey = usagePostKey();
     if (postKey === lastPostedUsageKey) return;
-    lastPostedUsageKey = postKey;
     // Persist the running total before the POST so a relaunch restores it even
     // when the flush fails and the server never records this report.
     persistCumulativeUsage();
@@ -2053,7 +2052,16 @@ module.exports = function (pi) {
     };
     if (completeCost) data.cumulative_cost_usd = cumulativeCostUsd;
     if (usageModel) data.model = usageModel;
-    await postEvent(config, { type: "external_session_usage", data });
+    try {
+      const response = await postEventChecked(
+        config,
+        { type: "external_session_usage", data },
+        AbortSignal.timeout(assistantItemPostTimeoutMs(config)),
+      );
+      if (response && postKey === usagePostKey()) lastPostedUsageKey = postKey;
+    } catch (_err) {
+      // A later observation can report these saved totals after the server recovers.
+    }
   }
 
   // Restore cumulative totals before recording new usage after a relaunch.
@@ -2460,7 +2468,7 @@ module.exports = function (pi) {
     // Publish readiness before usage so a hung POST cannot delay input handling.
     await postSessionUsage();
     // Readiness is not turn completion: a queued prompt may already be running.
-    // Only agent_end publishes idle so startup cannot complete a child task.
+    // Only agent_settled publishes idle so startup cannot complete a child task.
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -2494,7 +2502,7 @@ module.exports = function (pi) {
     // A brand-new agent loop must never inherit a replay window armed before it
     // began (e.g. a spuriously-armed window from an interrupt that landed while
     // idle). A legitimate interrupt that arrives after this point belongs to
-    // this loop and can still arm/replay; agent_end clears once the loop
+    // this loop and can still arm/replay; agent_settled clears once the loop
     // completes. See F18.
     clearPendingInterrupt();
     turnOutcomeController.abort();
@@ -2514,7 +2522,7 @@ module.exports = function (pi) {
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
-    // Pin the status response_id for this agent loop through agent_end.
+    // Pin the status response_id until Pi settles retry and compaction recovery.
     turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
     await postEvent(config, {
       type: "external_session_status",
@@ -2527,11 +2535,25 @@ module.exports = function (pi) {
 
   pi.on("agent_end", async (event, ctx) => {
     rememberContext(ctx);
-    const cancelled = ctx?.signal?.aborted || hasPendingInterrupt();
+    // Pi can retry or compact after this attempt; only usage is final here.
+    const messages = event && Array.isArray(event.messages) ? event.messages : [];
+    for (const message of messages) {
+      accumulateUsage(message);
+    }
+    await postSessionUsage();
+  });
+
+  pi.on("agent_settled", async (event, ctx) => {
+    rememberContext(ctx);
+    const cancelled = event?.aborted === true || ctx?.signal?.aborted || hasPendingInterrupt();
     const outcomeSignal = turnOutcomeController.signal;
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
-    const result = turnResult;
+    const result = cancelled && turnResult?.error ? null : turnResult;
+    if (result?.error && !compacting) {
+      result.item = history.enqueue(result.error, result.errorSourceId);
+      if (result.authNotice) ctx?.ui?.notify?.(result.authNotice, "error");
+    }
     const drainedHistory = compacting ? Promise.resolve(true) : history.flush();
     clearPendingInterrupt();
     agentRunning = false;
@@ -2540,18 +2562,6 @@ module.exports = function (pi) {
     // Accepted prompts that Pi never consumed (discarded queue, extension
     // commands) must not hide a later prompt consumed without ``input``.
     if (!ctx?.hasPendingMessages?.()) unconsumedMirroredPrompts.length = 0;
-    // Last-chance usage capture from the agent loop's final message set, in
-    // case neither ``message_end`` nor ``turn_end`` carried usage for some
-    // call. ``event.messages`` may hold the whole conversation; the
-    // fingerprint dedup means re-scanning already-counted messages is a no-op,
-    // so a plain forward-scan is safe (no overcount).
-    const messages =
-      event && Array.isArray(event.messages) ? event.messages : [];
-    let changed = false;
-    for (const message of messages) {
-      if (accumulateUsage(message)) changed = true;
-    }
-    if (changed) await postSessionUsage();
     if (outcomeSignal.aborted) return;
     // Reuse the agent_start response_id so the web client matches the idle
     // edge and clears the "streaming" status, unblocking queued follow-ups.
@@ -2566,7 +2576,7 @@ module.exports = function (pi) {
     }, AbortSignal.timeout(assistantItemPostTimeoutMs(config)));
     const drained = await drainedHistory;
     if (outcomeSignal.aborted) return;
-    // Pi continues queued steering after agent_end; the parent's dispatch is still active.
+    // Queued steering still belongs to the parent's active dispatch.
     if (outcome === "completed" && ctx?.hasPendingMessages?.()) return;
     const deliveryFailed = !drained || (Boolean(result?.output) && !result.item?.accepted);
     const status = deliveryFailed || outcome === "failed" ? "failed" : "idle";
@@ -2767,8 +2777,6 @@ module.exports = function (pi) {
     const authFailure = nativeAuthFailure(message, ctx);
     if (authFailure) {
       message = { ...message, errorMessage: authFailure.message };
-      if (ctx && ctx.ui && ctx.ui.notify)
-        ctx.ui.notify(authFailure.message, "error");
     }
     const responseId = currentResponseId();
     // Close the live preview for this message (no-op if nothing streamed),
@@ -2796,8 +2804,12 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      const item = history.enqueue(
-        {
+      // A failed model attempt may recover automatically before agent_settled.
+      turnResult = {
+        item: null,
+        outcome: "failed",
+        output: `Pi model error: ${errorMessage}`,
+        error: {
           response_id: responseId,
           item_type: "error",
           item_data: {
@@ -2806,9 +2818,9 @@ module.exports = function (pi) {
             message: `Pi model error: ${errorMessage}`,
           },
         },
-        assistantMessageSourceId(message, responseId, errorMessage),
-      );
-      turnResult = { item, outcome: "failed", output: `Pi model error: ${errorMessage}` };
+        errorSourceId: assistantMessageSourceId(message, responseId, errorMessage),
+        authNotice: authFailure?.message,
+      };
       return;
     }
     const text = textFromMessage(message);
