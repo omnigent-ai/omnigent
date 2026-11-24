@@ -176,6 +176,9 @@ class ProjectTicketNotifications:
                 break
         if project is None:
             return
+        for event in events:
+            # Lets the turn name a shared member who acted, as distinct from the owner.
+            event["project_owner"] = project.user_id
         remaining = []
         for event in events:
             if _routes_to_workers(event) and await self._route_to_workers(app, project, event):

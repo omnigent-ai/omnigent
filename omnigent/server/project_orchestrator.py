@@ -27,8 +27,16 @@ def _event_section(
         )
     elif _enters_completed_stage(event) and event["ticket_id"] not in finalized:
         note = f"\n\n{FINAL_UPDATE_REMINDER}"
+    person = (
+        f" · by {event['user_id']}"
+        if event.get("session_id") is None
+        and event.get("agent_id") is None
+        and event.get("user_id")
+        and event.get("user_id") != event.get("project_owner")
+        else ""
+    )
     return (
-        f"Ticket {event['ticket_id']} · {event['kind']}\n"
+        f"Ticket {event['ticket_id']} · {event['kind']}{person}\n"
         + json.dumps(event["payload"], ensure_ascii=False)
         + note
     )

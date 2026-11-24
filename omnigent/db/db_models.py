@@ -1031,6 +1031,9 @@ class SqlProjectTicket(OmnigentBase):
     latest_update: Mapped[str] = mapped_column(EnvelopedText(2048), nullable=False)
     comment_count: Mapped[int] = mapped_column(Integer, nullable=False)
     next_event_position: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Who asked for the work, set once at creation: a user ID, or ``github:<login>``
+    # for an imported pull request. NULL on rows from before it was recorded.
+    requested_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 

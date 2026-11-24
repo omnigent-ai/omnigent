@@ -11,6 +11,7 @@ from omnigent.entities.project import (
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
+    ImportPullRequest,
     LandTicketRequest,
     LinkRelatedTicket,
     TicketEventKind,
@@ -311,6 +312,19 @@ class SysTicketLandTool(_TicketTool):
     arguments = LandTicket
 
 
+class SysTicketImportPrTool(_TicketTool):
+    tool_name = "sys_ticket_import_pr"
+    help_text = (
+        "File an outside GitHub pull request as a ticket in this project's first stage. The "
+        "server reads the PR (read-only; nothing is posted to GitHub), records its author as "
+        "the requester `github:<login>`, adds the PR link as an output and returns the "
+        "ticket; importing the same PR again returns the existing ticket. Imported tickets "
+        "land only with the Reviewer's approval plus the owner's `owner-ok` for the same SHA. "
+        "Don't run the PR's code until the Reviewer has read it."
+    )
+    arguments = ImportPullRequest
+
+
 class SysSessionLinkTicketTool(_TicketTool):
     tool_name = "sys_session_link_ticket"
     help_text = (
@@ -427,6 +441,7 @@ TICKET_TOOL_CLASSES = (
     SysTicketStagesUpdateTool,
     SysTicketCommentTool,
     SysTicketLandTool,
+    SysTicketImportPrTool,
     SysSessionLinkTicketTool,
     SysTicketLinkTool,
     SysProjectMandateProposeTool,

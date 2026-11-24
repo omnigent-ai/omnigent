@@ -22,7 +22,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { useNow } from "@/hooks/useNow";
 import { Link, useSearchParams } from "@/lib/routing";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
-import type { ProjectTicket, TicketStage } from "@/lib/projectTicketsApi";
+import { getCurrentUserId } from "@/lib/identity";
+import { requesterLabel, type ProjectTicket, type TicketStage } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 import { TicketError, TicketLabels } from "./TicketControls";
 import { TicketStageBadge } from "./TicketStageAppearance";
@@ -473,6 +474,7 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           >
             {relativeTime(ticket.updated_at * 1000, now.getTime())}
           </time>
+          <TicketRequester ticket={ticket} />
         </div>
         <div className="flex items-center gap-2">
           <TicketNewActivity ticket={ticket} />
@@ -488,6 +490,18 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
         </div>
       </div>
     </>
+  );
+}
+
+/** Who asked for a ticket, when it wasn't the viewer: a shared member or an outside PR author. */
+function TicketRequester({ ticket }: { ticket: ProjectTicket }) {
+  const viewer = getCurrentUserId();
+  if (!ticket.requested_by || ticket.requested_by === viewer) return null;
+  const label = requesterLabel(ticket.requested_by, viewer);
+  return (
+    <span className="min-w-0 truncate" title={`Requested by ${label}`} data-testid="ticket-requester">
+      by {label}
+    </span>
   );
 }
 

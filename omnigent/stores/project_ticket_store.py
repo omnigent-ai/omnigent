@@ -109,6 +109,7 @@ def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
         "labels": row.labels,
         "latest_update": row.latest_update,
         "comment_count": row.comment_count,
+        "requested_by": row.requested_by,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -472,7 +473,16 @@ class ProjectTicketStore:
                 return "human"
         return audience
 
-    def create(self, project_id: str, body: CreateTicket, actor: TicketActor) -> dict[str, Any]:
+    def create(
+        self,
+        project_id: str,
+        body: CreateTicket,
+        actor: TicketActor,
+        *,
+        requested_by: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a ticket; ``requested_by`` defaults to the creating user and never changes."""
+
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
             configuration = _stages(project)
@@ -490,6 +500,7 @@ class ProjectTicketStore:
                 latest_update="Created the ticket",
                 comment_count=0,
                 next_event_position=0,
+                requested_by=requested_by or actor.user_id,
                 created_at=now,
                 updated_at=now,
             )

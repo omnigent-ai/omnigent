@@ -4351,6 +4351,37 @@
         "title": "ImportItemInput",
         "type": "object"
       },
+      "ImportPullRequest": {
+        "additionalProperties": false,
+        "description": "Body for importing an outside GitHub pull request as a ticket.",
+        "properties": {
+          "record": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A recorded GitHub pull-request object to use instead of reading GitHub, for offline intake and dry runs. It must match the URL.",
+            "title": "Record"
+          },
+          "url": {
+            "description": "The PR's URL, e.g. https://github.com/<owner>/<repo>/pull/<n>.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "ImportPullRequest",
+        "type": "object"
+      },
       "ImportSessionRequest": {
         "description": "Request body for importing one local harness session.\n\n`project_id` files the imported session into a first-class project the\ncaller owns, with the same ownership, default-fill, and mismatch-warning\nsemantics as `POST /v1/sessions`.",
         "properties": {
@@ -22896,6 +22927,61 @@
           }
         },
         "summary": "Project Cost",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/import-pr": {
+      "post": {
+        "description": "File an outside GitHub PR as a ticket, read-only; re-importing returns the same ticket.\n\nThe ticket's requester is `github:<login>`, which puts it in the outside-author\nlanding tier. A recorded `record` replaces the GitHub read for dry runs.",
+        "operationId": "import_pull_request_v1_projects__project_id__tickets_import_pr_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportPullRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Import Pull Request V1 Projects  Project Id  Tickets Import Pr Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Pull Request",
         "tags": [
           "project tickets"
         ]

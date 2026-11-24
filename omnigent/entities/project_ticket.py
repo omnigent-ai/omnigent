@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -324,6 +324,23 @@ class TicketActor:
     user_id: str | None
     session_id: str | None = None
     agent_id: str | None = None
+
+
+class ImportPullRequest(BaseModel):
+    """Body for importing an outside GitHub pull request as a ticket."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="The PR's URL, e.g. https://github.com/<owner>/<repo>/pull/<n>.",
+    )
+    record: dict[str, Any] | None = Field(
+        default=None,
+        description="A recorded GitHub pull-request object to use instead of reading GitHub, "
+        "for offline intake and dry runs. It must match the URL.",
+    )
 
 
 class LandTicketRequest(BaseModel):

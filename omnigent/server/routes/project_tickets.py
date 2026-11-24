@@ -16,6 +16,7 @@ from sqlalchemy.exc import StatementError
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
+    ImportPullRequest,
     LandTicketRequest,
     LinkRelatedTicket,
     LinkTicketSession,
@@ -35,7 +36,7 @@ from omnigent.runtime.project_ticket_instructions import (
     FINAL_UPDATE_REMINDER,
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
-from omnigent.server import session_live_state
+from omnigent.server import github_pr_intake, session_live_state
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.persona_mentions import (
     ORCHESTRATOR_MENTION_ID,
@@ -45,6 +46,7 @@ from omnigent.server.persona_mentions import (
     deliver_mentions,
     find_mentions,
 )
+from omnigent.server.project_landing import RISK_OK_LABEL
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
 from omnigent.server.routes._sessions.helpers import (
@@ -332,6 +334,36 @@ def create_project_tickets_router(
             )
         return TicketActor(user_id, source.id, source.agent_id)
 
+    async def refuse_member_approval(
+        request: Request,
+        project_id: str,
+        before: dict[str, Any],
+        body: UpdateTicket,
+        who: TicketActor,
+    ) -> None:
+        """Approval labels are the owner's: a shared member can't set or change them."""
+        after = [label.model_dump() for label in body.labels or []]
+        changed = [
+            key
+            for key in (APPROVED_LABEL, RISK_OK_LABEL, github_pr_intake.OWNER_OK_LABEL)
+            if label_value(after, key) != label_value(before.get("labels"), key)
+        ]
+        if not changed:
+            return
+        notifications = getattr(request.app.state, "project_ticket_notifications", None)
+        project = (
+            await asyncio.to_thread(
+                notifications.projects.get, before["project_id"] or project_id, user_id=who.user_id
+            )
+            if notifications is not None
+            else None
+        )
+        if project is not None and project.user_id != who.user_id:
+            raise OmnigentError(
+                f"Only the project owner can set {', '.join(f'`{key}`' for key in changed)}",
+                code=ErrorCode.FORBIDDEN,
+            )
+
     async def review_context(
         request: Request, project_id: str, who: TicketActor
     ) -> tuple[PersonaMentionTargets, Any, Mention, bool] | None:
@@ -541,6 +573,59 @@ def create_project_tickets_router(
         wake(request)
         return ticket
 
+    @router.post("/import-pr", status_code=201)
+    async def import_pull_request(
+        request: Request, project_id: str, body: ImportPullRequest
+    ) -> dict[str, Any]:
+        """File an outside GitHub PR as a ticket, read-only; re-importing returns the same ticket.
+
+        The ticket's requester is ``github:<login>``, which puts it in the outside-author
+        landing tier. A recorded ``record`` replaces the GitHub read for dry runs.
+        """
+        who = await actor(request, project_id)
+        owner, repo, number = github_pr_intake.parse_pr_url(body.url)
+        pr_key = f"{owner}/{repo}#{number}"
+        after: str | None = None
+        for _ in range(50):
+            page = await asyncio.to_thread(
+                store.list, project_id, user_id=who.user_id, after=after, limit=100
+            )
+            for row in page.get("data", []):
+                if any(
+                    label.get("key") == github_pr_intake.PR_LABEL and label.get("value") == pr_key
+                    for label in row.get("labels") or []
+                ):
+                    return {**row, "imported": False}
+            if not page.get("has_more"):
+                break
+            after = page.get("last_id")
+        record = body.record or await asyncio.to_thread(
+            github_pr_intake.fetch_pr, owner, repo, number
+        )
+        fields = github_pr_intake.ticket_from_pr(body.url, record)
+        create = CreateTicket(
+            title=fields["title"],
+            description=fields["description"],
+            labels=[TicketLabel(**label) for label in fields["labels"]],
+        )
+        with _storage_errors():
+            ticket = await asyncio.to_thread(
+                store.create, project_id, create, who, requested_by=fields["requested_by"]
+            )
+            await asyncio.to_thread(
+                store.comment,
+                project_id,
+                ticket["id"],
+                CommentOnTicket(
+                    text=f"Imported {pr_key} by `{fields['requested_by']}` (outside-author tier).",
+                    outputs=[{"type": "pull_request", "url": fields["url"]}],
+                    audience="agents",
+                ),
+                who,
+            )
+        wake(request)
+        return {**ticket, "imported": True}
+
     @router.get("/stages")
     async def ticket_stages(
         request: Request, project_id: str, include_usage: bool = False
@@ -605,6 +690,8 @@ def create_project_tickets_router(
             raises_human_request = not _has_needs_human(before)
         before = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
         context = None
+        if body.labels is not None and who.session_id is None:
+            await refuse_member_approval(request, project_id, before, body, who)
         if body.labels is not None:
             approved_after = label_value(
                 [label.model_dump() for label in body.labels], APPROVED_LABEL

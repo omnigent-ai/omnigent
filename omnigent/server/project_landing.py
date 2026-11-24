@@ -34,6 +34,7 @@ from typing import Any
 from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.entities.project_ticket import CommentOnTicket, TicketActor, UpdateTicket
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.github_pr_intake import OWNER_OK_LABEL, is_outside_requester
 
 _logger = logging.getLogger(__name__)
 
@@ -248,10 +249,15 @@ class LandingQueue:
 
     # -- gates -----------------------------------------------------------------
 
-    async def _label_setters(self, project: Any, ticket_id: str) -> dict[tuple[str, str], dict]:
-        """The latest event that set each ``(key, value)`` label on the ticket."""
+    async def _label_setters(
+        self, project: Any, ticket_id: str
+    ) -> dict[tuple[str, str], list[dict]]:
+        """Each current ``(key, value)`` label, with every event that set or kept it since it
+        last appeared. Edits replace the whole label list, so a later edit that merely keeps a
+        label is listed too; a gate trusts the label if any of those events is trusted.
+        """
         tickets = self._notifications.tickets
-        setters: dict[tuple[str, str], dict] = {}
+        setters: dict[tuple[str, str], list[dict]] = {}
         after = -1
         for _ in range(50):
             page = await asyncio.to_thread(
@@ -267,16 +273,31 @@ class LandingQueue:
                 labels = (payload.get("changes") or {}).get("labels") or (
                     payload.get("labels") if event.get("kind") == "created" else None
                 )
-                for label in labels if isinstance(labels, list) else []:
-                    if isinstance(label, dict) and isinstance(label.get("key"), str):
-                        setters[(label["key"], (label.get("value") or "").strip())] = event
+                if not isinstance(labels, list):
+                    continue
+                state = {
+                    (label["key"], (label.get("value") or "").strip())
+                    for label in labels
+                    if isinstance(label, dict) and isinstance(label.get("key"), str)
+                }
+                setters = {pair: [*setters.get(pair, []), event] for pair in state}
             if not page.get("has_more"):
                 break
             after = page.get("last_position", after)
         return setters
 
+    @staticmethod
+    def _is_owner(project: Any, event: dict[str, Any] | None) -> bool:
+        """A person's own edit as the project owner; shared members don't count."""
+        return (
+            event is not None
+            and event.get("session_id") is None
+            and event.get("agent_id") is None
+            and event.get("user_id") == project.user_id
+        )
+
     async def _is_reviewer_or_owner(self, project: Any, event: dict[str, Any]) -> bool:
-        if event.get("session_id") is None and event.get("agent_id") is None:
+        if self._is_owner(project, event):
             return True
         session_id = event.get("session_id")
         if not session_id:
@@ -302,19 +323,27 @@ class LandingQueue:
                 "this SHA, set by the Reviewer"
             )
         setters = await self._label_setters(project, ticket["id"])
-        approver = setters.get((APPROVED_LABEL, sha))
-        if approver is None or not await self._is_reviewer_or_owner(project, approver):
+        approvers = setters.get((APPROVED_LABEL, sha), [])
+        if not any([await self._is_reviewer_or_owner(project, event) for event in approvers]):
             raise refuse("The `approved` label wasn't set by the Reviewer's session or the owner")
         if RISK_LABEL in labels:
-            risk_ok = setters.get((RISK_OK_LABEL, labels.get(RISK_OK_LABEL, "")))
-            if (
-                RISK_OK_LABEL not in labels
-                or risk_ok is None
-                or (risk_ok.get("session_id") is not None or risk_ok.get("agent_id") is not None)
+            risk_ok = setters.get((RISK_OK_LABEL, labels.get(RISK_OK_LABEL, "")), [])
+            if RISK_OK_LABEL not in labels or not any(
+                self._is_owner(project, event) for event in risk_ok
             ):
                 raise refuse(
                     f"The ticket has `risk: {labels[RISK_LABEL]}`; "
                     "the owner must add `risk-ok` first"
+                )
+        if is_outside_requester(ticket.get("requested_by")):
+            owner_ok = setters.get((OWNER_OK_LABEL, sha), [])
+            if labels.get(OWNER_OK_LABEL) != sha or not any(
+                self._is_owner(project, event) for event in owner_ok
+            ):
+                raise refuse(
+                    f"This change came from an outside pull request "
+                    f"(`{ticket['requested_by']}`): the owner must set `{OWNER_OK_LABEL}` = "
+                    f"`{sha}` before it lands"
                 )
         return await asyncio.to_thread(self._fast_forward_check, target, sha)
 

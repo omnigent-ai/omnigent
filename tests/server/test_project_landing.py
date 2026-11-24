@@ -37,7 +37,9 @@ class FakeTickets:
         self.history: list[dict[str, Any]] = []
         self.notes: list[str] = []
 
-    def label(self, key: str, value: str, *, session_id: str | None = None) -> None:
+    def label(
+        self, key: str, value: str, *, session_id: str | None = None, user_id: str | None = None
+    ) -> None:
         self.ticket["labels"] = [
             *(label for label in self.ticket["labels"] if label["key"] != key),
             {"key": key, "value": value},
@@ -47,6 +49,7 @@ class FakeTickets:
                 "kind": "updated",
                 "session_id": session_id,
                 "agent_id": None,
+                "user_id": user_id,
                 "payload": {"changes": {"labels": list(self.ticket["labels"])}},
             }
         )
@@ -149,6 +152,30 @@ async def test_unapproved_or_wrongly_approved_or_risky_shas_are_refused(world) -
     with pytest.raises(OmnigentError, match="risk-ok"):
         await submit(world, sha)
     world.tickets.label("risk-ok", "yes")  # set by a person
+    assert (await submit(world, sha))["queued"]
+
+
+async def test_members_cannot_stand_in_for_the_owner_and_outside_prs_need_owner_ok(
+    world,
+) -> None:
+    world.project.user_id = "owner@example.com"
+    sha = feature(world, "f-outside")
+    world.tickets.label("approved", sha, user_id="member@example.com")
+    with pytest.raises(OmnigentError, match="Reviewer"):
+        await submit(world, sha)
+    world.tickets.label("approved", sha, session_id="rs")
+    world.tickets.label("risk", "auth", session_id="rs")
+    world.tickets.label("risk-ok", "yes", user_id="member@example.com")
+    with pytest.raises(OmnigentError, match="risk-ok"):
+        await submit(world, sha)
+    world.tickets.label("risk-ok", "yes", user_id="owner@example.com")
+    world.tickets.ticket["requested_by"] = "github:octocat"
+    with pytest.raises(OmnigentError, match="owner-ok"):
+        await submit(world, sha)
+    world.tickets.label("owner-ok", sha, user_id="member@example.com")
+    with pytest.raises(OmnigentError, match="owner-ok"):
+        await submit(world, sha)
+    world.tickets.label("owner-ok", sha, user_id="owner@example.com")
     assert (await submit(world, sha))["queued"]
 
 

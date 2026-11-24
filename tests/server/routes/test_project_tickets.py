@@ -1638,3 +1638,60 @@ async def test_delete_tickets_flag_is_owner_only_and_limited_to_throwaway_projec
     deleted = await project_client.delete(throwaway, params={"delete_tickets": "true"})
     assert deleted.status_code == 200, deleted.text
     assert (await project_client.get(throwaway)).status_code == 404
+
+
+async def test_shared_member_requests_are_attributed_and_approval_stays_the_owners(
+    multi_user_client,
+):
+    client = multi_user_client
+    project = (
+        await client.post("/v1/projects", json={"name": "Shared"}, headers=_as_user(ALICE))
+    ).json()
+    shared = await client.post(
+        f"/v1/projects/{project['id']}/shares", json={"user_id": BOB}, headers=_as_user(ALICE)
+    )
+    assert shared.status_code == 200, shared.text
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await client.post(base, json={"title": "From Bob"}, headers=_as_user(BOB))).json()
+    assert ticket["requested_by"] == BOB
+    sha = "b" * 40
+    for key in ("approved", "risk-ok", "owner-ok"):
+        refused = await client.patch(
+            f"{base}/{ticket['id']}",
+            json={"labels": [{"key": key, "value": sha}]},
+            headers=_as_user(BOB),
+        )
+        assert refused.status_code == 403, refused.text
+    owner = await client.patch(
+        f"{base}/{ticket['id']}",
+        json={"labels": [{"key": "owner-ok", "value": sha}]},
+        headers=_as_user(ALICE),
+    )
+    assert owner.status_code == 200, owner.text
+
+    url = "https://github.com/example-org/example-repo/pull/42"
+    record = {
+        "number": 42,
+        "html_url": url,
+        "title": "Fix the widget",
+        "user": {"login": "octocat"},
+        "base": {"ref": "main"},
+        "head": {"ref": "widget", "sha": "a" * 40},
+    }
+    imported = await client.post(
+        f"{base}/import-pr", json={"url": url, "record": record}, headers=_as_user(BOB)
+    )
+    assert imported.status_code == 201, imported.text
+    assert imported.json()["requested_by"] == "github:octocat" and imported.json()["imported"]
+    again = await client.post(
+        f"{base}/import-pr", json={"url": url, "record": record}, headers=_as_user(ALICE)
+    )
+    assert again.json()["id"] == imported.json()["id"] and again.json()["imported"] is False
+    outputs = (
+        await client.get(
+            f"{base}/{imported.json()['id']}/events",
+            params={"kind": "output"},
+            headers=_as_user(ALICE),
+        )
+    ).json()["data"]
+    assert [event["payload"]["url"] for event in outputs] == [url]

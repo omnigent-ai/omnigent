@@ -40,6 +40,7 @@ import {
   createTicket,
   getProjectFile,
   openProjectFile,
+  requesterLabel,
   ticketOutputs,
   ticketEventStage,
   type ProjectTicket,
@@ -48,6 +49,7 @@ import {
   type TicketOutput,
   type TicketLabel,
 } from "@/lib/projectTicketsApi";
+import { getCurrentUserId } from "@/lib/identity";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
@@ -477,6 +479,11 @@ function TicketDetails({
                 />
               </div>
               <TicketError error={configuration.error} />
+              {ticket.requested_by && (
+                <p className="text-sm text-muted-foreground" data-testid="ticket-panel-requester">
+                  Requested by {requesterLabel(ticket.requested_by, getCurrentUserId())}
+                </p>
+              )}
               <TicketAgents projectId={projectId} projectName={projectName} ticket={ticket} />
               <TicketCostSection projectId={projectId} ticketId={ticketId} />
               <section aria-label="Description" className="space-y-2">

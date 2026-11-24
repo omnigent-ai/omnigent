@@ -77,6 +77,8 @@ export interface ProjectTicket {
   agents_has_more?: boolean;
   latest_update: string;
   comment_count: number;
+  /** Who asked for the work: a user ID, or `github:<login>` for an imported PR. */
+  requested_by?: string | null;
   created_at: number;
   updated_at: number;
   /** The viewer's last-seen activity position; null when never opened. Absent for agents. */
@@ -418,4 +420,14 @@ export async function openProjectFile(contentPath: string, filename: string): Pr
     anchor.click();
   }
   setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+}
+
+/** A ticket requester for display: GitHub authors as `@login (GitHub PR)`, the viewer as "you". */
+export function requesterLabel(
+  requestedBy: string | null | undefined,
+  viewer: string | null,
+): string | null {
+  if (!requestedBy) return null;
+  if (requestedBy.startsWith("github:")) return `@${requestedBy.slice(7)} (GitHub PR)`;
+  return requestedBy === viewer ? "you" : requestedBy;
 }

@@ -15,6 +15,7 @@ from typing import Any
 
 from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.github_pr_intake import OWNER_OK_LABEL, is_outside_requester
 from omnigent.server.persona_mentions import Mention
 
 # The Review stage's id; this project's "Implemented" stage already uses ``review``.
@@ -131,8 +132,18 @@ def reviewer_handoff_message(
     worker = f"session `{worker_session_id}`" if worker_session_id else "the project owner"
     handoff = _quote(move_comment) if move_comment else "> (no handoff comment)"
     description = _quote(ticket.get("description") or "")
+    requester = ticket.get("requested_by")
+    outside = (
+        f"This change comes from an outside pull request by `{requester}`. Read the whole diff "
+        "from its merge base, including CI, git-hook, build and script changes, before anyone "
+        "runs it; say in your findings when it is safe to run. It lands only after your "
+        f"approval plus the owner's `{OWNER_OK_LABEL}` for the same SHA.\n\n"
+        if is_outside_requester(requester)
+        else ""
+    )
     return (
         f'Review requested on ticket "{ticket["title"]}" (`{ticket["id"]}`) by {worker}.\n\n'
+        f"{outside}"
         f"Handoff (branch, SHA, base and tests):\n{handoff}\n\n"
         f"Done-when and context, from the description:\n{description}\n\n"
         "Review it under your persona's rules. Post findings as one ticket comment, each "
