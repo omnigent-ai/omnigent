@@ -258,6 +258,19 @@ def test_text_that_compresses_well_is_still_bounded_so_it_stays_readable(limit: 
         column.process_bind_param("x" * (limit + 1), sqlite.dialect())
 
 
+def test_a_text_bound_above_the_column_admits_compressible_text() -> None:
+    column = EnvelopedText(2_000, max_text_bytes=8_000)
+
+    stored = column.process_bind_param("x" * 8_000, sqlite.dialect())
+    assert stored is not None and len(stored) <= 2_000
+    assert column.process_result_value(stored, sqlite.dialect()) == "x" * 8_000
+    with pytest.raises(ValueError, match="text exceeds 8000"):
+        column.process_bind_param("x" * 8_001, sqlite.dialect())
+    noise = "".join(random.Random(2).choices(string.printable, k=4_000))
+    with pytest.raises(ValueError, match="stored value exceeds 2000"):
+        column.process_bind_param(noise, sqlite.dialect())
+
+
 def test_text_none_round_trips_as_null() -> None:
     column = EnvelopedText(100)
 

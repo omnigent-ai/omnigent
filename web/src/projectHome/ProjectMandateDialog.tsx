@@ -15,6 +15,7 @@ import {
   acceptMandateProposal,
   dismissMandateProposal,
   getProject,
+  PROJECT_MANDATE_LARGE_BYTES,
   PROJECT_MANDATE_MAX_BYTES,
   updateProjectMandate,
   type MandateProposal,
@@ -95,6 +96,7 @@ export function ProjectMandateDialog({
   const busy = save.isPending || resolve.isPending;
   const bytes = draft === null ? 0 : mandateBytes(draft);
   const tooLarge = bytes > PROJECT_MANDATE_MAX_BYTES;
+  const large = !tooLarge && bytes > PROJECT_MANDATE_LARGE_BYTES;
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
     if (draft !== null && !tooLarge) save.mutate(draft);
@@ -178,6 +180,8 @@ export function ProjectMandateDialog({
               data-testid="project-mandate-size"
             >
               {bytes.toLocaleString()} / {PROJECT_MANDATE_MAX_BYTES.toLocaleString()} bytes
+              {large &&
+                ` · Every session in this project loads the mandate, about ${Math.round(bytes / 4).toLocaleString()} tokens each. Consider trimming it.`}
             </p>
             <TicketError error={save.error} />
             <DialogFooter className="border-t-0 bg-transparent">

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode, encode
+from omnigent.db.envelope import seal_text
 from omnigent.db.db_models import (
     SqlPreference,
     SqlProject,
@@ -40,6 +41,7 @@ from omnigent.entities.project import (
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
     PROJECT_IDENTITY_MAX_COUNT,
     PROJECT_MANDATE_MAX_BYTES,
+    PROJECT_MANDATE_MAX_STORED_BYTES,
     MandateProposal,
     ProjectIdentity,
     ProjectShare,
@@ -159,13 +161,23 @@ def _normalize_mandate(mandate: str) -> str | None:
     :param mandate: Owner-written markdown, e.g. ``"Only touch the docs/ tree."``.
     :returns: The trimmed text, or ``None`` when it is blank.
     :raises OmnigentError: ``INVALID_INPUT`` if it exceeds
-        :data:`PROJECT_MANDATE_MAX_BYTES` UTF-8 bytes.
+        :data:`PROJECT_MANDATE_MAX_BYTES` UTF-8 bytes, or compresses to more
+        than the column holds.
     """
     trimmed = mandate.strip()
     size = len(trimmed.encode("utf-8"))
     if size > PROJECT_MANDATE_MAX_BYTES:
         raise OmnigentError(
             f"project mandate too large ({size} bytes; max {PROJECT_MANDATE_MAX_BYTES})",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Only text above the column's size can compress past it; check the real envelope.
+    if size > PROJECT_MANDATE_MAX_STORED_BYTES and (
+        len(seal_text(trimmed)) > PROJECT_MANDATE_MAX_STORED_BYTES
+    ):
+        raise OmnigentError(
+            f"project mandate too large to store ({size} bytes compress to more than "
+            f"{PROJECT_MANDATE_MAX_STORED_BYTES}); shorten it",
             code=ErrorCode.INVALID_INPUT,
         )
     return trimmed or None

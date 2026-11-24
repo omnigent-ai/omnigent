@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
+import string
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -320,6 +322,12 @@ async def test_mandate_size_is_bounded(project_client: httpx.AsyncClient) -> Non
     too_large = await project_client.patch(path, json={"mandate": fits + "é"})
     assert too_large.status_code == 400
     assert "project mandate too large" in too_large.text
+    assert (await project_client.get(path)).json()["mandate"] == fits
+    # Within the byte limit but too random to compress into the stored column.
+    noise = "".join(random.Random(3).choices(string.ascii_letters, k=PROJECT_MANDATE_MAX_BYTES))
+    refused = await project_client.patch(path, json={"mandate": noise})
+    assert refused.status_code == 400
+    assert "too large to store" in refused.text
     assert (await project_client.get(path)).json()["mandate"] == fits
 
 

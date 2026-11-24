@@ -81,8 +81,11 @@ class MandateProposal:
 
 
 # Most UTF-8 bytes a project mandate may hold. It is added to every project
-# session's instructions, so it stays well inside the stored column's bound.
-PROJECT_MANDATE_MAX_BYTES = 12_000
+# session's instructions (about 8k tokens at this size). The stored column is
+# compressed, so the text may exceed it; the compressed envelope must still fit.
+PROJECT_MANDATE_MAX_BYTES = 32_000
+# Most bytes of the mandate's stored (compressed, possibly encrypted) envelope.
+PROJECT_MANDATE_MAX_STORED_BYTES = 16_383
 # Most UTF-8 bytes in one proposed addition, and how many may wait for review.
 MANDATE_PROPOSAL_MAX_BYTES = 2_000
 MANDATE_PROPOSALS_MAX_PENDING = 5

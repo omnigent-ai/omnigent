@@ -200,26 +200,29 @@ class EnvelopedText(BoundedBinary):
     and reads decompress at most that much, so every value written can be read
     back and a corrupt frame cannot allocate past the column's size.
 
-    :param max_stored_bytes: Most bytes the envelope may take, and most UTF-8
-        bytes of text, e.g. ``16_383``. A larger value raises ``ValueError`` on
-        write.
+    :param max_stored_bytes: Most bytes the envelope may take, e.g. ``16_383``.
+        A larger value raises ``ValueError`` on write.
+    :param max_text_bytes: Most UTF-8 bytes of text, written or read back.
+        Defaults to *max_stored_bytes*; a larger bound lets compressible text
+        exceed the column, e.g. ``32_000`` in a ``16_383``-byte column.
     """
 
     cache_ok = True
 
-    def __init__(self, max_stored_bytes: int) -> None:
+    def __init__(self, max_stored_bytes: int, *, max_text_bytes: int | None = None) -> None:
         super().__init__(max_stored_bytes)
-        # See EnvelopedJSON: the type cache key reads this argument by name.
+        # See EnvelopedJSON: the type cache key reads these arguments by name.
         self.max_stored_bytes = max_stored_bytes
+        self.max_text_bytes = max_stored_bytes if max_text_bytes is None else max_text_bytes
 
     def process_bind_param(self, value: Any, dialect: Dialect) -> bytes | None:
         if value is None:
             return None
         # Text that compresses well could fit the column yet be refused on read.
-        if len(value.encode("utf-8")) > self.max_stored_bytes:
-            raise ValueError(f"text exceeds {self.max_stored_bytes} bytes")
+        if len(value.encode("utf-8")) > self.max_text_bytes:
+            raise ValueError(f"text exceeds {self.max_text_bytes} bytes")
         return super().process_bind_param(seal_text(value), dialect)
 
     def process_result_value(self, value: bytes | memoryview | None, dialect: Dialect) -> Any:
         del dialect
-        return None if value is None else open_text(value, max_decoded_bytes=self.max_stored_bytes)
+        return None if value is None else open_text(value, max_decoded_bytes=self.max_text_bytes)

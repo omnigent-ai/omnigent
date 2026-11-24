@@ -153,7 +153,9 @@ export interface MandateProposal {
 }
 
 /** Most UTF-8 bytes a mandate may hold; mirrors `PROJECT_MANDATE_MAX_BYTES` on the server. */
-export const PROJECT_MANDATE_MAX_BYTES = 12_000;
+export const PROJECT_MANDATE_MAX_BYTES = 32_000;
+/** Above this size the mandate dialog notes that every project session pays for it. */
+export const PROJECT_MANDATE_LARGE_BYTES = 16_000;
 
 interface ProjectListResponse {
   object: "list";

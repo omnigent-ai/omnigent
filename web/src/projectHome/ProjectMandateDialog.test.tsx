@@ -88,11 +88,17 @@ describe("Project mandate editor", () => {
   it("counts trimmed UTF-8 bytes and blocks an oversized save", async () => {
     renderDialog();
     const input = await screen.findByLabelText("Project mandate");
-    fireEvent.change(input, { target: { value: `  ${"é".repeat(6_000)}  ` } });
-    expect(screen.getByTestId("project-mandate-size")).toHaveTextContent("12,000 / 12,000 bytes");
+    const size = screen.getByTestId("project-mandate-size");
+    fireEvent.change(input, { target: { value: `  ${"é".repeat(8_000)}  ` } });
+    expect(size).toHaveTextContent(/^16,000 \/ 32,000 bytes$/);
+    fireEvent.change(input, { target: { value: "é".repeat(16_000) } });
+    expect(size).toHaveTextContent(
+      "32,000 / 32,000 bytes · Every session in this project loads the mandate, about 8,000 tokens each.",
+    );
     expect(screen.getByTestId("project-mandate-save")).toBeEnabled();
-    fireEvent.change(input, { target: { value: "é".repeat(6_001) } });
+    fireEvent.change(input, { target: { value: "é".repeat(16_001) } });
     expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(size).not.toHaveTextContent("tokens");
     expect(screen.getByTestId("project-mandate-save")).toBeDisabled();
   });
 
