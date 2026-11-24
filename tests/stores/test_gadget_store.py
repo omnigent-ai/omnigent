@@ -408,6 +408,44 @@ def test_emptied_segments_and_markers_a_deletion_left_dont_count_as_owned(
     assert store.owns_any(ALICE) is True
 
 
+def test_two_stores_on_one_directory_never_lose_each_others_owner_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Store B retires an emptied segment while store A, another process on the same
+    # directory, starts a new segment for a create: B must not write back the head it read.
+    monkeypatch.setattr(local_module, "_OWNER_SEGMENT_SIZE", 1)
+    store_a = LocalGadgetStore(str(tmp_path / "gadgets"))
+    store_b = LocalGadgetStore(str(tmp_path / "gadgets"))
+    first = store_a.create(ALICE, "First").id
+    kept = store_a.create(ALICE, "Kept").id
+    # A deletion that stopped after removing the gadget and its marker left s00000000 empty.
+    (owner_dir,) = (tmp_path / "gadgets" / "owners").iterdir()
+    (owner_dir / "s00000000" / first).unlink()
+    shutil.rmtree(tmp_path / "gadgets" / "gadgets" / first)
+    real_write_head = LocalGadgetStore._write_head
+    created: list[str] = []
+    workers: list[threading.Thread] = []
+
+    def write_head(self: LocalGadgetStore, owner_dir: Path, first_n: int, last_n: int) -> None:
+        if self is store_b and not workers:
+            # A's create starts while B holds the head it is about to rewrite, and gets as far
+            # as it can before B writes.
+            worker = threading.Thread(
+                target=lambda: created.append(store_a.create(ALICE, "Racing").id)
+            )
+            workers.append(worker)
+            worker.start()
+            worker.join(timeout=0.5)
+        real_write_head(self, owner_dir, first_n, last_n)
+
+    monkeypatch.setattr(LocalGadgetStore, "_write_head", write_head)
+    store_b.list_owned_page(ALICE, limit=10)
+    workers[0].join(timeout=10)
+    assert created
+    seen = [gadget_id for page in _owned_pages(store_a, ALICE, limit=10) for gadget_id in page]
+    assert sorted(seen) == sorted([kept, *created])
+
+
 def test_an_owner_registration_is_its_own_account(store: LocalGadgetStore) -> None:
     old = store.create(ALICE, "Old", owner_registration="g1")
     store.user_files(ALICE, owner_registration="g1").mkdirs("shelf")

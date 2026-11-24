@@ -9,13 +9,16 @@ Layout under ``storage_location`` (by default ``<data_dir>/gadgets``)::
     users/<user key>/...             # one user's GadgetFiles scope (their shelf)
     .tmp/                            # staging for atomic writes; never listed
     .trash/                          # deleted scopes being removed; emptied on start
+    .locks/<owner key>.lock          # held while one process changes an owner's head
 
 Owner and user keys are SHA-256 prefixes of the user ID and, for an account with a
 registration, that registration, so any ID is a safe directory name and a username
 registered again starts with nothing. Owner markers fill numbered segments of about
 :data:`_OWNER_SEGMENT_SIZE` in creation order (the gadget's metadata names its
 segment), and ``head.json`` names the first and newest segments, so a page of a user's
-gadgets reads at most two segments, however many gadgets the user has. Reading a page
+gadgets reads at most two segments, however many gadgets the user has. Every change of a
+head happens under that owner's lock file, so processes sharing the directory never undo
+each other's. Reading a page
 repairs the index: a marker whose gadget is gone is removed, and so is an emptied
 segment before the newest.
 
@@ -37,7 +40,10 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
+
+from filelock import FileLock
 
 from omnigent.stores.gadget_store import (
     GADGET_ID_PATTERN,
@@ -258,7 +264,7 @@ class LocalGadgetStore(GadgetStore):
         # Renames read and rewrite the metadata file, and a deletion moves it away;
         # serialize them in this process.
         self._metadata_lock = threading.Lock()
-        # Picks an owner segment with room; another process can overfill one slightly.
+        # With the owner's lock file, serializes changes to an owner's head (_owner_index).
         self._owner_lock = threading.Lock()
         self._sweep()
 
@@ -358,6 +364,15 @@ class LocalGadgetStore(GadgetStore):
             raise CorruptData("Invalid gadget owner index")
         return first, last
 
+    @contextlib.contextmanager
+    def _owner_index(self, owner_dir: Path) -> Iterator[None]:
+        """Hold *owner_dir*'s head for a read-modify-write, in this process and across others
+        sharing the directory."""
+        locks = self._root / ".locks"
+        locks.mkdir(exist_ok=True)
+        with self._owner_lock, FileLock(str(locks / f"{owner_dir.name}.lock"), timeout=30):
+            yield
+
     def _write_head(self, owner_dir: Path, first: int, last: int) -> None:
         owner_dir.mkdir(parents=True, exist_ok=True)
         _replace_file(self._tmp_dir, owner_dir / _OWNER_HEAD, {"first": first, "last": last})
@@ -385,7 +400,7 @@ class LocalGadgetStore(GadgetStore):
             owner_registration=owner_registration,
         )
         owner_dir = self._owner_dir(owner_id, owner_registration)
-        with self._owner_lock:
+        with self._owner_index(owner_dir):
             segment = self._segment_with_room(owner_dir)
             (owner_dir / segment).mkdir(parents=True, exist_ok=True)
             directory = self._gadget_dir(gadget.id)
@@ -401,7 +416,7 @@ class LocalGadgetStore(GadgetStore):
 
     def _drop_empty_segment(self, owner_dir: Path, segment: str) -> None:
         """Remove an emptied segment before the newest, moving the first one on past it."""
-        with self._owner_lock:
+        with self._owner_index(owner_dir):
             first, last = self._read_head(owner_dir)
             number = int(segment[1:])
             if number >= last:
