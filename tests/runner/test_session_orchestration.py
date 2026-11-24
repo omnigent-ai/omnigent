@@ -1377,18 +1377,22 @@ async def test_explicit_host_create_preserves_worktree_and_project(
             )
         )
     posts = [r for r in requests if r.method == "POST"]
-    if supported is not True:
+    # Only explicit host placement needs scripted sessions; project_id works like project_name.
+    if supported is not True and placement == "host":
         assert "unavailable" in result["error"]
         assert not posts
         return
     body = json.loads(posts[0].content)
-    assert posts[0].url.path == "/v1/sessions/orchestrated/host"
-    assert body["host_id"] == destination
-    assert body["workspace"] == "/repos/example"
-    assert body["git"] == {"branch_name": "review", "base_branch": "main"}
     assert body["project_id"] == _PROJECT_ID
     assert "parent_session_id" not in body
-    assert posts[0].extensions["omnigent_host_id"] == destination
+    if placement == "same_host":
+        assert posts[0].url.path == "/v1/sessions/orchestrated"
+    else:
+        assert posts[0].url.path == "/v1/sessions/orchestrated/host"
+        assert body["host_id"] == destination
+        assert body["workspace"] == "/repos/example"
+        assert body["git"] == {"branch_name": "review", "base_branch": "main"}
+        assert posts[0].extensions["omnigent_host_id"] == destination
     assert posts[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
     assert result["conversation_id"] == session
     assert result["initial_message"]["queued"] is True

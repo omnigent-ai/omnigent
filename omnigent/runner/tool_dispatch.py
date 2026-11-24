@@ -4005,9 +4005,7 @@ async def _execute_session_create(
                         f"{server_max_chars} characters; no session was created"
                     }
                 )
-        if (placement == "host" or args.get("project_id") is not None) and info_data.get(
-            "scripted_sessions"
-        ) is not True:
+        if placement == "host" and info_data.get("scripted_sessions") is not True:
             return json.dumps(
                 {
                     "error": "Scripted session options are unavailable on this server; "
