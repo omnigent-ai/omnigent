@@ -1865,13 +1865,20 @@ function slackThreadRepliesStep(shared: boolean, messageMaxChars: number): strin
   // An earlier run can deliver a message and stop before its reply records the thread.
   const added = shared
     ? "each message this run sent to your task session, or that you found an earlier run sent there without recording it, with session set to the task session it went to"
-    : "each message this run started a session for with its task delivered, or that you found an earlier run started one for without recording it in its reply, with session set to that session's conversation_id";
+    : "each message this run started a session for with its task delivered, or that you found an earlier run started one for without recording it in its reply once that session's history (sys_session_get_history) shows your task message, with session set to that session's conversation_id";
+  // A session found by title may exist without its task, so it isn't followed until confirmed.
+  const unconfirmed = shared
+    ? []
+    : [
+        `If such an earlier session's history doesn't show your task message, list it as "<title> <conversation_id>" on a "${DELIVERY_PENDING}" line instead, so its thread is followed once the task is confirmed, and never resend the task.`,
+      ];
   const intro = shared
     ? `then a sentence saying that this is the task session of a Slack automation and that someone replied in the thread of a Slack message it was sent earlier, titled "Slack <channel> <thread ts>", then the instructions below, then says to handle the replies as part of that message's work`
     : "then says that someone replied in the thread of the Slack message that session is handling, and to handle the replies as part of that work, following the instructions it already has";
   return [
     `Then send new replies in the threads you follow to their sessions. The reply you read your check time from, when it has a "${SLACK_THREADS}" line, lists those threads as one-line JSON: each key is "<channel ID> <thread ts>", where the thread ts is the ts of the message that started the thread, and each value has session, the conversation_id of the session that message went to, and through, the ts of the newest message in the thread you have already read.`,
     `Add the thread of ${added} and through set to the message's own ts, and likewise for each pending delivery of a message that you confirmed above; a thread you already follow keeps its through.`,
+    ...unconfirmed,
     `Follow at most the ${MAX_FOLLOWED_SLACK_THREADS} with the newest through.`,
     "For each thread you follow, read the replies posted in it after its through and by the time you noted, for example with conversations.replies with the channel ID, ts set to the thread ts, oldest set to its through, latest set to the time you noted as a Unix timestamp, inclusive false, limit 200 and caching off, following the cursor while has_more is true; if your Slack tool takes an analysis_prompt, pass the same one as for history reads. If a read fails or you can't read every page of a thread, keep its through and send nothing for it in this run, so the next run reads it again.",
     `Leave out the message that started the thread, replies posted after the time you noted (the next run reads them), messages with a system subtype, posts that end with a "${OMNIGENT_ATTRIBUTION}" line, which Omnigent sessions add to what they post, and posts by bots. A reply with a bot_id and no user is a bot's. A person can post through an app, so a reply with a bot_id and a user is a bot's only when that user is a bot: check each such user with users.info (if your Slack tool takes an analysis_prompt, ask only for is_bot), and leave the reply out only when is_bot is true. If a lookup fails, keep that thread's through and send nothing for it in this run, so the next run checks again. The conditions above apply only to the message that starts a thread, so every other reply counts. When a reply has no permalink, build it as for a message, followed by ?thread_ts=<thread ts>&cid=<channel ID>.`,

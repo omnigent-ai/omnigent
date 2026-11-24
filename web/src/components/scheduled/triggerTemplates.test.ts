@@ -844,9 +844,14 @@ describe("Slack thread replies", () => {
     expect(prompt).toContain(
       `The reply you read your check time from, when it has a "Slack threads:" line, lists those threads as one-line JSON: each key is "<channel ID> <thread ts>"`,
     );
-    // A session an earlier run started without recording it still gets its thread followed.
+    // A session an earlier run started without recording it still gets its thread followed, but
+    // only once its history shows the task: it can exist without one, and follow-ups would reach
+    // a session that never got its instructions.
     expect(prompt).toContain(
-      "Add the thread of each message this run started a session for with its task delivered, or that you found an earlier run started one for without recording it in its reply, with session set to that session's conversation_id and through set to the message's own ts",
+      "Add the thread of each message this run started a session for with its task delivered, or that you found an earlier run started one for without recording it in its reply once that session's history (sys_session_get_history) shows your task message, with session set to that session's conversation_id and through set to the message's own ts",
+    );
+    expect(prompt).toContain(
+      'If such an earlier session\'s history doesn\'t show your task message, list it as "<title> <conversation_id>" on a "Delivery pending:" line instead, so its thread is followed once the task is confirmed, and never resend the task.',
     );
     // Re-adding a followed thread mustn't rewind it and send its replies again.
     expect(prompt).toContain("a thread you already follow keeps its through.");
@@ -921,9 +926,14 @@ describe("Slack thread replies", () => {
     expect(prompt.indexOf(recover)).toBeLessThan(
       prompt.indexOf("For each thread with replies left, send its session one message"),
     );
-    // Pending entries name top-level messages; a thread send there would be read back as one.
-    const threadStep = prompt.split("\n").find((line) => line.includes("Then send new replies"));
-    expect(threadStep).not.toContain("Delivery pending:");
+    // Pending entries name top-level messages; a thread send there would be read back as one, so
+    // the step uses the line only for an unconfirmed top-level task.
+    const threadStep =
+      prompt.split("\n").find((line) => line.includes("Then send new replies")) ?? "";
+    expect(threadStep.split('"Delivery pending:"').length - 1).toBe(1);
+    expect(threadStep).toContain(
+      'list it as "<title> <conversation_id>" on a "Delivery pending:" line instead, so its thread is followed once the task is confirmed',
+    );
     expect(prompt).toContain("stop following that thread and say so in your reply");
     expect(prompt).toContain(
       "Stopping means starting no more sessions in this run; still send new thread replies and write your reply.",
@@ -936,9 +946,13 @@ describe("Slack thread replies", () => {
 
   it("sends a task session's thread replies there with its instructions", () => {
     const prompt = renderTriggerPrompt("slack", channel(), { ...CTX, taskSessionMode: "continue" });
-    // A delivery an earlier run made without recording it still gets its thread followed.
+    // A delivery an earlier run made without recording it still gets its thread followed. It was
+    // found in the task session's history, so it needs no separate task confirmation.
     expect(prompt).toContain(
       "Add the thread of each message this run sent to your task session, or that you found an earlier run sent there without recording it, with session set to the task session it went to",
+    );
+    expect(prompt).not.toContain(
+      "If such an earlier session's history doesn't show your task message",
     );
     expect(prompt).toContain(
       'a sentence saying that this is the task session of a Slack automation and that someone replied in the thread of a Slack message it was sent earlier, titled "Slack <channel> <thread ts>", then the instructions below',
