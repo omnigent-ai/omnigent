@@ -373,6 +373,10 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
         ("sys_ticket_list", {}),
         ("sys_ticket_get", {"ticket_id": TICKET}),
         ("sys_project_identity_list", {}),
+        (
+            "sys_project_file_view",
+            {"url": f"/v1/projects/{PROJECT}/ticket-attachments/{TICKET}/content"},
+        ),
     ],
 )
 async def test_read_only_tools_only_send_gets(name, args):
@@ -381,6 +385,7 @@ async def test_read_only_tools_only_send_gets(name, args):
         "sys_ticket_list",
         "sys_ticket_get",
         "sys_project_identity_list",
+        "sys_project_file_view",
     )
     methods = []
 
@@ -399,7 +404,7 @@ async def test_read_only_tools_only_send_gets(name, args):
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 16
+    assert len(TICKET_TOOLS) == 17
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (
@@ -676,3 +681,96 @@ async def test_failed_startup_is_reported_and_a_retry_resumes_the_archived_sessi
     assert resumed["previous_state"] == "archived"
     assert resumed["session_id"] == "f" * 32
     assert team.inserts == 0
+
+
+def _png_bytes() -> bytes:
+    import io
+
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", (8, 8), (200, 0, 100)).save(out, format="PNG")
+    return out.getvalue()
+
+
+def _file_view_client(content: bytes, content_type: str, seen: list):
+    def handler(request):
+        seen.append(
+            (request.method, request.url.path, request.headers.get(ORCHESTRATION_SOURCE_HEADER))
+        )
+        if request.url.path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        return httpx.Response(200, content=content, headers={"content-type": content_type})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"/v1/projects/{PROJECT}/ticket-attachments/{TICKET}/content",
+        f"http://127.0.0.1:6768/v1/projects/{PROJECT}/ticket-attachments/{TICKET}/content",
+    ],
+)
+async def test_file_view_returns_a_ticket_screenshot_as_an_image(url):
+    from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+
+    seen: list = []
+    async with _file_view_client(_png_bytes(), "image/png", seen) as client:
+        output = await execute_ticket_tool("sys_project_file_view", {"url": url}, client, SOURCE)
+    result = decode_mcp_image_result(json.loads(output))
+    assert result is not None
+    assert [block["type"] for block in result.content] == ["text", "image"]
+    assert result.content[1]["mimeType"] == "image/png"
+    assert seen[-1] == (
+        "GET",
+        f"/v1/projects/{PROJECT}/ticket-attachments/{TICKET}/content",
+        SOURCE,
+    )
+
+
+async def test_file_view_refuses_another_projects_file_without_fetching_it():
+    seen: list = []
+    other = "d" * 32
+    async with _file_view_client(b"", "image/png", seen) as client:
+        output = await execute_ticket_tool(
+            "sys_project_file_view",
+            {"url": f"/v1/projects/{other}/files/{TICKET}/content"},
+            client,
+            SOURCE,
+        )
+    assert json.loads(output) == {"error": "That file belongs to another project"}
+    assert [path for _, path, _ in seen] == [f"/v1/sessions/{SOURCE}"]
+
+
+async def test_file_view_reads_text_and_saves_into_the_workspace(tmp_path):
+    seen: list = []
+    async with _file_view_client(b"INFO ok\n", "text/plain; charset=utf-8", seen) as client:
+        output = await execute_ticket_tool(
+            "sys_project_file_view",
+            {"url": f"/v1/projects/{PROJECT}/files/{TICKET}/content", "save_path": "out/run.log"},
+            client,
+            SOURCE,
+            tmp_path,
+        )
+    result = json.loads(output)
+    assert result["text"] == "INFO ok\n"
+    assert (tmp_path / "out" / "run.log").read_bytes() == b"INFO ok\n"
+
+
+async def test_file_view_rejects_other_paths_and_workspace_escapes(tmp_path):
+    seen: list = []
+    async with _file_view_client(b"x", "text/plain", seen) as client:
+        bad_path = await execute_ticket_tool(
+            "sys_project_file_view", {"url": "/v1/sessions/x/files/y/content"}, client, SOURCE
+        )
+        escape = await execute_ticket_tool(
+            "sys_project_file_view",
+            {"url": f"/v1/projects/{PROJECT}/files/{TICKET}/content", "save_path": "../x"},
+            client,
+            SOURCE,
+            tmp_path,
+        )
+    assert "Not a project file path" in json.loads(bad_path)["error"]
+    assert "error" in json.loads(escape)
+    assert all(path == f"/v1/sessions/{SOURCE}" for _, path, _ in seen)

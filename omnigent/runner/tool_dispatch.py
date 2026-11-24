@@ -8335,7 +8335,10 @@ async def execute_tool(
             from omnigent.runner.project_tickets import execute_ticket_tool
 
             ticket_workspace = None
-            if tool_name == "sys_project_artifact_save" and conversation_id is not None:
+            if conversation_id is not None and (
+                tool_name == "sys_project_artifact_save"
+                or (tool_name == "sys_project_file_view" and args.get("save_path"))
+            ):
                 os_spec = _effective_runner_os_env_spec(
                     agent_spec, conversation_id, runner_workspace
                 )

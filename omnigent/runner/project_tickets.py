@@ -1,14 +1,17 @@
 """Run ticket tools through the same project-private APIs as the web board."""
 
 import asyncio
+import base64
 import json
 import mimetypes
+import re
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools.builtins.project_tickets import TICKET_TOOLS
 from omnigent.tools.builtins.upload_file import safe_resolve
 from omnigent.util.uuid import uuid_to_bytes
@@ -60,6 +63,8 @@ async def execute_ticket_tool(
             return await _save_artifact(
                 body, ticket_id, project_id, workspace, request, client, source_id
             )
+        if name == "sys_project_file_view":
+            return await _view_project_file(body, project_id, workspace, client, source_id)
         if name == "sys_project_mandate_propose":
             created = await request(
                 "POST", f"/v1/projects/{project_id}/mandate/proposals", json=body
@@ -366,3 +371,90 @@ async def _save_artifact(
             json={"text": text, "outputs": [{"type": "artifact", "url": artifact["url"]}]},
         )
     return json.dumps(result, ensure_ascii=False)
+
+
+# Project file content paths agents meet in ticket text and outputs.
+_PROJECT_FILE_PATH = re.compile(
+    r"^(?:https?://[^/]+)?(?:/[^?#]*?)?/v1/projects/([^/?#]+)/(ticket-attachments|files)/"
+    r"([^/?#]+)/content/?(?:[?#].*)?$"
+)
+# Text a viewer can read inline without flooding the context.
+_MAX_TEXT_CHARS = 50_000
+_TEXT_TYPES = frozenset({"application/json", "application/xml", "text/markdown", "text/csv"})
+
+
+async def _view_project_file(
+    body: dict[str, Any],
+    project_id: str,
+    workspace: Path | None,
+    client: httpx.AsyncClient,
+    source_id: str,
+) -> str:
+    """Read a ticket attachment or project file of the session's own project.
+
+    The read goes through the runner's server client, so the server applies the
+    same project access check as the board; a path naming another project is
+    refused before any request.
+    """
+    match = _PROJECT_FILE_PATH.match(body["url"].strip())
+    if match is None:
+        return json.dumps(
+            {
+                "error": "Not a project file path. Expected /v1/projects/<project>/"
+                "ticket-attachments/<id>/content or /v1/projects/<project>/files/<id>/content."
+            }
+        )
+    raw_project, kind, raw_file = match.groups()
+    try:
+        if uuid_to_bytes(raw_project).hex() != project_id:
+            return json.dumps({"error": "That file belongs to another project"})
+        file_id = uuid_to_bytes(raw_file).hex()
+    except ValueError:
+        return json.dumps({"error": "Not a project file path"})
+    save_target: Path | None = None
+    if body.get("save_path"):
+        if workspace is None:
+            return json.dumps({"error": "save_path needs a session workspace"})
+        save_target = safe_resolve(body["save_path"], workspace)
+    response = await client.get(
+        f"/v1/projects/{project_id}/{kind}/{file_id}/content",
+        headers={ORCHESTRATION_SOURCE_HEADER: source_id},
+        timeout=60.0,
+    )
+    if response.status_code == 404:
+        return json.dumps({"error": "File not found in this project"})
+    response.raise_for_status()
+    content = response.content
+    content_type = (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    metadata: dict[str, Any] = {
+        "url": f"/v1/projects/{project_id}/{kind}/{file_id}/content",
+        "content_type": content_type or None,
+        "bytes": len(content),
+    }
+    if save_target is not None:
+        try:
+            await asyncio.to_thread(save_target.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(save_target.write_bytes, content)
+            metadata["saved_path"] = str(save_target)
+        except OSError as exc:
+            metadata["save_error"] = f"Couldn't save the file: {exc}"
+    if content_type.startswith("image/"):
+        image = native_image_payload(base64.b64encode(content).decode("ascii"), content_type)
+        if image is not None:
+            return encode_mcp_image_result(
+                [
+                    {"type": "text", "text": json.dumps(metadata)},
+                    {"type": "image", "mimeType": content_type, "data": image},
+                ],
+                is_error=False,
+            )
+        metadata["note"] = (
+            "The image couldn't be decoded for viewing; use save_path to inspect it."
+        )
+    elif content_type.startswith("text/") or content_type in _TEXT_TYPES:
+        text = content.decode("utf-8", errors="replace")
+        metadata["truncated"] = len(text) > _MAX_TEXT_CHARS
+        metadata["text"] = text[:_MAX_TEXT_CHARS]
+    elif save_target is None:
+        metadata["note"] = "Binary file; pass save_path to write it into your workspace."
+    return json.dumps(metadata, ensure_ascii=False)

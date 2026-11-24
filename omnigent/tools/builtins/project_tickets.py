@@ -463,6 +463,38 @@ class SysProjectArtifactSaveTool(_TicketTool):
     arguments = SaveProjectArtifact
 
 
+class ViewProjectFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+        description=(
+            "The file's content path as it appears in a ticket's description, comments or "
+            "outputs: /v1/projects/<project>/ticket-attachments/<id>/content or "
+            "/v1/projects/<project>/files/<id>/content. A full URL with that path also works."
+        ),
+    )
+    save_path: str | None = Field(
+        default=None,
+        max_length=4096,
+        description="Optional workspace-relative path to also write the file to, e.g. 'bug.png'.",
+    )
+
+
+class SysProjectFileViewTool(_TicketTool):
+    tool_name = "sys_project_file_view"
+    read_only = True
+    help_text = (
+        "Open an image or other file attached to this project's tickets: a screenshot pasted "
+        "into a ticket's description or comments (/v1/projects/<project>/ticket-attachments/"
+        "<id>/content) or a project file (/v1/projects/<project>/files/<id>/content). Images "
+        "come back for you to see, text files as text. Use it instead of fetching those paths "
+        "over HTTP, which has no credentials in your environment. Pass save_path to also "
+        "write the file into your workspace, e.g. to open a video or archive with other tools."
+    )
+    arguments = ViewProjectFile
+
+
 TICKET_TOOL_CLASSES = (
     SysTicketListTool,
     SysTicketGetTool,
@@ -480,6 +512,7 @@ TICKET_TOOL_CLASSES = (
     SysProjectIdentityUpdateTool,
     SysProjectIdentitySessionTool,
     SysProjectArtifactSaveTool,
+    SysProjectFileViewTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}
 READ_ONLY_TICKET_TOOLS: tuple[str, ...] = tuple(
