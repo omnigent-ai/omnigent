@@ -97,6 +97,26 @@ describe("separateMentionEdges", () => {
     expect(typeAt("Read @readme.md", 5, "foo ")).toBeNull();
   });
 
+  it("keeps a neighbouring tag's identity when the space is added", () => {
+    const value = "Read @readme.md more";
+    const adjusted = separateMentionEdges(value, { start: 15, end: 15, text: "x" }, ["@readme.md"]);
+    expect(adjusted).toEqual({ text: " x", caret: 2 });
+    const next = value.slice(0, 15) + adjusted!.text + value.slice(15);
+    expect(findMentionTokens(next, ["@readme.md"])).toEqual([
+      { start: 5, end: 15, token: "@readme.md" },
+    ]);
+  });
+
+  it("adds no space when a longer tag would take over the neighbouring tag's match", () => {
+    // Typing after the first @Alpha would make "@Alpha x" match in place of "@Alpha".
+    expect(
+      separateMentionEdges("@Alpha and @Alpha x", { start: 6, end: 6, text: "x" }, [
+        "@Alpha",
+        "@Alpha x",
+      ]),
+    ).toBeNull();
+  });
+
   it("leaves an insert that replaces the token itself alone", () => {
     expect(
       separateMentionEdges("Read @readme.md", { start: 5, end: 15, text: "x" }, tokens),

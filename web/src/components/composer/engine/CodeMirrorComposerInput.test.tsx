@@ -6,6 +6,7 @@ import {
   selectCharRight,
   undo,
 } from "@codemirror/commands";
+import { Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -374,6 +375,45 @@ describe("CodeMirrorComposerInput mention edges", () => {
 
   it("adds no space beside a token the editor does not paint", () => {
     expect(insertAt(15, "x", "input.type", [])).toBe("Read @readme.mdx");
+  });
+
+  it("keeps a programmatic insert beside a painted token as its own undo step", () => {
+    const { content, target } = mount({ value: "", mentionTokens: painted });
+    const editor = EditorView.findFromDOM(content)!;
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 0, insert: "Read @readme.md" },
+          userEvent: "input.type",
+        }),
+    );
+    act(() => insertComposerText(target(), "x", 15, 15));
+    expect(editor.state.doc.toString()).toBe("Read @readme.md x");
+    act(() => void undo(editor));
+    expect(editor.state.doc.toString()).toBe("Read @readme.md");
+  });
+
+  it("keeps an adjusted insert that is marked out of history out of undo", () => {
+    const { content } = mount({ value: "", mentionTokens: painted });
+    const editor = EditorView.findFromDOM(content)!;
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 0, insert: "Read @readme.md" },
+          userEvent: "input.type",
+        }),
+    );
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 15, insert: "x" },
+          userEvent: "input",
+          annotations: Transaction.addToHistory.of(false),
+        }),
+    );
+    expect(editor.state.doc.toString()).toBe("Read @readme.md x");
+    act(() => void undo(editor));
+    expect(editor.state.doc.toString()).toBe(" x");
   });
 
   it("leaves an IME composition insert beside a painted token unchanged", () => {

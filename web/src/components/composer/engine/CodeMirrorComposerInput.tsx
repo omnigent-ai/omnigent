@@ -103,6 +103,7 @@ function adjustedInsertTransaction(
 ): TransactionSpec | Transaction {
   if (
     !transaction.docChanged ||
+    transaction.annotation(controlledUpdate) ||
     !transaction.isUserEvent("input") ||
     transaction.isUserEvent("input.type.compose")
   ) {
