@@ -11,28 +11,25 @@ from pathlib import Path
 
 import httpx
 import pytest
-import yaml
 from playwright.sync_api import Page, expect
 
 from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native.model_switch import _draft
 from omnigent.runner.turn_routing import read_pending_replay, turn_routing_marker_present
-from tests._helpers.host import isolated_host
-from tests._helpers.live_server import isolated_local_server
-from tests._helpers.polling import poll_until
-from tests.e2e.conftest import get_mock_requests
-from tests.e2e.routing._helpers import claude_settings_snapshot, decisions
-from tests.e2e_ui.chat.test_claude_model_picker import (
+from tests._helpers.native_claude import (
     _PINNED_CLAUDE_MODELS,
     _assert_mock_claude_turn,
     _assert_native_claude_turn,
     _live_claude_snapshot,
     _native_claude_wire_model,
     _require_session_only_claude,
+    isolated_claude_mock_routing_stack,
 )
+from tests._helpers.polling import poll_until
+from tests.e2e.conftest import get_mock_requests
+from tests.e2e.routing._helpers import claude_settings_snapshot, decisions
 from tests.e2e_ui.conftest import (
     _BUILD_OUTPUT,
-    reset_mock_llm,
     set_fallback_mock_llm,
 )
 from tests.e2e_ui.messages.test_message_render_parity import (
@@ -51,7 +48,6 @@ from tests.e2e_ui.messages.test_native_claude_render_parity import (
     _wait_for_transcript_message,
     _wait_terminal_connected,
 )
-from tests.helpers.ui_configuration import validate_native_claude_mock_routing
 
 pytestmark = [pytest.mark.nightly, pytest.mark.timeout(420)]
 
@@ -66,72 +62,18 @@ def claude_mock_routing_stack(
     tmp_path: Path,
     claude_managed_settings: None,
 ) -> Iterator[tuple[str, httpx.Client, str, Path, Path]]:
-    """Own both runtimes and give the judge and native CLI only loopback endpoints."""
-    validate_native_claude_mock_routing(mock_llm_server_url)
-    reset_mock_llm(mock_llm_server_url)
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    claude_config = tmp_path / "claude-config"
-    claude_config.mkdir()
-    settings_path = claude_config / "settings.json"
-    settings_path.write_text(json.dumps({"model": _PINNED_CLAUDE_MODELS["sonnet"]}))
-    config = tmp_path / "server.yaml"
-    config.write_text(
-        yaml.safe_dump(
-            {
-                "llm": {
-                    "model": _JUDGE_MODEL,
-                    "connection": {
-                        "base_url": f"{mock_llm_server_url}/v1",
-                        "api_key": "mock-key",
-                    },
-                }
-            }
-        )
-    )
-    providers = {
-        "pinned-claude": {
-            "kind": "key",
-            "default": ["anthropic"],
-            "anthropic": {
-                "base_url": mock_llm_server_url,
-                "api_key": "mock-key",
-                "models": {"default": _PINNED_CLAUDE_MODELS["sonnet"], **_PINNED_CLAUDE_MODELS},
-            },
-        }
-    }
-    mock_env = {
-        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
-        "OPENAI_API_KEY": "mock-key",
-        "ANTHROPIC_BASE_URL": mock_llm_server_url,
-        "ANTHROPIC_AUTH_TOKEN": None,
-        "CLAUDE_CODE_OAUTH_TOKEN": None,
-        "CLAUDECODE": None,
-    }
-    with (
-        isolated_local_server(
-            tmp_path / "server",
-            extra_args=["--config", str(config)],
-            env={**mock_env, "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT)},
-        ) as base_url,
-        httpx.Client(base_url=base_url, timeout=30, trust_env=False) as client,
-        isolated_host(
-            tmp_path / "host",
-            base_url,
-            config={"providers": providers},
-            env={
-                **mock_env,
-                "CLAUDE_CONFIG_DIR": str(claude_config),
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            },
-            cwd=workspace,
-        ) as host,
-    ):
-        host.wait_online(client, timeout=120, poll_interval=0.5)
-        yield base_url, client, host.host_id, workspace, settings_path
+    """Serve the browser from the same owned mock-routing stack as API coverage."""
+    with isolated_claude_mock_routing_stack(
+        tmp_path,
+        mock_llm_server_url,
+        models=_PINNED_CLAUDE_MODELS,
+        judge_model=_JUDGE_MODEL,
+        web_ui_dist=_BUILD_OUTPUT,
+    ) as stack:
+        yield stack
 
 
-@pytest.mark.parametrize("entry", ["create", "chat", "terminal"])
+@pytest.mark.parametrize("entry", ["chat", "terminal"])
 def test_claude_routing_preserves_default_and_delivers_once(
     page: Page,
     claude_mock_routing_stack: tuple[str, httpx.Client, str, Path, Path],
@@ -139,7 +81,7 @@ def test_claude_routing_preserves_default_and_delivers_once(
     tmp_path: Path,
     entry: str,
 ) -> None:
-    """Create, composer and first-typed routing preserve a distinct saved default."""
+    """First Chat and Terminal messages preserve a distinct saved default."""
     base_url, client, host_id, workspace, settings_path = claude_mock_routing_stack
     saved_settings = claude_settings_snapshot(settings_path)
     verdict = json.dumps(
@@ -152,7 +94,6 @@ def test_claude_routing_preserves_default_and_delivers_once(
     set_fallback_mock_llm(mock_llm_server_url, _JUDGE_MODEL, verdict)
     nonce = uuid.uuid4().hex[:8]
     turns = [(f"route-user-{index}-{nonce}", f"route-reply-{index}-{nonce}") for index in (1, 2)]
-    first_prompt = _turn_prompt(1, *turns[0])
     agents = client.get("/v1/agents")
     agents.raise_for_status()
     agent_id = next(
@@ -166,8 +107,6 @@ def test_claude_routing_preserves_default_and_delivers_once(
         "workspace": str(workspace),
         "cost_control_mode_override": "on",
     }
-    if entry == "create":
-        create_body["smart_routing_message"] = first_prompt
     created = client.post("/v1/sessions", json=create_body, timeout=120)
     created.raise_for_status()
     session_id = str(created.json()["id"])
@@ -178,15 +117,14 @@ def test_claude_routing_preserves_default_and_delivers_once(
         _wait_terminal_connected(page)
         _require_session_only_claude(base_url, session_id)
         assert _live_claude_snapshot(base_url, session_id)["cost_control_mode_override"] == "on"
-        if entry != "create":
-            poll_until(
-                lambda: (
-                    bool(model := _live_claude_snapshot(base_url, session_id).get("llm_model"))
-                    and model != _native_claude_wire_model(_TARGET_MODEL)
-                ),
-                timeout_s=60,
-            )
-            assert decisions(client, session_id) == []
+        poll_until(
+            lambda: (
+                bool(model := _live_claude_snapshot(base_url, session_id).get("llm_model"))
+                and model != _native_claude_wire_model(_TARGET_MODEL)
+            ),
+            timeout_s=60,
+        )
+        assert decisions(client, session_id) == []
         assert claude_settings_snapshot(settings_path) == saved_settings
 
         native_sessions = []

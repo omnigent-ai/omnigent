@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import errno
@@ -13378,19 +13379,13 @@ _CAPTURED_EMPTY_NBSP_COMPOSER = (
 )
 
 
-def test_model_draft_reads_the_captured_empty_nbsp_composer() -> None:
-    assert claude_native_bridge._composer_box(_CAPTURED_EMPTY_NBSP_COMPOSER) == (
-        claude_native_bridge._ComposerBox(["❯\u00a0"], framed=True)
-    )
-    assert claude_model_switch._draft(_CAPTURED_EMPTY_NBSP_COMPOSER) == ""
-
-
 @pytest.mark.parametrize(
-    ("pane", "draft"),
+    ("pane", "draft", "expected_box"),
     [
         pytest.param(
             _SessionModelComposer(draft=draft, prompt_separator=separator)._capture_pane("", ""),
             draft,
+            None,
             id=f"{draft_id}-{separator_id}",
         )
         for draft, draft_id in [
@@ -13411,13 +13406,40 @@ def test_model_draft_reads_the_captured_empty_nbsp_composer() -> None:
         pytest.param(
             _composer_pane("/model").replace("❯ ", f"❯{prefix}", 1),
             prefix + "/model",
+            None,
             id=case,
         )
         for prefix, case in [("\t", "tab"), ("\u2009", "thin-space")]
+    ]
+    + [
+        pytest.param(
+            _CAPTURED_EMPTY_NBSP_COMPOSER,
+            "",
+            claude_native_bridge._ComposerBox(["❯\u00a0"], framed=True),
+            id="captured-empty-nbsp",
+        )
     ],
 )
-def test_model_draft_preserves_text_after_one_prompt_separator(pane: str, draft: str) -> None:
+def test_model_draft_preserves_text_after_one_prompt_separator(
+    pane: str, draft: str, expected_box: claude_native_bridge._ComposerBox | None
+) -> None:
+    if expected_box is not None:
+        assert claude_native_bridge._composer_box(pane) == expected_box
     assert claude_model_switch._draft(pane) == draft
+
+
+def test_the_users_claude_settings_file_is_only_ever_read() -> None:
+    """Direct accesses to the user's settings path remain read-only."""
+    tree = ast.parse(Path(claude_native_bridge.__file__).read_text(encoding="utf-8"))
+    accesses = [
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "_USER_CLAUDE_SETTINGS_PATH"
+    ]
+    assert accesses, "No direct settings-path accesses found; update the guard if it moved"
+    assert set(accesses) <= {"read_text", "read_bytes", "exists", "is_file"}, accesses
 
 
 def test_model_draft_joins_soft_wraps_without_losing_hard_newlines_or_whitespace() -> None:

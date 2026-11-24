@@ -14,9 +14,10 @@ The stack each CUJ runs against:
   logins cannot be relocated) but an isolated ``OMNIGENT_CONFIG_HOME`` /
   ``OMNIGENT_DATA_DIR``. It never reads or writes ``~/.omnigent``.
 
-The panes launched by these tests do real inference on the gateway, so no CUJ
-asserts on answer content — only on routing artifacts. That is deliberate: a
+Gateway-backed cases do not assert on answer content — only on routing artifacts.
+That is deliberate: a
 slow or failed generation must not be able to redden a routing test.
+Explicit mock-only cases own a loopback provider and can check exact replies.
 """
 
 from __future__ import annotations
@@ -73,9 +74,11 @@ MODEL_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
 _server_log_path: list[Path] = []
 
 
-@pytest.fixture(autouse=True, scope="session")
-def _require_opt_in() -> None:
-    """Skip the whole suite unless it was asked for explicitly."""
+@pytest.fixture(autouse=True)
+def _require_opt_in(request: pytest.FixtureRequest) -> None:
+    """Require opt-in for gateway cases; mock-only cases own isolated providers."""
+    if request.node.get_closest_marker("mock_only") is not None:
+        return
     if os.environ.get(_RUN_GATE_ENV) != "1":
         pytest.skip(
             f"set {_RUN_GATE_ENV}=1 to run the Smart Routing e2e CUJs "
@@ -94,12 +97,16 @@ def mock_router() -> Iterator[MockRouter]:
 
 
 @pytest.fixture(autouse=True)
-def _reset_mock_router(mock_router: MockRouter) -> Iterator[None]:
+def _reset_mock_router(request: pytest.FixtureRequest) -> Iterator[None]:
     """Clear the mock's served-request log between tests.
 
     Several CUJs count routing calls ("turn 2 must issue zero"), which only
     means anything against a per-test baseline.
     """
+    if request.node.get_closest_marker("mock_only") is not None:
+        yield
+        return
+    mock_router: MockRouter = request.getfixturevalue("mock_router")
     mock_router.reset()
     yield
 

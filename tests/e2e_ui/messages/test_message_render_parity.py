@@ -34,10 +34,18 @@ from __future__ import annotations
 
 import uuid
 
-import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import (
+    marker_turn_prompt as _turn_prompt,
+)
+from tests._helpers.session import (
+    message_item_text as _item_text,
+)
+from tests._helpers.session import (
+    ordered_message_items as _ordered_message_items,
+)
 from tests.e2e_ui.conftest import (
     _CUSTOM_AGENT_MODEL,
     configure_mock_llm,
@@ -96,64 +104,6 @@ def _ensure_chat_view(page: Page) -> None:
     if page.get_by_test_id("view-mode-toggle").count() == 0:
         return
     _select_view_mode(page, "Chat")
-
-
-def _turn_prompt(index: int, user_marker: str, assistant_token: str) -> str:
-    """Build turn *index*'s prompt: carry a marker, echo a token verbatim.
-
-    :param index: 1-based turn number, e.g. ``3``.
-    :param user_marker: Unique token embedded in the user message itself.
-    :param assistant_token: Unique token the agent must echo back exactly.
-    :returns: The composed prompt text.
-    """
-    return (
-        f"This is turn {index}. Context marker {user_marker}. "
-        f"Reply with exactly this token and nothing else: {assistant_token}"
-    )
-
-
-def _ordered_message_items(base_url: str, session_id: str) -> list[dict[str, object]]:
-    """Return the session's user/assistant message items in render order.
-
-    Filters ``GET /v1/sessions/{id}/items`` to ``type == "message"`` items
-    with a ``user`` / ``assistant`` role, preserving the server's position
-    order — which is exactly the order the SPA renders bubbles and the TUI
-    prints lines.
-
-    :param base_url: Spawned server base URL.
-    :param session_id: The session/conversation id.
-    :returns: Ordered message-item dicts (each with ``role`` + ``content``).
-    """
-    resp = httpx.get(
-        f"{base_url}/v1/sessions/{session_id}/items",
-        params={"limit": 100, "order": "asc"},
-        timeout=15.0,
-    )
-    resp.raise_for_status()
-    return [
-        item
-        for item in resp.json().get("data", [])
-        if item.get("type") == "message" and item.get("role") in ("user", "assistant")
-    ]
-
-
-def _item_text(item: dict[str, object]) -> str:
-    """Join every string ``text`` field across a message item's content blocks.
-
-    Works for both user (``input_text``) and assistant (``output_text`` /
-    ``text``) blocks, so the same extractor serves both roles.
-
-    :param item: One element from the items API.
-    :returns: The concatenated text, or ``""``.
-    """
-    content = item.get("content")
-    if not isinstance(content, list):
-        return ""
-    return " ".join(
-        block["text"]
-        for block in content
-        if isinstance(block, dict) and isinstance(block.get("text"), str)
-    )
 
 
 def _ordered_token_sequence(texts: list[str], tokens: list[str]) -> list[str]:
