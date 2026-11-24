@@ -27041,7 +27041,7 @@
             }
           },
           {
-            "description": "Set by a client that polls again soon: the answer may come from the runner's previous read, at most a minute old, and a runner slower than 10 seconds gets a 502 while its read finishes for the next poll.",
+            "description": "Set by a client that polls again soon: the answer may come from the runner's previous read, at most a minute old.",
             "in": "query",
             "name": "allow_cached",
             "required": false,
