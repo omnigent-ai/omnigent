@@ -296,10 +296,14 @@ describe("workspaceFileLink", () => {
     ).toBe(`https://github.com/acme/app/blob/${PUSHED}/packages/web/src/a.ts#L4-L9`);
   });
 
-  it("opens the pushed branch when HEAD has commits the push remote doesn't", () => {
-    expect(link({ ...pushedContext, headSha: HEAD })?.url).toBe(
-      "https://github.com/acme/app/blob/me/feature/packages/web/src/a.ts",
-    );
+  it("opens the pushed branch, without line anchors, when HEAD has commits the push remote doesn't", () => {
+    const ahead = { ...pushedContext, headSha: HEAD };
+    const branchUrl = "https://github.com/acme/app/blob/me/feature/packages/web/src/a.ts";
+    expect(link(ahead)?.url).toBe(branchUrl);
+    // The branch's lines may not be the ones on screen.
+    expect(
+      workspaceFileLink({ context: ahead, path: "src/a.ts", lines: { start: 4, end: 9 } })?.url,
+    ).toBe(branchUrl);
   });
 
   it("opens the repository the branch pushes to, such as a fork", () => {

@@ -293,7 +293,8 @@ function repositoryPathOf(workspacePrefix: string, path: string): string | null 
 
 /**
  * "Open in GitHub" for a workspace file, in the repository its branch pushes to: at HEAD
- * when the push remote has it, so line anchors match, otherwise at the pushed branch. Null
+ * when the push remote has it, so line anchors match, otherwise at the pushed branch without
+ * them. Null
  * when the workspace isn't a GitHub repository, the path is outside it, or the host is too
  * old to say where the workspace sits in its repository.
  */
@@ -310,16 +311,17 @@ export function workspaceFileLink(facts: WorkspaceFileLinkFacts): CodeHostFileLi
     if (!onGitHub(push.host)) return null;
     // No tracking commit: the push remote may not have the branch yet.
     if (!push.trackingSha) return { label, url: null, unavailableReason: PUSH_BRANCH_FIRST };
-    const revision = push.trackingSha === context.headSha ? context.headSha : push.branch;
+    const atHead = push.trackingSha === context.headSha;
     return {
       label,
       url: codeHostBlobUrl({
         host: push.host,
         owner: push.owner,
         repo: push.repo,
-        revision,
+        revision: atHead ? context.headSha : push.branch,
         path,
-        lines: facts.lines,
+        // Line numbers only match the remote's copy at HEAD.
+        lines: atHead ? facts.lines : null,
       }),
     };
   }

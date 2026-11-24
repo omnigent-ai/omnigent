@@ -101,7 +101,8 @@ import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { useHostSshTarget } from "@/hooks/useHostSshTarget";
 import { useRepositoryContext } from "@/hooks/useRepositoryContext";
 import { useSessionPullRequests } from "@/hooks/useSessionPullRequests";
-import { openLink } from "@/lib/openLinkInApp";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { workspaceFileLink } from "./fileCommands/codeHostFileLink";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -1373,6 +1374,8 @@ function FileViewerBody({
     shortcut?: readonly string[];
     /** Shown, but not selectable, with this reason as its tooltip. */
     disabledReason?: string;
+    /** Makes the row a link that opens `href` itself, in place of `onSelect`. */
+    link?: { href: string; follow: (event: MouseEvent) => void };
   }
   interface ToolbarAction {
     key: string;
@@ -1607,9 +1610,14 @@ function FileViewerBody({
       icon: <ExternalLinkIcon className="size-4" />,
       active: false,
       disabledReason: unavailableReason,
-      onSelect: () => {
-        if (url) openLink(conversationId, url);
-      },
+      link: url
+        ? {
+            href: url,
+            follow: (event) => followLinkWithPopupFallback(event, url, conversationId),
+          }
+        : undefined,
+      // The link row opens it; a disabled row ignores selection.
+      onSelect: () => {},
     });
   }
   // One wrap preference covers the source editor and the diff. Other views
@@ -1701,25 +1709,18 @@ function FileViewerBody({
     ].join("|"),
   );
 
-  // The span keeps a hover target for the reason, which a disabled item doesn't give.
-  const renderDisabledMenuItem = (item: ToolbarOption, reason: string) => (
-    <TooltipProvider key={item.key}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="block">
-            <DropdownMenuItem
-              disabled
-              aria-label={`${item.label} disabled: ${reason}`}
-              className="whitespace-nowrap"
-            >
-              {item.icon}
-              {item.label}
-            </DropdownMenuItem>
-          </span>
-        </TooltipTrigger>
-        <TooltipContent>{reason}</TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+  // A link row opens with the popup fallback; a disabled row keeps its reason readable.
+  const renderLinkOrDisabledMenuItem = (item: ToolbarOption) => (
+    <SessionActionMenuItem
+      key={item.key}
+      className="whitespace-nowrap"
+      disabledReason={item.disabledReason}
+      link={item.link}
+      onSelect={item.onSelect}
+    >
+      {item.icon}
+      {item.label}
+    </SessionActionMenuItem>
   );
 
   const renderActionButton = (action: ToolbarAction, interactive: boolean) => {
@@ -1771,8 +1772,8 @@ function FileViewerBody({
           </TooltipProvider>
           <DropdownMenuContent align="end" className="w-auto min-w-40">
             {action.menu.map((item) =>
-              item.disabledReason ? (
-                renderDisabledMenuItem(item, item.disabledReason)
+              item.link || item.disabledReason ? (
+                renderLinkOrDisabledMenuItem(item)
               ) : (
                 <DropdownMenuItem
                   key={item.key}
@@ -2045,8 +2046,8 @@ function FileViewerBody({
                           // toggles/actions, so flatten them straight into this "⋯"
                           // overflow rather than nesting a "⋯"-in-"⋯" submenu.
                           action.menu.map((option) =>
-                            option.disabledReason ? (
-                              renderDisabledMenuItem(option, option.disabledReason)
+                            option.link || option.disabledReason ? (
+                              renderLinkOrDisabledMenuItem(option)
                             ) : (
                               <DropdownMenuItem
                                 key={option.key}
