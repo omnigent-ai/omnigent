@@ -48,16 +48,18 @@ MCP independent creation.
   still printed, with a non-zero exit (`tests/cli/test_session_create.py`,
   `tests/e2e/test_session_create_cli_e2e.py`).
 - `cli-messaging`: `omnigent session send <id>` queues a message like a web composer
-  send. With `--wait` it returns once the turn was seen (as `running`, or as a reply
-  to the sent message) and the session then reads idle with no input waiting for its
-  terminal, confirmed by a second transcript read 2s later, since a native terminal
-  can report the end before its last reply is mirrored. An idle read from before the
-  turn doesn't end the wait. It prints the final reply, or nothing with a stderr note
-  when the turn left none; `--json` adds every message after the sent one. It stops
-  early, with the status shown, when a prompt waits for a person or the turn fails
-  (exit 1). A failure already on the session before the send counts only with a new
-  status, a different error, or an error item after the message. `--timeout` bounds
-  the whole exchange, send included.
+  send. With `--wait` it returns once the turn was seen (as `running`, or as a reply,
+  tool call or error after the sent message) and the session then reads idle with no
+  input waiting for its terminal, confirmed by a second transcript read 2s later, since
+  a native terminal can report the end before its last reply is mirrored. An idle read
+  from before the turn doesn't end the wait. The sent message is found by the ack's
+  item id, or by its text for a held input, never by someone else's message. It prints
+  the final reply, or nothing with a stderr note when the turn left none; `--json` adds
+  every message after the sent one. It stops early, with the status shown, when a
+  prompt waits for a person, the turn fails, or a held message is listed as never
+  delivered (both exit 1). A failure already on the session before the send counts
+  only with a new status, a different error, or an error item after the message.
+  `--timeout` bounds the whole exchange, send included.
   `omnigent session get <id>` prints the fields `sys_session_get_info` returns plus
   the URL, with cost and tokens under `--usage`. `omnigent session read <id>` prints
   the newest messages oldest first, without tool calls (`--last N`, `--after <message

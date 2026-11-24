@@ -8288,16 +8288,17 @@ def session_send(
     async def _send() -> None:
         async with open_session_client(base_url) as client:
             if not wait:
-                message_id = await send_message(client, session_id, text)
+                message = await send_message(client, session_id, text)
                 if json_output:
-                    sent = {"session_id": session_id, "message_id": message_id}
+                    sent = {"session_id": session_id, "message_id": message.item_id}
                     click.echo(json.dumps({**sent, "message_queued": True}))
                 return
-            message_id, result = await send_and_wait(client, session_id, text, timeout_s=timeout)
+            message, result = await send_and_wait(client, session_id, text, timeout_s=timeout)
         if json_output:
             report = {
                 "session_id": session_id,
-                "message_id": message_id,
+                "message_id": message.item_id,
+                "delivered": result.delivered,
                 "status": result.status,
                 "pending_approvals": result.pending_approvals,
                 "reply": result.reply,
@@ -8306,13 +8307,18 @@ def session_send(
             click.echo(json.dumps(report))
         elif result.reply is not None:
             click.echo(result.reply)
-        if result.status == "idle" and result.reply is None:
+        if result.delivered and result.status == "idle" and result.reply is None:
             click.echo(f"Session {session_id}'s turn ended without a reply.", err=True)
         if result.pending_approvals:
             click.echo(
                 f"Session {session_id} is waiting for you ({result.pending_approvals} "
                 "approval or question); answer it in the web UI.",
                 err=True,
+            )
+        if not result.delivered:
+            raise command_error(
+                f"Session {session_id} couldn't deliver the message, so nothing ran. "
+                f"`{cli_invocation()} session get {session_id}` shows its state."
             )
         if result.status == "failed":
             raise command_error(

@@ -75,11 +75,13 @@ class TurnResult:
         stopped to wait for an approval.
     :param pending_approvals: Approval prompts and questions waiting for a person.
     :param messages: The session's messages after the one sent, oldest first.
+    :param delivered: ``False`` when the session gave up on delivering the message.
     """
 
     status: str | None
     pending_approvals: int
     messages: list[JsonObject]
+    delivered: bool = True
 
     @property
     def reply(self) -> str | None:
@@ -112,15 +114,30 @@ async def open_session_client(base_url: str) -> AsyncIterator[httpx.AsyncClient]
         yield client
 
 
-async def send_message(client: httpx.AsyncClient, session_id: str, text: str) -> str | None:
+@dataclass(frozen=True)
+class SentMessage:
+    """
+    A message the server queued, and how to find it again.
+
+    :param text: The message text.
+    :param item_id: The stored message's id, or ``None`` while the server holds it
+        for a native terminal or a starting session.
+    :param pending_id: The held input's id, e.g. ``"pending_abc"``, or ``None``.
+    """
+
+    text: str
+    item_id: str | None = None
+    pending_id: str | None = None
+
+
+async def send_message(client: httpx.AsyncClient, session_id: str, text: str) -> SentMessage:
     """
     Queue *text* as the session's next user message.
 
     :param client: Client from :func:`open_session_client`.
     :param session_id: The session, e.g. ``"conv_abc123"``.
     :param text: The message.
-    :returns: The stored message's id, or ``None`` while the server holds the
-        message as a startup input that has no id yet.
+    :returns: The queued message and the ids the server acknowledged it with.
     :raises click.ClickException: When the session is missing, or the server
         refused, denied or did not confirm the message.
     """
@@ -140,8 +157,13 @@ async def send_message(client: httpx.AsyncClient, session_id: str, text: str) ->
     refusal = message_refusal(resp, "the message")
     if refusal is not None:
         raise command_error(f"{refusal[:1].upper()}{refusal[1:]}.")
-    item_id = response_object(resp).get("item_id")
-    return item_id if isinstance(item_id, str) and item_id else None
+    ack = response_object(resp)
+    item_id, pending_id = ack.get("item_id"), ack.get("pending_id")
+    return SentMessage(
+        text,
+        item_id if isinstance(item_id, str) and item_id else None,
+        pending_id if isinstance(pending_id, str) and pending_id else None,
+    )
 
 
 async def list_messages(
@@ -276,7 +298,7 @@ async def send_and_wait(
     text: str,
     *,
     timeout_s: float | None,
-) -> tuple[str | None, TurnResult]:
+) -> tuple[SentMessage, TurnResult]:
     """
     Send *text* and wait for the session's reply, all within *timeout_s*.
 
@@ -288,7 +310,7 @@ async def send_and_wait(
     :param text: The message.
     :param timeout_s: Seconds for the whole exchange, including the send, or
         ``None`` to wait as long as the turn takes.
-    :returns: The stored message id (see :func:`send_message`) and the outcome.
+    :returns: The queued message (see :func:`send_message`) and the outcome.
     :raises click.ClickException: When the send fails, the session can't be read,
         or time runs out.
     """
@@ -300,14 +322,10 @@ async def send_and_wait(
             )
             after = await latest_message_id(client, session_id)
             posting = True
-            message_id = await send_message(client, session_id, text)
+            message = await send_message(client, session_id, text)
             sent = True
             result = await _wait_for_reply(
-                client,
-                session_id,
-                after=after,
-                baseline=baseline,
-                sent=_SentMessage(message_id, text),
+                client, session_id, after=after, baseline=baseline, sent=message
             )
     except TimeoutError:
         if not posting:
@@ -324,21 +342,7 @@ async def send_and_wait(
             f"Timed out after {timeout_s:g}s waiting for session {session_id} to reply. "
             "The message stays with the session."
         ) from None
-    return message_id, result
-
-
-@dataclass(frozen=True)
-class _SentMessage:
-    """
-    The message ``session send`` posted, to find it in the transcript.
-
-    :param item_id: The stored message's id, or ``None`` while the server holds it
-        as a startup input.
-    :param text: The message text.
-    """
-
-    item_id: str | None
-    text: str
+    return message, result
 
 
 async def _wait_for_reply(
@@ -347,19 +351,21 @@ async def _wait_for_reply(
     *,
     after: str | None,
     baseline: JsonObject,
-    sent: _SentMessage,
+    sent: SentMessage,
 ) -> TurnResult:
     """
     Poll until the sent message's turn ends, fails, or waits for a person.
 
     A status read can predate the turn: a session reads idle, or still reads its
     last turn's failure, until the runner reports the new turn. So the turn has
-    ended only once it was seen, as ``running`` or as a reply to the sent message,
-    and the session then reads idle with nothing waiting for its terminal. Two
+    ended only once it was seen (as ``running``, or as a reply, tool call or error
+    after the sent message) and the session then reads idle with nothing waiting for
+    its terminal. Two
     transcript reads ``_SETTLE_S`` apart must agree, because a native terminal can
     report the end before its last reply is mirrored. A failure counts once it can't
     be the old one: the session wasn't failed before the send, has shown another
     status since, reports a different error, or has an error item after the message.
+    A held message the session listed as failed to deliver ends the wait too.
 
     :param after: The newest message id before the send, or ``None``.
     :param baseline: The session's state read before the send.
@@ -378,6 +384,13 @@ async def _wait_for_reply(
         if approvals:
             found = await _messages_after_sent(client, session_id, after, sent)
             return TurnResult(status, approvals, found[1] if found else [])
+        undelivered = state.get("failed_inputs")
+        if sent.pending_id is not None and isinstance(undelivered, list):
+            if any(
+                isinstance(entry, dict) and entry.get("pending_id") == sent.pending_id
+                for entry in undelivered
+            ):
+                return TurnResult("failed", 0, [], delivered=False)
         if status == "failed":
             found = await _messages_after_sent(client, session_id, after, sent)
             if (
@@ -396,9 +409,11 @@ async def _wait_for_reply(
         elif status == "idle" and not state.get("pending_inputs"):
             found = await _messages_after_sent(client, session_id, after, sent)
             replies = found[1] if found is not None else None
-            # Read after this idle status, a reply shows the turn had started.
-            if replies and any(message["role"] == "assistant" for message in replies):
-                turn_seen = True
+            # Read after this idle status, a reply or tool call shows the turn had started.
+            if found is not None and not turn_seen:
+                turn_seen = any(
+                    message["role"] == "assistant" for message in found[1]
+                ) or await _turn_activity_after(client, session_id, found[0])
             if turn_seen and replies is not None:
                 tail = [message["id"] for message in replies]
                 now = loop.time()
@@ -413,34 +428,57 @@ async def _wait_for_reply(
 
 
 async def _messages_after_sent(
-    client: httpx.AsyncClient, session_id: str, after: str | None, sent: _SentMessage
+    client: httpx.AsyncClient, session_id: str, after: str | None, sent: SentMessage
 ) -> tuple[str, list[JsonObject]] | None:
     """
     Find the sent message after *after* and return its id and every message after it.
 
-    The ack's item id finds it. A startup input has none yet, so the first user
-    message with the same text is taken, else the first user message.
+    The ack's item id finds it. A held message has none until its turn records it,
+    so the first user message with the same text (ignoring whitespace) is taken;
+    nobody else's message stands in for it.
 
     :returns: ``(message id, later messages)``, or ``None`` while it isn't stored.
     """
     messages = await _messages_after(client, session_id, after)
-    position = next(
-        (index for index, message in enumerate(messages) if message["id"] == sent.item_id),
-        None,
-    )
-    if position is None:
-        users = [index for index, message in enumerate(messages) if message["role"] == "user"]
-        matching = [
-            index for index in users if str(messages[index]["text"]).strip() == sent.text.strip()
+    if sent.item_id is not None:
+        matches = [
+            index for index, message in enumerate(messages) if message["id"] == sent.item_id
         ]
-        candidates = matching or users
-        if not candidates:
-            return None
-        position = candidates[0]
+    else:
+        words = sent.text.split()
+        matches = [
+            index
+            for index, message in enumerate(messages)
+            if message["role"] == "user" and str(message["text"]).split() == words
+        ]
+    if not matches:
+        return None
+    position = matches[0]
     message_id = messages[position]["id"]
     if not isinstance(message_id, str):
         return None
     return (message_id, messages[position + 1 :])
+
+
+async def _turn_activity_after(client: httpx.AsyncClient, session_id: str, item_id: str) -> bool:
+    """
+    Report whether a tool call, error or assistant message follows the sent message.
+
+    A turn that only calls tools can start and end between two polls, so this is
+    its only trace.
+    """
+    page = await _read_json(
+        client,
+        session_id,
+        f"/v1/sessions/{session_id}/items",
+        {"limit": 20, "order": "asc", "after": item_id},
+    )
+    data = page.get("data")
+    return any(
+        isinstance(item, dict)
+        and (item.get("type") != "message" or item.get("role") == "assistant")
+        for item in (data if isinstance(data, list) else [])
+    )
 
 
 async def session_info(

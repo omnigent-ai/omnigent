@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -80,6 +81,7 @@ class _FakeSession:
     state_delay_s: float = 0.0
     post_delay_s: float = 0.0
     calls: list[tuple[str, dict]] = field(default_factory=list)
+    message_read_times: list[float] = field(default_factory=list)
     _posted: bool = False
     _served: int = 0
 
@@ -103,6 +105,8 @@ class _FakeSession:
     def _items(self, request: httpx.Request) -> httpx.Response:
         params = dict(request.url.params)
         self.calls.append(("items", params))
+        if params.get("type") == "message" and params.get("order") == "asc":
+            self.message_read_times.append(time.monotonic())
         items = list(reversed(self.items)) if params.get("order") == "desc" else self.items
         if "after" in params:
             ids = [item["id"] for item in items]
@@ -236,6 +240,7 @@ def test_wait_json_lists_every_message_after_the_sent_one(router: respx.MockRout
     assert json.loads(result.stdout) == {
         "session_id": _SESSION,
         "message_id": "msg_sent",
+        "delivered": True,
         "status": "idle",
         "pending_approvals": 0,
         "reply": "Fixed the flaky test",
@@ -276,20 +281,95 @@ def test_wait_ends_a_turn_that_leaves_no_reply(router: respx.MockRouter) -> None
     assert "turn ended without a reply" in plain.stderr
 
 
-def test_wait_takes_a_reply_mirrored_after_the_turn_ends(router: respx.MockRouter) -> None:
+def test_wait_takes_a_reply_mirrored_after_the_turn_ends(
+    router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A native terminal can report idle before its last reply reaches the transcript."""
-    _FakeSession(
+    monkeypatch.setattr("omnigent.session_cli._SETTLE_S", 0.05)
+    session = _FakeSession(
         states=[
             ({"status": "running"}, []),
             ({"status": "idle"}, [_LOOKING]),
             ({"status": "idle"}, [_FIXED]),
         ]
-    ).install(router)
+    )
+    session.install(router)
 
     result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
 
     assert result.exit_code == 0, result.output
     assert result.stdout == "Fixed the flaky test\n"
+    # Idle with the progress message, idle with the reply (the end moves), then
+    # the same transcript again at least the settle period later.
+    first, moved, confirmed = session.message_read_times[-3:]
+    assert moved - first >= 0.05
+    assert confirmed - moved >= 0.05
+
+
+@pytest.mark.parametrize(
+    "ack",
+    [
+        pytest.param({"queued": True, "item_id": "msg_sent"}, id="stored-id-not-visible-yet"),
+        pytest.param({"queued": True, "pending_id": "pending_1"}, id="held-input-released"),
+    ],
+)
+def test_wait_never_takes_another_senders_exchange_for_its_own(
+    router: respx.MockRouter, ack: dict
+) -> None:
+    """Until the sent message shows up, nobody else's message stands in for it."""
+    done = _message("msg_7", "assistant", "Done")
+    _FakeSession(
+        ack=(202, ack),
+        stores_sent_message=False,
+        states=[
+            (
+                {"status": "idle"},
+                [
+                    _message("msg_5", "user", "Other"),
+                    _message("msg_6", "assistant", "Other reply"),
+                ],
+            ),
+            ({"status": "idle"}, []),
+            ({"status": "running"}, [_message("msg_sent", "user", "Fix  it\n")]),
+            ({"status": "idle"}, [done]),
+        ],
+    ).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["messages"] == [_shown(done)]
+
+
+def test_wait_reports_a_held_message_the_session_never_delivered(
+    router: respx.MockRouter,
+) -> None:
+    """A held input can fail to deliver without the session itself failing."""
+    _FakeSession(
+        ack=(202, {"queued": True, "pending_id": "pending_1"}),
+        stores_sent_message=False,
+        states=[
+            ({"status": "idle", "failed_inputs": [{"pending_id": "pending_1", "content": []}]}, [])
+        ],
+    ).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--json"])
+
+    assert result.exit_code == 1
+    report = json.loads(result.stdout)
+    assert (report["delivered"], report["status"]) == (False, "failed")
+    assert "couldn't deliver the message" in result.stderr
+
+
+def test_wait_ends_a_tool_only_turn_that_never_read_as_running(router: respx.MockRouter) -> None:
+    """A turn that only calls tools can start and end between two polls."""
+    _FakeSession(states=[({"status": "idle"}, [_tool_call("call_1")])]).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == ""
+    assert "turn ended without a reply" in result.stderr
 
 
 def test_wait_returns_a_fast_turn_seen_only_by_its_reply(router: respx.MockRouter) -> None:
@@ -644,11 +724,12 @@ def test_read_pages_past_tool_calls_on_a_server_without_the_message_filter(
     ]
 
 
+@pytest.mark.parametrize("filters_by_type", [True, False], ids=["filtered", "older-server"])
 def test_read_after_a_message_follows_every_page(
-    router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+    router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, filters_by_type: bool
 ) -> None:
     monkeypatch.setattr("omnigent.session_cli._ITEMS_PAGE_LIMIT", 2)
-    session = _FakeSession(items=_transcript(7))
+    session = _FakeSession(items=_transcript(7), filters_by_type=filters_by_type)
     session.install(router)
 
     everything = _invoke(["read", _SESSION, "--after", "msg_2", "--json"])
