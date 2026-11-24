@@ -1101,6 +1101,7 @@ async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_tr
     [
         ("No exact picker choice", False),
         ("post-clear-picker-refusal", False),
+        ("renderer-padding-refusal", False),
         ("physical-row-collision", False),
         ("physical-row-collision-after-read", False),
         (
@@ -1112,6 +1113,7 @@ async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_tr
     ids=[
         "picker-refusal",
         "post-clear-picker-refusal",
+        "renderer-padding-refusal",
         "physical-row-collision",
         "physical-row-collision-after-read",
         "unsupported-cli",
@@ -1131,11 +1133,14 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     )
 
     collision = refusal.startswith("physical-row-collision")
-    actual_picker = refusal == "post-clear-picker-refusal" or collision
+    padding = refusal == "renderer-padding-refusal"
+    actual_picker = refusal == "post-clear-picker-refusal" or collision or padding
     prompt = (
         "abcdefgh\nijklmnop"
         if collision
         else "Recover this exact draft: <literal> `message`  "
+        if padding
+        else "Recover  this exact draft: <literal> `message`"
         if actual_picker
         else "hello"
     )
@@ -1217,8 +1222,8 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     assert not client.messages
     assert (bridge_dir / turn_routing.PENDING_FILE).read_bytes() == pending_before
     if actual_picker:
-        if collision:
-            assert composer.text == "abcdefghijklmnop"
+        if collision or padding:
+            assert composer.text == ("abcdefghijklmnop" if collision else prompt)
             assert composer.sends == []
             assert composer.submitted == []
         else:
@@ -1253,8 +1258,8 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
             },
         )
     ]
-    if collision:
-        # The person explicitly clears the replacement before resubmitting the saved text.
+    if collision or padding:
+        # The person explicitly clears the input before resubmitting the saved text.
         composer.text = ""
         composer.cursor = 0
     refusing = False
