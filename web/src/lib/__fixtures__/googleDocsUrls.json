@@ -1,0 +1,184 @@
+[
+  {
+    "name": "editor",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit",
+    "kind": "embed",
+    "canonicalUrl": "https://docs.google.com/document/d/Doc_1-abc/edit"
+  },
+  {
+    "name": "document root",
+    "url": "https://docs.google.com/document/d/Doc_1-abc",
+    "kind": "embed",
+    "canonicalUrl": "https://docs.google.com/document/d/Doc_1-abc/edit"
+  },
+  {
+    "name": "editor trailing slash",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit/",
+    "kind": "embed",
+    "canonicalUrl": "https://docs.google.com/document/d/Doc_1-abc/edit"
+  },
+  {
+    "name": "account and sharing context",
+    "url": "HTTPS://DOCS.GOOGLE.COM/document/u/2/d/Doc_1-abc/edit?authuser=user%40example.test&usp=sharing&ouid=123&pli=1&sharing=1&utm_source=copy&tab=t.0",
+    "kind": "embed",
+    "canonicalUrl": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0"
+  },
+  {
+    "name": "tab fragment",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit#tab=t.second-tab",
+    "kind": "embed",
+    "canonicalUrl": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.second-tab"
+  },
+  {
+    "name": "percent encoded tab",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?%74ab=t%2E0",
+    "kind": "embed",
+    "canonicalUrl": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0"
+  },
+  {
+    "name": "same tab in query and fragment",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0#tab=t.0",
+    "kind": "embed",
+    "canonicalUrl": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0"
+  },
+  {
+    "name": "heading on selected tab",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0#heading=h.intro",
+    "kind": "external"
+  },
+  {
+    "name": "heading with duplicate tabs",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0&tab=t.other#heading=h.intro",
+    "kind": "external"
+  },
+  {
+    "name": "bookmark",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit#bookmark=id.example",
+    "kind": "external"
+  },
+  {
+    "name": "comment in query",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0&disco=comment123",
+    "kind": "external"
+  },
+  {
+    "name": "comment in fragment",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit#comment=123",
+    "kind": "external"
+  },
+  {
+    "name": "tab plus another target in fragment",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit#tab=t.0&bookmark=id.example",
+    "kind": "external"
+  },
+  {
+    "name": "access-bearing resource key",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?usp=sharing&resourcekey=0-example&tab=t.0",
+    "kind": "external"
+  },
+  {
+    "name": "resource key with an empty tab",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?resourcekey=0-example&tab=",
+    "kind": "external"
+  },
+  {
+    "name": "unknown query target",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0&range=A1",
+    "kind": "external"
+  },
+  {
+    "name": "unknown fragment target",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit#section",
+    "kind": "external"
+  },
+  {
+    "name": "conflicting tab locations",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0#tab=t.other",
+    "kind": "external"
+  },
+  {
+    "name": "unrecognized fragment syntax",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit#?tab=t.0",
+    "kind": "external"
+  },
+  {
+    "name": "wrong protocol",
+    "url": "http://docs.google.com/document/d/Doc_1-abc/edit",
+    "kind": "invalid"
+  },
+  {
+    "name": "similar hostname",
+    "url": "https://docs.google.com.example.test/document/d/Doc_1-abc/edit",
+    "kind": "invalid"
+  },
+  {
+    "name": "external target at an invalid origin",
+    "url": "http://docs.google.com/document/d/Doc_1-abc/edit?resourcekey=0-example&tab=",
+    "kind": "invalid"
+  },
+  {
+    "name": "userinfo",
+    "url": "https://user@docs.google.com/document/d/Doc_1-abc/edit",
+    "kind": "invalid"
+  },
+  {
+    "name": "custom port",
+    "url": "https://docs.google.com:8443/document/d/Doc_1-abc/edit",
+    "kind": "invalid"
+  },
+  {
+    "name": "document ID with a slash",
+    "url": "https://docs.google.com/document/d/Doc%2Fabc/edit",
+    "kind": "invalid"
+  },
+  {
+    "name": "dot segment",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/../Doc_1-abc/edit",
+    "kind": "invalid"
+  },
+  {
+    "name": "preview",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/preview",
+    "kind": "invalid"
+  },
+  {
+    "name": "published document",
+    "url": "https://docs.google.com/document/d/e/published-id/pub",
+    "kind": "invalid"
+  },
+  {
+    "name": "bare tab ID",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=0",
+    "kind": "invalid"
+  },
+  {
+    "name": "empty tab",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit#tab=",
+    "kind": "invalid"
+  },
+  {
+    "name": "malformed encoded tab",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0%0A",
+    "kind": "invalid"
+  },
+  {
+    "name": "duplicated tab",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?tab=t.0&tab=t.0",
+    "kind": "invalid"
+  },
+  {
+    "name": "literal control character",
+    "url": "https://docs.google.\tcom/document/d/Doc_1-abc/edit",
+    "kind": "invalid"
+  },
+  {
+    "name": "literal next-line character in query",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?usp=copy\u0085&tab=t.0",
+    "kind": "invalid"
+  },
+  {
+    "name": "literal byte order mark in query",
+    "url": "https://docs.google.com/document/d/Doc_1-abc/edit?usp=copy\ufeff&tab=t.0",
+    "kind": "invalid"
+  }
+]

@@ -37,6 +37,7 @@ class Feature(StrEnum):
     MCP_DISABLED_SERVERS = "mcp_disabled_servers"
     MCP_DISABLED_SERVERS_CLAUDE = "mcp_disabled_servers_claude"
     MCP_DISABLED_SERVERS_CODEX = "mcp_disabled_servers_codex"
+    GOOGLE_DOCS = "google_docs"
     CANVAS = "canvas"
     IMPORT_REVIEW = "import_review"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
@@ -90,6 +91,12 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.GOOGLE_DOCS,
+        description="Explicit shared Google Docs references per session",
+        owner="server",
+        review_by_release="0.28.0",
+    ),
     FeatureDefinition(
         feature=Feature.CODEX_PLAN_AT_LAUNCH,
         description="Start Codex in Plan mode with host compatibility checks",

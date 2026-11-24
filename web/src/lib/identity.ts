@@ -659,7 +659,13 @@ async function _wrongReplicaResendKey(res: Response): Promise<string | null> {
 export async function authenticatedFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
+  beforeDispatch?: () => void,
 ): Promise<Response> {
+  // Host discovery and replica recovery await: recheck ownership at every dispatch.
+  const dispatch: typeof hostFetch = (...args) => {
+    beforeDispatch?.();
+    return hostFetch(...args);
+  };
   const headers = new Headers(init?.headers);
   if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
     headers.set("X-Forwarded-Email", currentUserId);
@@ -726,7 +732,7 @@ export async function authenticatedFetch(
   // URL change. Without no-store the browser may serve a stale
   // cached response — e.g. one captured before an elicitation was
   // published — causing the ApprovalCard to vanish on navigate-back.
-  let res = await hostFetch(
+  let res = await dispatch(
     url,
     {
       ...init,
@@ -762,7 +768,7 @@ export async function authenticatedFetch(
     if (sentKey === null) clearHostKeyless(resendKey);
     const keyedHeaders = new Headers(headers);
     keyedHeaders.set(SLICE_KEY_HEADER, resendKey);
-    res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+    res = await dispatch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
     if (res.ok) clearHostKeyless(resendKey);
     derivedHostId = resendKey;
     stampedSliceKey = sentKey !== null;
@@ -781,7 +787,7 @@ export async function authenticatedFetch(
     // (callers/tests hold it by reference).
     const retryHeaders = new Headers(headers);
     retryHeaders.delete(SLICE_KEY_HEADER);
-    res = await hostFetch(
+    res = await dispatch(
       url,
       {
         ...init,
@@ -818,13 +824,13 @@ export async function authenticatedFetch(
       if (hostId !== null && !demoted) {
         const retryHeaders = new Headers(headers);
         retryHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, { ...init, headers: retryHeaders, cache: "no-store" });
+        res = await dispatch(url, { ...init, headers: retryHeaders, cache: "no-store" });
       }
     }
     if (await _isWrongReplica(res)) {
       const retryHeaders = new Headers(headers);
       retryHeaders.delete(SLICE_KEY_HEADER);
-      res = await hostFetch(
+      res = await dispatch(
         url,
         { ...init, headers: retryHeaders, cache: "no-store" },
         { unkeyed: true },
@@ -836,7 +842,7 @@ export async function authenticatedFetch(
         clearHostKeyless(hostId);
         const keyedHeaders = new Headers(headers);
         keyedHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+        res = await dispatch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
       }
     }
   } else if (

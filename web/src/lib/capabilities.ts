@@ -78,6 +78,7 @@ export type FeatureKey =
   | "quick_pick_palette"
   | "floating_composer"
   | "workspace_sidebar_v2"
+  | "google_docs"
   | "sidebar_saved_views"
   | "floating_panes";
 
