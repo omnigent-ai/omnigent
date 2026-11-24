@@ -578,6 +578,53 @@ describe("cost limit", () => {
   });
 });
 
+describe("notifications", () => {
+  const supportsNotifications = { info: { scheduled_task_notifications: true } };
+
+  it.each([false, true])(
+    "creates with notifications off only when switched off (%s)",
+    async (off) => {
+      render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, supportsNotifications);
+      const toggle = screen.getByRole("switch", { name: "Notifications" });
+      expect(toggle).toBeChecked();
+      fireEvent.change(screen.getByLabelText("Automation title"), { target: { value: "Review" } });
+      fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), {
+        target: { value: "Review new issues" },
+      });
+      if (off) fireEvent.click(toggle);
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+      const input = mutateAsync.mock.calls[0][0];
+      if (off) expect(input.notifications).toBe(false);
+      else expect(input).not.toHaveProperty("notifications");
+    },
+  );
+
+  it.each([false, true])("sends a saved choice only when it changes (%s)", async (change) => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ notifications: false })}
+      />,
+      supportsNotifications,
+    );
+    const toggle = screen.getByRole("switch", { name: "Notifications" });
+    expect(toggle).not.toBeChecked();
+    if (change) fireEvent.click(toggle);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    if (change) expect(input.notifications).toBe(true);
+    else expect(input).not.toHaveProperty("notifications");
+  });
+
+  it("is hidden from a server that predates it", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-notifications-field")).toBeNull();
+  });
+});
+
 describe("onCreated", () => {
   function fillRequiredFields() {
     fireEvent.change(screen.getByLabelText("Automation title"), {

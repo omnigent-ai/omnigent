@@ -264,6 +264,8 @@ export interface ServerInfo {
   automations_enabled?: boolean;
   /** True when scheduled tasks accept the optional random-worktree base ref. */
   scheduled_task_worktrees?: boolean;
+  /** True when scheduled tasks accept ``notifications``; older servers reject it. */
+  scheduled_task_notifications?: boolean;
   /**
    * True when ``GET /v1/sessions`` accepts ``search_scope``. Older servers
    * ignore it, so the palette lists one mixed search group there. Fails to
@@ -559,6 +561,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   installable_harnesses: [],
   dictation_available: false,
   scheduled_task_worktrees: false,
+  scheduled_task_notifications: false,
   archive_worktree_cleanup: false,
   automations_enabled: true,
   session_search_scope: false,
@@ -752,6 +755,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           dictation_available: data.dictation_available === true,
           scheduled_task_worktrees: data.scheduled_task_worktrees === true,
+          scheduled_task_notifications: data.scheduled_task_notifications === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,

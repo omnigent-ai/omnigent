@@ -42,6 +42,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
@@ -166,6 +167,8 @@ const PROVIDER_DEFAULT = "provider-default";
 const PERMISSION_SELECT_DEFAULT = "__agent_default__";
 const AUTOMATION_COST_LIMIT_HELP =
   "Each run gets a fresh budget, including when continuing an existing session: its recorded spend at the start of the run plus this amount. Reaching that threshold blocks further model requests and tool calls, but an in-progress response can overshoot it. Leave blank for no automation cost limit. Changes apply to future runs.";
+const AUTOMATION_NOTIFICATIONS_HELP =
+  "Turn off to mute the sessions this automation starts: no notifications or unread badges for you. Approval requests still show. A change applies to new sessions and to the session the automation continues; other existing sessions keep their setting.";
 const AUTOMATION_CONTROL_TRIGGER_CLASS_NAME =
   "h-9! min-h-9! max-w-full justify-start gap-1.5 rounded-lg border border-input bg-transparent py-2 pr-2 pl-2.5 text-ui leading-5 font-normal md:min-h-9! [&_svg]:p-0! [&>svg:last-child]:ml-auto [&>svg:last-child]:text-muted-foreground [&>svg:last-child]:opacity-100 [&_[data-testid$='-agent-model-value']]:font-normal";
 const AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME = `${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} border-transparent`;
@@ -297,6 +300,7 @@ export function CreateScheduledTaskDialog({
   } = useProjects({ enabled: open && projectsSupported });
   const resolveProjectId = useResolveOrCreateProjectId();
   const worktreesSupported = info !== "loading" && info.scheduled_task_worktrees === true;
+  const notificationsSupported = info !== "loading" && info.scheduled_task_notifications === true;
   const sessionModesSupported = info !== "loading" && info.scheduled_task_session_modes === true;
   const triggersSupported =
     sessionModesSupported && isFeatureEnabled(info, "session_orchestration");
@@ -541,6 +545,7 @@ export function CreateScheduledTaskDialog({
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
   const [baseBranch, setBaseBranch] = useState<string | null>(null);
+  const [notifications, setNotifications] = useState(true);
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
   // "managed_sandbox") instead of a connected host. Catalog-backed providers
   // offer repository selection instead of browsing a connected host.
@@ -670,6 +675,7 @@ export function CreateScheduledTaskDialog({
         setHostId(editingTask.hostId ?? "");
         setWorkspace(savedWorkspace);
         setBaseBranch(editingTask.baseBranch ?? null);
+        setNotifications(editingTask.notifications ?? true);
         setSandboxMode(editingTask.executionTarget === "managed_sandbox");
         setProjectChoice(null);
         setPickedProjectId(null);
@@ -713,6 +719,7 @@ export function CreateScheduledTaskDialog({
         setHostId("");
         setWorkspace("");
         setBaseBranch(null);
+        setNotifications(true);
         setSandboxMode(false);
         setProjectChoice(null);
         setPickedProjectId(null);
@@ -1660,6 +1667,7 @@ export function CreateScheduledTaskDialog({
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
+    setNotifications(true);
     resetMenus();
     setSandboxMode(false);
     setProjectChoice(null);
@@ -1708,6 +1716,9 @@ export function CreateScheduledTaskDialog({
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(worktreesSupported && baseBranch !== (editingTask?.baseBranch ?? null)
           ? { baseBranch }
+          : {}),
+        ...(notificationsSupported && notifications !== (editingTask?.notifications ?? true)
+          ? { notifications }
           : {}),
         ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
         ...workspacePatch,
@@ -2687,6 +2698,39 @@ export function CreateScheduledTaskDialog({
                                   />
                                 </DropdownMenuContent>
                               </DropdownMenu>
+                            </div>
+                          )}
+                          {notificationsSupported && (
+                            <div
+                              className="flex min-h-9 items-center justify-between gap-4 py-px"
+                              data-testid="task-notifications-field"
+                            >
+                              <label
+                                htmlFor="task-notifications"
+                                className="text-ui text-muted-foreground"
+                              >
+                                Notifications
+                              </label>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex pr-2.5">
+                                    <Switch
+                                      id="task-notifications"
+                                      checked={notifications}
+                                      onCheckedChange={setNotifications}
+                                      aria-describedby="task-notifications-help"
+                                      componentId="tasks.scheduled.notifications"
+                                      data-testid="task-notifications"
+                                    />
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent className="max-w-xs">
+                                  {AUTOMATION_NOTIFICATIONS_HELP}
+                                </TooltipContent>
+                              </Tooltip>
+                              <span id="task-notifications-help" className="sr-only">
+                                {AUTOMATION_NOTIFICATIONS_HELP}
+                              </span>
                             </div>
                           )}
                           <div className="flex min-h-9 items-center justify-between gap-4 py-px">

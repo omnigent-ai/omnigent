@@ -186,6 +186,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
+    muted_labels,
 )
 from omnigent.util.session_lifecycle import is_session_closed
 
@@ -2060,7 +2061,8 @@ def _session_labels(
     with the same services. A managed fire's session records the
     sandbox host id it was launched under, so the host routes by that id from
     its first connection and a relaunch keeps the same replica. A task with no
-    services writes no selection labels, so a copied session keeps its own.
+    services writes no selection labels, so a copied session keeps its own. A
+    task with notifications off mutes each one for its owner.
     """
     selection_labels = (
         (mcp_selection or mcp_selection_for(None)).session_labels(task.mcp_services)
@@ -2076,6 +2078,8 @@ def _session_labels(
         from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 
         labels[REQUESTED_HOST_ID_LABEL_KEY] = managed_host_id
+    if not task.notifications:
+        labels.update(muted_labels(task.user_id))
     return labels
 
 

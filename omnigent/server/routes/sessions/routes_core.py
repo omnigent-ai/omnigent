@@ -1750,6 +1750,7 @@ def register_core_routes(
             launched_by_scheduled_task_id=(
                 launching_task.id if launching_task is not None else None
             ),
+            mute_launched_session=launching_task is not None and not launching_task.notifications,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.

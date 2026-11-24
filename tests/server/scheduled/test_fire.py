@@ -76,10 +76,12 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    MUTED_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
+    muted_label_key,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -859,6 +861,17 @@ async def test_active_creates_session_grant_and_run(
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+@pytest.mark.parametrize("user_id", [None, "alice@example.com"])
+@pytest.mark.parametrize("notifications", [True, False])
+def test_notifications_off_mutes_each_new_session_for_its_owner(
+    user_id: str | None, notifications: bool
+) -> None:
+    labels = fire_mod._session_labels(_task(user_id=user_id, notifications=notifications))
+
+    muted = {key: value for key, value in labels.items() if key.startswith(MUTED_LABEL_KEY)}
+    assert muted == ({} if notifications else {muted_label_key(user_id): "1"})
 
 
 class _ListLabelSelection:

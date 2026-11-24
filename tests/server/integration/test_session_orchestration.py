@@ -22,10 +22,12 @@ from omnigent.server.sharing_settings import write_peer_session_messaging_overri
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
+    MUTED_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    muted_label_key,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -983,7 +985,9 @@ async def test_launches_from_a_run_tree_are_shared_with_the_automation_grantees(
         auth_app.state.feature_flags = FeatureFlags(
             auth_app.state.feature_flags.enabled_features - {Feature.SIBLING_SESSIONS}
         )
-    task = _shared_automation(auth_app, db_uri, monkeypatch, source["agent_id"], ["bob", "carol"])
+    task = _shared_automation(
+        auth_app, db_uri, monkeypatch, source["agent_id"], ["bob", "carol"], notifications=False
+    )
     _as_run_session(db_uri, source["id"], task, ["bob", "carol"])
     conversations = SqlAlchemyConversationStore(db_uri)
 
@@ -994,6 +998,10 @@ async def test_launches_from_a_run_tree_are_shared_with_the_automation_grantees(
         assert result.get("conversation_id"), result
         worker = conversations.get_conversation(result["conversation_id"])
         assert worker.labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] == task.id
+        # Notifications off mutes the sessions for the owner; grantees keep their own choice.
+        assert {
+            key: value for key, value in worker.labels.items() if key.startswith(MUTED_LABEL_KEY)
+        } == {muted_label_key("alice"): "1"}
         assert _session_levels(db_uri, worker.id) == {
             "alice": LEVEL_OWNER,
             "bob": LEVEL_READ,
@@ -1067,6 +1075,8 @@ async def test_a_launch_skips_grantees_who_can_no_longer_see_its_source(
     assert result.get("conversation_id"), result
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
     assert worker.labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] == first.id
+    # Notifications are on by default, so the session isn't muted.
+    assert not any(key.startswith(MUTED_LABEL_KEY) for key in worker.labels)
     assert _session_levels(db_uri, worker.id) == expected
 
 

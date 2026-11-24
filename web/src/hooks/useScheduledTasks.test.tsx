@@ -9,6 +9,12 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/lib/scheduledTasksApi";
 import {
+  beginMuteSave,
+  clearSessionMuteState,
+  isConversationMuted,
+  settleMuteSave,
+} from "@/lib/sessionMute";
+import {
   hasUnsettledRun,
   SCHEDULED_TASKS_KEY,
   scheduledTaskKey,
@@ -104,6 +110,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.clearAllMocks();
+  clearSessionMuteState();
 });
 
 describe("useScheduledTasks", () => {
@@ -189,6 +196,47 @@ describe("mutations invalidate the list", () => {
     await result.current.mutateAsync({ id: "st_1", input: { state: "paused" } });
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
   });
+
+  it.each([
+    ["changes notifications", { notifications: false }, true],
+    ["leaves notifications alone", { name: "renamed" }, false],
+  ] as const)(
+    "an update that %s refreshes the continued session",
+    async (_label, input, refreshes) => {
+      vi.mocked(api.updateScheduledTask).mockResolvedValue({
+        ...TASK,
+        sessionMode: "continue",
+        sessionId: "conv_kept",
+      });
+      const { queryClient, wrapper } = makeWrapper();
+      const spy = vi.spyOn(queryClient, "invalidateQueries");
+      const { result } = renderHook(() => useUpdateScheduledTask(), { wrapper });
+      await result.current.mutateAsync({ id: "st_1", input });
+      // The server muted or unmuted that session; its sidebar row must refetch.
+      for (const queryKey of [["conversations"], ["session", "conv_kept"]]) {
+        if (refreshes) expect(spy).toHaveBeenCalledWith({ queryKey });
+        else expect(spy).not.toHaveBeenCalledWith({ queryKey });
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "an update to notifications %s overrides a mute this tab saved for the continued session",
+    async (notifications) => {
+      vi.mocked(api.updateScheduledTask).mockResolvedValue({
+        ...TASK,
+        sessionMode: "continue",
+        sessionId: "conv_kept",
+        notifications,
+      });
+      // The tab's own recent save would otherwise outrank the server's change for a minute.
+      if (beginMuteSave("conv_kept", notifications)) settleMuteSave("conv_kept", notifications);
+      const { wrapper } = makeWrapper();
+      const { result } = renderHook(() => useUpdateScheduledTask(), { wrapper });
+      await result.current.mutateAsync({ id: "st_1", input: { notifications } });
+      expect(isConversationMuted({ id: "conv_kept", labels: {} })).toBe(!notifications);
+    },
+  );
 
   it("delete invalidates the list", async () => {
     const { queryClient, wrapper } = makeWrapper();

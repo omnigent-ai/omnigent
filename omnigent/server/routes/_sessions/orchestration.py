@@ -462,6 +462,7 @@ from omnigent.stores.conversation_store import (
     SessionActivity,
     SpawnTreeUsage,
     muted_label_key,
+    muted_labels,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -12948,6 +12949,7 @@ async def _create_session_from_existing_agent(
     created_by_scheduled_task_id: str | None = None,
     created_by: Conversation | None = None,
     launched_by_scheduled_task_id: str | None = None,
+    mute_launched_session: bool = False,
 ) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
     Create a session bound to an already-registered agent.
@@ -12986,6 +12988,8 @@ async def _create_session_from_existing_agent(
         permission mode of its own starts with the source's.
     :param launched_by_scheduled_task_id: The automation whose run's tree that source
         is in, if any, stamped as the worker's ``SCHEDULED_TASK_LAUNCH_LABEL_KEY``.
+    :param mute_launched_session: Whether that automation's notifications are off, so
+        the worker starts muted for ``user_id``.
     :returns: The newly created session snapshot, its conversation row, and
         the request body after project defaults were applied.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
@@ -13699,6 +13703,8 @@ async def _create_session_from_existing_agent(
         initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
     if launched_by_scheduled_task_id is not None:
         initial_labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] = launched_by_scheduled_task_id
+    if mute_launched_session:
+        initial_labels.update(muted_labels(user_id))
     initial_labels.update(registry_labels)
     initial_labels.update(automation_permission_labels)
     initial_labels.update(creator_permission_labels)
