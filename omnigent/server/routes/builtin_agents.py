@@ -34,6 +34,8 @@ from starlette.types import Message
 from omnigent.db.utils import builtin_agent_id, installed_agent_id
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native.permission_modes import APPROVAL_SKIPPING_PERMISSION_MODES
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
 from omnigent.server.auth import AuthProvider
@@ -409,6 +411,15 @@ def create_builtin_agents_router(
     ) -> AgentConfigObject | JSONResponse:
         """Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config."""
         agent = await editable_agent(request, agent_id)
+        if (
+            ORCHESTRATION_SOURCE_HEADER in request.headers
+            and body.permission_mode in APPROVAL_SKIPPING_PERMISSION_MODES
+        ):
+            # Only a person, in the agent editor, may make an agent skip approval by default.
+            raise OmnigentError(
+                "Only the agent's owner can set a permission mode that skips approval",
+                code=ErrorCode.FORBIDDEN,
+            )
         if if_match is not None:
             if len(request.headers.getlist("if-match")) != 1 or not (
                 len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')

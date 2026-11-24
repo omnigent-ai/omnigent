@@ -123,6 +123,41 @@ async def test_owner_can_update_bundle_and_mcp(auth_client: httpx.AsyncClient) -
     assert mcp.status_code == 200, mcp.text
 
 
+@pytest.mark.parametrize(
+    ("mode", "from_agent", "status"),
+    [
+        ("bypassPermissions", True, 403),
+        ("dontAsk", True, 403),
+        # An agent may still pick a mode that asks, and the owner may pick any mode.
+        ("acceptEdits", True, 200),
+        ("bypassPermissions", False, 200),
+    ],
+)
+async def test_only_a_person_sets_an_approval_skipping_default(
+    auth_client: httpx.AsyncClient, mode: str, from_agent: bool, status: int
+) -> None:
+    """An agent tool acting as the owner can't make the owner's agent skip approval."""
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+    agent = await create_test_agent(
+        auth_client,
+        name="permission-agent",
+        user=ALICE,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    headers = {"X-Forwarded-Email": ALICE}
+    if from_agent:
+        headers[ORCHESTRATION_SOURCE_HEADER] = agent["_session_id"]
+    patched = await auth_client.patch(
+        f"/v1/agents/{agent['id']}", json={"permission_mode": mode}, headers=headers
+    )
+    assert patched.status_code == status, patched.text
+    config = await auth_client.get(
+        f"/v1/agents/{agent['id']}/config", headers={"X-Forwarded-Email": ALICE}
+    )
+    assert config.json()["permission_mode"] == (mode if status == 200 else None)
+
+
 @pytest.mark.parametrize("level", [LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE])
 @pytest.mark.parametrize(
     "change",
