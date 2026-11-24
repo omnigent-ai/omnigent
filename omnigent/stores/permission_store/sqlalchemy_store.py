@@ -22,7 +22,6 @@ from sqlalchemy.sql.elements import ColumnElement
 from omnigent.db.account_authority import account_generation, lock_account, require_active_account
 from omnigent.db.db_models import (
     SqlConversationMetadata,
-    SqlProject,
     SqlScheduledTask,
     SqlScheduledTaskShare,
     SqlSessionPermission,
@@ -55,7 +54,7 @@ from omnigent.stores.permission_store import (
     PermissionStore,
     require_grantee_id_fits,
 )
-from omnigent.stores.project_store.access import accessible_project_ids
+from omnigent.stores.project_store.access import project_session_owners
 
 # Sentinel rows excluded from list_users() — never real, actionable
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
@@ -1062,19 +1061,10 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Levels *user_id* holds through project membership, keyed by session."""
         if not conversation_ids:
             return {}
-        rows = session.execute(
-            select(SqlConversationMetadata.id, SqlProject.user_id)
-            .join(
-                SqlProject,
-                (SqlProject.workspace_id == SqlConversationMetadata.workspace_id)
-                & (SqlProject.id == SqlConversationMetadata.project_id),
-            )
-            .where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.id.in_(list(conversation_ids)),
-                SqlProject.id.in_(accessible_project_ids(user_id)),
-            )
-        ).all()
+        stmt = project_session_owners(user_id).where(
+            SqlConversationMetadata.id.in_(list(conversation_ids))
+        )
+        rows = session.execute(stmt).all()
         # The owner manages sessions members start; members edit every project session.
         return {
             conversation_id: LEVEL_MANAGE if owner == user_id else LEVEL_EDIT

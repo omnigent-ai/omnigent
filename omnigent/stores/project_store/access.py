@@ -8,15 +8,19 @@ from __future__ import annotations
 
 from typing import Literal
 
-from sqlalchemy import Select, select, union
+from sqlalchemy import Select, or_, select, union
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlProject,
     SqlProjectShare,
+    SqlSessionPermission,
     current_workspace_id,
 )
+
+# Session owner level; mirrors ``omnigent.server.auth.LEVEL_OWNER`` without importing the server.
+LEVEL_OWNER = 4
 
 ProjectRole = Literal["owner", "member"]
 
@@ -51,9 +55,45 @@ def accessible_project_ids(user_id: str | None) -> Select[tuple[str]]:
     return select(union(owned, shared).subquery().c[0])
 
 
-def project_conversation_ids(user_id: str) -> Select[tuple[str]]:
-    """SELECT ids of sessions filed in projects *user_id* owns or was shared."""
-    return select(SqlConversationMetadata.id).where(
-        SqlConversationMetadata.workspace_id == current_workspace_id(),
-        SqlConversationMetadata.project_id.in_(accessible_project_ids(user_id)),
+def project_session_owners(user_id: str) -> Select[tuple[str, str | None]]:
+    """SELECT ``(session id, project owner)`` for sessions *user_id* reaches via a project.
+
+    Only sessions owned by the project's owner or a current member count, so a
+    session filed in the project by anyone else grants nothing through it.
+    """
+    participant_owned = (
+        select(SqlSessionPermission.conversation_id)
+        .where(
+            SqlSessionPermission.workspace_id == SqlConversationMetadata.workspace_id,
+            SqlSessionPermission.conversation_id == SqlConversationMetadata.id,
+            SqlSessionPermission.level >= LEVEL_OWNER,
+            or_(
+                SqlSessionPermission.user_id == SqlProject.user_id,
+                SqlSessionPermission.user_id.in_(
+                    select(SqlProjectShare.user_id).where(
+                        SqlProjectShare.workspace_id == SqlProject.workspace_id,
+                        SqlProjectShare.project_id == SqlProject.id,
+                    )
+                ),
+            ),
+        )
+        .exists()
     )
+    return (
+        select(SqlConversationMetadata.id, SqlProject.user_id)
+        .join(
+            SqlProject,
+            (SqlProject.workspace_id == SqlConversationMetadata.workspace_id)
+            & (SqlProject.id == SqlConversationMetadata.project_id),
+        )
+        .where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlProject.id.in_(accessible_project_ids(user_id)),
+            participant_owned,
+        )
+    )
+
+
+def project_conversation_ids(user_id: str) -> Select[tuple[str]]:
+    """SELECT ids of sessions *user_id* reaches through project membership."""
+    return select(project_session_owners(user_id).subquery().c[0])
