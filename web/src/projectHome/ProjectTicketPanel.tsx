@@ -51,11 +51,13 @@ import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCommentBody } from "./TicketCommentBody";
+import { TicketFileLinks } from "./TicketFileLinks";
 import { TicketMarkdown, useTicketImageUpload } from "./ticketImages";
 import { TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
 import { useTicketSeen } from "./useTicketSeen";
+import { useProjectAgentSession } from "./useProjectAgentSession";
 import {
   useTicket,
   useTicketActions,
@@ -325,6 +327,8 @@ function TicketDetails({
   onClose: () => void;
 } & TicketExpansionProps) {
   const query = useTicket(projectId, ticketId);
+  // File paths in text without an authoring session resolve against the project's agent.
+  const projectSessionId = useProjectAgentSession(projectId).sessionId;
   const { update, comment } = useTicketActions(projectId);
   const [editing, setEditing] = useState(false);
   const lifecycle = useTicketLifecycleEnabled();
@@ -452,9 +456,11 @@ function TicketDetails({
               <section aria-label="Description" className="space-y-2">
                 <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Description</h3>
                 {ticket.description ? (
-                  <TicketMarkdown className="text-ui leading-relaxed">
-                    {ticket.description}
-                  </TicketMarkdown>
+                  <TicketFileLinks sessionId={projectSessionId}>
+                    <TicketMarkdown className="text-ui leading-relaxed">
+                      {ticket.description}
+                    </TicketMarkdown>
+                  </TicketFileLinks>
                 ) : (
                   <Button
                     variant="ghost"
@@ -918,6 +924,7 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
   const query = useTicketEvents(projectId, ticket.id);
   const now = useNow();
   const viewerId = useViewerId();
+  const projectSessionId = useProjectAgentSession(projectId).sessionId;
   const events = query.data?.pages.flatMap((page) => page.data) ?? [];
   const { dividerPosition, dividerRef } = useTicketSeen({
     projectId,
@@ -932,7 +939,13 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
   const entries = groupAgentNotes(events);
   const hasAgentNotes = entries.some((entry) => Array.isArray(entry));
   const renderItem = (event: TicketEvent) => (
-    <TicketActivityItem key={event.id} event={event} nowMs={now.getTime()} viewerId={viewerId} />
+    <TicketActivityItem
+      key={event.id}
+      event={event}
+      nowMs={now.getTime()}
+      viewerId={viewerId}
+      fallbackSessionId={projectSessionId}
+    />
   );
   return (
     <section aria-label="Ticket activity" className="space-y-4 border-t border-border/60 pt-5">
@@ -1055,10 +1068,12 @@ function TicketActivityItem({
   event,
   nowMs,
   viewerId,
+  fallbackSessionId,
 }: {
   event: TicketEvent;
   nowMs: number;
   viewerId: string | null;
+  fallbackSessionId: string | null;
 }) {
   const note = event.kind === "comment" || event.kind === "execution";
   const body = typeof event.payload.text === "string" ? event.payload.text : null;
@@ -1132,7 +1147,11 @@ function TicketActivityItem({
             {involvement}
           </p>
         )}
-        {body && <TicketCommentBody body={body} />}
+        {body && (
+          <TicketFileLinks sessionId={event.session_id ?? fallbackSessionId}>
+            <TicketCommentBody body={body} />
+          </TicketFileLinks>
+        )}
       </div>
     </li>
   );
