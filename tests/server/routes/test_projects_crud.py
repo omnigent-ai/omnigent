@@ -692,6 +692,15 @@ async def test_review_routes_worker_and_reviewer_and_binds_approval_to_a_commit(
     labels = [{"key": "approved", "value": first}]
     refused = await project_client.patch(path, json={"labels": labels}, headers=as_worker)
     assert refused.status_code == 403
+    for key in ("owner-ok", "risk-ok"):
+        sign_off = [{"key": key, "value": first}]
+        for headers in (as_worker, as_reviewer):
+            denied = await project_client.patch(path, json={"labels": sign_off}, headers=headers)
+            assert denied.status_code == 403, denied.text
+        preset = await project_client.post(
+            tickets, json={"title": "Preset", "labels": sign_off}, headers=as_worker
+        )
+        assert preset.status_code == 403, preset.text
     malformed = [{"key": "approved", "value": "abc"}]
     bad = await project_client.patch(path, json={"labels": malformed}, headers=as_reviewer)
     assert bad.status_code == 400

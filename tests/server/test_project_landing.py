@@ -54,6 +54,10 @@ class FakeTickets:
             }
         )
 
+    def unlabel(self, key: str, *, user_id: str | None = None) -> None:
+        self.ticket["labels"] = [label for label in self.ticket["labels"] if label["key"] != key]
+        self.label("note", key, user_id=user_id)
+
     def get(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return dict(self.ticket)
 
@@ -168,13 +172,17 @@ async def test_members_cannot_stand_in_for_the_owner_and_outside_prs_need_owner_
     world.tickets.label("risk-ok", "yes", user_id="member@example.com")
     with pytest.raises(OmnigentError, match="risk-ok"):
         await submit(world, sha)
+    world.tickets.unlabel("risk-ok", user_id="owner@example.com")
     world.tickets.label("risk-ok", "yes", user_id="owner@example.com")
     world.tickets.ticket["requested_by"] = "github:octocat"
     with pytest.raises(OmnigentError, match="owner-ok"):
         await submit(world, sha)
-    world.tickets.label("owner-ok", sha, user_id="member@example.com")
+    # An agent's owner-ok isn't adopted when the owner later edits other labels.
+    world.tickets.label("owner-ok", sha, session_id="pr-worker")
+    world.tickets.label("needs-human", "", user_id="owner@example.com")
     with pytest.raises(OmnigentError, match="owner-ok"):
         await submit(world, sha)
+    world.tickets.unlabel("owner-ok", user_id="owner@example.com")
     world.tickets.label("owner-ok", sha, user_id="owner@example.com")
     assert (await submit(world, sha))["queued"]
 

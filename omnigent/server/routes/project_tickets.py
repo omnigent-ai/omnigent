@@ -334,31 +334,48 @@ def create_project_tickets_router(
             )
         return TicketActor(user_id, source.id, source.agent_id)
 
-    async def refuse_member_approval(
+    async def refuse_owner_label_change(
         request: Request,
         project_id: str,
-        before: dict[str, Any],
-        body: UpdateTicket,
+        before_labels: list[dict[str, Any]] | None,
+        after_labels: list[dict[str, Any]],
         who: TicketActor,
     ) -> None:
-        """Approval labels are the owner's: a shared member can't set or change them."""
-        after = [label.model_dump() for label in body.labels or []]
+        """Owner sign-off labels are the owner's own edit.
+
+        ``owner-ok`` and ``risk-ok`` refuse any agent session and any person but the
+        owner; ``approved`` refuses people other than the owner (the Reviewer's session
+        is checked separately).
+        """
         changed = [
             key
             for key in (APPROVED_LABEL, RISK_OK_LABEL, github_pr_intake.OWNER_OK_LABEL)
-            if label_value(after, key) != label_value(before.get("labels"), key)
+            if label_value(after_labels, key) != label_value(before_labels, key)
         ]
         if not changed:
             return
-        notifications = getattr(request.app.state, "project_ticket_notifications", None)
-        project = (
-            await asyncio.to_thread(
-                notifications.projects.get, before["project_id"] or project_id, user_id=who.user_id
+        agent_refused = [key for key in changed if key != APPROVED_LABEL]
+        if (who.session_id is not None or who.agent_id is not None) and agent_refused:
+            raise OmnigentError(
+                f"Only the project owner can set {', '.join(f'`{key}`' for key in agent_refused)}"
+                "; ask them on the ticket with needs-human",
+                code=ErrorCode.FORBIDDEN,
             )
+        if who.session_id is not None or who.agent_id is not None:
+            return
+        notifications = getattr(request.app.state, "project_ticket_notifications", None)
+        try:
+            normalized = uuid_to_bytes(project_id).hex()
+        except InvalidUuidError:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND) from None
+        project = (
+            await asyncio.to_thread(notifications.projects.get, normalized, user_id=who.user_id)
             if notifications is not None
             else None
         )
-        if project is not None and project.user_id != who.user_id:
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if project.user_id != who.user_id:
             raise OmnigentError(
                 f"Only the project owner can set {', '.join(f'`{key}`' for key in changed)}",
                 code=ErrorCode.FORBIDDEN,
@@ -568,6 +585,13 @@ def create_project_tickets_router(
         request: Request, project_id: str, body: CreateTicket
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
+        await refuse_owner_label_change(
+            request,
+            project_id,
+            [],
+            [label.model_dump() for label in body.labels],
+            who,
+        )
         with _storage_errors():
             ticket = await asyncio.to_thread(store.create, project_id, body, who)
         wake(request)
@@ -690,8 +714,14 @@ def create_project_tickets_router(
             raises_human_request = not _has_needs_human(before)
         before = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
         context = None
-        if body.labels is not None and who.session_id is None:
-            await refuse_member_approval(request, project_id, before, body, who)
+        if body.labels is not None:
+            await refuse_owner_label_change(
+                request,
+                project_id,
+                before.get("labels"),
+                [label.model_dump() for label in body.labels],
+                who,
+            )
         if body.labels is not None:
             approved_after = label_value(
                 [label.model_dump() for label in body.labels], APPROVED_LABEL

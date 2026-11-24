@@ -254,7 +254,8 @@ class LandingQueue:
     ) -> dict[tuple[str, str], list[dict]]:
         """Each current ``(key, value)`` label, with every event that set or kept it since it
         last appeared. Edits replace the whole label list, so a later edit that merely keeps a
-        label is listed too; a gate trusts the label if any of those events is trusted.
+        label is listed too. ``approved`` is trusted if any of those events is trusted, since
+        the Reviewer may re-assert it; owner sign-offs only by the event that introduced them.
         """
         tickets = self._notifications.tickets
         setters: dict[tuple[str, str], list[dict]] = {}
@@ -328,8 +329,8 @@ class LandingQueue:
             raise refuse("The `approved` label wasn't set by the Reviewer's session or the owner")
         if RISK_LABEL in labels:
             risk_ok = setters.get((RISK_OK_LABEL, labels.get(RISK_OK_LABEL, "")), [])
-            if RISK_OK_LABEL not in labels or not any(
-                self._is_owner(project, event) for event in risk_ok
+            if RISK_OK_LABEL not in labels or not self._is_owner(
+                project, risk_ok[0] if risk_ok else None
             ):
                 raise refuse(
                     f"The ticket has `risk: {labels[RISK_LABEL]}`; "
@@ -337,8 +338,8 @@ class LandingQueue:
                 )
         if is_outside_requester(ticket.get("requested_by")):
             owner_ok = setters.get((OWNER_OK_LABEL, sha), [])
-            if labels.get(OWNER_OK_LABEL) != sha or not any(
-                self._is_owner(project, event) for event in owner_ok
+            if labels.get(OWNER_OK_LABEL) != sha or not self._is_owner(
+                project, owner_ok[0] if owner_ok else None
             ):
                 raise refuse(
                     f"This change came from an outside pull request "
