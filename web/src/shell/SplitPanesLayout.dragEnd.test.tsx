@@ -137,6 +137,20 @@ describe("a divider drag that ends unsaved", () => {
     expect(onResize).toHaveBeenCalledWith([{ path: [], ratio: 0.3 }]);
   });
 
+  it("ends a drag that follows its pointer once the layout drops it, logging only the layout's reason", () => {
+    const onResize = vi.fn();
+    const { rerender } = render(<View split={SPLIT} onResize={onResize} />);
+    const divider = pressDivider();
+    // The capture ends while the divider is still shown, so the drag follows the pointer.
+    fireEvent.lostPointerCapture(divider, { pointerId: 1 });
+    rerender(<View split={undefined} onResize={onResize} />);
+    // The document no longer follows it: a cancel or a release there does nothing more.
+    fireEvent.pointerCancel(document.body, { pointerId: 1 });
+    fireEvent.pointerUp(document.body, { pointerId: 1 });
+    expect(logged()).toEqual([ended("split-hidden")]);
+    expect(onResize).not.toHaveBeenCalled();
+  });
+
   it("logs the layout's reason once, though the pointer is let go after it", () => {
     const { rerender } = render(<View split={SPLIT} />);
     const divider = pressDivider();
