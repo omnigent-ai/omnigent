@@ -3628,6 +3628,68 @@ async def test_a_github_info_poll_stops_waiting_for_a_tunnelled_runner_after_its
     assert queries == ["allow_cached=true", ""]
 
 
+@pytest.mark.asyncio
+async def test_github_info_serves_a_tunnelled_runner_answer_that_arrives_in_time(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner that answers over the tunnel before the PR read's bound is served unchanged."""
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        HelloFrame,
+        ResponseBodyFrame,
+        ResponseEndFrame,
+        ResponseHeadFrame,
+    )
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.server.routes.sessions import routes_resources
+
+    class _QuietRunnerSocket:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    registry = TunnelRegistry()
+    hello = HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+    registry.register("runner_one", _QuietRunnerSocket(), hello)
+    runner_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"),
+        base_url="http://runner",
+        timeout=httpx.Timeout(5.0, read=None),
+    )
+    set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
+    # The bound outlasts this runner's answer; servers without a bound wait regardless.
+    monkeypatch.setattr(routes_resources, "_PR_INFO_RUNNER_TIMEOUT_S", budget(5), raising=False)
+    payload = {"object": "session.github.info", "available": True, "pr": None}
+
+    read = asyncio.create_task(
+        client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github")
+    )
+    session = registry.get("runner_one")
+    assert session is not None
+    await poll_until_async(lambda: len(session.in_flight) == 1, timeout_s=budget(5))
+    request_id = next(iter(session.in_flight))
+    await asyncio.sleep(0.2)
+    registry.route_response_frame(
+        "runner_one",
+        ResponseHeadFrame(
+            id=request_id, status=200, headers=[["content-type", "application/json"]]
+        ),
+    )
+    await asyncio.sleep(0.2)
+    registry.route_response_frame(
+        "runner_one", ResponseBodyFrame(id=request_id, body=json.dumps(payload), encoding="utf-8")
+    )
+    registry.route_response_frame("runner_one", ResponseEndFrame(id=request_id))
+    resp = await asyncio.wait_for(read, timeout=budget(5))
+    await runner_client.aclose()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == payload
+    assert not session.in_flight
+
+
 def _pr_app(db_uri: str, **router_options: Any) -> FastAPI:
     """App whose sessions keep their pull requests in a real SQLite store."""
     SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)
