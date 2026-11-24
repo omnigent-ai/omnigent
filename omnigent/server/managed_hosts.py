@@ -458,8 +458,9 @@ def host_slice_key_enabled(labels: Mapping[str, str], host_id: str) -> bool:
     """
     Whether a session's managed host routes by its own id.
 
-    Only when the create or fork chose this host id, so the caller routes by it from
-    the start; otherwise the host stays on the caller's default replica.
+    Only when the launch requested this host id: chosen by the create or fork, or
+    minted by the server for a keyed request, so callers can route by it; otherwise
+    the host stays on the caller's default replica.
 
     :param labels: The session's labels.
     :param host_id: The session's managed host.
