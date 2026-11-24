@@ -9,6 +9,7 @@ from omnigent.runtime.project_ticket_instructions import (
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
 from omnigent.runtime.prompt import append_framework_instructions
+from omnigent.runtime.side_chat_instructions import side_chat_instruction
 from omnigent.spec import AgentSpec
 
 PROJECT_ORCHESTRATOR_INSTRUCTION = (
@@ -140,8 +141,8 @@ async def project_instructions(
 
     Blocks follow a fixed order: the mandate, then the identity persona or the
     Lead's charter, then conversation and ticket guidance, then the orchestrator
-    role. The mandate, persona and charter reach their sessions without project
-    tools; the rest need them.
+    role, then the side-chat note. The mandate, persona, charter and side-chat
+    note reach their sessions without project tools; the rest need them.
     """
     if server_client is None or spec is None:
         return None
@@ -163,6 +164,7 @@ async def project_instructions(
         PROJECT_CONVERSATION_INSTRUCTION if in_ticket_project else None,
         PROJECT_TICKET_WORK_INSTRUCTION if in_ticket_project else None,
         PROJECT_ORCHESTRATOR_INSTRUCTION if has_project_tools and designated is True else None,
+        side_chat_instruction(snapshot.get("side_chat_parent_id")),
     )
     return "\n\n".join(block for block in blocks if block) or None
 

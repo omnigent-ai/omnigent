@@ -14,6 +14,7 @@ from omnigent.runtime.project_ticket_instructions import (
     PROJECT_CONVERSATION_INSTRUCTION,
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
+from omnigent.runtime.side_chat_instructions import side_chat_instruction
 from omnigent.spec.types import AgentSpec, ToolGroupsConfig
 from omnigent.tools.builtins.project_tickets import SysTicketCreateTool
 
@@ -200,6 +201,28 @@ async def test_lead_charter_follows_the_mandate_and_precedes_ticket_guidance_and
         < prompt.index(PROJECT_ORCHESTRATOR_INSTRUCTION)
     )
     assert project_lead_charter_instruction("  ") is None
+
+
+@pytest.mark.parametrize("projects", [True, False])
+async def test_side_chat_of_any_session_is_told_to_hand_back_to_its_main_session(projects):
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=projects))
+    snapshot = {"side_chat_parent_id": "main-session"}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=snapshot)),
+        base_url="http://server.test",
+    ) as client:
+        prompt = await append_project_instructions("Author", client, "session", spec)
+    note = side_chat_instruction("main-session")
+    assert note is not None
+    assert prompt == f"Author\n\n{note}"
+    assert 'sys_session_message (session_id="main-session")' in note
+    assert "never interrupts" in note
+    assert PROJECT_ORCHESTRATOR_INSTRUCTION not in prompt
+
+
+@pytest.mark.parametrize("parent", [None, "", "  ", 3])
+def test_ordinary_session_gets_no_side_chat_note(parent):
+    assert side_chat_instruction(parent) is None
 
 
 @pytest.mark.parametrize("mandate", [None, "", "   ", 7])
