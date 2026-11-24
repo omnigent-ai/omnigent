@@ -49,6 +49,24 @@ export function formatMessageTimestamp(epochSeconds: number, now: Date = new Dat
   return `${day}, ${time}`;
 }
 
+/**
+ * When a file was uploaded, for file lists: "Just now", "5 min ago", "Today 2:41 PM",
+ * "Yesterday 9:05 AM", then the message-timestamp form for older days.
+ */
+export function formatUploadTime(epochSeconds: number, now: Date = new Date()): string {
+  if (!Number.isFinite(epochSeconds)) return "";
+  const date = new Date(epochSeconds * 1000);
+  const diff = Math.max(0, now.getTime() - date.getTime());
+  if (diff < MIN_MS) return "Just now";
+  if (diff < HOUR_MS) return `${Math.floor(diff / MIN_MS)} min ago`;
+  const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  if (date.toDateString() === now.toDateString()) return `Today ${time}`;
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return `Yesterday ${time}`;
+  return formatMessageTimestamp(epochSeconds, now);
+}
+
 export function absoluteTime(timestampMs: number): string {
   // Guard the same non-finite case as relativeTime — `new Date(NaN)` renders
   // "Invalid Date" in the row's tooltip.

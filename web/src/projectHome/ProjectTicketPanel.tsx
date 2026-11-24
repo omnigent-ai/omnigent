@@ -36,6 +36,7 @@ import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { WorkspaceFileIcon } from "@/shell/WorkspaceFileIcon";
+import { FileUploadTime } from "./ProjectFiles";
 import { ProjectOrchestrator } from "./ProjectOrchestrator";
 import {
   createTicket,
@@ -868,6 +869,8 @@ function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: s
         ] as const
       ).map(([type, label]) => {
         const group = outputs.filter((output) => output.type === type);
+        // Activity loads oldest first; files read newest first, like the project Files list.
+        if (type === "artifact") group.reverse();
         return group.length > 0 ? (
           <section key={type} aria-label={label} className="space-y-2">
             <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">{label}</h3>
@@ -969,7 +972,14 @@ function TicketArtifactLink({ output, inline }: { output: TicketOutput; inline: 
         {!inline && (
           <span className="block text-sm text-muted-foreground">
             {error ??
-              (file.data ? `Project file · ${formatBytes(file.data.bytes)}` : "Project file")}
+              (file.data ? (
+                <>
+                  {`Project file · ${formatBytes(file.data.bytes)} · `}
+                  <FileUploadTime createdAt={file.data.created_at} />
+                </>
+              ) : (
+                "Project file"
+              ))}
           </span>
         )}
       </span>

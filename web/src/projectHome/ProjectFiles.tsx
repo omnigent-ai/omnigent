@@ -6,7 +6,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Spinner } from "@/components/ui/spinner";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { listProjectFiles, openProjectFile, type ProjectFile } from "@/lib/projectTicketsApi";
-import { relativeTime } from "@/lib/relativeTime";
+import { absoluteTime, formatUploadTime } from "@/lib/relativeTime";
 import { Link, useSearchParams } from "@/lib/routing";
 import { WorkspaceFileIcon } from "@/shell/WorkspaceFileIcon";
 import { ticketPanelSearch } from "./projectHomeNavigation";
@@ -41,7 +41,7 @@ export function ProjectFiles({ projectId }: { projectId: string | null }) {
           <p className="p-3 text-sm text-destructive">{files.error.message}</p>
         ) : files.data?.length ? (
           <ul className="max-h-96 divide-y divide-border/60 overflow-y-auto">
-            {files.data.map((file) => (
+            {newestFirst(files.data).map((file) => (
               <ProjectFileRow key={file.id} file={file} />
             ))}
           </ul>
@@ -73,7 +73,7 @@ function ProjectFileRow({ file }: { file: ProjectFile }) {
       >
         <span className="block truncate text-sm font-medium hover:underline">{file.title}</span>
         <span className="block text-xs text-muted-foreground">
-          {error ?? relativeTime(file.created_at * 1000)}
+          {error ?? <FileUploadTime createdAt={file.created_at} />}
         </span>
       </button>
       {file.ticket_id && (
@@ -85,5 +85,22 @@ function ProjectFileRow({ file }: { file: ProjectFile }) {
         </Link>
       )}
     </li>
+  );
+}
+
+/** Newest upload first; uploads in the same second keep the server's order. */
+function newestFirst(files: ProjectFile[]): ProjectFile[] {
+  return [...files].sort((a, b) => b.created_at - a.created_at);
+}
+
+/** A file's readable upload time, with the exact time on hover. */
+export function FileUploadTime({ createdAt }: { createdAt: number }) {
+  return (
+    <time
+      dateTime={new Date(createdAt * 1000).toISOString()}
+      title={absoluteTime(createdAt * 1000)}
+    >
+      {formatUploadTime(createdAt)}
+    </time>
   );
 }

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { absoluteTime, formatMessageTimestamp, relativeTime } from "./relativeTime";
+import {
+  absoluteTime,
+  formatMessageTimestamp,
+  formatUploadTime,
+  relativeTime,
+} from "./relativeTime";
 
 const NOW = new Date("2026-05-28T12:00:00Z").getTime();
 const MIN = 60_000;
@@ -85,5 +90,30 @@ describe("formatMessageTimestamp", () => {
     expect(stamp(new Date(2026, 10, 12, 8, 5))).toBe("8:05 AM");
     expect(stamp(new Date(2026, 10, 11, 20, 56))).toBe("Nov 11, 8:56 PM");
     expect(stamp(new Date(2025, 10, 11, 20, 56))).toBe("Nov 11, 2025, 8:56 PM");
+  });
+});
+
+describe("formatUploadTime", () => {
+  const now = new Date(2026, 10, 24, 15, 30);
+  const at = (date: Date) => date.getTime() / 1000;
+  const time = (date: Date) =>
+    date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+  it("reads recent uploads relatively", () => {
+    expect(formatUploadTime(at(new Date(2026, 10, 24, 15, 29, 40)), now)).toBe("Just now");
+    expect(formatUploadTime(at(new Date(2026, 10, 24, 15, 25)), now)).toBe("5 min ago");
+  });
+
+  it("names today and yesterday with the time", () => {
+    const today = new Date(2026, 10, 24, 9, 5);
+    const yesterday = new Date(2026, 10, 23, 22, 41);
+    expect(formatUploadTime(at(today), now)).toBe(`Today ${time(today)}`);
+    expect(formatUploadTime(at(yesterday), now)).toBe(`Yesterday ${time(yesterday)}`);
+  });
+
+  it("falls back to the dated form and renders nothing for bad input", () => {
+    const older = new Date(2026, 10, 20, 8, 0);
+    expect(formatUploadTime(at(older), now)).toBe(formatMessageTimestamp(at(older), now));
+    expect(formatUploadTime(Number.NaN, now)).toBe("");
   });
 });
