@@ -7228,6 +7228,52 @@
         "title": "ProjectSessionCreateRequest",
         "type": "object"
       },
+      "ProposeIdentityRequest": {
+        "additionalProperties": false,
+        "description": "Propose a new identity, or a new persona for an existing one, for the owner to accept.",
+        "properties": {
+          "identity_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity whose persona to replace; omit when proposing a new one.",
+            "title": "Identity Id"
+          },
+          "instructions": {
+            "description": "The proposed persona text, at most 8,000 UTF-8 bytes.",
+            "title": "Instructions",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Name of a new identity; omit when editing.",
+            "title": "Name"
+          },
+          "rationale": {
+            "default": "",
+            "description": "Why it is proposed, shown to the owner.",
+            "title": "Rationale",
+            "type": "string"
+          }
+        },
+        "required": [
+          "instructions"
+        ],
+        "title": "ProposeIdentityRequest",
+        "type": "object"
+      },
       "ProposeMandateRequest": {
         "additionalProperties": false,
         "description": "Request body for `POST /v1/projects/{project_id}/mandate/proposals`.",
@@ -21806,6 +21852,212 @@
           }
         },
         "summary": "Create Identity",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/identities/proposals": {
+      "get": {
+        "description": "List identity proposals waiting for the owner, oldest first.",
+        "operationId": "list_identity_proposals_v1_projects__project_id__identities_proposals_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Identity Proposals V1 Projects  Project Id  Identities Proposals Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Identity Proposals",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "description": "Queue a new identity or persona edit; agents may propose but never apply one.\n\n**Returns:** The pending proposal.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 for an unknown project, 400 for bad bounds or an unknown target, 409 for a taken name or a full queue.",
+        "operationId": "propose_identity_v1_projects__project_id__identities_proposals_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposeIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Propose Identity V1 Projects  Project Id  Identities Proposals Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Propose Identity",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/identities/proposals/{proposal_id}": {
+      "delete": {
+        "description": "Drop a proposal without changing any identity. Owner only.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent request, 404 for an unknown proposal.",
+        "operationId": "dismiss_identity_proposal_v1_projects__project_id__identities_proposals__proposal_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Dismiss Identity Proposal V1 Projects  Project Id  Identities Proposals  Proposal Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dismiss Identity Proposal",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/identities/proposals/{proposal_id}/accept": {
+      "post": {
+        "description": "Create or update the proposed identity. Owner only, never an agent tool.\n\n**Returns:** The created or updated identity.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent request, 404 for an unknown project, proposal or edited identity, 409 for a taken name.",
+        "operationId": "accept_identity_proposal_v1_projects__project_id__identities_proposals__proposal_id__accept_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Accept Identity Proposal V1 Projects  Project Id  Identities Proposals  Proposal Id  Accept Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Accept Identity Proposal",
         "tags": [
           "projects"
         ]

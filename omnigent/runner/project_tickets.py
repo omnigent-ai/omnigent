@@ -73,6 +73,21 @@ async def execute_ticket_tool(
                 },
                 ensure_ascii=False,
             )
+        if name == "sys_project_identity_propose":
+            if "identity_id" in body:
+                body["identity_id"] = uuid_to_bytes(body["identity_id"]).hex()
+            proposal = await request(
+                "POST", f"/v1/projects/{project_id}/identities/proposals", json=body
+            )
+            return json.dumps(
+                {
+                    "status": "pending_owner_approval",
+                    "proposal": proposal,
+                    "note": "Not in effect until the project owner accepts it in the "
+                    "project's Team dialog.",
+                },
+                ensure_ascii=False,
+            )
         path = f"/v1/projects/{project_id}/tickets"
         if ticket_id is not None:
             path += f"/{ticket_id}"

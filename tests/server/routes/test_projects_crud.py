@@ -427,6 +427,71 @@ async def test_mandate_proposals_are_bounded(project_client: httpx.AsyncClient) 
     assert missing.status_code == 404
 
 
+async def test_agent_identity_proposals_apply_only_when_the_owner_accepts(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Agents draft identities and persona edits; only the owner creates or changes them."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    source = created["main_session_id"]
+    agent = {ORCHESTRATION_SOURCE_HEADER: source}
+    identities = f"/v1/projects/{created['id']}/identities"
+    base = f"{identities}/proposals"
+    direct = await project_client.post(
+        identities, json={"name": "PM", "instructions": "x"}, headers=agent
+    )
+    assert direct.status_code == 403
+    pm = await project_client.post(
+        base,
+        json={"name": " PM ", "instructions": "You own the roadmap.", "rationale": "Asked."},
+        headers=agent,
+    )
+    assert pm.status_code == 200
+    assert pm.json()["kind"] == "create"
+    assert pm.json()["session_id"] == source
+    designer = (
+        await project_client.post(
+            base, json={"name": "Designer", "instructions": "You own the UI."}, headers=agent
+        )
+    ).json()
+    duplicate = await project_client.post(
+        base, json={"name": "pm", "instructions": "Again."}, headers=agent
+    )
+    assert duplicate.status_code == 409
+    listed = (await project_client.get(base)).json()["data"]
+    assert [entry["name"] for entry in listed] == ["PM", "Designer"]
+    assert [entry["name"] for entry in (await project_client.get(identities)).json()["data"]] == [
+        "Orchestrator"
+    ]
+
+    accept = f"{base}/{pm.json()['id']}/accept"
+    assert (await project_client.post(accept, headers=agent)).status_code == 403
+    assert (
+        await project_client.delete(f"{base}/{designer['id']}", headers=agent)
+    ).status_code == 403
+    accepted = (await project_client.post(accept)).json()
+    assert (accepted["name"], accepted["instructions"]) == ("PM", "You own the roadmap.")
+    dismissed = await project_client.delete(f"{base}/{designer['id']}")
+    assert dismissed.json()["deleted"] is True
+    assert (await project_client.get(base)).json()["data"] == []
+    names = [entry["name"] for entry in (await project_client.get(identities)).json()["data"]]
+    assert names == ["Orchestrator", "PM"]
+
+    edit = (
+        await project_client.post(
+            base,
+            json={"identity_id": accepted["id"], "instructions": "You own pricing."},
+            headers=agent,
+        )
+    ).json()
+    assert (edit["kind"], edit["name"]) == ("update", "PM")
+    updated = (await project_client.post(f"{base}/{edit['id']}/accept")).json()
+    assert (updated["id"], updated["instructions"]) == (accepted["id"], "You own pricing.")
+    both = await project_client.post(
+        base, json={"name": "X", "identity_id": accepted["id"], "instructions": "y"}
+    )
+    assert both.status_code == 400
+
+
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     """DELETE removes the project; a second delete 404s."""
     created = (await project_client.post("/v1/projects", json={"name": "Doomed"})).json()

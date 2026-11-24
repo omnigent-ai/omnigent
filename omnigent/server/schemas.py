@@ -6617,6 +6617,47 @@ class ProjectIdentityRequest(BaseModel):
     effort: str | None = None
 
 
+class ProposeIdentityRequest(BaseModel):
+    """Propose a new identity, or a new persona for an existing one, for the owner to accept.
+
+    :param name: Name of a new identity; omit when editing.
+    :param identity_id: Identity whose persona to replace; omit when proposing a new one.
+    :param instructions: The proposed persona text, at most 8,000 UTF-8 bytes.
+    :param rationale: Why it is proposed, shown to the owner.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    identity_id: str | None = None
+    instructions: str
+    rationale: str = ""
+
+
+class ProjectIdentityProposalObject(BaseModel):
+    """A pending identity proposal; it applies nothing until the owner accepts it.
+
+    :param id: Proposal id (bare 32-char hex).
+    :param kind: ``create`` for a new identity, ``update`` for a persona edit.
+    :param identity_id: The identity an edit targets, or ``None``.
+    :param name: The identity's name.
+    :param instructions: The proposed persona.
+    :param rationale: Why it was proposed; may be empty.
+    :param session_id: The proposing session, or ``None``.
+    :param created_at: Unix epoch seconds when proposed.
+    """
+
+    id: str
+    object: Literal["project.identity_proposal"] = "project.identity_proposal"
+    kind: Literal["create", "update"]
+    identity_id: str | None = None
+    name: str
+    instructions: str
+    rationale: str = ""
+    session_id: str | None = None
+    created_at: int
+
+
 class ProjectIdentitySessionRequest(BaseModel):
     """Open an identity's session, starting one when it has none.
 

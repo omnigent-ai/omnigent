@@ -18,7 +18,7 @@ from collections.abc import Callable
 from typing import Any, Literal, TypedDict, TypeVar
 
 from omnigent.entities import Project
-from omnigent.entities.project import MandateProposal, ProjectIdentity
+from omnigent.entities.project import MandateProposal, ProjectIdentity, ProjectIdentityProposal
 
 
 class ProjectOrderPreference(TypedDict):
@@ -263,6 +263,43 @@ class ProjectStore(ABC):
         """Compare-and-set the identity's active session; a repeat is idempotent.
 
         :raises OmnigentError: ``NOT_FOUND`` or ``CONFLICT`` when the pointer moved.
+        """
+        raise NotImplementedError
+
+    def list_identity_proposals(
+        self, project_id: str, *, user_id: str | None
+    ) -> builtins.list[ProjectIdentityProposal]:
+        """List an owned project's pending identity proposals, oldest first."""
+        raise NotImplementedError
+
+    def propose_identity(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        instructions: str,
+        name: str | None = None,
+        identity_id: str | None = None,
+        rationale: str = "",
+        session_id: str | None = None,
+    ) -> ProjectIdentityProposal | None:
+        """
+        Queue a new identity (*name*) or a persona edit (*identity_id*) for the owner.
+
+        :returns: The proposal, or ``None`` if the project is not found / not owned.
+        :raises OmnigentError: ``INVALID_INPUT`` for bad bounds or a missing target,
+            ``ALREADY_EXISTS`` for a taken name, ``CONFLICT`` when the queue is full.
+        """
+        raise NotImplementedError
+
+    def resolve_identity_proposal(
+        self, project_id: str, proposal_id: str, *, user_id: str | None, accept: bool
+    ) -> ProjectIdentity | None:
+        """
+        Accept a proposal, creating or updating its identity, or dismiss it.
+
+        :returns: The created or updated identity on accept, ``None`` on dismiss.
+        :raises OmnigentError: ``NOT_FOUND`` for an unknown project or proposal.
         """
         raise NotImplementedError
 

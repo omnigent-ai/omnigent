@@ -991,6 +991,33 @@ class SqlProjectIdentity(OmnigentBase):
     )
 
 
+class SqlProjectIdentityProposal(OmnigentBase):
+    """A proposed identity or persona edit awaiting the project owner; applies nothing."""
+
+    __tablename__ = "project_identity_proposals"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # The identity whose persona an edit replaces; NULL proposes a new identity.
+    identity_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    name: Mapped[str] = mapped_column(EnvelopedText(1024), nullable=False)
+    instructions: Mapped[str] = mapped_column(EnvelopedText(16383), nullable=False)
+    rationale: Mapped[str] = mapped_column(EnvelopedText(2048), nullable=False)
+    session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_project_identity_proposals_created",
+            "workspace_id",
+            "project_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+
 class SqlProjectTicket(OmnigentBase):
     """A project-owned outcome; its sessions and append-only history are separate."""
 

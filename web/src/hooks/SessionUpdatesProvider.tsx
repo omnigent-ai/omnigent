@@ -536,6 +536,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           void queryClient.invalidateQueries({ queryKey: ["project-config"] });
           // Agents' mandate proposals arrive this way too.
           void queryClient.invalidateQueries({ queryKey: ["project-mandate"] });
+          void queryClient.invalidateQueries({ queryKey: ["project-identity-proposals"] });
           return;
         case "access_changed":
           // The server decides whether the session now belongs in Shared.

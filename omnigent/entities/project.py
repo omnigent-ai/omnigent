@@ -115,3 +115,35 @@ class ProjectIdentity:
     active_session_id: str | None = None
     created_at: int = 0
     updated_at: int | None = None
+
+
+@dataclass(frozen=True)
+class ProjectIdentityProposal:
+    """
+    A proposed new identity, or a new persona for an existing one, awaiting the owner.
+
+    It changes no identity and reaches no instructions until the owner accepts it.
+
+    :param id: Proposal id (bare 32-char hex).
+    :param project_id: The owning project.
+    :param name: The proposed identity's name; for an edit, the target's name when proposed.
+    :param instructions: The proposed persona text.
+    :param rationale: Why the agent proposed it, shown to the owner; may be empty.
+    :param identity_id: The identity whose persona an edit replaces, or ``None`` to create one.
+    :param session_id: The proposing session, or ``None`` for the owner.
+    :param created_at: Unix epoch seconds when it was proposed.
+    """
+
+    id: str
+    project_id: str
+    name: str
+    instructions: str
+    rationale: str = ""
+    identity_id: str | None = None
+    session_id: str | None = None
+    created_at: int = 0
+
+
+# Most identity proposals that may wait for the owner, and most UTF-8 bytes of a rationale.
+IDENTITY_PROPOSALS_MAX_PENDING = 10
+IDENTITY_PROPOSAL_RATIONALE_MAX_BYTES = 1_000

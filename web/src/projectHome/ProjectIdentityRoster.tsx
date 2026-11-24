@@ -8,7 +8,11 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { openProjectIdentitySession, type ProjectIdentity } from "@/lib/projectsApi";
 import { useNavigate } from "@/lib/routing";
 import { ProjectTeamDialog } from "./ProjectTeamDialog";
-import { projectIdentitiesKey, useProjectIdentities } from "./useProjectIdentities";
+import {
+  projectIdentitiesKey,
+  useProjectIdentities,
+  useProjectIdentityProposals,
+} from "./useProjectIdentities";
 
 /**
  * The project's owner-defined identities beside the Orchestrator button. Each
@@ -26,6 +30,7 @@ export function ProjectIdentityRoster({
   const client = useQueryClient();
   const [editing, setEditing] = useState(false);
   const identities = useProjectIdentities(projectId);
+  const proposed = useProjectIdentityProposals(projectId).data?.length ?? 0;
   const open = useMutation({
     mutationFn: (identity: ProjectIdentity) =>
       openProjectIdentitySession(projectId as string, identity.id, identity.active_session_id),
@@ -79,17 +84,22 @@ export function ProjectIdentityRoster({
           <Button
             type="button"
             variant="ghost"
-            size="icon-sm"
-            aria-label="Edit team"
+            size={proposed > 0 ? "sm" : "icon-sm"}
+            aria-label={proposed > 0 ? `Edit team, ${proposed} proposed` : "Edit team"}
             data-testid="project-edit-team"
-            className="text-muted-foreground"
+            className={proposed > 0 ? "text-foreground" : "text-muted-foreground"}
             onClick={() => setEditing(true)}
           >
             <UsersIcon />
+            {proposed > 0 && <span data-testid="project-team-proposed-count">{proposed}</span>}
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          {open.error ? `Could not open: ${open.error.message}` : "Team"}
+          {open.error
+            ? `Could not open: ${open.error.message}`
+            : proposed > 0
+              ? "Review proposed identities"
+              : "Team"}
         </TooltipContent>
       </Tooltip>
       {editing && (

@@ -30,6 +30,7 @@ from omnigent.server import session_live_state
 from omnigent.server.auth import AuthProvider
 from omnigent.server.project_identities import (
     ORCHESTRATOR_IDENTITY_ID,
+    identity_proposal_response,
     identity_response,
     identity_session_state,
     orchestrator_identity_response,
@@ -53,6 +54,7 @@ from omnigent.server.schemas import (
     ProjectIdentitySessionRequest,
     ProjectOrderRequest,
     ProjectOrderResponse,
+    ProposeIdentityRequest,
     ProposeMandateRequest,
     UpdateProjectRequest,
 )
@@ -430,7 +432,8 @@ def create_projects_router(
         """Identities shape agents' personas, so only the project owner edits them."""
         if ORCHESTRATION_SOURCE_HEADER in request.headers:
             raise OmnigentError(
-                "Only the project owner can change a project's identities",
+                "Only the project owner can change a project's identities; propose one "
+                "with sys_project_identity_propose instead",
                 code=ErrorCode.FORBIDDEN,
             )
 
@@ -467,6 +470,110 @@ def create_projects_router(
             await _identity_payload(project, identity) for identity in identities
         ]
         return {"object": "list", "data": data}
+
+    def _source_session(request: Request) -> str | None:
+        source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        try:
+            return uuid_to_bytes(source).hex() if source else None
+        except (InvalidUuidError, ValueError):
+            return None
+
+    @router.get("/projects/{project_id}/identities/proposals")
+    async def list_identity_proposals(request: Request, project_id: str) -> dict[str, Any]:
+        """List identity proposals waiting for the owner, oldest first."""
+        user_id = require_user(request, auth_provider)
+        project = await _owned_project(project_id, user_id)
+        proposals = await asyncio.to_thread(
+            project_store.list_identity_proposals, project.id, user_id=user_id
+        )
+        return {"object": "list", "data": [identity_proposal_response(p) for p in proposals]}
+
+    @router.post("/projects/{project_id}/identities/proposals")
+    async def propose_identity(
+        request: Request, project_id: str, body: ProposeIdentityRequest
+    ) -> dict[str, Any]:
+        """Queue a new identity or persona edit; agents may propose but never apply one.
+
+        :returns: The pending proposal.
+        :raises OmnigentError: 404 for an unknown project, 400 for bad bounds or
+            an unknown target, 409 for a taken name or a full queue.
+        """
+        user_id = require_user(request, auth_provider)
+        await _require_private_source(request, user_id)
+        project = await _owned_project(project_id, user_id)
+        target = _identity_id(body.identity_id) if body.identity_id is not None else None
+        source_session = _source_session(request)
+        proposal = await asyncio.to_thread(
+            project_store.propose_identity,
+            project.id,
+            user_id=user_id,
+            instructions=body.instructions,
+            name=body.name,
+            identity_id=target,
+            rationale=body.rationale,
+            session_id=source_session,
+        )
+        if proposal is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if source_session is not None:
+            # The owner must accept or dismiss it, so the proposing session needs their eyes.
+            session_live_state.raise_attention(source_session)
+        announce_projects_changed(user_id)
+        return identity_proposal_response(proposal)
+
+    def _refuse_agent_proposal_resolution(request: Request) -> None:
+        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+            raise OmnigentError(
+                "Only the project owner can accept or dismiss an identity proposal",
+                code=ErrorCode.FORBIDDEN,
+            )
+
+    @router.post("/projects/{project_id}/identities/proposals/{proposal_id}/accept")
+    async def accept_identity_proposal(
+        request: Request, project_id: str, proposal_id: str
+    ) -> dict[str, Any]:
+        """Create or update the proposed identity. Owner only, never an agent tool.
+
+        :returns: The created or updated identity.
+        :raises OmnigentError: 403 for an agent request, 404 for an unknown
+            project, proposal or edited identity, 409 for a taken name.
+        """
+        user_id = require_user(request, auth_provider)
+        _refuse_agent_proposal_resolution(request)
+        project = await _owned_project(project_id, user_id)
+        identity = await asyncio.to_thread(
+            project_store.resolve_identity_proposal,
+            project.id,
+            _identity_id(proposal_id),
+            user_id=user_id,
+            accept=True,
+        )
+        if identity is None:
+            raise OmnigentError("Identity proposal not found", code=ErrorCode.NOT_FOUND)
+        announce_projects_changed(user_id)
+        return await _identity_payload(project, identity)
+
+    @router.delete("/projects/{project_id}/identities/proposals/{proposal_id}")
+    async def dismiss_identity_proposal(
+        request: Request, project_id: str, proposal_id: str
+    ) -> dict[str, Any]:
+        """Drop a proposal without changing any identity. Owner only.
+
+        :raises OmnigentError: 403 for an agent request, 404 for an unknown proposal.
+        """
+        user_id = require_user(request, auth_provider)
+        _refuse_agent_proposal_resolution(request)
+        project = await _owned_project(project_id, user_id)
+        normalized = _identity_id(proposal_id)
+        await asyncio.to_thread(
+            project_store.resolve_identity_proposal,
+            project.id,
+            normalized,
+            user_id=user_id,
+            accept=False,
+        )
+        announce_projects_changed(user_id)
+        return {"id": normalized, "object": "project.identity_proposal.deleted", "deleted": True}
 
     @router.post("/projects/{project_id}/identities")
     async def create_identity(

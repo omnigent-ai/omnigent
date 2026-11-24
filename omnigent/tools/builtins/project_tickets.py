@@ -4,7 +4,11 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from omnigent.entities.project import MANDATE_PROPOSAL_MAX_BYTES
+from omnigent.entities.project import (
+    IDENTITY_PROPOSAL_RATIONALE_MAX_BYTES,
+    MANDATE_PROPOSAL_MAX_BYTES,
+    PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
+)
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
@@ -85,6 +89,39 @@ class ProposeMandateAddition(BaseModel):
             "the project, e.g. 'Run the UI tests before moving a ticket to review.'"
         ),
     )
+
+
+class ProposeIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=60,
+        description="Name of a new identity, e.g. 'PM' or 'Designer'. Omit when editing.",
+    )
+    identity_id: str | None = Field(
+        default=None,
+        description="ID of an existing identity whose persona to replace. Omit for a new one.",
+    )
+    instructions: str = Field(
+        min_length=1,
+        max_length=PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
+        description=(
+            "The complete persona, written to the identity in the second person, e.g. 'You are "
+            "the project's PM. You own the roadmap and write ticket descriptions.'"
+        ),
+    )
+    rationale: str | None = Field(
+        default=None,
+        max_length=IDENTITY_PROPOSAL_RATIONALE_MAX_BYTES,
+        description="One or two sentences for the owner on why, e.g. what the user asked for.",
+    )
+
+    @model_validator(mode="after")
+    def _one_target(self) -> "ProposeIdentity":
+        if (self.name is None) == (self.identity_id is None):
+            raise ValueError("Give name for a new identity or identity_id to edit one, not both")
+        return self
 
 
 class _TicketTool(Tool):
@@ -239,6 +276,23 @@ class SysProjectMandateProposeTool(_TicketTool):
         return cls.help_text
 
 
+class SysProjectIdentityProposeTool(_TicketTool):
+    tool_name = "sys_project_identity_propose"
+    help_text = (
+        "Propose a project identity (a named persistent role such as a PM or Designer, whose "
+        "persona is added to every session working as it), or a new persona for an existing "
+        "identity. Use it when the user asks you to set up roles; call once per identity. "
+        "Nothing changes until the owner accepts it in the project's Team dialog, so tell the "
+        "user it is waiting for them and never claim it exists before then. Agents cannot "
+        "create, edit or delete identities directly. Scoped to this session's project."
+    )
+    arguments = ProposeIdentity
+
+    @classmethod
+    def description(cls) -> str:
+        return cls.help_text
+
+
 class SaveProjectArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str = Field(
@@ -281,6 +335,7 @@ TICKET_TOOL_CLASSES = (
     SysSessionLinkTicketTool,
     SysTicketLinkTool,
     SysProjectMandateProposeTool,
+    SysProjectIdentityProposeTool,
     SysProjectArtifactSaveTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}

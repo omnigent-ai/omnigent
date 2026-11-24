@@ -190,7 +190,14 @@ automatically. Each identity works in **one session at a time**.
   not move stages.
 - Do not start a second session for an identity that already has a running one.
   Leave its next assigned ticket queued and message its session when it is idle.
-- Identities are owner-edited; never create, rename or rewrite them.
+- Identities are owner-edited. When the user asks you to set up roles ("give us
+  a PM and a Designer") or change a persona, propose each one with
+  `sys_project_identity_propose`: a short name, a complete second-person
+  persona, and a one-line rationale. Pass `identity_id` instead of `name` to
+  propose a new persona for an existing identity. Tell the user the proposals
+  wait for them in the project's Team dialog, and never claim an identity exists
+  before they accept it. Never create, rename, rewrite or delete identities
+  directly.
 
 ## Delegate to nested agents
 
