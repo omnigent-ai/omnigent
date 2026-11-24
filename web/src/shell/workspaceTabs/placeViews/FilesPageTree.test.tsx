@@ -31,7 +31,11 @@ import {
 } from "@/shell/filesPane/useTreeFilters";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
+import { toast } from "sonner";
+
 import { FilesPageTree } from "./FilesPageTree";
+
+vi.mock("sonner", () => ({ toast: { info: vi.fn() } }));
 
 const captured = vi.hoisted(() => ({ tree: null as ComponentProps<typeof FilesTree> | null }));
 
@@ -318,6 +322,27 @@ describe("FilesPageTree", () => {
     expect(captured.tree?.activeReveal).toBeNull();
   });
 
+  it("says why a reveal found nothing, and offers ignored files while they're off", () => {
+    vi.mocked(toast.info).mockClear();
+    const { onShowIgnored } = renderTree(listed([entry("README.md")]), false, {
+      showIgnored: false,
+    });
+    act(() => captured.tree?.onActiveRevealMissed?.("artifact.log"));
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith(
+      "artifact.log isn’t in the Files tree. Git may ignore it, and ignored files are hidden.",
+      { action: { label: "Show git-ignored files", onClick: onShowIgnored } },
+    );
+    cleanup();
+
+    vi.mocked(toast.info).mockClear();
+    renderTree(listed([entry("README.md")]));
+    act(() => captured.tree?.onActiveRevealMissed?.("gone.ts"));
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith(
+      "gone.ts isn’t in the Files tree. It may have moved or been deleted.",
+      {},
+    );
+  });
+
   describe("name filter", () => {
     const filterButton = () => screen.getByRole("button", { name: "Filter Files Tree by Name" });
     const nameField = () => screen.getByRole("textbox", { name: "Name contains" });
@@ -346,7 +371,14 @@ describe("FilesPageTree", () => {
       expect(filterButton()).toHaveAttribute("aria-pressed", "true");
       expect(nameField()).toHaveFocus();
       typeName("button");
-      expect(searches().at(-1)).toEqual(["conv_1", "button", "", "", { enabled: true }, "src"]);
+      expect(searches().at(-1)).toEqual([
+        "conv_1",
+        "button",
+        "",
+        "",
+        { enabled: true, hideIgnored: false },
+        "src",
+      ]);
       expect(screen.getByTestId("tree-filter-strip")).toHaveTextContent(
         "Names containing “button”",
       );
@@ -366,6 +398,14 @@ describe("FilesPageTree", () => {
       expect(nameField()).toHaveValue("");
       expect(screen.getByTestId("files-tree")).toBeInTheDocument();
       expect(paletteLabels()).not.toContain("Clear Files Tree Filter");
+    });
+
+    it("searches without what Git ignores while ignored files are off, as the tree lists", () => {
+      vi.useFakeTimers();
+      renderTree(listed([entry("README.md")]), false, { showIgnored: false });
+      fireEvent.click(filterButton());
+      typeName("artifact");
+      expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: true });
     });
 
     it("ends the filter for the header's Reveal, so the whole tree shows the viewed file", () => {
@@ -412,7 +452,14 @@ describe("FilesPageTree", () => {
       fireEvent.click(filterButton());
       typeName("button");
       expect(nameField()).toHaveValue("button");
-      expect(searches().at(-1)).toEqual(["conv_1", "button", "", "", { enabled: true }, ""]);
+      expect(searches().at(-1)).toEqual([
+        "conv_1",
+        "button",
+        "",
+        "",
+        { enabled: true, hideIgnored: false },
+        "",
+      ]);
     });
 
     it("narrows the search with globs, which do nothing until a name is set", () => {

@@ -3,11 +3,13 @@
 // the browsed folder doesn't hold the file, and hands the tree one reveal at a time.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import { rememberBrowseLocation } from "../filesPane/browseLocations";
 import { activeFileTreePath } from "./activeFileTreePath";
 import type { FilesTreeActiveReveal } from "./FilesTree";
 import {
   type ActiveFileRevealPlan,
+  missedRevealMessage,
   planActiveFileReveal,
   useActiveFileRevealRequests,
 } from "./revealActiveFile";
@@ -21,6 +23,8 @@ export interface TreeActiveReveal {
   onActiveRevealHandled: (key: number) => void;
   /** Reveals the viewed file, as the header's button does. */
   revealActiveFile: () => void;
+  /** The tree's listings left out the file a reveal asked for: say why. */
+  onActiveRevealMissed: (file: string) => void;
 }
 
 interface PendingReveal {
@@ -38,6 +42,8 @@ export function useTreeActiveReveal({
   workspaceRoot,
   workspaceKnown,
   showHidden,
+  showIgnored,
+  onShowIgnored,
 }: {
   conversationId: string;
   /** The tree is on screen, so it takes up this session's reveal requests. */
@@ -50,6 +56,9 @@ export function useTreeActiveReveal({
   /** The workspace's root is known, or can't be, so a reveal can be planned. */
   workspaceKnown: boolean;
   showHidden: boolean;
+  /** The tree lists what Git ignores; otherwise a missed reveal offers to. */
+  showIgnored: boolean;
+  onShowIgnored?: () => void;
 }): TreeActiveReveal {
   const plan = planActiveFileReveal({ activePath, location, workspaceRoot, showHidden });
   const [pending, setPending] = useState<PendingReveal | null>(null);
@@ -104,5 +113,11 @@ export function useTreeActiveReveal({
     activeReveal: inScope ? pending.reveal : null,
     onActiveRevealHandled,
     revealActiveFile: () => reveal(activePath),
+    onActiveRevealMissed: (file) =>
+      toast.info(missedRevealMessage(file, showIgnored), {
+        ...(!showIgnored && onShowIgnored
+          ? { action: { label: "Show git-ignored files", onClick: onShowIgnored } }
+          : {}),
+      }),
   };
 }

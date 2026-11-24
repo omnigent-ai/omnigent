@@ -27,7 +27,11 @@ const file = (path: string): WorkspaceFile => ({
   modified_at: null,
 });
 
-function renderTree(rootEntries: readonly WorkspaceFile[], onFileSelect = vi.fn()) {
+function renderTree(
+  rootEntries: readonly WorkspaceFile[],
+  onFileSelect = vi.fn(),
+  extra: Partial<FilesTreeProps> = {},
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -47,6 +51,7 @@ function renderTree(rootEntries: readonly WorkspaceFile[], onFileSelect = vi.fn(
     onFileSelect,
     reveal,
     label: "Workspace files",
+    ...extra,
   });
   const view = render(<FilesTree {...props(rootEntries)} />, { wrapper });
   return {
@@ -150,6 +155,19 @@ describe("FilesTree", () => {
     fireEvent.click(await screen.findByRole("treeitem", { name: /README\.md/ }), { altKey: true });
 
     expect(tree.onFileSelect.mock.calls).toEqual([["README.md"]]);
+  });
+
+  it.each([
+    ["a file", "artifact.log"],
+    ["a file in a folder", "build/out.o"],
+  ])("says when its listing leaves out %s it was asked to reveal", async (_case, target) => {
+    const onActiveRevealMissed = vi.fn();
+    renderTree([file("README.md"), folder("src")], vi.fn(), {
+      activeFile: target,
+      activeReveal: { key: 1, file: target },
+      onActiveRevealMissed,
+    });
+    await waitFor(() => expect(onActiveRevealMissed).toHaveBeenCalledExactlyOnceWith(target));
   });
 
   it("reveals a folder asked for after it mounted, and again for a new request for the same folder", async () => {

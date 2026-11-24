@@ -75,6 +75,8 @@ export interface FilesTreeProps {
   activeReveal?: FilesTreeActiveReveal | null;
   /** The tree took up `activeReveal`, so the request can be let go. */
   onActiveRevealHandled?: (key: number) => void;
+  /** The listings left out the file `activeReveal` asked for, or a folder above it. */
+  onActiveRevealMissed?: (file: string) => void;
   label: string;
 }
 
@@ -435,7 +437,9 @@ function FilesTreeRows(props: FilesTreeProps) {
     file: props.activeFile ?? null,
     request: props.activeReveal ?? null,
     onRequestHandled: props.onActiveRevealHandled,
+    onRequestMissed: props.onActiveRevealMissed,
     present,
+    loadedFolders,
     cacheKey,
     containerRef,
   });
@@ -601,7 +605,9 @@ function useRevealActiveFile({
   file,
   request,
   onRequestHandled,
+  onRequestMissed,
   present,
+  loadedFolders,
   cacheKey,
   containerRef,
 }: {
@@ -610,7 +616,9 @@ function useRevealActiveFile({
   file: string | null;
   request: FilesTreeActiveReveal | null;
   onRequestHandled?: (key: number) => void;
+  onRequestMissed?: (file: string) => void;
   present: ReadonlySet<string>;
+  loadedFolders: ReadonlySet<string>;
   cacheKey: string;
   containerRef: React.RefObject<HTMLDivElement | null>;
 }) {
@@ -620,6 +628,8 @@ function useRevealActiveFile({
   const handledRequest = useRef<number | null>(null);
   const latestHandled = useRef(onRequestHandled);
   latestHandled.current = onRequestHandled;
+  const latestMissed = useRef(onRequestMissed);
+  latestMissed.current = onRequestMissed;
   useEffect(() => {
     if (file === null || revealedActiveFiles.get(cacheKey) === file) {
       pending.current = null;
@@ -658,12 +668,22 @@ function useRevealActiveFile({
       pending.current = null;
       revealedActiveFiles.set(cacheKey, current.file);
     };
+    // A listing that arrived without the path leaves nothing to reveal, e.g. what Git ignores.
+    const missing = (path: string) => {
+      if (!loadedFolders.has(parentFolder(path))) return false;
+      finish();
+      if (current.asked) latestMissed.current?.(current.file);
+      return true;
+    };
     const parts = current.file.split("/");
     for (let depth = 1; depth < parts.length; depth++) {
       const path = folderTreePath(parts.slice(0, depth).join("/"));
       const folder = asFolder(model.getItem(path));
-      // Its parent's listing hasn't arrived yet; the next sync carries on from here.
-      if (!folder) return;
+      if (!folder) {
+        missing(path);
+        // Otherwise its parent's listing hasn't arrived yet; the next sync carries on.
+        return;
+      }
       if (folder.isExpanded()) {
         current.seenOpen.add(path);
         continue;
@@ -674,10 +694,13 @@ function useRevealActiveFile({
       if (folder.isExpanded()) current.seenOpen.add(path);
     }
     // Scroll only once the file's own row exists, after every listing above it arrived.
-    if (!present.has(current.file)) return;
+    if (!present.has(current.file)) {
+      missing(current.file);
+      return;
+    }
     finish();
     const shown = displayedRowPath(model, current.file);
     selection.selectWithoutFocus(shown);
     scrollRowIntoView(model, treeRoot(containerRef.current), shown);
-  }, [model, selection, file, request, present, cacheKey, containerRef]);
+  }, [model, selection, file, request, present, loadedFolders, cacheKey, containerRef]);
 }

@@ -651,13 +651,20 @@ async function fetchWorkspaceFileSearch(
   exclude: string,
   location: string,
   signal?: AbortSignal,
+  hideIgnored = false,
 ): Promise<WorkspaceFileSearchResult> {
   // The workspace API only searches inside the workspace.
   if (!browseLocationBase(location)) {
     const viaApi = await searchFilesViaWorkspaceApi(
       conversationId,
       query,
-      { path: location, include, exclude, limit: FILE_SEARCH_LIMIT },
+      {
+        path: location,
+        include,
+        exclude,
+        limit: FILE_SEARCH_LIMIT,
+        includeGitIgnored: !hideIgnored,
+      },
       signal,
     );
     if (viaApi) {
@@ -729,6 +736,8 @@ export function useWorkspaceFileSearch(
   const trimmed = query.trim();
   const trimmedInclude = include?.trim() ?? "";
   const trimmedExclude = exclude?.trim() ?? "";
+  // Like a listing, REST has no way to leave ignored files out, so only the API's search does.
+  const hideIgnored = options.hideIgnored ?? false;
   return useQuery({
     queryKey: [
       "workspace-file-search",
@@ -737,6 +746,7 @@ export function useWorkspaceFileSearch(
       trimmedInclude,
       trimmedExclude,
       location,
+      ...ignoredKey(hideIgnored),
     ],
     // React Query aborts the signal when a newer query replaces this one.
     queryFn: ({ signal }) =>
@@ -747,6 +757,7 @@ export function useWorkspaceFileSearch(
         trimmedExclude,
         location,
         signal,
+        hideIgnored,
       ),
     enabled:
       (options.enabled ?? true) && !!conversationId && trimmed.length > 0 && serveable !== false,

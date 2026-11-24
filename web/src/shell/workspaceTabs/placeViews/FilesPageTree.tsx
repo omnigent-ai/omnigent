@@ -168,6 +168,8 @@ export function FilesPageTree({
     workspaceRoot,
     workspaceKnown: environment.data !== undefined || environment.isError,
     showHidden,
+    showIgnored,
+    onShowIgnored,
   });
   const away = planWorkingFolderReturn({ browsed, workspaceRoot }).availability.available;
   const folderName =
@@ -240,7 +242,8 @@ export function FilesPageTree({
     filters.applied.nameContains,
     filters.applied.include,
     filters.applied.exclude,
-    { enabled: summary.active },
+    // The matches follow the tree's ignored-files choice, as its listing does.
+    { enabled: summary.active, hideIgnored: !showIgnored },
     location,
   );
   // Typing keeps the previous matches in view, but a new root's search starts from none:
@@ -447,6 +450,7 @@ export function FilesPageTree({
         reveal={null}
         activeFile={activeFileTreePath(activePath, location, workspaceRoot)}
         activeReveal={reveal.activeReveal}
+        onActiveRevealMissed={reveal.onActiveRevealMissed}
         onActiveRevealHandled={reveal.onActiveRevealHandled}
         label="Workspace files"
       />

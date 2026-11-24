@@ -1108,10 +1108,38 @@ describe("useWorkspaceFileSearch through the workspace API", () => {
     expect(searchFilesViaWorkspaceApi).toHaveBeenCalledWith(
       "conv_live",
       "main",
-      { path: "src", include: "*.ts", exclude: "", limit: 500 },
+      { path: "src", include: "*.ts", exclude: "", limit: 500, includeGitIgnored: true },
       expect.any(AbortSignal),
     );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("asks the API to leave out what Git ignores, and keeps that search apart", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValue({
+      data: [],
+      hasMore: false,
+      truncated: false,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = renderHook(
+      ({ hideIgnored }: { hideIgnored: boolean }) =>
+        useWorkspaceFileSearch("conv_live", "main", "", "", { hideIgnored }, ""),
+      {
+        initialProps: { hideIgnored: true },
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+    await waitFor(() => expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(1));
+    rerender({ hideIgnored: false });
+    await waitFor(() => expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(2));
+
+    const asked = vi.mocked(searchFilesViaWorkspaceApi).mock.calls.map(([, , options]) => options);
+    expect(asked.map((options) => options.includeGitIgnored)).toEqual([false, true]);
+    vi.mocked(searchFilesViaWorkspaceApi).mockReset();
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValue(null);
   });
 
   it("falls back to REST when the workspace API declines a folder search", async () => {
