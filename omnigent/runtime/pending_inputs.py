@@ -1116,7 +1116,19 @@ def _is_command_entry(entry: _Entry, *, claude_commands: bool) -> bool:
         exit words; ``/``-led text counts for every harness.
     :returns: Whether the entry is such a command.
     """
-    text = _collapse_whitespace(_content_text(entry.content))
+    return is_native_command(entry.content, claude_commands=claude_commands)
+
+
+def is_native_command(content: list[dict[str, Any]], *, claude_commands: bool) -> bool:
+    """
+    Whether a native terminal runs message *content* itself instead of prompting.
+
+    :param content: Message content blocks, e.g. ``[{"type": "input_text", "text": "/compact"}]``.
+    :param claude_commands: Also count Claude Code's ``!`` shell commands and
+        exit words; ``/``-led text counts for every harness.
+    :returns: Whether the content is such a command.
+    """
+    text = _collapse_whitespace(_content_text(content))
     if text.startswith("/"):
         return True
     return claude_commands and (text.startswith("!") or text.lower() in _CLAUDE_EXIT_WORDS)

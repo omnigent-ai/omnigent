@@ -191,15 +191,49 @@ async def test_codex_editor_model_input_keeps_edit_access(
     "codex_client", [frozenset({Feature.MESSAGE_SENDER_CONTEXT})], indirect=True
 )
 @pytest.mark.parametrize(
-    ("caller", "named"), [("owner", False), ("editor", True), ("admin", True)]
+    ("caller", "content", "named"),
+    [
+        ("owner", [{"type": "input_text", "text": "Explain this code"}], False),
+        ("editor", [{"type": "input_text", "text": "Explain this code"}], True),
+        ("admin", [{"type": "input_text", "text": "Explain this code"}], True),
+        ("editor", [{"type": "input_text", "text": "!!literal bang"}], True),
+        (
+            "editor",
+            [
+                {"type": "input_text", "text": "!printf FIRST"},
+                {"type": "input_text", "text": "more"},
+            ],
+            True,
+        ),
+        (
+            "editor",
+            [
+                {"type": "input_text", "text": "!inspect this file"},
+                {"type": "input_file", "filename": "note.txt", "file_data": "aGk="},
+            ],
+            True,
+        ),
+        ("editor", [{"type": "input_text", "text": "/compact"}], False),
+        ("admin", [{"type": "input_text", "text": "!printf authorized"}], False),
+    ],
+    ids=[
+        "owner",
+        "editor",
+        "admin",
+        "escaped-bang",
+        "multiple-blocks",
+        "attachment",
+        "slash-command",
+        "shell-command",
+    ],
 )
-async def test_only_collaborators_are_named_to_the_agent(
+async def test_only_collaborators_model_input_names_them(
     codex_client: tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation],
     caller: str,
+    content: list[dict[str, Any]],
     named: bool,
 ) -> None:
     client, runner, _conv = codex_client
-    content = [{"type": "input_text", "text": "Explain this code"}]
     response = await client.post(
         _EVENT_PATH,
         json=_message(content),

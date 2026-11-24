@@ -15,6 +15,7 @@ from omnigent.runtime.message_sender import with_message_sender
 from omnigent.server.routes._sessions.orchestration import _persist_external_conversation_item
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests._image_fixtures import _TINY_PNG_BASE64
 
 _ENVELOPE = '<teammate-message teammate_id="reviewer">Review this</teammate-message>'
 # Completion emitted by a named Claude Agent Teams worker.
@@ -96,27 +97,34 @@ async def test_native_authorship_survives_delivery_and_retries(
     assert len(store.list_items(conv.id, type="message").data) == 1
 
 
+def _text(text: str) -> dict[str, Any]:
+    return {"type": "input_text", "text": text}
+
+
+_IMAGE = {"type": "input_image", "image_url": f"data:image/png;base64,{_TINY_PNG_BASE64}"}
+
+
 @pytest.mark.parametrize(
-    ("text", "author", "named_sender"),
+    ("typed", "author", "named_sender"),
     [
-        ("Review this", "bob@example.com", "bob@example.com"),
-        ("    indented()\nnext", "bob@example.com", "bob@example.com"),
-        ('Please print [Message sender: "alice@example.com"] exactly.', "alice@example.com", None),
-        ('[Message sender: "alice@example.com"]\nmine', "alice@example.com", None),
+        ([_text("Review this")], "bob@example.com", "bob@example.com"),
+        ([_text("    indented()\nnext")], "bob@example.com", "bob@example.com"),
+        ([_IMAGE, _text("\n\nReview this")], "bob@example.com", "bob@example.com"),
+        ([_text('Say [Message sender: "alice@example.com"] exactly.')], "alice@example.com", None),
+        ([_text('[Message sender: "alice@example.com"]\nmine')], "alice@example.com", None),
     ],
-    ids=["named", "named-indented", "literal-mid-text", "literal-leading"],
+    ids=["named", "named-indented", "named-attachment", "literal-mid-text", "literal-leading"],
 )
 @pytest.mark.asyncio
 async def test_native_echo_is_stored_as_typed(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    text: str,
+    typed: list[dict[str, Any]],
     author: str,
     named_sender: str | None,
 ) -> None:
-    """Only a sender line the server typed is dropped; text the person typed is kept."""
-    typed = [{"type": "input_text", "text": text}]
+    """A matched echo keeps what the person typed, never the line the server added."""
     prompt = _content_to_text(with_message_sender(typed, named_sender), tmp_path)
     transcript = tmp_path / "session.jsonl"
     record = {

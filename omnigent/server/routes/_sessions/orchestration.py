@@ -385,7 +385,6 @@ from omnigent.server.routes._sessions.helpers import (
     _spec_harness,
     _stable_id_reuse_is_exact_retry,
     _stop_session_via_runner,
-    _strip_echoed_message_sender,
     _usage_by_model_for_display,
     _validate_session_workspace,
     _validate_terminal_launch_args,
@@ -3680,7 +3679,11 @@ async def _persist_external_conversation_item_unlocked(
                 pending_inputs.mark_uncertain(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
-            item = _strip_echoed_message_sender(item, drained.named_sender)
+            if drained.named_sender is not None and match_method != "fifo_fallback":
+                # The echo carries the sender line typed for the agent; store what was typed.
+                item = item.model_copy(
+                    update={"data": item.data.model_copy(update={"content": drained.content})}
+                )
             item = _merge_pending_file_blocks(item, drained.content)
             # A text match preserves the sender recorded at POST time. FIFO
             # settlement alone does not establish authorship of the mirror.

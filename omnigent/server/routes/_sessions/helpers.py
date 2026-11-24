@@ -116,7 +116,6 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.message_sender import strip_message_sender
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import presence, session_live_state, session_pull_requests, shutdown_state
@@ -5004,36 +5003,6 @@ def _merge_pending_file_blocks(
         return item
     merged_data = item.data.model_copy(update={"content": [*file_blocks, *item.data.content]})
     return item.model_copy(update={"data": merged_data})
-
-
-def _strip_echoed_message_sender(
-    item: NewConversationItem,
-    sender: str | None,
-) -> NewConversationItem:
-    """
-    Drop the sender line the server typed ahead of a web message from its echo.
-
-    :param item: The mirrored user-message item about to be persisted.
-    :param sender: ``named_sender`` of the pending entry the echo drained, or
-        ``None`` when the message was delivered as typed.
-    :returns: A copy of *item* without that line, or *item* when it has none.
-    """
-    if sender is None or not isinstance(item.data, MessageData):
-        return item
-    content = list(item.data.content)
-    for index, block in enumerate(content):
-        text = block.get("text") if isinstance(block, dict) else None
-        if not isinstance(text, str):
-            continue
-        stripped = strip_message_sender(text, sender)
-        if stripped == text:
-            return item
-        if stripped.strip():
-            content[index] = {**block, "text": stripped}
-        else:
-            del content[index]
-        return item.model_copy(update={"data": item.data.model_copy(update={"content": content})})
-    return item
 
 
 def _message_text(content: list[dict[str, Any]]) -> str | None:

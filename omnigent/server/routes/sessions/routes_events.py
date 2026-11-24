@@ -92,7 +92,6 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.content_resolver import _resolve_message_content
-from omnigent.runtime.message_sender import message_sender_for
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import presence
 from omnigent.server import session_pull_requests as server_prs
@@ -1074,6 +1073,25 @@ def _legacy_side_chat_attachment(
         if text:
             texts.append(text)
     return len(texts) == 1 and side_chat_question_from_text(texts[0]) is not None
+
+
+def _runs_as_native_command(content: list[dict[str, Any]], native_harness: str | None) -> bool:
+    """
+    Whether a native terminal runs message *content* itself instead of prompting.
+
+    :param content: Message content blocks as posted.
+    :param native_harness: The session's native pane harness, e.g. ``"codex-native"``,
+        or ``None`` when an API harness turns every message into model input.
+    :returns: ``True`` for a slash command, Claude Code shell or exit input, or a
+        lone Codex ``!command``.
+    """
+    if native_harness is None:
+        return False
+    if native_harness == "codex-native" and shell_command_from_input(content) is not None:
+        return True
+    return pending_inputs.is_native_command(
+        content, claude_commands=native_harness == "claude-native"
+    )
 
 
 def register_events_routes(
@@ -4169,15 +4187,20 @@ def register_events_routes(
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
             return {"queued": True, "item_id": item_id}
-        # Name a collaborator to the agent; the owner's own messages go as typed.
+        # Name a collaborator to the agent. The owner's messages, and commands a
+        # native terminal runs itself, go as typed.
+        content = body.data.get("content")
         message_sender = (
-            message_sender_for(body.data.get("content"), created_by)
+            created_by
             if created_by is not None
             and getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
                 Feature.MESSAGE_SENDER_CONTEXT
             )
             and body.type == "message"
             and body.data.get("role", "user") == "user"
+            and isinstance(content, list)
+            and bool(content)
+            and not _runs_as_native_command(content, native_harness)
             and not await asyncio.to_thread(
                 _is_session_owner,
                 created_by,
