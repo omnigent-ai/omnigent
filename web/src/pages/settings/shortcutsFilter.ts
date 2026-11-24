@@ -53,7 +53,7 @@ export function filterShortcutPage(
   return groups.flatMap((group) => {
     const items = group.items.filter((row) => {
       if (row.shortcutId !== undefined && pressed.has(row.shortcutId)) return true;
-      // Rows the registry doesn't bind, such as the browser's New session chord, by what they show.
+      // A chord typed as the keys a row draws, such as the browser's ⌘⇧O for New session.
       if (chord && displaysChord(row, chord, environment.mac)) return true;
       const text = rowText(row, group);
       return parts.every((part) => text.includes(part));
