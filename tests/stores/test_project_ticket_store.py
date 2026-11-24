@@ -23,6 +23,11 @@ from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStor
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 
 
+def _as_read(ticket, *, needs_final_update=False):
+    """An edit's ticket as a single-ticket read returns it, with its final-update state."""
+    return {**ticket, "final_update": None, "needs_final_update": needs_final_update}
+
+
 @pytest.fixture
 def board(db_uri):
     projects = SqlAlchemyProjectStore(db_uri)
@@ -77,7 +82,10 @@ def test_atomic_edits_and_append_only_outputs(board):
     assert events[2]["payload"]["changes"]["labels"] == result["labels"]
     assert "tags" not in events[0]["payload"]
     assert "tags" not in events[2]["payload"]["changes"]
-    assert tickets.update(project.id, ticket["id"], UpdateTicket(labels=None), actor) == result
+    assert (
+        _as_read(tickets.update(project.id, ticket["id"], UpdateTicket(labels=None), actor))
+        == result
+    )
     assert tickets.events(project.id, ticket["id"], user_id="alice")["data"] == events
     done = tickets.update(
         project.id,
@@ -138,13 +146,14 @@ def test_unseen_activity_counts_others_after_the_forward_only_marker(board):
         "new_comment_count": 0,
         "first_new_position": None,
     }
-    # The marker never moves backwards and clamps to the latest activity.
+    # The marker never moves backwards and clamps to the latest activity: the agent
+    # note at position 5 (created, own note, execution, its output, stage move, note).
     assert tickets.mark_seen(
         project.id, mine["id"], MarkTicketSeen(seen_position=0), user_id="alice"
     ) == {"viewer_seen_position": 2}
     assert tickets.mark_seen(
         project.id, mine["id"], MarkTicketSeen(seen_position=99), user_id="alice"
-    ) == {"viewer_seen_position": 4}
+    ) == {"viewer_seen_position": 5}
     with pytest.raises(OmnigentError):
         tickets.mark_seen(project.id, mine["id"], MarkTicketSeen(seen_position=4), user_id="bob")
     with pytest.raises(OmnigentError):
@@ -196,7 +205,7 @@ def test_labels_project_existing_storage_and_history_without_rewriting_it(board,
             "SELECT * FROM project_ticket_events ORDER BY position"
         ).all()
     for _ in range(2):
-        assert tickets.get(project.id, ticket["id"], user_id="alice") == expected
+        assert tickets.get(project.id, ticket["id"], user_id="alice") == _as_read(expected)
         assert tickets.list(project.id, user_id="alice")["data"] == [expected]
         assert (
             tickets.events(project.id, ticket["id"], user_id="alice")["data"] == expected_history
@@ -582,7 +591,7 @@ def test_description_stages_and_feedback_change_atomically(board, monkeypatch):
                 ),
                 actor,
             )
-    assert tickets.get(project.id, ticket_id, user_id="alice") == review
+    assert tickets.get(project.id, ticket_id, user_id="alice") == _as_read(review)
     working = tickets.update(
         project.id,
         ticket_id,
@@ -861,7 +870,10 @@ def test_reordering_occupied_stages_needs_no_summary_and_preserves_project_bound
     with workspace_scope(9), pytest.raises(OmnigentError):
         tickets.update_stages(project.id, UpdateTicketStages(**original), actor)
     assert tickets.stages(project.id, user_id="alice") == saved
-    assert tickets.get(project.id, ticket["id"], user_id="alice") == ticket
+    # It sits in the completed stage with no final update yet.
+    assert tickets.get(project.id, ticket["id"], user_id="alice") == _as_read(
+        ticket, needs_final_update=True
+    )
 
 
 def test_failed_stage_move_and_bounded_edit_roll_back_the_entire_configuration(board, monkeypatch):
@@ -894,7 +906,7 @@ def test_failed_stage_move_and_bounded_edit_roll_back_the_entire_configuration(b
             tickets.update_stages(project.id, change, actor)
     assert tickets.stages(project.id, user_id="alice") == original
     for ticket in records:
-        assert tickets.get(project.id, ticket["id"], user_id="alice") == ticket
+        assert tickets.get(project.id, ticket["id"], user_id="alice") == _as_read(ticket)
         assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 1
 
 
@@ -949,7 +961,9 @@ def test_requester_filter_pages_only_that_requesters_tickets(board):
     ]
     tickets.create(project.id, CreateTicket(title="theirs"), actor, requested_by="bob")
 
-    first = tickets.list(project.id, user_id="alice", stage_id="open", limit=2, requested_by="alice")
+    first = tickets.list(
+        project.id, user_id="alice", stage_id="open", limit=2, requested_by="alice"
+    )
     rest = tickets.list(
         project.id,
         user_id="alice",
