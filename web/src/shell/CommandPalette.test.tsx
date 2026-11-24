@@ -1425,27 +1425,31 @@ describe("CommandPalette — commands a mounted feature offers", () => {
     expect(document.activeElement).toBe(screen.getByText("Where the command moves focus"));
   });
 
-  it("drops one that moves focus when ⌘K reopens before the palette finished closing", async () => {
-    withSidebarFlag(true);
-    const animation = stubExitAnimation();
-    const go = vi.fn();
-    const opener = openPalette(go);
-    animation.exitNext();
-    fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
-    expect(document.querySelector(PALETTE_CONTENT)).not.toBeNull();
+  // The classic palette's exit; the QuickPick palette closes through its own dialog.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "drops one that moves focus when ⌘K reopens before the palette finished closing",
+    async () => {
+      withSidebarFlag(true);
+      const animation = stubExitAnimation();
+      const go = vi.fn();
+      const opener = openPalette(go);
+      animation.exitNext();
+      fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
+      expect(document.querySelector(PALETTE_CONTENT)).not.toBeNull();
 
-    // Reopened during the exit: the user wants the palette now.
-    fireEvent.click(opener);
-    await vi.waitFor(() => expect(screen.getByTestId("command-palette-input")).toHaveFocus());
-    animation.stop();
-    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Escape" });
-    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
-    });
-    // Not run late, by the reopened palette's Escape.
-    expect(go).not.toHaveBeenCalled();
-  });
+      // Reopened during the exit: the user wants the palette now.
+      fireEvent.click(opener);
+      await vi.waitFor(() => expect(screen.getByTestId("command-palette-input")).toHaveFocus());
+      animation.stop();
+      fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Escape" });
+      await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+      // Not run late, by the reopened palette's Escape.
+      expect(go).not.toHaveBeenCalled();
+    },
+  );
 
   // The QuickPick palette lists them under its own flag; its own test covers that.
   it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
@@ -1511,36 +1515,40 @@ describe("CommandPalette reopened during its exit animation", () => {
     );
   }
 
-  it("focuses its search field again after a row click left focus on the list", async () => {
-    const animation = stubExitAnimation();
-    render(<Opener />, { wrapper: withQueryClient() });
-    const editor = screen.getByRole<HTMLTextAreaElement>("textbox", { name: "Editor" });
-    editor.focus();
-    act(() => setOpen(true));
-    await vi.waitFor(() => expect(screen.getByTestId("command-palette-input")).toHaveFocus());
-    animation.exitNext();
-    // Clicking a row focuses the list, and the row's command closes the palette.
-    act(() => screen.getByRole("listbox").focus());
-    act(() => setOpen(false));
-    expect(document.querySelector(PALETTE_CONTENT)).not.toBeNull();
+  // The classic palette's exit; the QuickPick palette closes through its own dialog.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "focuses its search field again after a row click left focus on the list",
+    async () => {
+      const animation = stubExitAnimation();
+      render(<Opener />, { wrapper: withQueryClient() });
+      const editor = screen.getByRole<HTMLTextAreaElement>("textbox", { name: "Editor" });
+      editor.focus();
+      act(() => setOpen(true));
+      await vi.waitFor(() => expect(screen.getByTestId("command-palette-input")).toHaveFocus());
+      animation.exitNext();
+      // Clicking a row focuses the list, and the row's command closes the palette.
+      act(() => screen.getByRole("listbox").focus());
+      act(() => setOpen(false));
+      expect(document.querySelector(PALETTE_CONTENT)).not.toBeNull();
 
-    // ⌘K again while it animates out.
-    act(() => setOpen(true));
-    const input = screen.getByTestId("command-palette-input");
-    await vi.waitFor(() => expect(input).toHaveFocus());
-    // The replaced content's late close doesn't pull focus back to the editor.
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
-    });
-    expect(input).toHaveFocus();
-    fireEvent.change(input, { target: { value: "settings" } });
-    expect(input).toHaveValue("settings");
+      // ⌘K again while it animates out.
+      act(() => setOpen(true));
+      const input = screen.getByTestId("command-palette-input");
+      await vi.waitFor(() => expect(input).toHaveFocus());
+      // The replaced content's late close doesn't pull focus back to the editor.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+      expect(input).toHaveFocus();
+      fireEvent.change(input, { target: { value: "settings" } });
+      expect(input).toHaveValue("settings");
 
-    // Cancelling still returns focus to where the user was before the first opening.
-    animation.stop();
-    fireEvent.keyDown(input, { key: "Escape" });
-    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    // Radix returns focus just after the content unmounts.
-    await vi.waitFor(() => expect(editor).toHaveFocus());
-  });
+      // Cancelling still returns focus to where the user was before the first opening.
+      animation.stop();
+      fireEvent.keyDown(input, { key: "Escape" });
+      await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      // Radix returns focus just after the content unmounts.
+      await vi.waitFor(() => expect(editor).toHaveFocus());
+    },
+  );
 });
