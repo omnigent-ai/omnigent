@@ -3589,10 +3589,11 @@ async def test_only_a_github_info_poll_lets_the_runner_answer_from_its_previous_
 
 
 @pytest.mark.asyncio
-async def test_github_info_serves_a_tunnelled_runner_answer_that_arrives_in_time(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("params", [{}, {"allow_cached": "true"}], ids=["one-shot", "poll"])
+async def test_github_info_serves_a_tunnelled_runners_late_answer_unchanged(
+    client: httpx.AsyncClient, params: dict[str, str]
 ) -> None:
-    """A runner that answers over the tunnel before the PR read's bound is served unchanged."""
+    """A runner answer that arrives over the tunnel late and in parts is served unchanged."""
     from omnigent.runner.transports.ws_tunnel.frames import (
         HelloFrame,
         ResponseBodyFrame,
@@ -3601,7 +3602,6 @@ async def test_github_info_serves_a_tunnelled_runner_answer_that_arrives_in_time
     )
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
     from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
-    from omnigent.server.routes.sessions import routes_resources
 
     class _QuietRunnerSocket:
         async def send_text(self, data: str) -> None:
@@ -3619,12 +3619,10 @@ async def test_github_info_serves_a_tunnelled_runner_answer_that_arrives_in_time
         timeout=httpx.Timeout(5.0, read=None),
     )
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
-    # The bound outlasts this runner's answer; servers without a bound wait regardless.
-    monkeypatch.setattr(routes_resources, "_PR_INFO_RUNNER_TIMEOUT_S", budget(5), raising=False)
     payload = {"object": "session.github.info", "available": True, "pr": None}
 
     read = asyncio.create_task(
-        client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github")
+        client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github", params=params)
     )
     session = registry.get("runner_one")
     assert session is not None
