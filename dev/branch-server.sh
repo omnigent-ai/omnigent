@@ -106,7 +106,9 @@ cmd_up() {
   fi
 
   local name run
-  name=$(git -C "$wt" rev-parse --abbrev-ref HEAD | tr '/' '-')
+  # A detached worktree is named by its commit instead of "HEAD".
+  name=$(git -C "$wt" symbolic-ref -q --short HEAD || echo "detached-$(git -C "$wt" rev-parse --short HEAD)")
+  name=${name//\//-}
   run=$(mktemp -d "$RUN_ROOT/${RUN_PREFIX}${name}-XXXXXX")
   mkdir -p "$run/data" "$run/config" "$run/artifacts" "$run/logs"
   local db="sqlite:///$run/data/chat.db" url="http://127.0.0.1:$port"

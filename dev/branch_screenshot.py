@@ -13,6 +13,7 @@ Pair with ``dev/branch-server.sh``; see ``dev/branch-server.md``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 from pathlib import Path
 
@@ -35,6 +36,15 @@ def installed_chromium() -> str | None:
     return str(candidates[-1]) if candidates else None
 
 
+def settle(page: Page, seconds: float) -> None:
+    """Give the app up to ``seconds`` to go network-idle after load.
+
+    Chat pages keep a live stream open and never go idle, so this is best effort.
+    """
+    with contextlib.suppress(Error):
+        page.wait_for_load_state("networkidle", timeout=seconds * 1000)
+
+
 def click(page: Page, target: str) -> None:
     """Click a button/link by accessible name, falling back to visible text."""
     by_role = page.get_by_role("button", name=target).or_(page.get_by_role("link", name=target))
@@ -54,6 +64,9 @@ def main() -> int:
     )
     parser.add_argument("--width", type=int, default=1440)
     parser.add_argument("--height", type=int, default=900)
+    parser.add_argument(
+        "--settle", type=float, default=5.0, help="max seconds to wait for idle after load"
+    )
     parser.add_argument("--timeout", type=float, default=15.0, help="seconds per step")
     args = parser.parse_args()
 
@@ -68,7 +81,8 @@ def main() -> int:
             )
             page = context.new_page()
             page.set_default_timeout(args.timeout * 1000)
-            page.goto(args.url, wait_until="networkidle")
+            page.goto(args.url, wait_until="load")
+            settle(page, args.settle)
             for target in args.click:
                 click(page, target)
             for text in args.expect:
