@@ -36,6 +36,8 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "OMNIGENT_GITHUB_APP_SLUG",
         "OMNIGENT_GITHUB_APP_TOKEN_ENC_KEY",
         "OMNIGENT_DOMAIN",
+        "OMNIGENT_GITHUB_HOST",
+        "OMNIGENT_GITHUB_API_URL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -179,3 +181,48 @@ def test_token_set_from_payload_error() -> None:
 def test_token_set_from_payload_missing_access_token() -> None:
     with pytest.raises(GitHubAppError):
         token_set_from_payload({"scope": "repo"})
+
+
+# ── GitHub Enterprise Server host ───────────────────────────────
+
+
+def _enable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_GITHUB_APP_CLIENT_ID", "Iv1abc")
+    monkeypatch.setenv("OMNIGENT_GITHUB_APP_CLIENT_SECRET", "shh")
+    monkeypatch.setenv("OMNIGENT_GITHUB_APP_REDIRECT_URI", "https://x/cb")
+
+
+def test_from_env_defaults_to_github_com(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable(monkeypatch)
+    cfg = GitHubAppConfig.from_env()
+    assert cfg is not None
+    assert cfg.github.host == "github.com"
+    assert cfg.github.api_url == "https://api.github.com"
+
+
+def test_from_env_reads_enterprise_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_GITHUB_HOST", "ghe.example.com")
+    monkeypatch.setenv("OMNIGENT_GITHUB_APP_SLUG", "omni-app")
+    cfg = GitHubAppConfig.from_env()
+    assert cfg is not None
+    assert cfg.github.api_url == "https://ghe.example.com/api/v3"
+    assert cfg.install_url == "https://ghe.example.com/apps/omni-app/installations/new"
+    url = build_authorize_url(cfg, state="s1")
+    assert url.startswith("https://ghe.example.com/login/oauth/authorize?")
+
+
+def test_from_env_rejects_malformed_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_GITHUB_HOST", "https://ghe.example.com")
+    with pytest.raises(RuntimeError, match="OMNIGENT_GITHUB_HOST"):
+        GitHubAppConfig.from_env()
+
+
+def test_default_urls_unchanged() -> None:
+    cfg = make_config()
+    assert cfg.install_url == "https://github.com/apps/omni-app/installations/new"
+    assert build_authorize_url(cfg, state="s1").startswith(
+        "https://github.com/login/oauth/authorize?"
+    )

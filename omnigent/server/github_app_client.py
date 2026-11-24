@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import httpx
 
+from omnigent.git_providers.github_host import GitHubHost
 from omnigent.server.github_app import (
     GitHubAppConfig,
     GitHubAppError,
@@ -21,16 +22,18 @@ from omnigent.server.github_app import (
     token_set_from_payload,
 )
 
-_TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
-_USER_ENDPOINT = "https://api.github.com/user"
+# Paths relative to the configured host (see :mod:`omnigent.git_providers.github_host`): the
+# token endpoint is on the web host, the rest on the API base.
+_TOKEN_PATH = "/login/oauth/access_token"
+_USER_PATH = "/user"
 # Repos the token can access (App-scoped), most-recently-pushed first.
-_USER_REPOS_ENDPOINT = "https://api.github.com/user/repos"
+_USER_REPOS_PATH = "/user/repos"
 _REPOS_PER_PAGE = 100
 # Cap the walk so a user with thousands of repos gets a bounded, fast
 # response for the picker (the newest ~300 by push time).
 _REPOS_MAX_PAGES = 3
 
-_REPO_BRANCHES_ENDPOINT = "https://api.github.com/repos/{full_name}/branches"
+_REPO_BRANCHES_PATH = "/repos/{full_name}/branches"
 _BRANCHES_PER_PAGE = 100
 # Cap the branch walk the same way — a busy repo can have hundreds of
 # branches, but the picker only needs a bounded, fast list.
@@ -54,6 +57,11 @@ class GitHubAppClient:
         # Injectable transport for tests (httpx.MockTransport); None uses
         # the real network.
         self._transport = transport
+
+    @property
+    def github(self) -> GitHubHost:
+        """The GitHub host this client talks to (github.com by default)."""
+        return self._config.github
 
     def _http_client(self) -> httpx.AsyncClient:
         """Open an AsyncClient, honoring an injected test transport."""
@@ -86,7 +94,7 @@ class GitHubAppClient:
         """
         async with self._http_client() as client:
             resp = await client.get(
-                _USER_ENDPOINT,
+                f"{self.github.api_url}{_USER_PATH}",
                 headers={
                     "Authorization": f"Bearer {access_token}",
                     "Accept": "application/vnd.github+json",
@@ -125,7 +133,7 @@ class GitHubAppClient:
         async with self._http_client() as client:
             for page in range(1, _REPOS_MAX_PAGES + 1):
                 resp = await client.get(
-                    _USER_REPOS_ENDPOINT,
+                    f"{self.github.api_url}{_USER_REPOS_PATH}",
                     params={"per_page": _REPOS_PER_PAGE, "page": page, "sort": "pushed"},
                     headers=headers,
                 )
@@ -169,7 +177,7 @@ class GitHubAppClient:
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/vnd.github+json",
         }
-        url = _REPO_BRANCHES_ENDPOINT.format(full_name=full_name)
+        url = f"{self.github.api_url}{_REPO_BRANCHES_PATH.format(full_name=full_name)}"
         branches: list[str] = []
         async with self._http_client() as client:
             for page in range(1, _BRANCHES_MAX_PAGES + 1):
@@ -196,7 +204,7 @@ class GitHubAppClient:
         """POST the given form fields to the token endpoint and parse the reply."""
         async with self._http_client() as client:
             resp = await client.post(
-                _TOKEN_ENDPOINT,
+                f"{self.github.web_url}{_TOKEN_PATH}",
                 data=fields,
                 headers={"Accept": "application/json"},
             )

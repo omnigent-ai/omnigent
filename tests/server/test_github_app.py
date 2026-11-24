@@ -8,9 +8,12 @@ so this file never names a client secret alongside the httpx sink.
 
 from __future__ import annotations
 
+import dataclasses
+
 import httpx
 import pytest
 
+from omnigent.git_providers.github_host import parse_github_host
 from omnigent.server.github_app import GitHubAppError
 from omnigent.server.github_app_client import GitHubAppClient
 from tests.server.github_app_fixtures import make_config
@@ -169,3 +172,46 @@ async def test_list_branches_non_200_raises() -> None:
 
     with pytest.raises(GitHubAppError):
         await _client(handler).list_branches("ghu_bad", "caffeinelabs/nope")
+
+
+@pytest.mark.asyncio
+async def test_enterprise_host_routes_token_and_api_calls() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.host}{request.url.path}")
+        if request.url.path == "/login/oauth/access_token":
+            return httpx.Response(200, json={"access_token": "ghu_new"})
+        if request.url.path == "/api/v3/user":
+            return httpx.Response(200, json={"login": "octo", "id": 7})
+        if request.url.path == "/api/v3/user/repos":
+            return httpx.Response(200, json=[{"full_name": "org/app"}])
+        if request.url.path == "/api/v3/repos/org/app/branches":
+            return httpx.Response(200, json=[{"name": "main"}])
+        return httpx.Response(404)
+
+    config = dataclasses.replace(make_config(), github=parse_github_host("ghe.example.com", None))
+    client = GitHubAppClient(config, transport=httpx.MockTransport(handler))
+    assert (await client.exchange_code("code123")).access_token == "ghu_new"
+    assert await client.fetch_login("ghu_x") == ("octo", 7)
+    repos, _ = await client.list_repos("ghu_x")
+    assert [repo["full_name"] for repo in repos] == ["org/app"]
+    assert await client.list_branches("ghu_x", "org/app") == ["main"]
+    assert seen == [
+        "POST ghe.example.com/login/oauth/access_token",
+        "GET ghe.example.com/api/v3/user",
+        "GET ghe.example.com/api/v3/user/repos",
+        "GET ghe.example.com/api/v3/repos/org/app/branches",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_default_host_calls_github_com() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.url.host}{request.url.path}")
+        return httpx.Response(200, json={"login": "octo", "id": 7})
+
+    await _client(handler).fetch_login("ghu_x")
+    assert seen == ["api.github.com/user"]
