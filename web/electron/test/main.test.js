@@ -772,6 +772,8 @@ function loadNavigationHarness({
     "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt, openFloatingComposerFromShortcut, focusAfterBrowserSignIn };" +
     "\nmodule.exports.quitStarted = () => quitConfirmation.quitStarted();" +
     "\nmodule.exports.startDesktopOpenListener = startDesktopOpenListener;" +
+    "\nmodule.exports.setBrowserHandoffTimeoutMs = (ms) => { browserHandoffTimeoutMs = ms; };" +
+    "\nmodule.exports.registerConversationShownReset = registerConversationShownReset;" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -807,6 +809,8 @@ function loadNavigationHarness({
   Object.assign(api, module.exports.panelTestApi);
   api.quitStarted = module.exports.quitStarted;
   api.startDesktopOpenListener = module.exports.startDesktopOpenListener;
+  api.setBrowserHandoffTimeoutMs = module.exports.setBrowserHandoffTimeoutMs;
+  api.registerConversationShownReset = module.exports.registerConversationShownReset;
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
     serverUrl,
@@ -3836,8 +3840,95 @@ describe("browser conversation handoff", () => {
     assert.equal(options.isKnownOrigin("http://localhost:6767"), true);
     assert.equal(options.isKnownOrigin("https://saved.example.com"), true);
     assert.equal(options.isKnownOrigin("https://attacker.example"), false);
-    assert.equal(options.openLink, h.api.enqueueDeepLink);
     h.api.disposeAuth();
+  });
+
+  /** Start the listener with a short wait, and return what it hands to `openLink`. */
+  async function handoffListener(t, harnessOptions = {}) {
+    let options;
+    const h = loadNavigationHarness({
+      serverUrl: "http://localhost:6767/",
+      deepLinks: { ...require("../src/deepLink"), acceptCliDeepLink: async () => true },
+      desktopOpenServer: async (given) => {
+        options = given;
+        return { port: 28417, close: async () => {} };
+      },
+      ...harnessOptions,
+    });
+    t.after(() => h.api.disposeAuth());
+    h.electron.app.isReady = () => true;
+    h.api.registerIpc();
+    h.api.setBrowserHandoffTimeoutMs(300);
+    await h.api.startDesktopOpenListener();
+    return { h, openLink: options.openLink };
+  }
+
+  /** The window's page, at `url`, reports the conversation it has loaded (null for none). */
+  function pageReports(h, url, conversationId) {
+    h.webContents.getURL = () => url;
+    h.ipc.get("omnigent:conversation-shown")(
+      { sender: h.webContents, senderFrame: { url } },
+      conversationId,
+    );
+  }
+
+  it("reports success only once the page says it has loaded the conversation", async (t) => {
+    const { h, openLink } = await handoffListener(t);
+    const opening = openLink("omnigent://localhost:6767/c/conv_abc");
+    let settled = false;
+    void opening.then(() => (settled = true));
+
+    // On the conversation's address, signed in or not: that alone is not success.
+    h.webContents.getURL = () => "http://localhost:6767/c/conv_abc";
+    await new Promise((resolve) => {
+      setTimeout(resolve, 150);
+    });
+    assert.equal(settled, false);
+
+    pageReports(h, "http://localhost:6767/c/conv_abc", "conv_abc");
+    assert.equal(await opening, true);
+    assert.deepEqual(
+      h.calls.progress.filter(({ channel }) => channel === "omnigent:open-path"),
+      [{ channel: "omnigent:open-path", data: "/c/conv_abc" }],
+    );
+  });
+
+  it("reports failure when the page never loads the conversation", async (t) => {
+    const { h, openLink } = await handoffListener(t);
+    const link = "omnigent://localhost:6767/c/conv_abc";
+
+    // A signed-out page sits on the conversation's address, then goes to sign-in.
+    h.webContents.getURL = () => "http://localhost:6767/c/conv_abc";
+    const signedOut = openLink(link);
+    h.webContents.getURL = () => "http://localhost:6767/login?next=/c/conv_abc";
+    assert.equal(await signedOut, false);
+
+    // Another conversation's report, or a page too old to report, is not this one.
+    pageReports(h, "http://localhost:6767/c/conv_other", "conv_other");
+    assert.equal(await openLink(link), false);
+    // A report from a frame of another origin is ignored.
+    h.webContents.getURL = () => "http://localhost:6767/c/conv_abc";
+    h.ipc.get("omnigent:conversation-shown")(
+      { sender: h.webContents, senderFrame: { url: "https://attacker.example/" } },
+      "conv_abc",
+    );
+    assert.equal(await openLink(link), false);
+    assert.equal(await openLink("not a link"), false);
+  });
+
+  it("forgets what a page reported once the window loads a new document", async (t) => {
+    const { h, openLink } = await handoffListener(t);
+    h.api.registerConversationShownReset(h.win);
+    pageReports(h, "http://localhost:6767/c/conv_abc", "conv_abc");
+    assert.equal(await openLink("omnigent://localhost:6767/c/conv_abc"), true);
+
+    // A reload that succeeds: the window stays on its server, with nothing shown yet.
+    h.emit("did-navigate", "http://localhost:6767/c/conv_abc", 200, "OK");
+
+    const state = h.api.windows.get(h.win);
+    assert.equal(state.origin, "http://localhost:6767");
+    assert.equal(state.shownConversationId, null);
+    assert.equal(await openLink("omnigent://localhost:6767/c/conv_abc"), false);
   });
 });
 

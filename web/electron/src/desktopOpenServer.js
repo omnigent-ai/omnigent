@@ -95,12 +95,12 @@ function conversationIdFrom(body) {
  *
  * @param {{
  *   isKnownOrigin: (origin: string) => boolean,
- *   openLink: (link: string) => void,
+ *   openLink: (link: string) => boolean | Promise<boolean>,
  *   ports?: number[],
  *   now?: () => number,
  * }} options `isKnownOrigin` says whether the user has connected the app to
  *   that server; every other origin is refused. `openLink` receives the
- *   `omnigent://` link to open.
+ *   `omnigent://` link and says whether the app ended up showing it.
  * @returns {Promise<{ port: number, close: () => Promise<void> } | null>} null
  *   when every port is taken.
  */
@@ -150,8 +150,8 @@ async function startDesktopOpenServer({
     if (!link) return reply(400, cors);
     if (now() - lastOpenAt < MIN_OPEN_INTERVAL_MS) return reply(429, cors);
     lastOpenAt = now();
-    openLink(link);
-    return reply(204, cors);
+    // Accepted only once the app shows the conversation; otherwise the page keeps it.
+    return reply((await openLink(link)) ? 204 : 504, cors);
   };
 
   for (const candidate of ports) {

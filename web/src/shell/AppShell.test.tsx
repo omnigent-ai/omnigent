@@ -80,7 +80,12 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // network-backed hooks are replaced.
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
-  useDeleteTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
+  useDeleteTerminal: vi.fn(() => ({
+    mutate: vi.fn(),
+    mutateAsync: vi.fn(() => Promise.resolve()),
+    isPending: false,
+    isError: false,
+  })),
   useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), launch: vi.fn(), isPending: false })),
 }));
 
@@ -771,10 +776,10 @@ beforeEach(() => {
     isLoading: false,
     error: null,
   });
-  deleteTerminalMutate = vi.fn();
+  deleteTerminalMutate = vi.fn(() => Promise.resolve());
   useDeleteTerminalMock.mockReset();
   useDeleteTerminalMock.mockReturnValue({
-    mutate: deleteTerminalMutate,
+    mutateAsync: deleteTerminalMutate,
     isPending: false,
     isError: false,
   } as unknown as ReturnType<typeof useDeleteTerminal>);
@@ -2104,6 +2109,62 @@ describe("Chat-mode terminal panel layout", () => {
     expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
   });
 
+  it("confirms a bulk shell close once and moves the selection to the kept shell", async () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_a",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_a", name: "a", session: "u-1", running: true },
+        { id: "terminal_b", name: "b", session: "u-1", running: true },
+        { id: "terminal_c", name: "c", session: "u-1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_abc");
+
+    const closeOthersOf = async (label: string) => {
+      fireEvent.contextMenu(screen.getByTitle(label));
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
+    };
+    // Cancelling the single confirmation kills nothing.
+    await closeOthersOf("c · u-1");
+    expect(screen.getByRole("dialog")).toHaveTextContent("Close 2 shells?");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(deleteTerminalMutate).not.toHaveBeenCalled();
+
+    // One kill fails; the other shell's kill still goes ahead, and its shell leaves the list.
+    deleteTerminalMutate.mockImplementation((id: string) => {
+      if (id === "terminal_a") return Promise.reject(new Error("runner offline"));
+      useTerminalsMock.mockReturnValue({
+        terminals: [
+          { id: "terminal_a", name: "a", session: "u-1", running: true },
+          { id: "terminal_c", name: "c", session: "u-1", running: true },
+        ],
+        isLoading: false,
+        error: null,
+      });
+      return Promise.resolve();
+    });
+    await closeOthersOf("c · u-1");
+    fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+    expect(deleteTerminalMutate.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
+    await waitFor(() =>
+      expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_c"),
+    );
+    // The killed shell's tab goes; the failed shell's tab stays.
+    expect(screen.queryByTitle("b · u-1")).toBeNull();
+    expect(screen.getByTitle("a · u-1")).toBeInTheDocument();
+  });
+
   it("hides the shell close affordance from a read-only viewer", () => {
     // Killing a shell is server-gated on edit access, so a read-only viewer
     // gets no close "x" — otherwise the click would confirm, DELETE, and 403.
@@ -2153,6 +2214,83 @@ describe("Chat-mode terminal panel layout", () => {
     // Click the second tab's body (title = "name · session") → it activates.
     fireEvent.click(screen.getByTitle("b · s2"));
     expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_b");
+  });
+
+  it("greys every shell a bulk close is killing", async () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_c",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_a", name: "a", session: "u-1", running: true },
+        { id: "terminal_b", name: "b", session: "u-1", running: true },
+        { id: "terminal_c", name: "c", session: "u-1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+    const kills: Record<string, () => void> = {};
+    deleteTerminalMutate.mockImplementation(
+      (id: string) =>
+        new Promise<void>((resolve) => {
+          kills[id] = resolve;
+        }),
+    );
+    renderShell("/c/conv_abc");
+
+    fireEvent.contextMenu(screen.getByTitle("c · u-1"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+
+    // Both kills are in flight, so both tabs read as closing and take no second close.
+    for (const label of ["a · u-1", "b · u-1"]) {
+      expect(screen.getByTitle(label)).toHaveAttribute("aria-busy", "true");
+      expect(screen.getByTitle(label)).toHaveClass("opacity-50", "pointer-events-none");
+    }
+    expect(screen.getByTitle("c · u-1")).toHaveAttribute("aria-busy", "false");
+    await act(async () => kills.terminal_a());
+    expect(screen.getByTitle("a · u-1")).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByTitle("b · u-1")).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("shows the rail again when a shell closed while launching is still running", async () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_main",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    const shell = { id: "terminal_main", name: "main", session: "u-1", running: true };
+    const listShells = (terminals: (typeof shell)[]) =>
+      useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
+    listShells([shell]);
+    // A shell still launching has nothing to kill yet: the close resolves at once and the
+    // shell leaves the list, with its kill deferred until the launch returns.
+    deleteTerminalMutate.mockImplementation(() => {
+      listShells([]);
+      return Promise.resolve();
+    });
+    renderShell("/c/conv_abc", undefined, { rerenderable: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    // Its tab was the last open one, so the rail hides.
+    expect(await screen.findByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+
+    // The deferred kill failed: the shell is listed again, still running.
+    listShells([shell]);
+    fireEvent.click(screen.getByTestId("rerender-shell"));
+    expect(await screen.findByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+    expect(screen.getByTitle("main · u-1")).toBeInTheDocument();
   });
 
   it("greys out and freezes a shell tab while its close (kill) is in flight", () => {
@@ -4071,6 +4209,40 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
   });
 
+  it("disables Close other tabs while no tab is shown", async () => {
+    writePinnedWorkspaceTabs([]);
+    writeSessionWorkspaceState("conv_no_keeper", {
+      open: true,
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_no_keeper", permission_level: 4 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_no_keeper");
+
+    // Closing the shown page leaves the shell open but shows no tab.
+    fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
+    // The tab, not the panel picker's entry for the same shell.
+    const shellTab = () => screen.getByRole("button", { name: "main · u-1", hidden: true });
+    expect(shellTab()).toHaveAttribute("aria-current", "false");
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    const closeOthers = await screen.findByRole("menuitem", { name: "Close other tabs" });
+    expect(closeOthers).toHaveAttribute("data-disabled");
+    fireEvent.click(closeOthers);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(deleteTerminalMutate).not.toHaveBeenCalled();
+    expect(shellTab()).toBeInTheDocument();
+  });
+
   it("opens and closes unpinned pages through + when every page is unpinned", () => {
     writePinnedWorkspaceTabs([]);
     mockConversations([{ id: "conv_unpinned", permission_level: null }]);
@@ -4087,6 +4259,28 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("tab", { name: "Changes" })).toBeNull();
     expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
     expect(readSessionWorkspaceState("conv_unpinned").rightRailTab).toBeNull();
+  });
+
+  it("closes several open page tabs in one bulk close", async () => {
+    writePinnedWorkspaceTabs(["files"]);
+    writeSessionWorkspaceState("conv_bulk_pages", {
+      rightRailTab: "changes",
+      openPanels: ["changes", "subagents"],
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_bulk_pages", permission_level: null }]);
+    renderShell("/c/conv_bulk_pages");
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
+    // Both pages close; neither survives the other's close.
+    expect(screen.queryByRole("tab", { name: "Changes" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Agents" })).toBeNull();
+    expect(readSessionWorkspaceState("conv_bulk_pages").openPanels ?? []).toEqual([]);
   });
 
   it("selects a pinned page when its workspace becomes available", () => {
