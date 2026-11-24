@@ -385,6 +385,11 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
+/** An onSend that queues every message, as ChatPage does while the agent works. */
+function enqueueFromComposer(text: string, files?: File[], replyDraft?: StoredReplyDraft) {
+  useChatStore.getState().enqueueMessage(text, files, replyDraft);
+}
+
 function forceMobileViewport(): () => void {
   const original = window.matchMedia;
   window.matchMedia = ((query: string) => ({
@@ -857,9 +862,10 @@ describe("Composer send shortcut", () => {
     [true, "metaKey"],
     [true, "ctrlKey"],
   ] as const)(
-    "steers the draft and backlog (alternate send: %s, modifier: %s)",
+    "steers the draft and backlog with Always steer off (alternate send: %s, modifier: %s)",
     (alternate, modifier) => {
       localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(false);
       const onSend = vi.fn((text: string, files?: File[]) => {
         useChatStore.getState().enqueueMessage(text, files);
       });
@@ -904,6 +910,64 @@ describe("Composer send shortcut", () => {
           sendQueued.mock.invocationCallOrder[0]!,
         );
         expect(useChatStore.getState().queuedMessages).toEqual([]);
+      } finally {
+        act(() =>
+          useChatStore.setState({
+            boundAgentId: originalState.boundAgentId,
+            queuedMessages: [],
+            send: originalState.send,
+            sessionStatus: originalState.sessionStatus,
+            status: originalState.status,
+          }),
+        );
+      }
+    },
+  );
+
+  it.each([
+    [false, "metaKey"],
+    [false, "ctrlKey"],
+    [true, "metaKey"],
+    [true, "ctrlKey"],
+  ] as const)(
+    "queues the draft behind the turn with Always steer on (alternate send: %s, modifier: %s)",
+    (alternate, modifier) => {
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(true);
+      const sendNow = vi.fn().mockResolvedValue(undefined);
+      const originalState = useChatStore.getState();
+      setComposerState({
+        boundAgentId: "agent_shortcut",
+        queuedMessages: [{ queueId: "q_1", text: "queued first", conversationId: "conv_shortcut" }],
+        sessionStatus: "running",
+        send: sendNow,
+        status: "streaming",
+      });
+      const onSend = vi.fn();
+
+      try {
+        renderWithTooltips(
+          <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
+        );
+        fireEvent.change(textarea(), { target: { value: "after this turn" } });
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+
+        expect(onSend).toHaveBeenCalledExactlyOnceWith("after this turn", undefined, undefined, {
+          queue: true,
+        });
+        expect(textarea()).toHaveValue("");
+        // The existing backlog stays queued; nothing is steered into the turn.
+        expect(sendNow).not.toHaveBeenCalled();
+        expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+          "queued first",
+        ]);
+
+        // With nothing to queue, the chord still steers the backlog.
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+        expect(onSend).toHaveBeenCalledOnce();
+        expect(sendNow.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+          ["queued first", "agent_shortcut"],
+        ]);
       } finally {
         act(() =>
           useChatStore.setState({
@@ -7141,9 +7205,7 @@ describe("Composer reply quotes", () => {
   it("does not clear a new identical draft after submitting an edited restored send", async () => {
     const stableId = "f".repeat(32);
     // Submit through the store: the queued path is what a mid-turn Enter takes.
-    renderWithTooltips(
-      <Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />,
-    );
+    renderWithTooltips(<Composer {...composerProps({ onSend: enqueueFromComposer })} />);
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
@@ -7857,7 +7919,7 @@ describe("Composer workflow entry point", () => {
         usePlanStops.setState({ requests: {}, settledStops: {} });
       });
       const onStop = vi.fn();
-      const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+      const onSend = vi.fn(enqueueFromComposer);
       const error = vi.spyOn(toast, "error");
       const { rerender } = renderWithWorkflows(
         <Composer {...composerProps({ onStop, onSend, isWorking })} />,
@@ -8641,7 +8703,7 @@ describe("Composer — editing queued messages", () => {
 
   it("dequeues the recalled message so re-sending can't duplicate it", async () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     renderWithTooltips(<Composer {...props} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
@@ -8714,7 +8776,7 @@ describe("Composer — editing queued messages", () => {
     useChatStore.setState({
       queuedMessages: [{ queueId: "q_image", text, conversationId: CONV, files: [file] }],
     });
-    const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+    const onSend = vi.fn(enqueueFromComposer);
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
     const strip = screen.getByTestId("composer-queued-strip");
@@ -8768,7 +8830,7 @@ describe("Composer — editing queued messages", () => {
 
   it.each([false, true])("recalls queued path mentions with quotes: %s", (quoted) => {
     useChatStore.setState({ queuedMessages: [], sessionHarness: "codex-native" });
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...props} ref={ref} />);
     act(() =>

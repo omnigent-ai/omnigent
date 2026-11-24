@@ -85,6 +85,31 @@ const designTools =
         },
       };
 
+/**
+ * The floating panel's launch-offer subscriptions in a main window. The shell hears the first
+ * subscriber come and the last one go; each subscription's unsubscribe runs once.
+ */
+function launchOfferSubscriber() {
+  const subscriptions = new Set();
+  return (callback) => {
+    if (typeof callback !== "function") return () => {};
+    const subscription = {};
+    const listener = (_event, offer) => callback(offer);
+    ipcRenderer.on("omnigent:floating-composer:launch-offer", listener);
+    subscriptions.add(subscription);
+    if (subscriptions.size === 1) {
+      ipcRenderer.send("omnigent:floating-composer:launch-takers", true);
+    }
+    return () => {
+      if (!subscriptions.delete(subscription)) return;
+      ipcRenderer.removeListener("omnigent:floating-composer:launch-offer", listener);
+      if (subscriptions.size === 0) {
+        ipcRenderer.send("omnigent:floating-composer:launch-takers", false);
+      }
+    };
+  };
+}
+
 contextBridge.exposeInMainWorld("omnigentDesktop", {
   kind: "electron",
   /** Paint the dock/taskbar badge; 0 clears it. Fire-and-forget. */
@@ -181,8 +206,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       sessionArchived: state?.sessionArchived === true,
     });
   },
+  /**
+   * Report the conversation this page is showing, once it has loaded for the
+   * signed-in user; null when it shows none. Fire-and-forget.
+   * @param {string | null} conversationId
+   */
+  reportConversationShown: (conversationId) => {
+    ipcRenderer.send(
+      "omnigent:conversation-shown",
+      typeof conversationId === "string" ? conversationId : null,
+    );
+  },
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
+  /** Open a session in its own window on this server. Resolves whether it opened. */
+  openSessionWindow: (sessionId) => ipcRenderer.invoke("omnigent:open-session-window", sessionId),
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
   confirmQuit: (options) =>
     ipcRenderer.invoke("omnigent:confirm-quit", { dontAskAgain: options?.dontAskAgain === true }),
@@ -305,12 +343,32 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       return () => ipcRenderer.removeListener("omnigent:floating-composer:shown", listener);
     },
     /**
+     * From the panel: whether a launch's first message can go to a main window that sends it.
+     * Read the attachments only after this says yes.
+     */
+    canHandOffLaunch: () => ipcRenderer.invoke("omnigent:floating-composer:can-hand-off"),
+    /**
      * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
-     * then hide. Resolves `{ ok: true }` or
+     * then hide. A launch passes its first message as `message`, or null. Resolves
+     * `{ ok: true, delivery: "page" }` when that window sent the message, `{ ok: true }`, or
      * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.
      */
-    openInMainWindow: (path) =>
-      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path),
+    openInMainWindow: (path, message) =>
+      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path, message ?? null),
+    /**
+     * From a main window: this document takes launches' first messages, so main offers them
+     * here. Returns an unsubscribe function, which tells main it no longer takes them.
+     */
+    onLaunchOffer: launchOfferSubscriber(),
+    /** From a main window: take the message of a launch offered to this document, once. */
+    takeLaunchOffer: (offerId) =>
+      ipcRenderer.invoke("omnigent:floating-composer:launch-take", offerId),
+    /** From a main window: confirms the rebuilt offer; resolves whether it's still ours. */
+    confirmLaunchOffer: (offerId) =>
+      ipcRenderer.invoke("omnigent:floating-composer:launch-confirm", offerId),
+    /** From a main window: won't send the offered message, so the panel delivers it at once. */
+    declineLaunchOffer: (offerId) =>
+      ipcRenderer.invoke("omnigent:floating-composer:launch-decline", offerId),
     /** From the panel: its native file picker opened or closed. */
     filePicker: (state) =>
       ipcRenderer.send(

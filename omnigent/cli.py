@@ -27,7 +27,17 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from importlib import import_module, resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, NoReturn, TypeAlias, cast, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    BinaryIO,
+    Literal,
+    NoReturn,
+    TextIO,
+    TypeAlias,
+    cast,
+    get_args,
+)
 
 import click
 import psutil
@@ -7640,6 +7650,7 @@ def session(ctx: click.Context) -> None:
 
     \b
     Examples:
+      omnigent session create --agent claude -m "Fix the flaky test"
       omnigent session export --id conv_abc123
       omnigent session export --id conv_abc123 --output transcript.jsonl
       omnigent session export --id conv_abc123 --server https://myserver.com
@@ -8006,6 +8017,184 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 
     new_id = created.get("id") or created.get("session_id")
     click.echo(f"Imported {len(initial_items)} item(s) into {new_id}")
+
+
+@session.command("create")
+@click.option(
+    "--agent",
+    default=None,
+    metavar="NAME",
+    help="Native agent to run, as `omnigent <agent>` names it, e.g. claude or codex.",
+)
+@click.option(
+    "--agent-id",
+    default=None,
+    metavar="AGENT_ID",
+    help="Run a registered agent by id instead of a native one.",
+)
+@click.option("--title", default=None, help="Session title.")
+@click.option(
+    "--project-id",
+    default=None,
+    metavar="PROJECT_ID",
+    help="File the session in this project. Its saved agent and workspace apply "
+    "unless you pass --agent/--agent-id or --workspace.",
+)
+@click.option("--model", default=None, help="Model for the session, e.g. claude-sonnet-4-6.")
+@click.option("--reasoning-effort", default=None, help="Reasoning effort, e.g. high.")
+@click.option(
+    "--permission-mode",
+    default=None,
+    help="Permission mode in the agent's own terms, e.g. auto for Claude. Modes "
+    "that skip approval are refused.",
+)
+@click.option(
+    "--workspace",
+    default=None,
+    metavar="DIR",
+    help="Directory the session works in. Defaults to the project's saved "
+    "workspace, else the current directory.",
+)
+@click.option(
+    "--host-id",
+    default=None,
+    metavar="HOST_ID",
+    help="Run on another connected host you own instead of this machine. Needs "
+    "--workspace, an absolute path on that host.",
+)
+@click.option("-m", "--message", default=None, help="First message to queue.")
+@click.option(
+    "--message-file",
+    type=click.File("r", encoding="utf-8"),
+    default=None,
+    help="Read the first message from FILE ('-' for stdin).",
+)
+@click.option(
+    "--server",
+    default=None,
+    help="Omnigent server URL. Defaults to the configured server, or a local one.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Print the result as JSON.")
+def session_create(
+    agent: str | None,
+    agent_id: str | None,
+    title: str | None,
+    project_id: str | None,
+    model: str | None,
+    reasoning_effort: str | None,
+    permission_mode: str | None,
+    workspace: str | None,
+    host_id: str | None,
+    message: str | None,
+    message_file: TextIO | None,
+    server: str | None,
+    json_output: bool,
+) -> None:
+    """Create a session without a terminal, queue its first message, and print its id.
+
+    The session runs on this machine's host, which is started if needed, unless
+    --host-id names another connected host you own. It is created as you, the
+    same as starting a session in the web UI, so the server's host, workspace
+    and permission-mode checks apply. The command exits once the message is
+    queued; open the session in the web UI or with `omnigent claude --resume`
+    to follow it.
+
+    \b
+    Examples:
+      omnigent session create --agent claude --title "Fix flaky test" -m "Fix tests/test_x.py"
+      omnigent session create --agent codex --project-id proj_123 --message-file task.md
+      id=$(omnigent session create --agent claude --permission-mode auto --message-file -)
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+    from omnigent.session_create_cli import (
+        ScriptedSession,
+        create_session,
+        project_has_saved_workspace,
+        queue_message,
+        resolve_agent_id,
+        wait_for_local_host,
+    )
+
+    if message is not None and message_file is not None:
+        raise click.UsageError("Pass --message or --message-file, not both.")
+    text = message_file.read() if message_file is not None else message
+    if text is not None and not text.strip():
+        raise click.UsageError("The first message is empty.")
+    resolved_agent_id = resolve_agent_id(agent=agent, agent_id=agent_id, project_id=project_id)
+    if host_id is not None and workspace is None:
+        raise click.UsageError("--host-id needs --workspace, an absolute path on that host.")
+    if host_id is not None and workspace is not None and not workspace.startswith("/"):
+        raise click.UsageError("--workspace must be an absolute path on the --host-id host.")
+    if host_id is None and workspace is not None:
+        workspace = str(Path(workspace).expanduser().resolve())
+
+    cfg = _load_effective_config()
+    if host_id is None:
+        from omnigent.host.identity import load_or_create_host_identity
+
+        # Running here needs this machine's host daemon connected to the server.
+        base_url = _ensure_backend(server if server is not None else cfg.get("server"))
+        host_id = load_or_create_host_identity().host_id
+        wait_for_local_host(
+            base_url.rstrip("/"),
+            _remote_headers(server_url=base_url.rstrip("/"), host_id=host_id),
+            host_id,
+        )
+    else:
+        attach_url = _resolve_attach_server(server, cfg.get("server"))
+        if attach_url is None:
+            raise click.ClickException(
+                "No Omnigent server to create the session on: pass --server, or set "
+                "the server in your config."
+            )
+        base_url = attach_url
+    base_url = base_url.rstrip("/")
+
+    with httpx.Client(
+        base_url=base_url,
+        # Session requests must reach the replica holding the host's tunnel.
+        headers=_remote_headers(server_url=base_url, host_id=host_id),
+        trust_env=_trust_env_for(base_url),
+    ) as client:
+        if workspace is None and (
+            project_id is None or not project_has_saved_workspace(client, project_id)
+        ):
+            workspace = str(Path.cwd().resolve())
+        spec = ScriptedSession(
+            agent_id=resolved_agent_id,
+            host_id=host_id,
+            workspace=workspace,
+            title=title,
+            project_id=project_id,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            permission_mode=permission_mode,
+        )
+        session_id = create_session(client, spec)
+
+        def _report(message_queued: bool) -> None:
+            if not json_output:
+                click.echo(session_id)
+                return
+            from omnigent.conversation_browser import conversation_url
+
+            result = {
+                "session_id": session_id,
+                "url": conversation_url(base_url, session_id),
+                "message_queued": message_queued,
+            }
+            click.echo(json.dumps(result))
+
+        try:
+            if text is not None:
+                queue_message(client, session_id, text)
+        except click.ClickException:
+            # Name the half-created session on stdout so a script can clean it up.
+            _report(False)
+            raise
+    _report(text is not None)
 
 
 # Shared option help for ``run`` and the harness commands. These are the same

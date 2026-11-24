@@ -6,9 +6,12 @@ import {
   closeDesktopWindow,
   confirmDesktopQuit,
   onDesktopCommand,
+  reportConversationShown,
+  openDesktopSessionWindow,
   setDesktopCommandState,
   startSystemDictation,
   supportsDesktopCommands,
+  supportsDesktopSessionWindows,
   supportsSystemDictation,
   getServerPicker,
   getWidenWindowForRightSidebar,
@@ -841,6 +844,23 @@ describe("desktop command bridge", () => {
     await expect(confirmDesktopQuit(false)).resolves.toBe(false);
   });
 
+  it("reports the conversation on screen to a shell that listens for it", () => {
+    // An older shell has no such method: the report is simply dropped.
+    installDesktop({});
+    expect(() => reportConversationShown("conv_a")).not.toThrow();
+
+    const report = vi.fn();
+    installDesktop({ reportConversationShown: report });
+    reportConversationShown("conv_a");
+    reportConversationShown(null);
+    expect(report.mock.calls).toEqual([["conv_a"], [null]]);
+
+    report.mockImplementationOnce(() => {
+      throw new Error("bridge down");
+    });
+    expect(() => reportConversationShown("conv_a")).not.toThrow();
+  });
+
   it("confirms a quit with the Don't ask again choice", async () => {
     const confirmQuit = vi.fn().mockResolvedValue(true);
     installDesktop({ confirmQuit });
@@ -970,5 +990,44 @@ describe("right sidebar window bridge", () => {
       throw new Error("ipc down");
     });
     expect(() => resetRightSidebarWindowTracking()).not.toThrow();
+  });
+});
+
+describe("desktop session windows", () => {
+  function setSessionWindowBridge(openSessionWindow?: (id: string) => Promise<boolean>): void {
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      ...(openSessionWindow ? { openSessionWindow } : {}),
+    };
+  }
+
+  it("asks a capable shell to open the session and reports its answer", async () => {
+    const openSessionWindow = vi.fn().mockResolvedValue(true);
+    setSessionWindowBridge(openSessionWindow);
+
+    expect(supportsDesktopSessionWindows()).toBe(true);
+    expect(await openDesktopSessionWindow("conv_1")).toBe(true);
+    expect(openSessionWindow).toHaveBeenCalledWith("conv_1");
+  });
+
+  it("reports no window for an older shell, a browser, or a failed request", async () => {
+    setSessionWindowBridge();
+    expect(supportsDesktopSessionWindows()).toBe(false);
+    expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+
+    setElectron(false);
+    expect(supportsDesktopSessionWindows()).toBe(false);
+    expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      setSessionWindowBridge(() => Promise.reject(new Error("ipc down")));
+      expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+      expect(warn).toHaveBeenCalled();
+      setSessionWindowBridge(() => Promise.resolve(false));
+      expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

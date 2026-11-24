@@ -710,6 +710,12 @@ class SubagentEntry:
     :param mid_turn: Whether the forwarded items leave the child's turn open
         (see :func:`_leaves_turn_open`), so inactivity waits for
         ``_SUBAGENT_MID_TURN_IDLE_THRESHOLD_S``.
+    :param observed_model: Latest verbatim ``message.model`` in the child's
+        own transcript, e.g. ``"claude-haiku-4-5"``. Sticky, because a later
+        read window may carry no assistant record. ``None`` until one is seen.
+    :param posted_model: Last model reported to the child session via
+        ``external_model_change``. Left behind ``observed_model`` after a
+        failed post so the next poll retries.
     """
 
     subagent_id: str
@@ -721,6 +727,8 @@ class SubagentEntry:
     last_status: str | None = None
     delivery_error: str | None = None
     mid_turn: bool = False
+    observed_model: str | None = None
+    posted_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1909,6 +1917,8 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
             mid_turn=row.get("mid_turn") is True,
+            observed_model=concrete_reported_model(row.get("observed_model")),
+            posted_model=concrete_reported_model(row.get("posted_model")),
         )
     return SubagentForwardState(subagents=entries)
 
@@ -1933,6 +1943,8 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
                 "mid_turn": entry.mid_turn,
+                "observed_model": entry.observed_model,
+                "posted_model": entry.posted_model,
             }
             for entry in state.subagents.values()
         },
@@ -2445,8 +2457,10 @@ async def _forward_one_subagent(
     seen = set(seen_source_ids)
     pending, safe_offset = _pending_items_from_records(result, seen, entry.byte_offset)
     new_entry = entry
+    if result.latest_model is not None:
+        new_entry = replace(new_entry, observed_model=result.latest_model)
     if safe_offset != entry.byte_offset:
-        new_entry = replace(entry, byte_offset=safe_offset)
+        new_entry = replace(new_entry, byte_offset=safe_offset)
         await checkpoint.put(new_entry)
 
     batches = await asyncio.to_thread(_partition_subagent_batches, pending)
@@ -2658,6 +2672,16 @@ async def _forward_one_subagent(
         if stop_after_batch:
             break
 
+    reported_entry = await _post_subagent_model_if_new(
+        client,
+        entry=new_entry,
+        parent_session_id=parent_session_id,
+        retry_tracker=status_retry_tracker,
+    )
+    if reported_entry is not new_entry:
+        new_entry = reported_entry
+        await checkpoint.put(new_entry)
+
     delivery_pending = any(item.item.source_id not in seen for item in pending)
     idle_threshold_s = (
         _SUBAGENT_MID_TURN_IDLE_THRESHOLD_S if new_entry.mid_turn else _SUBAGENT_IDLE_THRESHOLD_S
@@ -2709,6 +2733,60 @@ async def _forward_one_subagent(
         return
     status_retry_tracker.clear(retry_key)
     await checkpoint.put(replace(new_entry, last_status=desired_status))
+
+
+async def _post_subagent_model_if_new(
+    client: httpx.AsyncClient,
+    *,
+    entry: SubagentEntry,
+    parent_session_id: str,
+    retry_tracker: _PostRetryTracker,
+) -> SubagentEntry:
+    """
+    Report a sub-agent's own model to its child session, deduped per child.
+
+    A Task spawn can run on a different model than the parent, and the child
+    session has no other source for it: without this report its
+    ``reported_model`` stays empty and surfaces fall back to the parent's.
+
+    :param client: Omnigent HTTP client.
+    :param entry: Child cursor carrying ``observed_model`` and ``posted_model``.
+    :param parent_session_id: Parent session id, used for log context.
+    :param retry_tracker: Backoff state for metadata posts to sub-agents.
+    :returns: ``entry`` unchanged when there is nothing to post or the post
+        should be retried, else a copy with ``posted_model`` advanced.
+    """
+    model = entry.observed_model
+    if model is None or model == entry.posted_model:
+        return entry
+    retry_key = f"subagent_model:{entry.child_conversation_id}"
+    if retry_tracker.retry_delay_s(retry_key) is not None:
+        return entry
+    try:
+        await _post_external_model_change(
+            client, session_id=entry.child_conversation_id, model=model
+        )
+    except httpx.HTTPError as exc:
+        decision = retry_tracker.record_failure(
+            retry_key, exc, session_id=entry.child_conversation_id
+        )
+        _logger.warning(
+            "Failed to report claude-native sub-agent model; child=%s model=%s "
+            "attempt=%s permanent=%s http_status=%s",
+            entry.child_conversation_id,
+            model,
+            decision.attempts,
+            decision.permanent,
+            _http_status_for_log(exc),
+            exc_info=True,
+            extra={"session_id": parent_session_id},
+        )
+        if not decision.exhausted:
+            return entry
+        # Stop retrying a rejected report; a later model change posts again.
+    else:
+        retry_tracker.clear(retry_key)
+    return replace(entry, posted_model=model)
 
 
 def _tool_use_ids_in_transcript(

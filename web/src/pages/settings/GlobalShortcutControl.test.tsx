@@ -329,4 +329,118 @@ describe("GlobalShortcutControl", () => {
     expect(toggle).not.toBeChecked();
     expect(screen.getByTestId(RECORDER_TEST_ID)).toHaveTextContent("Alt+Space");
   });
+
+  it("offers the free chord the shell proposed, and saves it on one click", async () => {
+    const bridge = installBridge({
+      enabled: true,
+      accelerator: "Alt+Space",
+      error: "Alt+Space isn't working. Another app may be using it.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+    renderControl();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Alt+Space isn't working.");
+
+    fireEvent.click(screen.getByRole("button", { name: /^Use .+ instead$/ }));
+
+    await waitFor(() =>
+      expect(bridge.setGlobalShortcut).toHaveBeenCalledExactlyOnceWith({
+        enabled: true,
+        accelerator: "Control+Alt+Shift+Space",
+      }),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Use .+ instead$/ })).toBeNull();
+  });
+
+  it("offers a proposed chord when the shell refuses the one that was just turned on", async () => {
+    const bridge = installBridge(
+      { enabled: false, accelerator: "Alt+Space" },
+      { ok: true, setting: { enabled: true, accelerator: "Control+Alt+Shift+Space" } },
+    );
+    bridge.setGlobalShortcut.mockResolvedValueOnce({
+      ok: false,
+      error: "Couldn't use Alt+Space. It may be invalid or already in use by another app.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+    renderControl();
+    const toggle = await screen.findByRole("switch", { name: SWITCH_NAME });
+
+    fireEvent.click(toggle);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("already in use by another app");
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: /^Use .+ instead$/ }));
+
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(bridge.setGlobalShortcut).toHaveBeenLastCalledWith({
+      enabled: true,
+      accelerator: "Control+Alt+Shift+Space",
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("ignores the row's other saves while the proposed chord's save is pending", async () => {
+    const bridge = installBridge({
+      enabled: true,
+      accelerator: "Alt+Space",
+      error: "Alt+Space isn't working. Another app may be using it.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+    let finish: ((result: GlobalShortcutSaveResult) => void) | undefined;
+    bridge.setGlobalShortcut.mockImplementationOnce(
+      () =>
+        new Promise<GlobalShortcutSaveResult>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    renderControl();
+    const proposal = await screen.findByRole("button", { name: /^Use .+ instead$/ });
+
+    fireEvent.click(proposal);
+    // aria-disabled controls still get clicks, so these reach the row's save guard.
+    fireEvent.click(proposal);
+    fireEvent.click(screen.getByRole("switch", { name: SWITCH_NAME }));
+    fireEvent.click(screen.getByTestId(RECORDER_TEST_ID));
+
+    // The whole row waits for the pending approval, and says so.
+    expect(proposal).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("switch", { name: SWITCH_NAME })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.getByTestId(RECORDER_TEST_ID)).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByTestId(RECORDER_TEST_ID)).not.toHaveTextContent("Press a shortcut…");
+    expect(bridge.setGlobalShortcut).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      finish?.({ ok: true, setting: { enabled: true, accelerator: "Control+Alt+Shift+Space" } });
+    });
+    expect(bridge.setGlobalShortcut).toHaveBeenCalledTimes(1);
+    // Accepted: the warning and proposal go, and the keyboard lands on the chord it set.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Use .+ instead$/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId(RECORDER_TEST_ID)).toHaveTextContent(/Space$/);
+    expect(screen.getByTestId(RECORDER_TEST_ID)).toHaveFocus();
+  });
+
+  it("still records a chord while off after a refused enable", async () => {
+    const bridge = installBridge({ enabled: false, accelerator: "Alt+Space" });
+    bridge.setGlobalShortcut.mockResolvedValueOnce({
+      ok: false,
+      error: "Couldn't use Alt+Space. It may be invalid or already in use by another app.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+    renderControl();
+    fireEvent.click(await screen.findByRole("switch", { name: SWITCH_NAME }));
+    await screen.findByRole("alert");
+
+    fireEvent.click(screen.getByTestId(RECORDER_TEST_ID));
+    fireEvent.keyDown(window, { code: "KeyK", ctrlKey: true, shiftKey: true });
+
+    await waitFor(() =>
+      expect(bridge.setGlobalShortcut).toHaveBeenLastCalledWith({
+        enabled: false,
+        accelerator: "Control+Shift+K",
+      }),
+    );
+  });
 });

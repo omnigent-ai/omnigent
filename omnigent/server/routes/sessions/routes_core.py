@@ -82,6 +82,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_live_state
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -104,6 +105,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.failed_status_diagnostics import bound_runner_connection
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.openapi_request_bodies import SESSION_CREATE_OPENAPI_EXTRA
@@ -2383,6 +2385,7 @@ def register_core_routes(
                         id=proj.id,
                         name=proj.name,
                         icon=icon if isinstance(icon, str) else None,
+                        muted=proj.config.get("muted") is True,
                     )
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in sorted(conversation_store.list_projects(owned_by=user_id)):
@@ -2533,6 +2536,15 @@ def register_core_routes(
             request=request,
         )
         snapshot.side_chat_allowed = side_chat_ok
+        # The session list also reads the stored pending count, which stays stale
+        # when a prompt is resolved on a replica that never recorded it.
+        tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+        if bound_runner_connection(tunnel_registry, conv.runner_id) is not None and (
+            pending_elicitations.count_for(conv.id) != (conv.pending_elicitation_count or 0)
+        ):
+            session_live_state.reconcile_pending_count(
+                conv.id, conv.pending_elicitation_count, runner_id=conv.runner_id
+            )
         return snapshot
 
     @router.get(

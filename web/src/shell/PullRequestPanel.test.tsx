@@ -1721,6 +1721,25 @@ describe("PullRequestPanel", () => {
     expect(screen.getAllByRole("button", { name: /util\.py/ }).length).toBeGreaterThan(0);
   });
 
+  it("truncates a long file name in the sidebar tree from its middle, keeping its start", async () => {
+    state.changes = {
+      data: { available: true, data: [file("src/DataModelHandler.scala", "modified")] },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderChanges();
+    await screen.findByRole("button", { name: "src" });
+    // The section header carries aria-expanded; the sidebar row doesn't.
+    const row = fileRowButtons(/DataModelHandler\.scala/).find(
+      (button) => !button.hasAttribute("aria-expanded"),
+    )!;
+    const start = within(row).getByText("DataModelHandler.");
+    expect(start).toHaveClass("truncate");
+    expect(start.closest('[class~="[direction:rtl]"]')).toBeNull();
+    expect(within(row).getByText("scala")).toBeInTheDocument();
+  });
+
   it("collapses a folder to hide its files in the sidebar tree", async () => {
     state.changes = {
       data: {

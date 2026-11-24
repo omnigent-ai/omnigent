@@ -23,6 +23,7 @@ import {
   hostFetch,
   isDatabricksWorkspace,
   isHostRoutingEnabled,
+  type UploadProgressListener,
 } from "./host";
 import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
 import {
@@ -656,10 +657,17 @@ async function _wrongReplicaResendKey(res: Response): Promise<string | null> {
   return typeof sliceKey === "string" && sliceKey !== "" ? sliceKey : null;
 }
 
+/** A request through `authenticatedFetch`, with an optional upload-progress listener. */
+export interface AuthenticatedRequestInit extends RequestInit {
+  /** Told how much of the body each request this call sends has uploaded. */
+  onUploadProgress?: UploadProgressListener;
+}
+
 export async function authenticatedFetch(
   input: RequestInfo | URL,
-  init?: RequestInit,
+  options?: AuthenticatedRequestInit,
 ): Promise<Response> {
+  const { onUploadProgress, ...init } = options ?? {};
   const headers = new Headers(init?.headers);
   if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
     headers.set("X-Forwarded-Email", currentUserId);
@@ -668,6 +676,11 @@ export async function authenticatedFetch(
   // the modal host for cache affinity. An explicit caller header wins.
   // OSS ingress deployments opt in to this routing.
   const url = typeof input === "string" ? input : input.toString();
+  // A retried attempt re-sends the whole body, so its progress restarts from zero.
+  const retryAttempt = (requestInit: RequestInit, routing: { unkeyed?: boolean } = {}) => {
+    onUploadProgress?.(0, null);
+    return hostFetch(url, requestInit, { ...routing, onUploadProgress });
+  };
   // Resolve this session's host BEFORE deriving the slice key below, so a fresh
   // session sub-path request keys to the right replica on the first attempt
   // instead of guessing the modal host and self-healing via the keyless retry.
@@ -733,7 +746,7 @@ export async function authenticatedFetch(
       headers,
       cache: "no-store",
     },
-    { unkeyed },
+    { unkeyed, onUploadProgress },
   );
 
   // After a host switch this page can still key a session by its old host, which
@@ -762,7 +775,7 @@ export async function authenticatedFetch(
     if (sentKey === null) clearHostKeyless(resendKey);
     const keyedHeaders = new Headers(headers);
     keyedHeaders.set(SLICE_KEY_HEADER, resendKey);
-    res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+    res = await retryAttempt({ ...init, headers: keyedHeaders, cache: "no-store" }, {});
     if (res.ok) clearHostKeyless(resendKey);
     derivedHostId = resendKey;
     stampedSliceKey = sentKey !== null;
@@ -781,8 +794,7 @@ export async function authenticatedFetch(
     // (callers/tests hold it by reference).
     const retryHeaders = new Headers(headers);
     retryHeaders.delete(SLICE_KEY_HEADER);
-    res = await hostFetch(
-      url,
+    res = await retryAttempt(
       {
         ...init,
         headers: retryHeaders,
@@ -818,14 +830,13 @@ export async function authenticatedFetch(
       if (hostId !== null && !demoted) {
         const retryHeaders = new Headers(headers);
         retryHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, { ...init, headers: retryHeaders, cache: "no-store" });
+        res = await retryAttempt({ ...init, headers: retryHeaders, cache: "no-store" }, {});
       }
     }
     if (await _isWrongReplica(res)) {
       const retryHeaders = new Headers(headers);
       retryHeaders.delete(SLICE_KEY_HEADER);
-      res = await hostFetch(
-        url,
+      res = await retryAttempt(
         { ...init, headers: retryHeaders, cache: "no-store" },
         { unkeyed: true },
       );
@@ -836,7 +847,7 @@ export async function authenticatedFetch(
         clearHostKeyless(hostId);
         const keyedHeaders = new Headers(headers);
         keyedHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
+        res = await retryAttempt({ ...init, headers: keyedHeaders, cache: "no-store" }, {});
       }
     }
   } else if (

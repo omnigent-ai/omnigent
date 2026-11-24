@@ -10411,7 +10411,10 @@ async def test_sys_session_share_public_allows_public_grant(level: str, number: 
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
+@pytest.mark.parametrize("archived", [False, True])
+async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(
+    archived: bool,
+) -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
@@ -10442,6 +10445,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "agent_id": "ag_xyz",
                     "agent_name": "researcher",
                     "status": "running",
+                    "archived": archived,
                     "created_at": 1,
                     "updated_at": 84,
                     "title": "auth flow",
@@ -10486,6 +10490,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     info = json.loads(output)
     assert info["session_id"] == "conv_target"
     assert info["status"] == "running"
+    assert info["archived"] is archived
     assert info["last_activity_at"] == 84
     assert info["title"] == "auth flow"
     assert info["agent_id"] == "ag_xyz"
@@ -10517,6 +10522,120 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     assert "items" not in info
     assert "total_cost_usd" not in info
     assert "usage_by_model" not in info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot_usage", "expected_usage"),
+    [
+        pytest.param(
+            {
+                "total_cost_usd": 1.25,
+                "usage_by_model": {
+                    "model-a": {
+                        "input_tokens": 12,
+                        "output_tokens": 4,
+                        "total_tokens": 30,
+                        "cache_read_input_tokens": 14,
+                        "total_cost_usd": 1.0,
+                    },
+                    "model-b": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+                },
+            },
+            {
+                "total_cost_usd": 1.25,
+                "cost_hidden": False,
+                "input_tokens": 15,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 14,
+                "cache_creation_input_tokens": None,
+                "total_tokens": 34,
+                "by_model": {
+                    "model-a": {
+                        "input_tokens": 12,
+                        "output_tokens": 4,
+                        "total_tokens": 30,
+                        "cache_read_input_tokens": 14,
+                        "total_cost_usd": 1.0,
+                    },
+                    "model-b": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+                },
+            },
+            id="priced",
+        ),
+        pytest.param(
+            {
+                "total_cost_usd": None,
+                "cost_hidden": True,
+                "usage_by_model": {"model-a": {"input_tokens": 7}},
+            },
+            {
+                "total_cost_usd": None,
+                "cost_hidden": True,
+                "input_tokens": 7,
+                "output_tokens": None,
+                "cache_read_input_tokens": None,
+                "cache_creation_input_tokens": None,
+                "total_tokens": None,
+                "by_model": {"model-a": {"input_tokens": 7}},
+            },
+            id="cost-hidden",
+        ),
+        pytest.param(
+            {"total_cost_usd": None, "usage_by_model": None},
+            {
+                "total_cost_usd": None,
+                "cost_hidden": False,
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_input_tokens": None,
+                "cache_creation_input_tokens": None,
+                "total_tokens": None,
+                "by_model": {},
+            },
+            id="no-usage-yet",
+        ),
+        pytest.param({"usage_included": False}, None, id="aggregate-skipped"),
+    ],
+)
+async def test_sys_session_get_info_include_usage_reports_cost_and_tokens(
+    snapshot_usage: dict[str, object],
+    expected_usage: dict[str, object] | None,
+) -> None:
+    """
+    ``include_usage`` asks the server for the usage aggregate and projects it.
+
+    Token totals sum the per-model buckets, an unrecorded bucket stays null
+    instead of reading as zero, and an unpriced or hidden cost stays null.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_reads: list[dict[str, str]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            session_reads.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={"id": "conv_target", "status": "idle", **snapshot_usage},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target", "include_usage": True}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert [read["include_usage"] for read in session_reads] == ["true"]
+    info = json.loads(output)
+    assert info["session_id"] == "conv_target"
+    assert info["usage"] == expected_usage
 
 
 @pytest.mark.asyncio

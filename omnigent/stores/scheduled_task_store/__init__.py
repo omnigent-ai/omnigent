@@ -152,6 +152,7 @@ class ScheduledTaskStore(ABC):
         session_mode: str = "new",
         session_id: str | None = None,
         source_session_id: str | None = None,
+        workflow_id: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
         host_id: str | None = None,
@@ -188,6 +189,8 @@ class ScheduledTaskStore(ABC):
             its prompt to; ``None`` lets its first firing create one.
         :param source_session_id: The session each firing's new session starts
             as a copy of, or ``None`` for runs that start empty.
+        :param workflow_id: The saved workflow every run starts as a run of, or
+            ``None`` for a task saved without one.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
         :param project_id: First-class project each fired session is filed
@@ -335,6 +338,7 @@ class ScheduledTaskStore(ABC):
         max_cost_usd: float | None = _UNSET,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
+        workflow_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
         base_branch: str | None = _UNSET,
         host_id: str | None = _UNSET,
@@ -349,14 +353,13 @@ class ScheduledTaskStore(ABC):
         """
         Update mutable fields of a task.
 
-        Most parameters use ``None`` to mean "leave unchanged". For the per-task
-        overrides (``model_override``, ``reasoning_effort``,
-        ``permission_mode``), ``base_branch``, ``host_id``, ``project_id``, ``max_cost_usd``,
-        ``session_id``, and ``last_run_conversation_id``, the sentinel default means
-        "not provided / leave unchanged"; passing ``None`` explicitly sets the column to NULL —
-        so resetting an override to the agent default actually clears it (e.g.
-        turning a set ``bypassPermissions`` back off), and clearing a host
-        binding or nulling out a deleted last-run conversation.
+        Most parameters use ``None`` to mean "leave unchanged". For the per-task overrides
+        (``model_override``, ``reasoning_effort``, ``permission_mode``), ``base_branch``,
+        ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, ``workflow_id``, and
+        ``last_run_conversation_id``, the sentinel default means "not provided / leave unchanged";
+        passing ``None`` explicitly sets the column to NULL — so resetting an override to the agent
+        default actually clears it (e.g. turning a set ``bypassPermissions`` back off), and
+        clearing a host binding or nulling out a deleted last-run conversation.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged. ``mcp_services`` replaces the task's MCP services

@@ -14,6 +14,7 @@ import { resetWorkspaceTabsSessionsForTests, workspaceTabsSession } from "./work
 const captured = vi.hoisted(() => ({
   panel: null as ComponentProps<typeof WorkspaceTabsPanel> | null,
   deleteTerminal: vi.fn(async (_id: string) => undefined),
+  deleteOptions: undefined as { reportsFailure?: boolean } | undefined,
 }));
 vi.mock("./WorkspaceTabsPanel", () => ({
   WorkspaceTabsPanel: (props: ComponentProps<typeof WorkspaceTabsPanel>) => {
@@ -23,7 +24,10 @@ vi.mock("./WorkspaceTabsPanel", () => ({
 }));
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
-  useDeleteTerminal: () => ({ mutateAsync: captured.deleteTerminal }),
+  useDeleteTerminal: (_conversationId: string, options?: { reportsFailure?: boolean }) => {
+    captured.deleteOptions = options;
+    return { mutateAsync: captured.deleteTerminal };
+  },
 }));
 
 const ZSH: TerminalInfo = { id: "t1", name: "zsh", session: "s1", running: true };
@@ -119,6 +123,27 @@ describe("WorkspaceTabsHost", () => {
 
     await expect(captured.panel!.endShell("terminal:t1")).resolves.toBe(true);
     expect(captured.deleteTerminal).toHaveBeenCalledWith("t1");
+  });
+
+  it("leaves a shell that won't end for the sidebar to report", async () => {
+    host();
+    captured.deleteTerminal.mockRejectedValueOnce(new Error("runner offline"));
+    await expect(captured.panel!.endShell("terminal:t1")).resolves.toBe(false);
+    expect(captured.deleteOptions).toEqual({ reportsFailure: false });
+  });
+
+  it("asks once in the Close shells dialog before a split's shells close together", async () => {
+    const user = userEvent.setup();
+    host({ terminals: [ZSH, { ...ZSH, id: "t2", name: "bash" }] });
+    let closing!: Promise<boolean>;
+    act(() => {
+      closing = captured.panel!.confirmCloseShells(["terminal:t1", "terminal:t2"]);
+    });
+    expect(await screen.findByRole("heading", { name: "Close 2 shells?" })).toBeInTheDocument();
+    expect(screen.getByText("zsh · s1 and bash · s1")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Close shell" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Close shells" }));
+    await expect(closing).resolves.toBe(true);
   });
 
   it("binds Back and Forward, opening the sidebar before a step", async () => {

@@ -50,13 +50,16 @@ from omnigent.server.scheduled.schedule import (
     scheduled_trigger_key,
     timer_rule,
 )
+from omnigent.server.session_journal import open_store as open_journal_store
 from omnigent.server.startup_inputs import STARTUP_LABEL
+from omnigent.server.workflows import open_store as open_workflow_store
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.server.scheduled.test_dispatch_scheduler import _drain
 from tests.server.scheduled.test_fire import (
+    _WORKFLOW_STEPS,
     FakeAgentStore,
     FakeHostStore,
     FakePermissionStore,
@@ -68,6 +71,8 @@ from tests.server.scheduled.test_fire import (
     _FakeConversation,
     _FakeHost,
     _managed_sandbox_config,
+    _workflow_prompt,
+    _workflows_on,
 )
 from tests.server.scheduled.test_scheduler import FakeClock
 
@@ -123,6 +128,7 @@ def _claim(
     agent_id: str = _AGENT_ID,
     user_id: str | None = None,
     one_time: bool = False,
+    prompt: str = "do the thing",
     **kwargs: Any,
 ) -> _Claimed:
     """Create a due task and claim its first occurrence, as the scheduler's poll would.
@@ -135,7 +141,7 @@ def _claim(
     created = store.create(
         uuid.uuid4().hex,
         "nightly",
-        "do the thing",
+        prompt,
         "FREQ=HOURLY;COUNT=1" if one_time else "FREQ=HOURLY",
         user_id,
         agent_id,
@@ -169,6 +175,7 @@ def _deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDeps:
         managed_launches=overrides.get("managed_launches"),
         startup_inputs=overrides.get("startup_inputs"),
         project_store=overrides.get("project_store"),
+        app_state=overrides.get("app_state"),
     )
 
 
@@ -217,6 +224,34 @@ async def test_connected_fire_runs_on_the_claimed_run(
     assert row["attributes"]["run_id"] == run.id
     assert row["attributes"]["task_id"] == claimed.task.id
     assert row["attributes"]["trigger_key"] == run.trigger_key
+
+
+async def test_a_claimed_run_of_a_workflow_automation_starts_as_a_run_of_the_workflow(
+    store, db_uri
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    workflow = open_workflow_store(conversations).create(
+        user_id=None, name="Triage", description="Triage the queue", steps=_WORKFLOW_STEPS
+    )
+    journal = open_journal_store(conversations)
+    assert journal is not None
+    claimed = _claim(store, prompt=_workflow_prompt(workflow.id))
+    plans_at_launch: list[Any] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        plans_at_launch.append(journal.current_workflow_run(conv.id))
+
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, app_state=_workflows_on()),
+        launch_dispatch=dispatch,
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    [run] = _runs(store, claimed.task)
+    [plan] = plans_at_launch
+    assert (run.status, run.conversation_id) == ("running", plan.conversation_id)
+    assert (plan.workflow_id, plan.scheduled_task_run_id) == (workflow.id, run.id)
+    assert plan.content["steps"] == workflow.steps
 
 
 @pytest.mark.parametrize(

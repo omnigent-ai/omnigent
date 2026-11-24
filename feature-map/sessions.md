@@ -86,6 +86,13 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+- `palette-pane-corners`: where floating panes can show (`workspace_sidebar_v2` or
+  `floating_panes` on, and not a touch device), the QuickPick palette lists the
+  **Pane corners** setting. **Automatic** follows the server's `floating_panes`
+  policy and names what it gives now; **Floating panes** and **Sharp corners**
+  override it on this device, and a reload keeps the choice. Settings →
+  Appearance offers the same choice (`web/src/shell/settingsCommands.test.ts`,
+  `tests/e2e_ui/sessions/test_floating_panes.py`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -152,6 +159,8 @@ the header menu), and each place is a separate entry point.
   session starts. Older servers keep the folder-only dialog.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+  Double-clicking the folder's name renames it inline instead, like a session
+  row; a rejected name shows a toast and keeps the old name.
   Agents rename projects and set their emoji with `sys_project_update`, and
   rename, pin or archive
   sessions with `sys_session_update` (see
@@ -337,6 +346,26 @@ the header menu), and each place is a separate entry point.
   Server admins configure the available targets under Settings → Admin → General →
   **Nested agent destinations**.
 
+- To move a conversation from the browser to the desktop app, open its link
+  (`/c/<id>`) in a desktop browser while the app is running and connected to
+  that server. The first time, a toast asks **Open conversations in the
+  Omnigent desktop app?**; **Open in app** opens it there and makes later links
+  move on their own. Turn it on or off under Settings → General → Conversation
+  links → **Open conversations in the desktop app**. Links to a file or to
+  Canvas stay in the browser.
+
+**Pop out a session (desktop layouts):** open a session's header ⋯ menu, or a
+sidebar row's menu or right-click menu, and choose **Open in new window**. A
+browser opens a 960×820 popup on that session; it keeps the desktop layout and
+starts with the sidebar collapsed (the sidebar toggle reopens it). A blocked
+popup shows a toast asking to allow pop-ups. Browser pop-outs stay in the browser
+even when automatic desktop handoff is enabled. The desktop app opens another app
+window on the same server instead of the system browser; that window doesn't
+replace the main window's saved size and position. Choosing it again for a
+session that's already popped out brings its window forward. Mobile viewports,
+the iOS/Android apps, embedding host pages, and desktop builds that predate the
+feature don't offer it.
+
 **Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
@@ -435,8 +464,18 @@ Failed output from a muted automation session is also hidden from Unread;
 its failure remains visible on the automation card and in run history.
 Automation failures that never created a session keep their separate Inbox cards.
 
+**Mute a project:** in the project folder's menu (three-dot or right-click) or
+the project home's menu, choose Mute project. Every session filed in the
+project, including ones added later and workers its sessions start, then
+behaves as muted above, and the folder header shows a muted bell. A member
+session's own menu reads Muted with project; choose Unmute project to undo.
+Sessions outside the project, such as one coordinating it, still notify.
+The item appears only on servers that advertise `project_mute` in `/v1/info`.
+
 **Project folder:** right-click its header or open its three-dot menu, then
-choose Rename project. Start typing as soon as the dialog opens. Delete project
+choose Rename project. Start typing as soon as the dialog opens. Or double-click
+the folder's name (not its chevron) to edit it in place: Enter or blur saves,
+Escape cancels, and the dialog remains the place to change its emoji. Delete project
 archives every session in the folder; when any of them has an agent working,
 awaiting approval, or running background work, the dialog says how many and
 that deleting stops them, then asks again with Delete anyway.
@@ -727,7 +766,10 @@ after stopping; this relaunches the parent and both use one runner. Sending to
 an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
-chat with its tab's close button; the parent and sibling chats keep running.
+chat with its tab's close button or its tab menu's Close; the parent and sibling
+chats keep running. Close other tabs and Close all tabs, in the tab menu or the
+rail's panel picker (⌄), stop every side chat they close, while sub-agent tabs
+they close are only hidden.
 On another device, open the same parent: saved side chats appear in the existing
 Workspace tab strip or mobile Side chats drawer. Discovery fetches up to 20 chats
 without changing the active panel or tab. Tabs closed on this device stay closed
@@ -754,7 +796,8 @@ and does not apply to the grid's shared panel. Covered by
 `web/electron/e2e/desktop_right_sidebar_widens_window.e2e.js`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
-strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
+strip offers edit, steer, reorder and delete. Mod+Enter steers them all, or
+queues the draft when Always steer is on.
 Closing the side chat discards the follow-ups queued on that device. Other
 devices keep their tabs and queued work. Closing still stops the chat's running
 turn, as before. A closed Codex side chat resumes on its next message or Resume,
@@ -981,6 +1024,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`project-rename`, project header right-click and three-dot menus:**
   `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
   covers typing across the menu's exit animation from both menus.
+- **`project-rename`, double-click the folder name:**
+  `tests/e2e_ui/sessions/test_project_inline_rename.py` saves with Enter and
+  checks the server, cancels with Escape, and shows a duplicate name's toast.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):

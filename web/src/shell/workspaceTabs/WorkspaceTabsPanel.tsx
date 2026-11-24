@@ -8,11 +8,17 @@ import { isPinnedTab } from "./pinnedTabs";
 import { reorderStripEntries, type StripReorderEntry } from "./stripReorder";
 import { pinnedTabsMaxWidth, TAB_GAP } from "./tabStripWidth";
 import { useTabStripWidth } from "./useTabStripWidth";
-import { type TabSearchEntry, WorkspaceTabSearch } from "./WorkspaceTabSearch";
+import { tabGroup as tabGroupDefinition, tabGroupOf, tabPullRequestUrl } from "./tabGroups";
+import {
+  type TabSearchClosing,
+  type TabSearchEntry,
+  WorkspaceTabSearch,
+} from "./WorkspaceTabSearch";
 import {
   NEW_TAB_DIVIDER_ROOM,
   NewTabButton,
   PINNED_TAB_WIDTH,
+  StripDivider,
   StripTab,
   StripTabMenu,
   type TabTitle,
@@ -62,6 +68,7 @@ import { terminalDisplayLabel, terminalTabKey, useTerminals } from "@/hooks/useT
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { closeBrowserView, forgetBrowserTab } from "@/hooks/useBrowserTabs";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { getPullRequestStatus } from "@/lib/pullRequestStatus";
 import { shortcutAriaKeys, shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 import { supportsSideChat } from "@/lib/sideChat";
 import { subagentSessionIdFromTab, subagentTabId } from "@/lib/subagentTabs";
@@ -104,10 +111,33 @@ import {
 import { UNSUPPORTED_TAB_TITLE, UnsupportedTabContent } from "../workspaceSidebar/unsupportedTab";
 import { useWorkspaceSidebarTabActions } from "../workspaceSidebar/useWorkspaceSidebarTabActions";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
-import { RailTerminalView, WorkspaceTabTooltip } from "../WorkspacePanel";
+import { usePanesSplitsAllowed } from "../panesViewGate";
+import {
+  SidebarTerminalPanes,
+  sidebarShellUnit,
+  useShownTerminalGroups,
+} from "../SidebarTerminalPanes";
+import { beginClosingShells, readTerminalGroups } from "../terminalGroupsStore";
+import { useTerminalOpenRequests } from "../terminalOpenRequest";
+import {
+  groupKeys,
+  normalizeTerminalGroups,
+  projectStrip,
+  type StripEntry,
+  type TerminalGroup,
+} from "@/lib/terminalGroups";
+import { useFloatingPanesShown } from "../useFloatingPanes";
+import { WorkspaceRailEdgeHandle, WorkspaceRailGutterHandle } from "../WorkspaceRailResizeHandle";
+import { WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
-import { recentPullRequestRows, recentPullRequestUrl } from "./recentPullRequestRow";
+import { useMountedShellKeys } from "./shellTabBudget";
+import {
+  knownPullRequestStatus,
+  recentPullRequestRows,
+  recentPullRequestUrl,
+} from "./recentPullRequestRow";
 import { useRecentPullRequestFacts } from "./useRecentPullRequestFacts";
+import { shellLabelList } from "./useTabsShellClose";
 import { FileTypeIcon } from "@/shell/FileTypeIcon";
 import { WorkspaceHistoryChevrons } from "./WorkspaceHistoryChevrons";
 import { LOCAL_CHANGES_LABEL, type PlaceIcon, placeTitle, truncateMiddle } from "./placeTitle";
@@ -172,9 +202,12 @@ export interface WorkspaceTabsPanelProps {
   terminalKeys: readonly string[] | null;
   /** The shell the user just opened by hand, whose terminal may take focus. */
   autoFocusTerminalKey?: string | null;
-  openTerminalTab: (key: string) => void;
+  /** Select the shell's tab and reveal the sidebar; `focus: false` leaves the keyboard where it is. */
+  openTerminalTab: (key: string, options?: { focus?: boolean }) => void;
   /** Ask before a shell ends; resolves false when the user keeps it. Ends nothing itself. */
   confirmCloseShell: (key: string) => Promise<boolean>;
+  /** Ask once before a split's shells end together; false when the user keeps them. */
+  confirmCloseShells: (keys: readonly string[]) => Promise<boolean>;
   /** End a shell; false when it couldn't be ended. */
   endShell: (key: string) => Promise<boolean>;
   maximized: boolean;
@@ -193,6 +226,21 @@ export interface WorkspaceTabsPanelProps {
   /** Back and Forward, bound where they also work while the sidebar is closed. */
   historyCommands?: readonly WorkspaceHistoryCommand[];
   onHistoryGo?: (direction: WorkspaceHistoryDirection) => void;
+}
+
+const SPLIT_PIN_REASON = "A split can't be pinned.";
+
+type ShellGroupEntry = Extract<StripEntry<TabId>, { kind: "group" }>;
+
+/** Whether `groupId` still holds exactly `keys`, as when its close was asked about. */
+function sameShellGroup(
+  groups: readonly TerminalGroup[],
+  groupId: string,
+  keys: readonly string[],
+): boolean {
+  const now = groups.find((group) => group.id === groupId);
+  const nowKeys = now ? groupKeys(now) : [];
+  return nowKeys.length === keys.length && keys.every((key) => nowKeys.includes(key));
 }
 
 const PLACE_ICONS: Record<PlaceIcon, LucideIcon> = {
@@ -271,6 +319,7 @@ function WorkspaceTabsPanelImpl({
   autoFocusTerminalKey = null,
   openTerminalTab,
   confirmCloseShell,
+  confirmCloseShells,
   endShell,
   maximized,
   onToggleMaximized,
@@ -293,21 +342,62 @@ function WorkspaceTabsPanelImpl({
   const selectedTab = knownTabs.find((tab) => tab.id === selectedTabId);
   // The Pull requests list's own count; a tab showing one pull request has none.
   const pullRequestCount = usePullRequestListCount(conversationId);
-  // Every strip entry but a pinned one shares one width. Pinned tabs keep their icon's
-  // width and stay put while they all fit their share of the strip; past it, they scroll.
+  // A sidebar split's shells show as one strip entry, at its first member's place.
+  const { groups: shellGroups, mainKeys: shellMainKeys } = useShownTerminalGroups(conversationId);
+  const shellSplitsAllowed = usePanesSplitsAllowed(!isOwnerLevel(permissionLevel));
+  /** The sidebar's splits as they are now, which may be newer than this render's. */
+  const liveShellGroups = () =>
+    normalizeTerminalGroups(readTerminalGroups(conversationId), {
+      mainKeys: shellMainKeys,
+      isGone: () => false,
+    });
+  const shellKeyOfTab = (tabId: TabId) => {
+    const binding = knownTabs.find((tab) => tab.id === tabId)?.binding;
+    return binding?.kind === "terminal" ? binding.key : null;
+  };
+  const stripEntries: StripEntry<TabId>[] = shellSplitsAllowed
+    ? projectStrip(
+        tabs.map((tab) => tab.id),
+        shellKeyOfTab,
+        shellGroups,
+      )
+    : tabs.map((tab) => ({ kind: "tab", id: tab.id }));
+  const groupEntryOf = new Map<TabId, ShellGroupEntry>();
+  for (const entry of stripEntries) {
+    if (entry.kind === "group")
+      for (const memberId of entry.memberIds) groupEntryOf.set(memberId, entry);
+  }
+  /** The tab a group's strip entry stands for: its focused shell's tab. */
+  const representativeOf = (entry: ShellGroupEntry) =>
+    entry.memberIds.find((tabId) => shellKeyOfTab(tabId) === entry.group.split.focusedKey) ??
+    entry.memberIds[0];
+  const selectedGroup = selectedTabId === null ? undefined : groupEntryOf.get(selectedTabId);
+  // Every strip entry but a pinned one shares one width, and a split shows as one entry.
+  // Pinned tabs keep their icon's width and stay put while they all fit their share of the
+  // strip; past it, they scroll.
   const pinnedCount = tabs.filter(isPinnedTab).length;
   const pinnedNaturalWidth = pinnedCount === 0 ? 0 : pinnedCount * (PINNED_TAB_WIDTH + TAB_GAP) + 1;
   const pinsStayPutIn = (areaWidth: number) =>
     pinnedNaturalWidth <= pinnedTabsMaxWidth(areaWidth, NEW_TAB_BUTTON_ROOM);
   const stripWidth = useTabStripWidth(
-    tabs.length - pinnedCount,
+    stripEntries.length - pinnedCount,
     (areaWidth) => NEW_TAB_BUTTON_ROOM + (pinsStayPutIn(areaWidth) ? pinnedNaturalWidth : 0),
   );
-  const reorderEntries: StripReorderEntry<TabId>[] = tabs.map((tab) => ({
-    key: tab.id,
-    tabIds: [tab.id],
-  }));
-  const stripValue = selectedTabId ?? "";
+  // A split's shells are never pinned: a shell that joins a split leaves the pinned tabs.
+  const pinnedInSplitsSignature = tabs
+    .filter((tab) => groupEntryOf.has(tab.id) && isPinnedTab(tab))
+    .map((tab) => tab.id)
+    .join(" ");
+  useEffect(() => {
+    if (pinnedInSplitsSignature) store.setPinned(pinnedInSplitsSignature.split(" "), false);
+  }, [store, pinnedInSplitsSignature]);
+  // The strip's entries as a drag sees them, keyed as the strip renders them.
+  const reorderEntries: StripReorderEntry<TabId>[] = stripEntries.map((entry) =>
+    entry.kind === "group"
+      ? { key: `group:${entry.group.id}`, tabIds: entry.memberIds }
+      : { key: entry.id, tabIds: [entry.id] },
+  );
+  const stripValue = selectedGroup ? representativeOf(selectedGroup) : (selectedTabId ?? "");
   // The rail goes inert a frame late (WorkspaceTabsHost); focus stays out meanwhile.
   const railInertRef = useInertRef<HTMLElement>(inert ?? false, undefined, {
     pending: inertPending ?? !open,
@@ -360,6 +450,60 @@ function WorkspaceTabsPanelImpl({
       return unchanged ? previous : next;
     });
   }, [shellTabsSignature, liveShellTabsSignature]);
+  // A shell tab shows its live shell, or the one it attached to while the shell list is
+  // unavailable. A shell known to be gone never shows.
+  const shellShows = (tab: WorkspaceTab): boolean => {
+    if (tab.binding?.kind !== "terminal") return false;
+    const state = store.resourceState(tab.id);
+    if (state === "live") return true;
+    return state !== "gone" && attachedShells.has(attachedShellKey(tab.id, tab.binding.key));
+  };
+  // One host shows the selected tab's shell, or its split; the most recently shown other shell
+  // tabs keep their terminals mounted there, hidden, so switching back doesn't reconnect them.
+  const selectedShellKey =
+    selectedTab?.binding?.kind === "terminal" && shellShows(selectedTab)
+      ? selectedTab.binding.key
+      : null;
+  const shownShellKeys = [
+    ...new Set(
+      knownTabs.flatMap((tab) =>
+        tab.binding?.kind === "terminal" && shellShows(tab) ? [tab.binding.key] : [],
+      ),
+    ),
+  ];
+  // Each shell's split comes along as one unit, every member counted against the budget.
+  const mountedShellKeys = useMountedShellKeys(
+    shownShellKeys,
+    selectedShellKey,
+    open && !inert,
+    (key) => sidebarShellUnit(shellGroups, shellSplitsAllowed, key),
+  );
+  // Focus moving to another pane of the shown split selects that shell's tab, with no step of its
+  // own. Read live: the split or the selection may have changed since this render.
+  const selectFocusedShell = (shellKey: string) => {
+    const selected = store.selectedTab();
+    if (selected?.binding?.kind !== "terminal") return;
+    const unit = sidebarShellUnit(liveShellGroups(), shellSplitsAllowed, selected.binding.key);
+    if (!unit.includes(shellKey)) return;
+    const unitTabs = store
+      .tabs()
+      .filter(
+        (tab): tab is WorkspaceTab =>
+          !isUnknownTab(tab) && tab.binding?.kind === "terminal" && unit.includes(tab.binding.key),
+      );
+    const focused = unitTabs.find(
+      (tab) => tab.binding?.kind === "terminal" && tab.binding.key === shellKey,
+    );
+    if (focused)
+      store.selectAmong(
+        focused.id,
+        unitTabs.map((tab) => tab.id),
+      );
+  };
+  // A pane's shell moving here, or a sidebar split's survivor, opens through the shell tab opener.
+  useTerminalOpenRequests(contained ? null : conversationId, (request) =>
+    openTerminalTab(request.key, { focus: request.focus }),
+  );
   useEffect(() => {
     if (pending) return;
     store.setTerminalInventory(
@@ -408,7 +552,7 @@ function WorkspaceTabsPanelImpl({
     tab.binding?.kind === "agent" ? [subagentTabId(tab.binding.id)] : [],
   );
   const agentLabels = useSubagentTabLabels(agentTabIds);
-  // Recent pull requests on any new-tab page, named from what the session already knows of them.
+  // PRs on new-tab pages and open PR tabs, named from what the session already knows of them.
   const recentPullRequestUrls = [
     ...new Set(
       knownTabs.flatMap((tab) =>
@@ -418,8 +562,17 @@ function WorkspaceTabsPanelImpl({
       ),
     ),
   ];
-  const pullRequestFacts = useRecentPullRequestFacts(conversationId, recentPullRequestUrls);
+  const openPullRequestUrls = [
+    ...new Set(knownTabs.flatMap((tab) => tabPullRequestUrl(tab) ?? [])),
+  ];
+  const pullRequestFacts = useRecentPullRequestFacts(conversationId, [
+    ...new Set([...recentPullRequestUrls, ...openPullRequestUrls]),
+  ]);
   const pullRequestRows = recentPullRequestRows(recentPullRequestUrls, pullRequestFacts);
+  const openPullRequestRows = recentPullRequestRows(openPullRequestUrls, pullRequestFacts);
+  // A PR tab's status, from its read details or the session's link; unknown until either says.
+  const pullRequestStatusOf = (url: string) =>
+    getPullRequestStatus(knownPullRequestStatus(url, pullRequestFacts));
   const chatTabs = knownTabs.filter((tab) => tab.binding?.kind === "chat");
   // In the order the review lists them, so a file tab's "2/3" matches what it shows.
   const orderedChangedPaths = useMemo(
@@ -529,6 +682,9 @@ function WorkspaceTabsPanelImpl({
     onReveal?.();
   };
   const inDrawer = placement === "drawer";
+  // Where the panes float now: the flag on and 48rem or wider. The drawer keeps its classic strip.
+  // A grid cell keeps its own layout, as the floating styles leave it.
+  const floatingPanes = useFloatingPanesShown() && !inDrawer && !contained;
   // Hotkeys and ⌘K rows act only while this panel is the keyboard target.
   const commandsActive = !pending && keyboardTarget;
   useNewBrowserHotkey(() => addBrowser(), showBrowserTab && commandsActive);
@@ -613,6 +769,15 @@ function WorkspaceTabsPanelImpl({
       return closed;
     };
   };
+  /** One message for a close, however many of its shells kept running. */
+  const reportShellsStillRunning = (keys: readonly string[]) => {
+    const names = shellLabelList(keys.map(terminalLabel));
+    const state = keys.length > 1 ? "They're still running." : "It's still running.";
+    toast.error(`Couldn't close ${names}. ${state}`, {
+      duration: Number.POSITIVE_INFINITY,
+      closeButton: true,
+    });
+  };
   /**
    * How closing a bound tab treats its resource: a shell asks, then ends, before its
    * tab goes; a browser view is released after. A side chat or sub-agent tab only
@@ -623,10 +788,45 @@ function WorkspaceTabsPanelImpl({
     if (binding?.kind === "terminal") {
       return {
         confirm: () => confirmCloseShell(binding.key),
-        teardown: () => endShell(binding.key),
+        teardown: async () => {
+          const ended = await endShell(binding.key);
+          if (!ended) reportShellsStillRunning([binding.key]);
+          return ended;
+        },
       };
     }
     return { release: releaseFor(tab) };
+  };
+  /** Close a split's entry: every shell in it ends, asked about once, and their tabs go. */
+  const closeShellGroup = (
+    entry: ShellGroupEntry,
+    source?: "pointer",
+  ): Promise<{ ok: boolean }> => {
+    if (!canCloseShells) return Promise.resolve({ ok: false });
+    if (source === "pointer") stripWidth.closedByPointer();
+    else stripWidth.closedByKeyboard();
+    const keys = groupKeys(entry.group);
+    let release: (() => void) | null = null;
+    const closing = store
+      .closeTerminalGroup(entry.memberIds, {
+        terminalKeys: keys,
+        // Once confirmed, the split takes no changes until its shells have ended. A split that
+        // changed while asking closes nothing: the answer was about other shells.
+        confirm: async () => {
+          if (!(await confirmCloseShells(keys))) return false;
+          if (!sameShellGroup(liveShellGroups(), entry.group.id, keys)) return false;
+          release = beginClosingShells(conversationId, keys);
+          return release !== null;
+        },
+        teardownFor: endShell,
+      })
+      .then((result) => {
+        if (!result.ok && "failed" in result) reportShellsStillRunning(result.failed);
+        return result;
+      })
+      .finally(() => release?.());
+    onReveal?.();
+    return closing;
   };
   const newTab = () => {
     // "+" and its chord add the new tab at the far end, past every open tab.
@@ -636,7 +836,9 @@ function WorkspaceTabsPanelImpl({
 
   // The strip's tab list, which the chevron and ⌘K's "Search tabs…" open.
   const [tabSearchOpen, setTabSearchOpen] = useState(false);
-  const stripEntryIds = tabs.map((tab) => tab.id);
+  const stripEntryIds = stripEntries.map((entry) =>
+    entry.kind === "group" ? representativeOf(entry) : entry.id,
+  );
   const actions = useWorkspaceSidebarTabActions({
     store,
     scopeId: commandsActive ? conversationId : null,
@@ -644,13 +846,40 @@ function WorkspaceTabsPanelImpl({
     sidebarOpen: open,
     entryIds: stripEntryIds,
     selectedEntryId: stripValue === "" ? null : stripValue,
-    selectedLabel: selectedTab ? titleOf(selectedTab).label : undefined,
+    // A split is one tab, which its own menu calls "Close split".
+    selectedLabel: selectedGroup ? "split" : selectedTab ? titleOf(selectedTab).label : undefined,
     closeRefusalFor: (tabId) => closeRefusalFor(tabs.find((tab) => tab.id === tabId)),
     canClose: (tab) => tab.binding?.kind !== "terminal" || canCloseShells,
     closeStepsFor,
     releaseFor,
+    // A split closes as one, asking once for its shells.
+    closeEntry: (tabId, source) => {
+      const group = groupEntryOf.get(tabId);
+      return group ? closeShellGroup(group, source) : null;
+    },
+    // A split moves as one entry, and a tab moves past a split whole, never between its tabs.
+    // A split's members may sit anywhere in the tab order, so with one shown every move goes
+    // by entries, and one at the strip's end stays put.
+    moveEntry: (tabId, delta) => {
+      if (groupEntryOf.size === 0) return false;
+      const from = reorderEntries.findIndex((entry) => entry.tabIds.includes(tabId));
+      if (from === -1) return false;
+      const over = reorderEntries[from + delta];
+      const order = over && reorderStripEntries(reorderEntries, reorderEntries[from].key, over.key);
+      if (order) store.reorder(order);
+      return true;
+    },
     offers: { newTab, searchTabs: () => setTabSearchOpen(true) },
-    pinning: {},
+    pinning: {
+      refusalFor: (tabId) => (groupEntryOf.has(tabId) ? SPLIT_PIN_REASON : undefined),
+    },
+    tabGroups: {
+      groupOf: tabGroupOf,
+      merged: (tab) => {
+        const url = tabPullRequestUrl(tab);
+        return url !== undefined && pullRequestStatusOf(url) === "merged";
+      },
+    },
     onReveal,
   });
   const closeTab = actions.closeTab;
@@ -694,9 +923,13 @@ function WorkspaceTabsPanelImpl({
   const fullScreenCommand = workspaceFullScreenCommand(facts);
   const tabActionCommands = actions.commands;
   const reopenCommand = tabActionCommandFor(tabActionCommands, "reopen");
+  const unsavedTabIds = session.dirtyTabIds();
   const tabSearchEntries: TabSearchEntry[] = tabs.flatMap((tab) => {
     if (isUnknownTab(tab)) return [];
     const title = titleOf(tab);
+    const pullRequestUrl = tabPullRequestUrl(tab);
+    const pullRequestRow =
+      pullRequestUrl === undefined ? undefined : openPullRequestRows.get(pullRequestUrl);
     return [
       {
         tabId: tab.id,
@@ -705,9 +938,48 @@ function WorkspaceTabsPanelImpl({
         icon: title.icon,
         ...(title.filePath !== undefined ? { filePath: title.filePath } : {}),
         selected: tab.id === selectedTabId,
+        group: tabGroupOf(tab),
+        ...(pullRequestUrl !== undefined
+          ? {
+              pullRequest: {
+                number: pullRequestRow?.detail,
+                // The row's label is the PR's title once it carries a number beside it.
+                title:
+                  tab.place.kind === "pull" &&
+                  tab.place.path === undefined &&
+                  pullRequestRow?.detail
+                    ? pullRequestRow.label
+                    : undefined,
+                description: pullRequestRow?.description,
+                status: pullRequestStatusOf(pullRequestUrl),
+              },
+            }
+          : {}),
+        unsaved: unsavedTabIds.has(tab.id),
+        closable: closeRefusalFor(tab) === undefined,
       },
     ];
   });
+  // Each heading's buttons run the group's ⌘K commands, named and offered as those are.
+  const tabSearchClosing: TabSearchClosing = {
+    closeTab: (tabId) => closeTab(tabId),
+    groupActions: (group) => {
+      const { closeMerged, closeAll } = tabGroupDefinition(group);
+      return [closeMerged, closeAll].flatMap((action) => {
+        if (action === undefined) return [];
+        const command = tabActionCommandFor(tabActionCommands, action);
+        if (!command.availability.available) return [];
+        return [
+          {
+            id: action,
+            label: command.menuLabel,
+            ariaLabel: command.label,
+            run: () => runCommand(command),
+          },
+        ];
+      });
+    },
+  };
   // A launch from a new-tab page turns that tab into the shell once it opens.
   const runCommand = (
     command: WorkspaceCommand,
@@ -920,37 +1192,23 @@ function WorkspaceTabsPanelImpl({
           />
         );
       case "terminal": {
-        const shellState = store.resourceState(tab.id);
-        // Until the shell list confirms it, a shell isn't ended; an attached one stays put.
-        if (
-          tab.binding?.kind !== "terminal" ||
-          shellState === "gone" ||
-          (shellState !== "live" && !attachedShells.has(attachedShellKey(tab.id, tab.binding.key)))
-        ) {
-          const connection: TerminalTabConnection =
-            tab.binding?.kind === "terminal"
-              ? tabConnections.connectionOf(shellOf(tab, tab.binding.key))
-              : { kind: "ended" };
-          return (
-            <TerminalTabStatus
-              connection={connection}
-              sandboxNotice={tabConnections.sandboxNotice(connection)}
-              onResumeSession={isEditorLevel(permissionLevel) ? resumeSession : undefined}
-              resumingSession={tabConnections.resumingSession}
-              onTryAgain={retryTerminals}
-              // Only the owner can attach a runner, so only the owner gets the command.
-              localReconnectCommand={
-                isOwnerLevel(permissionLevel) ? tabConnections.localReconnectCommand : undefined
-              }
-            />
-          );
-        }
+        // A shown shell renders in the shell host below; its tab panel stays empty.
+        if (shellShows(tab)) return null;
+        const connection: TerminalTabConnection =
+          tab.binding?.kind === "terminal"
+            ? tabConnections.connectionOf(shellOf(tab, tab.binding.key))
+            : { kind: "ended" };
         return (
-          <RailTerminalView
-            conversationId={conversationId}
-            terminalKey={tab.binding.key}
-            readOnly={!isOwnerLevel(permissionLevel)}
-            autoFocus={active && autoFocusTerminalKey === tab.binding.key}
+          <TerminalTabStatus
+            connection={connection}
+            sandboxNotice={tabConnections.sandboxNotice(connection)}
+            onResumeSession={isEditorLevel(permissionLevel) ? resumeSession : undefined}
+            resumingSession={tabConnections.resumingSession}
+            onTryAgain={retryTerminals}
+            // Only the owner can attach a runner, so only the owner gets the command.
+            localReconnectCommand={
+              isOwnerLevel(permissionLevel) ? tabConnections.localReconnectCommand : undefined
+            }
           />
         );
       }
@@ -1005,18 +1263,38 @@ function WorkspaceTabsPanelImpl({
     }
   };
 
-  const selectedUnknown = tabs.find((tab) => tab.id === selectedTabId && isUnknownTab(tab));
-  const effectiveHandleProps = pending
-    ? {
-        ...handleProps,
-        onMouseDown: undefined,
-        onKeyDown: undefined,
-        "aria-disabled": true,
-        tabIndex: -1,
+  // All tabs: before the tabs in the classic strip; with floating panes the strip starts with the
+  // tabs, and the list opens from beside Full screen.
+  const tabSearch = !pending && tabs.length > 0 && (
+    <WorkspaceTabSearch
+      trailing={floatingPanes}
+      open={tabSearchOpen}
+      onOpenChange={setTabSearchOpen}
+      entries={tabSearchEntries}
+      closing={tabSearchClosing}
+      reopen={
+        reopenCommand.availability.available
+          ? {
+              label: reopenCommand.menuLabel,
+              ...(reopenCommand.shortcut ? { shortcut: shortcutKeys(reopenCommand.shortcut) } : {}),
+            }
+          : null
       }
-    : handleProps;
+      onChoose={(choice) => {
+        const command =
+          choice.kind === "reopen"
+            ? reopenCommand
+            : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
+        if (command) runCommand(command);
+      }}
+    />
+  );
 
-  return (
+  const selectedUnknown = tabs.find((tab) => tab.id === selectedTabId && isUnknownTab(tab));
+  // Floating panes leave a gutter beside the rail; dragging it resizes the rail too.
+  const gutterHandle = floatingPanes && !maximized;
+
+  const rail = (
     <aside
       aria-label="Workspace"
       {...commandRegionProps("workspace")}
@@ -1055,12 +1333,10 @@ function WorkspaceTabsPanelImpl({
         style={{ width: maximized || inDrawer ? "100%" : `calc(${width}px - 1px)` }}
       >
         {!maximized && !inDrawer && (
-          <div
-            {...effectiveHandleProps}
-            className={cn(
-              "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
-              pending && "cursor-default hover:bg-transparent active:bg-transparent",
-            )}
+          <WorkspaceRailEdgeHandle
+            handleProps={handleProps}
+            pending={pending}
+            bare={gutterHandle}
           />
         )}
         <WorkspaceSidebarFrame
@@ -1072,30 +1348,7 @@ function WorkspaceTabsPanelImpl({
               {!pending && onHistoryGo && (
                 <WorkspaceHistoryChevrons commands={historyCommands} onGo={onHistoryGo} />
               )}
-              {!pending && tabs.length > 0 && (
-                <WorkspaceTabSearch
-                  open={tabSearchOpen}
-                  onOpenChange={setTabSearchOpen}
-                  entries={tabSearchEntries}
-                  reopen={
-                    reopenCommand.availability.available
-                      ? {
-                          label: reopenCommand.menuLabel,
-                          ...(reopenCommand.shortcut
-                            ? { shortcut: shortcutKeys(reopenCommand.shortcut) }
-                            : {}),
-                        }
-                      : null
-                  }
-                  onChoose={(choice) => {
-                    const command =
-                      choice.kind === "reopen"
-                        ? reopenCommand
-                        : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
-                    if (command) runCommand(command);
-                  }}
-                />
-              )}
+              {!floatingPanes && tabSearch}
             </div>
           }
           tabs={
@@ -1116,6 +1369,48 @@ function WorkspaceTabsPanelImpl({
                   entries: tabs
                     .map((tab, index): WorkspaceSidebarStripEntry | null => {
                       const selected = tab.id === selectedTabId;
+                      const groupEntry = groupEntryOf.get(tab.id);
+                      if (groupEntry) {
+                        // A group shows once, at its first member's place.
+                        if (groupEntry.memberIds[0] !== tab.id) return null;
+                        const keys = groupKeys(groupEntry.group);
+                        const focusedLabel = terminalLabel(groupEntry.group.split.focusedKey);
+                        const representative = representativeOf(groupEntry);
+                        return {
+                          key: `group:${groupEntry.group.id}`,
+                          tab: (
+                            <StripTab
+                              tabId={representative}
+                              index={index}
+                              title={{
+                                label: `${focusedLabel} +${keys.length - 1}`,
+                                tooltip: keys.map(terminalLabel).join(", "),
+                                icon: PLACE_ICONS.terminal,
+                                connecting: false,
+                              }}
+                              selected={groupEntry === selectedGroup}
+                              closable={canCloseShells}
+                              onClose={(source) => actions.closeVisibleTab(representative, source)}
+                              width={stripWidth.width}
+                              onKeyDown={(event) => actions.handleTabKeyDown(event, representative)}
+                              menu={
+                                <StripTabMenu
+                                  items={[
+                                    {
+                                      id: "close-split",
+                                      label: "Close split",
+                                      disabled: !canCloseShells,
+                                      // From its own menu, which has focus: the close is the sidebar's.
+                                      onSelect: () =>
+                                        actions.closeVisibleTab(representative, undefined, true),
+                                    },
+                                  ]}
+                                />
+                              }
+                            />
+                          ),
+                        };
+                      }
                       if (isUnknownTab(tab)) {
                         return {
                           key: tab.id,
@@ -1155,7 +1450,7 @@ function WorkspaceTabsPanelImpl({
                             onKeyDown={(event) => actions.handleTabKeyDown(event, tab.id)}
                             menu={
                               <StripTabMenu
-                                items={actions.menuItemsFor(tab.id, index, title.label, closable)}
+                                items={actions.menuItemsFor(tab.id, title.label, closable)}
                               />
                             }
                           />
@@ -1170,12 +1465,18 @@ function WorkspaceTabsPanelImpl({
             // Below 160px "+" would run under Full screen, so it gives way; ⌘K and its chord still open a tab.
             !pending && (
               <div className="contents @max-[160px]/rail:hidden">
-                <NewTabButton onClick={newTab} />
+                <NewTabButton onClick={newTab} divider={!floatingPanes} />
               </div>
             )
           }
           trailing={
             <>
+              {floatingPanes && tabSearch ? (
+                <>
+                  <StripDivider />
+                  {tabSearch}
+                </>
+              ) : null}
               {!inDrawer && (
                 <WorkspaceTabTooltip
                   label={fullScreenCommand?.menuLabel ?? "Full screen"}
@@ -1246,6 +1547,25 @@ function WorkspaceTabsPanelImpl({
                   </WorkspaceSidebarTabPanel>
                 );
               })}
+              {shownShellKeys.length > 0 && (
+                <div
+                  data-workspace-terminal-host=""
+                  className={cn(
+                    "absolute inset-0 flex min-h-0 flex-col bg-card",
+                    selectedShellKey === null && "invisible",
+                  )}
+                >
+                  <SidebarTerminalPanes
+                    conversationId={conversationId}
+                    shownKey={selectedShellKey}
+                    mountedKeys={mountedShellKeys}
+                    readOnly={!isOwnerLevel(permissionLevel)}
+                    visible={selectedShellKey !== null && open && !inert}
+                    autoFocusKey={autoFocusTerminalKey}
+                    onFocusShell={selectFocusedShell}
+                  />
+                </div>
+              )}
               {selectedUnknown && (
                 <UnsupportedTabContent onClose={() => closeTab(selectedUnknown.id)} />
               )}
@@ -1254,6 +1574,19 @@ function WorkspaceTabsPanelImpl({
         </WorkspaceSidebarFrame>
       </div>
     </aside>
+  );
+  return (
+    <>
+      {rail}
+      {gutterHandle && (
+        <WorkspaceRailGutterHandle
+          onMouseDown={handleProps.onMouseDown}
+          pending={pending}
+          railWidth={width}
+          shown={open}
+        />
+      )}
+    </>
   );
 }
 

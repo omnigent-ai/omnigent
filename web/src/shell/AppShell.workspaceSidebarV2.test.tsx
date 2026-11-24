@@ -15,7 +15,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useContext } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
@@ -190,6 +190,7 @@ vi.mock("./TerminalsPanel", () => ({ TerminalsPanel: () => null }));
 import { useSessionAgent } from "@/hooks/useAgents";
 import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
+import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
 import { AppShell } from "./AppShell";
 import { FileViewerContext, useOpenGithubTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
@@ -230,13 +231,16 @@ const viewportListeners = new Map<(event: { matches: boolean }) => void, string>
 /** The window is `width` wide: below 1181px the shell shows the sidebar as a drawer. */
 function setViewport(width: number, pointer: "fine" | "coarse" = "fine") {
   vi.spyOn(window, "matchMedia").mockImplementation((query: string) => {
-    const max = /max-width:\s*([\d.]+)px/.exec(query);
-    const min = /min-width:\s*([\d.]+)px/.exec(query);
+    // A media query's rem is the browser's default font size, 16px here.
+    const pixels = (bound: RegExpExecArray | null) =>
+      bound === null ? null : Number(bound[1]) * (bound[2] === "rem" ? 16 : 1);
+    const max = pixels(/max-width:\s*([\d.]+)(px|rem)/.exec(query));
+    const min = pixels(/min-width:\s*([\d.]+)(px|rem)/.exec(query));
     const pointerQuery = /pointer:\s*(\w+)/.exec(query);
     const matches =
       pointerQuery !== null
         ? pointerQuery[1] === pointer
-        : (max === null || width <= Number(max[1])) && (min === null || width >= Number(min[1]));
+        : (max === null || width <= max) && (min === null || width >= min);
     return {
       matches,
       media: query,
@@ -455,6 +459,79 @@ describe("workspace_sidebar_v2", () => {
       }),
     );
     expect(await screen.findByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["keeps it collapsed when the session opens", "session-open", "Expand right panel"],
+    ["reveals it for a click", "click", "Collapse right panel"],
+  ] as const)(
+    "shows the Tasks page in a collapsed sidebar, and %s",
+    async (_, requestedBy, toggle) => {
+      writeWorkspacePanelDefault("collapsed");
+      const initialChatState = useChatStore.getState();
+      useChatStore.setState({
+        todos: [{ content: "Only item", status: "pending", activeForm: "" }],
+      });
+      onTestFinished(() => useChatStore.setState(initialChatState));
+      setViewport(DESKTOP);
+      renderShell(withFlag(true));
+      expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+
+      act(() =>
+        requestedBy === "click"
+          ? openTasksTab("conv_ws")
+          : showTasksTabBesideChat("conv_ws", requestedBy),
+      );
+
+      await waitFor(() =>
+        expect(workspaceTabsSessions.openWorkspacePage).toHaveBeenCalledWith("conv_ws", "tasks"),
+      );
+      expect(await screen.findByRole("button", { name: toggle })).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["follows the flag", { floating_panes: true }, "fine", true],
+    ["stays off when the server says off", { floating_panes: false }, "fine", false],
+    ["stays off on an older server without it", {}, "fine", false],
+    ["stays off on a touch client", { floating_panes: true }, "coarse", false],
+  ] as const)("marks the shell for floating panes: %s", (_, features, pointer, floating) => {
+    setViewport(DESKTOP, pointer);
+    const info = withFlag(true);
+    const { floating_panes: _withoutIt, ...base } = info.features ?? {};
+    renderShell({ ...info, features: { ...base, ...features } });
+
+    const shell = document.querySelector(".app-shell");
+    if (floating) expect(shell).toHaveAttribute("data-floating-panes", "");
+    else expect(shell).not.toHaveAttribute("data-floating-panes");
+    // The session column is marked, so the styling cards its chat page and nothing else.
+    expect(document.querySelector("[data-main-view]")).toHaveAttribute("data-main-view", "chat");
+  });
+
+  it("reserves the header's room for the rail only while the rail sits inline", async () => {
+    setViewport(1000);
+    renderShell({
+      ...withFlag(true),
+      features: { ...withFlag(true).features, floating_panes: true },
+    });
+    const column = () => document.querySelector<HTMLElement>("[data-main-view]")!;
+    const offset = () => column().style.getPropertyValue("--workspace-panel-offset");
+    expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
+    expect(tabs.host).toMatchObject({ placement: "drawer" });
+    expect(offset()).toBe("0px");
+
+    // Opening the drawer and putting it away leaves the rail open, and still out of the header's way.
+    fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
+    const drawer = screen.getByTestId("workspace-tabs-drawer");
+    await waitFor(() => expect(drawer).toHaveAttribute("data-state", "open"));
+    expect(offset()).toBe("0px");
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close", hidden: true }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(offset()).toBe("0px");
+
+    resizeTo(DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "rail" }));
+    expect(Number.parseFloat(offset())).toBeGreaterThan(0);
   });
 
   it("shows the tabs in the Workspace drawer in a narrow desktop window", async () => {

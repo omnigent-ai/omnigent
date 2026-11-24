@@ -55,6 +55,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
+  AppWindowIcon,
   ArchiveIcon,
   BellIcon,
   BellOffIcon,
@@ -136,7 +137,14 @@ import {
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueries, useQueryClient } from "@tanstack/react-query";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
-import { canFlagUnread, isConversationMuted, showsUnreadFor } from "@/lib/sessionMute";
+import {
+  canFlagUnread,
+  isConversationMuted,
+  isInMutedProject,
+  isSessionMuted,
+  showsUnreadFor,
+  useMutedProjects,
+} from "@/lib/sessionMute";
 import {
   Link,
   useLocation,
@@ -209,6 +217,7 @@ import {
 } from "@/hooks/useConversations";
 import { fetchConversationById, useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { ProjectMembersNotMovedError } from "@/lib/projectsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -230,6 +239,7 @@ import { useActiveRootSessionId } from "@/hooks/useSession";
 import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { SidebarEditRow } from "./SidebarEditRow";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -247,8 +257,11 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
+import { useFloatingPanes } from "@/shell/useFloatingPanes";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
+import { isOwnSessionWindow } from "@/lib/sessionWindow";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
@@ -923,6 +936,7 @@ function SidebarImpl({
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   // Unread sessions as the Inbox lists them; like its row dot, the open session
   // counts only when marked unread.
+  useMutedProjects();
   const unreadInboxCount = useReadStateSnapshot(
     () =>
       collectUnreadInboxItems(
@@ -1080,6 +1094,7 @@ function SidebarImpl({
   // class so it only applies on desktop — on mobile the sidebar is a
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, resizing, handleProps: resizeHandleProps } = useResizableSidebar();
+  const floatingPanes = useFloatingPanes();
 
   // On the mobile layout, a leftward swipe on the open drawer slides it shut and
   // a rightward swipe across the chat slides the closed one open, both under
@@ -1365,7 +1380,12 @@ function SidebarImpl({
         {!peek && (
           <div
             {...resizeHandleProps}
-            className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+            className={cn(
+              "absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
+              // Where the panes float, 48rem and wider, the cursor band spans the gap with no bar.
+              floatingPanes &&
+                "min-[48rem]:w-[calc(var(--pane-gap)+5px)] min-[48rem]:hover:bg-transparent min-[48rem]:active:bg-transparent",
+            )}
           />
         )}
         {inSettings ? (
@@ -1966,6 +1986,33 @@ function ProjectFolder({
     icon,
     onProjectRenamed,
   );
+  // Double-clicking the name renames it inline, as a session row does. The
+  // header shows the committed name until the renamed folder replaces this one.
+  const renameProject = useRenameProject();
+  const [renamingInline, setRenamingInline] = useState(false);
+  const [pendingName, setPendingName] = useState<string | null>(null);
+  const shownName = pendingName ?? name;
+  const commitInlineRename = async (value: string) => {
+    setRenamingInline(false);
+    const newName = value.trim();
+    if (newName === "" || newName === name) return;
+    setPendingName(newName);
+    try {
+      await renameProject.mutateAsync({ id: projectId, oldName: name, newName });
+      onProjectRenamed?.(name, newName);
+    } catch (error) {
+      if (error instanceof ProjectMembersNotMovedError) {
+        // The unmoved sessions keep this folder alive under its old name.
+        setPendingName(null);
+        onProjectRenamed?.(name, newName);
+        showToast(error.message);
+        return;
+      }
+      setPendingName(null);
+      const message = error instanceof Error ? error.message : String(error);
+      showToast(`Couldn't rename the project: ${message}`);
+    }
+  };
 
   const headerDrag = useSortable({
     id: projectDragId(name),
@@ -2028,7 +2075,21 @@ function ProjectFolder({
       )}
       <ConversationSection
         headerDrag={placeholder ? undefined : headerDrag}
-        title={name}
+        title={shownName}
+        onRenameHeader={
+          placeholder || pendingName !== null ? undefined : () => setRenamingInline(true)
+        }
+        headerEditor={
+          renamingInline ? (
+            <SidebarEditRow
+              initialTitle={name}
+              label="Rename project"
+              inputTestId="rename-project-inline-input"
+              onCommit={(value) => void commitInlineRename(value)}
+              onCancel={() => setRenamingInline(false)}
+            />
+          ) : undefined
+        }
         icon={
           icon ? (
             <span className="text-[14px] leading-none">{icon}</span>
@@ -2050,6 +2111,16 @@ function ProjectFolder({
         }
         active={headerActive}
         marker={marker}
+        headerStatus={
+          menuActions.mute?.muted ? (
+            <BellOffIcon
+              role="img"
+              aria-label="Muted"
+              data-testid="project-muted-icon"
+              className="size-3.5 shrink-0 text-muted-foreground"
+            />
+          ) : undefined
+        }
         conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
         heldConversations={expanded ? undefined : [...(draftRow ? [draftRow] : []), ...heldRows]}
         listRef={listRef}
@@ -2348,6 +2419,7 @@ function ConversationList({
   const unseenTick = useUnseenTick(statusView);
   const draftIds = useSessionDraftIds(statusView);
   const startingId = useStartingConversationId(statusView);
+  const mutedProjects = useMutedProjects();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   // Resolve the active conversation's top-level root once here (rows get a plain
   // `isActive` prop, not their own query). Falls back to the raw id while the
@@ -2763,7 +2835,8 @@ function ConversationList({
       (g) => orderSessionFamilies(g.conversations),
     );
     return { pinned, shared, sessions, projectGroups, groupTitles };
-    // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
+    // `unseenTick` / `draftIds` / `mutedProjects` aren't read here: they version the stores
+    // status buckets read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     allConversations,
@@ -2788,6 +2861,7 @@ function ConversationList({
     customOrder,
     unseenTick,
     draftIds,
+    mutedProjects,
     startingId,
     workingIds,
   ]);
@@ -2937,6 +3011,15 @@ function ConversationList({
       return next;
     });
   }, []);
+  // The project home is addressed by name, so follow its project to the new name,
+  // keeping the query (an open session panel).
+  const navigate = useNavigate();
+  const location = useLocation();
+  const handleProjectRenamed = useStableCallback((oldName: string, newName: string) => {
+    renameExpandedProject(oldName, newName);
+    if (projectHomeName !== oldName) return;
+    navigate({ pathname: projectHomePath(newName), search: location.search }, { replace: true });
+  });
 
   const revealedDrafts = useRef(new Set<string>());
   useEffect(() => {
@@ -3853,7 +3936,7 @@ function ConversationList({
                               selectedIds={selectedIds}
                               onToggleSelected={onToggleSelected}
                               onProjectAssigned={expandProject}
-                              onProjectRenamed={renameExpandedProject}
+                              onProjectRenamed={handleProjectRenamed}
                               onConversationsLoaded={handleFolderConversationsLoaded}
                               reorderable={reorderable}
                             />
@@ -4092,6 +4175,7 @@ function projectMarkerState(
   let terminalReason: string | undefined;
   let running = false;
   let starting = false;
+  let background = false;
   let error = false;
   let disconnected = false;
   let unseen = false;
@@ -4103,10 +4187,12 @@ function projectMarkerState(
     if (state?.kind === "awaiting") {
       awaiting += state.count;
       terminalReason ??= state.terminalReason;
-    } else if (state?.kind === "running") {
+    } else if (state?.kind === "running" && !state.background) {
       running = true;
     } else if (c.id === startingConversationId) {
       starting = true;
+    } else if (state?.kind === "running") {
+      background = true;
     } else if (state?.kind === "error") {
       error = true;
     } else if (state?.kind === "disconnected") {
@@ -4119,6 +4205,7 @@ function projectMarkerState(
   if (terminalReason) return { kind: "awaiting", count: 0, terminalReason };
   if (running) return { kind: "running" };
   if (starting) return { kind: "starting" };
+  if (background) return { kind: "running", background: true };
   if (error) return { kind: "error" };
   if (disconnected) return { kind: "disconnected" };
   if (unseen) return { kind: "unseen" };
@@ -4141,6 +4228,7 @@ function SectionHeader({
   collapsed,
   onToggleCollapsed,
   onActivate,
+  onRename,
   contextMenu,
   contextMenuDisabled,
 }: {
@@ -4168,6 +4256,8 @@ function SectionHeader({
   /** When set, a header click outside its chevron runs this instead of toggling;
       the chevron and Left/Right arrows still collapse and expand. */
   onActivate?: () => void;
+  /** When set, a double-click outside the chevron runs this (inline rename). */
+  onRename?: () => void;
   /** Optional context-menu content for the header button. */
   contextMenu?: ReactNode;
   /** Suppresses the header context menu while another interaction owns it. */
@@ -4226,6 +4316,15 @@ function SectionHeader({
         if (onActivate && !onToggle) onActivate();
         else onToggleCollapsed();
       }}
+      onDoubleClick={
+        onRename
+          ? (event) => {
+              if ((event.target as Element).closest("[data-section-toggle]")) return;
+              event.preventDefault();
+              onRename();
+            }
+          : undefined
+      }
       className={cn(
         headerDrag &&
           !headerDrag.attributes["aria-disabled"] &&
@@ -4781,6 +4880,8 @@ function ConversationSection({
   collapsed,
   onToggleCollapsed,
   onActivate,
+  onRenameHeader,
+  headerEditor,
   collapsedFamilies,
   onToggleFamily,
   onRowClick,
@@ -4824,6 +4925,10 @@ function ConversationSection({
   onToggleCollapsed: () => void;
   /** Header click outside its chevron (see SectionHeader). */
   onActivate?: () => void;
+  /** Header double-click outside its chevron, ignored in selection mode. */
+  onRenameHeader?: () => void;
+  /** Shown in place of the header and its controls while the title is edited. */
+  headerEditor?: ReactNode;
   collapsedFamilies: ReadonlySet<string>;
   onToggleFamily: (familyId: string) => void;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -4907,7 +5012,8 @@ function ConversationSection({
   const protectsCollapsedBadge = isCollapsed && marker != null;
   return (
     <section className="group/section relative">
-      {title && (
+      {title && headerEditor}
+      {title && !headerEditor && (
         // Header + its hover-revealed kebab share a `group/header` scope so the
         // kebab keys off hovering the header alone — NOT the whole section,
         // which would also reveal it when hovering a child row.
@@ -4928,6 +5034,7 @@ function ConversationSection({
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
             onActivate={selectionMode ? undefined : onActivate}
+            onRename={selectionMode ? undefined : onRenameHeader}
             headerDrag={headerDrag}
             contextMenu={headerContextMenu}
             contextMenuDisabled={selectionMode}
@@ -5143,7 +5250,7 @@ export function ConversationMenuItems({
 }: {
   /** The menu family to render items from; the kebab's dropdown by default. */
   components?: MenuComponents;
-  /** On a kanban card, only actions that change the board: no nested agent, grid, pin, share or automation. */
+  /** On a kanban card, only actions that change the board: no nested agent, grid, new window, pin, share or automation. */
   kanbanCard?: boolean;
   conversation: Conversation;
   /** Session menu commands whose chords to list (the open session's row only). */
@@ -5185,7 +5292,11 @@ export function ConversationMenuItems({
   reorder?: { previousId?: string; nextId?: string };
 }) {
   const info = useServerInfo();
-  const isMuted = isConversationMuted(conversation);
+  useMutedProjects();
+  const isMuted = isSessionMuted(conversation);
+  // Only the project's own menu can lift a mute that comes from the project, and
+  // while it applies the session's own toggle would change nothing visible.
+  const mutedByProject = isInMutedProject(conversation);
   const setMuted = useSetConversationMuted();
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
@@ -5214,6 +5325,9 @@ export function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const openSessionWindow = useOpenSessionWindow();
+  const { conversationId: routeSessionId } = useParams<{ conversationId: string }>();
+  const showsOwnSessionWindow = isOwnSessionWindow(conversation.id, routeSessionId);
   const { trackClick } = useOmnigentAnalytics();
   const [view, setView] = useState<"main" | "move" | "projects" | "nests">("main");
 
@@ -5328,6 +5442,16 @@ export function ConversationMenuItems({
           </C.SubContent>
         </C.Sub>
       )}
+      {openSessionWindow && !kanbanCard && !showsOwnSessionWindow && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="open-session-window"
+          onSelect={() => openSessionWindow(conversation.id)}
+        >
+          <AppWindowIcon className="size-3.5" />
+          Open in new window
+        </C.Item>
+      )}
       {/* Desktop pins from the hover button unless Settings hides it; archived
           rows omit Pin (archive outranks pin). */}
       {onTogglePinned && !kanbanCard && !isArchived && !isIndentedSibling(conversation) && (
@@ -5416,10 +5540,15 @@ export function ConversationMenuItems({
         <C.Item
           className="mobile-touch-target"
           data-testid="mute-conversation"
+          disabled={mutedByProject}
           onSelect={() => setMuted.mutate({ id: conversation.id, muted: !isMuted })}
         >
-          {isMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
-          {isMuted ? "Unmute" : "Mute"}
+          {isMuted || mutedByProject ? (
+            <BellIcon className="size-3.5" />
+          ) : (
+            <BellOffIcon className="size-3.5" />
+          )}
+          {mutedByProject ? "Muted with project" : isMuted ? "Unmute" : "Mute"}
         </C.Item>
       )}
       {/* Muted sessions can clear unread state, but cannot be flagged unread here. */}
@@ -6200,6 +6329,7 @@ function ConversationRowImpl({
   );
   // Explicit unread overrides active-row suppression; running turns remain
   // hidden through readState.unseen. Muting hides the dot without marking read.
+  useMutedProjects();
   const isMuted = isConversationMuted(conversation);
   const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
   const hasUnseenMessages = showsUnreadFor(conversation, unread);
@@ -6219,8 +6349,9 @@ function ConversationRowImpl({
   const isStartingUp = useChatStore(
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
+  // A send waking the session shows its startup spinner over background work.
   const sessionState =
-    badgeState?.kind === "awaiting" || badgeState?.kind === "running"
+    badgeState?.kind === "awaiting" || (badgeState?.kind === "running" && !badgeState.background)
       ? badgeState
       : isStartingUp
         ? { kind: "starting" as const }
@@ -6390,6 +6521,7 @@ function ConversationRowImpl({
           // Prefer the just-committed name so a rename reopened before the
           // prop catches up starts from what the row shows.
           initialTitle={pendingTitle ?? conversation.title ?? ""}
+          maxLength={USER_SESSION_TITLE_MAX_CHARS}
           onCommit={(title) => {
             // Bail on no-op edits so we don't fire an unnecessary PATCH.
             const trimmed = title.trim();
@@ -7246,6 +7378,20 @@ function ProjectFolderMenuItems({
         <Settings2Icon className="size-3.5" />
         Project settings
       </C.Item>
+      {actions.mute && (
+        <C.Item
+          data-testid="mute-project"
+          disabled={actions.mute.disabled}
+          onSelect={actions.mute.toggle}
+        >
+          {actions.mute.muted ? (
+            <BellIcon className="size-3.5" />
+          ) : (
+            <BellOffIcon className="size-3.5" />
+          )}
+          {actions.mute.muted ? "Unmute project" : "Mute project"}
+        </C.Item>
+      )}
       {actions.ordering && (
         <C.Sub>
           <C.SubTrigger data-testid="move-project">
@@ -7288,6 +7434,8 @@ export interface ProjectFolderMenuActions {
     last: boolean;
     move: (destination: "up" | "down" | "top" | "bottom") => void;
   };
+  /** Mute or unmute every session in the project; absent on servers that can't store it. */
+  mute?: { muted: boolean; disabled: boolean; toggle: () => void };
   openRename: () => void;
   openSettings: () => void;
   openDelete: () => void;
@@ -7340,7 +7488,35 @@ export function useProjectFolderMenu(
   // icon. `null` (staged removal) renders as the empty folder.
   const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
 
-  const actions = useMemo<ProjectFolderMenuActions>(
+  const info = useServerInfo();
+  const muteSupported = info !== "loading" && info.project_mute === true;
+  const projectMuted = useMutedProjects().some((project) => project.id === projectId);
+  const saveConfig = updateConfig.mutate;
+  const mute = useMemo<ProjectFolderMenuActions["mute"]>(() => {
+    if (!muteSupported) return undefined;
+    return {
+      muted: projectMuted,
+      // Like the icon, the mute merges onto the whole config the PATCH replaces.
+      disabled: !configReady,
+      toggle: () => {
+        if (!configReady) return;
+        const config = { ...(iconConfig ?? {}) };
+        if (projectMuted) delete config.muted;
+        else config.muted = true;
+        saveConfig(
+          { id: projectId, name: projectName, config },
+          {
+            onError: () =>
+              showToast(
+                projectMuted ? "Couldn't unmute the project." : "Couldn't mute the project.",
+              ),
+          },
+        );
+      },
+    };
+  }, [muteSupported, projectMuted, configReady, iconConfig, projectId, projectName, saveConfig]);
+
+  const baseActions = useMemo<ProjectFolderMenuActions>(
     () => ({
       openRename: () => {
         menuOpenedDialogRef.current = true;
@@ -7368,6 +7544,11 @@ export function useProjectFolderMenu(
       },
     }),
     [projectName],
+  );
+  // Kept apart so the menu's open/close callbacks stay stable as the mute loads.
+  const actions = useMemo(
+    () => (mute ? { ...baseActions, mute } : baseActions),
+    [baseActions, mute],
   );
 
   const dialogs = (
@@ -7435,10 +7616,13 @@ export function useProjectFolderMenu(
                     config: next,
                   });
                 }
-              } catch {
+              } catch (error) {
                 // Errors surface via the mutation state below. A rename that
-                // lands before a failed icon write is already persisted; only
-                // the icon needs retrying.
+                // lands before a failed icon write or member move is already
+                // persisted; only the rest needs retrying.
+                if (error instanceof ProjectMembersNotMovedError) {
+                  onRenamed?.(projectName, newName);
+                }
                 return;
               }
               setRenameOpen(false);

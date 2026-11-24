@@ -292,11 +292,23 @@ export function StripTabMenu({
 /** The room the divider after "+" takes in the strip: the row's 4px gap before it, and its line. */
 export const NEW_TAB_DIVIDER_ROOM = 4 + 1;
 
+/** The strip's divider between its tabs and its controls, drawn like the tabs' own separators. */
+export function StripDivider() {
+  return <Separator orientation="vertical" className="h-4 data-vertical:self-center" />;
+}
+
 /**
  * The strip's "+", whose tooltip shows New tab's chord from the shortcut registry, and the
  * divider that sets it apart from the strip's controls, drawn like the tabs' own separators.
  */
-export function NewTabButton({ onClick }: { onClick: () => void }) {
+export function NewTabButton({
+  onClick,
+  divider = true,
+}: {
+  onClick: () => void;
+  /** Off where the strip draws its divider elsewhere: floating panes put it before All tabs. */
+  divider?: boolean;
+}) {
   return (
     <>
       <WorkspaceTabTooltip label="New tab" shortcut={shortcutKeys("workspace.newTab")}>
@@ -312,7 +324,7 @@ export function NewTabButton({ onClick }: { onClick: () => void }) {
           <PlusIcon className="size-4" />
         </Button>
       </WorkspaceTabTooltip>
-      <Separator orientation="vertical" className="h-4 data-vertical:self-center" />
+      {divider ? <StripDivider /> : null}
     </>
   );
 }

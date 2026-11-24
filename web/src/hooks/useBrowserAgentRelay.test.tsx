@@ -413,9 +413,17 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
   });
 
-  it.each([false, true])("isolates SSH identity: %s", async (ssh) => {
+  it.each([
+    { name: "recovery", response: { ok: true }, remembersHost: true },
+    { name: "SSH", response: { ok: true, sshPreviewHost: true }, remembersHost: false },
+    {
+      name: "trusted remote",
+      response: { ok: true, trustedRemotePreviewHost: true },
+      remembersHost: false,
+    },
+  ])("isolates preview identity: $name", async ({ response, remembersHost }) => {
     const bridge = installBridge({
-      browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, sshPreviewHost: ssh }),
+      browserOpenOrNavigate: vi.fn().mockResolvedValue(response),
     });
     const client = new QueryClient();
     client.setQueryData(
@@ -456,7 +464,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
         sourceIsArcaHost: true,
       },
     );
-    if (ssh) {
+    if (!remembersHost) {
       expect({ ...localStorage }).toEqual(storageBefore);
       return;
     }
@@ -869,6 +877,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     ["screenshot", "snapshot", "click", "type"].flatMap((action) => [
       { action, privilege: { hostIsThisMachine: true } },
       { action, privilege: { hostIsThisMachine: false, sshPreviewHost: true } },
+      { action, privilege: { hostIsThisMachine: false, trustedRemotePreviewHost: true } },
     ]),
   )(
     "fetches a fresh host for $action after a privileged navigation ($privilege)",
@@ -894,7 +903,12 @@ describe("useBrowserAgentRelay — privileged reads", () => {
       expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
       getSessionSlim.mockResolvedValue({ id: CONV, hostId: "remote-host", parentSessionId: null });
       emitBrowserActionRequest(actionEvent(action, { ref: "e1", text: "hello" }, "read"), CONV);
-      const opts = { sessionHostProtocol: 1, sshPreviewProtocol: 1, sourceHostId: "remote-host" };
+      const opts = {
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+        trustedRemotePreviewProtocol: 1,
+        sourceHostId: "remote-host",
+      };
       await vi.waitFor(() => {
         if (action === "screenshot")
           expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, opts);
@@ -930,6 +944,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
       sessionHostProtocol: 1,
       sshPreviewProtocol: 1,
+      trustedRemotePreviewProtocol: 1,
       sourceHostId: "remote-host",
     });
   });
@@ -972,6 +987,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
       expect(call.mock.calls[1].at(-1)).toEqual({
         sessionHostProtocol: 1,
         sshPreviewProtocol: 1,
+        trustedRemotePreviewProtocol: 1,
         sourceHostId: "fresh-host",
       });
       expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
@@ -1081,6 +1097,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
       sessionHostProtocol: 1,
       sshPreviewProtocol: 1,
+      trustedRemotePreviewProtocol: 1,
       sourceHostId: null,
     });
   });
@@ -1101,6 +1118,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
       sessionHostProtocol: 1,
       sshPreviewProtocol: 1,
+      trustedRemotePreviewProtocol: 1,
       sourceHostId: "remote-host",
     });
   });

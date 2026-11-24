@@ -1,6 +1,6 @@
 // The Files tree's ⌘K commands for a page that can hide its tree: Reveal Active
-// File and the tree root's commands stay while the tree is hidden, and running one
-// asks the page to show the tree first (see `useFilesTreeShowRequests`).
+// File, the name filter and the tree root's commands stay while the tree is hidden,
+// and running one asks the page to show the tree first (see `useFilesTreeShowRequests`).
 
 import { useId, useMemo } from "react";
 import { useSession } from "@/hooks/useSession";
@@ -13,6 +13,7 @@ import {
   requestActiveFileReveal,
   revealActiveFilePaletteCommand,
 } from "./revealActiveFile";
+import { filterTreeByNamePaletteCommand, requestTreeNameFilter } from "./treeNameFilter";
 import {
   planActiveFolderAsTreeRoot,
   planWorkingFolderReturn,
@@ -69,6 +70,10 @@ export function useFilesTreePageCommands({
       revealActiveFilePaletteCommand(facts.reveal, () => {
         requestFilesTreeShown(conversationId);
         requestActiveFileReveal(conversationId, activePath);
+      }),
+      filterTreeByNamePaletteCommand(() => {
+        requestFilesTreeShown(conversationId);
+        requestTreeNameFilter(conversationId);
       }),
       ...treeRootPaletteCommands(conversationId, facts),
     ];

@@ -6,6 +6,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import { isMacPlatform } from "@/lib/hotkeys";
 
+import { useFileActionStore } from "../fileCommands/fileActionStore";
+import { pathToCopy } from "../fileCommands/target";
+import { FileViewerContext } from "../FileViewerContext";
 import { FilesTree, type FilesTreeProps, type FilesTreeReveal } from "./FilesTree";
 
 const folder = (path: string): WorkspaceFile => ({
@@ -24,7 +27,11 @@ const file = (path: string): WorkspaceFile => ({
   modified_at: null,
 });
 
-function renderTree(rootEntries: readonly WorkspaceFile[], onFileSelect = vi.fn()) {
+function renderTree(
+  rootEntries: readonly WorkspaceFile[],
+  onFileSelect = vi.fn(),
+  extra: Partial<FilesTreeProps> = {},
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -39,10 +46,12 @@ function renderTree(rootEntries: readonly WorkspaceFile[], onFileSelect = vi.fn(
     changedFiles: [],
     sort: "alpha",
     showHidden: false,
+    showIgnored: true,
     refreshToken: 0,
     onFileSelect,
     reveal,
     label: "Workspace files",
+    ...extra,
   });
   const view = render(<FilesTree {...props(rootEntries)} />, { wrapper });
   return {
@@ -57,6 +66,49 @@ function renderTree(rootEntries: readonly WorkspaceFile[], onFileSelect = vi.fn(
 
 afterEach(cleanup);
 
+/** The viewer context of a session whose workspace is at /repo. */
+const REPO_VIEWER = {
+  openFile: vi.fn(),
+  openGithubTab: vi.fn(),
+  isChangedPath: () => false,
+  conversationId: "conv_tree",
+  workspaceRoot: "/repo",
+  workspaceHome: null,
+};
+
+describe("FilesTree rooted at a folder", () => {
+  it("copies a row's path inside the folder, not the workspace root", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={REPO_VIEWER}>
+          <FilesTree
+            conversationId="conv_tree"
+            browseLocation="src"
+            rootEntries={[file("a.ts")]}
+            changedFiles={[]}
+            sort="alpha"
+            showHidden={false}
+            showIgnored
+            refreshToken={0}
+            onFileSelect={vi.fn()}
+            reveal={null}
+            label="Workspace files"
+          />
+        </FileViewerContext.Provider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.contextMenu(await screen.findByRole("treeitem", { name: /a\.ts/ }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+
+    // The app's file action host copies what the request's target names.
+    const [request] = useFileActionStore.getState().pending;
+    expect(request?.command).toBe("copy-path");
+    expect(pathToCopy(request!.target)?.text).toBe("/repo/src/a.ts");
+  });
+});
+
 describe("FilesTree", () => {
   it("opens a file in a folder that was empty when the tree first showed it", async () => {
     const tree = renderTree([]);
@@ -67,6 +119,20 @@ describe("FilesTree", () => {
     fireEvent.click(row);
 
     expect(tree.onFileSelect.mock.calls.map(([path]) => path)).toEqual(["README.md"]);
+  });
+
+  it("marks the files and folders Git ignores as ignored", async () => {
+    renderTree([
+      { ...folder("build"), ignored: true },
+      { ...file("debug.log"), ignored: true },
+      file("main.ts"),
+    ]);
+
+    const status = async (name: RegExp) =>
+      (await screen.findByRole("treeitem", { name })).getAttribute("data-item-git-status");
+    expect(await status(/^build/)).toBe("ignored");
+    expect(await status(/debug\.log/)).toBe("ignored");
+    expect(await status(/main\.ts/)).toBeNull();
   });
 
   it("opens a file in a new tab on ⌘-click (Ctrl-click off macOS) or a middle click, as browsers do", async () => {
@@ -89,6 +155,19 @@ describe("FilesTree", () => {
     fireEvent.click(await screen.findByRole("treeitem", { name: /README\.md/ }), { altKey: true });
 
     expect(tree.onFileSelect.mock.calls).toEqual([["README.md"]]);
+  });
+
+  it.each([
+    ["a file", "artifact.log"],
+    ["a file in a folder", "build/out.o"],
+  ])("says when its listing leaves out %s it was asked to reveal", async (_case, target) => {
+    const onActiveRevealMissed = vi.fn();
+    renderTree([file("README.md"), folder("src")], vi.fn(), {
+      activeFile: target,
+      activeReveal: { key: 1, file: target },
+      onActiveRevealMissed,
+    });
+    await waitFor(() => expect(onActiveRevealMissed).toHaveBeenCalledExactlyOnceWith(target));
   });
 
   it("reveals a folder asked for after it mounted, and again for a new request for the same folder", async () => {

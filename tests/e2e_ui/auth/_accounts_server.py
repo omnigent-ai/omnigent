@@ -22,6 +22,7 @@ the browser's origin agree.
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import (
     _HEALTH_POLL_INTERVAL_S,
@@ -96,6 +98,16 @@ class AccountsServer:
                 str(data["verification_uri_complete"]), self.public_url
             ),
         )
+
+
+def sign_in_as_admin(page: Page, server: AccountsServer) -> None:
+    """Sign in as the seeded admin through the SPA login form, setting the session cookie."""
+    page.goto(f"{server.public_url}/login")
+    page.locator("#login-username").fill(ADMIN_USERNAME)
+    page.locator("#login-password").fill(ADMIN_PASSWORD)
+    page.get_by_role("button", name="Sign in").click()
+    # A successful login hard-navigates away from /login.
+    expect(page).not_to_have_url(re.compile(r"/login"), timeout=10_000)
 
 
 def _swap_host(url: str, public_url: str) -> str:

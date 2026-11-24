@@ -1869,6 +1869,37 @@ describe("WorkflowDetailPage", () => {
     expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
   });
 
+  it.each([true, false])(
+    "links a run an automation started to that automation (automations %s)",
+    (automations) => {
+      vi.mocked(useServerInfo).mockReturnValue({
+        ...FALLBACK_SERVER_INFO,
+        automations_enabled: automations,
+        features: { automations_v2: true },
+      });
+      mockWorkflow({});
+      const automationId = "9".repeat(32);
+      mockRuns([
+        {
+          ...run("a".repeat(32), "Scheduled triage", {}),
+          automation: { id: automationId, name: "Nightly triage" },
+        },
+        run("b".repeat(32), "Manual triage", {}),
+      ]);
+      renderPage();
+
+      const [scheduled, manual] = screen.getAllByTestId("workflow-run");
+      expect(within(manual!).queryByTestId("workflow-run-automation")).toBeNull();
+      const link = within(scheduled!).queryByTestId("workflow-run-automation");
+      if (!automations) {
+        expect(link).toBeNull();
+        return;
+      }
+      expect(link).toHaveTextContent("Scheduled · Nightly triage");
+      expect(link).toHaveAttribute("href", `/tasks/${automationId}`);
+    },
+  );
+
   it("lists the workflow runs below a run, saying who started the ones further down", () => {
     mockWorkflow({});
     const calledId = "c".repeat(32);

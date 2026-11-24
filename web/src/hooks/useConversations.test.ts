@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
+import { ProjectMembersNotMovedError } from "@/lib/projectsApi";
 import * as identity from "@/lib/identity";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
@@ -33,6 +34,7 @@ import {
   useProjectSessions,
   useRenameProject,
   useUpdateProjectConfig,
+  useSyncMutedProjects,
   useMoveToProject,
   useMoveToNest,
   withMoveTombstone,
@@ -719,7 +721,7 @@ describe("useRenameProject", () => {
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    return renderHook(() => useRenameProject(), { wrapper });
+    return { queryClient, ...renderHook(() => useRenameProject(), { wrapper }) };
   }
 
   // Regression: promoting a label-only folder must return the created id so a
@@ -751,6 +753,22 @@ describe("useRenameProject", () => {
     });
 
     expect(id).toBe("proj_1");
+  });
+
+  it("refetches projects when re-filing a member fails after the rename", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_1", name: "Renamed" })); // PATCH rename
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [{ id: "conv_1" }], first_id: null, last_id: null, has_more: false }),
+    );
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 })); // re-file
+
+    const { queryClient, result } = renderRenameHook();
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    await expect(
+      result.current.mutateAsync({ id: "proj_1", oldName: "old", newName: "Renamed" }),
+    ).rejects.toThrow(ProjectMembersNotMovedError);
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
 });
 
@@ -2869,17 +2887,79 @@ describe("useUpdateProjectConfig cache seeding", () => {
     fetchMock
       .mockResolvedValueOnce(mockResponse({ id: "p_new", name: "Work" })) // apiCreateProject
       .mockResolvedValueOnce(
-        mockResponse({ id: "p_new", name: "Work", config: { agent_id: "ag_x" } }),
+        mockResponse({ id: "p_new", name: "Work", config: { agent_id: "ag_x", muted: true } }),
       );
 
     const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
-    result.current.mutate({ id: null, name: "Work", config: { agent_id: "ag_x" } });
+    result.current.mutate({ id: null, name: "Work", config: { agent_id: "ag_x", muted: true } });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // The config cache holds the fresh value keyed by the NEW id.
-    expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({ agent_id: "ag_x" });
-    // The projects list now resolves "Work" → the promoted first-class id.
-    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Work" }]);
+    expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({
+      agent_id: "ag_x",
+      muted: true,
+    });
+    // The projects list now resolves "Work" → the promoted first-class id, muted.
+    expect(queryClient.getQueryData(["projects"])).toEqual([
+      { id: "p_new", name: "Work", muted: true },
+    ]);
+  });
+});
+
+describe("useSyncMutedProjects", () => {
+  it("mirrors the viewer's muted projects into the mute store as the projects query changes", async () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("me");
+    onTestFinished(() => viewer.mockRestore());
+    let reply: unknown = [
+      { id: "p_factory", name: "Factory", muted: true },
+      { id: "p_other", name: "Other", muted: false },
+    ];
+    fetchMock.mockImplementation(async (url: string) =>
+      url === "/v1/sessions/projects"
+        ? mockResponse(reply)
+        : mockResponse({}, { ok: false, status: 404 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useSyncMutedProjects(), { wrapper });
+
+    const mine = { id: "a", labels: {}, project_id: "p_factory", owner: "me" };
+    await waitFor(() => expect(isConversationMuted(mine)).toBe(true));
+    // Only the viewer's own sessions are filed in their projects.
+    expect(isConversationMuted({ ...mine, owner: "alice" })).toBe(false);
+    expect(isConversationMuted({ ...mine, project_id: "p_other" })).toBe(false);
+
+    // An unmute saved elsewhere reaches the store on the next projects read.
+    reply = [{ id: "p_factory", name: "Factory", muted: false }];
+    await act(() => queryClient.refetchQueries({ queryKey: ["projects"] }));
+    await waitFor(() => expect(isConversationMuted(mine)).toBe(false));
+  });
+
+  it("keeps the last list when the projects reply isn't one, instead of throwing at the app root", async () => {
+    let reply: unknown = [{ id: "p_factory", name: "Factory", muted: true }];
+    fetchMock.mockImplementation(async (url: string) =>
+      url === "/v1/sessions/projects"
+        ? mockResponse(reply)
+        : mockResponse({}, { ok: false, status: 404 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(
+      () => {
+        useSyncMutedProjects();
+        return useProjects().data;
+      },
+      { wrapper },
+    );
+    const filed = { id: "a", labels: {}, project_id: "p_factory" };
+    await waitFor(() => expect(isConversationMuted(filed)).toBe(true));
+
+    reply = { error: "unexpected" };
+    await act(() => queryClient.refetchQueries({ queryKey: ["projects"] }));
+    await waitFor(() => expect(result.current).toEqual({ error: "unexpected" }));
+    expect(isConversationMuted(filed)).toBe(true);
   });
 });
 

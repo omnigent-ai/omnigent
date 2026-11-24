@@ -2,6 +2,7 @@
 // and the sibling listing each one opens.
 
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import { isAbsoluteComposerPath } from "@/lib/composerContext";
 
 /** One clickable piece of the path, e.g. the `agents` in `.github/agents/config.yaml`. */
 export interface BreadcrumbSegment {
@@ -23,6 +24,14 @@ export function breadcrumbSegments(filePath: string): BreadcrumbSegment[] {
     current = current === "" ? label : current === "/" ? `/${label}` : `${current}/${label}`;
     return { label, path: current, isFile: index === labels.length - 1 };
   });
+}
+
+/**
+ * Whether the breadcrumbs can list a path's folders: a workspace-relative or POSIX
+ * absolute path. A Windows drive or UNC path shows its segments without folder lists.
+ */
+export function canBrowseBreadcrumbs(filePath: string): boolean {
+  return filePath.startsWith("/") || !isAbsoluteComposerPath(filePath);
 }
 
 /** The folder holding `path`: `""` for the workspace root, `"/"` for the host root. */

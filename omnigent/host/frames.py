@@ -104,6 +104,9 @@ CAP_WORKSPACE_API = "workspace_api"
 # The host's runners accept session messages up to ``SESSION_MESSAGE_MAX_CHARS``
 # (32,000) instead of 8,000, so automations can send long instructions:
 CAP_LONG_SESSION_MESSAGES = "long_session_messages"
+# The host's runners ship the ``import-memory`` framework skill, so the server may
+# list it; an older runner cannot load its content:
+CAP_MEMORY_IMPORT_SKILL = "memory_import_skill"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -127,6 +130,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_LOGIN,
     CAP_CLONE_REPOSITORY,
     CAP_LONG_SESSION_MESSAGES,
+    CAP_MEMORY_IMPORT_SKILL,
 ]
 # The workspace API needs the optional `omnigent[workspace-api]` extra.
 if importlib.util.find_spec("connectrpc") is not None:
