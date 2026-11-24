@@ -182,22 +182,41 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
   // A build that failed after creating its gadget: Try again continues with that gadget
   // rather than leave it behind and make another.
   const unfinished = useRef<{ description: string; gadget: Gadget } | null>(null);
+  // Cancel ends the build in progress: each step checks it is still the current one, and a
+  // gadget it made after Cancel is deleted. Once the build message is on its way it can't be
+  // taken back, so that step finishes and shows the gadget the session is building.
+  const operation = useRef(0);
+  const delivering = useRef(false);
   const build = async (description: string) => {
+    const run = ++operation.current;
+    const cancelled = () => run !== operation.current;
     let gadget = unfinished.current?.description === description ? unfinished.current.gadget : null;
     if (gadget === null) {
       // The description changed since the failed try: its gadget is not this one.
       const abandoned = unfinished.current?.gadget;
       unfinished.current = null;
       if (abandoned) void deleteGadget(abandoned.id).catch(() => undefined);
-      gadget = await createGadget(gadgetNameFrom(description));
+      const created = await createGadget(gadgetNameFrom(description));
+      if (cancelled()) {
+        void deleteGadget(created.id).catch(() => undefined);
+        return;
+      }
+      gadget = created;
       unfinished.current = { description, gadget };
     }
     await show(gadget);
-    await openGadgetSession(gadget, composeGadgetBuildPrompt(gadget, description), navigate, {
-      deliver: true,
-      reveal: false,
-      railSessionId: sessionId,
-    });
+    // Cancel already deleted the unfinished gadget.
+    if (cancelled()) return;
+    delivering.current = true;
+    try {
+      await openGadgetSession(gadget, composeGadgetBuildPrompt(gadget, description), navigate, {
+        deliver: true,
+        reveal: false,
+        railSessionId: sessionId,
+      });
+    } finally {
+      delivering.current = false;
+    }
     unfinished.current = null;
     openGadgetTab(gadget);
   };
@@ -217,10 +236,13 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
         explanation="Say what it shows, what data it uses and what people do with it. This session builds it here, and its buttons send their work back to this session."
         onBuild={build}
         onCancel={() => {
-          // Cancel after a failed build leaves no half-made gadget behind.
-          const abandoned = unfinished.current?.gadget;
-          unfinished.current = null;
-          if (abandoned) void deleteGadget(abandoned.id).catch(() => undefined);
+          operation.current += 1;
+          // Cancel leaves no half-made gadget behind, except one already being built.
+          if (!delivering.current) {
+            const abandoned = unfinished.current?.gadget;
+            unfinished.current = null;
+            if (abandoned) void deleteGadget(abandoned.id).catch(() => undefined);
+          }
           setGadgetDraft(sessionId, false);
         }}
         errorTitle="Couldn’t start building the gadget"

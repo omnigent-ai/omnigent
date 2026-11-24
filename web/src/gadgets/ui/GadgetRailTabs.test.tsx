@@ -14,6 +14,7 @@ import {
   useGadgetRailRequest,
 } from "@/lib/gadgetRailTabs";
 import {
+  type Gadget,
   createGadget,
   deleteGadget,
   getSessionGadgets,
@@ -442,6 +443,31 @@ describe("New gadget tab", () => {
     expect(within(content).getByRole("textbox", { name: "Describe the gadget" })).toHaveValue(
       "A tracker",
     );
+  });
+
+  it("deletes, without linking or sending, a gadget whose create finishes after Cancel", async () => {
+    const created = gadgetFixture({ id: "3", name: "Incident tracker", published_revision: null });
+    let finishCreate: (gadget: Gadget) => void = () => {};
+    vi.mocked(createGadget).mockReturnValue(
+      new Promise<Gadget>((resolve) => {
+        finishCreate = resolve;
+      }),
+    );
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    renderWithGadgets(<Rail conversationId="conv_1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    const content = await screen.findByRole("region", { name: "content" });
+    fireEvent.change(within(content).getByRole("textbox", { name: "Describe the gadget" }), {
+      target: { value: "An incident tracker for my team" },
+    });
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    await waitFor(() => expect(createGadget).toHaveBeenCalled());
+    fireEvent.click(within(content).getByRole("button", { name: "Cancel" }));
+    finishCreate(created);
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("3"));
+    expect(linkGadgetToSession).not.toHaveBeenCalled();
+    expect(openGadgetSession).not.toHaveBeenCalled();
+    expect(screen.queryByRole("tab", { name: "Incident tracker" })).toBeNull();
   });
 
   it("closes without building on Cancel", async () => {

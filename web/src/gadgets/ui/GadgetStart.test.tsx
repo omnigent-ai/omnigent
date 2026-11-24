@@ -1,7 +1,13 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createGadget, createGadgetRevision, publishGadgetRevision } from "@/gadgets/api/gadgetApi";
+import {
+  type Gadget,
+  createGadget,
+  createGadgetRevision,
+  deleteGadget,
+  publishGadgetRevision,
+} from "@/gadgets/api/gadgetApi";
 import { GADGET_START_PARAM } from "@/gadgets/host/gadgetPages";
 import { GADGET_INTRO, GadgetStartDialog, GadgetStartPage } from "./GadgetStart";
 import { renderWithGadgets, gadgetFixture } from "./testUtils";
@@ -10,6 +16,7 @@ import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
 vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetApiModule>()),
   createGadget: vi.fn(),
+  deleteGadget: vi.fn(),
   createGadgetRevision: vi.fn(),
   publishGadgetRevision: vi.fn(),
 }));
@@ -51,6 +58,30 @@ describe("New gadget", () => {
     // The session is not started here: the build instructions wait in the composer.
     expect(opened.searchParams.get("prompt")).toMatch(/gadget_id new-1/);
     expect(opened.searchParams.get("prompt")).toMatch(/An incident tracker for my team$/);
+  });
+
+  it("deletes instead of opening a gadget whose create finishes after Cancel", async () => {
+    let finishCreate: (gadget: Gadget) => void = () => {};
+    vi.mocked(createGadget).mockReturnValue(
+      new Promise<Gadget>((resolve) => {
+        finishCreate = resolve;
+      }),
+    );
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    const onOpenChange = vi.fn();
+    renderWithGadgets(<GadgetStartDialog open onOpenChange={onOpenChange} />, {
+      path: "/gadget",
+    });
+    const dialog = screen.getByRole("dialog", { name: "New gadget" });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "Describe the gadget" }), {
+      target: { value: "A reading list" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Build" }));
+    await waitFor(() => expect(createGadget).toHaveBeenCalled());
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    finishCreate(CREATED);
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("new-1"));
+    expect(location().pathname).toBe("/gadget");
   });
 
   it("keeps the description and explains a failed build", async () => {

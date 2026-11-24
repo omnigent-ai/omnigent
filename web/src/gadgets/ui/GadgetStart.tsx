@@ -1,13 +1,13 @@
 // Starting a new gadget: describe it, or make one from a template. The New gadget dialog and the
 // create page show it. Build makes the gadget and opens New session with the gadget beside the
 // composer and the build instructions in it; the viewer picks where the session runs and sends it.
-import { type RefObject, useCallback } from "react";
+import { type RefObject, useCallback, useEffect, useRef } from "react";
 import { ChevronRightIcon } from "lucide-react";
 
 import { PageScroll } from "@/components/PageScroll";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Link, useNavigate } from "@/lib/routing";
-import { type Gadget, createGadget } from "@/gadgets/api/gadgetApi";
+import { type Gadget, createGadget, deleteGadget } from "@/gadgets/api/gadgetApi";
 import { composeGadgetBuildPrompt, gadgetNameFrom } from "@/gadgets/host/gadgetBuild";
 import { gadgetBoardNewSessionUrl, gadgetBoardPath } from "@/gadgets/host/gadgetPages";
 import { markGadgetSessionPending } from "@/gadgets/host/gadgetSession";
@@ -42,6 +42,15 @@ function GadgetStartContent({
   compact?: boolean;
 }) {
   const navigate = useNavigate();
+  // Closing New gadget, or Cancel, while a create is under way: the gadget it then makes is
+  // deleted instead of opened.
+  const dismissed = useRef(false);
+  useEffect(() => {
+    dismissed.current = false;
+    return () => {
+      dismissed.current = true;
+    };
+  }, []);
   const openNewSession = useCallback(
     (gadget: Gadget, prompt: string) => {
       markGadgetSessionPending(gadget.id);
@@ -54,9 +63,18 @@ function GadgetStartContent({
   );
   const build = async (description: string) => {
     const gadget = await createGadget(gadgetNameFrom(description));
+    if (dismissed.current) {
+      void deleteGadget(gadget.id).catch(() => undefined);
+      return;
+    }
     openNewSession(gadget, composeGadgetBuildPrompt(gadget, description));
   };
   const onTemplateCreated = (gadget: Gadget, template: GadgetTemplate) => {
+    if (dismissed.current) {
+      // A template's gadget is complete; a blank one has nothing in it yet.
+      if (!template.revision) void deleteGadget(gadget.id).catch(() => undefined);
+      return;
+    }
     if (template.revision) {
       navigate(gadgetBoardPath(gadget.id), { state: IN_APP_GADGET_OPEN });
       onLeave?.();
@@ -70,7 +88,10 @@ function GadgetStartContent({
       <GadgetDescribeForm
         explanation={START_EXPLANATION}
         onBuild={build}
-        onCancel={onCancel}
+        onCancel={() => {
+          dismissed.current = true;
+          onCancel?.();
+        }}
         errorTitle="Couldn’t create the gadget"
         compact={compact}
       />
