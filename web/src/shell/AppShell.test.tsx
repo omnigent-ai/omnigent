@@ -1141,12 +1141,18 @@ describe("AppShell header", () => {
   describe("the chat pane's strip with floating panes", () => {
     const FLOATING = serverInfo({ features: { floating_panes: true } });
 
-    /** A window `width` px wide, as the floating panes' 48rem query reads it. */
+    /** A window `width` px wide, as every min- and max-width query reads it (rem is 16px). */
     function windowWidth(width: number) {
       const baseMatchMedia = window.matchMedia;
+      const answer = (query: string) => {
+        const bound = /^\((min|max)-width: ([\d.]+)(px|rem)\)$/.exec(query);
+        if (!bound) return baseMatchMedia(query).matches;
+        const limit = Number(bound[2]) * (bound[3] === "rem" ? 16 : 1);
+        return bound[1] === "min" ? width >= limit : width <= limit;
+      };
       const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
         ...baseMatchMedia(query),
-        matches: query === "(min-width: 768px)" ? width >= 768 : baseMatchMedia(query).matches,
+        matches: answer(query),
       }));
       onTestFinished(() => matchMedia.mockRestore());
     }
@@ -1164,36 +1170,43 @@ describe("AppShell header", () => {
     const viewSwitch = () =>
       screen.getByRole("group", { name: "Switch between chat and terminal" });
 
-    it("moves the Chat/Terminal switch from the header into the chat's card", async () => {
-      windowWidth(1440);
-      terminalFirstSession();
-      renderShell("/c/conv_terminal", FLOATING);
+    // 1000px floats the cards below the desktop layout's width, where the header has no switch.
+    it.each([1440, 1000])(
+      "moves the Chat/Terminal switch from the header into the chat's card at %ipx",
+      async (width) => {
+        windowWidth(width);
+        terminalFirstSession();
+        renderShell("/c/conv_terminal", FLOATING);
 
-      expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
-      expect(strip()).toContainElement(viewSwitch());
-      expect(viewSwitch()).toHaveAttribute("data-variant", "pane");
-      expect(document.querySelector("header")).not.toContainElement(viewSwitch());
-      const main = document.querySelector("main[data-session-id]")!;
-      expect(main).toHaveAttribute("data-chat-pane-strip", "");
-      expect(main.firstElementChild).toBe(strip());
-    });
+        expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+        expect(strip()).toContainElement(viewSwitch());
+        expect(viewSwitch()).toHaveAttribute("data-variant", "pane");
+        expect(document.querySelector("header")).not.toContainElement(viewSwitch());
+        const main = document.querySelector("main[data-session-id]")!;
+        expect(main).toHaveAttribute("data-chat-pane-strip", "");
+        expect(main.firstElementChild).toBe(strip());
+      },
+    );
 
-    it("keeps the row and its switch over the Terminal view", async () => {
-      windowWidth(1440);
-      terminalFirstSession();
-      renderShell("/c/conv_terminal?view=terminal", FLOATING);
+    it.each([1440, 1000])(
+      "keeps the row and its switch over the Terminal view at %ipx",
+      async (width) => {
+        windowWidth(width);
+        terminalFirstSession();
+        renderShell("/c/conv_terminal?view=terminal", FLOATING);
 
-      expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
-      expect(await screen.findByRole("group", { name: "Chat pane" })).toContainElement(
-        viewSwitch(),
-      );
-    });
+        expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+        expect(await screen.findByRole("group", { name: "Chat pane" })).toContainElement(
+          viewSwitch(),
+        );
+      },
+    );
 
     it.each([
       ["without floating panes", undefined, 1440, { "omnigent.ui": "terminal" }],
       ["below 48rem", FLOATING, 700, { "omnigent.ui": "terminal" }],
       ["in a chat-first session", FLOATING, 1440, {}],
-    ] as const)("keeps the switch in the header %s", (_case, info, width, sessionLabels) => {
+    ] as const)("adds no row %s", (_case, info, width, sessionLabels) => {
       const labels: Record<string, string> = { ...sessionLabels };
       windowWidth(width);
       terminalFirstSession(labels);
@@ -1203,9 +1216,15 @@ describe("AppShell header", () => {
       expect(document.querySelector("main[data-session-id]")).not.toHaveAttribute(
         "data-chat-pane-strip",
       );
-      if (labels["omnigent.ui"] === "terminal") {
+      // The header keeps the switch in the desktop layout; narrower, its ⋯ menu offers the views.
+      if (labels["omnigent.ui"] === "terminal" && width >= 1181) {
         expect(document.querySelector("header")).toContainElement(viewSwitch());
         expect(viewSwitch()).toHaveAttribute("data-variant", "header");
+      }
+      if (width < 1181) {
+        expect(
+          screen.queryByRole("group", { name: "Switch between chat and terminal" }),
+        ).toBeNull();
       }
     });
 

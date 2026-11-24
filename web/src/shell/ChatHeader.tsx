@@ -711,7 +711,7 @@ export function ChatHeader({
         {!pending &&
           conversationId &&
           (viewToggleHost ? (
-            createPortal(<ViewModeToggle variant="pane" />, viewToggleHost)
+            createPortal(<ViewModeToggle variant="pane" alwaysVisible />, viewToggleHost)
           ) : (
             <ViewModeToggle />
           ))}

@@ -3173,8 +3173,8 @@ function AppShellImpl() {
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
   // A terminal-first chat's card has a row of its own, over its Chat and Terminal views, which
   // takes the Chat/Terminal switch. A sidebar shell in the main view has no switch to hold.
-  const chatPaneStrip =
-    floatingPanesShown && !!conversationId && terminalFirst && !isShellView && !mobileViewport;
+  // It shows wherever the cards float, below the desktop layout's width too.
+  const chatPaneStrip = floatingPanesShown && !!conversationId && terminalFirst && !isShellView;
   const shellViewTargetAvailable =
     isShellView && terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey);
 
