@@ -7,6 +7,7 @@ import { ProjectFiles } from "./ProjectFiles";
 import { ProjectIdentityRoster } from "./ProjectIdentityRoster";
 import { ProjectTicketSources } from "./ProjectTicketSources";
 import { projectOrchestratorPath, ticketPanelSearch } from "./projectHomeNavigation";
+import { useProjectRecord } from "./useProjectAgentSession";
 import { useTicketProject } from "./useProjectTickets";
 
 export function ProjectBoardActions({
@@ -19,7 +20,7 @@ export function ProjectBoardActions({
   const isMobile = useIsMobileViewport();
   const [search] = useSearchParams();
   const { projectId, projects } = useTicketProject(projectName);
-  const leadRemoved = projects.data?.find((project) => project.id === projectId)?.lead_removed;
+  const leadRemoved = useProjectRecord(projectId).data?.lead_removed;
   return (
     <div className="flex items-center gap-2" role="group" aria-label="Project actions">
       {!leadRemoved && (

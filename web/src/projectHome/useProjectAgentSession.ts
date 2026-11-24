@@ -4,14 +4,22 @@ import { getProject } from "@/lib/projectsApi";
 import { ApiError, getSessionSlim } from "@/lib/sessionsApi";
 import { useTicketProject } from "./useProjectTickets";
 
-/** The saved binding, not the most recent project session. Navigation only reads it. */
-export function useProjectAgentSession(projectId: string | null) {
-  const project = useQuery({
-    queryKey: ["project-record", projectId],
+/** Cache key of the full project record (the sidebar's project list is only a summary). */
+export const projectRecordKey = (projectId: string | null) => ["project-record", projectId];
+
+/** The full project record, including its main session and routing settings. */
+export function useProjectRecord(projectId: string | null) {
+  return useQuery({
+    queryKey: projectRecordKey(projectId),
     queryFn: () => getProject(projectId!),
     enabled: projectId !== null,
     refetchInterval: 15_000,
   });
+}
+
+/** The saved binding, not the most recent project session. Navigation only reads it. */
+export function useProjectAgentSession(projectId: string | null) {
+  const project = useProjectRecord(projectId);
   const storedSessionId =
     project.data?.main_session_id !== undefined
       ? project.data.main_session_id

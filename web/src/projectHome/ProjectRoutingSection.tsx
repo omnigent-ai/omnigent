@@ -8,9 +8,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useProjects } from "@/hooks/useConversations";
 import { LEAD_IDENTITY_ID, setProjectRouting, type ProjectIdentity } from "@/lib/projectsApi";
 import { TicketError } from "./TicketControls";
+import { projectRecordKey, useProjectRecord } from "./useProjectAgentSession";
 import { projectIdentitiesKey } from "./useProjectIdentities";
 
 // Radix Select can't use an empty value, so the default choice gets a sentinel.
@@ -29,11 +29,12 @@ export function ProjectRoutingSection({
   personas: ProjectIdentity[];
 }) {
   const client = useQueryClient();
-  const project = useProjects().data?.find((entry) => entry.id === projectId);
+  const project = useProjectRecord(projectId).data;
   const routing = useMutation({
     mutationFn: (next: { router_identity_id: string | null; lead_removed: boolean }) =>
       setProjectRouting(projectId, next),
-    onSuccess: () => {
+    onSuccess: (updated) => {
+      client.setQueryData(projectRecordKey(projectId), updated);
       void client.invalidateQueries({ queryKey: ["projects"] });
       void client.invalidateQueries({ queryKey: projectIdentitiesKey(projectId) });
     },
