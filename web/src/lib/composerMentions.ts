@@ -1,19 +1,6 @@
 import type { ComposerAttachment } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 
-/** Text landing in `[start, end)` of a draft, as a typed or pasted insert. */
-export interface ComposerInsert {
-  start: number;
-  end: number;
-  text: string;
-}
-
-/** The text to insert instead, and where the caret lands inside it. */
-export interface ComposerInsertAdjustment {
-  text: string;
-  caret: number;
-}
-
 /**
  * Pure ``@``-mention utilities (workspace files and other sessions) shared by the in-session composer
  * (``ChatPage``) and the new-session launcher (``NewChatDialog``). Kept free of
@@ -300,6 +287,19 @@ export function findMentionTokens(text: string, tokens: readonly string[]): Ment
     }
   }
   return ranges.sort((a, b) => a.start - b.start);
+}
+
+/** Text landing in `[start, end)` of a draft, as a typed or pasted insert. */
+export interface ComposerInsert {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** The text to insert instead, and where the caret lands inside it. */
+export interface ComposerInsertAdjustment {
+  text: string;
+  caret: number;
 }
 
 /**

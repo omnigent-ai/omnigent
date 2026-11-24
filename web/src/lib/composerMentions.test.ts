@@ -58,9 +58,13 @@ describe("separateMentionEdges", () => {
   const typeAt = (value: string, at: number, text: string) =>
     separateMentionEdges(value, { start: at, end: at, text }, tokens);
 
-  it("adds a space when text is typed right after a token", () => {
+  it("adds a space when text is typed right after a token, keeping the neighbour's identity", () => {
     expect(typeAt("Read @readme.md", 15, "x")).toEqual({ text: " x", caret: 2 });
     expect(typeAt("@Alpha planning", 15, "x")).toEqual({ text: " x", caret: 2 });
+    const value = "Read @readme.md more";
+    const adjusted = typeAt(value, 15, "x");
+    const next = value.slice(0, 15) + adjusted!.text + value.slice(15);
+    expect(findMentionTokens(next, tokens)).toEqual([{ start: 5, end: 15, token: "@readme.md" }]);
   });
 
   it("adds a space when text is typed right before a token, keeping the caret after the text", () => {
@@ -95,16 +99,6 @@ describe("separateMentionEdges", () => {
     expect(typeAt("Read @readme.md", 5, "foo bar")).toEqual({ text: "foo bar ", caret: 7 });
     expect(typeAt("Read @readme.md", 15, "foo ")).toEqual({ text: " foo ", caret: 5 });
     expect(typeAt("Read @readme.md", 5, "foo ")).toBeNull();
-  });
-
-  it("keeps a neighbouring tag's identity when the space is added", () => {
-    const value = "Read @readme.md more";
-    const adjusted = separateMentionEdges(value, { start: 15, end: 15, text: "x" }, ["@readme.md"]);
-    expect(adjusted).toEqual({ text: " x", caret: 2 });
-    const next = value.slice(0, 15) + adjusted!.text + value.slice(15);
-    expect(findMentionTokens(next, ["@readme.md"])).toEqual([
-      { start: 5, end: 15, token: "@readme.md" },
-    ]);
   });
 
   it("adds no space when a longer tag would take over the neighbouring tag's match", () => {

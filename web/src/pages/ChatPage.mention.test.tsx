@@ -1285,7 +1285,7 @@ describe.each(["textarea", "codemirror"] as const)(
     });
 
     it.runIf(engine === "textarea")(
-      "releases the pill when text is typed right after it, as the textarea has always done",
+      "releases the pill when text is typed right after it",
       async () => {
         await renderComposer(composerProps());
         typeAt("Read @rea");
