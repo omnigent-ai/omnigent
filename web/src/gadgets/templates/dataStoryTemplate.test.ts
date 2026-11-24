@@ -356,6 +356,37 @@ describe("data story template", () => {
     expect(byId("refresh").hidden).toBe(false);
   });
 
+  it.each([
+    ["negative", [-40, -10, -25]],
+    ["equal negative", [-20, -20, -20]],
+  ])("keeps %s bars inside the chart, growing from zero", async (_name, values) => {
+    const { load, ready } = startStory();
+    await waitFor(() => expect(ready()).toBe(true));
+    const losses = {
+      ...WEEKLY,
+      kind: "bar",
+      series: [
+        {
+          name: "Change",
+          points: values.map((y, index) => ({ x: `Week ${index + 1}`, y })),
+        },
+      ],
+      annotations: [],
+    };
+    load({ ideas: IDEAS, story: STORY, series: { weekly: losses } });
+    await waitFor(() =>
+      expect(byId("view").querySelectorAll("#section-trend rect.bar")).toHaveLength(3),
+    );
+    const chart = byId("view").querySelector("#section-trend svg.chart") as SVGSVGElement;
+    const height = Number(chart.getAttribute("viewBox")?.split(" ")[3]);
+    for (const bar of chart.querySelectorAll("rect.bar")) {
+      const top = Number(bar.getAttribute("y"));
+      const bottom = top + Number(bar.getAttribute("height"));
+      expect(top).toBeGreaterThanOrEqual(0);
+      expect(bottom).toBeLessThanOrEqual(height);
+    }
+  });
+
   it("draws every chart when the series take more than one page", async () => {
     const { emit, load, pages, ready } = startStory();
     await waitFor(() => expect(ready()).toBe(true));

@@ -581,7 +581,9 @@ ${GADGET_KIT_HELPERS}
     var bars = data.kind === 'bar' || data.kind === 'column';
     var lo = ys.length ? Math.min.apply(null, ys) : 0;
     var hi = ys.length ? Math.max.apply(null, ys) : 1;
+    // Bars grow from zero, so zero is in the range at either end; all-negative bars too.
     if (bars || (lo > 0 && lo < hi * 0.35)) lo = Math.min(0, lo);
+    if (bars) hi = Math.max(0, hi);
     if (hi === lo) hi = lo + 1;
     var y = scale(lo, hi, height - pad.b, pad.t);
     var band = (width - pad.l - pad.r) / Math.max(1, xs.length);

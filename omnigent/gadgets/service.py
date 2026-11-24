@@ -1067,6 +1067,8 @@ class GadgetService:
         return {
             "gadget": {key: app[key] for key in ("id", "name", "browse_url", "permissions")},
             "published_revision": revision.get("id"),
+            "published_by": publication["updated_by"] if publication is not None else None,
+            "published_at": publication["updated_at"] if publication is not None else None,
             "guide": revision.get("guide"),
             "collections": revision.get("collections", {}),
             "constraints": revision.get("constraints", []),

@@ -39,7 +39,7 @@ comments.
   New session when there is no session yet, pinned gadgets under Gadget in the sidebar,
   sharing, comments, and Reply / Ask in side chat from a selection in the gadget.
 - **The frame**: published HTML runs in a sandboxed iframe (`sandbox="allow-scripts"`, opaque
-  origin, a CSP that blocks network requests) and reaches its data only through the SDK's
+  origin, a CSP set to block network requests) and reaches its data only through the SDK's
   postMessage bridge, which the web checks against the viewer's permissions. See [What gadget
   code can send out](#what-gadget-code-can-send-out) for what that boundary does not cover.
 
@@ -138,7 +138,12 @@ What a gadget keeps, and how long:
 | Can edit (`LEVEL_EDIT`) | yes | yes | yes | |
 | Can manage (`LEVEL_MANAGE`), owner | yes | yes | yes | yes |
 
-Only those who may publish read unpublished revisions. Gadgets and the shelf belong to the
+Only those who may publish read unpublished revisions. Publishing decides what each action asks
+an agent to do, and a viewer who clicks an action runs it in their own gadget session, with
+their own access: so Can edit is trust to direct the agents of everyone who uses the gadget.
+The clicker sees the action's name, not its description; `sys_gadget_describe` names who
+published the current version (`published_by`), and the skill tells the agent to check with the
+clicker before doing something they likely did not mean. Gadgets and the shelf belong to the
 account's registration, named by its account row's creation time: a password change or reset
 revokes the account's sessions but keeps the registration, so nothing in the gadget store
 changes, while a username registered again gets a new registration and starts with nothing.
@@ -151,8 +156,10 @@ The frame's write and action controls follow these: the SDK disables controls ma
 
 ## What gadget code can send out
 
-The frame's CSP blocks every network request a page can make on its own: `fetch`, XHR,
-WebSockets, scripts, styles, fonts, images and other subresources, and forms. It cannot stop the
+The frame's CSP is set to block every network request a page can make on its own: `fetch`,
+XHR, WebSockets, scripts, styles, fonts, images and other subresources, and forms. The tests
+check the policy the web app sets, not a browser enforcing it, so this rests on the browser's
+CSP and sandbox support. It cannot stop the
 gadget's document from navigating itself (setting `location`, for example), and browsers offer
 no policy that does: that navigation's request leaves the browser before the web app can react,
 and its URL can carry anything the gadget had read. So treat gadget code as able to send out

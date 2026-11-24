@@ -387,7 +387,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
   } else if (gadget) {
     description = sharingReadOnly
       ? "This server allows read-only sharing — invite others to view this gadget."
-      : "Can view lets people use it; Can edit also lets them change its data and publish versions; Can manage also lets them share and delete it.";
+      : "Can view lets people use it; Can edit also lets them change its data and publish versions, which decide what its actions ask an agent to do; Can manage also lets them share and delete it.";
   } else if (filePath) {
     description = "This link opens the selected file in full screen.";
   } else if (sharingReadOnly) {

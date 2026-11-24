@@ -1806,8 +1806,12 @@ def test_describe_answers_for_an_unpublished_gadget_and_points_to_the_skill(
     assert unpublished["next_steps"].startswith("Nothing is published yet")
     assert "gadget skill" in unpublished["next_steps"]
 
+    assert unpublished["published_by"] is None
     published = service.describe(publish_actions_board(service)["id"])
     assert "Nothing is published" not in published["next_steps"]
+    # The agent can tell who decided what the actions ask it to do.
+    assert published["published_by"] == service.viewer.user_id
+    assert published["published_at"]
     assert published["actions"][0]["name"] == "run_card"
 
 

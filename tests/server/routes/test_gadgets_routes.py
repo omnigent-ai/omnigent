@@ -183,8 +183,26 @@ async def test_rules_of_the_wrong_type_get_the_gadget_error_shape(
     assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
 
 
-async def test_requests_need_an_identity_and_a_json_body(client: httpx.AsyncClient) -> None:
+async def test_requests_need_an_identity_and_a_json_body(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     assert (await client.get("/v1/gadgets")).status_code == 401
+    # A change from a page on an untrusted origin is refused before its body is read.
+    monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", "https://omnigent.example")
+    foreign = await client.post(
+        "/v1/gadgets",
+        json={"name": "Board"},
+        headers={**_as(ALICE), "Origin": "https://evil.example"},
+    )
+    assert foreign.status_code == 403
+    assert (await client.get("/v1/gadgets", headers=_as(ALICE))).json()["items"] == []
+    trusted = await client.post(
+        "/v1/gadgets",
+        json={"name": "Board"},
+        headers={**_as(ALICE), "Origin": "https://omnigent.example"},
+    )
+    assert trusted.status_code in (200, 201)
+    monkeypatch.delenv("OMNIGENT_WS_ALLOWED_ORIGINS")
     form = await client.post(
         "/v1/gadgets", content="name=bad", headers={**_as(ALICE), "Content-Type": "text/plain"}
     )
