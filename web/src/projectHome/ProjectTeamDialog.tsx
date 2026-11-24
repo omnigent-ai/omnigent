@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { PlusIcon, Trash2Icon } from "lucide-react";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -148,6 +149,7 @@ export function ProjectTeamDialog({
                   className="justify-start"
                   onClick={() => choose(identity)}
                 >
+                  <PersonaAvatar name={identity.name} size="xs" />
                   <span className="truncate">{identity.name}</span>
                 </Button>
               ))}

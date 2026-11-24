@@ -2,6 +2,7 @@ import { useId, useMemo, useState } from "react";
 import { parseMarkdownIntoBlocks } from "streamdown";
 import { Button } from "@/components/ui/button";
 import { markdownPreviewText } from "@/lib/markdownPreviewText";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { emphasizeMentions, type PersonaMention } from "./personaMentions";
 import { TicketMarkdown } from "./ticketImages";
 
@@ -73,9 +74,9 @@ export function TicketCommentBody({
             <span
               key={mention.id}
               data-testid="ticket-comment-mention"
-              className="rounded-full bg-primary/10 px-1.5 py-0.5 font-medium text-primary"
+              className="inline-flex items-center gap-1 rounded-full bg-primary/10 py-0.5 pr-1.5 pl-0.5 font-medium text-primary"
             >
-              @{mention.name}
+              <PersonaAvatar name={mention.name} size="xs" />@{mention.name}
             </span>
           ))}
         </p>

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { UserRoundIcon, UsersIcon } from "lucide-react";
+import { UsersIcon } from "lucide-react";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { RunningDot } from "@/components/RunningDot";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -59,7 +60,7 @@ export function ProjectIdentityRoster({
                 loading={pending}
                 onClick={() => open.mutate(identity)}
               >
-                <UserRoundIcon />
+                <PersonaAvatar name={identity.name} size="xs" />
                 {!isMobile && <span className="max-w-28 truncate">{identity.name}</span>}
                 {busy && <RunningDot />}
               </Button>

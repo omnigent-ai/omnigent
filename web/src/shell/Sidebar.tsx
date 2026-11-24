@@ -197,6 +197,8 @@ import {
   useRenameConversation,
   useAutomationsEnabled,
 } from "@/hooks/useConversations";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
+import { sidebarPersonaName, useOrchestratorSessionIds } from "@/projectHome/usePersonaSessions";
 import { fetchConversationById, useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
@@ -432,6 +434,8 @@ const ProjectNamesContext = createContext<Map<string, string>>(new Map());
 // have one), sharing the same list-level lookup as the names map so a row can
 // surface the real project glyph in the pinned flyout without its own query.
 const ProjectIconsContext = createContext<Map<string, string>>(new Map());
+// Project Orchestrator session ids, so their rows draw the persona avatar.
+const OrchestratorSessionIdsContext = createContext<ReadonlySet<string>>(new Set());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // The filter menu's "Show" toggles: which optional metadata each row renders.
 const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
@@ -495,26 +499,29 @@ function SidebarRowDataProvider({
   onReorder: (fromId: string, toId: string) => void;
   children: ReactNode;
 }) {
+  const orchestratorSessionIds = useOrchestratorSessionIds();
   return (
-    <ProjectNamesContext.Provider value={projectNamesById}>
-      <ProjectIconsContext.Provider value={projectIconsById}>
-        <HostsByIdContext.Provider value={hostsById}>
-          <SidebarShowContext.Provider value={show}>
-            <IsMobileContext.Provider value={isMobile}>
-              <ViewerIdContext.Provider value={viewerId}>
-                <ServerInfoContext.Provider value={serverInfo}>
-                  <RowActivationContext.Provider value={onActivate}>
-                    <SessionReorderContext.Provider value={onReorder}>
-                      {children}
-                    </SessionReorderContext.Provider>
-                  </RowActivationContext.Provider>
-                </ServerInfoContext.Provider>
-              </ViewerIdContext.Provider>
-            </IsMobileContext.Provider>
-          </SidebarShowContext.Provider>
-        </HostsByIdContext.Provider>
-      </ProjectIconsContext.Provider>
-    </ProjectNamesContext.Provider>
+    <OrchestratorSessionIdsContext.Provider value={orchestratorSessionIds}>
+      <ProjectNamesContext.Provider value={projectNamesById}>
+        <ProjectIconsContext.Provider value={projectIconsById}>
+          <HostsByIdContext.Provider value={hostsById}>
+            <SidebarShowContext.Provider value={show}>
+              <IsMobileContext.Provider value={isMobile}>
+                <ViewerIdContext.Provider value={viewerId}>
+                  <ServerInfoContext.Provider value={serverInfo}>
+                    <RowActivationContext.Provider value={onActivate}>
+                      <SessionReorderContext.Provider value={onReorder}>
+                        {children}
+                      </SessionReorderContext.Provider>
+                    </RowActivationContext.Provider>
+                  </ServerInfoContext.Provider>
+                </ViewerIdContext.Provider>
+              </IsMobileContext.Provider>
+            </SidebarShowContext.Provider>
+          </HostsByIdContext.Provider>
+        </ProjectIconsContext.Provider>
+      </ProjectNamesContext.Provider>
+    </OrchestratorSessionIdsContext.Provider>
   );
 }
 
@@ -6073,6 +6080,8 @@ function ConversationRowImpl({
   const trailingLayout =
     TRAILING_SLOT_LAYOUT[trailingSlotKind(sessionState, hasSessionIndicator, showUpdated)];
   const showHarness = show.includes("harness");
+  const orchestratorSessionIds = useContext(OrchestratorSessionIdsContext);
+  const personaName = sidebarPersonaName(conversation, orchestratorSessionIds);
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -6310,7 +6319,7 @@ function ConversationRowImpl({
           "relative flex text-left text-foreground transition-colors",
           // With the harness icon the row takes a project row's shape: a leading
           // icon centered against the title and meta column.
-          showHarness ? "items-center" : "flex-col justify-center",
+          showHarness || personaName ? "items-center" : "flex-col justify-center",
           SIDEBAR_HOVER_HIGHLIGHT,
           // Full width (not 100%+1rem) so the highlight stays inset from the
           // right edge, aligning with the project/folder rows above.
@@ -6372,14 +6381,18 @@ function ConversationRowImpl({
         }}
         title={isMobile ? (conversation.title ?? conversation.id) : undefined}
       >
-        {showHarness ? (
+        {showHarness || personaName ? (
           <>
             <span className="flex size-4 shrink-0 items-center justify-center">
-              <SessionHarnessIcon
-                conversation={conversation}
-                testId="session-row-harness"
-                withFallback
-              />
+              {personaName ? (
+                <PersonaAvatar name={personaName} size="xs" />
+              ) : (
+                <SessionHarnessIcon
+                  conversation={conversation}
+                  testId="session-row-harness"
+                  withFallback
+                />
+              )}
             </span>
             <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">{rowText}</div>
           </>

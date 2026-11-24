@@ -76,16 +76,17 @@ describe("MentionTextarea", () => {
     const input = screen.getByLabelText("Add a comment") as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: "cc @", selectionStart: 4 } });
     const all = await screen.findAllByTestId("persona-mention-option");
+    // Each option leads with the persona's initials avatar.
     expect(all.map((option) => option.textContent)).toEqual([
-      "Orchestratorbuilt in",
-      "PM",
-      "Designer",
+      "OOrchestratorbuilt in",
+      "PMPM",
+      "DDesigner",
     ]);
     fireEvent.change(input, {
       target: { value: "cc @de please look", selectionStart: 6, selectionEnd: 6 },
     });
     expect(screen.getAllByTestId("persona-mention-option").map((o) => o.textContent)).toEqual([
-      "Designer",
+      "DDesigner",
     ]);
     fireEvent.keyDown(input, { key: "Enter" });
     expect(input.value).toBe("cc @Designer please look");

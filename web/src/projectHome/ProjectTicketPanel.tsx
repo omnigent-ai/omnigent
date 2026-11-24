@@ -52,7 +52,9 @@ import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCostSection } from "./ProjectCost";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { MentionTextarea } from "./MentionTextarea";
+import { usePersonaForSession, useProjectPersonaLookup } from "./usePersonaSessions";
 import { payloadMentions } from "./personaMentions";
 import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketFileLinks } from "./TicketFileLinks";
@@ -959,6 +961,7 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
   const now = useNow();
   const viewerId = useViewerId();
   const projectSessionId = useProjectAgentSession(projectId).sessionId;
+  const personaLookup = useProjectPersonaLookup(projectId);
   const events = query.data?.pages.flatMap((page) => page.data) ?? [];
   const { dividerPosition, dividerRef } = useTicketSeen({
     projectId,
@@ -976,6 +979,7 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
     <TicketActivityItem
       key={event.id}
       event={event}
+      personaLookup={personaLookup}
       nowMs={now.getTime()}
       viewerId={viewerId}
       fallbackSessionId={projectSessionId}
@@ -1129,11 +1133,13 @@ function TicketFinalUpdateSection({
 
 function TicketActivityItem({
   event,
+  personaLookup,
   nowMs,
   viewerId,
   fallbackSessionId,
 }: {
   event: TicketEvent;
+  personaLookup: ReturnType<typeof useProjectPersonaLookup>;
   nowMs: number;
   viewerId: string | null;
   fallbackSessionId: string | null;
@@ -1149,8 +1155,13 @@ function TicketActivityItem({
     event.user_id && event.user_id === viewerId
       ? "You"
       : (event.user_id ?? (agent ? "Agent" : "System"));
+  const personaName = usePersonaForSession(event.session_id, personaLookup);
   const actor = event.session_id ? (
-    <TicketSessionLink sessionId={event.session_id} showAgentName />
+    <TicketSessionLink
+      sessionId={event.session_id}
+      showAgentName
+      label={personaName ?? undefined}
+    />
   ) : (
     <span className="text-foreground">{author}</span>
   );
@@ -1164,7 +1175,9 @@ function TicketActivityItem({
           note && "rounded-full bg-muted",
         )}
       >
-        {note ? (
+        {note && personaName ? (
+          <PersonaAvatar name={personaName} size="md" />
+        ) : note ? (
           agent ? (
             <BotIcon aria-hidden className="size-3.5" />
           ) : (

@@ -30,8 +30,8 @@ const USER_PALETTE = [
   "var(--brand-accent)",
 ] as const;
 
-/** FNV-1a hash of the identity, for stable palette-slot assignment. */
-function userHash(userId: string): number {
+/** FNV-1a hash of a name or identity, for stable palette-slot assignment. */
+export function stableNameHash(userId: string): number {
   let hash = 0x811c9dc5;
   for (let i = 0; i < userId.length; i += 1) {
     hash ^= userId.charCodeAt(i);
@@ -47,7 +47,7 @@ function userHash(userId: string): number {
  * staying inside the UI's palette).
  */
 export function userColor(userId: string): string {
-  return USER_PALETTE[userHash(userId) % USER_PALETTE.length]!;
+  return USER_PALETTE[stableNameHash(userId) % USER_PALETTE.length]!;
 }
 
 /**

@@ -8,7 +8,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import { createPortal } from "react-dom";
-import { UserRoundIcon } from "lucide-react";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { insertMention, mentionQueryAt } from "./personaMentions";
@@ -144,7 +144,7 @@ export function MentionTextarea({
                 }}
                 onMouseEnter={() => setActive(index)}
               >
-                <UserRoundIcon className="size-3.5 text-muted-foreground" />
+                <PersonaAvatar name={identity.name} size="xs" />
                 <span className="truncate">{identity.name}</span>
                 {identity.builtin && (
                   <span className="ml-auto text-xs text-muted-foreground">built in</span>
