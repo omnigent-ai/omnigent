@@ -17,6 +17,34 @@ from tests.browser_ui.files.test_file_line_navigation import (
 
 seeded_session = seeded_session_fixture
 
+_MAC_SHELL_INIT_SCRIPT = """
+    Object.defineProperty(navigator, "userAgent", { value: "Mozilla/5.0 (Macintosh)" });
+    window.omnigentDesktop = {
+        kind: "electron",
+        setBadgeCount() {},
+        notify() { return Promise.resolve(false); },
+        onNotificationActivated() { return () => {}; },
+        getServerPicker() { return Promise.resolve(null); },
+        switchServer() { return Promise.resolve(); },
+        openServerSetup() {},
+    };
+"""
+
+# Electron builds the drag area from app-region boxes; any no-drag box over a point excludes it.
+_WINDOW_DRAG_AT_POINT = """([x, y]) => {
+    const contains = (el) => {
+        const box = el.getBoundingClientRect();
+        return box.width > 0 && box.height > 0 && x >= box.left && x < box.right
+            && y >= box.top && y < box.bottom && getComputedStyle(el).visibility !== "hidden";
+    };
+    const describe = (el) => `${el.tagName.toLowerCase()}.${[...el.classList].join(".")}`;
+    const region = (value) => [...document.querySelectorAll("*")]
+        .filter((el) => getComputedStyle(el).getPropertyValue("-webkit-app-region") === value)
+        .filter(contains)
+        .map(describe);
+    return { drag: region("drag"), noDrag: region("no-drag") };
+}"""
+
 
 @pytest.mark.parametrize("width", [240, 360, 472, 900])
 def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, width: int) -> None:
@@ -121,3 +149,50 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
         viewport.get_by_role("button", name=f"Close {path.split('/')[-1]}", exact=True).click()
     first_close = f"Close {paths[0].split('/')[-1]}"
     expect(viewport.get_by_role("button", name=first_close, exact=True)).to_be_in_viewport()
+
+
+def test_maximized_tab_bar_empty_space_drags_macos_window(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    files = {"src/README.md": "# Readme", "src/design.md": "# Design"}
+    paths = list(files)
+    _mock_markdown_files(page, seeded_session, files)
+    state = [
+        {
+            "id": seeded_session.session_id,
+            "state": {
+                "open": True,
+                "rightRailTab": "files",
+                "openFiles": paths,
+                "selectedFilePath": paths[0],
+            },
+        }
+    ]
+    encoded_state = json.dumps(json.dumps(state))
+    page.add_init_script(_MAC_SHELL_INIT_SCRIPT)
+    page.add_init_script(
+        f"localStorage.setItem('omnigent:session-workspace-state', {encoded_state});"
+    )
+    page.set_viewport_size({"width": 1280, "height": 860})
+    page.goto(f"{seeded_session.contract.base_url}/c/{seeded_session.session_id}")
+    expect(page.locator("html")).to_have_attribute("data-electron-mac", "true")
+    toolbar = page.get_by_role("toolbar", name="Workspace tabs")
+    viewport = toolbar.locator("[data-workspace-tabs-viewport]")
+    expect(viewport.get_by_role("button", name="Close design.md", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    toolbar.get_by_role("button", name="Full screen", exact=True).click()
+    expect(toolbar.get_by_role("button", name="Exit full screen", exact=True)).to_be_visible()
+
+    last_tab = viewport.locator(":scope > div > *").last.bounding_box()
+    trailing = viewport.evaluate("el => el.nextElementSibling.getBoundingClientRect().toJSON()")
+    assert last_tab is not None and trailing["left"] - (last_tab["x"] + last_tab["width"]) > 200
+    empty_point = [
+        (last_tab["x"] + last_tab["width"] + trailing["left"]) / 2,
+        last_tab["y"] + last_tab["height"] / 2,
+    ]
+    regions = page.evaluate(_WINDOW_DRAG_AT_POINT, empty_point)
+    assert regions["drag"], f"{empty_point} is outside the window drag strip: {regions}"
+    assert regions["noDrag"] == [], (
+        f"empty tab-bar space at {empty_point} is excluded from window dragging: {regions}"
+    )
