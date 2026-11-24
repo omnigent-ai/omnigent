@@ -777,7 +777,8 @@ pull_request_links:
 ```
 
 `url_template` must be an http(s) URL with a `{number}` field. It may also use
-`{host}`, `{owner}` and `{repo}`. Only GitHub-style pull request links
+`{host}`, `{owner}` and `{repo}`. Fields go after the host, in the path, query or
+fragment. Only GitHub-style pull request links
 (`https://<host>/<owner>/<repo>/pull/<number>`) under an `applies_to` prefix
 move. That covers the composer, the Pull Requests panel, Canvas cards,
 automation runs, the Inbox, `#123` references in chat, and pull request links

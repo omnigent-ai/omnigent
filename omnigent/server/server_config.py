@@ -289,8 +289,15 @@ def _is_destination_hostname(hostname: str | None) -> bool:
     """
     if hostname is None:
         return False
-    last_label = hostname.rstrip(".").rsplit(".", 1)[-1]
-    if _DESTINATION_HOSTNAME.fullmatch(hostname) and not _NUMERIC_LABEL.fullmatch(last_label):
+    labels = hostname.rstrip(".").split(".")
+    if _DESTINATION_HOSTNAME.fullmatch(hostname) and not _NUMERIC_LABEL.fullmatch(labels[-1]):
+        try:
+            # A browser rejects a punycode label that doesn't decode, as in ``xn--.example.com``.
+            for label in labels:
+                if label.startswith("xn--"):
+                    label.encode("ascii").decode("idna")
+        except UnicodeError:
+            return False
         return True
     try:
         ipaddress.ip_address(hostname)
@@ -299,11 +306,13 @@ def _is_destination_hostname(hostname: str | None) -> bool:
     return True
 
 
-def _is_http_destination(url: str) -> bool:
+def _is_http_destination(template: str) -> bool:
     """
-    Whether *url* is an absolute http(s) URL with a valid hostname and, if any, a usable port.
+    Whether *template* is an absolute http(s) URL whose host and port hold no fields and are valid.
     """
-    parts = urlsplit(url)
+    parts = urlsplit(template)
+    if "{" in parts.netloc or "}" in parts.netloc:
+        return False
     try:
         # ``port`` raises for a non-numeric or out-of-range port.
         has_usable_port = parts.port is None or parts.port > 0
@@ -326,24 +335,27 @@ def _pull_request_link_template(raw: object) -> str:
         "{number}" not in template
         or "{" in without_fields
         or "}" in without_fields
-        or not _is_http_destination(_PULL_REQUEST_LINK_FIELD.sub("x", template))
+        or not _is_http_destination(template)
     ):
         raise ValueError(
-            f"{PULL_REQUEST_LINKS_KEY}.url_template must be an http(s) URL with a {{number}}"
-            " field and no fields other than {host}, {owner}, {repo} and {number}"
+            f"{PULL_REQUEST_LINKS_KEY}.url_template must be an http(s) URL with a valid host and"
+            " a {number} field, using only {host}, {owner}, {repo} and {number} after the host"
         )
     return template
 
 
 def _pull_request_link_prefix(raw: str) -> str:
     """
-    Validate one ``applies_to`` entry, returning it lowercased without a trailing slash.
+    Validate one ``applies_to`` entry, returning it lowercased, with no trailing slash or host dot.
     """
-    prefix = raw.strip().strip("/").lower()
-    host, *names = prefix.split("/")
+    host, *names = raw.strip().strip("/").lower().split("/")
+    # Pull request links name their host without a trailing dot.
+    host = host.rstrip(".")
     patterns = (_GITHUB_OWNER, _GITHUB_REPO)
     if (
         len(names) > 2
+        # The client matches pull request hosts by name, never by IPv6 literal.
+        or ":" in host
         or not _is_destination_hostname(host)
         or not all(pattern.fullmatch(name) for pattern, name in zip(patterns, names, strict=False))
     ):
@@ -351,7 +363,7 @@ def _pull_request_link_prefix(raw: str) -> str:
             f"{PULL_REQUEST_LINKS_KEY}.applies_to entries must be host, host/owner or"
             f" host/owner/repo, got {raw!r}"
         )
-    return prefix
+    return "/".join([host, *names])
 
 
 def load_pull_request_links(config: Mapping[str, Any]) -> PullRequestLinks | None:

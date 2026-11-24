@@ -788,14 +788,14 @@ def test_pull_request_links_are_unset_without_config() -> None:
 
 
 def test_pull_request_links_normalize_the_configured_block() -> None:
-    """Names and templates are trimmed; prefixes compare lowercase, once each, without a slash."""
+    """Names and templates are trimmed; prefixes compare lowercase, once each, with no end dots."""
     links = load_pull_request_links(
         {
             "pull_request_links": {
                 "url_template": f"  {_REVIEW_TEMPLATE} ",
                 "name": " Code Review ",
                 "applies_to": [
-                    "GitHub.com/Example-Org/",
+                    "GitHub.com./Example-Org/",
                     "ghe.example.com",
                     "github.com/example-org",
                 ],
@@ -814,17 +814,18 @@ def test_pull_request_links_normalize_the_configured_block() -> None:
 @pytest.mark.parametrize(
     "url_template",
     [
-        "https://review.example.com:8443/{owner}/{repo}/{number}",
-        "https://{host}.review.example.com/{number}",
+        "https://review.example.com:8443/{host}/{owner}/{repo}/{number}",
+        "https://review.example.com/?pr={owner}%2F{repo}#{number}",
+        "https://xn--bcher-kva.example/{number}",
         "https://[::1]:8443/{number}",
         "http://10.0.0.5/review/{number}",
     ],
-    ids=["port", "host-field-subdomain", "ipv6-literal", "ipv4-literal"],
+    ids=["port", "query-and-fragment", "punycode", "ipv6-literal", "ipv4-literal"],
 )
 def test_pull_request_links_accept_destinations_with_ports_and_ip_literals(
     url_template: str,
 ) -> None:
-    """Validation rejects unusable destinations, not ordinary ports, subdomains or IP hosts."""
+    """Validation rejects unusable destinations, not ports, queries, punycode or IP hosts."""
     links = load_pull_request_links(
         {
             "pull_request_links": {
@@ -940,6 +941,32 @@ def test_pull_request_links_accept_destinations_with_ports_and_ip_literals(
         ({"name": "Review", "applies_to": ["github.com/example org"]}, "host/owner/repo"),
         ({"name": "Review", "applies_to": ["https:github.com"]}, "host/owner/repo"),
         ({"name": "Review", "applies_to": ["github.com/example_org"]}, "host/owner/repo"),
+        ({"name": "Review", "applies_to": ["::1"]}, "host/owner/repo"),
+        ({"name": "Review", "applies_to": ["[::1]"]}, "host/owner/repo"),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://xn--.example.com/{number}",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://review.{number}/pull/{number}",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://{host}.review.example.com/{number}",
+            },
+            "url_template",
+        ),
     ],
     ids=[
         "not-a-mapping",
@@ -967,6 +994,11 @@ def test_pull_request_links_accept_destinations_with_ports_and_ip_literals(
         "prefix-owner-with-space",
         "prefix-scheme-without-slashes",
         "prefix-invalid-owner",
+        "prefix-ipv6",
+        "prefix-bracketed-ipv6",
+        "template-invalid-punycode",
+        "template-field-in-host",
+        "template-host-field-subdomain",
     ],
 )
 def test_malformed_pull_request_links_stop_startup(block: object, message: str) -> None:
