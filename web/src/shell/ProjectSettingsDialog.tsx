@@ -46,7 +46,7 @@ import {
 } from "@/lib/projectLaunchPreferences";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
-import { ProjectSharingSection } from "./ProjectSharing";
+import { ProjectProductApproversSection, ProjectSharingSection } from "./ProjectSharing";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
 /** Select sentinel for "no default" — Radix Select can't hold an empty value. */
@@ -700,6 +700,7 @@ export function ProjectSettingsDialog({
           </DialogFooter>
         </form>
         {projectId !== null && <ProjectSharingSection projectId={projectId} />}
+        {projectId !== null && <ProjectProductApproversSection projectId={projectId} />}
       </DialogContent>
     </Dialog>
   );

@@ -19,6 +19,8 @@ import { apiErrorFromResponse } from "./sessionsApi";
  * slot". Creation uses these choices for Orchestrator; later sessions prefill from them.
  */
 export interface ProjectConfig {
+  /** People besides the owner whose own `product-ok` approves others' features. Owner-only. */
+  product_approvers?: string[];
   /** Default host id, or the sandbox sentinel. */
   host_id?: string;
   /** Default working directory / repo path on that host. */

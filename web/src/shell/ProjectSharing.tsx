@@ -11,6 +11,7 @@ import {
   listProjectShares,
   revokeProjectShare,
   shareProject,
+  updateProjectConfig,
 } from "@/lib/projectsApi";
 
 function sharesKey(projectId: string) {
@@ -125,6 +126,96 @@ export function ProjectSharingSection({ projectId }: { projectId: string }) {
         ))}
         {shares.isSuccess && members.length === 0 && (
           <li className="text-muted-foreground text-sm">Not shared with anyone yet.</li>
+        )}
+      </ul>
+    </section>
+  );
+}
+
+/**
+ * The owner's product approvers: people besides the owner whose own `product-ok`
+ * lets a feature someone else requested land. Members see the list read-only.
+ */
+export function ProjectProductApproversSection({ projectId }: { projectId: string }) {
+  const queryClient = useQueryClient();
+  const project = useQuery({
+    queryKey: ["project", projectId],
+    queryFn: () => getProject(projectId),
+    staleTime: 30_000,
+  });
+  const [draft, setDraft] = useState("");
+  const approvers = project.data?.config?.product_approvers ?? [];
+  const save = useMutation({
+    // Re-read so the whole-config write keeps every other stored setting.
+    mutationFn: async (next: string[]) => {
+      const current = await getProject(projectId);
+      return updateProjectConfig(projectId, { ...current.config, product_approvers: next });
+    },
+    onSuccess: () => {
+      setDraft("");
+      void queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["project-config", projectId] });
+    },
+  });
+  const isOwner = project.data !== undefined && project.data.shared !== true;
+  const onSubmit = (event: FormEvent) => {
+    event.preventDefault();
+    const userId = draft.trim();
+    if (userId && !approvers.includes(userId)) save.mutate([...approvers, userId]);
+  };
+  return (
+    <section className="flex flex-col gap-2 border-t pt-4" data-testid="project-product-approvers">
+      <h3 className="font-medium text-ui">Product approvers</h3>
+      <p className="text-muted-foreground text-sm">
+        A feature someone other than the owner asked for lands only after a product approver adds
+        `product-ok` on its ticket. The owner always counts.
+      </p>
+      {isOwner && (
+        <form onSubmit={onSubmit} className="flex gap-2">
+          <Input
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder="User ID, e.g. name@example.com"
+            aria-label="Product approver to add"
+            data-testid="product-approver-input"
+            className="flex-1"
+          />
+          <Button
+            type="submit"
+            size="sm"
+            data-testid="product-approver-add"
+            loading={save.isPending}
+            disabled={draft.trim() === ""}
+          >
+            Add
+          </Button>
+        </form>
+      )}
+      {save.isError && (
+        <p className="text-destructive text-sm" role="alert">
+          {(save.error as Error).message}
+        </p>
+      )}
+      <ul className="flex flex-col gap-1" data-testid="product-approver-list">
+        {approvers.map((userId) => (
+          <li key={userId} className="flex items-center justify-between gap-2 text-sm">
+            <span className="truncate">{userId}</span>
+            {isOwner && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={`Remove ${userId} as a product approver`}
+                onClick={() => save.mutate(approvers.filter((entry) => entry !== userId))}
+                disabled={save.isPending}
+              >
+                <XIcon className="size-3.5" />
+              </Button>
+            )}
+          </li>
+        ))}
+        {project.isSuccess && approvers.length === 0 && (
+          <li className="text-muted-foreground text-sm">Only the owner so far.</li>
         )}
       </ul>
     </section>
