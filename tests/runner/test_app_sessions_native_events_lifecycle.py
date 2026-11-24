@@ -3330,18 +3330,22 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     assert int_resp.status_code == 204, int_resp.text
 
 
+@pytest.mark.parametrize("bridge_published", [False, True], ids=["no-thread", "idle-thread"])
 @pytest.mark.asyncio
 async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_held_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    bridge_published: bool,
 ) -> None:
     """
-    Stop before Codex has a thread reaches the turn holding the message for it.
+    Stop reaches the runner's turn while its message is not yet in Codex.
 
-    With no bridge state there is no Codex turn to interrupt: the message waits
-    in the runner's own turn until Codex starts. Stop must interrupt and cancel
-    that turn, or the held message would still be sent once Codex is up.
+    Before Codex has a thread, or once it has one but no turn yet (the thread
+    started while the message was still waiting to be submitted), there is no
+    Codex turn to interrupt: the message is in the runner's own turn. Stop must
+    interrupt and cancel that turn, or the message would still be sent.
     """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner import app as runner_app_module
     from tests.runner.conftest import _BlockingHarnessClient, _sse
 
@@ -3391,6 +3395,22 @@ async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_he
         assert sent.status_code == 202, sent.text
         await asyncio.wait_for(harness.post_seen.wait(), timeout=5)
         turn = app.state.active_turns[conv_id]
+        if bridge_published:
+            codex_native_bridge.write_bridge_state(
+                codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
+                codex_native_bridge.CodexNativeBridgeState(
+                    session_id=conv_id,
+                    socket_path="ws://127.0.0.1:43214",
+                    thread_id="thread_codex_started",
+                    codex_home=str(tmp_path / "codex-home"),
+                    active_turn_id=None,
+                ),
+            )
+
+            def _no_app_server(transport: str, *, client_name: str = "omnigent") -> None:
+                raise AssertionError(f"no Codex turn to interrupt at {transport!r}")
+
+            monkeypatch.setattr(codex_native_app_server, "client_for_transport", _no_app_server)
 
         stopped = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"})
         assert stopped.status_code == 204, stopped.text

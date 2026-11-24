@@ -714,8 +714,9 @@ class NativeInterruptRunner:
         Interrupt the session's Codex turn, or hand a turn waiting for Codex to the caller.
 
         :param conv_id: Session whose turn to interrupt.
-        :returns: The interrupt's response, or ``None`` before Codex has a thread,
-            so the caller cancels the in-process turn waiting for it to start.
+        :returns: The interrupt's response, or ``None`` when Codex has no turn or
+            MCP startup to stop, so the caller cancels an in-process turn still
+            waiting to submit its message (or settles a Stop with no turn).
         """
         from omnigent.harnesses.codex_native.app_server import (
             CodexAppServerResponseError,
@@ -735,11 +736,12 @@ class NativeInterruptRunner:
             return None
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)
         if state.active_turn_id is None and not pending_mcp:
+            # Nothing to stop in Codex; a message not yet submitted is the runner's to cancel.
             self._logger.info(
                 "Codex-native interrupt skipped for %s: no active turn or MCP startup.",
                 conv_id,
             )
-            return Response(status_code=204)
+            return None
         if pending_mcp:
             self._logger.info(
                 "Codex-native interrupt for %s cancels MCP startup: %s",

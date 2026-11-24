@@ -6833,6 +6833,9 @@ async def _codex_discover_thread_and_forward(
                     )
                 return
 
+        if login_required or sign_in_recorded:
+            # The sign-in is done: a turn arriving during Plan setup waits for the state.
+            clear_bridge_startup_error(bridge_dir)
         if apply_plan_mode is not None:
             await apply_plan_mode(thread_id)
         write_bridge_state(
@@ -6847,9 +6850,9 @@ async def _codex_discover_thread_and_forward(
                 cwd=workspace,
             ),
         )
-        if login_required or startup_pending_recorded:
-            # The user signed in (or the TUI otherwise started a thread). Cleared
-            # after the state is up, so a turn waiting on the record sees one or the other.
+        if startup_pending_recorded:
+            # A still-starting record goes only once the state is up, so a turn held on it
+            # sees one or the other.
             clear_bridge_startup_error(bridge_dir)
 
         server_url = _required_runner_env("RUNNER_SERVER_URL")

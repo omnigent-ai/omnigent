@@ -4806,19 +4806,44 @@ class _ClosableStub:
         return None
 
 
+_LATE_SIGN_IN_SCREEN = (
+    "launcher: Sign in to continue:\n"
+    "  https://signin.example.com/device\n  code: HQ7M-2KPD\nwaiting for sign-in...\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("late_screen", "records_while_waiting", "record_at_plan_setup", "state_published_at_clear"),
+    [
+        (None, ["agent_startup_pending"], "agent_startup_pending", [True]),
+        (
+            _LATE_SIGN_IN_SCREEN,
+            ["agent_startup_pending", "databricks_sign_in_pending"],
+            None,
+            [False, True],
+        ),
+    ],
+    ids=["still-starting", "late-sign-in"],
+)
 @pytest.mark.asyncio
-async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_after_the_budget(
+async def test_codex_discover_thread_and_forward_hands_a_waiting_turn_over_at_thread_start(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    late_screen: str | None,
+    records_while_waiting: list[str],
+    record_at_plan_setup: str | None,
+    state_published_at_clear: list[bool],
 ) -> None:
     """
-    A sign-in prompt the pane shows after the still-starting record replaces that record.
+    Past the budget the pane is still watched for a sign-in, and the thread start hands over.
 
-    A chat turn waits on the still-starting record rather than failing, so the
-    wait keeps watching the pane: a launcher that only later asks for a sign-in
-    must still turn the waiting message into the sign-in card. Once the thread
-    starts, the bridge state is published before the record is cleared, so a
-    waiting turn always sees one or the other.
+    A chat turn waits on the still-starting record rather than failing, so a
+    launcher that only later asks for a sign-in must still replace the record
+    with the sign-in card. When the thread starts, what a turn arriving during
+    Plan setup sees depends on the record: a still-starting record stays until
+    the bridge state is up, so that turn keeps waiting; a sign-in record is
+    already resolved and is cleared first, so that turn waits for the state
+    instead of failing on it.
     """
     from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
     from omnigent.runner.app import (
@@ -4827,34 +4852,38 @@ async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_after_
     )
     from omnigent.runner.native import orchestration
 
+    thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
     pane = _ScriptedCodexPane("launcher: login failed, retrying in 6 seconds...\n")
     wait_calls: list[dict[str, object]] = []
     records_seen: list[str | None] = []
-    state_published_at_clear: list[bool] = []
+    plan_setup_records: list[str | None] = []
+    clears: list[bool] = []
     real_clear = codex_native_bridge.clear_bridge_startup_error
+
+    def _record_code() -> str | None:
+        failure = codex_native_bridge.read_bridge_startup_failure(tmp_path)
+        return failure.code if failure is not None else None
 
     async def _fake_wait(*_args: object, **kwargs: object) -> str:
         wait_calls.append(kwargs)
         if len(wait_calls) == 1:
             raise TimeoutError
-        failure = codex_native_bridge.read_bridge_startup_failure(tmp_path)
-        records_seen.append(failure.code if failure is not None else None)
-        if len(wait_calls) == 2:
-            pane.screen = (
-                "launcher: Sign in to continue:\n"
-                "  https://signin.example.com/device\n  code: HQ7M-2KPD\nwaiting for sign-in...\n"
-            )
+        records_seen.append(_record_code())
+        if late_screen is not None and len(wait_calls) == 2:
+            pane.screen = late_screen
             await asyncio.sleep(3600.0)
-        return "019e96aa-abcd-7343-8d3b-6f914d60936b"
+        return thread_id
+
+    async def _plan_setup(started_thread_id: str) -> None:
+        assert started_thread_id == thread_id
+        plan_setup_records.append(_record_code())
 
     def _record_clear(bridge_dir: Path) -> None:
-        state_published_at_clear.append(
-            codex_native_bridge.read_bridge_state(bridge_dir) is not None
-        )
+        clears.append(codex_native_bridge.read_bridge_state(bridge_dir) is not None)
         real_clear(bridge_dir)
 
     async def _fake_supervise(**_kwargs: object) -> None:
-        records_seen.append(codex_native_bridge.read_bridge_startup_error(tmp_path))
+        records_seen.append(_record_code())
 
     real_async_client = httpx.AsyncClient
 
@@ -4889,16 +4918,20 @@ async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_after_
                 app_server=app_server,  # type: ignore[arg-type]
                 terminal_instance=pane,  # type: ignore[arg-type]
                 thread_start_timeout_seconds=120.0,
+                apply_plan_mode=_plan_setup,
             ),
             timeout=10.0,
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
-    assert wait_calls == [{"timeout": 120.0}, {"timeout": None}, {"timeout": None}]
-    # Still starting, then the sign-in prompt, then cleared by the time forwarding starts.
-    assert records_seen == ["agent_startup_pending", "databricks_sign_in_pending", None]
-    assert state_published_at_clear == [True]
+    expected_waits = [{"timeout": 120.0}] + [{"timeout": None}] * len(records_while_waiting)
+    assert wait_calls == expected_waits
+    # The record each open-ended wait began with, then none once forwarding starts.
+    assert records_seen == [*records_while_waiting, None]
+    assert plan_setup_records == [record_at_plan_setup]
+    # Whether the bridge state was up at each clear of the record.
+    assert clears == state_published_at_clear
 
 
 @pytest.mark.asyncio
