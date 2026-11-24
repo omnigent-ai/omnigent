@@ -22,17 +22,18 @@ export interface GadgetTemplate {
 // Shown in the New gadget dialog and the template preview.
 const messages = {
   radarName: "Where was I?",
-  radarDescription: "Sees what your recent sessions add up to, and what to do next.",
+  radarDescription: "Tracks every change you have in flight, from commit to impact report.",
   radarShowsSummary:
-    "What your recent sessions add up to, grouped by goal, with what is blocked or waiting on you",
+    "Each change from your recent sessions on its track: before the PR, in review, rolling out, or waiting on metrics",
   radarShowsDesign:
-    "A page your gadget session designs for your work, such as a rollout as stages or reviews as lanes",
+    "What waits on what, the PRs and flags involved, and the sessions working on each change",
   radarShowsSteps:
-    "Only the step that is due in the workflows you repeat, such as a metric check after a ramp or the telemetry you meant to add; it learns from what you click",
-  radarShowsBack: "Back to the previous look whenever a new design misses",
+    "Only the next step you are sure to want, such as ramping a flag after two quiet days; it learns how each project ships from what you click",
+  radarShowsBack:
+    "A page your gadget session designs for your work, with Back to the previous look",
   radarSuggestScan: "Scan my sessions from the last 3 days",
-  radarSuggestLanes: "Show my pull request reviews as lanes",
-  radarSuggestWindow: "Scan 7 days by default and leave out trivial sessions",
+  radarSuggestLanes: "Show my changes as a board by stage",
+  radarSuggestWindow: "We don't use flags in the web app: we canary, then roll out",
   storyName: "Data story",
   storyDescription:
     "Finds the stories in your recent data work, then builds the one you pick from real data.",
