@@ -80,7 +80,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanEdit, useIsSessionOwner } from "@/hooks/usePermissions";
 import {
   RunnerOfflineError,
   useWorkspaceAsleep,
@@ -806,7 +806,12 @@ function pullRequestLabel(pr: PullRequestAssociation, sessionProvider?: string |
 
 type Associations = Pick<
   PullRequestInfo,
-  "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
+  | "prs"
+  | "tracking_available"
+  | "selected_pr_url"
+  | "provider"
+  | "provider_display"
+  | "owner_only_changes"
 >;
 export type PullRequestSubtab = "summary" | "comments" | "changes";
 
@@ -1143,6 +1148,7 @@ export function PullRequestPanel({
   // then only supplies the selected PR's details.
   const storesPrs = storesSessionPullRequests(useServerInfo());
   const stored = useSessionPullRequests(conversationId, info.data);
+  const sessionOwner = useIsSessionOwner(conversationId);
   const hostOffline = useHostOffline(conversationId, info);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
   const sandboxStarting = useSandboxStarting(conversationId);
@@ -1154,10 +1160,24 @@ export function PullRequestPanel({
   }>();
   useEffect(() => {
     if (info.data) {
-      const { prs, tracking_available, selected_pr_url, provider, provider_display } = info.data;
+      const {
+        prs,
+        tracking_available,
+        selected_pr_url,
+        provider,
+        provider_display,
+        owner_only_changes,
+      } = info.data;
       setKnownAssociations({
         sessionId: conversationId,
-        data: { prs, tracking_available, selected_pr_url, provider, provider_display },
+        data: {
+          prs,
+          tracking_available,
+          selected_pr_url,
+          provider,
+          provider_display,
+          owner_only_changes,
+        },
       });
     }
   }, [conversationId, info.data]);
@@ -1319,7 +1339,9 @@ export function PullRequestPanel({
     ) : undefined;
   const showTrackingControls = !!associations?.tracking_available && !linkInEmptyState;
   // Only the session's owner links, unlinks or changes its PRs; the server refuses anyone else.
-  const ownerOnlyChanges = info.data?.owner_only_changes === true;
+  // Without live info (host offline, a selection loading), the session says who owns it.
+  const ownerOnlyChanges =
+    live?.owner_only_changes === true || (live === undefined && sessionOwner === false);
   const canChangeTracking = showTrackingControls && !ownerOnlyChanges;
   const showsList =
     (listedPrs.length > 1 || (!!onOpenPullRequest && listedPrs.length > 0)) && !showingDetails;

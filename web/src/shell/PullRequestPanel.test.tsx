@@ -67,6 +67,8 @@ const state = vi.hoisted(() => ({
   diff: null as PullRequestDiffResponse | null,
   diffError: null as Error | null,
   canEdit: true,
+  // The server's word on whether the viewer owns the session; null when it doesn't say.
+  sessionOwner: null as boolean | null,
   updateSessionPr: vi.fn(),
   realPrHooks: false,
   repoLabels: {
@@ -183,7 +185,10 @@ vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => {
     useUnlinkSessionPr: () => state.unlink,
   };
 });
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
+vi.mock("@/hooks/usePermissions", () => ({
+  useCanEdit: () => state.canEdit,
+  useIsSessionOwner: () => state.sessionOwner,
+}));
 let sandboxStarting = false;
 vi.mock("@/hooks/useSessionReconnect", () => ({ useSandboxStarting: () => sandboxStarting }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
@@ -444,6 +449,7 @@ beforeEach(() => {
   state.diff = { object: "session.github.pr_diff", patch: "PATCH" };
   state.diffError = null;
   state.canEdit = true;
+  state.sessionOwner = null;
   state.repoLabels = { data: undefined, isPending: true, isError: false, error: null };
   state.updateLabels = { mutate: vi.fn(), isError: false, error: null };
 });
@@ -2721,6 +2727,47 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByRole("button", { name: "Unlink PR" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
     expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  });
+
+  it("keeps a non-owner's PR changes hidden while the host is offline", async () => {
+    const user = userEvent.setup();
+    const url = "https://github.com/example/one/pull/42";
+    state.sessionOwner = false;
+    state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+    state.stored.conv_1 = [
+      { url, host: "github.com", repository: "example/one", number: 42, relationship: "created" },
+      { ...OTHER_PR },
+    ];
+    renderPanel();
+
+    await screen.findByRole("list", { name: "Pull requests" });
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Link a PR/ })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Actions for example/one #42" }));
+    expect(screen.queryByRole("menuitem", { name: "Unlink PR" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Copy PR link" })).toBeEnabled();
+  });
+
+  it("keeps a non-owner's PR changes hidden while another PR's details load", () => {
+    const url = state.info!.data!.pr!.url;
+    Object.assign(state.info!.data!, {
+      owner_only_changes: true,
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [
+        { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
+      ],
+    });
+    // A server that doesn't say who owns the session: only the PR info's marker decides.
+    state.sessionOwner = null;
+    const { rerender } = renderPanel();
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+
+    state.info = { isLoading: true, error: null, isFetching: true };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Link a PR/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Unlink PR" })).toBeNull();
   });
 
   it("offers a non-owner no link in the empty state", () => {
