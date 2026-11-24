@@ -77,6 +77,7 @@ class FakeTickets:
 
     def comment(self, project_id: str, ticket_id: str, body: Any, actor: Any) -> dict[str, Any]:
         assert body.audience == "agents"
+        assert actor.agent_id == reliability.LOOP_AGENT_ID and actor.session_id is None
         self.notes.append((ticket_id, body.text))
         # Like the store, the returned row predates the write's updated_at stamp.
         ticket = next(t for t in self.tickets if t["id"] == ticket_id)

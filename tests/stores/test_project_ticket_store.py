@@ -947,3 +947,22 @@ def test_project_delete_with_tickets_removes_ticket_history_only_when_asked(boar
             count = connection.exec_driver_sql(f"SELECT COUNT(*) FROM {table}").scalar()
             assert count == remaining.get(table, 0), table
     assert tickets.get(other.id, kept["id"], user_id="alice")["title"] == "Kept"
+
+
+def test_reliability_loop_notes_are_agent_notes_that_never_wake_anyone(board):
+    from omnigent.server.project_reliability import LOOP_AGENT_ID
+
+    tickets, _, project = board
+    ticket = tickets.create(project.id, CreateTicket(title="Waiting"), TicketActor("alice"))
+    tickets.comment(
+        project.id,
+        ticket["id"],
+        CommentOnTicket(text="Reliability check: woke the worker.", audience="agents"),
+        TicketActor("alice", agent_id=LOOP_AGENT_ID),
+    )
+    pending = [
+        event
+        for event in tickets.project_pending_notifications(project.id)
+        if event["kind"] == "comment"
+    ]
+    assert [(event["urgent"], event["agent_id"]) for event in pending] == [(False, LOOP_AGENT_ID)]

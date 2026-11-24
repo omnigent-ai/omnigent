@@ -54,6 +54,15 @@ _DEFAULTS: dict[str, Any] = {
     "max_wait_hours": 72.0,
 }
 WAITING_LABEL = "waiting"
+# The loop writes as an agent, not a person: its notes and label edits must not
+# start worker turns or wake the orchestrator the way a person's comment does.
+LOOP_AGENT_ID = uuid.uuid5(uuid.NAMESPACE_URL, "omnigent:project-reliability-loop").hex
+
+
+def _loop_actor(project: Any) -> TicketActor:
+    return TicketActor(user_id=project.user_id, agent_id=LOOP_AGENT_ID)
+
+
 NUDGE, RESTART, ESCALATE = 1, 2, 3
 LEAD_RESTART, LEAD_ROLLOVER = 1, 2
 
@@ -266,7 +275,7 @@ class ReliabilityLoop:
             project.id,
             ticket_id,
             CommentOnTicket(text=f"{NOTE_PREFIX}: {text}"[:2000], audience="agents"),
-            TicketActor(user_id=project.user_id),
+            _loop_actor(project),
         )
         # The returned row predates the write's own updated_at stamp.
         return max(int(result.get("updated_at") or 0), int(time.time()))
@@ -507,7 +516,7 @@ class ReliabilityLoop:
             project.id,
             ticket["id"],
             UpdateTicket(labels=labels),
-            TicketActor(user_id=project.user_id),
+            _loop_actor(project),
         )
         return await self._note(project, ticket["id"], text)
 
