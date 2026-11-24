@@ -373,8 +373,7 @@ def test_unknown_thinking_defaults_leave_entry_unchanged() -> None:
     [
         "system.ai.gpt-6-2-astra",
         "databricks-gpt-6-astra",
-        "system.ai.gpt-6-1-sol",
-        "openai/gpt-6.1-sol",
+        "openai/gpt-6.2-astra",
     ],
 )
 def test_models_without_none_effort_map_unsupported_pi_levels(model_id: str) -> None:
@@ -392,7 +391,9 @@ def test_models_without_none_effort_map_unsupported_pi_levels(model_id: str) -> 
     }
 
 
-@pytest.mark.parametrize("model_id", ["system.ai.gpt-6-luna", "system.ai.gpt-5-5"])
+@pytest.mark.parametrize(
+    "model_id", ["system.ai.gpt-6-luna", "system.ai.gpt-6-1-sol", "system.ai.gpt-5-5"]
+)
 def test_other_gpt_models_keep_default_thinking_levels(model_id: str) -> None:
     """Models that accept ``none`` get no level map."""
     entry = pi_model_json_entry(

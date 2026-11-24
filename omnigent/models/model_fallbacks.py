@@ -35,7 +35,7 @@ PI_ANTHROPIC_THINKING_REQUIRED = StaticModelFallback(
 # ``xhigh``/``max`` are accepted. Pi sends ``none`` for its ``off`` level unless
 # the model entry marks it unsupported.
 PI_GPT_NO_NONE_EFFORT = StaticModelFallback(
-    model_ids=("gpt-6-astra", "gpt-6-2-astra", "gpt-6-1-sol"),
+    model_ids=("gpt-6-astra", "gpt-6-2-astra"),
     owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
     provenance=(
         "OpenAI GPT-6 Astra upgrade guide (none/minimal unsupported; low..max); "
