@@ -718,6 +718,9 @@ class _CodexForwarderState:
         terminals after a turn, or ``None`` when none is due.
     :param goal_unknown: Whether the last goal read failed. Until a read or a
         goal notification succeeds, the flag may be set but is never cleared.
+    :param forwarder_started_thread_id: Thread this forwarder started for a web
+        clear-context plan answer, e.g. ``"thread_fresh"``. The terminal's TUI is
+        still attached to the planning thread, so it is relaunched on this one.
     """
 
     model: str | None = None
@@ -811,6 +814,7 @@ class _CodexForwarderState:
     background_terminals_supported: bool = True
     background_terminal_poll: asyncio.Task[None] | None = None
     goal_unknown: bool = False
+    forwarder_started_thread_id: str | None = None
 
     def __post_init__(self) -> None:
         """
@@ -2831,6 +2835,7 @@ async def supervise_forwarder(
     client: CodexAppServerClient | None = None,
     auth: httpx.Auth | None = None,
     ap_transport: httpx.AsyncBaseTransport | None = None,
+    relaunch_terminal: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> None:
     """
     Mirror Codex app-server notifications into an Omnigent session.
@@ -2853,6 +2858,9 @@ async def supervise_forwarder(
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.
+    :param relaunch_terminal: Optional ``(session_id, thread_id)`` callback that
+        reattaches the session's Codex TUI to a thread this forwarder started,
+        awaited once the forwarder has subscribed to it.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -2961,6 +2969,17 @@ async def supervise_forwarder(
                                 elicitation_tracker=target.elicitation_tracker,
                                 forwarder_state=forwarder_state,
                                 ready_signal=thread_active,
+                                on_subscribed=(
+                                    None
+                                    if relaunch_terminal is None
+                                    else functools.partial(
+                                        _relaunch_terminal_on_forwarder_thread,
+                                        relaunch_terminal,
+                                        forwarder_state,
+                                        session_id=target.session_id,
+                                        thread_id=target.thread_id,
+                                    )
+                                ),
                             ),
                             name="codex-native-forwarder-subscribe",
                         )
@@ -3412,6 +3431,38 @@ async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) ->
     return payload
 
 
+async def _relaunch_terminal_on_forwarder_thread(
+    relaunch_terminal: Callable[[str, str], Awaitable[None]],
+    forwarder_state: _CodexForwarderState,
+    *,
+    session_id: str,
+    thread_id: str,
+) -> None:
+    """
+    Reattach the session's TUI when the forwarder, not the TUI, started its thread.
+
+    A TUI ``/clear`` already shows the new thread. A web clear-context answer
+    leaves the TUI on the planning thread, and Codex cannot switch it remotely.
+
+    :param relaunch_terminal: ``(session_id, thread_id)`` relaunch callback.
+    :param forwarder_state: Forwarder state recording the thread it started.
+    :param session_id: Omnigent session now owning the thread, e.g. ``"conv_new"``.
+    :param thread_id: Newly subscribed Codex thread id, e.g. ``"thread_fresh"``.
+    :returns: None. Relaunch failures are logged and do not stop forwarding.
+    """
+    if forwarder_state.forwarder_started_thread_id != thread_id:
+        return
+    try:
+        await relaunch_terminal(session_id, thread_id)
+    except Exception:
+        _logger.warning(
+            "Codex terminal relaunch on thread %s failed for session %s",
+            thread_id,
+            session_id,
+            exc_info=True,
+        )
+
+
 async def _subscribe_until_ready(
     client: CodexAppServerClient,
     ap_client: httpx.AsyncClient,
@@ -3423,6 +3474,7 @@ async def _subscribe_until_ready(
     elicitation_tracker: _CodexElicitationTaskTracker,
     forwarder_state: _CodexForwarderState | None = None,
     ready_signal: asyncio.Event | None = None,
+    on_subscribed: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Subscribe this app-server connection to a Codex thread.
@@ -3467,6 +3519,8 @@ async def _subscribe_until_ready(
         thread parks here instead of polling. ``None`` falls back to the
         fixed-interval retry (used where no live event stream drives the
         signal).
+    :param on_subscribed: Awaited once after a successful subscription and its
+        replay, outside the delivery scope. Not called when subscribing fails.
     :returns: None.
     """
     bridge_state = read_bridge_state(bridge_dir)
@@ -3543,7 +3597,7 @@ async def _subscribe_until_ready(
                         replay_from_turn_id=replay_from_turn_id,
                         replay_history=not history_unavailable,
                     )
-                    return
+                    break
             if timed_out:
                 _logger.warning(
                     "Codex thread/resume for %s did not answer within %.0fs; retrying",
@@ -3569,6 +3623,8 @@ async def _subscribe_until_ready(
                 # its rollout isn't flushed yet (brief race) — a short
                 # poll covers that window.
                 await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
+    if on_subscribed is not None:
+        await on_subscribed()
 
 
 async def _finish_subscription(
@@ -6733,6 +6789,7 @@ async def _start_clear_context_plan_implementation_turn(
     if not isinstance(thread_id, str) or not thread_id:
         _logger.warning("Codex clear-context plan implementation skipped: new thread id missing")
         return
+    forwarder_state.forwarder_started_thread_id = thread_id
     update_thread_id(bridge_dir, thread_id)
     text = f"{_PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX}\n\n{plan_text}"
     await _start_plan_implementation_turn(
