@@ -909,3 +909,14 @@ describe("QuickPick cards", () => {
     expect(layouts()).toEqual([["Files", false]]);
   });
 });
+
+describe("QuickPick rendering", () => {
+  it("renders once for each change, with no heading buttons to line up", () => {
+    const summary = vi.fn(() => "2 results");
+    const view = renderPicker({ summary });
+    const settled = summary.mock.calls.length;
+    // A new prop renders the list once more, and measuring its headings asks for nothing else.
+    view.rerender(<Harness summary={summary} onAccept={vi.fn()} placeholder="Search" />);
+    expect(summary.mock.calls.length - settled).toBe(1);
+  });
+});

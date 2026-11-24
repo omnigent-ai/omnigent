@@ -483,6 +483,9 @@ export function QuickPick<Value>({
   const [headingActionBars, setHeadingActionBars] = useState<
     readonly { key: string; top: number; height: number; width: number }[]
   >([]);
+  // The last measurement written: an unchanged one sets no state, since even a same-value
+  // update renders the list again, which would measure again after every commit.
+  const measuredBars = useRef("[]");
   useLayoutEffect(() => {
     const listbox = listboxRef.current;
     const bars: { key: string; top: number; height: number; width: number }[] = [];
@@ -506,9 +509,10 @@ export function QuickPick<Value>({
         });
       }
     }
-    setHeadingActionBars((current) =>
-      JSON.stringify(current) === JSON.stringify(bars) ? current : bars,
-    );
+    const measured = JSON.stringify(bars);
+    if (measured === measuredBars.current) return;
+    measuredBars.current = measured;
+    setHeadingActionBars(bars);
   });
   const setQueryField = useCallback(
     (node: HTMLInputElement | null) => {
