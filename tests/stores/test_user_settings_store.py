@@ -10,7 +10,9 @@ from sqlalchemy import column, insert, table
 from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import get_or_create_engine
 from omnigent.server.server_config import SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
+from omnigent.stores.host_store import host_session_defaults_key
 from omnigent.stores.user_settings_store import (
+    HOST_SESSION_DEFAULTS_MAX_BYTES,
     SESSION_TITLE_INSTRUCTIONS_PREFERENCE_KEY,
     UserSettingsStore,
     open_user_settings_store,
@@ -26,7 +28,12 @@ def store(db_uri: str) -> UserSettingsStore:
     return UserSettingsStore(db_uri)
 
 
-def _write_raw_value(db_uri: str, user_id: str, value: bytes) -> None:
+def _write_raw_value(
+    db_uri: str,
+    user_id: str,
+    value: bytes,
+    key: str = SESSION_TITLE_INSTRUCTIONS_PREFERENCE_KEY,
+) -> None:
     with get_or_create_engine(db_uri).begin() as connection:
         # Untyped columns skip the value codec while letting each dialect quote ``key``.
         raw_preferences = table(
@@ -40,7 +47,7 @@ def _write_raw_value(db_uri: str, user_id: str, value: bytes) -> None:
             insert(raw_preferences).values(
                 workspace_id=0,
                 user_id=user_id,
-                key=SESSION_TITLE_INSTRUCTIONS_PREFERENCE_KEY,
+                key=key,
                 value=value,
             )
         )
@@ -161,3 +168,62 @@ def test_single_user_resolver_reads_local_user(store: UserSettingsStore) -> None
     )
 
     assert resolve("conv_any") == "Local rule."
+
+
+HOST_ID = "a1ed1ab71de2311e20488a989e61701c"
+OTHER_HOST_ID = "b1b5efd7dfc33b5a6241f1866ffb00e6"
+
+
+def test_host_session_defaults_round_trip_and_clear(store: UserSettingsStore) -> None:
+    assert store.get_host_session_defaults(HOST_ID, user_id=ALICE) == {}
+
+    defaults = {"agent_id": "187b7cb7ac30abf4debfaa578d052ec6", "workspace": "/work/app"}
+    assert store.save_host_session_defaults(HOST_ID, defaults, user_id=ALICE) == defaults
+    assert store.get_host_session_defaults(HOST_ID, user_id=ALICE) == defaults
+
+    store.save_host_session_defaults(HOST_ID, {"workspace": "/work/other"}, user_id=ALICE)
+    assert store.get_host_session_defaults(HOST_ID, user_id=ALICE) == {"workspace": "/work/other"}
+
+    assert store.save_host_session_defaults(HOST_ID, {}, user_id=ALICE) == {}
+    assert store.get_host_session_defaults(HOST_ID, user_id=ALICE) == {}
+
+
+def test_host_session_defaults_are_isolated_per_host_and_user(store: UserSettingsStore) -> None:
+    store.save_host_session_defaults(HOST_ID, {"workspace": "/alice"}, user_id=ALICE)
+    store.save_host_session_defaults(HOST_ID, {"workspace": "/local"}, user_id=None)
+
+    assert store.get_host_session_defaults(HOST_ID, user_id=ALICE) == {"workspace": "/alice"}
+    assert store.get_host_session_defaults(HOST_ID, user_id=BOB) == {}
+    assert store.get_host_session_defaults(HOST_ID, user_id=None) == {"workspace": "/local"}
+    assert store.get_host_session_defaults(OTHER_HOST_ID, user_id=ALICE) == {}
+    # A dashed spelling of the same host id reads the same row.
+    dashed = "a1ed1ab7-1de2-311e-2048-8a989e61701c"
+    assert store.get_host_session_defaults(dashed, user_id=ALICE) == {"workspace": "/alice"}
+
+
+def test_host_session_defaults_reject_oversized_value(store: UserSettingsStore) -> None:
+    store.save_host_session_defaults(HOST_ID, {"workspace": "/keep"}, user_id=ALICE)
+
+    with pytest.raises(ValueError, match=f"exceed {HOST_SESSION_DEFAULTS_MAX_BYTES} bytes"):
+        store.save_host_session_defaults(
+            HOST_ID, {"workspace": "/" + "x" * HOST_SESSION_DEFAULTS_MAX_BYTES}, user_id=ALICE
+        )
+    assert store.get_host_session_defaults(HOST_ID, user_id=ALICE) == {"workspace": "/keep"}
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param(b"\x00\x07unknown codec", {}, id="unknown-codec"),
+        pytest.param(b"not json", {}, id="not-json"),
+        pytest.param(b'["/work"]', {}, id="not-an-object"),
+        pytest.param(b'{"workspace": "/work", "agent_id": 7}', {"workspace": "/work"}, id="mixed"),
+        pytest.param(b"x" * (HOST_SESSION_DEFAULTS_MAX_BYTES + 1), {}, id="over-limit"),
+    ],
+)
+def test_unreadable_host_session_defaults_are_ignored(
+    store: UserSettingsStore, db_uri: str, stored: bytes, expected: dict[str, str]
+) -> None:
+    _write_raw_value(db_uri, ALICE, stored, key=host_session_defaults_key(HOST_ID))
+
+    assert store.get_host_session_defaults(HOST_ID, user_id=ALICE) == expected

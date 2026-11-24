@@ -20,6 +20,7 @@ from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._session_create_validation import (
+    host_session_defaults_for_create,
     resolve_project_session_create,
 )
 from omnigent.server.routes.sessions import routes_core
@@ -35,6 +36,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.user_settings_store import UserSettingsStore
 from tests._helpers.polling import poll_until_async
 from tests.server.helpers import build_agent_bundle
 
@@ -907,3 +909,182 @@ async def test_legacy_string_repository_is_ignored_without_failing_the_create(db
         )
         assert resolved.body.workspaces is None
         assert resolved.body.sandbox_provider == "modal"
+
+
+HOST_ID = "a1ed1ab71de2311e20488a989e61701c"
+HOST_DEFAULTS = {
+    "agent_id": CUSTOM_AGENT_ID,
+    "workspace": "/work/host",
+    "model": "opus",
+    "effort": "high",
+}
+
+
+async def test_host_defaults_fill_only_fields_no_higher_source_names(db_uri: str) -> None:
+    """Precedence per field: request, then project config, then the host's defaults."""
+    project_store = SqlAlchemyProjectStore(db_uri)
+    empty_project = project_store.create(
+        "687b7cb7ac30abf4debfaa578d052ec6", "no-defaults", ALICE, {}
+    )
+    agent_project = project_store.create(
+        "787b7cb7ac30abf4debfaa578d052ec6",
+        "agent-default",
+        ALICE,
+        # A key the server does not apply (model) still outranks the host.
+        {"agent_id": OTHER_AGENT_ID, "model": "sonnet"},
+    )
+
+    filled = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(project_id=empty_project.id, host_id=HOST_ID),
+        user_id=ALICE,
+        project_store=project_store,
+        host_defaults=HOST_DEFAULTS,
+    )
+    assert filled.body.agent_id == CUSTOM_AGENT_ID
+    assert filled.body.workspace == "/work/host"
+    assert filled.host_default_fields == {"agent_id", "workspace"}
+    # Model and effort are composer hints; an agent's own model outranks them.
+    assert filled.body.model_override is None
+    assert filled.body.reasoning_effort is None
+
+    project_wins = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(project_id=agent_project.id, host_id=HOST_ID),
+        user_id=ALICE,
+        project_store=project_store,
+        host_defaults=HOST_DEFAULTS,
+    )
+    assert project_wins.body.agent_id == OTHER_AGENT_ID
+    assert project_wins.body.workspace == "/work/host"
+    assert project_wins.host_default_fields == {"workspace"}
+
+    request_wins = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest.model_validate(
+            {"project_id": agent_project.id, "host_id": HOST_ID, "workspace": None}
+        ),
+        user_id=ALICE,
+        project_store=project_store,
+        host_defaults=HOST_DEFAULTS,
+    )
+    assert request_wins.body.workspace is None
+    assert request_wins.host_default_fields == frozenset()
+
+
+async def test_host_defaults_fill_a_create_without_project() -> None:
+    resolved = await resolve_project_session_create(
+        body=SessionCreateRequest(agent_id=OTHER_AGENT_ID, host_id=HOST_ID),
+        user_id=ALICE,
+        project_store=None,
+        host_defaults=HOST_DEFAULTS,
+    )
+    assert resolved.project_id is None
+    assert resolved.body.agent_id == OTHER_AGENT_ID
+    assert resolved.body.workspace == "/work/host"
+    assert resolved.host_default_fields == {"workspace"}
+
+    unchanged = SessionCreateRequest(agent_id=OTHER_AGENT_ID, host_id=HOST_ID)
+    without_defaults = await resolve_project_session_create(
+        body=unchanged, user_id=ALICE, project_store=None, host_defaults={}
+    )
+    assert without_defaults.body is unchanged
+
+
+async def test_a_host_default_cannot_bind_the_proactive_agent(db_uri: str) -> None:
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
+
+    project = SqlAlchemyProjectStore(db_uri).create(
+        "887b7cb7ac30abf4debfaa578d052ec6", "proactive-host", ALICE, {}
+    )
+    with pytest.raises(OmnigentError, match="built-in schedule"):
+        await resolve_project_session_create(
+            body=ProjectSessionCreateRequest(project_id=project.id, host_id=HOST_ID),
+            user_id=ALICE,
+            project_store=SqlAlchemyProjectStore(db_uri),
+            host_defaults={"agent_id": PROACTIVE_AGENT_ID},
+        )
+
+
+@pytest.mark.parametrize(
+    ("placement", "applies"),
+    [
+        pytest.param({"host_id": HOST_ID}, True, id="top-level-host"),
+        pytest.param({}, False, id="no-host"),
+        pytest.param({"host_id": HOST_ID, "host_type": "managed"}, False, id="managed"),
+        pytest.param({"host_id": HOST_ID, "parent_session_id": "conv_parent"}, False, id="child"),
+        pytest.param({"host_id": HOST_ID, "sibling_source_id": "conv_source"}, False, id="nested"),
+    ],
+)
+async def test_host_defaults_load_only_for_new_top_level_host_sessions(
+    db_uri: str, placement: dict[str, str], applies: bool
+) -> None:
+    UserSettingsStore(db_uri).save_host_session_defaults(
+        HOST_ID, {"workspace": "/work/host"}, user_id=ALICE
+    )
+    body = SessionCreateRequest.model_construct(agent_id=OTHER_AGENT_ID, **placement)
+
+    loaded = await host_session_defaults_for_create(
+        body, user_id=ALICE, conversation_store=SqlAlchemyConversationStore(db_uri)
+    )
+
+    assert loaded == ({"workspace": "/work/host"} if applies else {})
+
+
+@pytest.mark.parametrize(
+    ("request_fields", "saved", "status", "hint"),
+    [
+        pytest.param(
+            {"agent_id": CUSTOM_AGENT_ID},
+            {"workspace": "/work/host"},
+            400,
+            True,
+            id="host-workspace",
+        ),
+        pytest.param(
+            {"agent_id": CUSTOM_AGENT_ID, "workspace": "/work/explicit"},
+            {"workspace": "/work/host"},
+            400,
+            False,
+            id="explicit-workspace",
+        ),
+        pytest.param(
+            {},
+            {"agent_id": "987b7cb7ac30abf4debfaa578d052ec6"},
+            404,
+            True,
+            id="deleted-host-agent",
+        ),
+    ],
+)
+async def test_unavailable_host_default_fails_with_an_actionable_error(
+    project_create_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request_fields: dict[str, str],
+    saved: dict[str, str],
+    status: int,
+    hint: bool,
+) -> None:
+    """A stale default is reported, never swapped for another configuration."""
+    from omnigent.server.routes._sessions import orchestration
+
+    checked: list[object] = []
+
+    async def missing_workspace(**kwargs: object) -> str:
+        checked.append(kwargs["workspace"])
+        raise OmnigentError("workspace does not exist on host", code="invalid_input")
+
+    monkeypatch.setattr(orchestration, "_validate_session_workspace", missing_workspace)
+    UserSettingsStore(db_uri).save_host_session_defaults(HOST_ID, saved, user_id=ALICE)
+    project_id = await _project(project_create_client, {})
+
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_id": HOST_ID, **request_fields},
+        headers=_headers(),
+    )
+
+    assert response.status_code == status, response.text
+    assert ("this host's session defaults" in response.text) is hint
+    if status == 400:
+        assert checked == [request_fields.get("workspace", "/work/host")]
+    listed = await project_create_client.get("/v1/sessions", headers=_headers())
+    assert listed.json()["data"] == []

@@ -140,6 +140,7 @@ from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.extension_assets import create_extension_assets_router
 from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
+from omnigent.server.routes.host_session_defaults import create_host_session_defaults_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.inbox_items import create_inbox_items_router
 from omnigent.server.routes.memory import create_memory_router
@@ -423,6 +424,9 @@ class ServerInfoResponse(BaseModel):
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
+    # GET/PUT /v1/hosts/{host_id}/session-defaults; absent on older servers,
+    # which clients treat as unsupported.
+    host_session_defaults: bool = False
     admin_view: bool = False
     # Session comments accept and preserve immutable PR coordinates.
     comment_anchor_metadata: bool = True
@@ -4218,6 +4222,8 @@ def create_app(
                 "workflow_sharing": workflows_available
                 and stores_workflow_grants(permission_store),
                 "session_title_instructions": user_settings_store is not None,
+                "host_session_defaults": host_store is not None
+                and user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
@@ -5758,6 +5764,19 @@ def create_app(
             prefix="/v1",
             tags=["hosts"],
         )
+        if user_settings_store is not None:
+            app.include_router(
+                create_host_session_defaults_router(
+                    host_store,
+                    user_settings_store,
+                    agent_store,
+                    conversation_store,
+                    permission_store=permission_store,
+                    auth_provider=auth_provider,
+                ),
+                prefix="/v1",
+                tags=["hosts"],
+            )
         app.include_router(
             create_plugins_router(host_registry, host_store, auth_provider=auth_provider),
             prefix="/v1",

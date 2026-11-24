@@ -6409,6 +6409,65 @@ class SessionTitleInstructionsResponse(BaseModel):
     max_chars: int
 
 
+class HostSessionDefaults(BaseModel):
+    """
+    The caller's defaults for new sessions on one of their hosts.
+
+    Every field is optional; an unset field leaves that choice to the other
+    sources. Explicit request values, then project settings, then the agent's
+    own declared settings win over these.
+
+    :param agent_id: Agent to bind when neither the request nor its project
+        names one.
+    :param workspace: Absolute directory on the host, used when neither the
+        request nor its project names one, e.g. ``"/home/me/app"``.
+    :param model: Model for :attr:`agent_id`, e.g. ``"opus"``. A client hint
+        the new-session composer pre-fills; the server does not apply it.
+    :param effort: Reasoning effort for :attr:`agent_id`, e.g. ``"high"``.
+        A client hint like :attr:`model`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str | None = Field(default=None, min_length=1, max_length=128)
+    workspace: str | None = Field(default=None, min_length=1, max_length=1024)
+    model: str | None = None
+    effort: str | None = None
+
+    @field_validator("workspace")
+    @classmethod
+    def _require_absolute_workspace(cls, value: str | None) -> str | None:
+        """Accept only the absolute paths a host-bound session accepts."""
+        from omnigent.server.routes._workspace_validation import _is_windows_absolute_path
+
+        if value is not None and not (value.startswith("/") or _is_windows_absolute_path(value)):
+            raise ValueError("workspace must be an absolute path")
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, value: str | None) -> str | None:
+        """Apply the session ``model_override`` charset and length rules."""
+        from omnigent.models.model_override import validate_model_override
+
+        return None if value is None else validate_model_override(value)
+
+    @field_validator("effort")
+    @classmethod
+    def _validate_effort(cls, value: str | None) -> str | None:
+        """Apply the session ``reasoning_effort`` vocabulary."""
+        from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
+
+        return validate_effort(value, "host session defaults", EFFORT_VALUES)
+
+    @model_validator(mode="after")
+    def _pair_model_settings_with_agent(self) -> Self:
+        """Model and effort vocabularies are per harness, so they need an agent."""
+        if (self.model is not None or self.effort is not None) and self.agent_id is None:
+            raise ValueError("model and effort defaults require agent_id")
+        return self
+
+
 # ── Projects ──────────────────────────────────────────────────────
 
 

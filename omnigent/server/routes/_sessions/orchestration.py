@@ -12993,6 +12993,8 @@ async def _create_session_from_existing_agent(
         fails authorization.
     """
     from omnigent.server.routes._session_create_validation import (
+        host_default_error,
+        host_session_defaults_for_create,
         resolve_project_session_create,
         server_sandbox_providers,
     )
@@ -13014,9 +13016,18 @@ async def _create_session_from_existing_agent(
         user_id=user_id,
         project_store=project_store,
         launchable_sandbox_providers=server_sandbox_providers(request),
+        # A worker keeps the placement its source asked for.
+        host_defaults=(
+            None
+            if created_by_session_id is not None
+            else await host_session_defaults_for_create(
+                body, user_id=user_id, conversation_store=conversation_store
+            )
+        ),
     )
     body = project_resolution.body
     project_id = project_resolution.project_id
+    host_default_fields = project_resolution.host_default_fields
     if (
         project_id is None
         and created_by_project_id is not None
@@ -13044,13 +13055,18 @@ async def _create_session_from_existing_agent(
 
     apply_browser_agent_tools_creation_labels(body.labels, request.headers)
 
-    agent = await validate_session_agent(
-        user_id=user_id,
-        agent_id=body.agent_id,
-        agent_store=agent_store,
-        permission_store=permission_store,
-        conversation_store=conversation_store,
-    )
+    try:
+        agent = await validate_session_agent(
+            user_id=user_id,
+            agent_id=body.agent_id,
+            agent_store=agent_store,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
+        )
+    except OmnigentError as exc:
+        if "agent_id" in host_default_fields and exc.code == ErrorCode.NOT_FOUND:
+            raise host_default_error(exc, "agent") from exc
+        raise
 
     # Top-level Smart Routing: "auto" on a native wrapper agent means the client
     # picked Smart Routing with no bundle agent, and its ``agent_id`` is only a
@@ -13406,14 +13422,19 @@ async def _create_session_from_existing_agent(
     # Validate the host workspace before creating a session or worktree.
     canonical_workspace: str | None = body.workspace
     if body.host_id is not None:
-        canonical_workspace = await _validate_session_workspace(
-            user_id=user_id,
-            host_id=body.host_id,
-            workspace=body.workspace,
-            agent=agent,
-            agent_cache=agent_cache,
-            request=request,
-        )
+        try:
+            canonical_workspace = await _validate_session_workspace(
+                user_id=user_id,
+                host_id=body.host_id,
+                workspace=body.workspace,
+                agent=agent,
+                agent_cache=agent_cache,
+                request=request,
+            )
+        except OmnigentError as exc:
+            if "workspace" in host_default_fields and exc.code == ErrorCode.INVALID_INPUT:
+                raise host_default_error(exc, "workspace") from exc
+            raise
 
     from omnigent.server.routes._session_harness_readiness import (
         require_codex_plan_launch_support,
