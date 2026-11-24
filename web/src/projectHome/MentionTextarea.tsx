@@ -4,8 +4,10 @@ import {
   useRef,
   useState,
   type ComponentProps,
+  type CSSProperties,
   type KeyboardEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import { UserRoundIcon } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
@@ -114,41 +116,50 @@ export function MentionTextarea({
         }}
         onKeyDown={handleKeyDown}
       />
-      {/* The composer sits at the bottom of the panel, so the list opens upward. */}
-      {open && (
-        <ul
-          id={listId}
-          role="listbox"
-          aria-label="Mention a persona"
-          data-testid="persona-mention-suggestions"
-          className="absolute bottom-full left-2 z-50 mb-1 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
-        >
-          {suggestions.map((identity, index) => (
-            <li
-              key={identity.id}
-              role="option"
-              aria-selected={index === active}
-              data-testid="persona-mention-option"
-              className={cn(
-                "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm",
-                index === active && "bg-accent text-accent-foreground",
-              )}
-              // Keep focus in the textarea so the caret position survives the click.
-              onMouseDown={(event) => {
-                event.preventDefault();
-                choose(identity.name);
-              }}
-              onMouseEnter={() => setActive(index)}
-            >
-              <UserRoundIcon className="size-3.5 text-muted-foreground" />
-              <span className="truncate">{identity.name}</span>
-              {identity.builtin && (
-                <span className="ml-auto text-xs text-muted-foreground">built in</span>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
+      {/* Portaled and fixed above the box: the composer's scrolling footer would clip it. */}
+      {open &&
+        createPortal(
+          <ul
+            id={listId}
+            role="listbox"
+            aria-label="Mention a persona"
+            data-testid="persona-mention-suggestions"
+            style={listPosition(containerRef.current)}
+            className="fixed z-50 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
+          >
+            {suggestions.map((identity, index) => (
+              <li
+                key={identity.id}
+                role="option"
+                aria-selected={index === active}
+                data-testid="persona-mention-option"
+                className={cn(
+                  "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm",
+                  index === active && "bg-accent text-accent-foreground",
+                )}
+                // Keep focus in the textarea so the caret position survives the click.
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  choose(identity.name);
+                }}
+                onMouseEnter={() => setActive(index)}
+              >
+                <UserRoundIcon className="size-3.5 text-muted-foreground" />
+                <span className="truncate">{identity.name}</span>
+                {identity.builtin && (
+                  <span className="ml-auto text-xs text-muted-foreground">built in</span>
+                )}
+              </li>
+            ))}
+          </ul>,
+          document.body,
+        )}
     </div>
   );
+}
+
+function listPosition(anchor: HTMLElement | null): CSSProperties {
+  const rect = anchor?.getBoundingClientRect();
+  if (!rect) return {};
+  return { left: rect.left + 8, bottom: window.innerHeight - rect.top + 4 };
 }
