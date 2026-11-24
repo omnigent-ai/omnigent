@@ -542,6 +542,9 @@ describe("CodeViewer markdown preview copy", () => {
     ["an escaped character", "Price is 5\\*3 today", "*3", "today", "\\*3 today"],
     ["text after an entity", "AT&amp;T rocks", "T rocks", "rocks", "T rocks"],
     ["an entity on its own", "a &amp; b", "&", "&", "&amp;"],
+    ["an entity filling its text node", "&amp;", "&", "&", "&amp;"],
+    ["a doubly encoded entity", "&amp;amp;", "&amp;", "&amp;", "&amp;amp;"],
+    ["escaped backslashes", "\\\\\\\\", "\\\\", "\\\\", "\\\\\\\\"],
     [
       "a selection starting at an escape",
       "\\*literal\\* here",
@@ -649,6 +652,22 @@ describe("CodeViewer markdown preview copy", () => {
     range.setEnd(previewText("Next").node, 4);
     window.getSelection()?.addRange(range);
     expect(fireCopyEvent(afterFormula)).toHaveBeenCalledWith("text/plain", "b\n\nNext");
+  });
+
+  it("keeps the browser's copy for a selection between a formula's glyphs", () => {
+    renderViewer("Energy is $$E = mc^2$$ here.", true, "doc.md", { viewMode: "preview" });
+    const formula = document.querySelector(".markdown-preview .katex-html");
+    if (!formula) throw new Error("no rendered formula");
+    const walker = document.createTreeWalker(formula, NodeFilter.SHOW_TEXT);
+    const glyphs: Text[] = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if ((node as Text).data.trim()) glyphs.push(node as Text);
+    }
+    const range = document.createRange();
+    range.setStart(glyphs[0], 0);
+    range.setEnd(glyphs[glyphs.length - 1], 1);
+    window.getSelection()?.addRange(range);
+    expectBrowserCopy(glyphs[0]);
   });
 
   it("keeps the browser's copy for a selection reaching outside the preview", () => {

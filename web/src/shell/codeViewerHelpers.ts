@@ -973,7 +973,7 @@ function textSource(
       start,
       end: nextStampedStart(child, owner.end),
     };
-    const characters = alignText(child.data, source, stretch);
+    const characters = alignText(child.data, source, stretch, parent.tagName === "CODE");
     const next = found && characters.find(isKnown);
     if (found && next) {
       return {
@@ -992,56 +992,65 @@ const CHARACTER_REFERENCE = /&(?:#\d{1,7}|#[xX][\dA-Fa-f]{1,6}|[A-Za-z][A-Za-z\d
 // ASCII punctuation, which a backslash escapes.
 const ESCAPABLE = /[!-/:-@[-`{-~]/;
 
+/** An escape (`\*`) or character reference (`&amp;`) at *at* that renders as *text* at *index*. */
+function encodedCharacterAt(
+  text: string,
+  index: number,
+  source: string,
+  at: number,
+): { span: SourceSpan; units: number } | null {
+  const char = text[index];
+  if (source[at] === "\\" && source[at + 1] === char && ESCAPABLE.test(char)) {
+    return { span: { start: at, end: at + 2 }, units: 1 };
+  }
+  CHARACTER_REFERENCE.lastIndex = at;
+  const reference = source[at] === "&" ? CHARACTER_REFERENCE.exec(source) : null;
+  if (!reference) return null;
+  const decoded = new DOMParser().parseFromString(reference[0], "text/html").body.textContent;
+  if (!decoded || !text.startsWith(decoded, index)) return null;
+  return { span: { start: at, end: at + reference[0].length }, units: decoded.length };
+}
+
 /**
  * The first part of *source* within [*from*, *to*) that renders as *text* at
- * *index*: an escape (`\*`), a character reference (`&amp;`) or the character
- * itself. A reference can render as two code units, e.g. an emoji's pair.
+ * *index*: an escape, a character reference or the character itself. A
+ * reference can render as two code units, e.g. an emoji's pair. *literal* text
+ * (code) renders its source as written, so only the character itself matches.
  */
 function nextCharacterSource(
   text: string,
   index: number,
   source: string,
-  from: number,
-  to: number,
+  { from, to, literal }: { from: number; to: number; literal: boolean },
 ): { span: SourceSpan; units: number } | null {
-  const char = text[index];
   for (let at = from; at < to; at++) {
-    if (source[at] === "\\" && source[at + 1] === char && ESCAPABLE.test(char)) {
-      return { span: { start: at, end: at + 2 }, units: 1 };
-    }
-    CHARACTER_REFERENCE.lastIndex = at;
-    const reference = source[at] === "&" ? CHARACTER_REFERENCE.exec(source) : null;
-    if (reference) {
-      const decoded = new DOMParser().parseFromString(reference[0], "text/html").body.textContent;
-      if (decoded && text.startsWith(decoded, index)) {
-        return { span: { start: at, end: at + reference[0].length }, units: decoded.length };
-      }
-    }
-    if (source[at] === char) return { span: { start: at, end: at + 1 }, units: 1 };
+    const encoded = literal ? null : encodedCharacterAt(text, index, source, at);
+    if (encoded) return encoded;
+    if (source[at] === text[index]) return { span: { start: at, end: at + 1 }, units: 1 };
   }
   return null;
 }
 
 /**
  * The source behind each character of *text*, found in *stretch* of *source*.
- * Verbatim text is found whole; otherwise characters match in order, skipping
- * syntax such as quote prefixes and trimmed indentation.
+ * Characters match in order, keeping escapes and references whole and skipping
+ * syntax such as quote prefixes and trimmed indentation. *literal* text (code)
+ * matches its characters as written.
  */
-function alignText(text: string, source: string, stretch: SourceSpan): CharacterSources {
-  const local = source.slice(stretch.start, stretch.end);
-  const verbatim = local.indexOf(text);
-  // A match right after a backslash would drop that escape of its first character.
-  if (verbatim !== -1 && local[verbatim - 1] !== "\\") {
-    const first = stretch.start + verbatim;
-    return Array.from({ length: text.length }, (_, i) => ({
-      start: first + i,
-      end: first + i + 1,
-    }));
-  }
+function alignText(
+  text: string,
+  source: string,
+  stretch: SourceSpan,
+  literal: boolean,
+): CharacterSources {
   const characters: CharacterSources = [];
   let at = stretch.start;
   while (characters.length < text.length) {
-    const next = nextCharacterSource(text, characters.length, source, at, stretch.end);
+    const next = nextCharacterSource(text, characters.length, source, {
+      from: at,
+      to: stretch.end,
+      literal,
+    });
     if (!next) {
       characters.push(null);
       continue;
@@ -1075,16 +1084,14 @@ function edgeOffset(
 
 /**
  * Where *point* falls in the Markdown *source*, as the selection's *side* edge.
- * A point the source can't place, such as one inside a rendered formula, takes
- * its stamped element's *side* edge. Null when no stamped element holds the point.
+ * Null when its text sits in an unstamped element, such as a rendered formula's
+ * markup, whose source is unknown.
  */
 function sourceOffset(point: TextPoint, side: SelectionSide, source: string): number | null {
   const parent = point.node.parentElement;
-  const owner = parent?.closest("[data-md-start]");
-  const ownerSpan = owner ? stampedSpan(owner) : null;
-  if (!parent || !ownerSpan) return null;
-  if (owner !== parent) return side === "start" ? ownerSpan.start : ownerSpan.end;
-  const { stretch, characters } = textSource(point.node, parent, ownerSpan, source);
+  const owner = parent ? stampedSpan(parent) : null;
+  if (!parent || !owner) return null;
+  const { stretch, characters } = textSource(point.node, parent, owner, source);
   return edgeOffset(characters, stretch, point.offset, side);
 }
 

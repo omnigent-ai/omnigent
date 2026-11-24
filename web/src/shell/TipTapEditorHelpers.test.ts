@@ -597,6 +597,9 @@ describe("selectionMarkdown on copy", () => {
     ed.view.dispatch(
       ed.state.tr.setSelection(CellSelection.create(ed.state.doc, cell("Name"), cell("alpha"))),
     );
-    expect(copyCurrentSelection(ed).get("text/plain")).toBe("Name\n\nalpha");
+    const flavors = copyCurrentSelection(ed);
+    expect(flavors.get("text/plain")).toBe("Name\n\nalpha");
+    // ProseMirror still writes the selected cells' HTML.
+    expect(flavors.get("text/html")).toMatch(/<table.*<p>Name<\/p>.*<p>alpha<\/p>/);
   });
 });
