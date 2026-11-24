@@ -200,7 +200,7 @@ import {
   onResponseEnd,
   onResponseStart,
 } from "./interactionTelemetry";
-import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
+import { getSessionHost, isHostKeyless, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
@@ -7034,14 +7034,21 @@ export async function startStreamPump(
   // A host can be learned while an open is pending or backing off; the bind
   // snapshot may predate that gap even without a successful open.
   let hostReaddressed = false;
-  // The host the latest open was addressed to.
+  // The host the latest open was addressed to, and whether it went keyless.
   let openedHost = getSessionHost(id);
+  let openedKeyless = openedHost !== null && isHostKeyless(openedHost);
   const unsubscribeHost = isDatabricksWorkspace()
     ? subscribeSessionHostChanges(() => {
         const host = getSessionHost(id);
-        if (host !== null && host !== openedHost) {
+        if (host === null) return;
+        if (host !== openedHost) {
           hostReaddressed = true;
           liveAttempt?.abort();
+        } else if (isHostKeyless(host) !== openedKeyless) {
+          // Keyless requests reach another replica, whose parked prompts the
+          // keyed bind snapshot lacks. The open re-addresses itself.
+          openedKeyless = !openedKeyless;
+          hostReaddressed = true;
         }
       })
     : undefined;
@@ -7076,6 +7083,7 @@ export async function startStreamPump(
       // an open that has hung past the stale window, not just a dead body.
       streamAttemptActivity.set(attempt, Date.now());
       openedHost = getSessionHost(id);
+      openedKeyless = openedHost !== null && isHostKeyless(openedHost);
       liveAttempt = attempt;
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
       // Whether this attempt opened, so its close is signaled exactly once.

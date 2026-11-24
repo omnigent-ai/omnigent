@@ -82,7 +82,12 @@ import {
 } from "@/lib/sessionDrafts";
 import { getCurrentAuthorId, getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
-import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import {
+  clearHostKeyless,
+  getSessionHost,
+  setSessionHost,
+  setSessionParent,
+} from "@/lib/sessionHost";
 import {
   setOmnigentHostConfig,
   type OmnigentAnalyticsEvent,
@@ -18839,8 +18844,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     /**
      * `routeStreamOpens` plus per-open routing headers and abort wiring (a real
      * fetch fails on abort). `snapshotExtras` adds host/parent fields to a GET
-     * snapshot; `pendingFirstOpenFor` parks that session's first open pre-headers,
-     * and `failFirstOpenFor` answers it with a 503.
+     * snapshot, and `keylessSnapshotExtras` adds fields only an unkeyed one reads;
+     * `pendingFirstOpenFor` parks that session's first open pre-headers,
+     * `failFirstOpenFor` answers it with a 503, and `refuseKeyedOpensFor` refuses
+     * its host-keyed opens as wrong_replica naming the key they sent.
      */
     // A hostless open carries the client's own random key.
     const CLIENT_KEY_RE = /^[0-9a-f]{32}$/;
@@ -18852,8 +18859,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     function routeKeyedStreamOpens(
       opts: {
         snapshotExtras?: Map<string, Record<string, unknown>>;
+        keylessSnapshotExtras?: Map<string, Record<string, unknown>>;
         pendingFirstOpenFor?: string;
         failFirstOpenFor?: string;
+        refuseKeyedOpensFor?: string;
       } = {},
     ): KeyedStreamRoute {
       const sinks: StreamSink[] = [];
@@ -18868,7 +18877,16 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         if (streamMatch) {
           const open: StreamOpen = { headers: new Headers(init?.headers), aborted: false };
           opens.push(open);
-          log.push(`open:${routeLabel(open.headers.get(SLICE_KEY))}`);
+          const key = open.headers.get(SLICE_KEY);
+          log.push(`open:${routeLabel(key)}`);
+          if (
+            opts.refuseKeyedOpensFor === streamMatch[1] &&
+            key !== null &&
+            !CLIENT_KEY_RE.test(key)
+          ) {
+            const error = { code: "wrong_replica", slice_key: key };
+            return Response.json({ error }, { status: 400 });
+          }
           if (opts.failFirstOpenFor === streamMatch[1] && !firstOpenFailed) {
             firstOpenFailed = true;
             return mockResponse({}, { ok: false, status: 503 });
@@ -18897,7 +18915,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
           const sessionId = snapshotMatch[1]!;
           log.push(`snapshot:${sessionId}`);
           const extras = opts.snapshotExtras?.get(sessionId);
-          if (extras !== undefined) {
+          const keylessExtras = new Headers(init?.headers).has(SLICE_KEY)
+            ? undefined
+            : opts.keylessSnapshotExtras?.get(sessionId);
+          if (extras !== undefined || keylessExtras !== undefined) {
             return mockResponse({
               id: sessionId,
               agent_id: "agent_xyz",
@@ -18908,6 +18929,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
               pending_elicitations: [],
               pending_inputs: [],
               ...extras,
+              ...keylessExtras,
             });
           }
         }
@@ -19120,6 +19142,53 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
       await teardown(controller, loop);
       setSessionHost(id, null);
+    });
+
+    it("shows a prompt parked on the replica its keyless re-address reaches", async () => {
+      workspaceMode();
+      const id = "conv_rekey_keyless";
+      const before = userMessage("keyless_pre", "before the prompt");
+      seedSession(id, [before]);
+      setSessionHost(id, "host_b");
+      const prompt = {
+        type: "response.elicitation_request",
+        elicitation_id: "elicit_keyless_replica",
+        params: { mode: "form", message: "Approve the parked command?", requestedSchema: null },
+      };
+      // host_b's tunnel dialed in keyless: only the default replica holds its prompt.
+      const route = routeKeyedStreamOpens({
+        snapshotExtras: new Map([[id, { host_id: "host_b" }]]),
+        keylessSnapshotExtras: new Map([[id, { pending_elicitations: [prompt] }]]),
+        refuseKeyedOpensFor: id,
+      });
+      const controller = new AbortController();
+      // Bound from the keyed replica's snapshot, which listed no prompt.
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync(50);
+
+      // The refusal names the key already sent, so the open retries keyless.
+      expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
+        "open:host_b",
+        "open:none",
+      ]);
+      expect(route.log.indexOf(`snapshot:${id}`)).toBeGreaterThan(route.log.indexOf("open:none"));
+      const card = useChatStore
+        .getState()
+        .blocks.find(
+          (b): b is ElicitationBlock =>
+            b.type === "elicitation" && b.elicitationId === "elicit_keyless_replica",
+        );
+      expect(card?.status).toBe("pending");
+
+      await teardown(controller, loop);
+      setSessionHost(id, null);
+      clearHostKeyless("host_b");
     });
 
     it("rebinds a hostless child's stream when its parent's host is learned", async () => {
