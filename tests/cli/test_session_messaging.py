@@ -141,6 +141,7 @@ def router(monkeypatch: pytest.MonkeyPatch) -> Iterator[respx.MockRouter]:
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr("omnigent.cli._resolve_attach_server", lambda server, configured: _BASE)
     monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None: None)
+    monkeypatch.setattr("omnigent.session_cli._renew_stored_login", lambda server_url: None)
     # No local-server pidfile, so the printed URL has no --base-path prefix.
     monkeypatch.setattr("omnigent.host.local_server._read_local_server_pid_file", lambda: None)
     monkeypatch.setattr("omnigent.session_cli._WAIT_FIRST_INTERVAL_S", 0.001)
@@ -341,6 +342,32 @@ def test_wait_never_takes_another_senders_exchange_for_its_own(
     assert json.loads(result.stdout)["messages"] == [_shown(done)]
 
 
+def test_wait_refuses_to_guess_between_identical_held_messages(router: respx.MockRouter) -> None:
+    """Another sender's message with the same text can't be told apart from a held one."""
+    held = {"pending_inputs": [{"pending_id": "pending_1"}]}
+    _FakeSession(
+        ack=(202, {"queued": True, "pending_id": "pending_1"}),
+        stores_sent_message=False,
+        states=[
+            (
+                {"status": "idle", **held},
+                [
+                    _message("msg_5", "user", "Fix it"),
+                    _message("msg_6", "assistant", "Their reply"),
+                ],
+            ),
+            ({"status": "running"}, [_message("msg_7", "user", "Fix it")]),
+            ({"status": "idle"}, [_message("msg_8", "assistant", "Done")]),
+        ],
+    ).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
+
+    assert result.exit_code == 1
+    assert "more than one message with the text sent" in result.stderr
+    assert result.stdout == ""
+
+
 def test_wait_reports_a_held_message_the_session_never_delivered(
     router: respx.MockRouter,
 ) -> None:
@@ -361,9 +388,14 @@ def test_wait_reports_a_held_message_the_session_never_delivered(
     assert "couldn't deliver the message" in result.stderr
 
 
-def test_wait_ends_a_tool_only_turn_that_never_read_as_running(router: respx.MockRouter) -> None:
+@pytest.mark.parametrize("messages_before", [0, 25], ids=["first-page", "past-a-full-page"])
+def test_wait_ends_a_tool_only_turn_that_never_read_as_running(
+    router: respx.MockRouter, messages_before: int
+) -> None:
     """A turn that only calls tools can start and end between two polls."""
-    _FakeSession(states=[({"status": "idle"}, [_tool_call("call_1")])]).install(router)
+    # Other people's messages can fill whole pages before the tool call.
+    others = [_message(f"msg_o{n}", "user", f"Other {n}") for n in range(messages_before)]
+    _FakeSession(states=[({"status": "idle"}, [*others, _tool_call("call_1")])]).install(router)
 
     result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
 
@@ -557,6 +589,49 @@ def test_send_rejects_bad_arguments_before_any_request(
     assert result.exit_code == 2
     assert error in result.stderr
     assert session.calls == []
+
+
+def test_session_client_renews_a_stored_login_before_it_lapses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long wait outlives the stored login's access token through its refresh grant."""
+    from omnigent.session_cli import open_session_client
+
+    login = {"token": "old-token", "lapsing": False}
+    refreshes: list[str] = []
+
+    def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | None:
+        if login["lapsing"] and min_remaining_seconds > 0:
+            return None
+        return str(login["token"])
+
+    def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | None:
+        refreshes.append(server_url)
+        login.update(token="new-token", lapsing=False)
+        return "new-token"
+
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", load_token)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_stored_token)
+    bearers: list[str | None] = []
+
+    async def _requests() -> None:
+        with respx.mock(assert_all_called=False) as mock_router:
+
+            def _record(request: httpx.Request) -> httpx.Response:
+                bearers.append(request.headers.get("Authorization"))
+                return httpx.Response(200, json={"id": _SESSION, "status": "idle"})
+
+            mock_router.get(_STATE_URL).mock(side_effect=_record)
+            async with open_session_client(_BASE) as client:
+                await client.get(f"/v1/sessions/{_SESSION}")
+                login["lapsing"] = True
+                await client.get(f"/v1/sessions/{_SESSION}")
+
+    asyncio.run(_requests())
+
+    assert bearers == ["Bearer old-token", "Bearer new-token"]
+    assert refreshes == [_BASE]
 
 
 def _install_session_info(router: respx.MockRouter) -> respx.Route:

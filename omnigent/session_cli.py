@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import os
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,6 +22,7 @@ from typing import cast
 import click
 import httpx
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.session_create_cli import (
     message_event,
     message_refusal,
@@ -41,6 +43,8 @@ _WAIT_MAX_INTERVAL_S = 10.0
 _SETTLE_S = 2.0
 #: The items API's largest page.
 _ITEMS_PAGE_LIMIT = 1000
+#: Page size for the read that looks for a tool call after the sent message.
+_ACTIVITY_PAGE_LIMIT = 20
 _STATE_PARAMS = {
     "include_items": "false",
     "include_usage": "false",
@@ -99,19 +103,60 @@ async def open_session_client(base_url: str) -> AsyncIterator[httpx.AsyncClient]
     Open a client that sends each session request to the replica holding its host.
 
     :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
-    :yields: An authenticated client. Its credential is refreshed per request, so a
-        long reply wait outlives one token.
+    :yields: An authenticated client. A stored ``omnigent login`` token is renewed
+        from its refresh grant before it lapses, so a long reply wait outlives it.
     """
     from omnigent.chat import _server_auth, _server_headers
     from omnigent.cli_auth import open_server_client
 
+    # An already-expired login must be renewed before choosing how to authenticate.
+    await asyncio.to_thread(_renew_stored_login, base_url)
+    auth = _server_auth(server_url=base_url)
     async with open_server_client(
         base_url,
-        auth=_server_auth(server_url=base_url),
+        auth=_RenewingAuth(auth, base_url) if auth is not None else None,
         headers=_server_headers(),
         timeout=_READ_TIMEOUT,
     ) as client:
         yield client
+
+
+def _renew_stored_login(server_url: str) -> None:
+    """
+    Renew the stored ``omnigent login`` token for *server_url* if it is about to lapse.
+
+    Does nothing with an ``OMNIGENT_REMOTE_AUTH_TOKEN`` override, a token with
+    enough life left, or no refresh grant to renew it with.
+    """
+    from omnigent.chat import _REMOTE_AUTH_TOKEN_ENV
+    from omnigent.cli_auth import REFRESH_MIN_REMAINING_SECONDS, load_token, refresh_stored_token
+
+    if os.environ.get(_REMOTE_AUTH_TOKEN_ENV, "").strip():
+        return
+    if load_token(server_url, min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS) is None:
+        refresh_stored_token(server_url)
+
+
+class _RenewingAuth(httpx.Auth):
+    """The CLI's server auth, with the stored login renewed before each request."""
+
+    def __init__(self, inner: httpx.Auth, server_url: str) -> None:
+        self._inner = inner
+        self._server_url = server_url
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        """Renew the login off the event loop, then authenticate as the CLI does."""
+        await asyncio.to_thread(_renew_stored_login, self._server_url)
+        flow = self._inner.async_auth_flow(request)
+        outgoing = await anext(flow)
+        while True:
+            response = yield outgoing
+            try:
+                outgoing = await flow.asend(response)
+            except StopAsyncIteration:
+                return
 
 
 @dataclass(frozen=True)
@@ -434,10 +479,11 @@ async def _messages_after_sent(
     Find the sent message after *after* and return its id and every message after it.
 
     The ack's item id finds it. A held message has none until its turn records it,
-    so the first user message with the same text (ignoring whitespace) is taken;
-    nobody else's message stands in for it.
+    so the user message with the same text (ignoring whitespace) is taken; nobody
+    else's message stands in for it.
 
     :returns: ``(message id, later messages)``, or ``None`` while it isn't stored.
+    :raises click.ClickException: When more than one message has the held text.
     """
     messages = await _messages_after(client, session_id, after)
     if sent.item_id is not None:
@@ -453,6 +499,12 @@ async def _messages_after_sent(
         ]
     if not matches:
         return None
+    if len(matches) > 1:
+        raise command_error(
+            f"Session {session_id} has more than one message with the text sent, so its "
+            f"reply can't be told apart. `{cli_invocation()} session read {session_id}` "
+            "shows them."
+        )
     position = matches[0]
     message_id = messages[position]["id"]
     if not isinstance(message_id, str):
@@ -467,18 +519,23 @@ async def _turn_activity_after(client: httpx.AsyncClient, session_id: str, item_
     A turn that only calls tools can start and end between two polls, so this is
     its only trace.
     """
-    page = await _read_json(
-        client,
-        session_id,
-        f"/v1/sessions/{session_id}/items",
-        {"limit": 20, "order": "asc", "after": item_id},
-    )
-    data = page.get("data")
-    return any(
-        isinstance(item, dict)
-        and (item.get("type") != "message" or item.get("role") == "assistant")
-        for item in (data if isinstance(data, list) else [])
-    )
+    params: dict[str, str | int] = {
+        "limit": _ACTIVITY_PAGE_LIMIT,
+        "order": "asc",
+        "after": item_id,
+    }
+    while True:
+        page = await _read_json(client, session_id, f"/v1/sessions/{session_id}/items", params)
+        data = page.get("data")
+        for item in data if isinstance(data, list) else []:
+            if isinstance(item, dict) and (
+                item.get("type") != "message" or item.get("role") == "assistant"
+            ):
+                return True
+        last_id = page.get("last_id")
+        if page.get("has_more") is not True or not isinstance(last_id, str):
+            return False
+        params = {**params, "after": last_id}
 
 
 async def session_info(

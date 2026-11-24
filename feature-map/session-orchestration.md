@@ -53,7 +53,9 @@ MCP independent creation.
   input waiting for its terminal, confirmed by a second transcript read 2s later, since
   a native terminal can report the end before its last reply is mirrored. An idle read
   from before the turn doesn't end the wait. The sent message is found by the ack's
-  item id, or by its text for a held input, never by someone else's message. It prints
+  item id, or by its text for a held input, never by someone else's message; a held
+  text that more than one message matches is refused (exit 1). A stored `omnigent
+  login` token is renewed from its refresh grant during the wait. It prints
   the final reply, or nothing with a stderr note when the turn left none; `--json` adds
   every message after the sent one. It stops early, with the status shown, when a
   prompt waits for a person, the turn fails, or a held message is listed as never
