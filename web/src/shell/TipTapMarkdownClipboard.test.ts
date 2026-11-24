@@ -10,6 +10,7 @@ import { AllSelection, TextSelection } from "@tiptap/pm/state";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { rememberSourceBlocks } from "./markdownSourceBlocks";
 import { MarkdownClipboard } from "./TipTapMarkdownClipboard";
+import { savedMarkdown } from "./markdownSave";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -124,6 +125,9 @@ describe("copying from the Markdown editor", () => {
     const ed = makeEditor(DOC);
     expect(copy(ed, "print").text).toBe("print");
     expect(copy(ed, "print('hello')").text).toBe("```python\nprint('hello')\n```");
+    // Prose would serialize `<tag>` as `&lt;tag>`; code keeps it literal.
+    const html = makeEditor("```html\nprefix <tag> suffix\n```");
+    expect(copy(html, "<tag>").text).toBe("<tag>");
   });
 
   it("copies a whole table cell as its text, not a one-cell table", () => {
@@ -142,17 +146,38 @@ describe("copying from the Markdown editor", () => {
     ["a final newline", "# Title\n\nBody.\n"],
     ["blank lines at both ends", "\n\n# Title\n\nBody.\n\n\n"],
     ["CRLF line endings", "# Title\r\n\r\n* one\r\n* two\r\n"],
+    // TipTap appends an empty paragraph after a final code block on the first transaction.
+    ["a final code block", "# Title\n\n```sh\necho hi\n```\n"],
   ])("copies the whole document byte for byte with %s", (_case, source) => {
     const ed = makeEditor(source);
     expect(copySelection(ed, new AllSelection(ed.state.doc)).text).toBe(source);
   });
 
-  it("copies the whole document with its edits, not the stale source", () => {
-    const ed = makeEditor("# Title\n\n* one\n* two\n");
+  it.each([
+    ["a text edit", (ed: Editor) => ed.state.tr.insertText("Edited ", textPosition(ed, "Title"))],
+    [
+      "trailing spaces",
+      (ed: Editor) => ed.state.tr.insertText("   ", textPosition(ed, "two", true)),
+    ],
+    [
+      "a leading blank paragraph",
+      (ed: Editor) => ed.state.tr.insert(0, ed.state.schema.nodes.paragraph.create()),
+    ],
+  ])("copies the whole document as Save writes it after %s", (_case, edit) => {
+    const source = "# Title\n\n* one\n* two\n";
+    const ed = makeEditor(source);
+    ed.view.dispatch(edit(ed));
+    const copied = copySelection(ed, new AllSelection(ed.state.doc)).text;
+    expect(copied).not.toBe(source);
+    expect(copied).toBe(savedMarkdown(ed, true));
+  });
+
+  it("copies the original source again once an edit is undone", () => {
+    const source = "# Title\n\n* one\n* two\n";
+    const ed = makeEditor(source);
     ed.view.dispatch(ed.state.tr.insertText("Edited ", textPosition(ed, "Title")));
-    expect(copySelection(ed, new AllSelection(ed.state.doc)).text).toBe(
-      "# Edited Title\n\n* one\n* two\n",
-    );
+    ed.commands.undo();
+    expect(copySelection(ed, new AllSelection(ed.state.doc)).text).toBe(source);
   });
 
   it("falls back to plain text and keeps the HTML when serializing fails", () => {

@@ -4,28 +4,39 @@
 // targets and the editor itself still paste formatted content.
 
 import { Extension, type Editor, type JSONContent } from "@tiptap/core";
-import type { Slice } from "@tiptap/pm/model";
+import type { Node as ProseMirrorNode, Slice } from "@tiptap/pm/model";
 import { Plugin, PluginKey, type Selection } from "@tiptap/pm/state";
-import { rememberedMarkdown } from "./markdownSourceBlocks";
-import { markdownKeepingSource } from "./tiptapMarkdownPatches";
+import { rememberedLoad } from "./markdownSourceBlocks";
+import { savedMarkdown } from "./markdownSave";
 
 function trimNewlines(markdown: string): string {
   return markdown.replace(/^\n+|\n+$/g, "");
 }
 
-/** *markdown* without the line endings and edge blank lines the editor can't hold. */
-function withoutEdges(markdown: string): string {
-  return markdown.replace(/\r\n?/g, "\n").replace(/^\n+|\s+$/g, "");
+/**
+ * Whether *doc* is *loaded*, give or take the empty paragraphs TipTap appends
+ * after a final list, heading or code block, which Save drops as well.
+ */
+function isUnchanged(doc: ProseMirrorNode, loaded: ProseMirrorNode): boolean {
+  let count = doc.childCount;
+  while (count > loaded.childCount) {
+    const last = doc.child(count - 1);
+    if (last.type.name !== "paragraph" || last.content.size > 0) return false;
+    count--;
+  }
+  if (count !== loaded.childCount) return false;
+  for (let index = 0; index < count; index++) {
+    if (!doc.child(index).eq(loaded.child(index))) return false;
+  }
+  return true;
 }
 
 // Unchanged, the document copies as the loaded file, byte for byte; once edited,
 // it copies as Save would write it.
 function wholeDocumentMarkdown(editor: Editor): string {
-  const markdown = trimNewlines(markdownKeepingSource(editor));
-  const loaded = rememberedMarkdown(editor);
-  if (loaded === null) return markdown;
-  if (withoutEdges(loaded) === withoutEdges(markdown)) return loaded;
-  return loaded.endsWith("\n") && markdown ? `${markdown}\n` : markdown;
+  const loaded = rememberedLoad(editor);
+  if (loaded && isUnchanged(editor.state.doc, loaded.doc)) return loaded.markdown;
+  return savedMarkdown(editor, loaded?.markdown.endsWith("\n") ?? false);
 }
 
 /**
