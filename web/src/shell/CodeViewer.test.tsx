@@ -544,6 +544,7 @@ describe("CodeViewer markdown preview copy", () => {
     ["an entity on its own", "a &amp; b", "&", "&", "&amp;"],
     ["an entity filling its text node", "&amp;", "&", "&", "&amp;"],
     ["a doubly encoded entity", "&amp;amp;", "&amp;", "&amp;", "&amp;amp;"],
+    ["part of an unknown entity name", "a &madeup; b", "made", "made", "made"],
     ["escaped backslashes", "\\\\\\\\", "\\\\", "\\\\", "\\\\\\\\"],
     [
       "a selection starting at an escape",
@@ -667,19 +668,25 @@ describe("CodeViewer markdown preview copy", () => {
     );
   });
 
-  it("copies a rendered diagram's whole fence, comments included, across it", () => {
-    const fence = "```mermaid\ngraph TD\n%% a diagram comment\nA-->B\n```";
-    renderViewer(`Before\n\n${fence}\n\nAfter`, true, "doc.md", { viewMode: "preview" });
+  // A rendered construct copies its whole source, comments the render hides included.
+  it.each([
+    [
+      "diagram",
+      "```mermaid\ngraph TD\n%% a diagram comment\nA-->B\n```",
+      "[data-testid='mermaid-preview'] svg",
+    ],
+    ["formula", "$$\nx^2 % a TeX comment\n$$", ".katex"],
+  ])("copies a rendered %s's whole source across it", async (_shape, construct, rendered) => {
+    const markdown = `Before\n\n${construct}\n\nAfter`;
+    const { container } = renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    await waitFor(() => expect(container.querySelector(rendered)).not.toBeNull());
     const start = previewText("Before");
     const end = previewText("After");
     const range = document.createRange();
     range.setStart(start.node, start.offset);
     range.setEnd(end.node, end.offset + "After".length);
     window.getSelection()?.addRange(range);
-    expect(fireCopyEvent(start.node)).toHaveBeenCalledWith(
-      "text/plain",
-      `Before\n\n${fence}\n\nAfter`,
-    );
+    expect(fireCopyEvent(start.node)).toHaveBeenCalledWith("text/plain", markdown);
   });
 
   it("places text after a rendered formula past the same text before it", () => {

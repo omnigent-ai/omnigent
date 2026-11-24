@@ -598,10 +598,17 @@ describe("selectionMarkdown on copy", () => {
     );
   });
 
-  it("copies a selected heading node whole, marker included", () => {
-    const ed = openMarkdown("# Release notes\n\nBody text.");
+  it.each([
+    ["heading", "# Release notes\n\nBody text.", "# Release notes"],
+    [
+      "code block",
+      "```js\nconst answer = 42;\n```\n\nBody text.",
+      "```js\nconst answer = 42;\n```",
+    ],
+  ])("copies a selected %s node whole, syntax included", (_shape, markdown, expected) => {
+    const ed = openMarkdown(markdown);
     ed.commands.setNodeSelection(0);
-    expect(copyCurrentSelection(ed).get("text/plain")).toBe("# Release notes");
+    expect(copyCurrentSelection(ed).get("text/plain")).toBe(expected);
   });
 
   it("leaves a few table cells' bare rows to TipTap's plain text", () => {

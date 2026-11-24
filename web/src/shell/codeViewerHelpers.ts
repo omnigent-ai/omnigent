@@ -990,7 +990,8 @@ function encodedCharacterAt(
   const reference = source[at] === "&" ? CHARACTER_REFERENCE.exec(source) : null;
   if (!reference) return null;
   const decoded = new DOMParser().parseFromString(reference[0], "text/html").body.textContent;
-  if (!decoded || !text.startsWith(decoded, index)) return null;
+  // An unknown name such as `&madeup;` decodes to itself: literal text, not a reference.
+  if (!decoded || decoded === reference[0] || !text.startsWith(decoded, index)) return null;
   return { span: { start: at, end: at + reference[0].length }, units: decoded.length };
 }
 
