@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { FileTextIcon, FolderOpenIcon } from "lucide-react";
+import { FolderOpenIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Spinner } from "@/components/ui/spinner";
@@ -8,6 +8,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { listProjectFiles, openProjectFile, type ProjectFile } from "@/lib/projectTicketsApi";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams } from "@/lib/routing";
+import { WorkspaceFileIcon } from "@/shell/WorkspaceFileIcon";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 
 /** Documents, screenshots and evidence that agents and the owner saved to the project. */
@@ -59,7 +60,7 @@ function ProjectFileRow({ file }: { file: ProjectFile }) {
   const [error, setError] = useState<string | null>(null);
   return (
     <li className="flex items-center gap-3 p-3">
-      <FileTextIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
+      <WorkspaceFileIcon path={file.filename} mimeType={file.content_type} className="size-4" />
       <button
         type="button"
         className="min-w-0 flex-1 text-left"

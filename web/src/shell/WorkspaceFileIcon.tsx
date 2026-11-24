@@ -12,6 +12,7 @@ import {
   FileTypeIcon,
   FileVideoIcon,
   PresentationIcon,
+  ScrollTextIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -22,6 +23,7 @@ type FileTypeGroup =
   | "presentation"
   | "archive"
   | "json"
+  | "log"
   | "code"
   | "image"
   | "video"
@@ -43,8 +45,9 @@ interface FileVisual {
 const DOCUMENT_EXTENSIONS = new Set(["doc", "docx", "txt", "md", "rtf"]);
 const SPREADSHEET_EXTENSIONS = new Set(["xls", "xlsx", "csv", "tsv"]);
 const PRESENTATION_EXTENSIONS = new Set(["ppt", "pptx", "key"]);
-const ARCHIVE_EXTENSIONS = new Set(["zip", "rar", "7z", "tar", "gz"]);
-const JSON_EXTENSIONS = new Set(["json", "jsonl"]);
+const ARCHIVE_EXTENSIONS = new Set(["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz"]);
+const JSON_EXTENSIONS = new Set(["json", "jsonl", "ndjson"]);
+const LOG_EXTENSIONS = new Set(["log", "out", "err"]);
 const CODE_EXTENSIONS = new Set([
   "js",
   "jsx",
@@ -61,6 +64,30 @@ const CODE_EXTENSIONS = new Set([
   "yaml",
   "yml",
   "toml",
+  "sh",
+  "bash",
+  "zsh",
+  "c",
+  "h",
+  "cpp",
+  "hpp",
+  "cs",
+  "kt",
+  "swift",
+  "scala",
+  "php",
+  "vue",
+  "svelte",
+]);
+const ARCHIVE_MIME_TYPES = new Set([
+  "application/zip",
+  "application/gzip",
+  "application/x-gzip",
+  "application/x-tar",
+  "application/x-7z-compressed",
+  "application/x-rar-compressed",
+  "application/x-bzip2",
+  "application/x-xz",
 ]);
 const IMAGE_EXTENSIONS = new Set([
   "avif",
@@ -130,6 +157,12 @@ const VISUALS: Record<FileTypeGroup, FileVisual> = {
     Icon: FileJsonIcon,
     colorClass: "text-purple-500 dark:text-purple-400",
   },
+  log: {
+    group: "log",
+    tagColor: "default",
+    Icon: ScrollTextIcon,
+    colorClass: "text-slate-500 dark:text-slate-400",
+  },
   code: {
     group: "code",
     tagColor: "purple",
@@ -184,9 +217,10 @@ export function workspaceFileVisual(path: string, mimeType?: string | null): Fil
   const mime = mimeType?.split(";")[0]?.trim().toLowerCase() ?? "";
   if (mime === "application/pdf") return VISUALS.pdf;
   if (mime.startsWith("image/")) return VISUALS.image;
-  if (mime.startsWith("video/")) return VISUALS.video;
+  if (mime.startsWith("video/") && mime !== "video/mp2t") return VISUALS.video;
   if (mime.startsWith("audio/")) return VISUALS.audio;
   if (mime === "application/json" || mime.endsWith("+json")) return VISUALS.json;
+  if (ARCHIVE_MIME_TYPES.has(mime)) return VISUALS.archive;
 
   const extension = extensionOf(path);
   if (extension === "pdf") return VISUALS.pdf;
@@ -195,12 +229,18 @@ export function workspaceFileVisual(path: string, mimeType?: string | null): Fil
   if (PRESENTATION_EXTENSIONS.has(extension)) return VISUALS.presentation;
   if (ARCHIVE_EXTENSIONS.has(extension)) return VISUALS.archive;
   if (JSON_EXTENSIONS.has(extension)) return VISUALS.json;
+  if (LOG_EXTENSIONS.has(extension)) return VISUALS.log;
   if (CODE_EXTENSIONS.has(extension)) return VISUALS.code;
   if (IMAGE_EXTENSIONS.has(extension)) return VISUALS.image;
   if (VIDEO_EXTENSIONS.has(extension)) return VISUALS.video;
   if (AUDIO_EXTENSIONS.has(extension)) return VISUALS.audio;
   if (DATABASE_EXTENSIONS.has(extension)) return VISUALS.database;
   if (FONT_EXTENSIONS.has(extension)) return VISUALS.font;
+
+  // An unrecognized extension still reads as text when the server typed it so.
+  if (mime === "text/x-log") return VISUALS.log;
+  if (mime === "text/csv") return VISUALS.spreadsheet;
+  if (mime.startsWith("text/")) return VISUALS.document;
   return VISUALS.generic;
 }
 

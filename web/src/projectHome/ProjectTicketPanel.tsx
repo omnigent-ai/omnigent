@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
   ExternalLinkIcon,
-  FileTextIcon,
+  FileIcon,
   GitPullRequestIcon,
   LinkIcon,
   Maximize2Icon,
@@ -35,6 +35,7 @@ import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { WorkspaceFileIcon } from "@/shell/WorkspaceFileIcon";
 import { ProjectOrchestrator } from "./ProjectOrchestrator";
 import {
   createTicket,
@@ -858,6 +859,16 @@ function TicketArtifactImage({ output, className }: { output: TicketOutput; clas
   );
 }
 
+/** The activity timeline's icon for an attached project file, by its type. */
+function TicketArtifactEventIcon({ output }: { output: TicketOutput }) {
+  const file = useProjectFileInfo(output.url);
+  return file.data ? (
+    <WorkspaceFileIcon path={file.data.filename} mimeType={file.data.content_type} />
+  ) : (
+    <FileIcon aria-hidden className="size-3.5" />
+  );
+}
+
 function TicketArtifactLink({ output, inline }: { output: TicketOutput; inline: boolean }) {
   const file = useProjectFileInfo(output.url);
   const [error, setError] = useState<string | null>(null);
@@ -879,7 +890,16 @@ function TicketArtifactLink({ output, inline }: { output: TicketOutput; inline: 
           : "flex w-full items-center gap-3 p-3 transition-colors hover:bg-muted/40 focus-visible:ring-inset",
       )}
     >
-      {!inline && <FileTextIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />}
+      {!inline &&
+        (file.data ? (
+          <WorkspaceFileIcon
+            path={file.data.filename}
+            mimeType={file.data.content_type}
+            className="size-4"
+          />
+        ) : (
+          <FileIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
+        ))}
       <span className={inline ? undefined : "min-w-0 flex-1"}>
         <span className={inline ? undefined : "block truncate text-sm font-medium"}>{name}</span>
         {!inline && (
@@ -1264,7 +1284,11 @@ function TicketActivityItem({
           event.payload.type === "pull_request" ? (
             <GitPullRequestIcon aria-hidden className="size-3.5" />
           ) : event.payload.type === "artifact" ? (
-            <FileTextIcon aria-hidden className="size-3.5" />
+            outputImage ? (
+              <TicketArtifactEventIcon output={outputImage} />
+            ) : (
+              <FileIcon aria-hidden className="size-3.5" />
+            )
           ) : (
             <LinkIcon aria-hidden className="size-3.5" />
           )

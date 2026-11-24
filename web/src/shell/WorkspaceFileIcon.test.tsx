@@ -18,6 +18,8 @@ describe("WorkspaceFileIcon", () => {
     ["song.flac", "audio", "indigo", "lucide-file-headphone"],
     ["chat.sqlite3", "database", "purple", "lucide-database"],
     ["brand.woff2", "font", "default", "lucide-file-type"],
+    ["server.log", "log", "default", "lucide-scroll-text"],
+    ["deploy.sh", "code", "purple", "lucide-file-code-corner"],
     ["LICENSE", "generic", "default", "lucide-file"],
   ])("maps %s to the requested icon and tag color", (path, group, tagColor, iconClass) => {
     const { container } = render(<WorkspaceFileIcon path={path} />);
@@ -32,5 +34,18 @@ describe("WorkspaceFileIcon", () => {
     const { container } = render(<WorkspaceFileIcon path="preview.bin" mimeType="image/png" />);
 
     expect(container.querySelector("svg")).toHaveAttribute("data-file-type", "image");
+  });
+
+  it.each([
+    ["bundle", "application/zip", "archive"],
+    ["notes", "text/markdown", "document"],
+    ["export", "text/csv", "spreadsheet"],
+    ["run", "text/x-log", "log"],
+    ["app.py", "text/plain", "code"],
+    ["stream.ts", "video/mp2t", "code"],
+  ])("types %s served as %s as %s", (path, mimeType, group) => {
+    const { container } = render(<WorkspaceFileIcon path={path} mimeType={mimeType} />);
+
+    expect(container.querySelector("svg")).toHaveAttribute("data-file-type", group);
   });
 });
