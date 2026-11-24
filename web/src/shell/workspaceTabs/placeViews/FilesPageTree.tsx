@@ -159,6 +159,7 @@ export function FilesPageTree({
   const { session } = useSession(conversationId);
   const canBrowseOutside = isOwnerLevel(session?.permissionLevel ?? null);
   const files = useWorkspaceAllFiles(conversationId, { hideIgnored: !showIgnored }, location);
+  const listingHidesIgnored = files.data?.available === true && files.data.ignoredHidden === true;
   const changes = useWorkspaceChangedFiles(conversationId);
   const reveal = useTreeActiveReveal({
     conversationId,
@@ -242,8 +243,8 @@ export function FilesPageTree({
     filters.applied.nameContains,
     filters.applied.include,
     filters.applied.exclude,
-    // The matches follow the tree's ignored-files choice, as its listing does.
-    { enabled: summary.active, hideIgnored: !showIgnored },
+    // The matches leave out what Git ignores where the listing does, on a host that can.
+    { enabled: summary.active, hideIgnored: listingHidesIgnored },
     location,
   );
   // Typing keeps the previous matches in view, but a new root's search starts from none:
@@ -253,6 +254,20 @@ export function FilesPageTree({
     if (search.data && !search.isPlaceholderData) settledLocation.current = location;
   });
   const matchesFromOtherFolder = search.isPlaceholderData && settledLocation.current !== location;
+  // A listing with nothing to show mounts no tree, so a reveal it holds is missed here.
+  const emptyListing =
+    !summary.active &&
+    files.data?.available === true &&
+    visibleEntries(files.data.data, showHidden).length === 0;
+  const pendingReveal = reveal.activeReveal;
+  useEffect(() => {
+    if (!pendingReveal || !emptyListing) return;
+    reveal.onActiveRevealHandled(pendingReveal.key);
+    const file = pendingReveal.file ?? activeFileTreePath(activePath, location, workspaceRoot);
+    if (file) reveal.onActiveRevealMissed(file);
+    // Runs once per reveal; the rest is read from the render that holds it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingReveal, emptyListing]);
   const dark = useResolvedThemeMode() === "dark";
   const treeArea = useRef<HTMLDivElement>(null);
   useFocusTreeAfterRootChange(treeArea, location);
@@ -329,6 +344,23 @@ export function FilesPageTree({
     if (search.isError && !result) {
       content = (
         <TreeMessage alert>{`Couldn’t search the files: ${search.error.message}`}</TreeMessage>
+      );
+    } else if (result?.ignoredUnfiltered) {
+      content = (
+        <div className="flex flex-col items-start gap-2 pb-2">
+          <TreeMessage>The files can’t be searched without what Git ignores right now.</TreeMessage>
+          {onShowIgnored ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mx-3"
+              onClick={onShowIgnored}
+            >
+              Show git-ignored files
+            </Button>
+          ) : null}
+        </div>
       );
     } else if (unsearchable) {
       content = (

@@ -639,6 +639,11 @@ export interface WorkspaceFileSearchResult {
    * is unavailable). `files` is then empty, which doesn't mean nothing matched.
    */
   unavailable: boolean;
+  /**
+   * True when a search without what Git ignores couldn't run: only the workspace API's
+   * search leaves those out, and it declined. `files` is then empty.
+   */
+  ignoredUnfiltered?: true;
 }
 
 // One cap for both routes, so the API and REST return the same matches.
@@ -680,6 +685,16 @@ async function fetchWorkspaceFileSearch(
         unavailable: false,
       };
     }
+  }
+  // REST would bring back what Git ignores, which the tree leaves out.
+  if (hideIgnored) {
+    return {
+      files: [],
+      truncated: false,
+      hasMore: false,
+      unavailable: false,
+      ignoredUnfiltered: true,
+    };
   }
   const params = new URLSearchParams({ limit: String(FILE_SEARCH_LIMIT) });
   if (query) params.set("q", query);
@@ -736,7 +751,7 @@ export function useWorkspaceFileSearch(
   const trimmed = query.trim();
   const trimmedInclude = include?.trim() ?? "";
   const trimmedExclude = exclude?.trim() ?? "";
-  // Like a listing, REST has no way to leave ignored files out, so only the API's search does.
+  // Only the API's search leaves ignored files out; without it, the search says so instead.
   const hideIgnored = options.hideIgnored ?? false;
   return useQuery({
     queryKey: [

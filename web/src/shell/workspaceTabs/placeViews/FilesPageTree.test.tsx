@@ -322,6 +322,16 @@ describe("FilesPageTree", () => {
     expect(captured.tree?.activeReveal).toBeNull();
   });
 
+  it("says why a reveal found nothing in a folder whose every entry Git ignores", () => {
+    vi.mocked(toast.info).mockClear();
+    const { onShowIgnored } = renderTree(listed([], true), false, { showIgnored: false });
+    fireEvent.click(screen.getByRole("button", { name: "Reveal Active File" }));
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith(
+      "a.ts isn’t in the Files tree. Git may ignore it, and ignored files are hidden.",
+      { action: { label: "Show git-ignored files", onClick: onShowIgnored } },
+    );
+  });
+
   it("says why a reveal found nothing, and offers ignored files while they're off", () => {
     vi.mocked(toast.info).mockClear();
     const { onShowIgnored } = renderTree(listed([entry("README.md")]), false, {
@@ -402,10 +412,41 @@ describe("FilesPageTree", () => {
 
     it("searches without what Git ignores while ignored files are off, as the tree lists", () => {
       vi.useFakeTimers();
-      renderTree(listed([entry("README.md")]), false, { showIgnored: false });
+      renderTree(listed([entry("README.md")], true), false, { showIgnored: false });
       fireEvent.click(filterButton());
       typeName("artifact");
       expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: true });
+    });
+
+    it("searches everything on a host whose listing can't leave ignored files out", () => {
+      vi.useFakeTimers();
+      renderTree(listed([entry("README.md")]), false, { showIgnored: false });
+      fireEvent.click(filterButton());
+      typeName("artifact");
+      expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: false });
+    });
+
+    it("says it can't search without ignored files right now, and offers them", () => {
+      vi.useFakeTimers();
+      vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+        data: {
+          files: [],
+          truncated: false,
+          hasMore: false,
+          unavailable: false,
+          ignoredUnfiltered: true,
+        },
+      } as never);
+      const { onShowIgnored } = renderTree(listed([entry("README.md")], true), false, {
+        showIgnored: false,
+      });
+      fireEvent.click(filterButton());
+      typeName("artifact");
+      expect(
+        screen.getByText("The files can’t be searched without what Git ignores right now."),
+      ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Show git-ignored files" }));
+      expect(onShowIgnored).toHaveBeenCalledTimes(1);
     });
 
     it("ends the filter for the header's Reveal, so the whole tree shows the viewed file", () => {

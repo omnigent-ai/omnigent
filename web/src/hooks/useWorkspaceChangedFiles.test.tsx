@@ -1114,6 +1114,24 @@ describe("useWorkspaceFileSearch through the workspace API", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("doesn't fall back to REST, which can't leave ignored files out, for a search without them", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce(null);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(
+      () => useWorkspaceFileSearch("conv_live", "main", "", "", { hideIgnored: true }, ""),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data).toMatchObject({ files: [], ignoredUnfiltered: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("asks the API to leave out what Git ignores, and keeps that search apart", async () => {
     onlineMock.mockReturnValue(true);
     vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValue({
