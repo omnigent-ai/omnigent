@@ -66,6 +66,7 @@ from omnigent.server.project_router import (
     choose_router,
     lead_present,
 )
+from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
@@ -354,6 +355,18 @@ def create_projects_router(
                 permission_store,
             )
 
+    async def _refuse_role_side_chat(request: Request, user_id: str | None, action: str) -> None:
+        """Refuse a coordination write from a side chat of the Lead or an identity."""
+        if conversation_store is not None:
+            await asyncio.to_thread(
+                refuse_role_side_chat,
+                request,
+                action=action,
+                user_id=user_id,
+                conversations=conversation_store,
+                projects=project_store,
+            )
+
     @router.post("/projects")
     async def create_project(
         request: Request,
@@ -525,6 +538,7 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        await _refuse_role_side_chat(request, user_id, "Editing the project")
         _refuse_agent_mandate_write(request, body.mandate)
         if body.description is not None:
             current = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
@@ -597,6 +611,7 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        await _refuse_role_side_chat(request, user_id, "Proposing mandate changes")
         source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
         try:
             source_session = uuid_to_bytes(source).hex() if source else None
@@ -769,6 +784,7 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        await _refuse_role_side_chat(request, user_id, "Creating project identities")
         source_session = _source_session(request)
         if ORCHESTRATION_SOURCE_HEADER in request.headers and source_session is None:
             raise OmnigentError("Invalid orchestration source", code=ErrorCode.INVALID_INPUT)
@@ -860,6 +876,7 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        await _refuse_role_side_chat(request, user_id, "Editing project identities")
         project = await _owned_project(project_id, user_id)
         if identity_id == LEAD_IDENTITY_ID:
             return await _update_lead(request, project, user_id, body)
@@ -1115,6 +1132,7 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        await _refuse_role_side_chat(request, user_id, "Opening identity sessions")
         project = await _owned_project(project_id, user_id)
         if identity_id == ORCHESTRATOR_IDENTITY_ID:
             raise OmnigentError(

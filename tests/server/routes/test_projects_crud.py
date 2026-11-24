@@ -1511,3 +1511,51 @@ async def test_side_chats_of_the_lead_and_a_persona_carry_the_role_but_not_hold_
     assert plain_fork.status_code == 201, plain_fork.text
     plain = (await project_client.get(f"/v1/sessions/{plain_fork.json()['id']}")).json()
     assert plain["project_side_chat_role"] is None
+
+
+async def test_the_server_refuses_coordination_from_a_role_side_chat(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """A side chat of the Lead or a persona gets 403 on coordination writes; reads still work."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    project = f"/v1/projects/{created['id']}"
+    pm = (
+        await project_client.post(
+            f"{project}/identities", json={"name": "PM", "instructions": "Plan."}
+        )
+    ).json()
+    lead = {ORCHESTRATION_SOURCE_HEADER: created["main_session_id"]}
+    ticket = await project_client.post(f"{project}/tickets", json={"title": "T"}, headers=lead)
+    assert ticket.status_code == 201, ticket.text
+    ticket_path = f"{project}/tickets/{ticket.json()['id']}"
+    for source in (created["main_session_id"], pm["active_session_id"]):
+        fork = await project_client.post(f"/v1/sessions/{source}/fork", json={"side_chat": True})
+        assert fork.status_code == 201, fork.text
+        side = {ORCHESTRATION_SOURCE_HEADER: fork.json()["id"]}
+        for method, path, body in (
+            ("POST", f"{project}/tickets", {"title": "Mine"}),
+            ("PATCH", ticket_path, {"stage_id": "done"}),
+            ("PATCH", ticket_path, {"labels": [{"key": "kind", "value": "fix"}]}),
+            ("PATCH", project, {"name": "Renamed"}),
+            ("POST", f"{project}/identities", {"name": "Spy", "instructions": "x"}),
+            ("PATCH", f"{project}/identities/{pm['id']}", {"instructions": "x"}),
+            ("POST", f"{project}/identities/{pm['id']}/session", {}),
+            ("POST", f"{project}/mandate/proposals", {"text": "More."}),
+            ("PATCH", f"/v1/sessions/{created['main_session_id']}", {"title": "x"}),
+            ("PUT", f"{project}/kpis", {"kpis": []}),
+        ):
+            refused = await project_client.request(method, path, json=body, headers=side)
+            assert refused.status_code == 403, (method, path, refused.text)
+            assert "side chat" in refused.text
+        commented = await project_client.patch(ticket_path, json={"comment": "FYI."}, headers=side)
+        assert commented.status_code == 200, commented.text
+        posted = await project_client.post(
+            f"{ticket_path}/comments", json={"text": "Note."}, headers=side
+        )
+        assert posted.status_code == 201, posted.text
+        assert (await project_client.get(f"{project}/tickets", headers=side)).status_code == 200
+    # The role's main session and people using the UI keep coordinating.
+    moved = await project_client.patch(ticket_path, json={"stage_id": "done"}, headers=lead)
+    assert moved.status_code == 200, moved.text
+    plain = await project_client.post(f"{project}/tickets", json={"title": "By hand"})
+    assert plain.status_code == 201, plain.text

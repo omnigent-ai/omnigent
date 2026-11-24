@@ -32,7 +32,6 @@ from omnigent.server.session_delivery import deliver_to_session
 from omnigent.server.startup_inputs import ManagedStartupInputs
 from omnigent.server.ticket_responder import ROUTER, assignee_name, responder_order
 from omnigent.server.ticket_review import APPROVED_LABEL, REVIEW_STAGE_ID, REVIEWER_NAME
-
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 

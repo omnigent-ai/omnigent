@@ -28,6 +28,7 @@ from omnigent.server.project_status import (
     load_status_sources,
     status_period,
 )
+from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.projects import refuse_unless_owner_or_lead
 
@@ -187,6 +188,15 @@ def create_project_kpis_router(
         Only the project owner, or the project's Lead session, may write.
         """
         user_id = require_user(request, auth_provider)
+        if conversation_store is not None:
+            await asyncio.to_thread(
+                refuse_role_side_chat,
+                request,
+                action="Changing the project's KPIs",
+                user_id=user_id,
+                conversations=conversation_store,
+                projects=project_store,
+            )
         project = await load_project(project_id, user_id)
         session_id = await asyncio.to_thread(
             refuse_unless_owner_or_lead,

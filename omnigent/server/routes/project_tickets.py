@@ -52,6 +52,7 @@ from omnigent.server.persona_mentions import (
 )
 from omnigent.server.project_landing import RISK_OK_LABEL, could_supersede, is_pure_rebase
 from omnigent.server.project_status_spend import project_total_cents
+from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
 from omnigent.server.routes._sessions.helpers import (
@@ -308,6 +309,10 @@ def _spawn_review_routing(
     task.add_done_callback(_mention_tasks.discard)
 
 
+# A ticket update with only these fields is a comment, which a role's side chat may post.
+_TICKET_COMMENT_FIELDS = frozenset({"comment", "audience"})
+
+
 def create_project_tickets_router(
     store: ProjectTicketStore,
     conversations: ConversationStore,
@@ -320,11 +325,23 @@ def create_project_tickets_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/projects/{project_id}/tickets")
 
-    async def actor(request: Request, project_id: str) -> TicketActor:
+    async def actor(
+        request: Request, project_id: str, coordination: str | None = None
+    ) -> TicketActor:
+        """The caller; *coordination* names a write a role's side chat may not make."""
         user_id = require_user(request, auth_provider)
         raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
         if raw_source is None:
             return TicketActor(user_id)
+        if coordination is not None:
+            await asyncio.to_thread(
+                refuse_role_side_chat,
+                request,
+                action=coordination,
+                user_id=user_id,
+                conversations=conversations,
+                projects=projects,
+            )
         await asyncio.to_thread(
             require_named_source_private, request, user_id, conversations, permissions
         )
@@ -699,7 +716,7 @@ def create_project_tickets_router(
     async def create_ticket(
         request: Request, project_id: str, body: CreateTicket
     ) -> dict[str, Any]:
-        who = await actor(request, project_id)
+        who = await actor(request, project_id, "Creating tickets")
         await refuse_owner_label_change(
             request,
             project_id,
@@ -721,7 +738,7 @@ def create_project_tickets_router(
         The ticket's requester is ``github:<login>``, which puts it in the outside-author
         landing tier. A recorded ``record`` replaces the GitHub read for dry runs.
         """
-        who = await actor(request, project_id)
+        who = await actor(request, project_id, "Importing pull requests")
         owner, repo, number = github_pr_intake.parse_pr_url(body.url)
         pr_key = f"{owner}/{repo}#{number}"
         after: str | None = None
@@ -778,7 +795,7 @@ def create_project_tickets_router(
     async def update_ticket_stages(
         request: Request, project_id: str, body: UpdateTicketStages
     ) -> dict[str, Any]:
-        who = await actor(request, project_id)
+        who = await actor(request, project_id, "Changing the board's stages")
         with _storage_errors():
             configuration = await asyncio.to_thread(store.update_stages, project_id, body, who)
         wake(request)
@@ -838,7 +855,11 @@ def create_project_tickets_router(
     async def update_ticket(
         request: Request, project_id: str, ticket_id: str, body: UpdateTicket
     ) -> dict[str, Any]:
-        who = await actor(request, project_id)
+        changed = {
+            name for name in body.model_fields_set if getattr(body, name) not in (None, False)
+        }
+        comment_only = changed <= _TICKET_COMMENT_FIELDS
+        who = await actor(request, project_id, None if comment_only else "Editing tickets")
         before = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
         context = None
         # The same permission checks for a full list or for adds/removes, on what they change.
@@ -902,7 +923,7 @@ def create_project_tickets_router(
         request: Request, project_id: str, ticket_id: str, body: LandTicketRequest
     ) -> dict[str, Any]:
         """Queue a Reviewer-approved commit for the landing queue; refusals are 409s."""
-        who = await actor(request, project_id)
+        who = await actor(request, project_id, "Landing")
         queue = getattr(request.app.state, "project_landing", None)
         notifications = getattr(request.app.state, "project_ticket_notifications", None)
         if queue is None or notifications is None:
@@ -1019,7 +1040,7 @@ def create_project_tickets_router(
     async def link_session(
         request: Request, project_id: str, ticket_id: str, body: LinkTicketSession
     ) -> dict[str, Any]:
-        who = await actor(request, project_id)
+        who = await actor(request, project_id, "Linking sessions to tickets")
         await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
         session_id = await check_session(who, project_id, body.session_id)
         with _storage_errors():
@@ -1055,7 +1076,7 @@ def create_project_tickets_router(
         ticket_id: str,
         body: LinkRelatedTicket,
     ) -> dict[str, Any]:
-        who = await actor(request, project_id)
+        who = await actor(request, project_id, "Linking tickets")
         with _storage_errors():
             result = await asyncio.to_thread(
                 store.link_ticket, project_id, ticket_id, body.related_ticket_id, body.action, who

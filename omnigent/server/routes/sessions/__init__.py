@@ -971,6 +971,7 @@ def create_sessions_router(
         host_registry=host_registry,
         register_initial_file_upload=register_initial_file_upload,
         pull_request_refresher=pull_request_refresher,
+        project_store=project_store,
     )
 
     register_ui_routes(
@@ -1015,6 +1016,7 @@ def create_sessions_router(
         register_startup_dispatch=register_startup_dispatch,
         register_project_session_delete=register_project_session_delete,
         clear_session_into_fresh_session=clear_session_into_fresh_session,
+        project_store=project_store,
     )
 
     register_permissions_routes(

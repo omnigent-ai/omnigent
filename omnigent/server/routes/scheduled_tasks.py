@@ -45,6 +45,7 @@ from omnigent.server.proactive_agent import (
     is_proactive_task,
     reject_proactive_agent_id,
 )
+from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
@@ -1071,6 +1072,13 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+        refuse_role_side_chat(
+            request,
+            action="Creating scheduled tasks",
+            user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            conversations=conversation_store,
+            projects=project_store,
+        )
         _reject_proactive_agent(body.agent_id)
         _refuse_workflow_reuse(await _workflow_reuse_problem(body.prompt, body.session_mode))
         await _validate_rrule_or_400(
@@ -1709,6 +1717,13 @@ def create_scheduled_tasks_router(
             auth_provider=auth_provider,
             conversation_store=conversation_store,
             permission_store=permission_store,
+        )
+        refuse_role_side_chat(
+            request,
+            action="Changing scheduled tasks",
+            user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            conversations=conversation_store,
+            projects=project_store,
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         stored = _require_owned(scheduled_task_id, owner_id)

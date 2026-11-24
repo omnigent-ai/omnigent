@@ -119,6 +119,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.session_pull_request_store import SessionPullRequestLimitError
 
 if TYPE_CHECKING:
@@ -265,6 +266,7 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+    project_store: ProjectStore | None = None,
 ) -> None:
     """Register the resources routes on router."""
     pull_request_store = server_prs.open_store(conversation_store)
@@ -3970,6 +3972,7 @@ def register_resources_routes(
         :returns: The refreshed ``session.github.info`` object.
         """
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+        from omnigent.server.role_side_chat import refuse_role_side_chat
         from omnigent.server.session_orchestration import require_orchestration_source
 
         if request.url.path.endswith("/prs/orchestrated") and not request.headers.get(
@@ -3987,6 +3990,14 @@ def register_resources_routes(
                 _get_user_id(request, auth_provider),
                 conversation_store,
                 permission_store,
+            )
+            await asyncio.to_thread(
+                refuse_role_side_chat,
+                request,
+                action="Linking pull requests",
+                user_id=_get_user_id(request, auth_provider),
+                conversations=conversation_store,
+                projects=project_store,
             )
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()

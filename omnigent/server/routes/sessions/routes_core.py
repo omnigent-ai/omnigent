@@ -1419,30 +1419,33 @@ def register_core_routes(
                 )
         return runner_id, launch_failed
 
+    async def _refuse_role_side_chat(request: Request, user_id: str | None, action: str) -> None:
+        """Refuse a coordination write from a side chat of the Lead or an identity."""
+        from omnigent.server.role_side_chat import refuse_role_side_chat
+
+        await asyncio.to_thread(
+            refuse_role_side_chat,
+            request,
+            action=action,
+            user_id=user_id,
+            conversations=conversation_store,
+            projects=project_store,
+        )
+
     async def _side_chat_project_role(
         project: Project, parent_id: str, include_instructions: bool
     ) -> dict[str, str] | None:
         """The Lead or identity role a side chat's source session holds, if any."""
-        from omnigent.entities.project_routing import LEAD_IDENTITY_ID, LEAD_NAME
+        from omnigent.server.role_side_chat import project_role_of_session
 
-        if project.main_session_id == parent_id:
-            role = {"id": LEAD_IDENTITY_ID, "name": LEAD_NAME}
-            if include_instructions and project.lead_charter:
-                role["instructions"] = project.lead_charter
-            return role
-        parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
-        identity_id = (parent.labels or {}).get(PROJECT_IDENTITY_LABEL_KEY) if parent else None
-        if parent is None or parent.project_id != project.id or not identity_id:
-            return None
-        identity = await asyncio.to_thread(
-            project_store.get_identity, project.id, identity_id, user_id=project.user_id
+        return await asyncio.to_thread(
+            project_role_of_session,
+            project,
+            normalize_uuid(parent_id) or parent_id,
+            conversation_store,
+            project_store,
+            include_instructions=include_instructions,
         )
-        if identity is None or identity.active_session_id != parent.id:
-            return None
-        role = {"id": identity.id, "name": identity.name}
-        if include_instructions and identity.instructions:
-            role["instructions"] = identity.instructions
-        return role
 
     def _side_chat_allowed_sync(user_id: str | None, conversation: Conversation) -> bool:
         """Synchronous :func:`side_chat_allowed` for an already-read *conversation*."""
@@ -1486,6 +1489,9 @@ def register_core_routes(
             raise OmnigentError(
                 "Independent sessions require an orchestration source", code=ErrorCode.FORBIDDEN
             )
+        await _refuse_role_side_chat(
+            request, _require_user(request, auth_provider), "Starting sessions"
+        )
         if request.url.path.endswith("/sessions/orchestrated/host") and not (
             request.app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS)
         ):
@@ -4066,6 +4072,9 @@ def register_core_routes(
             conversation_store,
             permission_store,
         )
+        caller = normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "")
+        if caller is not None and caller != normalize_uuid(session_id):
+            await _refuse_role_side_chat(request, user_id, "Changing other sessions")
         if body.archived is True:
             await asyncio.to_thread(
                 require_archive_outside_source_lineage, request, session_id, conversation_store
