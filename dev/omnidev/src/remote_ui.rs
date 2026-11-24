@@ -34,30 +34,25 @@ pub fn run(server_url: Option<String>, databricks_profile: Option<String>) -> Re
     let repo_root = paths::find_repo_root(&std::env::current_dir()?, false)?;
     let recent_path = paths::recent_servers_path()?;
     let mut recent = load_recent(&recent_path);
-    let mut server = match server_url {
-        Some(url) => {
-            // Reuse the profile last paired with this URL unless one is given.
-            let databricks_profile = recent
-                .iter()
-                .find(|known| known.url == url)
-                .and_then(|known| known.databricks_profile.clone());
-            Server {
-                url,
-                databricks_profile,
-            }
-        }
-        None => match pick(&recent)? {
-            Some(server) => server,
-            None => {
-                eprintln!("Cancelled.");
-                return Ok(());
-            }
-        },
+    let Some(url) = (match server_url {
+        Some(url) => Some(url),
+        None => pick(&recent)?,
+    }) else {
+        eprintln!("Cancelled.");
+        return Ok(());
     };
-    if databricks_profile.is_some() {
-        server.databricks_profile = databricks_profile;
-    }
-    check_url(&server.url)?;
+    check_url(&url)?;
+    // Reuse the profile last paired with this URL unless one is given.
+    let databricks_profile = databricks_profile.or_else(|| {
+        recent
+            .iter()
+            .find(|known| known.url == url)
+            .and_then(|known| known.databricks_profile.clone())
+    });
+    let server = Server {
+        url,
+        databricks_profile,
+    };
     remember(&mut recent, server.clone());
     if let Err(error) = save_recent(&recent_path, &recent) {
         eprintln!("omnidev: could not remember {}: {error:#}", server.url);
@@ -86,15 +81,36 @@ pub fn run(server_url: Option<String>, databricks_profile: Option<String>) -> Re
         Some(profile) => vite.env("OMNIGENT_DATABRICKS_PROFILE", profile),
         None => vite.env_remove("OMNIGENT_DATABRICKS_PROFILE"),
     };
+    // A static token left in the shell would be sent to whichever server was picked.
+    if std::env::var_os("OMNIGENT_AUTH_TOKEN").is_some() {
+        eprintln!("omnidev: ignoring OMNIGENT_AUTH_TOKEN; use --databricks-profile instead");
+        vite.env_remove("OMNIGENT_AUTH_TOKEN");
+    }
     // exec so Ctrl-C and Vite's own keyboard shortcuts reach Vite directly.
     Err(vite.exec()).context("starting Vite with pnpm")
 }
 
-/// Catch typos before they land in the recent list; Vite validates the rest.
+/// Accept only what the dev proxy uses, so no credentials or typos land in the
+/// history file: http(s), a host, an optional path and an optional `?o=<org-id>`.
 fn check_url(url: &str) -> Result<()> {
-    let scheme_ok = url.starts_with("http://") || url.starts_with("https://");
-    if !scheme_ok || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        bail!("server URL must start with http:// or https:// and contain no spaces: {url:?}");
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    let valid = rest.is_some_and(|rest| {
+        let (before_query, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let host = before_query.split('/').next().unwrap_or_default();
+        let org_selector = query
+            .strip_prefix("o=")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+        !host.is_empty()
+            && !host.contains('@')
+            && (query.is_empty() || org_selector)
+            && !rest.contains('#')
+            && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
+    });
+    if !valid {
+        // Not echoed: a rejected URL may hold credentials.
+        bail!("server URL must look like http(s)://host[:port][/path][?o=<org-id>], without credentials");
     }
     Ok(())
 }
@@ -129,9 +145,9 @@ fn label(server: &Server) -> String {
     }
 }
 
-/// Recent servers plus a final new-URL row; `None` when cancelled.
-fn pick(recent: &[Server]) -> Result<Option<Server>> {
-    if !std::io::stdin().is_terminal() {
+/// URL of a recent server or of a new one typed in; `None` when cancelled.
+fn pick(recent: &[Server]) -> Result<Option<String>> {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         bail!("no terminal for the server picker; pass --server <URL>");
     }
     if recent.is_empty() {
@@ -140,23 +156,29 @@ fn pick(recent: &[Server]) -> Result<Option<Server>> {
     let mut rows: Vec<String> = recent.iter().map(label).collect();
     rows.push(NEW_URL_ROW.into());
     match select(&rows)? {
-        Some(index) if index < recent.len() => Ok(Some(recent[index].clone())),
+        Some(index) if index < recent.len() => Ok(Some(recent[index].url.clone())),
         Some(_) => prompt_url(),
         None => Ok(None),
     }
 }
 
 /// Line prompt for a new server; an empty answer cancels.
-fn prompt_url() -> Result<Option<Server>> {
+fn prompt_url() -> Result<Option<String>> {
     eprint!("Server URL (Databricks workspaces: keep ?o=<org-id>): ");
     std::io::stderr().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     let url = line.trim();
-    Ok((!url.is_empty()).then(|| Server {
-        url: url.into(),
-        databricks_profile: None,
-    }))
+    Ok((!url.is_empty()).then(|| url.to_string()))
+}
+
+/// Leaves raw mode on drop, so a panic or early return can't strand the terminal.
+struct RawMode;
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
 }
 
 /// Arrow-key list drawn inline on stderr; erased once a row is chosen.
@@ -167,39 +189,34 @@ fn select(rows: &[String]) -> Result<Option<usize>> {
         _ => 80,
     } - 1;
     let lines = u16::try_from(rows.len() + 1).unwrap_or(u16::MAX);
+    // stderr is unbuffered, so queued erases reach the terminal without a flush.
     let mut out = std::io::stderr();
     terminal::enable_raw_mode()?;
-    let choice = (|| -> Result<Option<usize>> {
-        let mut selected = 0;
-        loop {
-            draw(&mut out, rows, selected, width)?;
-            let key = loop {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        break key;
-                    }
+    let _raw_mode = RawMode;
+    let mut selected = 0;
+    loop {
+        draw(&mut out, rows, selected, width)?;
+        let key = loop {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    break key;
                 }
-            };
-            queue!(out, MoveUp(lines), Clear(ClearType::FromCursorDown))?;
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    selected = selected.checked_sub(1).unwrap_or(rows.len() - 1)
-                }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                    selected = (selected + 1) % rows.len()
-                }
-                KeyCode::Enter => return Ok(Some(selected)),
-                KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(None)
-                }
-                _ => {}
             }
+        };
+        queue!(out, MoveUp(lines), Clear(ClearType::FromCursorDown))?;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.checked_sub(1).unwrap_or(rows.len() - 1)
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                selected = (selected + 1) % rows.len()
+            }
+            KeyCode::Enter => return Ok(Some(selected)),
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+            _ => {}
         }
-    })();
-    terminal::disable_raw_mode()?;
-    out.flush()?;
-    choice
+    }
 }
 
 fn draw(out: &mut impl Write, rows: &[String], selected: usize, width: usize) -> Result<()> {
@@ -272,14 +289,26 @@ mod tests {
     }
 
     #[test]
-    fn check_url_accepts_http_urls_without_spaces() {
-        assert!(check_url("https://a.example.com/?o=1").is_ok());
-        assert!(check_url("http://localhost:6767").is_ok());
+    fn check_url_accepts_only_what_the_dev_proxy_uses() {
+        for good in [
+            "https://a.example.com/?o=1",
+            "https://a.example.com/custom/mount",
+            "http://localhost:6767",
+        ] {
+            assert!(check_url(good).is_ok(), "{good:?} should be accepted");
+        }
         for bad in [
             "",
             "a.example.com",
             "ftp://a.example.com",
+            "https://",
+            "https:///path",
             "https://a.example.com /",
+            "https://user:secret@a.example.com",
+            "https://a.example.com/?token=secret",
+            "https://a.example.com/?o=1&token=secret",
+            "https://a.example.com/?o=abc",
+            "https://a.example.com/#token=secret",
         ] {
             assert!(check_url(bad).is_err(), "{bad:?} should be rejected");
         }

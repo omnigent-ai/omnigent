@@ -55,13 +55,15 @@ it.each([
   }
 });
 
-it("re-mints the profile's CLI token shortly before it expires", async () => {
+it("re-mints the profile's CLI token before expiry and keeps it through failed refreshes", async () => {
   const bin = mkdtempSync(path.join(tmpdir(), "fake-databricks-"));
   const calls = path.join(bin, "calls");
+  const failing = path.join(bin, "failing");
   writeFileSync(
     path.join(bin, "databricks"),
     `#!/bin/sh
 echo "$*" >> "$FAKE_DATABRICKS_CALLS"
+[ -e "$FAKE_DATABRICKS_FAILING" ] && exit 1
 printf '{"access_token":"token-%s","expiry":"2030-01-01T01:00:00.123456789Z"}' $(($(wc -l < "$FAKE_DATABRICKS_CALLS")))
 `,
     { mode: 0o755 },
@@ -69,6 +71,7 @@ printf '{"access_token":"token-%s","expiry":"2030-01-01T01:00:00.123456789Z"}' $
   try {
     vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH}`);
     vi.stubEnv("FAKE_DATABRICKS_CALLS", calls);
+    vi.stubEnv("FAKE_DATABRICKS_FAILING", failing);
     vi.stubEnv("OMNIGENT_URL", origin);
     vi.stubEnv("OMNIGENT_AUTH_TOKEN", "");
     vi.stubEnv("OMNIGENT_DATABRICKS_PROFILE", "dev-profile");
@@ -85,15 +88,24 @@ printf '{"access_token":"token-%s","expiry":"2030-01-01T01:00:00.123456789Z"}' $
       return sent.Authorization;
     };
 
+    const at = (time: string) => {
+      vi.setSystemTime(new Date(`2030-01-01T${time}Z`));
+      return authorization();
+    };
+
     vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date("2030-01-01T00:00:00Z"));
-    expect(authorization()).toBe("Bearer token-1");
-    vi.setSystemTime(new Date("2030-01-01T00:58:00Z"));
-    expect(authorization()).toBe("Bearer token-1");
-    vi.setSystemTime(new Date("2030-01-01T00:59:30Z"));
-    expect(authorization()).toBe("Bearer token-2");
+    expect(at("00:00:00")).toBe("Bearer token-1");
+    expect(at("00:58:00")).toBe("Bearer token-1");
+    expect(at("00:59:30")).toBe("Bearer token-2");
+    writeFileSync(failing, "");
+    // A failed refresh keeps the unexpired token and waits 10s before retrying.
+    expect(at("00:59:45")).toBe("Bearer token-2");
+    expect(at("00:59:50")).toBe("Bearer token-2");
+    expect(at("01:00:01")).toBeUndefined();
+    rmSync(failing);
+    expect(at("01:00:12")).toBe("Bearer token-5");
     expect(readFileSync(calls, "utf8")).toBe(
-      "auth token --profile dev-profile --output json\n".repeat(2),
+      "auth token --profile dev-profile --output json\n".repeat(5),
     );
   } finally {
     vi.useRealTimers();

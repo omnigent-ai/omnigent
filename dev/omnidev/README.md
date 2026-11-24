@@ -200,7 +200,10 @@ omnidev ui --server 'https://<workspace-host>/?o=<org-id>' --databricks-profile 
   `/api/2.0/omnigent` mount and sends a `?o=<org-id>` selector as the
   `X-Databricks-Org-Id` header.
 - Tokens come from `databricks auth token`, matched by host or taken from
-  `--databricks-profile`, and are re-minted before they expire.
+  `--databricks-profile`, and are re-minted before they expire. An inherited
+  `OMNIGENT_AUTH_TOKEN` is ignored, and URLs with credentials or query
+  parameters other than `?o=` are rejected, so neither reaches another server
+  or the history file.
 - The picker lists the last 10 servers, most recent first, and always ends with
   "Enter a new URL…". With no history it asks for a URL. Each server keeps the
   profile last used with it. The list is stored in

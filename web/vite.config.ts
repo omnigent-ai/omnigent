@@ -27,9 +27,9 @@ function isWorkspaceHost(hostname: string): boolean {
 // automatically, so the browser's relative /v1/... paths reach the
 // workspace-hosted server without hand-typing the /api/2.0/omnigent prefix. An
 // explicit non-root path is respected (a custom mount, or a local server).
-// A `?o=<org-id>` workspace selector moves into the org-id routing header.
 function resolveTarget(raw: string): { target: string; orgId: string | null } {
   const url = new URL(raw);
+  // A `?o=<org-id>` workspace selector moves into the org-id routing header.
   const orgId = url.searchParams.get("o");
   if (orgId !== null && !/^\d+$/.test(orgId)) {
     throw new Error("OMNIGENT_URL ?o= must be a numeric workspace org id");
@@ -48,31 +48,35 @@ const { target: OMNIGENT_URL, orgId: ORG_ID } = resolveTarget(
 // Mint tokens from this Databricks CLI profile instead of matching by host.
 const DATABRICKS_PROFILE = process.env.OMNIGENT_DATABRICKS_PROFILE || undefined;
 
-let cachedToken: { value: string | null; refreshAt: number } | undefined;
+let cachedToken: { value: string | null; expiresAt: number; refreshAt: number } | undefined;
 
 function resolveToken(host: string): string | null {
   if (process.env.OMNIGENT_AUTH_TOKEN) return process.env.OMNIGENT_AUTH_TOKEN;
   const now = Date.now();
   if (cachedToken && now < cachedToken.refreshAt) return cachedToken.value;
 
-  let value: string | null = null;
-  let expiresAt = Number.NaN;
   try {
     const selector = DATABRICKS_PROFILE ? ["--profile", DATABRICKS_PROFILE] : ["--host", host];
+    // Bounded: this blocks the dev server, and the CLI's own timeout allows a browser login.
     const output = execFileSync("databricks", ["auth", "token", ...selector, "--output", "json"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
+      timeout: 30_000,
     });
     const tokenResponse = JSON.parse(output) as { access_token?: string; expiry?: string };
-    value = tokenResponse.access_token ?? null;
-    expiresAt = Date.parse(tokenResponse.expiry ?? "");
+    if (!tokenResponse.access_token) throw new Error("databricks auth token returned no token");
+    // CLI OAuth tokens last about an hour; one without a parseable expiry is re-read in minutes.
+    const expiresAt = Date.parse(tokenResponse.expiry ?? "") || now + 5 * 60_000;
+    // Re-mint a minute before expiry, at most every 10s.
+    const refreshAt = Math.max(now + 10_000, expiresAt - 60_000);
+    cachedToken = { value: tokenResponse.access_token, expiresAt, refreshAt };
   } catch {
-    // Retried below after the minimum interval, e.g. once the user logs in again.
+    // Keep a still-valid token through a failed refresh; retry in 10s, e.g. after a new login.
+    const expiresAt = cachedToken?.expiresAt ?? 0;
+    const value = now < expiresAt ? (cachedToken?.value ?? null) : null;
+    cachedToken = { value, expiresAt, refreshAt: now + 10_000 };
   }
-  // CLI OAuth tokens expire after about an hour: re-mint a minute early, at most every 10s.
-  const refreshAt = Number.isNaN(expiresAt) ? 0 : expiresAt - 60_000;
-  cachedToken = { value, refreshAt: Math.max(now + 10_000, refreshAt) };
-  return value;
+  return cachedToken.value;
 }
 
 function configureProxy(target: string, useAuth: boolean): NonNullable<ProxyOptions["configure"]> {
