@@ -356,7 +356,8 @@ updates and worker reports promptly between checks.
   for **every unfinished ticket**, including idle or unassigned work, and every
   unresolved `needs-human` item, even in a completed stage. Do not check only
   recently updated tickets or running workers. Inspect relevant details with
-  `sys_ticket_get`. Check assigned workers with
+  `sys_ticket_get`; pass `include_description=false` and `include_stages=false`
+  for routine re-reads. Check assigned workers with
   `sys_session_get_info`, reading `sys_session_get_history` when needed. Look
   for questions, errors, idle workers with unfinished tickets, completed work
   awaiting verification, stale assignments, and related work that may unblock

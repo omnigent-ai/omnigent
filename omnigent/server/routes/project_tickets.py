@@ -276,6 +276,7 @@ def create_project_tickets_router(
         stage_id: TicketStageId | None = None,
         after: str | None = None,
         limit: int = Query(50, ge=1, le=100),
+        include_guidance: bool = False,
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
         page = await asyncio.to_thread(
@@ -286,7 +287,8 @@ def create_project_tickets_router(
             after=after,
             limit=limit,
         )
-        if who.session_id is not None:
+        # Project sessions already carry this guidance in their instructions.
+        if include_guidance and who.session_id is not None:
             page["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
         await enrich(project_id, page["data"], who)
         return page
@@ -340,10 +342,12 @@ def create_project_tickets_router(
         return {"cost_usd": cost, "days": days, "since_day_utc": since}
 
     @router.get("/{ticket_id}")
-    async def get_ticket(request: Request, project_id: str, ticket_id: str) -> dict[str, Any]:
+    async def get_ticket(
+        request: Request, project_id: str, ticket_id: str, include_guidance: bool = False
+    ) -> dict[str, Any]:
         who = await actor(request, project_id)
         ticket = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
-        if who.session_id is not None:
+        if include_guidance and who.session_id is not None:
             ticket["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
         await enrich(project_id, [ticket], who)
         return ticket

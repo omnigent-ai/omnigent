@@ -29,6 +29,16 @@ class ListTickets(BaseModel):
     )
     after: str | None = Field(default=None, description="Previous page's last_id.")
     limit: int = Field(default=50, ge=1, le=100)
+    compact: bool = Field(
+        default=True,
+        description="Compact rows (no descriptions, truncated latest_update, stage IDs and "
+        "names only). Set false for full tickets and stage instructions.",
+    )
+    include_guidance: bool = Field(
+        default=False,
+        description="Also return the ticket work guidance. Project sessions already have it "
+        "in their instructions; request it only if yours lack it.",
+    )
 
 
 class GetTicket(BaseModel):
@@ -39,6 +49,18 @@ class GetTicket(BaseModel):
     sessions_after: str | None = None
     related_after: str | None = None
     limit: int = Field(default=50, ge=1, le=100)
+    include_description: bool = Field(
+        default=True,
+        description="False omits the description from the ticket and its events.",
+    )
+    include_stages: bool = Field(
+        default=True, description="False omits the project's stage definitions."
+    )
+    include_guidance: bool = Field(
+        default=False,
+        description="Also return the ticket work guidance. Project sessions already have it "
+        "in their instructions; request it only if yours lack it.",
+    )
 
 
 class EditTicket(UpdateTicket):
@@ -182,9 +204,10 @@ class _TicketTool(Tool):
 class SysTicketListTool(_TicketTool):
     tool_name = "sys_ticket_list"
     help_text = (
-        "List tickets, oldest first, and this project's ordered stage definitions "
-        "(IDs, names, instructions, appearance, and derived start/completion metadata). "
-        "Colors and icons are visual only. "
+        "List tickets, oldest first, and this project's ordered stages. By default rows are "
+        "compact (ID, title, stage, labels, truncated latest update, updated_at, running "
+        "agents) and stages carry only ID, name and completion; pass compact=false for "
+        "descriptions and full stage definitions, or read one with sys_ticket_get. "
         "The first stage starts new tickets; the last means complete. Read these before choosing "
         "a stage; do not assume fixed names. Filtering by the last stage lists newest first. "
         "Use last_id as after while has_more is true."
@@ -199,7 +222,8 @@ class SysTicketGetTool(_TicketTool):
         "and related tickets, plus the project's current stage definitions. "
         "Compare the stage's meaning with actual work and the next step at progress and "
         "handoff checkpoints. "
-        "Use kind=output to read PRs and other links."
+        "Use kind=output to read PRs and other links. For routine re-reads, pass "
+        "include_description=false and include_stages=false to keep the response small."
     )
     arguments = GetTicket
 

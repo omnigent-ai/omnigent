@@ -22581,6 +22581,16 @@
               "title": "Limit",
               "type": "integer"
             }
+          },
+          {
+            "in": "query",
+            "name": "include_guidance",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Guidance",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -22892,6 +22902,16 @@
             "schema": {
               "title": "Ticket Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_guidance",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Guidance",
+              "type": "boolean"
             }
           }
         ],

@@ -89,9 +89,15 @@ async def execute_ticket_tool(
         path = f"/v1/projects/{project_id}/tickets"
         if ticket_id is not None:
             path += f"/{ticket_id}"
+        guidance = {"include_guidance": "true"} if body.pop("include_guidance", False) else {}
         if name == "sys_ticket_list":
-            result = await request("GET", path, params=body)
+            compact = body.pop("compact", True)
+            result = await request("GET", path, params={**body, **guidance})
+            if compact:
+                result = _compact_page(result)
         elif name == "sys_ticket_get":
+            include_description = body.pop("include_description", True)
+            include_stages = body.pop("include_stages", True)
             sessions_after = body.pop("sessions_after", None)
             related_after = body.pop("related_after", None)
             session_params = {"limit": body["limit"]}
@@ -100,19 +106,29 @@ async def execute_ticket_tool(
             related_params = {"limit": body["limit"]}
             if related_after is not None:
                 related_params["after"] = related_after
-            ticket, events, sessions, related, stages = await asyncio.gather(
-                request("GET", path),
+            reads = [
+                request("GET", path, params=guidance),
                 request("GET", path + "/events", params=body),
                 request("GET", path + "/sessions", params=session_params),
                 request("GET", path + "/related", params=related_params),
-                request("GET", f"/v1/projects/{project_id}/tickets/stages"),
-            )
+            ]
+            if include_stages:
+                reads.append(request("GET", f"/v1/projects/{project_id}/tickets/stages"))
+            ticket, events, sessions, related, *stages = await asyncio.gather(*reads)
+            if not include_description:
+                ticket.pop("description", None)
+                for event in events.get("data", []):
+                    payload = event.get("payload")
+                    if isinstance(payload, dict):
+                        payload.pop("description", None)
+                for row in related.get("data", []):
+                    row.pop("description", None)
             result = {
                 "ticket": ticket,
                 "events": events,
                 "sessions": sessions,
                 "related": related,
-                **stages,
+                **(stages[0] if stages else {}),
             }
         else:
             method, suffix = {
@@ -134,6 +150,39 @@ async def execute_ticket_tool(
         )
     except (ValueError, httpx.HTTPError) as exc:
         return json.dumps({"error": str(exc)})
+
+
+# Compact list rows keep what a board scan needs; read one ticket for the rest.
+_COMPACT_TICKET_FIELDS = (
+    "id",
+    "title",
+    "stage_id",
+    "labels",
+    "latest_update",
+    "updated_at",
+    "comment_count",
+    "has_running_agents",
+    "needs_final_update",
+)
+_COMPACT_STAGE_FIELDS = ("id", "name", "is_complete")
+_LATEST_UPDATE_MAX_CHARS = 160
+
+
+def _compact_page(page: dict[str, Any]) -> dict[str, Any]:
+    rows = []
+    for ticket in page.get("data", []):
+        row = {key: ticket[key] for key in _COMPACT_TICKET_FIELDS if key in ticket}
+        latest = row.get("latest_update")
+        if isinstance(latest, str) and len(latest) > _LATEST_UPDATE_MAX_CHARS:
+            row["latest_update"] = latest[: _LATEST_UPDATE_MAX_CHARS - 1].rstrip() + "…"
+        rows.append(row)
+    compact = {key: value for key, value in page.items() if key not in ("data", "stages")}
+    compact["stages"] = [
+        {key: stage[key] for key in _COMPACT_STAGE_FIELDS if key in stage}
+        for stage in page.get("stages", [])
+    ]
+    compact["data"] = rows
+    return compact
 
 
 async def _resolve_identity(

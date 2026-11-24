@@ -16,7 +16,7 @@ TICKET = "c" * 32
 @pytest.mark.parametrize(
     "name,args,method,suffix,expected",
     [
-        ("sys_ticket_list", {"stage_id": "open", "limit": 2}, "GET", "", None),
+        ("sys_ticket_list", {"stage_id": "open", "limit": 2, "compact": False}, "GET", "", None),
         (
             "sys_ticket_create",
             {"title": "Do it"},
@@ -141,6 +141,8 @@ async def test_tools_use_only_the_callers_project(name, args, method, suffix, ex
             assert json.loads(request.content) == expected
         else:
             assert request.url.params["stage_id"] == "open" and request.url.params["limit"] == "2"
+            assert "compact" not in request.url.params
+            assert "include_guidance" not in request.url.params
         return httpx.Response(200, json={"ok": True})
 
     async with httpx.AsyncClient(
@@ -189,6 +191,87 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
     assert result["related"] == {"data": [], "has_more": False}
     assert result["stages"] == stages.model_dump()["stages"]
     assert result["initial_stage_id"] == "open"
+
+
+async def test_list_is_compact_by_default_and_get_can_skip_description_and_stages():
+    stages = default_ticket_stages()
+    seen = []
+    ticket = {
+        "id": TICKET,
+        "title": "Trim",
+        "description": "Long description " * 50,
+        "stage_id": "open",
+        "labels": [{"key": "needs-human"}],
+        "latest_update": "x" * 400,
+        "updated_at": 1,
+        "created_at": 0,
+        "comment_count": 2,
+        "has_running_agents": True,
+        "needs_final_update": False,
+        "agents": [{"agent_name": "a", "harness": "h"}],
+    }
+
+    def handler(request):
+        seen.append(request.url)
+        if request.url.path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        if request.url.path.endswith("/stages"):
+            return httpx.Response(200, json=stages.model_dump())
+        if request.url.path.endswith("/events"):
+            assert set(request.url.params) <= {"after", "kind", "limit"}
+            event = {"kind": "created", "payload": {"title": "Trim", "description": "Long"}}
+            return httpx.Response(200, json={"data": [event], "has_more": False})
+        if request.url.path.endswith("/sessions"):
+            return httpx.Response(200, json={"data": []})
+        if request.url.path.endswith("/related"):
+            return httpx.Response(200, json={"data": [{"id": SOURCE, "description": "Long"}]})
+        if request.url.path.endswith(f"/tickets/{TICKET}"):
+            assert request.url.params.get("include_guidance") == "true"
+            return httpx.Response(200, json={**ticket, "agent_guidance": "G"})
+        assert "include_guidance" not in request.url.params
+        return httpx.Response(
+            200,
+            json={**stages.model_dump(), "data": [ticket], "has_more": False, "last_id": TICKET},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        listed = json.loads(await execute_ticket_tool("sys_ticket_list", {}, client, SOURCE))
+        detail = json.loads(
+            await execute_ticket_tool(
+                "sys_ticket_get",
+                {
+                    "ticket_id": TICKET,
+                    "include_description": False,
+                    "include_stages": False,
+                    "include_guidance": True,
+                },
+                client,
+                SOURCE,
+            )
+        )
+    row = listed["data"][0]
+    assert set(row) == {
+        "id",
+        "title",
+        "stage_id",
+        "labels",
+        "latest_update",
+        "updated_at",
+        "comment_count",
+        "has_running_agents",
+        "needs_final_update",
+    }
+    assert len(row["latest_update"]) == 160 and row["latest_update"].endswith("…")
+    assert listed["stages"][0] == {"id": "open", "name": "Open", "is_complete": False}
+    assert listed["initial_stage_id"] == "open" and listed["last_id"] == TICKET
+    assert "description" not in detail["ticket"]
+    assert detail["ticket"]["agent_guidance"] == "G"
+    assert "description" not in detail["events"]["data"][0]["payload"]
+    assert "description" not in detail["related"]["data"][0]
+    assert "stages" not in detail
+    assert not any(url.path.endswith("/stages") for url in seen)
 
 
 @pytest.mark.parametrize(

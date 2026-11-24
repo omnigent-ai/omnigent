@@ -883,7 +883,13 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     source = project["main_session_id"]
     empty = json.loads(await execute_ticket_tool("sys_ticket_list", {}, project_client, source))
     assert empty["data"] == []
-    assert empty["agent_guidance"] == PROJECT_TICKET_WORK_INSTRUCTION
+    assert "agent_guidance" not in empty
+    guided = json.loads(
+        await execute_ticket_tool(
+            "sys_ticket_list", {"include_guidance": True}, project_client, source
+        )
+    )
+    assert guided["agent_guidance"] == PROJECT_TICKET_WORK_INSTRUCTION
     assert "agent_guidance" not in (await project_client.get(base)).json()
     stages = await project_client.get(base + "/stages")
     assert stages.status_code == 200 and stages.json()["initial_stage_id"] == "open"
@@ -928,6 +934,8 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         "agents": [],
         "agents_has_more": False,
         "has_running_agents": False,
+        "final_update": None,
+        "needs_final_update": False,
         **NOTHING_NEW,
     }
     assert (await project_client.get(f"{base}/{ticket['id']}/events")).json() == events_before
@@ -952,9 +960,11 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     assert events[-1]["session_id"] == source
     assert events[-1]["payload"]["reason"] == "stage_removed"
     assert (await project_client.post(base, json={"title": "Next"})).json()["stage_id"] == "triage"
-    listed = json.loads(await execute_ticket_tool("sys_ticket_list", {}, project_client, source))
+    listed = json.loads(
+        await execute_ticket_tool("sys_ticket_list", {"compact": False}, project_client, source)
+    )
     assert listed["stages"] == configured["stages"]
-    assert listed["agent_guidance"] == PROJECT_TICKET_WORK_INSTRUCTION
+    assert "agent_guidance" not in listed
     detail = json.loads(
         await execute_ticket_tool(
             "sys_ticket_get", {"ticket_id": ticket["id"]}, project_client, source
@@ -963,7 +973,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     assert detail["stages"][1]["instructions"] == "Attach recovery evidence"
     assert detail["stages"][1]["color"] == "purple"
     assert detail["stages"][1]["icon"] == "search"
-    assert detail["ticket"]["agent_guidance"] == PROJECT_TICKET_WORK_INSTRUCTION
+    assert "agent_guidance" not in detail["ticket"]
     moved = json.loads(
         await execute_ticket_tool(
             "sys_ticket_update",
@@ -1052,12 +1062,14 @@ async def test_agent_source_is_project_scoped_owned_bound_and_private(multi_user
     response = await client.post(path, json={"title": "Agent ticket"}, headers=headers)
     assert response.status_code == 201, response.text
     ticket_id = response.json()["id"]
-    assert (await client.get(path, headers=headers)).json()["agent_guidance"] == (
+    guided = {"include_guidance": "true"}
+    assert "agent_guidance" not in (await client.get(path, headers=headers)).json()
+    assert (await client.get(path, headers=headers, params=guided)).json()["agent_guidance"] == (
         PROJECT_TICKET_WORK_INSTRUCTION
     )
-    assert (await client.get(f"{path}/{ticket_id}", headers=headers)).json()["agent_guidance"] == (
-        PROJECT_TICKET_WORK_INSTRUCTION
-    )
+    assert (await client.get(f"{path}/{ticket_id}", headers=headers, params=guided)).json()[
+        "agent_guidance"
+    ] == PROJECT_TICKET_WORK_INSTRUCTION
     events = (await client.get(f"{path}/{ticket_id}/events", headers=headers)).json()["data"]
     assert events[0]["session_id"] == source.id and events[0]["user_id"] == ALICE
     stages = (await client.get(path + "/stages", headers=headers)).json()
