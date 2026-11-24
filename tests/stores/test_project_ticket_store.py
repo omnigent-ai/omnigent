@@ -1070,3 +1070,35 @@ def test_a_routed_persons_comment_clears_needs_human_but_keeps_routing_to_the_as
     assert tickets.get(project.id, ticket["id"], user_id="alice")["labels"] == [
         {"key": "needs-human"}
     ]
+
+
+def test_a_persons_sign_off_label_answers_the_ask_but_an_agents_does_not(board):
+    tickets, _, project = board
+    worker = TicketActor("alice", uuid4().hex, uuid4().hex)
+    owner = TicketActor("alice")
+    ticket = tickets.create(project.id, CreateTicket(title="Risky"), worker)
+    asked = [{"key": "risk", "value": "auth"}, {"key": "needs-human"}]
+    tickets.update(project.id, ticket["id"], UpdateTicket(labels=asked), worker)
+
+    # An agent adding a sign-off (the route refuses it; the store still mustn't treat it
+    # as an answer) leaves the ask open.
+    tickets.update(
+        project.id, ticket["id"], UpdateTicket(labels=[*asked, {"key": "push-ok"}]), worker
+    )
+    assert len(tickets.human_requests(user_id="alice")["data"]) == 1
+
+    # The owner removes needs-human themselves while adding risk-ok: the asker is still found.
+    signed = tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(labels=[asked[0], {"key": "push-ok"}, {"key": "risk-ok"}]),
+        owner,
+    )
+    assert {label["key"] for label in signed["labels"]} == {"risk", "push-ok", "risk-ok"}
+    event = tickets.events(project.id, ticket["id"], user_id="alice")["data"][-1]
+    assert event["payload"]["gate_labels_added"] == ["risk-ok"]
+    assert event["payload"]["answered_ask"] is True
+    assert "cleared_by_label" not in event["payload"]
+    context = tickets.person_comment_context(project.id, ticket["id"], event["position"])
+    assert context["asker"] == worker.session_id
+    assert tickets.human_requests(user_id="alice")["data"] == []

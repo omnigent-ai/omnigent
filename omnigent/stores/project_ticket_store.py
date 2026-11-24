@@ -149,6 +149,19 @@ def _note_audience(
 
 
 NEEDS_HUMAN_LABEL = "needs-human"
+# Sign-off labels that answer an ask: a person adding one clears needs-human, wakes the asker.
+GATE_LABELS = ("risk-ok", "product-ok", "owner-ok", "push-ok")
+
+
+def _gate_labels_added(
+    before: list[dict[str, Any]] | None, after: list[dict[str, Any]] | None
+) -> list[str]:
+    """The sign-off labels *after* has that *before* didn't, in ``GATE_LABELS`` order."""
+    keys_before = {label.get("key") for label in before or [] if isinstance(label, dict)}
+    keys_after = {label.get("key") for label in after or [] if isinstance(label, dict)}
+    return [key for key in GATE_LABELS if key in keys_after and key not in keys_before]
+
+
 PRODUCT_OK_LABEL = "product-ok"
 _UNDELIVERED = (NOTIFICATION_PENDING, NOTIFICATION_DIGEST, NOTIFICATION_ESCALATED)
 _URGENT = (NOTIFICATION_PENDING, NOTIFICATION_ESCALATED)
@@ -527,11 +540,18 @@ class ProjectTicketStore:
         return True
 
     def _clear_answered_ask(
-        self, session: Session, project: SqlProject, ticket: SqlProjectTicket, actor: TicketActor
+        self,
+        session: Session,
+        project: SqlProject,
+        ticket: SqlProjectTicket,
+        actor: TicketActor,
+        *,
+        by_label: str | None = None,
     ) -> None:
-        """Drop needs-human after the comment that answered it; the agent can add it back.
+        """Drop needs-human after the comment or sign-off label that answered it.
 
-        The comment itself carries the notification, so the label change wakes no one.
+        The agent can add it back. The answering event carries the notification, so
+        this label change wakes no one.
         """
         labels = [
             label
@@ -545,7 +565,10 @@ class ProjectTicketStore:
             ticket,
             actor,
             "updated",
-            {"changes": {"labels": labels}, "cleared_by_comment": True},
+            {
+                "changes": {"labels": labels},
+                **({"cleared_by_label": by_label} if by_label else {"cleared_by_comment": True}),
+            },
             quiet=True,
         )
 
@@ -1319,6 +1342,16 @@ class ProjectTicketStore:
             needs_human_changed = body.labels is not None and _has_needs_human(
                 changes.get("labels")
             ) != _has_needs_human(row.labels)
+            # A person's sign-off label answers their ask; judged on the labels before it.
+            person = actor.session_id is None and actor.agent_id is None
+            gates_added = (
+                _gate_labels_added(row.labels, changes.get("labels"))
+                if body.labels is not None and person
+                else []
+            )
+            label_answers_ask = bool(gates_added) and self._answers_open_ask(
+                session, project, row, actor
+            )
             for key, value in changes.items():
                 setattr(row, key, value)
             if target is not None:
@@ -1333,9 +1366,16 @@ class ProjectTicketStore:
                     row,
                     actor,
                     "updated",
-                    {"changes": changes, **({"stage": _stage_snapshot(target)} if target else {})},
+                    {
+                        "changes": changes,
+                        **({"stage": _stage_snapshot(target)} if target else {}),
+                        **({"gate_labels_added": gates_added} if gates_added else {}),
+                        **({"answered_ask": True} if label_answers_ask else {}),
+                    },
                     needs_human_changed=needs_human_changed,
                 )
+                if label_answers_ask and _has_needs_human(row.labels):
+                    self._clear_answered_ask(session, project, row, actor, by_label=gates_added[0])
             if body.final:
                 _require_complete(project, row)
                 _require_human_final(body.comment or "")
@@ -1787,7 +1827,7 @@ class ProjectTicketStore:
                     ask
                     for ask in reversed(asks)
                     if ask.start < before_position
-                    and (ask.end is None or ask.end > before_position)
+                    and (ask.end is None or ask.end >= before_position)
                 ),
                 None,
             )

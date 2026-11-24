@@ -19,6 +19,8 @@ from omnigent.entities.project import Project
 from omnigent.server.project_orchestrator import (
     ticket_batch_message,
     ticket_comment_for_worker_message,
+    ticket_gate_label_for_merger_message,
+    ticket_gate_label_for_worker_message,
 )
 from omnigent.server.project_router import (
     choose_router,
@@ -29,11 +31,14 @@ from omnigent.server.project_router import (
 from omnigent.server.session_delivery import deliver_to_session
 from omnigent.server.startup_inputs import ManagedStartupInputs
 from omnigent.server.ticket_responder import ROUTER, assignee_name, responder_order
-from omnigent.server.ticket_review import REVIEW_STAGE_ID, REVIEWER_NAME
+from omnigent.server.ticket_review import APPROVED_LABEL, REVIEW_STAGE_ID, REVIEWER_NAME
+
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 
 _logger = logging.getLogger(__name__)
+# The persona that lands approved commits; told when a sign-off unblocks one.
+MERGER_NAME = "Merger"
 
 DIGEST_SECONDS_ENV = "OMNIGENT_ORCHESTRATOR_DIGEST_SECONDS"
 DEFAULT_DIGEST_SECONDS = 180.0
@@ -50,11 +55,17 @@ def _env_seconds(name: str, default: float) -> float:
         return default
 
 
+def _adds_gate_label(event: dict[str, Any]) -> bool:
+    """A person's edit that added a sign-off label such as ``risk-ok``."""
+    return event["kind"] == "updated" and bool(event["payload"].get("gate_labels_added"))
+
+
 def _routes_to_workers(event: dict[str, Any]) -> bool:
-    """A person's new comment, not yet answered by or escalated past the ticket's workers."""
+    """A person's new comment or sign-off label, not yet answered by or escalated past the
+    ticket's workers."""
     return (
         event["urgent"]
-        and event["kind"] == "comment"
+        and (event["kind"] == "comment" or _adds_gate_label(event))
         and event["session_id"] is None
         and event["agent_id"] is None
         and not event.get("escalated")
@@ -209,7 +220,11 @@ class ProjectTicketNotifications:
             commenters=context["commenters"],
             in_review=context["stage_id"] == REVIEW_STAGE_ID,
         )
-        text = ticket_comment_for_worker_message(project.id, event)
+        text = (
+            ticket_gate_label_for_worker_message(project.id, event)
+            if _adds_gate_label(event)
+            else ticket_comment_for_worker_message(project.id, event)
+        )
         for session_id in order:
             if session_id is ROUTER:
                 return False
@@ -230,6 +245,43 @@ class ProjectTicketNotifications:
             )
         return False
 
+    async def _tell_merger(self, app: Any, project: Project, event: dict[str, Any]) -> None:
+        """Wake the Merger when a person's sign-off unblocks a ticket's approved commit."""
+        if not _adds_gate_label(event):
+            return
+        ticket = await asyncio.to_thread(
+            self.tickets.get, project.id, event["ticket_id"], user_id=project.user_id
+        )
+        ticket = ticket.get("ticket", ticket)
+        approved = next(
+            (
+                label.get("value")
+                for label in ticket.get("labels") or []
+                if label.get("key") == APPROVED_LABEL and label.get("value")
+            ),
+            None,
+        )
+        if approved is None:
+            return
+        merger = next(
+            (
+                identity
+                for identity in await project_identities(app, project)
+                if identity.name.casefold() == MERGER_NAME.casefold()
+            ),
+            None,
+        )
+        if merger is None or not merger.active_session_id:
+            return
+        stable_id = hashlib.sha256(f"{event['id']}:merger".encode()).hexdigest()[:32]
+        await self.deliver_to_session(
+            app,
+            project,
+            merger.active_session_id,
+            stable_id=stable_id,
+            text=ticket_gate_label_for_merger_message(project.id, event, approved),
+        )
+
     async def _deliver_project(self, app: Any, project_id: str, *, digest_due: bool) -> None:
         events = await asyncio.to_thread(self.tickets.project_pending_notifications, project_id)
         if not events:
@@ -246,6 +298,8 @@ class ProjectTicketNotifications:
             event["project_owner"] = project.user_id
         remaining = []
         for event in events:
+            if _routes_to_workers(event):
+                await self._tell_merger(app, project, event)
             if _routes_to_workers(event) and await self._route_to_workers(app, project, event):
                 # The orchestrator hears about it in a digest once a worker replies,
                 # or urgently if none replies in time.

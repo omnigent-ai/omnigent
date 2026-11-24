@@ -73,6 +73,41 @@ def ticket_comment_for_worker_message(project_id: str, event: dict[str, Any]) ->
     )
 
 
+def _gate_labels_text(event: dict[str, Any]) -> str:
+    return ", ".join(f"`{key}`" for key in event["payload"].get("gate_labels_added") or [])
+
+
+def ticket_gate_label_for_worker_message(project_id: str, event: dict[str, Any]) -> str:
+    """A worker's turn when a person adds a sign-off label, such as ``risk-ok``."""
+    title = event.get("ticket_title") or ""
+    cleared = (
+        " That answered the ticket's needs-human ask, so the label was cleared; if it doesn't "
+        "resolve your question, add needs-human back with sys_ticket_update, keeping the other "
+        "labels, and ask again exactly."
+        if event["payload"].get("answered_ask")
+        else ""
+    )
+    return (
+        f'A person added {_gate_labels_text(event)} on ticket {event["ticket_id"]} "{title}" '
+        f"in project {project_id}, which you are linked to.{cleared}\n\n"
+        "Carry on with the step that waited on it: for example, hand the approved SHA to "
+        "whoever lands it, or retry the gate check. You are the one agent woken for it. "
+        "Note what you did on the ticket with sys_ticket_comment."
+    )
+
+
+def ticket_gate_label_for_merger_message(
+    project_id: str, event: dict[str, Any], approved: str
+) -> str:
+    """The Merger's turn when a person's sign-off unblocks a ticket's approved commit."""
+    title = event.get("ticket_title") or ""
+    return (
+        f'A person added {_gate_labels_text(event)} on ticket {event["ticket_id"]} "{title}" '
+        f"in project {project_id}. Its approved commit is `{approved}`. If it is waiting in "
+        "your landing stack on that sign-off, check every gate again and continue landing it."
+    )
+
+
 _SNIPPET_CHARS = 140
 
 

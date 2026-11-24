@@ -258,3 +258,21 @@ def test_worker_turn_says_when_a_comment_cleared_needs_human():
     assert "cleared" not in ticket_comment_for_worker_message("p1", event)
     event["payload"]["cleared_needs_human"] = True
     assert "add needs-human back" in ticket_comment_for_worker_message("p1", event)
+
+
+def test_sign_off_turns_name_the_label_and_the_approved_commit():
+    from omnigent.server.project_orchestrator import (
+        ticket_gate_label_for_merger_message,
+        ticket_gate_label_for_worker_message,
+    )
+
+    event = {
+        "ticket_id": "t1",
+        "ticket_title": "Risky",
+        "payload": {"gate_labels_added": ["risk-ok"]},
+    }
+    assert "added `risk-ok`" in ticket_gate_label_for_worker_message("p1", event)
+    assert "cleared" not in ticket_gate_label_for_worker_message("p1", event)
+    event["payload"]["answered_ask"] = True
+    assert "add needs-human back" in ticket_gate_label_for_worker_message("p1", event)
+    assert "`" + "b" * 40 + "`" in ticket_gate_label_for_merger_message("p1", event, "b" * 40)

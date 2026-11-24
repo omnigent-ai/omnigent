@@ -1841,3 +1841,73 @@ async def test_shared_member_requests_are_attributed_and_approval_stays_the_owne
         )
     ).json()["data"]
     assert [event["payload"]["url"] for event in outputs] == [url]
+
+
+async def test_a_persons_sign_off_label_clears_the_ask_and_wakes_the_asker_and_merger(
+    project_client, project_app, db_uri
+):
+    project = (await project_client.post("/v1/projects", json={"name": "Sign-off"})).json()
+    store = SqlAlchemyConversationStore(db_uri)
+    worker = store.create_conversation(project_id=project["id"]).id
+    for session_id in (project["main_session_id"], worker):
+        store.set_host_id(session_id, uuid4().hex, "/tmp/project")
+    merger = (
+        await project_client.post(
+            f"/v1/projects/{project['id']}/identities",
+            json={"name": "Merger", "instructions": "x"},
+        )
+    ).json()["active_session_id"]
+    service = project_app.state.project_ticket_notifications
+    service.digest_seconds = service.worker_reply_seconds = 3600
+    tickets = service.tickets
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Risky"})).json()
+    path = f"{base}/{ticket['id']}"
+    owner = (await project_client.get(f"{path}/events")).json()["data"][0]["user_id"]
+    as_worker = TicketActor(user_id=owner, session_id=worker)
+    tickets.link_session(project["id"], ticket["id"], worker, "attach", as_worker)
+    sha = "a" * 40
+    tickets.update(
+        project["id"],
+        ticket["id"],
+        UpdateTicket(labels=[{"key": "risk", "value": "auth"}, {"key": "approved", "value": sha}]),
+        TicketActor(user_id=owner),
+    )
+    asked = [{"key": "risk", "value": "auth"}, {"key": "approved", "value": sha}]
+    tickets.update(
+        project["id"],
+        ticket["id"],
+        UpdateTicket(labels=[*asked, {"key": "needs-human"}], comment="OK to land? Add risk-ok"),
+        as_worker,
+    )
+    await service.flush_page(project_app, force_digest=True)
+
+    def heard(text: str, session_id: str) -> bool:
+        return any(
+            text in part.get("text", "")
+            for pending in store.list_pending_inputs(session_id)
+            for part in pending.data.content
+        )
+
+    # An agent can't stand in: the server refuses its sign-off, and nothing clears.
+    refused = await project_client.patch(
+        path,
+        json={"labels": [*asked, {"key": "needs-human"}, {"key": "risk-ok"}]},
+        headers={ORCHESTRATION_SOURCE_HEADER: worker},
+    )
+    assert refused.status_code == 403
+    # The owner keeps needs-human in the list they send; adding risk-ok answers the ask.
+    signed = await project_client.patch(
+        path, json={"labels": [*asked, {"key": "needs-human"}, {"key": "risk-ok"}]}
+    )
+    assert signed.status_code == 200, signed.text
+    await service.flush_page(project_app)
+
+    labels = (await project_client.get(path)).json()["labels"]
+    assert {label["key"] for label in labels} == {"risk", "approved", "risk-ok"}
+    events = (await project_client.get(f"{path}/events")).json()["data"]
+    assert events[-1]["payload"]["cleared_by_label"] == "risk-ok"
+    assert events[-2]["payload"]["gate_labels_added"] == ["risk-ok"]
+    assert heard("A person added `risk-ok`", worker) and heard("needs-human ask", worker)
+    assert heard(f"Its approved commit is `{sha}`", merger)
+    assert not heard("A person added `risk-ok`", project["main_session_id"])
