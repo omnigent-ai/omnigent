@@ -1056,6 +1056,39 @@ def _post_hook_with_reattach(
             backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
 
 
+def _permission_hook_reauth(
+    bridge_dir: Path, server_url: str, headers: dict[str, str]
+) -> Callable[[], dict[str, str] | None]:
+    """
+    Renew the permission hook's auth from the runner's refreshed header snapshot.
+
+    The hook cannot mint a token itself (the runner keeps its credential from
+    child processes), so a prompt parked past its token's lifetime takes the
+    headers the runner last wrote to ``permission_hook.json``. Only when that
+    snapshot has not changed does it fall back to minting one.
+
+    :param bridge_dir: Bridge directory holding ``permission_hook.json``.
+    :param server_url: Omnigent server URL the hook POSTs to.
+    :param headers: Headers the hook started with.
+    :returns: A reauth callable for :func:`_post_hook_with_reattach`.
+    """
+    from omnigent.native.native_policy_hook import policy_hook_reauth
+
+    mint = policy_hook_reauth(server_url, headers)
+    seen = [read_permission_hook_config(bridge_dir).get("ap_auth_headers")]
+
+    def reauth() -> dict[str, str] | None:
+        snapshot = read_permission_hook_config(bridge_dir).get("ap_auth_headers")
+        if isinstance(snapshot, dict) and snapshot and snapshot != seen[0]:
+            seen[0] = snapshot
+            fresh = {str(key): str(value) for key, value in snapshot.items()}
+            _merge_identity_headers(fresh, server_url)
+            return fresh
+        return mint()
+
+    return reauth
+
+
 def _main_permission_request(argv: list[str]) -> int:
     """
     Forward one Claude ``PermissionRequest`` hook to the active Omnigent session.
@@ -1069,8 +1102,6 @@ def _main_permission_request(argv: list[str]) -> int:
         to its terminal prompt; an ``AskUserQuestion`` is denied instead so
         Claude asks it in chat text.
     """
-    from omnigent.native.native_policy_hook import policy_hook_reauth
-
     args = _parse_permission_args(argv)
     raw = sys.stdin.read()
     try:
@@ -1111,7 +1142,7 @@ def _main_permission_request(argv: list[str]) -> int:
         headers,
         payload,
         "claude permission",
-        reauth=policy_hook_reauth(ap_server_url, headers),
+        reauth=_permission_hook_reauth(bridge_dir, ap_server_url, headers),
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
         answer_window_s=(
             PRE_RESOLVED_ELICITATION_TTL_S - _QUESTION_ANSWER_WINDOW_MARGIN_S

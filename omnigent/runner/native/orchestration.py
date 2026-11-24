@@ -437,6 +437,48 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     task.add_done_callback(_evict)
 
 
+# A parked permission hook re-reads this snapshot when its token lapses, and
+# runner bearers refresh minutes before expiry, so a minute keeps it current.
+_PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S = 60.0
+
+
+async def _refresh_claude_permission_hook_auth(
+    *,
+    bridge_dir: Path,
+    server_url: str,
+    auth_token_factory: Callable[[], str | None],
+    refresh_interval_s: float = _PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S,
+) -> None:
+    """Keep the Claude permission hook's header snapshot on a live bearer.
+
+    The hook subprocess cannot mint a token of its own, so without this a
+    prompt that waits past the launch token's lifetime can no longer reach
+    the server.
+
+    :param bridge_dir: Owner-only Claude bridge directory.
+    :param server_url: Omnigent server receiving permission requests.
+    :param auth_token_factory: Refresh-capable runner bearer factory.
+    :param refresh_interval_s: Delay between snapshot refreshes.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.harnesses.claude_native.bridge import update_permission_hook_auth_headers
+
+    last_token: str | None = None
+    while True:
+        await asyncio.sleep(refresh_interval_s)
+        try:
+            token = await asyncio.to_thread(auth_token_factory)
+            if token and token != last_token:
+                headers = databricks_request_headers(server_url, bearer_token=token)
+                if update_permission_hook_auth_headers(bridge_dir, headers):
+                    last_token = token
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Keep the last snapshot and retry on the next tick.
+            _logger.warning("Could not refresh Claude permission-hook auth", exc_info=True)
+
+
 # Background tasks that re-pop a still-pending cost-budget approval on a
 # terminal client that attaches after the ASK fired. Kept referenced so
 # they aren't garbage-collected before they run.
@@ -10583,6 +10625,18 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.forwarder import supervise_forwarder
 
     async def _supervise_bridge() -> None:
+        hook_auth_task = (
+            asyncio.create_task(
+                _refresh_claude_permission_hook_auth(
+                    bridge_dir=bridge_dir,
+                    server_url=server_url,
+                    auth_token_factory=_auth_factory,
+                ),
+                name=f"claude-hook-auth-{session_id}",
+            )
+            if _auth_factory is not None
+            else None
+        )
         try:
             await supervise_forwarder(
                 base_url=server_url,
@@ -10596,6 +10650,9 @@ async def _auto_create_claude_terminal(
                 event_dispatcher=event_dispatcher,
             )
         finally:
+            if hook_auth_task is not None:
+                hook_auth_task.cancel()
+                await asyncio.gather(hook_auth_task, return_exceptions=True)
             await _shutdown_session_router_async(session_id, _subagent_router)
             await _shutdown_session_turn_router_async(session_id, _claude_turn_router)
 
