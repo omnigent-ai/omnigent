@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import secrets
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -190,6 +191,24 @@ def should_skip_permissions(
     if permission_mode == _BYPASS_PERMISSION_MODE:
         return True
     return headless
+
+
+def agy_argv_model(argv: Sequence[str]) -> str | None:
+    """Return the model an agy argv launches with, or ``None`` for agy's default.
+
+    Reads the last ``--model`` so pass-through args and provider-configured
+    models are both seen as agy itself would see them.
+
+    :param argv: agy argv as built by :func:`build_agy_launch`.
+    :returns: The effective ``--model`` value, if any.
+    """
+    model: str | None = None
+    for index, arg in enumerate(argv):
+        if arg == "--model" and index + 1 < len(argv):
+            model = argv[index + 1]
+        elif arg.startswith("--model="):
+            model = arg.removeprefix("--model=")
+    return model or None
 
 
 def build_agy_launch(

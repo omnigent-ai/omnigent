@@ -14,7 +14,7 @@ from omnigent.harnesses.antigravity_native.credentials import (
     antigravity_credentials_ready,
     resolve_antigravity_credentials,
 )
-from omnigent.harnesses.antigravity_native.launch import build_agy_launch
+from omnigent.harnesses.antigravity_native.launch import agy_argv_model, build_agy_launch
 from omnigent.onboarding import secrets
 from omnigent.onboarding.configure_models import build_gateway_provider_entry
 from omnigent.onboarding.gemini_gateway import GEMINI_API_BASE_URL, validate_gemini_base_url
@@ -67,6 +67,14 @@ def test_saved_gateway_drives_launch_and_isolated_settings(tmp_path: Path, resum
     settings = json.loads((tmp_path / "session/.gemini/antigravity-cli/settings.json").read_text())
     assert settings["modelProvider"] == "gemini"
     assert "gateway-fake-key" not in json.dumps(settings)
+
+
+def test_saved_provider_model_is_the_effective_launch_model(tmp_path: Path) -> None:
+    """With no requested model, the seed must see the provider's ``--model``."""
+    secrets.store_secret("gateway", "gateway-fake-key")
+    save_provider(tmp_path)
+    argv, _ = build_agy_launch(conversation_id=None, model=None, resume=False)
+    assert agy_argv_model(argv) == "Gemini 3.1 Pro (High)"
 
 
 def test_explicit_model_wins(tmp_path: Path) -> None:

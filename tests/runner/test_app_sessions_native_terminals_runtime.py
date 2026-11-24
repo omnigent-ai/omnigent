@@ -2661,6 +2661,8 @@ async def _run_antigravity_auto_create(
     lsof_attributes_ports: bool = False,
     build_agy_launch_calls: list[dict[str, Any]] | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    launch_argv: tuple[str, ...] = ("agy",),
+    seed_calls: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
     """
     Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
@@ -2695,6 +2697,8 @@ async def _run_antigravity_auto_create(
         the auto-create path forwards (e.g. snapshot ``terminal_launch_args`` →
         ``extra_args``).
     :param auth_token_factory: Optional runner credential source for the launch.
+    :param launch_argv: argv the stubbed ``build_agy_launch`` returns.
+    :param seed_calls: When provided, records kwargs passed to the isolated-home seed.
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
@@ -2717,11 +2721,17 @@ async def _run_antigravity_auto_create(
     def _fake_build_agy_launch(**kwargs: Any) -> tuple[tuple[str, ...], dict[str, str]]:
         if build_agy_launch_calls is not None:
             build_agy_launch_calls.append(kwargs)
-        return (("agy",), {"AGY_ENV": "1"})
+        return (launch_argv, {"AGY_ENV": "1"})
 
     monkeypatch.setattr(launch_mod, "build_agy_launch", _fake_build_agy_launch)
     monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
-    monkeypatch.setattr(bridge_mod, "seed_isolated_agy_home", lambda *_args, **_kwargs: {})
+
+    def _fake_seed(*_args: Any, **kwargs: Any) -> dict[str, str]:
+        if seed_calls is not None:
+            seed_calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(bridge_mod, "seed_isolated_agy_home", _fake_seed)
     # Auto-create now spawns the RPC reader (NOT the transcript forwarder); stub
     # ``supervise_reader`` at its definition module (the helper imports it lazily)
     # so the test does not start a real one. The reader is wrapped in
@@ -2930,6 +2940,43 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
     # Bypass must come only from the pass-through args on this attended path.
     assert call["permission_mode"] is None
     assert call["headless"] is False
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "launch_argv", "seeded_model"),
+    (
+        ({}, ("agy",), None),
+        (
+            {"model_override": "gemini-3.1-pro-high"},
+            ("agy", "--model", "gemini-3.1-pro-high"),
+            "gemini-3.1-pro-high",
+        ),
+        # No session model: the launcher substituted the configured provider's model.
+        ({}, ("agy", "--model", "provider-model"), "provider-model"),
+    ),
+    ids=("agy-default", "session-model", "provider-model"),
+)
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_seeds_with_effective_launch_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: dict[str, Any],
+    launch_argv: tuple[str, ...],
+    seeded_model: str | None,
+) -> None:
+    """The isolated-home seed sees the ``--model`` agy launches with, not the request."""
+    seed_calls: list[dict[str, Any]] = []
+    await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id="93c6f9222c7ac0f45ba2736b57b51f88",
+        snapshot=snapshot,
+        candidate_ports=[52549],
+        launch_argv=launch_argv,
+        seed_calls=seed_calls,
+    )
+    assert len(seed_calls) == 1
+    assert seed_calls[0]["launch_model"] == seeded_model
 
 
 @pytest.mark.parametrize(

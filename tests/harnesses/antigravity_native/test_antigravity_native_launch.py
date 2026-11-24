@@ -13,6 +13,7 @@ import pytest
 import omnigent.harnesses.antigravity_native.launch as _mod
 from omnigent.harnesses.antigravity_native.launch import (
     NativeAntigravityLaunch,
+    agy_argv_model,
     agy_binary_path,
     build_agy_launch,
     resolve_native_antigravity_launch,
@@ -428,3 +429,18 @@ class TestShouldSkipPermissions:
     def test_none_mode_headless_true(self) -> None:
         """``None`` mode + headless skips (headless wins regardless of mode)."""
         assert should_skip_permissions(permission_mode=None, headless=True) is True
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    (
+        (["agy"], None),
+        (["agy", "--model", "gemini-3.1-pro-high"], "gemini-3.1-pro-high"),
+        (["agy", "--model=claude-sonnet-4-6"], "claude-sonnet-4-6"),
+        # A later pass-through flag overrides the generated one, as in agy.
+        (["agy", "--model", "first", "--model=second"], "second"),
+        (["agy", "--model"], None),
+    ),
+)
+def test_agy_argv_model_reads_the_effective_model(argv: list[str], expected: str | None) -> None:
+    assert agy_argv_model(argv) == expected

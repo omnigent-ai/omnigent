@@ -7279,7 +7279,7 @@ async def _auto_create_antigravity_terminal(
         write_mcp_config,
         write_tmux_target,
     )
-    from omnigent.harnesses.antigravity_native.launch import build_agy_launch
+    from omnigent.harnesses.antigravity_native.launch import agy_argv_model, build_agy_launch
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 
     if server_client is None:
@@ -7383,7 +7383,7 @@ async def _auto_create_antigravity_terminal(
             seed_isolated_agy_home,
             bridge_dir,
             trusted_workspace=workspace,
-            launch_model=model,
+            launch_model=agy_argv_model(argv),
         ),
     }
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
