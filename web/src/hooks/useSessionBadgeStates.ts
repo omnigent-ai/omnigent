@@ -17,6 +17,7 @@ type BadgeConversation = Pick<
   | "pending_elicitations_count"
   | "background_work_running"
   | "blocked_on"
+  | "harness"
 >;
 
 /** A healthy loaded transcript's latest error, or undefined when the row's label decides. */

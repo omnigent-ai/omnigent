@@ -30,6 +30,7 @@ function stateLabel(state: SessionState | null, status: Conversation["status"]):
     case "awaiting":
       return "Needs response";
     case "running":
+      return state.shell ? "Background shell running" : "Running";
     case "starting":
       return "Running";
     case "unseen":

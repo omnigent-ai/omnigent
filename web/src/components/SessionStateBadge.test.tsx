@@ -73,6 +73,17 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(container.querySelector('[data-testid="running-dot"]')).not.toBeNull();
   });
 
+  it("renders background shells alone as a static terminal icon, not the spinner", () => {
+    const { container } = renderBadge({ kind: "running", background: true, shell: true });
+    const badge = screen.getByRole("img", { name: "Agent idle, background shell still running" });
+    expect(badge).toHaveAttribute("data-state", "running");
+    expect(container.querySelector('[data-testid="running-dot"]')).toBeNull();
+    expect(container.querySelector(".animate-spin")).toBeNull();
+    const icon = screen.getByTestId("background-shell-icon");
+    expect(icon).toHaveClass("lucide-square-terminal", "text-muted-foreground");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
+  });
+
   it("renders starting with the same spinner as running and its own label", () => {
     const { container } = renderBadge({ kind: "starting" });
     const badge = screen.getByTestId("session-state-badge");

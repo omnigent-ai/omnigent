@@ -4112,6 +4112,7 @@ function projectMarkerState(
   let awaiting = 0;
   let terminalReason: string | undefined;
   let running = false;
+  let shellOnly = false;
   let starting = false;
   let error = false;
   let disconnected = false;
@@ -4125,7 +4126,8 @@ function projectMarkerState(
       awaiting += state.count;
       terminalReason ??= state.terminalReason;
     } else if (state?.kind === "running") {
-      running = true;
+      if (state.shell) shellOnly = true;
+      else running = true;
     } else if (c.id === startingConversationId) {
       starting = true;
     } else if (state?.kind === "error") {
@@ -4139,6 +4141,7 @@ function projectMarkerState(
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
   if (terminalReason) return { kind: "awaiting", count: 0, terminalReason };
   if (running) return { kind: "running" };
+  if (shellOnly) return { kind: "running", background: true, shell: true };
   if (starting) return { kind: "starting" };
   if (error) return { kind: "error" };
   if (disconnected) return { kind: "disconnected" };
@@ -7048,6 +7051,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "pending_elicitations_count",
   "background_work_running",
   "blocked_on",
+  "harness",
   "provisional",
   "nested_draft_source_id",
   "project_draft_name",

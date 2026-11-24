@@ -2003,6 +2003,29 @@ describe("Sidebar failed session indicator", () => {
     );
   });
 
+  it.each([
+    ["claude-native", "Claude Code", "Agent idle, background shell still running", false],
+    ["codex-native", "Codex", "Working in the background", true],
+  ])(
+    "shows a seen %s row (%s) with background work as %s, spinning=%s",
+    (harness, agentName, label, spinning) => {
+      const session = conv("conv_background", agentName, {
+        status: "idle",
+        background_work_running: true,
+        harness,
+        updated_at: 200,
+      });
+      seedReadState([{ id: session.id, viewer_last_seen: 200 }]);
+      mockConversations([session]);
+      renderSessionSidebar();
+
+      const row = screen.getByRole("link", { name: "conv_background" }).closest("li")!;
+      const badge = within(row).getByRole("img", { name: label });
+      expect(badge).toHaveAttribute("data-state", "running");
+      expect(within(badge).queryByTestId("running-dot") !== null).toBe(spinning);
+    },
+  );
+
   it("keeps the error icon on the active, already-read session", () => {
     const session = conv("conv_error", "Codex", {
       status: "idle",
@@ -3884,6 +3907,36 @@ describe("Sidebar collapsed project marker", () => {
       expect(
         within(screen.getByTestId("project-show-more")).getByTestId("session-state-badge"),
       ).toHaveAttribute("data-state", expected);
+    },
+  );
+
+  it.each([false, true])(
+    "shows a collapsed project's background shells unless a turn runs, turnRunning=%s",
+    (turnRunning) => {
+      projectsMock.push("Customer X");
+      seedReadState([
+        { id: "conv_turn", viewer_last_seen: 300 },
+        { id: "conv_shell", viewer_last_seen: 300 },
+      ]);
+      mockConversations([
+        conv("conv_turn", "Codex", {
+          labels: { omni_project: "Customer X" },
+          status: turnRunning ? "running" : "idle",
+          updated_at: 300,
+        }),
+        conv("conv_shell", "Claude Code", {
+          labels: { omni_project: "Customer X" },
+          status: "idle",
+          background_work_running: true,
+          harness: "claude-native",
+          updated_at: 300,
+        }),
+      ]);
+      renderSidebar();
+      const header = screen.getByRole("button", { name: /^Customer X/ });
+      expect(within(header).getByTestId("session-state-badge")).toHaveAccessibleName(
+        turnRunning ? "Session running" : "Agent idle, background shell still running",
+      );
     },
   );
 
