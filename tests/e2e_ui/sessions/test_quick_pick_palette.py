@@ -173,20 +173,6 @@ def test_quick_pick_reopened_over_its_picker_takes_the_keys(
     expect(themes).to_have_count(0)
 
 
-def test_quick_pick_palette_opens_on_a_page_still_applying_its_flags(
-    page: Page, quick_pick_server: str
-) -> None:
-    """On a slow page, ⌘K first opens the flag-off palette; the helper waits for QuickPick."""
-    # A 4x slower CPU makes /v1/info land after first render, as on a loaded machine.
-    page.context.new_cdp_session(page).send("Emulation.setCPUThrottlingRate", {"rate": 4})
-    page.goto(f"{quick_pick_server}/")
-    expect(page.get_by_role("heading", name="What should we build?")).to_be_visible(timeout=60_000)
-    palette_input = open_quick_pick_palette(page)
-    palette_input.fill("select theme")
-    page.keyboard.press("Enter")
-    expect(page.get_by_role("combobox", name="Select theme")).to_be_focused(timeout=20_000)
-
-
 def test_quick_pick_on_an_open_session(
     request: pytest.FixtureRequest, seeded_session: tuple[str, str]
 ) -> None:

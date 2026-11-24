@@ -7,10 +7,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
-  cancelRecentSessionSwitcher,
-  commitRecentSessionSwitcher,
   openRecentSessionSwitcher,
-  releaseRecentSessionSwitcher,
   stepRecentSessionSwitcher,
   useRecentSessionHotkey,
   useRecentSessionSwitchStore,
@@ -214,24 +211,6 @@ it("moves on when the selected session is deleted, without reordering the rest",
   ).toEqual([expect.stringContaining("Session a"), expect.stringContaining("Session c")]);
   key("keyup", { key: "Control" });
   expect(navigate.mock.calls).toEqual([["/c/c"]]);
-});
-
-it("never opens a session that went away, whether released, entered, or clicked", () => {
-  for (const accept of ["release", "enter", "click"] as const) {
-    navigate.mockClear();
-    useRecentSessionSwitchStore.setState({ readLiveSessionIds: () => new Set(["a", "b", "c"]) });
-    act(() => {
-      openRecentSessionSwitcher(1, { holding: true, navigate });
-    });
-    // Gone before the switcher's list caught up.
-    useRecentSessionSwitchStore.setState({ readLiveSessionIds: () => new Set(["a", "c"]) });
-    act(() => {
-      if (accept === "release") releaseRecentSessionSwitcher();
-      else commitRecentSessionSwitcher("b");
-    });
-    expect(navigate.mock.calls).toEqual(accept === "release" ? [["/c/c"]] : []);
-    act(() => cancelRecentSessionSwitcher());
-  }
 });
 
 it("closes without switching once no other session is left", async () => {

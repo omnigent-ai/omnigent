@@ -10,6 +10,7 @@ import {
   cancelRecentSessionSwitcher,
   commitRecentSessionSwitcher,
   openRecentSessionSwitcher,
+  releaseRecentSessionSwitcher,
   selectRecentSession,
   useClaimRecentSessionChord,
   useRecentSessionHotkey,
@@ -138,7 +139,7 @@ describe("useRecentSessionHotkey", () => {
     expect(selected()).toBe("c");
   });
 
-  it("Esc cancels and stays on the open session, even with Control still held", () => {
+  it("doesn't read Esc as a release, so cancelling stays on the open session", () => {
     renderHook(() => useRecentSessionHotkey(true));
     press(ctrlBracketRight);
     // The dialog closes on Esc; the binding must not read it as a release.
@@ -148,6 +149,22 @@ describe("useRecentSessionHotkey", () => {
     releaseControl();
     expect(opened()).toEqual([]);
     expect(switcher()).toBeNull();
+  });
+
+  it("never opens a session that went away, on release or on Enter or a click", () => {
+    for (const accept of ["release", "commit"] as const) {
+      navigate.mockClear();
+      useRecentSessionSwitchStore.setState({ readLiveSessionIds: () => new Set(["a", "b", "c"]) });
+      act(() => openRecentSessionSwitcher(1, { holding: true, navigate }));
+      // Gone before the switcher's list caught up.
+      useRecentSessionSwitchStore.setState({ readLiveSessionIds: () => new Set(["a", "c"]) });
+      act(() => {
+        if (accept === "release") releaseRecentSessionSwitcher();
+        else commitRecentSessionSwitcher("b");
+      });
+      expect(navigate.mock.calls).toEqual(accept === "release" ? [["/c/c"]] : []);
+      act(() => cancelRecentSessionSwitcher());
+    }
   });
 
   it("closes without switching when the window loses focus or is hidden", () => {

@@ -274,6 +274,9 @@ describe("the entry points and ⌘K agree", () => {
     await screen.findByText("Filed session");
     run("Select Sessions");
     expect(await screen.findByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+    // The selection covers the project's rows: clicking the filed session selects it.
+    fireEvent.click(screen.getByRole("link", { name: /Filed session/ }));
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
   });
 
   it("withdraws the project header's rows when grouping hides the Projects section", async () => {

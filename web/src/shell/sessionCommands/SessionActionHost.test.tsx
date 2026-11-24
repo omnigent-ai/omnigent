@@ -264,7 +264,8 @@ describe("SessionActionHost", () => {
   });
 
   it("does nothing on a server that doesn't move nests", async () => {
-    renderHost();
+    // Nests, but from before session_nest_moves.
+    renderHost(new QueryClient(), { ...FALLBACK_SERVER_INFO, sibling_sessions: true });
     act(() => requestSessionAction(SESSION, "move-to-nest"));
     await act(async () => {});
     expect(screen.queryByRole("combobox", { name: "Move session to a nest" })).toBeNull();

@@ -426,7 +426,7 @@ describe("archiving the open session", () => {
   it("opens the session visited before it from the row menu, as ⌃[ would", () => {
     mockConversations(SESSIONS);
     registerRecentSessions(["conv_b", "conv_c", "conv_a"]);
-    renderOnSession("conv_b");
+    renderOnSession("conv_b", { quickPick: true });
     openRowMenu("Bravo");
     fireEvent.click(screen.getByTestId("archive-conversation"));
 
@@ -439,7 +439,7 @@ describe("archiving the open session", () => {
   it("opens the most recent session not being archived after a bulk archive", () => {
     mockConversations(SESSIONS);
     registerRecentSessions(["conv_b", "conv_c", "conv_a"]);
-    renderOnSession("conv_b");
+    renderOnSession("conv_b", { quickPick: true });
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
     fireEvent.click(screen.getByRole("link", { name: /Bravo/ }));
     fireEvent.click(screen.getByRole("link", { name: /Charlie/ }));

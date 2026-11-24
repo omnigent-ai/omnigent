@@ -1,14 +1,6 @@
-// ⌃] / ⌃[ switch sessions by recency through a transient switcher, like macOS
-// ⌘Tab: the first press opens it one step from the open session, more presses
-// while Control is held cycle the selection, and releasing Control opens it.
-// Esc cancels; Enter or a click opens the selection.
-//
-// The order is frozen when the switcher opens: visited sessions still live, most
-// recent first, then the rest in sidebar order. Opened before the sessions have
-// loaded, the switcher remembers the presses, and a release, until they arrive.
-//
-// macOS only: there Control is free, while on Windows/Linux Ctrl is the command
-// key and Ctrl+[ / Ctrl+] are taken. ⌘K opens the switcher on every platform.
+// ⌃] / ⌃[ switch sessions by recency, like macOS ⌘Tab; releasing Control opens the selection.
+// The order is frozen when the switcher opens, and presses made before the sessions load are
+// kept, with a release, until they arrive.
 
 import { useEffect, useRef } from "react";
 import { create } from "zustand";

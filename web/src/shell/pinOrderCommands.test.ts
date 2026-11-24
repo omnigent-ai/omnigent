@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  PIN_ORDER_COMMAND_IDS,
-  PIN_ORDER_SAVING_REASON,
-  type PinOrderFacts,
-  pinOrderCommands,
-} from "./pinOrderCommands";
+import { PIN_ORDER_SAVING_REASON, type PinOrderFacts, pinOrderCommands } from "./pinOrderCommands";
 
 const PINNED = ["a", "b", "c", "d"];
 
@@ -20,12 +15,6 @@ function targets(input: Partial<PinOrderFacts>) {
 }
 
 describe("pinOrderCommands", () => {
-  it("lists every move once, in menu order", () => {
-    expect(pinOrderCommands(facts()).map((command) => command.id)).toEqual([
-      ...PIN_ORDER_COMMAND_IDS,
-    ]);
-  });
-
   it("targets the first pin, the one above, and the one below", () => {
     expect(targets({ sessionId: "c" })).toEqual({
       "move-pin-to-top": "a",
@@ -65,11 +54,11 @@ describe("pinOrderCommands", () => {
     }
   });
 
-  it("names each move by where it puts the session in Pinned", () => {
-    expect(pinOrderCommands(facts()).map((command) => command.label)).toEqual([
-      "Move to top of Pinned",
-      "Move up in Pinned",
-      "Move down in Pinned",
+  it("lists each move once, in menu order, named by where it puts the session in Pinned", () => {
+    expect(pinOrderCommands(facts()).map(({ id, label }) => [id, label])).toEqual([
+      ["move-pin-to-top", "Move to top of Pinned"],
+      ["move-pin-up", "Move up in Pinned"],
+      ["move-pin-down", "Move down in Pinned"],
     ]);
   });
 });
