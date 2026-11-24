@@ -107,9 +107,24 @@ def test_command_palette_reopened_while_closing_takes_typed_keys(
     palette_input = page.get_by_test_id("command-palette-input")
     expect(palette_input).to_be_focused(timeout=10_000)
 
+    # As ⌘K arrives, before the app handles it, note whether the closing palette is still there.
+    page.evaluate(
+        """() => {
+            const noteReopen = (event) => {
+                if (event.key.toLowerCase() !== "k") return;
+                window.removeEventListener("keydown", noteReopen, true);
+                window.__paletteClosingAtReopen =
+                    document.querySelector("[data-command-palette]") !== null;
+            };
+            window.addEventListener("keydown", noteReopen, true);
+        }"""
+    )
     # Clicking a row puts focus on the list as the palette closes; ⌘K comes at once.
     page.get_by_role("dialog").get_by_text("e2e-palette-reopen-b").click()
     page.keyboard.press("ControlOrMeta+k")
+    assert page.evaluate("window.__paletteClosingAtReopen") is True, (
+        "⌘K arrived after the palette had finished closing"
+    )
     expect(palette_input).to_be_focused(timeout=10_000)
     page.keyboard.type("reopen")
     expect(palette_input).to_have_value("reopen")

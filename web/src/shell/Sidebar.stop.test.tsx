@@ -111,13 +111,21 @@ describe("sidebar Stop session item", () => {
     expect(screen.queryByTestId("stop-session-confirm")).toBeNull();
   });
 
-  it("reports a failed stop in a toast, since the dialog has closed", async () => {
-    mocks.stop.mutateAsync.mockRejectedValue(new Error("runner unreachable"));
+  it("reports a failed stop in a toast, even once the dialog and its row are gone", async () => {
+    let failStop: (error: Error) => void = () => {};
+    mocks.stop.mutateAsync.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        failStop = reject;
+      }),
+    );
     mockConversations([HOST_SPAWNED]);
-    renderSidebar();
+    const sidebar = renderSidebar();
     openKebab();
     fireEvent.click(screen.getByTestId("stop-conversation"));
     fireEvent.click(screen.getByRole("button", { name: "Stop session" }));
+    expect(screen.queryByTestId("stop-session-confirm")).toBeNull();
+    sidebar.unmount();
+    failStop(new Error("runner unreachable"));
     await waitFor(() =>
       expect(mocks.toast).toHaveBeenCalledWith("Couldn't stop the session: runner unreachable"),
     );
