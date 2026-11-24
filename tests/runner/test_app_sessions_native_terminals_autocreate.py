@@ -708,20 +708,22 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("terminal_args", "effort", "expected_levels", "expected_notices"),
+    ("terminal_args", "model_override", "effort", "expected_levels", "expected_notices"),
     [
-        (None, "high", ["high"], []),
-        (["--provider", "p", "--model", "m"], "high", ["high"], []),
-        (["--thinking", "low"], "high", ["low"], []),
-        (["--thinking=low"], "high", [], []),
-        (["--model", "p/m:low"], "high", [], []),
-        (None, "bogus", [], ["pi_native_effort_ignored"]),
+        (None, None, "high", ["high"], []),
+        (None, "anthropic/m:low", "high", [], []),
+        (["--provider", "p", "--model", "m"], None, "high", ["high"], []),
+        (["--thinking", "low"], None, "high", ["low"], []),
+        (["--thinking=low"], None, "high", [], []),
+        (["--model", "p/m:low"], None, "high", [], []),
+        (None, None, "bogus", [], ["pi_native_effort_ignored"]),
     ],
 )
 async def test_auto_create_pi_terminal_unmanaged_applies_session_effort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     terminal_args: list[str] | None,
+    model_override: str | None,
     effort: str,
     expected_levels: list[str],
     expected_notices: list[str],
@@ -745,6 +747,7 @@ async def test_auto_create_pi_terminal_unmanaged_applies_session_effort(
             terminal_launch_args=terminal_args,
             external_session_id=None,
             reasoning_effort=effort,
+            model_override=model_override,
         )
 
     monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)

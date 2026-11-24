@@ -3079,7 +3079,9 @@ async def _auto_create_pi_terminal(
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 provider_args.extend(["--model", own_login_model])
-    if not managed_launch and not _pi_args_have_thinking(launch_config.terminal_launch_args or []):
+    if not managed_launch and not _pi_args_have_thinking(
+        [*(launch_config.terminal_launch_args or []), *provider_args]
+    ):
         # Pi's own login or a terminal-pinned model still honours the session effort.
         from omnigent.harnesses.pi_native.credentials import pi_thinking_launch_args
 
