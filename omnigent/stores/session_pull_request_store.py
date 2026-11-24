@@ -113,6 +113,8 @@ class StoredPullRequest(PullRequestReport):
     :ivar run_recorded: Whether the server recorded ``run_id`` when it first stored
         the PR, so ``None`` there means the PR was first seen outside any run.
         False for a PR the user linked and for PRs stored before runs were recorded.
+    :ivar merged_at: Epoch seconds of the first fetch that found the PR merged, or
+        ``None`` when no fetch has, including PRs merged before this was recorded.
     """
 
     state: str | None = None
@@ -120,6 +122,7 @@ class StoredPullRequest(PullRequestReport):
     state_checked_at: float | None = None
     run_id: str | None = None
     run_recorded: bool = False
+    merged_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -361,6 +364,11 @@ def _apply_fetch(document: _Document, fetched: FetchedState, checked_at: float) 
     def refresh(entry: StoredPullRequest) -> StoredPullRequest:
         if entry.url != fetched.url:
             return entry
+        # Only a fetch that sees the move to merged dates it; one already stored as
+        # merged before this was recorded stays undated.
+        newly_merged = (
+            fetched.state == "MERGED" and entry.merged_at is None and entry.state != "MERGED"
+        )
         changed = (entry.state, entry.is_draft) != (fetched.state, fetched.is_draft) or (
             title is not None and title != entry.title
         )
@@ -376,6 +384,7 @@ def _apply_fetch(document: _Document, fetched: FetchedState, checked_at: float) 
             is_draft=fetched.is_draft,
             state_checked_at=checked_at,
             title=title or entry.title,
+            merged_at=checked_at if newly_merged else entry.merged_at,
         )
 
     return replace(document, prs=tuple(refresh(pr) for pr in document.prs))

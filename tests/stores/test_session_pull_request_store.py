@@ -442,3 +442,22 @@ def test_initial_run_ids_read_only_the_sessions_a_run_created(
     conversations.set_labels(OTHER, {SCHEDULED_TASK_RUN_LABEL_KEY: "c" * 32})
     assert store.initial_run_ids([SESSION, OTHER, MISSING]) == {SESSION: "a" * 32}
     assert store.initial_run_ids([]) == {}
+
+
+def test_merged_at_is_the_first_fetch_that_finds_the_pr_merged(
+    store: SessionPullRequestStore,
+) -> None:
+    """Later refreshes keep the date; a PR already stored as merged stays undated."""
+    store.apply_report(SESSION, [_report(A), _report(B)], fetched=_fetch(A), requested_at=1_000.0)
+    store.apply_report(SESSION, [], fetched=_fetch(A, "MERGED"), requested_at=2_000.0)
+    store.apply_report(SESSION, [], fetched=_fetch(A, "MERGED"), requested_at=9_000.0)
+    stored = store.read(SESSION)
+    assert stored is not None
+    merged = stored.get(A)
+    assert merged is not None
+    assert (merged.state, merged.merged_at, merged.state_checked_at) == (
+        "MERGED",
+        2_000.0,
+        9_000.0,
+    )
+    assert stored.get(B).merged_at is None  # type: ignore[union-attr]

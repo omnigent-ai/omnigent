@@ -134,9 +134,11 @@ async def test_summary_counts_completed_moves_and_reports_missing_sources(
         "UTC",
         1,
     )
-    # The spend source is installed; this project has no recorded spend yet.
-    assert body["sources"] == {"spend": "available", "prs_merged": "unavailable"}
+    # Both sources are installed; this project has no spend or merged PRs yet.
+    assert body["sources"] == {"spend": "available", "prs_merged": "available"}
     assert body["totals"]["spend_cents"] == 0
+    # A "Done" stage isn't Merged, and no PRs are linked: nothing merged yet.
+    assert body["totals"]["prs_merged"] == 0
     owner = next(row for row in body["members"] if row["kind"] == "human")
     assert owner["tickets_done"] == 1
     assert (await project_client.get(f"{project}/status/summary?window=1d")).status_code == 422
@@ -176,6 +178,8 @@ def test_sources_are_found_by_module_and_missing_ones_stay_none(
     module = types.ModuleType(project_status.SPEND_SOURCE_MODULE)
     module.build_source = lambda app_state: (app_state, spend)  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, project_status.SPEND_SOURCE_MODULE, module)
+    # As if the PRs-merged module weren't installed.
+    monkeypatch.setitem(sys.modules, project_status.PRS_MERGED_SOURCE_MODULE, None)
     loaded = project_status.load_status_sources("state")
     assert loaded.spend == ("state", spend)
     assert loaded.prs_merged is None
