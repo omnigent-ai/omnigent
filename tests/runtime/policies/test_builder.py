@@ -127,29 +127,54 @@ name: no-guardrails
 
 
 _CLAUDE_MODE_LABEL = "omnigent.claude_native.permission_mode"
+_CODEX_MODE_LABEL = "omnigent.codex_native.approval_mode"
+_CLAUDE = "claude-native"
+_CODEX = "codex-native"
 
 
 @pytest.mark.parametrize(
-    ("labels", "launch_args", "reviewed"),
+    ("harness", "labels", "launch_args", "reviewed"),
     [
-        ({}, [], True),
-        ({_CLAUDE_MODE_LABEL: "default"}, [], True),
-        ({_CLAUDE_MODE_LABEL: "auto"}, [], False),
-        ({_CLAUDE_MODE_LABEL: "bypassPermissions"}, [], False),
-        ({_CLAUDE_MODE_LABEL: "dontAsk"}, [], False),
-        ({}, PERMISSION_LAUNCH_ARGS["claude-native"]["auto"], False),
-        # The live mode wins over the launch flags it replaced.
-        ({_CLAUDE_MODE_LABEL: "default"}, PERMISSION_LAUNCH_ARGS["claude-native"]["auto"], True),
-        ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, [], False),
-        ({}, PERMISSION_LAUNCH_ARGS["codex-native"]["full-access"], False),
-        ({}, PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"], True),
+        (_CLAUDE, {}, [], True),
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "default"}, [], True),
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "auto"}, [], False),
+        (_CLAUDE, {}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["auto"], False),
+        (_CLAUDE, {}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["bypassPermissions"], False),
+        (_CLAUDE, {}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["dontAsk"], False),
+        # A reported mode that skips approval counts only from the launch settings.
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "bypassPermissions"}, [], True),
+        # A live mode that keeps approval wins over the launch flags it replaced.
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "default"}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["auto"], True),
+        (_CODEX, {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, [], False),
+        (_CODEX, {}, PERMISSION_LAUNCH_ARGS[_CODEX]["full-access"], False),
+        (
+            _CODEX,
+            {_CODEX_MODE_LABEL: "ask-for-approval"},
+            PERMISSION_LAUNCH_ARGS[_CODEX]["full-access"],
+            True,
+        ),
+        (_CODEX, {}, PERMISSION_LAUNCH_ARGS[_CODEX]["approve-for-me"], True),
         # A session another session or an automation started: the starting agent
         # picked its mode, so it keeps the review.
-        ({_CLAUDE_MODE_LABEL: "auto", CREATED_BY_SESSION_LABEL_KEY: "conv_creator"}, [], True),
-        ({_CLAUDE_MODE_LABEL: "auto", SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1"}, [], True),
         (
-            {_CLAUDE_MODE_LABEL: "bypassPermissions", SCHEDULED_TASK_LAUNCH_LABEL_KEY: "task_1"},
+            _CLAUDE,
+            {
+                _CLAUDE_MODE_LABEL: "auto",
+                CREATED_BY_SESSION_LABEL_KEY: "0123456789abcdef0123456789abcdef",
+            },
             [],
+            True,
+        ),
+        (
+            _CLAUDE,
+            {_CLAUDE_MODE_LABEL: "auto", SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1"},
+            [],
+            True,
+        ),
+        (
+            _CODEX,
+            {SCHEDULED_TASK_LAUNCH_LABEL_KEY: "task_1"},
+            PERMISSION_LAUNCH_ARGS[_CODEX]["full-access"],
             True,
         ),
     ],
@@ -157,6 +182,7 @@ _CLAUDE_MODE_LABEL = "omnigent.claude_native.permission_mode"
 def test_scheduled_task_review_follows_the_session_mode(
     tmp_path: Path,
     conversation_store: SqlAlchemyConversationStore,
+    harness: str,
     labels: dict[str, str],
     launch_args: list[str],
     reviewed: bool,
@@ -168,11 +194,11 @@ def test_scheduled_task_review_follows_the_session_mode(
     the review. Adding a policy always asks.
     """
     agent_dir = _write_spec(tmp_path, "spec_version: 1\nname: no-guardrails\n")
-    conv = conversation_store.create_conversation()
-    if labels:
-        conversation_store.set_labels(conv.id, labels)
-    if launch_args:
-        conversation_store.update_conversation(conv.id, terminal_launch_args=launch_args)
+    conv = conversation_store.create_conversation(
+        harness_override=harness,
+        labels=labels or None,
+        terminal_launch_args=launch_args or None,
+    )
     engine = build_policy_engine(
         spec=parse(agent_dir),
         conversation_id=conv.id,
@@ -191,6 +217,7 @@ def test_a_sub_agent_in_auto_mode_keeps_the_scheduled_task_review(
     parent = conversation_store.create_conversation()
     child = conversation_store.create_conversation(
         parent_conversation_id=parent.id,
+        harness_override=_CLAUDE,
         labels={_CLAUDE_MODE_LABEL: "auto"},
     )
     engine = build_policy_engine(

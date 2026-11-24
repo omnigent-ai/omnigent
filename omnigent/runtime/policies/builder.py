@@ -121,7 +121,9 @@ _REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
 )
 
 
-def _required_approval_specs(conversation: Conversation | None) -> tuple[FunctionPolicySpec, ...]:
+def _required_approval_specs(
+    conversation: Conversation | None, harness: str | None
+) -> tuple[FunctionPolicySpec, ...]:
     """
     The approval guards appended to *conversation*'s engine.
 
@@ -130,11 +132,12 @@ def _required_approval_specs(conversation: Conversation | None) -> tuple[Functio
     check instead of the review, so malformed changes are still refused.
 
     :param conversation: The refreshed conversation row, or ``None`` when there is none.
+    :param harness: The harness the session runs, e.g. ``"claude-native"``.
     :returns: The guard specs, in evaluation order.
     """
-    from omnigent.server.scheduled.fire import session_skips_scheduled_task_review
+    from omnigent.server.scheduled.harness_settings import session_skips_scheduled_task_review
 
-    if conversation is not None and session_skips_scheduled_task_review(conversation):
+    if conversation is not None and session_skips_scheduled_task_review(conversation, harness):
         return (_ASK_ON_ADD_POLICY_SPEC, _CHECK_SCHEDULED_TASK_CHANGE_SPEC)
     return _REQUIRED_APPROVAL_SPECS
 
@@ -756,10 +759,6 @@ def build_policy_engine(
                 code=ErrorCode.CONFLICT,
             )
         conv = confirmed
-    # Mandatory approval guards, appended even when no guardrails are declared.
-    # Chosen from the refreshed row: the scheduled-task review follows its mode.
-    required_specs = _required_approval_specs(conv)
-    all_policy_specs.extend(required_specs)
     # A sub-agent conversation runs the CHILD agent's spec, but every
     # engine-build site resolves the session's agent binding to the ROOT
     # bundle spec. Resolve ``conv.sub_agent_name`` to the child spec so the
@@ -774,6 +773,15 @@ def build_policy_engine(
     # ``sub_agent_name`` is a display label resolve to no spec and are
     # unaffected.
     child_spec = _resolve_sub_agent_spec(spec, conv)
+    # Mandatory approval guards, appended even when no guardrails are declared.
+    # Chosen from the refreshed row: the scheduled-task review follows its mode.
+    session_harness = (
+        conv.harness_override
+        if conv is not None and conv.harness_override
+        else (child_spec or spec).executor.harness_kind
+    )
+    required_specs = _required_approval_specs(conv, session_harness)
+    all_policy_specs.extend(required_specs)
     child_guardrails = child_spec.guardrails if child_spec is not None else None
     if child_guardrails is not None and child_guardrails.policies:
         agent_policy_specs = agent_policy_specs + list(child_guardrails.policies)

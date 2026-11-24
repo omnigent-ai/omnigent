@@ -1070,41 +1070,75 @@ def test_check_scheduled_task_change_allows_a_valid_reminder_without_asking() ->
 
 
 _OMITTED = object()
+_CALLER = "conv_caller"
 
 
-@pytest.mark.parametrize("action", ["create", "update"])
+def _check_task_change(tool: str, arguments: dict[str, object]):
+    from omnigent.policies.builtins.safety import check_scheduled_task_change
+
+    return check_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": tool,
+            "data": {"arguments": arguments},
+            "context": {"conversation_id": _CALLER},
+        }
+    )
+
+
 @pytest.mark.parametrize(
     ("permission_mode", "result"),
     [
         ("bypassPermissions", "ASK"),
         ("full-access", "ASK"),
-        # An older runner's update may leave the mode out, which keeps the task's own.
+        # An older runner may leave the mode out; it is filled in later.
         (_OMITTED, "ASK"),
         ("auto", "ALLOW"),
         (None, "ALLOW"),
     ],
 )
 def test_check_scheduled_task_change_still_asks_for_a_task_mode_that_skips_approval(
-    action: str, permission_mode: object, result: str
+    permission_mode: object, result: str
 ) -> None:
-    """A task that may run without any reviewer is shown to a person even so."""
-    from omnigent.policies.builtins.safety import check_scheduled_task_change
+    """A new-session task that may run without any reviewer is shown to a person."""
+    arguments: dict[str, object] = {"name": "nightly triage", "prompt": "Triage new issues."}
+    if permission_mode is not _OMITTED:
+        arguments["permission_mode"] = permission_mode
+    assert _check_task_change("sys_scheduled_task_create", arguments)["result"] == result
 
-    arguments: dict[str, object] = {
+
+@pytest.mark.parametrize(
+    ("continuation", "result"),
+    [
+        ({"session_mode": "continue", "session_id": _CALLER}, "ALLOW"),
+        ({"session_mode": "continue", "session_id": "conv_other"}, "ASK"),
+        ({"session_mode": "continue"}, "ASK"),
+        ({"session_id": "conv_other"}, "ASK"),
+    ],
+)
+def test_check_scheduled_task_change_lets_a_task_continue_only_the_calling_session(
+    continuation: dict[str, object], result: str
+) -> None:
+    """A continued run takes the continued session's mode, known only for the caller."""
+    arguments = {
         "name": "nightly triage",
+        "prompt": "Triage new issues.",
+        "permission_mode": None,
+        **continuation,
+    }
+    assert _check_task_change("sys_scheduled_task_create", arguments)["result"] == result
+
+
+@pytest.mark.parametrize("permission_mode", [None, "auto", _OMITTED])
+def test_check_scheduled_task_change_asks_for_every_update(permission_mode: object) -> None:
+    """An update keeps stored settings, such as a continued session, this call can't see."""
+    arguments: dict[str, object] = {
         "scheduled_task_id": "0123456789abcdef0123456789abcdef",
         "prompt": "Triage new issues.",
     }
     if permission_mode is not _OMITTED:
         arguments["permission_mode"] = permission_mode
-    verdict = check_scheduled_task_change(
-        {
-            "type": "tool_call",
-            "target": f"sys_scheduled_task_{action}",
-            "data": {"arguments": arguments},
-        }
-    )
-    assert verdict["result"] == result
+    assert _check_task_change("sys_scheduled_task_update", arguments)["result"] == "ASK"
 
 
 @pytest.mark.parametrize(

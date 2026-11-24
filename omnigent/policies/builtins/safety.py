@@ -591,22 +591,50 @@ def check_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
 
     The policy builder uses it instead of :func:`ask_on_scheduled_task_change` in a
     session whose own mode doesn't ask a person, so the same requests are refused
-    there. A create or update still asks when it selects a mode skipping approval,
-    or omits the mode, which an update keeps from the task.
+    there. A change still asks when its unattended runs aren't known to keep
+    approval: every update, and a create that :func:`_create_keeps_approval`
+    doesn't clear.
 
     :param event: Policy event dict.
-    :returns: DENY for a malformed create, update or reminder, ASK for a task mode
-        that skips approval or is omitted, ALLOW otherwise.
+    :returns: DENY for a malformed change, ASK for one that may run without
+        approval, ALLOW otherwise.
     """
     return _scheduled_task_change_verdict(event, ask=False)
+
+
+def _create_keeps_approval(args: dict[str, object], event: PolicyEvent) -> bool:
+    """Whether a create's unattended runs are known not to skip approval.
+
+    A run in a new session takes the request's mode, which must be stated and keep
+    approval; ``null`` is the agent default, which a task can't inherit when it skips
+    approval. A run that continues a session takes that session's own mode, so only
+    the calling session itself is known. An update keeps stored settings this call
+    can't see, so it never qualifies.
+
+    :param args: The create request's arguments.
+    :param event: Policy event dict, whose context names the calling session.
+    :returns: ``True`` when the task may be created without the review.
+    """
+    if (
+        "permission_mode" not in args
+        or args["permission_mode"] in APPROVAL_SKIPPING_PERMISSION_MODES
+    ):
+        return False
+    target = args.get("session_id")
+    if args.get("session_mode") != "continue" and target is None:
+        return True
+    context = event.get("context")
+    caller = context.get("conversation_id") if isinstance(context, dict) else None
+    return target is not None and target == caller
 
 
 def _scheduled_task_change_verdict(event: PolicyEvent, *, ask: bool) -> PolicyResponse:
     """The verdict on a scheduled-task change or reminder.
 
     :param event: Policy event dict.
-    :param ask: Whether every valid change asks (``True``), or only a create or update
-        that selects a mode skipping approval or omits it (``False``).
+    :param ask: Whether every valid change asks (``True``), or only one whose unattended
+        runs aren't known to keep approval (``False``): every update, and a create that
+        :func:`_create_keeps_approval` doesn't clear.
     :returns: DENY for a malformed change, ASK or ALLOW for a valid one, ALLOW otherwise.
     """
     if event.get("type") != "tool_call":
@@ -626,13 +654,7 @@ def _scheduled_task_change_verdict(event: PolicyEvent, *, ask: bool) -> PolicyRe
     error = scheduled_task_review_error(args, action=action, require_complete=False)
     if error:
         return {"result": "DENY", "reason": f"Cannot {action} a scheduled task. {error}"}
-    # A person still sees a task mode that skips approval, which would run with no
-    # reviewer, and an omitted one, which keeps a mode this call can't see.
-    if (
-        not ask
-        and "permission_mode" in args
-        and args["permission_mode"] not in APPROVAL_SKIPPING_PERMISSION_MODES
-    ):
+    if not ask and action == "create" and _create_keeps_approval(args, event):
         return _ALLOW
     if action == "create":
         name = _clip(str(args.get("name") or "(unnamed)"))

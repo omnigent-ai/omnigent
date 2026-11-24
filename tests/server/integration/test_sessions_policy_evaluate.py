@@ -869,10 +869,12 @@ async def test_scheduled_changes_skip_the_review_in_a_session_whose_mode_does_no
 
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
+    store = get_conversation_store()
     await asyncio.to_thread(
-        get_conversation_store().set_labels,
-        session_id,
-        {"omnigent.claude_native.permission_mode": "auto"},
+        store.update_conversation, session_id, harness_override="claude-native"
+    )
+    await asyncio.to_thread(
+        store.set_labels, session_id, {"omnigent.claude_native.permission_mode": "auto"}
     )
     # A regression that still asks would park the request; fail fast instead.
     response = await asyncio.wait_for(
