@@ -268,8 +268,20 @@ export function composerInlineMentions(
   ];
 }
 
-// A token must start a word and end at whitespace, punctuation or the text end.
-const TOKEN_END_RE = /[\s.,;:!?)\]}'"]/;
+const SPACE_RE = /\s/;
+const PUNCTUATION_RE = /[.,;:!?)\]}'"]/;
+
+/**
+ * Whether a token ending at ``end`` is complete. Whitespace or the text end always ends it.
+ * Punctuation ends it only when no word character follows, so ``@Plan`` is not ``@Plan.png``.
+ */
+function endsToken(text: string, end: number): boolean {
+  const next = text[end];
+  if (next === undefined || SPACE_RE.test(next)) return true;
+  if (!PUNCTUATION_RE.test(next)) return false;
+  const after = text[end + 1];
+  return after === undefined || SPACE_RE.test(after) || PUNCTUATION_RE.test(after);
+}
 
 /** Where a known token sits in composer text. */
 export interface MentionTokenRange {
@@ -289,7 +301,7 @@ export function findMentionTokens(text: string, tokens: readonly string[]): Ment
     for (let at = text.indexOf(token); at >= 0; at = text.indexOf(token, at + 1)) {
       const end = at + token.length;
       if (at > 0 && !/\s/.test(text[at - 1])) continue;
-      if (end < text.length && !TOKEN_END_RE.test(text[end])) continue;
+      if (!endsToken(text, end)) continue;
       if (ranges.some((r) => at < r.end && end > r.start)) continue;
       ranges.push({ start: at, end, token });
     }

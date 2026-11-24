@@ -1493,6 +1493,20 @@ describe("Composer pasted chips", () => {
     );
   });
 
+  it("keeps the chips of one multi-file paste on the caret's line before a newline", async () => {
+    await renderCodeMirrorComposer();
+    typeAt("Compare\nthen");
+    caretAt("Compare".length);
+    paste({
+      files: [
+        new File(["a"], "a.png", { type: "image/png" }),
+        new File(["b"], "b.png", { type: "image/png" }),
+      ],
+    });
+    expect(valueOf()).toBe("Compare @a.png @b.png\nthen");
+    expect(tokens()).toEqual(["@a.png", "@b.png"]);
+  });
+
   it("names a re-pasted file apart from a literal spelling and tray file it repeats", async () => {
     const onSend = await renderCodeMirrorComposer();
     const shot = new File(["a"], "shot.png", { type: "image/png" });

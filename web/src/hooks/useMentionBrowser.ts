@@ -475,22 +475,26 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   };
 
   // Replace [start, end) with the token, spaced off from the words around it, caret after it.
+  // With ``skipExistingSpace`` the caret also passes a space already after the token, as a mention
+  // pick does; otherwise it stops after what was inserted.
   const insertTokenAt = (
     target: ComposerTextTarget | null,
     start: number,
     end: number,
     token: string,
+    skipExistingSpace = false,
   ): boolean => {
     const current = liveText(target);
     const lead = start > 0 && !/\s/.test(current[start - 1]!) ? " " : "";
     const trail = /^\s/.test(current.slice(end)) ? "" : " ";
     const tokenStart = start + lead.length;
-    return editDraft(target, start, end, lead + token + trail, tokenStart + token.length + 1);
+    const caret = tokenStart + token.length + (skipExistingSpace ? 1 : trail.length);
+    return editDraft(target, start, end, lead + token + trail, caret);
   };
 
   // Swap the typed "@query" for the token plus one space, caret after it.
   const insertToken = (active: MentionState, token: string): boolean => {
-    if (!insertTokenAt(textareaRef.current, active.start, active.end, token)) return false;
+    if (!insertTokenAt(textareaRef.current, active.start, active.end, token, true)) return false;
     setMention(null);
     setMentionIndex(-1);
     return true;

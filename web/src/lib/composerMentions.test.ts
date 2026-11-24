@@ -112,6 +112,37 @@ describe("unique tokens across files and sessions", () => {
   });
 });
 
+describe("token boundaries", () => {
+  const plan = [{ token: "@Plan", marker: "[Session]" }];
+
+  it("does not end a token at punctuation that a word character follows", () => {
+    expect(findMentionTokens("@Plan.png", ["@Plan"])).toEqual([]);
+    expect(findMentionTokens("@Plan-v2", ["@Plan"])).toEqual([]);
+    expect(expandMentionTokens("Send @Plan.png", plan)).toBe("Send @Plan.png");
+  });
+
+  it("ends a token at punctuation followed by space, end of text, or more punctuation", () => {
+    expect(expandMentionTokens("Ask @Plan. Then @Plan, and @Plan..", plan)).toBe(
+      "Ask [Session]. Then [Session], and [Session]..",
+    );
+    expect(findMentionTokens("@Plan.\nnext", ["@Plan"]).map((range) => range.end)).toEqual([5]);
+  });
+
+  it("keeps a literal filename that starts with a session token as typed", () => {
+    // The attachment's metadata is gone, so the literal filename is all that remains.
+    const sessionTags = composerInlineMentions(
+      {
+        files: [],
+        sessions: [{ id: "s_plan", title: "Plan", isSubagent: false, token: "@Plan" }],
+      },
+      null,
+    );
+    expect(expandMentionTokens("Compare @Plan.png with it", sessionTags)).toBe(
+      "Compare @Plan.png with it",
+    );
+  });
+});
+
 describe("pasted chips in the token scan", () => {
   it("keeps a pasted chip whole when a session token is a prefix of its name", () => {
     const file = new File(["p"], "Plan.png", { type: "image/png" });
