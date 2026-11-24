@@ -57,6 +57,12 @@ import { TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
 import { useTicketSeen } from "./useTicketSeen";
+import {
+  newTicketDraftKey,
+  ticketCommentDraftKey,
+  useTicketDraft,
+  writeTicketDraft,
+} from "./ticketTextDrafts";
 import { useProjectAgentSession } from "./useProjectAgentSession";
 import {
   useTicket,
@@ -169,6 +175,8 @@ export function ProjectTicketPanel({
     mutationFn: async (body: { title: string; description: string }) =>
       createTicket(await ensure.mutateAsync(), body),
     onSuccess: (ticket) => {
+      writeTicketDraft(newTicketDraftKey(projectName, "title"), "");
+      writeTicketDraft(newTicketDraftKey(projectName, "description"), "");
       void client.invalidateQueries({ queryKey: ["project-tickets", ticket.project_id] });
       onCreated(ticket.id);
     },
@@ -182,6 +190,8 @@ export function ProjectTicketPanel({
         onExpandedChange={onExpandedChange}
       >
         <TicketEditor
+          key={projectName}
+          draftProjectName={projectName}
           resolveProjectId={async () => projectId ?? (await ensure.mutateAsync())}
           onSave={(body) => create.mutate(body)}
           pending={create.isPending}
@@ -236,8 +246,11 @@ function TicketEditor({
   error,
   disabled = false,
   resolveProjectId,
+  draftProjectName,
 }: {
   resolveProjectId: () => Promise<string>;
+  /** Persist the unsaved form as this project's new-ticket draft. */
+  draftProjectName?: string;
   ticket?: ProjectTicket;
   onSave: (body: { title: string; description: string }) => void;
   onCancel?: () => void;
@@ -245,8 +258,14 @@ function TicketEditor({
   error: Error | null;
   disabled?: boolean;
 }) {
-  const [title, setTitle] = useState(ticket?.title ?? "");
-  const [description, setDescription] = useState(ticket?.description ?? "");
+  const [title, setTitle] = useTicketDraft(
+    draftProjectName && newTicketDraftKey(draftProjectName, "title"),
+    ticket?.title ?? "",
+  );
+  const [description, setDescription] = useTicketDraft(
+    draftProjectName && newTicketDraftKey(draftProjectName, "description"),
+    ticket?.description ?? "",
+  );
   const mobile = useIsMobileViewport();
   const images = useTicketImageUpload(resolveProjectId, setDescription);
   return (
@@ -504,7 +523,8 @@ function TicketCommentComposer({
   ticketId: string;
   comment: ReturnType<typeof useTicketActions>["comment"];
 }) {
-  const [text, setText] = useState("");
+  const draftKey = ticketCommentDraftKey(projectId, ticketId);
+  const [text, setText] = useTicketDraft(draftKey);
   const [attaching, setAttaching] = useState(false);
   const [outputUrl, setOutputUrl] = useState("");
   const [outputType, setOutputType] = useState<TicketOutput["type"]>("pull_request");
@@ -516,23 +536,25 @@ function TicketCommentComposer({
       onSubmit={(event) => {
         event.preventDefault();
         if (!text.trim() || comment.isPending || images.uploading) return;
-        comment.mutate(
-          {
+        // The promise settles even if the user navigates away, so the posted draft still clears.
+        comment
+          .mutateAsync({
             id: ticketId,
             body: {
               text: text.trim(),
               outputs:
                 attaching && outputUrl.trim() ? [{ type: outputType, url: outputUrl.trim() }] : [],
             },
-          },
-          {
-            onSuccess: () => {
+          })
+          .then(
+            () => {
+              writeTicketDraft(draftKey, "");
               setText("");
               setOutputUrl("");
               setAttaching(false);
             },
-          },
-        );
+            () => {}, // Shown through comment.error.
+          );
       }}
     >
       <div className="rounded-xl border border-input bg-background focus-within:border-ring">

@@ -182,6 +182,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clients.splice(0).forEach((client) => client.clear());
+  // Unsent ticket comments and new-ticket forms persist as drafts.
+  window.localStorage.clear();
 });
 
 describe("ticket updates in Chat", () => {
