@@ -2181,10 +2181,11 @@ def gadget_grantee_key(user_id: str) -> str:
     """The key that finds a gadget grantee's grant in any letter case, on every database.
 
     SQL ``lower()`` folds only ASCII on SQLite and follows the collation elsewhere, so
-    the fold is done here: SHA-256 of the NFC-normalized, case-folded ID, as 64 hex digits.
+    the fold is done here: SHA-256 of the canonical caseless form (``NFC(casefold(NFD(id)))``,
+    Unicode's canonical caseless match), as 64 hex digits.
     The grant itself keeps the exact ``user_id``, which authorization matches.
     """
-    folded = unicodedata.normalize("NFC", user_id).casefold()
+    folded = unicodedata.normalize("NFC", unicodedata.normalize("NFD", user_id).casefold())
     return hashlib.sha256(folded.encode()).hexdigest()
 
 

@@ -224,6 +224,8 @@ def test_the_model_fills_in_the_grantee_key(tmp_path: Path) -> None:
     """The key folds case the same way for any letters, so a re-share finds its grant."""
     assert gadget_grantee_key("Ömer@Example.com") == gadget_grantee_key("ömer@example.com")
     assert gadget_grantee_key("alice") != gadget_grantee_key("alicia")
+    # Case folding alone leaves this pair in different canonical forms.
+    assert gadget_grantee_key("\u0390") == gadget_grantee_key("\u0390".upper())
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'model.db'}")
     SqlGadgetShare.__table__.create(engine)
     with engine.begin() as conn:
