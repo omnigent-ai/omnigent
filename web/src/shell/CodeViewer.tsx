@@ -66,6 +66,7 @@ import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceI
 import {
   type ActiveSelection,
   type SaveStatus,
+  type SourceSpan,
   detectLang,
   getSelectionOffsets,
   indexToLine,
@@ -77,6 +78,7 @@ import {
   isPdfFile,
   lineOverlapsSelection,
   markdownPreviewSelectionSource,
+  rehypeRecordRawHtml,
   rehypeSourceOffsets,
   selectedPreviewHtml,
 } from "./codeViewerHelpers";
@@ -174,7 +176,7 @@ function rehypeRawWhenPresent() {
 // iframe. Order matters: alerts transform before sanitize, slug adds IDs to
 // headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
 // later, rendering math from the already-sanitized tree.
-const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
+const MARKDOWN_REHYPE_PLUGINS = [
   rehypeRawWhenPresent,
   rehypeSlug,
   rehypeGithubAlerts,
@@ -185,7 +187,7 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   MATH_PLUGIN.rehypePlugin,
   // Last, so sanitize keeps the source offsets that copy maps a selection through.
   rehypeSourceOffsets,
-];
+] satisfies Options["rehypePlugins"];
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).
@@ -300,19 +302,21 @@ function MarkdownPreview({
   tocOpen: boolean;
   onTocOpenChange: (open: boolean) => void;
 }) {
+  // Where raw HTML sits in *content*, refilled each time the document renders.
+  const [rawHtml] = useState<SourceSpan[]>(() => []);
   // Rewrite `\(…\)`/`\[…\]` to `$$…$$` as chat does; remark-math only honours `$`.
   // Memoized so resizes and toolbar re-renders skip re-parsing the document.
   const markdown = useMemo(
     () => (
       <ReactMarkdown
         remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+        rehypePlugins={[[rehypeRecordRawHtml, rawHtml], ...MARKDOWN_REHYPE_PLUGINS]}
         components={MARKDOWN_COMPONENTS}
       >
         {normalizeExplicitMathDelimiters(content)}
       </ReactMarkdown>
     ),
-    [content],
+    [content, rawHtml],
   );
   // Plain text gets the selection's Markdown source, and HTML its rendered form
   // for rich paste. The math rewrite above keeps every offset, so they index
@@ -322,13 +326,14 @@ function MarkdownPreview({
       const selection = window.getSelection();
       if (selection?.rangeCount !== 1) return;
       const range = selection.getRangeAt(0);
-      const source = markdownPreviewSelectionSource(range, event.currentTarget, content);
+      const root = event.currentTarget;
+      const source = markdownPreviewSelectionSource(range, root, content, rawHtml);
       if (source === null) return;
       event.preventDefault();
       event.clipboardData.setData("text/plain", source);
-      event.clipboardData.setData("text/html", selectedPreviewHtml(range, event.currentTarget));
+      event.clipboardData.setData("text/html", selectedPreviewHtml(range, root));
     },
-    [content],
+    [content, rawHtml],
   );
   return (
     <div className="flex h-full">

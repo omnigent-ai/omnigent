@@ -554,8 +554,6 @@ describe("CodeViewer markdown preview copy", () => {
     ],
     ["an escaped star inside bold", "**\\* star**", "* star", "* star", "\\* star"],
     ["heading text with an entity", "# #tags &amp; tips", "#tags", "#tags", "#tags"],
-    ["a word after an emoji shortcode", "Ship it :rocket: today", "today", "today", "today"],
-    ["an emoji shortcode's glyph", "Ship it :rocket: today", "🚀", "🚀", ":rocket:"],
     ["TeX delimiters", "Inline \\(x^2\\) math", "Inline", "math", "Inline \\(x^2\\) math"],
     [
       "whole list items",
@@ -668,6 +666,39 @@ describe("CodeViewer markdown preview copy", () => {
     range.setEnd(glyphs[glyphs.length - 1], 1);
     window.getSelection()?.addRange(range);
     expectBrowserCopy(glyphs[0]);
+  });
+
+  // Emoji shortcodes split their sentence into text with no recorded source, so
+  // no selection of it guesses which shortcode or glyph it came from.
+  it.each([
+    ["a word beside a shortcode", "Ship it :rocket: today", "today"],
+    ["a shortcode's glyph", "Ship it :rocket: today", "🚀"],
+    ["one of two adjacent shortcodes", ":rocket::smile:", "🚀"],
+    ["a shortcode before the same literal glyph", ":rocket: 🚀", "🚀"],
+  ])("keeps the browser's copy for %s", (_shape, markdown, selected) => {
+    renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    const { node, offset } = previewText(selected);
+    const range = document.createRange();
+    range.setStart(node, offset);
+    range.setEnd(node, offset + selected.length);
+    window.getSelection()?.addRange(range);
+    expectBrowserCopy(node);
+  });
+
+  // Raw HTML can hold text the preview never shows; the copy must not carry it.
+  it.each([
+    ["a hidden comment", "a<!--INERT-->**b**"],
+    ["a stripped element", 'a<script type="text/plain">INERT</script>**b**'],
+  ])("keeps the browser's copy across %s", (_shape, markdown) => {
+    renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    expect(document.querySelector(".markdown-preview")?.textContent).toBe("ab");
+    const start = previewText("a");
+    const end = previewText("b");
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset + 1);
+    window.getSelection()?.addRange(range);
+    expectBrowserCopy(start.node);
   });
 
   it("keeps the browser's copy for a selection reaching outside the preview", () => {
