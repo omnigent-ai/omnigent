@@ -304,7 +304,8 @@ export interface ComposerInsertAdjustment {
 
 /**
  * The insert with a space added where it would break a token it touches: right after one, or
- * right before one. ``caret`` stays after the inserted text. Null when the tokens stay matched.
+ * right before one. ``caret`` stays after the inserted text. Null when no space is needed, or
+ * when one would make a touched token match a different tag; the insert then lands as typed.
  */
 export function separateMentionEdges(
   value: string,
