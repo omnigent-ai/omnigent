@@ -12,6 +12,9 @@ and the recording protocol for comparing revisions.
 - `find`: search finds edited content without typing into the document.
 - `modes`: Edit, Source, and Preview retain the same saved content.
 - `review`: selected text anchors a comment; an unsent draft remains editable.
+- `copy`: copying in Edit pastes as Markdown into plain-text targets (inline
+  Markdown for part of a block, the file's source for the whole document) and
+  as formatting into rich-text targets. Preview still copies rendered text.
 - `responsive`: desktop and mobile show the file and retain edits and drafts.
 - `load`: fixed mixed-content documents expose parsing and rendering costs.
 - `offline`: unsaved edits remain guarded when the workspace cannot save.
