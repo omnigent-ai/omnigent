@@ -259,10 +259,12 @@ async def test_bound_model_control_keeps_the_literal_through_the_real_actuator(
         assert [command for command in composer.submitted if command] == [f"/model {selected}"]
     else:
         assert composer.saved_default == composer.options[0]
-        assert composer.submitted == (["/status"] if selected.endswith("[1m]") else []) + [
-            "/model",
-            "/status",
-        ]
+        expected = ["/model", "/status"]
+        if selected.endswith("[1m]"):
+            expected.insert(0, "/status")
+        else:
+            expected.append("/model")
+        assert composer.submitted == expected
 
 
 _PASSWORD_PANE_TAIL = (
