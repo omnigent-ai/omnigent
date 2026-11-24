@@ -1233,7 +1233,7 @@ async def test_ticket_running_projection_batches_links_and_respects_access(
     assert batches == [[worker.id]]
     assert grant_batches == [([worker.id], ALICE), ([worker.id], RESERVED_USER_PUBLIC)]
     active_row = next(row for row in page if row["id"] == active["id"])
-    identity = {"agent_name": "project-agent", "harness": "codex"}
+    identity = {"agent_name": "project-agent", "harness": "codex", "persona": None}
     assert active_row["agents"] == [identity] and active_row["agents_has_more"] is False
     assert next(row for row in page if row["id"] == quiet["id"])["agents"] == []
     ticket_routes._session_status_cache[worker.id] = "idle"

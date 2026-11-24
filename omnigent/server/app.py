@@ -4670,6 +4670,7 @@ def create_app(
                     permissions=permission_store,
                     agents=agent_store,
                     agent_cache=agent_cache,
+                    projects=project_store,
                 ),
                 prefix="/v1",
                 tags=["project tickets"],

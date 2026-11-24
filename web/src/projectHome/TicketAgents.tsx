@@ -1,5 +1,6 @@
 import { useEffect, useMemo } from "react";
 import { ChevronRightIcon, MessageSquareIcon } from "lucide-react";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { ticketResponseSession, type ProjectTicket } from "@/lib/projectTicketsApi";
@@ -46,6 +47,7 @@ export function TicketAgents({
       ),
     [identities],
   );
+  const leadName = (orchestratorId && personaNames.get(orchestratorId)) || "Lead";
   // Personas get work through labels and routed turns, so they're often never linked.
   const personaAgents = ticketPersonaAgents({
     identities: identities ?? [],
@@ -75,6 +77,8 @@ export function TicketAgents({
               showStatus
               needsResponse={responseSession === orchestratorId}
               involvement={orchestrator?.involvement || "Coordinates work and handles questions"}
+              label={leadName}
+              icon={personaIcon(leadName)}
             />
           ) : (
             <Link
@@ -106,6 +110,7 @@ export function TicketAgents({
                 needsResponse={responseSession === session.session_id}
                 involvement={session.involvement}
                 label={personaNames.get(session.session_id)}
+                icon={personaIcon(personaNames.get(session.session_id))}
               />
             </li>
           ))}
@@ -117,6 +122,7 @@ export function TicketAgents({
               needsResponse={responseSession === agent.sessionId}
               involvement={agent.involvement}
               label={agent.name}
+              icon={personaIcon(agent.name)}
             />
           </li>
         ))}
@@ -134,4 +140,9 @@ export function TicketAgents({
       )}
     </section>
   );
+}
+
+/** A persona's avatar for its Agents row; ordinary sessions keep their agent icon. */
+function personaIcon(name: string | undefined) {
+  return name ? <PersonaAvatar name={name} size="md" className="mt-0.5" /> : undefined;
 }

@@ -14,6 +14,8 @@ from typing import Any
 from fastapi import APIRouter, Query, Request
 from sqlalchemy.exc import StatementError
 
+from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
+from omnigent.entities.project_routing import LEAD_NAME
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
@@ -67,7 +69,7 @@ from omnigent.server.ticket_review import (
     to_reviewer_message,
     to_worker_message,
 )
-from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+from omnigent.stores import AgentStore, ConversationStore, PermissionStore, ProjectStore
 from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
@@ -300,6 +302,7 @@ def create_project_tickets_router(
     permissions: PermissionStore | None = None,
     agents: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    projects: ProjectStore | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/projects/{project_id}/tickets")
 
@@ -564,7 +567,7 @@ def create_project_tickets_router(
         )
         sessions = await asyncio.to_thread(conversations.get_session_activity, session_ids)
 
-        def identities() -> dict[str, tuple[str, str | None]]:
+        def identities() -> dict[str, tuple[str, str | None, str | None]]:
             rows = conversations.get_conversations(session_ids)
             project = uuid_to_bytes(project_id).hex()
             known_agents = (
@@ -572,16 +575,35 @@ def create_project_tickets_router(
                 if agents is not None
                 else {}
             )
+            personas = _persona_names(project) if rows else {}
             return {
                 row.id: (
                     row.sub_agent_name or known_agents[row.agent_id].name,
                     _resolve_harness(row, agent_cache=agent_cache, agents_by_id=known_agents),
+                    personas.get(row.id)
+                    or personas.get((row.labels or {}).get(PROJECT_IDENTITY_LABEL_KEY, "")),
                 )
                 for row in rows.values()
                 if row.project_id == project
                 and row.agent_id is not None
                 and row.agent_id in known_agents
             }
+
+        def _persona_names(project: str) -> dict[str, str]:
+            """Persona names keyed by identity id, plus the Lead's current and former sessions."""
+            if projects is None:
+                return {}
+            record = projects.get(project, user_id=who.user_id)
+            if record is None:
+                return {}
+            names = {
+                identity.id: identity.name
+                for identity in projects.list_identities(project, user_id=who.user_id)
+            }
+            for session_id in [*record.retired_main_session_ids, record.main_session_id]:
+                if session_id:
+                    names[session_id] = LEAD_NAME
+            return names
 
         metadata = await asyncio.to_thread(identities)
         # Seen state belongs to the person viewing the board, not to agents reading tickets.
@@ -605,7 +627,8 @@ def create_project_tickets_router(
                 metadata[sid] for sid in linked.session_ids if sid in metadata
             )
             ticket["agents"] = [
-                {"agent_name": name, "harness": harness} for name, harness in distinct
+                {"agent_name": name, "harness": harness, "persona": persona}
+                for name, harness, persona in distinct
             ]
             ticket["agents_has_more"] = linked.has_more
 

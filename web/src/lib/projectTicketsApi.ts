@@ -73,7 +73,12 @@ export interface ProjectTicket {
   /** Latest linked-agent activity; absent or null means unknown. */
   has_running_agents?: boolean | null;
   /** Authorized linked-agent identities, batched with the ticket page. */
-  agents?: { agent_name: string; harness: string | null }[];
+  agents?: {
+    agent_name: string;
+    harness: string | null;
+    /** The project persona the session works as, e.g. "Lead" or "Reviewer". */
+    persona?: string | null;
+  }[];
   agents_has_more?: boolean;
   latest_update: string;
   comment_count: number;
