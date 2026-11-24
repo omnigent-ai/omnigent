@@ -31,6 +31,7 @@ from omnigent.harnesses.claude_native.main import (
 from omnigent.harnesses.claude_native.model_switch import supports_session_only_model_switch
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_INSTRUCTIONS
 from tests._helpers.host import isolated_host
+from tests._helpers.mock_llm import advertised_tool_names
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests.e2e.conftest import get_mock_message_requests
@@ -1140,7 +1141,7 @@ def _claude_text_blocks(content: object) -> list[str]:
 
 def _assert_mock_claude_turn(
     mock_url: str, marker: str, model: str, *, native_session: str, user_text: str
-) -> None:
+) -> dict:
     """Correlate one conversation request, accounting for explicit title calls."""
     turn_requests = []
     observed = []
@@ -1198,6 +1199,7 @@ def _assert_mock_claude_turn(
         observed.append(details)
     assert len(turn_requests) == 1, {"marker": marker, "requests": observed}
     assert turn_requests[0]["body"]["model"] == _native_claude_wire_model(model)
+    return turn_requests[0]["body"]
 
 
 def _assert_native_claude_turn(
@@ -1482,7 +1484,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
                 base_url, session_id, marker, reply, model
             )
             assert user_text == draft, {"expected": draft, "native_user_text": user_text}
-            _assert_mock_claude_turn(
+            prior_request = _assert_mock_claude_turn(
                 mock_llm_server_url,
                 marker,
                 model,
@@ -1508,16 +1510,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     nonce = uuid.uuid4().hex[:8]
     busy_marker, busy_reply = f"busy-user-{nonce}", f"busy-reply-{nonce}"
     busy_prompt = f"Reply with exactly {busy_reply}. Context marker: {busy_marker}."
-    prior_request = next(
-        request["body"]
-        for request in reversed(get_mock_message_requests(mock_llm_server_url))
-        if any(
-            message.get("role") == "user"
-            and _claude_text_blocks(message.get("content")) == [user_text]
-            for message in request["body"].get("messages", [])
-        )
-    )
-    tool_names = [tool["name"] for tool in prior_request.get("tools", []) if tool.get("name")]
+    tool_names = sorted(advertised_tool_names([prior_request]))
     assert tool_names, "A conversation tool must distinguish the held turn from title requests"
     configure_mock_llm(
         mock_llm_server_url,
