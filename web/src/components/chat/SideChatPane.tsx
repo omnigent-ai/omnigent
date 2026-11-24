@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { cn } from "@/lib/utils";
+import { foldBackgroundTurns } from "@/lib/backgroundTurns";
 import {
   type Bubble,
   type BubbleCache,
@@ -490,7 +491,9 @@ export function SideChatPane({
     sessionStatus,
   ]);
 
-  const lastAssistantIndex = liveCandidateAssistantIndex(bubbles);
+  // Rows as drawn: an orchestrator's automatic turns fold into background-update strips.
+  const rows = useMemo(() => foldBackgroundTurns(bubbles), [bubbles]);
+  const lastAssistantIndex = liveCandidateAssistantIndex(rows);
   const showsWorking =
     (!readOnly || fullSession) &&
     (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
@@ -658,7 +661,7 @@ export function SideChatPane({
                   <EditSentMessageContext.Provider
                     value={readOnly || starting ? null : editSentMessage}
                   >
-                    {bubbles.map((bubble, index) => (
+                    {rows.map((bubble, index) => (
                       <BubbleView
                         key={bubbleKey(bubble)}
                         bubble={bubble}

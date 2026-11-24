@@ -250,6 +250,16 @@ export type Bubble =
     }
   | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
+  | {
+      /** A run of automatic turns folded for display; see `foldBackgroundTurns`. */
+      kind: "background_updates";
+      /** The run's first input; keys the row as the run grows. */
+      itemId: string;
+      bubbles: Bubble[];
+      updateCount: number;
+      ticketCount: number;
+      createdAtS?: number;
+    }
   | { kind: "subagent_activity"; itemId: string; data: Record<string, unknown> }
   | {
       kind: "routing_decision";
@@ -2036,6 +2046,13 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   }
   if (a.kind === "subagent_activity" && b.kind === "subagent_activity") {
     return a.itemId === b.itemId && a.data === b.data;
+  }
+  if (a.kind === "background_updates" && b.kind === "background_updates") {
+    return (
+      a.itemId === b.itemId &&
+      a.bubbles.length === b.bubbles.length &&
+      a.bubbles.every((bubble, index) => bubblesEqual(bubble, b.bubbles[index]!))
+    );
   }
   return false;
 }

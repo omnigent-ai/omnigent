@@ -69,6 +69,11 @@ import {
   withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
 import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
+import {
+  automaticInputKind,
+  foldBackgroundTurns,
+  receivesTicketUpdates,
+} from "@/lib/backgroundTurns";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 import { AssistantPresentationContext, type ChatPresentation } from "./assistantPresentation";
 
@@ -248,12 +253,16 @@ function TranscriptImpl({
   const hideSessionMessages = usePeerSessionMessageDisplay() === "hide";
   const streamBubbles = useMemo(
     () =>
-      visibleTranscriptBubbles(
-        pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles),
-        hideSessionMessages,
+      foldBackgroundTurns(
+        visibleTranscriptBubbles(
+          pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles),
+          hideSessionMessages,
+        ),
       ),
     [bubbles, pendingElicitations.length, hideSessionMessages],
   );
+  // An orchestrator's automatic inputs live inside folded rows, so they aren't turns to jump to.
+  const foldsBackground = useMemo(() => receivesTicketUpdates(bubbles), [bubbles]);
   const committedUserIds = useMemo(() => {
     const ids = new Set<string>();
     for (const block of blocks) {
@@ -349,8 +358,9 @@ function TranscriptImpl({
     (b: Bubble): b is Extract<Bubble, { kind: "user" }> =>
       b.kind === "user" &&
       !isSystemBubble(b) &&
-      !(hideSessionMessages && isSessionMessageBubble(b)),
-    [hideSessionMessages],
+      !(hideSessionMessages && isSessionMessageBubble(b)) &&
+      !(foldsBackground && automaticInputKind(b) !== null),
+    [hideSessionMessages, foldsBackground],
   );
   const userMessageIds = useMemo(
     () => display.bubbles.filter(isUserTurnBubble).map((b) => b.itemId),

@@ -17,6 +17,7 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
+  ChevronDownIcon,
   ChevronRightIcon,
   ChevronUpIcon,
   CopyIcon,
@@ -513,6 +514,7 @@ export function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
   if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
   if (bubble.kind === "subagent_activity") return `subagent_activity:${bubble.itemId}`;
+  if (bubble.kind === "background_updates") return `background_updates:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
 }
 
@@ -844,6 +846,54 @@ function formatBubbleTimestamp(epochSeconds: number | undefined): string | null 
   return formatMessageTimestamp(epochSeconds);
 }
 
+// Background-update rows the reader opened, by row key; survives virtualized remounts.
+const expandedBackgroundRows = new Set<string>();
+
+/** One folded run of automatic turns: a quiet expandable strip in the transcript. */
+function BackgroundUpdatesRow({
+  bubble,
+}: {
+  bubble: Extract<Bubble, { kind: "background_updates" }>;
+}) {
+  const rowKey = bubbleKey(bubble);
+  const [expanded, setExpanded] = useState(() => expandedBackgroundRows.has(rowKey));
+  const toggle = () => {
+    if (expanded) expandedBackgroundRows.delete(rowKey);
+    else expandedBackgroundRows.add(rowKey);
+    setExpanded(!expanded);
+  };
+  const updates = `${bubble.updateCount} background update${bubble.updateCount === 1 ? "" : "s"}`;
+  const tickets =
+    bubble.ticketCount > 0
+      ? ` · ${bubble.ticketCount} ticket${bubble.ticketCount === 1 ? "" : "s"}`
+      : "";
+  const Chevron = expanded ? ChevronDownIcon : ChevronRightIcon;
+  return (
+    <div data-testid="background-updates" data-expanded={expanded} className="flex flex-col gap-4">
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={expanded}
+        className="flex w-fit items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+      >
+        <Chevron className="size-3.5 shrink-0" />
+        <span>
+          {expanded ? "Hide " : ""}
+          {updates}
+          {tickets}
+        </span>
+      </button>
+      {expanded && (
+        <div className="flex flex-col gap-4 border-l-2 border-muted pl-3">
+          {bubble.bubbles.map((inner) => (
+            <BubbleView key={bubbleKey(inner)} bubble={inner} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Memoized so a streaming delta (which rebuilds the whole bubble array) only
 // re-renders the bubble that actually changed, not every prior message's
 // markdown/syntax-highlighting subtree. See `bubblesEqual`.
@@ -867,6 +917,7 @@ export const BubbleView = memo(
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
+    if (bubble.kind === "background_updates") return <BackgroundUpdatesRow bubble={bubble} />;
     if (bubble.kind === "subagent_activity") {
       return <ActivityNotice data={bubble.data} />;
     }

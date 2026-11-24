@@ -389,7 +389,10 @@ updates and worker reports promptly between checks.
 - Reuse the existing monitor rather than adding one per update or ticket.
   Stay quiet when nothing changed; don't post heartbeat comments. After an
   automatic wake (ticket update, worker message, timer), end with at most one
-  line unless the user must act; never post status to the user's Inbox. Before declaring
+  line unless the user must act; never post status to the user's Inbox. The chat
+  folds automatic turns into a "background updates" strip the user rarely opens.
+  Only a turn that adds `needs-human` or posts to the Inbox stays visible, so put
+  anything the user must act on there, not in an automatic turn's reply. Before declaring
   "waiting on you" or cancelling checks, reconcile every remaining ticket: it must
   be complete, explicitly paused by the user, or have a substantiated human blocker
   with its exact question and worker chat link recorded. A planning-only assignment
