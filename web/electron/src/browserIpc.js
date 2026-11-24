@@ -601,6 +601,7 @@ function registerBrowserIpc({
             opts?.rememberedArcaHostId,
             opts?.sourceIsArcaHost,
             r.localhostBlocked === true,
+            opts?.trustedRemotePreviewProtocol,
           )
         : null;
     return {

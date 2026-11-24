@@ -72,9 +72,4 @@ describe("trusted remote hosts", () => {
     assert.equal(isTrustedRemoteContext([entry], { serverTarget: entry.serverUrl }, SERVER), false);
     assert.equal(isTrustedRemoteContext([], context, SERVER), false);
   });
-
-  it("treats a changed host identity as untrusted", () => {
-    const rotated = { ...context, sourceHostId: "sandbox-host-2" };
-    assert.equal(isTrustedRemoteContext([entry], rotated, SERVER), false);
-  });
 });

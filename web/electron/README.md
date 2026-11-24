@@ -628,7 +628,7 @@ The file lives in the desktop user-data directory: on macOS,
 `~/.config/Omnigent/settings.json`; on Windows, `%APPDATA%/Omnigent/settings.json`.
 Development builds use `Omnigent Dev` instead of `Omnigent`.
 
-`server_url` is the server the session runs on and `host_id` is that session's
+`server_url` is the resolved server URL after sign-in and `host_id` is that session's
 host ID; a denied agent loopback preview gives the exact entry to add. Save the
 file and retry the preview; restarting is unnecessary. This grants sessions on
 that host access to permitted desktop localhost URLs across ports, including

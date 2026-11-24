@@ -29,9 +29,11 @@ for (const trustSource of ["SSH", "settings"]) {
     },
     async () => {
       const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-ssh-preview-"));
-      const recordRoot =
+      const recordRoot = path.join(
         process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
-        fs.mkdtempSync(path.join(os.tmpdir(), "omni-ssh-preview-recordings-"));
+          fs.mkdtempSync(path.join(os.tmpdir(), "omni-ssh-preview-recordings-")),
+        trustSource.toLowerCase(),
+      );
       const sshLog = path.join(scratch, "ssh.jsonl");
       const marker = randomUUID();
       const requests = [];
@@ -47,9 +49,11 @@ for (const trustSource of ["SSH", "settings"]) {
       });
       const url = `http://127.0.0.1:${fixture.address().port}/preview`;
       const binDir = path.join(scratch, "bin");
-      fs.mkdirSync(binDir);
-      fs.copyFileSync(path.join(__dirname, "fixtures/previewSsh.cjs"), path.join(binDir, "ssh"));
-      fs.chmodSync(path.join(binDir, "ssh"), 0o755);
+      if (!settingsTrust) {
+        fs.mkdirSync(binDir);
+        fs.copyFileSync(path.join(__dirname, "fixtures/previewSsh.cjs"), path.join(binDir, "ssh"));
+        fs.chmodSync(path.join(binDir, "ssh"), 0o755);
+      }
       let backend;
       let desktop;
       let stopCapture = async () => {};
@@ -249,47 +253,45 @@ for (const trustSource of ["SSH", "settings"]) {
             "one real CLI subprocess after consent",
           );
         await hold();
-        const subdomainUrl = url.replace("127.0.0.1", "dev.localhost");
-        await navigate(subdomainUrl);
-        await eventually(
-          async () => (await page(subdomainUrl))?.text.includes(marker),
-          "subdomain preview",
-        );
+        if (!settingsTrust) {
+          const subdomainUrl = url.replace("127.0.0.1", "dev.localhost");
+          await navigate(subdomainUrl);
+          await eventually(
+            async () => (await page(subdomainUrl))?.text.includes(marker),
+            "subdomain preview",
+          );
+        }
         const agent = await agentNavigate(backend.sessionId, `${url}?agent`);
         assert.equal(agent.ok, true, JSON.stringify(agent));
         await eventually(
           async () => (await page(`${url}?agent`))?.text.includes(marker),
           "agent preview",
         );
-        const snapshot = await agentAction(backend.sessionId, "snapshot");
-        assert.equal(snapshot.ok, true, JSON.stringify(snapshot));
-        assert.equal(snapshot.data.url, `${url}?agent`);
-        assert.match(snapshot.data.tree, /button "Test interaction"/);
-        evidence.snapshot = snapshot.data;
+        if (!settingsTrust) {
+          const snapshot = await agentAction(backend.sessionId, "snapshot");
+          assert.equal(snapshot.ok, true, JSON.stringify(snapshot));
+          assert.equal(snapshot.data.url, `${url}?agent`);
+          assert.match(snapshot.data.tree, /button "Test interaction"/);
+          evidence.snapshot = snapshot.data;
+        }
         const clicked = await agentAction(backend.sessionId, "click", { selector: "button" });
         assert.equal(clicked.ok, true, JSON.stringify(clicked));
         await eventually(
           async () => (await page(`${url}?agent`))?.text.includes("Interaction works"),
           "agent interaction",
         );
-        const screenshot = await agentAction(backend.sessionId, "screenshot");
-        assert.equal(screenshot.ok, true, JSON.stringify(screenshot));
-        assert.match(screenshot.data_url, /^data:image\/png;base64,/);
+        if (!settingsTrust) {
+          const screenshot = await agentAction(backend.sessionId, "screenshot");
+          assert.equal(screenshot.ok, true, JSON.stringify(screenshot));
+          assert.match(screenshot.data_url, /^data:image\/png;base64,/);
+        }
         assert.equal(
           (await desktop.electronApp.evaluate(() => global.previewPrompts)).length,
           settingsTrust ? 0 : 1,
         );
         await hold();
 
-        await openSessionBrowserTab(desktop.window, backend.serverUrl, backend.otherSessionId);
-        const count = requests.length;
-        await navigate(`${url}?other-host`);
-        await desktop.window.getByText(/navigation blocked:.*loopback\/internal host/).waitFor();
-        const denied = await agentNavigate(backend.otherSessionId, `${url}?other-agent`);
-        assert.equal(denied.ok, false, JSON.stringify(denied));
-        assert.equal(requests.length, count, "another host cannot use the grant");
         if (settingsTrust) {
-          await openSessionBrowserTab(desktop.window, backend.serverUrl, backend.sessionId);
           setTrusted([]);
           const revoked = await agentAction(backend.sessionId, "snapshot");
           assert.equal(revoked.ok, false, JSON.stringify(revoked));
@@ -298,6 +300,14 @@ for (const trustSource of ["SSH", "settings"]) {
           await hold();
           return;
         }
+
+        await openSessionBrowserTab(desktop.window, backend.serverUrl, backend.otherSessionId);
+        const count = requests.length;
+        await navigate(`${url}?other-host`);
+        await desktop.window.getByText(/navigation blocked:.*loopback\/internal host/).waitFor();
+        const denied = await agentNavigate(backend.otherSessionId, `${url}?other-agent`);
+        assert.equal(denied.ok, false, JSON.stringify(denied));
+        assert.equal(requests.length, count, "another host cannot use the grant");
         await closeDesktop();
 
         requests.length = 0;

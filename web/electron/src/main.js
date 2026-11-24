@@ -4769,7 +4769,7 @@ function createBrowserRegistryForWindow(win) {
           isTrustedRemoteContext(
             readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
             context,
-            target,
+            windows.get(win)?.serverUrl,
           )) ||
         context?.hostIsThisMachine === true ||
         (context?.hostIsSshPreview === true &&
@@ -6345,6 +6345,7 @@ function registerIpc() {
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
+      // Explicit grants follow the resolved server, including sign-in redirects.
       const serverTarget = normalizedServerTarget(senderServerUrl(event));
       // Page supplies the session host ID; main verifies this machine's identity and live enrollment.
       return {
@@ -6357,7 +6358,7 @@ function registerIpc() {
           { serverTarget, sourceHostId },
           serverTarget,
         )
-          ? { hostIsTrustedRemotePreview: true }
+          ? { hostIsTrustedRemotePreview: true, serverTarget }
           : {}),
         ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
         opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
@@ -6442,6 +6443,7 @@ function registerIpc() {
       rememberedArcaHostId,
       sourceIsArcaHost,
       localhostBlocked = false,
+      trustedRemotePreviewProtocol,
     ) => {
       const previewHint = isLoopbackPreviewUrl(url)
         ? sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)
@@ -6450,6 +6452,9 @@ function registerIpc() {
       const targetContext = previewRecoveryTargetForEvent(event, url);
       if (!targetContext) {
         if (!localhostBlocked || !isLoopbackPreviewUrl(url) || !sourceHostId) return null;
+        if (trustedRemotePreviewProtocol !== TRUSTED_REMOTE_PREVIEW_PROTOCOL) {
+          return "This server's web app does not support settings-based localhost previews. Update it, then retry.";
+        }
         const serverUrl = normalizedServerTarget(senderServerUrl(event));
         if (!serverUrl) return null;
         const entry = JSON.stringify({ server_url: serverUrl, host_id: sourceHostId });
