@@ -3829,6 +3829,39 @@ async def test_managed_launch_waits_for_runner_a_message_relaunched(
     assert fake.terminated == []
 
 
+@pytest.mark.parametrize("binding", ["other_host", "move_claim", "unbound", "same_runner"])
+async def test_managed_runner_wait_does_not_follow_a_binding_it_cannot_serve(binding: str) -> None:
+    """Only a new runner on the launch's own host takes over the wait."""
+    from omnigent.server.managed_hosts import new_move_claim
+    from omnigent.server.routes import sessions as sessions_module
+
+    bound = {
+        "other_host": SimpleNamespace(host_id="host_other", runner_id="runner_elsewhere"),
+        "move_claim": SimpleNamespace(host_id="host_launch", runner_id=new_move_claim()),
+        "unbound": SimpleNamespace(host_id="host_launch", runner_id=None),
+        "same_runner": SimpleNamespace(host_id="host_launch", runner_id="runner_launched"),
+    }[binding]
+    awaited: list[str] = []
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> None:
+            del timeout_s
+            awaited.append(runner_id)
+
+    connected = await sessions_module._wait_for_managed_runner_tunnel(
+        "session_1",
+        "runner_launched",
+        _TunnelRegistry(),  # type: ignore[arg-type]
+        ManagedLaunchTracker(),
+        settle_failure=False,
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: bound),  # type: ignore[arg-type]
+        host_id="host_launch",
+    )
+
+    assert connected is False
+    assert awaited == ["runner_launched"]
+
+
 async def test_managed_launch_stops_following_relaunched_runners_at_its_deadline(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
