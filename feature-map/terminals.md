@@ -51,7 +51,8 @@ Native subagents that share a parent's terminal show their work in chat and have
 no Chat/Terminal switcher. Open the parent session to use its terminal. Children
 with their own terminal retain the switcher.
 
-- Use the Chat/Terminal switcher in the session header.
+- Use the Chat/Terminal switcher in the session header. With `floating_panes` on, a
+  terminal-first session's chat card shows it in the card's top row instead.
 - Press ⌘/Ctrl+Alt+\ to toggle between Chat and Terminal view. The chord is
   off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.
@@ -115,7 +116,11 @@ with their own terminal retain the switcher.
   focusing a pane selects its shell's tab. Closing the entry, from its ×, its menu's **Close
   split** or Close tab's chord (⌥⌘W), asks once ("Close 2 shells?") and ends every shell in it;
   a pane's own **Close Pane** ends just that pane's shell. Move Tab Left and Right move the
-  entry whole.
+  entry whole. Its panes take the panes view's keys and ⌘K commands: ⌘⌥ plus an arrow key
+  moves between them, and ⌘K lists Maximize Pane (Restore Panes while one fills the split),
+  Equalize Panes, Move Pane…, the Swap and Focus commands, and Close Pane. A close that
+  can't end its shells keeps their tabs and says so once, naming each, such as "Couldn't
+  close zsh and bash. They're still running."
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host or a new sandbox, then look at both the terminal strip and the

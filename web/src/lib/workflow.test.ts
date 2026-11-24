@@ -7,6 +7,7 @@ import {
 
 import {
   REVIEW_PLAN_FIRST,
+  automationsUsingWorkflow,
   continuePlanMessage,
   createWorkflowPrompt,
   editWorkflowPlanPrompt,
@@ -21,6 +22,21 @@ import {
   taskActionMessage,
   workflowMessage,
 } from "./workflow";
+
+describe("automationsUsingWorkflow", () => {
+  const workflowId = "0123456789abcdef0123456789abcdef";
+  const run = `/workflow Run the saved workflow "Triage" (ID ${workflowId}).`;
+
+  it("finds automations by the workflow they store, else by the prompt that runs it", () => {
+    const stored = { id: "stored", prompt: "Summarize", workflowId };
+    const prompted = { id: "prompted", prompt: run };
+    const other = { id: "other", prompt: run, workflowId: "f".repeat(32) };
+    const plain = { id: "plain", prompt: "Summarize", workflowId: null };
+    expect(
+      automationsUsingWorkflow([stored, prompted, other, plain], workflowId).map(({ id }) => id),
+    ).toEqual(["stored", "prompted"]);
+  });
+});
 
 describe("continuePlanMessage", () => {
   it("asks the agent to pick the plan back up, by name when it has one", () => {

@@ -9,6 +9,11 @@ import type { TerminalInfo } from "@/lib/terminals";
 
 type Answer = (closed: boolean) => void;
 
+/** Shells named as the close dialog and its failures name them: "a", "a and b", "a, b and c". */
+export function shellLabelList(labels: readonly string[]): string {
+  return labels.length > 1 ? `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}` : labels[0];
+}
+
 /** The shell close the dialog is asking about, and the request it answers. */
 export interface TabsShellCloseQuestion {
   /** The shells' labels, as the dialog names them: "a", or "a, b and c". */
@@ -36,7 +41,7 @@ export function useTabsShellClose({
   deleteTerminal,
 }: {
   terminals: readonly TerminalInfo[];
-  /** Ends a terminal; rejects when it couldn't, having told the user. */
+  /** Ends a terminal; rejects when it couldn't, leaving the sidebar to tell the user. */
   deleteTerminal: (terminalId: string) => Promise<unknown>;
 }): TabsShellClose {
   const latestTerminals = useRef(terminals);
@@ -66,8 +71,7 @@ export function useTabsShellClose({
         return terminal ? [terminalDisplayLabel(terminal)] : [];
       });
       if (labels.length === 0) return Promise.resolve(true);
-      const label =
-        labels.length > 1 ? `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}` : labels[0];
+      const label = shellLabelList(labels);
       return new Promise<boolean>((resolve) => {
         pending.current = resolve;
         setQuestion({ label, count: labels.length, answer: resolve });

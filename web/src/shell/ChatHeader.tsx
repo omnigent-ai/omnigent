@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
 import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
@@ -62,6 +63,7 @@ import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
+import { useChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
 import { MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
@@ -393,6 +395,8 @@ export function ChatHeader({
   mobileMenu,
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
+  // Floating panes give the switch to the chat pane's own strip.
+  const viewToggleHost = useChatPaneViewToggleHost(conversationId);
   const canvas = useCanvasWorkspace();
   useCanvasHeaderPaletteCommands(canvas);
   const { trackClick } = useOmnigentAnalytics();
@@ -717,7 +721,13 @@ export function ChatHeader({
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
-        {!pending && conversationId && <ViewModeToggle />}
+        {!pending &&
+          conversationId &&
+          (viewToggleHost ? (
+            createPortal(<ViewModeToggle variant="pane" alwaysVisible />, viewToggleHost)
+          ) : (
+            <ViewModeToggle />
+          ))}
         {!pending && !actionConversation && canFork && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>

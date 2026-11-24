@@ -12,8 +12,8 @@ import {
   resolveFloatingPanes,
 } from "@/lib/paneCornersPreference";
 
-/** index.css floats the panes from 48rem, which a media query reads as 768px whatever the root size. */
-const FLOATING_PANES_QUERY = "(min-width: 768px)";
+/** index.css floats the panes from 48rem; a media query reads rem from the browser's font size. */
+const FLOATING_PANES_QUERY = "(min-width: 48rem)";
 
 export interface PaneCornersState {
   /** Whether this client can show floating panes at all: sidebar v2 or the policy on, and no touch. */
