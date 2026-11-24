@@ -2651,10 +2651,17 @@ async def test_auto_create_claude_terminal_offers_its_own_notes_on_the_first_lau
 
 
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_offers_the_notes_of_a_wrapper_set_config_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("case", ["wrapper-config-dir", "wrapper-unsets-memory-off", "child"])
+async def test_auto_create_claude_terminal_offers_the_notes_of_the_launched_claude_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    """An ``env`` wrapper's ``CLAUDE_CONFIG_DIR`` is offered and marked, not the runner's."""
+    """
+    The offer follows the launch Claude actually gets, and only a top-level session spends it.
+
+    An ``env`` wrapper's ``CLAUDE_CONFIG_DIR`` is offered and marked, not the runner's;
+    a wrapper that unsets the memory-off variable leaves auto memory on, so no offer;
+    a child session (here linked only by its parent id) makes no offer and no marker.
+    """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -2673,21 +2680,25 @@ async def test_auto_create_claude_terminal_offers_the_notes_of_a_wrapper_set_con
     monkeypatch.setattr(
         "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
     )
+    wrapper_args = (
+        ["-u", "CLAUDE_CODE_DISABLE_AUTO_MEMORY", f"CLAUDE_CONFIG_DIR={wrapped}"]
+        if case == "wrapper-unsets-memory-off"
+        else [f"CLAUDE_CONFIG_DIR={wrapped}"]
+    )
     monkeypatch.setattr(
         "omnigent.harness_startup_config.resolve_harness_args",
-        lambda _harness, cli_args, cfg=None: [
-            f"CLAUDE_CONFIG_DIR={wrapped}",
-            "claude",
-            *cli_args,
-        ],
+        lambda _harness, cli_args, cfg=None: [*wrapper_args, "claude", *cli_args],
     )
+    snapshot: dict[str, Any] = {"labels": {}}
+    if case == "child":
+        snapshot["parent_session_id"] = "conv_parent"
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/info":
             return httpx.Response(200, json={"memory": True})
         if request.url.path == "/v1/memory/entries":
             return httpx.Response(200, json={"entries": [], "next_page_token": None})
-        return httpx.Response(200, json={"labels": {}})
+        return httpx.Response(200, json=snapshot)
 
     captured: dict[str, Any] = {}
     await _auto_create_claude_terminal(
@@ -2707,10 +2718,14 @@ async def test_auto_create_claude_terminal_offers_the_notes_of_a_wrapper_set_con
 
     args = captured["spec"].args
     prompt = args[args.index("--append-system-prompt") + 1]
-    assert json.dumps(str(wrapped)) in prompt
     assert str(tmp_path / "runner-config") not in prompt
-    markers = list((tmp_path / "omnigent-data" / "memory-import-offers").iterdir())
-    assert len(markers) == 1
+    offers = tmp_path / "omnigent-data" / "memory-import-offers"
+    if case == "wrapper-config-dir":
+        assert json.dumps(str(wrapped)) in prompt
+        assert len(list(offers.iterdir())) == 1
+    else:
+        assert "Claude Code's own memory" not in prompt
+        assert not offers.exists()
 
 
 @pytest.mark.asyncio

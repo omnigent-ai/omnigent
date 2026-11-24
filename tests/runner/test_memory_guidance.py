@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 from pathlib import Path
 
@@ -419,10 +418,13 @@ def _claude_note(config_dir: Path, project: str, name: str) -> Path:
 @pytest.fixture
 def claude_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The launch's Claude config dir, with the runner's own data dir kept under tmp_path."""
-    config = tmp_path / "claude-config"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
-    return config
+    return tmp_path / "claude-config"
+
+
+def _launch_env(config_dir: Path | str) -> dict[str, str]:
+    """A launch environment that selects *config_dir* as Claude Code's config dir."""
+    return {"CLAUDE_CONFIG_DIR": str(config_dir)}
 
 
 async def test_offer_counts_the_notes_and_is_made_once_per_config_dir(
@@ -431,20 +433,19 @@ async def test_offer_counts_the_notes_and_is_made_once_per_config_dir(
     _claude_note(claude_config, "-home-me-repo", "role.md")
     _claude_note(claude_config, "-home-me-repo", "style.md")
 
-    text = await claude_memory_import_note(tmp_path, dict(os.environ))
+    text = await claude_memory_import_note(tmp_path, _launch_env(claude_config))
 
     assert text is not None
     assert "2 note files from it are still on this machine" in text
     assert json.dumps(str(claude_config)) in text
     assert "import-memory skill" in text
     assert "do not ask again" in text
-    assert await claude_memory_import_note(tmp_path, dict(os.environ)) is None
+    assert await claude_memory_import_note(tmp_path, _launch_env(claude_config)) is None
     # The offer is keyed by the config dir, so another dir with notes is offered too.
     other = tmp_path / "other-config"
     _claude_note(other, "-home-me-other", "role.md")
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
     assert "1 note file from it is still" in (
-        await claude_memory_import_note(tmp_path, dict(os.environ)) or ""
+        await claude_memory_import_note(tmp_path, _launch_env(other)) or ""
     )
 
 
@@ -452,33 +453,33 @@ async def test_a_relative_config_dir_resolves_against_the_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = tmp_path / "repo"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "cfg")
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
     _claude_note(workspace / "cfg", "-repo", "role.md")
 
-    text = await claude_memory_import_note(workspace, dict(os.environ))
+    text = await claude_memory_import_note(workspace, _launch_env("cfg"))
 
     assert text is not None
     assert json.dumps(str(workspace / "cfg")) in text
 
 
 async def test_the_offer_reads_the_launch_env_not_the_runners(
-    claude_config: Path, tmp_path: Path
+    claude_config: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An ``env`` wrapper's config dir wins; the runner's own dir is neither read nor marked."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_config))
     _claude_note(claude_config, "-home-me-repo", "runner.md")
     wrapped = tmp_path / "wrapped-config"
     _claude_note(wrapped, "-home-me-repo", "role.md")
     _claude_note(wrapped, "-home-me-repo", "style.md")
 
-    text = await claude_memory_import_note(tmp_path, {"CLAUDE_CONFIG_DIR": str(wrapped)})
+    text = await claude_memory_import_note(tmp_path, _launch_env(wrapped))
 
     assert text is not None
     assert "2 note files from it are still on this machine" in text
     assert json.dumps(str(wrapped)) in text
     # The runner's own dir was not claimed, so a launch that uses it still gets its offer.
     assert "1 note file from it is still" in (
-        await claude_memory_import_note(tmp_path, dict(os.environ)) or ""
+        await claude_memory_import_note(tmp_path, _launch_env(claude_config)) or ""
     )
 
 
@@ -495,16 +496,15 @@ async def test_without_a_config_dir_the_default_is_the_launch_home_claude(
     assert json.dumps(str(home / ".claude")) in text
 
 
-async def test_without_a_config_dir_the_default_is_home_claude(
+async def test_without_home_in_the_launch_env_the_default_is_the_account_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = tmp_path / "home"
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.setenv("HOME", str(home))
+    home = tmp_path / "account-home"
+    monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
     _claude_note(home / ".claude", "-home-me-repo", "role.md")
 
-    text = await claude_memory_import_note(tmp_path, dict(os.environ))
+    text = await claude_memory_import_note(tmp_path, {})
 
     assert text is not None
     assert json.dumps(str(home / ".claude")) in text
@@ -524,7 +524,7 @@ async def test_no_offer_without_claude_notes_and_no_marker_is_written(
         (memory / "archived.md").mkdir()
 
     assert count_claude_memory_notes(claude_config) == 0
-    assert await claude_memory_import_note(tmp_path, dict(os.environ)) is None
+    assert await claude_memory_import_note(tmp_path, _launch_env(claude_config)) is None
     assert not (tmp_path / "omnigent-data").exists()
 
 
@@ -546,7 +546,7 @@ async def test_a_failing_probe_yields_no_offer(
         )
         _claude_note(claude_config, "-home-me-repo", "role.md")
 
-    assert await claude_memory_import_note(tmp_path, dict(os.environ)) is None
+    assert await claude_memory_import_note(tmp_path, _launch_env(claude_config)) is None
     assert not (tmp_path / "omnigent-data").exists()
 
 
@@ -630,7 +630,7 @@ async def test_both_harnesses_record_their_offers_in_one_data_directory(
     _claude_note(claude_config, "-home-me-repo", "role.md")
     _codex_note(codex_home, "MEMORY.md")
 
-    assert await claude_memory_import_note(tmp_path, dict(os.environ)) is not None
+    assert await claude_memory_import_note(tmp_path, _launch_env(claude_config)) is not None
     assert await codex_memory_import_note(codex_home) is not None
 
     offers = tmp_path / "omnigent-data" / "memory-import-offers"

@@ -9183,6 +9183,9 @@ class _ClaudeSessionLaunchMetadata:
     #: session carries a routing decision — a web create routes the model
     #: before the pane launches — so no prompt is ever held and replayed.
     turn_routing: bool = False
+    #: The session is a child (sub-agent, worker or side chat) whose replies its
+    #: parent receives, so one-time user offers are left to top-level sessions.
+    has_parent: bool = False
 
 
 def _claude_launch_metadata_from_envelope(
@@ -9215,6 +9218,7 @@ def _claude_launch_metadata_from_envelope(
         ),
         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
         resume_cost_usd=snapshot.own_cost_usd,
+        has_parent=bool(snapshot.parent_session_id),
     )
 
 
@@ -9283,6 +9287,7 @@ async def _load_legacy_claude_launch_metadata(
         ),
         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
         resume_cost_usd=_claude_resume_cost_from_snapshot(snapshot),
+        has_parent=bool(snapshot.get("parent_session_id")),
     )
     from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
 
@@ -10152,8 +10157,8 @@ async def _auto_create_claude_terminal(
     # Apply the per-harness startup command/args override from config
     # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
     # downstream integration can wrap this managed-host launch — e.g. a wrapper
-    # such as ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
-    # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
+    # sets ``command: my-wrapper`` + ``args: ["--"]`` to run
+    # ``my-wrapper -- <augmented args>`` (the config args prepend, and augmentation
     # appends below, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.
@@ -10195,27 +10200,24 @@ async def _auto_create_claude_terminal(
             **extra,
         )
 
-    # Decided before the instructions are composed, since the offer goes into them.
-    # The offer reads the config dir the launched Claude will use: an ``env``
-    # wrapper in the configured command can set its own ``CLAUDE_CONFIG_DIR`` or
-    # ``--chdir``. Augmentation only appends to the args, so the base args
-    # already give the wrapper's final shape. The pane env added at launch (Tool
-    # Search, gateway and relay variables) never sets the config dir or HOME.
+    # Resolve the wrapped launch's env and cwd before composing the instructions,
+    # since the offer goes into them. Base args already give the wrapper's shape.
+    # Only a top-level session is offered: a child's reply goes to its parent.
     claude_memory_import = None
-    if _CLAUDE_AUTO_MEMORY_OFF_ENV in claude_auto_memory_env:
+    if _CLAUDE_AUTO_MEMORY_OFF_ENV in claude_auto_memory_env and not launch_metadata.has_parent:
         offer_spec = claude_terminal_spec(
             resolve_harness_args("claude-native", tuple(base_claude_args), cfg=_harness_cfg),
             dict(claude_auto_memory_env),
         )
+        offer_env = _claude_terminal_launch_env(offer_spec)
         try:
             offer_cwd = _claude_terminal_launch_cwd(offer_spec, agent_os_env)
         except OmnigentError:
             # The launch itself will refuse below; make no offer.
             offer_cwd = None
-        if offer_cwd is not None:
-            claude_memory_import = await claude_memory_import_note(
-                offer_cwd, _claude_terminal_launch_env(offer_spec)
-            )
+        # A wrapper can unset or change the variable, leaving auto memory on.
+        if offer_cwd is not None and offer_env.get(_CLAUDE_AUTO_MEMORY_OFF_ENV) == "1":
+            claude_memory_import = await claude_memory_import_note(offer_cwd, offer_env)
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
@@ -10257,7 +10259,7 @@ async def _auto_create_claude_terminal(
 
     env_spec = claude_terminal_spec(
         launch_args,
-        # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL etc.) when
+        # Tool Search env plus model gateway env (ANTHROPIC_BASE_URL etc.) when
         # derived. Empty provider config still forces ENABLE_TOOL_SEARCH=true so
         # MCP schemas are loaded on demand.
         {
