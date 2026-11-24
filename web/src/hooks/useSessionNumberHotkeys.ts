@@ -1,8 +1,5 @@
-// Cmd+1..9 (Ctrl on Win/Linux) jumps to the Nth session the sidebar lists,
-// top to bottom (the caller passes its visible rows); ⌘0 stays the app's Actual
-// Size. Once-bound, ref-backed, and
-// platform-aware (only ⌘ fires on macOS, only Ctrl on Win/Linux). Fires even in
-// a focused text field so you can jump mid-compose. Bind ONCE.
+// Cmd/Ctrl+1..9 jumps to the Nth session the sidebar lists (⌘0 stays Actual Size), even from a
+// text field. Only ⌘ fires on macOS and only Ctrl elsewhere. Once-bound and ref-backed: bind ONCE.
 //
 // Platform-aware chord: a browser tab reserves plain Cmd/Ctrl+digit for native
 // tab-switching, so in the browser the binding adds Alt (Cmd/Ctrl+Alt+digit) to

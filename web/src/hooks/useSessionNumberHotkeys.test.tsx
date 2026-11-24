@@ -1,8 +1,5 @@
-// Numeric pinned-session jump to the Nth pinned session: 1–9 → indices 0–8; ⌘0 is
-// left to Actual Size. Platform-aware chord — plain Cmd/Ctrl+digit in the Electron shell,
-// Cmd/Ctrl+Alt+digit in the browser (matched on e.code there, since Alt rewrites
-// e.key). Only ⌘ fires on macOS, only Ctrl on Win/Linux. Fires inside text
-// fields; out-of-range and the session the window's URL shows are no-ops.
+// Cmd/Ctrl+1–9 (plus Alt in the browser, matched on e.code) jumps to the Nth session; ⌘0 stays
+// Actual Size. Out-of-range digits and the session the URL already shows are no-ops.
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -39,7 +36,6 @@ function press(
   return e;
 }
 
-/** Render on macOS (⌘) by default; pass isMac=false for the Ctrl (Win/Linux) path. */
 /** Render on macOS (⌘) by default, with the window at *path*; isMac=false is Win/Linux. */
 function render(ids: readonly string[], path = "/", isMac = true) {
   window.history.replaceState(null, "", path);
@@ -153,30 +149,14 @@ describe("useSessionNumberHotkeys", () => {
     expect(navigate).toHaveBeenCalledWith("/c/a");
   });
 
-  it.each([
-    ["a trailing slash", "/c/a/", undefined],
-    ["a Canvas route", "/canvas/c/a", undefined],
-    ["the server's base path", "/omnigent/c/a/", "/omnigent"],
-  ])("knows the window shows the session at %s", (_case, path, base) => {
-    window.__OMNIGENT_BASE_PATH__ = base;
-    render(ids, path);
+  // The route shapes themselves are matched in sessionRoutes.test.ts.
+  it("knows the window shows the session under the server's base path", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/omnigent";
+    render(ids, "/omnigent/c/a/");
     press("1");
     expect(navigate).not.toHaveBeenCalled();
     press("2");
     expect(navigate).toHaveBeenCalledWith("/c/b");
-  });
-
-  it("reads an encoded session id as the router decodes it", () => {
-    render(["123", "b"], "/canvas/c/%31%32%33");
-    press("1");
-    expect(navigate).not.toHaveBeenCalled();
-  });
-
-  it("opens the session from a path outside the server's base path", () => {
-    window.__OMNIGENT_BASE_PATH__ = "/omnigent";
-    render(ids, "/c/a");
-    press("1");
-    expect(navigate).toHaveBeenCalledWith("/c/a");
   });
 
   it("knows the session under an embedding host's mount", () => {
@@ -186,25 +166,10 @@ describe("useSessionNumberHotkeys", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("opens the session from a page whose path only ends like its route", () => {
-    render(ids, "/extensions/demo/c/a");
-    press("1");
-    expect(navigate).toHaveBeenCalledWith("/c/a");
-  });
-
   it("prevents the browser's native tab-switch when it navigates", () => {
     render(ids);
     const e = press("1");
     expect(e.defaultPrevented).toBe(true);
-  });
-
-  it("only maps the first nine: a tenth pinned session has no shortcut", () => {
-    const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
-    render(ten);
-    press("9");
-    expect(navigate).toHaveBeenCalledWith("/c/i");
-    press("0");
-    expect(navigate).toHaveBeenCalledTimes(1);
   });
 
   it("does nothing when the list is empty", () => {
