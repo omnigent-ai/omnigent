@@ -7,6 +7,7 @@
 import {
   BotIcon,
   FileDiffIcon,
+  FileTextIcon,
   FolderTreeIcon,
   GitPullRequestIcon,
   ListChecksIcon,
@@ -61,7 +62,7 @@ export interface WorkspacePanelTabDescriptor {
 export const WORKSPACE_PANEL_TABS: Record<WorkspacePanelTab, WorkspacePanelTabDescriptor> = {
   "google-docs": {
     label: "Google Docs",
-    icon: FolderTreeIcon,
+    icon: FileTextIcon,
     shown: ({ showGoogleDocs }) => showGoogleDocs === true,
   },
   "content-search": {
