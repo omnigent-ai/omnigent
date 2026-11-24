@@ -3175,12 +3175,13 @@ function AppShellImpl() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" keeps the switcher.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
-  // A terminal-first chat's card has a row of its own, over its Chat and Terminal views, which
-  // takes the Chat/Terminal switch. A sidebar shell in the main view has no switch to hold.
-  // With floating panes a split shows as cards of its own, in Chat and Terminal, so the session's
-  // column is no card then; a lone pane stays the chat's card, its row holding the view switch,
-  // wherever the cards float, below the desktop layout's width too.
+  // With floating panes a split draws cards of its own, so the session's column is no card then;
+  // marking it "terminal" takes the chat card's styling off, as the Terminal view's does.
   const panesDrawCards = floatingPanesShown && panesView && splitBesideChat;
+  let mainColumnView: "chat" | "terminal" | undefined;
+  if (conversationId) mainColumnView = panesDrawCards ? "terminal" : "chat";
+  // A terminal-first chat's card has a row of its own, which takes the Chat/Terminal switch
+  // wherever the cards float. A sidebar shell in the main view has no switch to hold.
   const chatPaneStrip =
     floatingPanesShown && !!conversationId && terminalFirst && !isShellView && !panesDrawCards;
   const shellViewTargetAvailable =
@@ -3454,7 +3455,7 @@ function AppShellImpl() {
                 data-workspace-panel-resizing={inlinePanelResizing || undefined}
                 data-workspace-panel-animate={rightPanelVisibilityAnimating || undefined}
                 // A session's chat floats as one pane; the panes view floats its own cards.
-                data-main-view={conversationId ? (panesDrawCards ? "terminal" : "chat") : undefined}
+                data-main-view={mainColumnView}
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
