@@ -791,6 +791,7 @@ async def test_native_transcript_preserves_browser_title_preference(
         ("claude-native", "Explain /login", False, False),
         ("codex-native", "/login", False, False),
         ("claude-native", "/login", True, True),
+        ("claude-native", "set up the worktree", False, True),
     ],
 )
 async def test_native_message_repeat_with_same_stable_id_forwards_once(
@@ -895,6 +896,8 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
                 return
             assert first.status_code == 202, first.text
             assert message_forwards() == 1
+            # A message sent during a turn follows that turn's request instead of starting one.
+            assert pending_inputs.has_pending_turn_start(session_id) is not active_turn
             # The runner learns the message's id so a failed turn can name it.
             forwarded_body = json.loads(
                 next(r for r in forwarded if r.url.path.endswith("/events")).content
@@ -2931,6 +2934,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             # The forwarded message is the meta item; its store id lets the
             # runner dedup it on a cold-cache history reload.
             "persisted_item_id": meta["id"],
+            "request_item_id": visible["id"],
         }
     ]
     event_types = [event["type"] for _, event in published]

@@ -257,15 +257,21 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _read_explicit_unread,
     _read_last_seen,
+    _record_sent_request,
     _session_active_response_cache,
     _session_background_agents_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_dispatched_turns,
+    _session_held_overflow,
+    _session_held_request_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _session_turn_ends,
+    _session_turn_request_cache,
     _unbound_managed_launch_tasks,
     build_policy_engine,
     get_agent_cache,
@@ -5427,6 +5433,8 @@ def _publish_status(
         left running, on its ``"waiting"`` edge. Kept for snapshots until the
         next non-``waiting`` edge; ignored on every other status.
     """
+    # Any status edge tells the server where the runner's turn stands.
+    _session_dispatched_turns.discard(session_id)
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
     # follow-on quiescence signal. This matters for claude-native: the
@@ -5450,6 +5458,7 @@ def _publish_status(
         # tracked in-flight response id rather than leaving it for the
         # snapshot to reopen a streaming bubble.
         _session_active_response_cache.pop(session_id, None)
+        _session_turn_request_cache.pop(session_id, None)
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
@@ -5545,6 +5554,15 @@ def _publish_status(
             _session_active_response_cache[session_id] = response_id
     else:
         _session_active_response_cache.pop(session_id, None)
+    # A ``waiting`` edge naming background agents ends a claude-native turn too.
+    if status not in ("running", "waiting") or background_agents:
+        _session_turn_request_cache.pop(session_id, None)
+        _session_turn_ends[session_id] = _session_turn_ends.get(session_id, 0) + 1
+        pending_inputs.mark_turn_ended(session_id)
+        # The ended turn took up any message still held; a turn the runner
+        # starts with held messages names them on its running edge.
+        _session_held_request_cache.pop(session_id, None)
+        _session_held_overflow.discard(session_id)
     # Keep the background-shell tally sticky alongside the status (see the
     # cache's declaration). A ``Stop`` hook reports an authoritative count
     # (``None`` is never sent by it): a positive count sets the tally, and
@@ -8851,6 +8869,8 @@ async def _dispatch_skill_slash_command_to_runner(
         [visible_item, meta_item],
     )
     visible = persisted_items[0]
+    if not visible.deduplicated:
+        _record_sent_request(session_id, visible.id)
 
     # Mirror the plain-message path's title seeding: a session whose FIRST
     # message is a skill invocation (web landing composer, REPL) would
@@ -8883,6 +8903,8 @@ async def _dispatch_skill_slash_command_to_runner(
         # Hand the runner that id so a cold-cache reload drops the
         # right persisted copy (see _forward_event_to_runner).
         "persisted_item_id": persisted_items[1].id,
+        # The runner names the turn by the item a side chat cuts before: the visible command.
+        "request_item_id": visible.id,
     }
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
@@ -8902,6 +8924,7 @@ async def _dispatch_skill_slash_command_to_runner(
             json=runner_body,
             timeout=_RUNNER_FORWARD_TIMEOUT,
         )
+        _session_dispatched_turns.add(session_id)
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())
     except (httpx.HTTPError, ConnectionError) as exc:

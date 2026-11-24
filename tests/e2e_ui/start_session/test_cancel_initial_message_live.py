@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
-from playwright.sync_api import Page, Request, Response, expect
+from playwright.sync_api import Locator, Page, Request, Response, expect
 
 pytestmark = [pytest.mark.workspace_panel_product_default, pytest.mark.timeout(240)]
 
@@ -28,8 +28,8 @@ _USER = '[data-testid="message-bubble"][data-role="user"]'
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 
 
-def _choose_workspace_and_routing(page: Page, workspace: Path) -> None:
-    """Choose an actual host folder and Claude's Smart Routing model in the UI."""
+def _choose_workspace(page: Page, workspace: Path) -> Locator:
+    """Choose an actual host folder in the new-chat UI and return the agent picker."""
     picker = page.get_by_test_id("new-chat-landing-agent-select")
     expect(picker).to_be_enabled(timeout=60_000)
     page.get_by_test_id("new-chat-landing-workspace-chip").click()
@@ -40,7 +40,12 @@ def _choose_workspace_and_routing(page: Page, workspace: Path) -> None:
     folder.press("Enter")
     page.get_by_test_id("workspace-picker-select").click()
     expect(page.get_by_test_id("workspace-picker")).to_be_hidden()
+    return picker
 
+
+def _choose_workspace_and_routing(page: Page, workspace: Path) -> None:
+    """Choose an actual host folder and Claude's Smart Routing model in the UI."""
+    picker = _choose_workspace(page, workspace)
     picker.click()
     claude = page.get_by_role("menuitem", name="Claude Code", exact=True)
     expect(claude).to_be_visible()

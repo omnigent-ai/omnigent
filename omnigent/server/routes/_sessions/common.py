@@ -664,6 +664,117 @@ _runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+# The input each running turn began with, so a side chat forked mid-turn copies
+# only what came before it. Set as that input is persisted or a runner starts a turn
+# with it; the turn's end drops it.
+_session_turn_request_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+# Messages sent to an SDK runner while a turn's start is recorded, oldest first, by
+# the item a side chat cuts before, which is how the runner names them too.
+_session_held_request_cache: WorkspaceScopedCache[str, dict[str, None]] = WorkspaceScopedCache()
+
+# Most messages tracked per session for the turn after the running one.
+_MAX_HELD_REQUESTS = 64
+
+# The start recorded for a running turn that took up no stored request, e.g. a
+# buffered /compact, so a side chat leaves none of the history out.
+_NO_TURN_REQUEST = ""
+
+# Sessions whose runner took a message, until the server sees their next status
+# edge: a side chat counts the turn in flight before its running edge arrives.
+_session_dispatched_turns: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+
+# Sessions holding more messages than _MAX_HELD_REQUESTS, until their turn ends: an
+# empty held map then does not show that no request still waits.
+_session_held_overflow: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+
+# How many turns each session has ended, so an input stored while one ended is not
+# taken for the start of a later turn.
+_session_turn_ends: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
+def _record_turn_request(session_id: str, item_id: str) -> None:
+    """
+    Record *item_id* as the input *session_id*'s turn began with, unless one is recorded.
+
+    The first input persisted since the last turn ended is the turn's start. A
+    follow-up sent before the turn is seen running, or steered into it, never
+    replaces it, whatever its status said when it was sent.
+
+    :param session_id: Session the input was persisted to, e.g. ``"conv_abc123"``.
+    :param item_id: The persisted input's item id.
+    """
+    _session_turn_request_cache.setdefault(session_id, item_id)
+
+
+def _record_sent_request(session_id: str, item_id: str) -> None:
+    """
+    Record a message or skill persisted for *session_id*'s SDK runner.
+
+    The first since the last turn ended is the turn's start. A later one waits:
+    the runner steers it into the running turn, or holds it for a turn that
+    starts as this one ends (see :func:`_record_held_turn_start`).
+
+    :param session_id: Session the message was sent to, e.g. ``"conv_abc123"``.
+    :param item_id: The persisted item a side chat cuts before, e.g. a skill's visible
+        command.
+    """
+    record = _session_turn_request_cache.get(session_id)
+    if record is None:
+        _session_turn_request_cache[session_id] = item_id
+        return
+    if record == _NO_TURN_REQUEST:
+        # The running turn answers no request, so a side chat leaves this one out first.
+        _session_turn_request_cache[session_id] = item_id
+    held = _session_held_request_cache.setdefault(session_id, {})
+    if len(held) < _MAX_HELD_REQUESTS:
+        held.setdefault(item_id, None)
+    else:
+        _session_held_overflow.add(session_id)
+
+
+def _record_held_turn_start(session_id: str, input_item_ids: object, *, continued: bool) -> None:
+    """
+    Record the start of a turn a runner began with messages it held.
+
+    The runner names the stored items every turn it starts takes up, by the item a
+    side chat cuts before, so the record follows the stream that also ends turns. A
+    held-message turn starts as the one before it ends, with no idle edge between,
+    and messages held for later turns keep their place. An older runner names none;
+    its running edge then arrives while a turn already runs, and that turn takes
+    up every held message, starting at the oldest.
+
+    :param session_id: Session whose turn started, e.g. ``"conv_abc123"``.
+    :param input_item_ids: The turn's stored items, oldest first, e.g.
+        ``["msg_b", "msg_c"]``; ``[]`` when none is stored, and ``None`` from an
+        older runner or a native turn.
+    :param continued: Whether the edge arrived while a turn was already running.
+    """
+    if isinstance(input_item_ids, list):
+        named = [item_id for item_id in input_item_ids if isinstance(item_id, str)]
+        held = _session_held_request_cache.get(session_id) or {}
+        if not named:
+            # The turn takes up no stored request, so only messages still held stay out.
+            if held:
+                _session_turn_request_cache[session_id] = next(iter(held))
+            elif session_id not in _session_held_overflow:
+                _session_turn_request_cache[session_id] = _NO_TURN_REQUEST
+            return
+        _session_turn_request_cache[session_id] = named[0]
+        if named[0] in held:
+            # The runner takes held messages up in order, so older ones were already taken up.
+            for held_item_id in list(held):
+                del held[held_item_id]
+                if held_item_id == named[0]:
+                    break
+        for item_id in named:
+            held.pop(item_id, None)
+        if not held:
+            _session_held_request_cache.pop(session_id, None)
+    elif continued and (held := _session_held_request_cache.pop(session_id, None)):
+        _session_turn_request_cache[session_id] = next(iter(held))
+
+
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
@@ -1231,6 +1342,7 @@ __all__ = [
     "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
     "_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
+    "_MAX_HELD_REQUESTS",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
     "_MCP_ELICITATION_TYPE",
@@ -1241,6 +1353,7 @@ __all__ = [
     "_NATIVE_POLICY_NOT_ENFORCED_CODE",
     "_NATIVE_TERMINAL_ENSURE_FAILED_CODE",
     "_NATIVE_TERMINAL_START_FAILED_CODE",
+    "_NO_TURN_REQUEST",
     "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE",
     "_PI_EXTENSION_UI_HOOK_TIMEOUT_S",
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
@@ -1296,6 +1409,9 @@ __all__ = [
     "_read_explicit_unread",
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
+    "_record_held_turn_start",
+    "_record_sent_request",
+    "_record_turn_request",
     "_runner_relay_tasks",
     "_runner_status_probe_backoff",
     "_runner_status_probe_inflight",
@@ -1306,10 +1422,15 @@ __all__ = [
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",
+    "_session_dispatched_turns",
+    "_session_held_overflow",
+    "_session_held_request_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
+    "_session_turn_ends",
+    "_session_turn_request_cache",
     "_unbound_managed_launch_tasks",
     "get_server_host_registry",
     "get_server_runner_router",

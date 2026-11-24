@@ -4472,6 +4472,7 @@ def create_runner_app(
         *,
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
+        input_item_ids: list[str] | None = None,
     ) -> None:
         if status == "running":
             # A new turn pulls any backed-off native idle watcher back to the
@@ -4503,6 +4504,10 @@ def create_runner_app(
             # response's own terminal error; the id lets it recognise this edge
             # as the same failure instead of adding a second card.
             event["response_id"] = response_id
+        if input_item_ids is not None:
+            # The stored messages a turn takes up when it follows the last one with no idle
+            # edge; empty when none of them is stored, e.g. a buffered /compact.
+            event["input_item_ids"] = input_item_ids
         if status == "failed":
             source = source_error if source_error is not None else (error or {})
             dimensions: dict[str, str] = {}
@@ -4532,6 +4537,28 @@ def create_runner_app(
 
     def _is_native_harness(conv_id: str) -> bool:
         return is_native_harness(_session_harness_name(conv_id))
+
+    def _turn_input_item_ids(conv_id: str, bodies: list[_JsonObject]) -> list[str] | None:
+        """
+        Name the stored items a turn takes up, by the item the server cuts a side chat before.
+
+        That is a body's ``request_item_id``, e.g. a skill's visible command, else its
+        ``persisted_item_id``. A native turn names none: its inputs are stored later,
+        from its transcript, so naming none must not read as "no stored request".
+
+        :param conv_id: Session whose turn starts, e.g. ``"conv_abc123"``.
+        :param bodies: The message bodies the turn takes up, oldest first.
+        :returns: The item ids, ``[]`` when none is stored, or ``None`` for a native turn.
+        """
+        if _is_native_harness(conv_id):
+            return None
+        return [
+            item_id
+            for body in bodies
+            if isinstance(
+                item_id := body.get("request_item_id") or body.get("persisted_item_id"), str
+            )
+        ]
 
     async def _codex_native_bridge_state_and_dir_for_session(
         conv_id: str,
@@ -5581,7 +5608,11 @@ def create_runner_app(
                     for body in all_bodies
                     if isinstance(pending_id := body.get("pending_id"), str)
                 }
-                _publish_turn_status(session_id, "running")
+                _publish_turn_status(
+                    session_id,
+                    "running",
+                    input_item_ids=_turn_input_item_ids(session_id, all_bodies),
+                )
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(next_body, session_id),
                     name=f"turn-cont-{session_id}",
@@ -8477,7 +8508,11 @@ def create_runner_app(
                     extra={"session_id": conversation_id},
                 )
 
-                _publish_turn_status(conversation_id, "running")
+                _publish_turn_status(
+                    conversation_id,
+                    "running",
+                    input_item_ids=_turn_input_item_ids(conversation_id, [message_body]),
+                )
 
                 if stream:
                     response = await _stream_message_to_harness(message_body, conversation_id)

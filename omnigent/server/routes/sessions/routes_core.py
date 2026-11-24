@@ -11,7 +11,7 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from itertools import batched
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 from fastapi import (
@@ -49,6 +49,7 @@ from omnigent.entities import (
     Agent,
     CommentsFingerprint,
     Conversation,
+    ConversationItem,
     StoredFile,
     synthesize_conversation_title,
 )
@@ -78,6 +79,7 @@ from omnigent.runner.routing import RunnerRouter, routing_host_id, routing_host_
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
+    pending_inputs,
     user_session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -161,7 +163,11 @@ from omnigent.server.routes._sessions.common import (
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _FORK_HISTORY_NATIVE_HARNESSES,
+    _NO_TURN_REQUEST,
     _logger,
+    _session_background_agents_cache,
+    _session_dispatched_turns,
+    _session_turn_request_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -301,6 +307,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
+    is_human_input,
     muted_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -331,6 +338,38 @@ from omnigent.version import VERSION
 
 # Harnesses whose sessions offer ``/rewind``.
 _REWIND_HARNESSES = frozenset({"claude-sdk", "claude-native"})
+
+# Newest items a side chat fork reads for its source's request when no turn start is recorded.
+_SIDE_CHAT_REQUEST_LOOKBACK = 200
+
+
+class _SideChatCutoff(NamedTuple):
+    """
+    Where a side chat forked mid-turn stops copying its source's history.
+
+    :param before_item_id: Copy only the items before this one.
+    :param up_to_response_id: Copy through this response's last item.
+    :param copy_items: ``False`` copies no items.
+    """
+
+    before_item_id: str | None = None
+    up_to_response_id: str | None = None
+    copy_items: bool = True
+
+
+class _NewestRequest(NamedTuple):
+    """
+    The newest request among a session's most recent items.
+
+    :param item_id: The request's first item id, ``None`` when none is in reach.
+    :param answered: Whether the agent produced anything after the request.
+    :param end_response_id: Response id of the newest item a copy can end on.
+    """
+
+    item_id: str | None
+    answered: bool
+    end_response_id: str | None
+
 
 # An image a prompt carries inline rather than as a stored file.
 _INLINE_IMAGE_URL = re.compile(r"^data:image/[\w.+-]+;base64,", re.IGNORECASE)
@@ -4912,6 +4951,15 @@ def register_core_routes(
         from the truncated items instead of resuming the source's full
         native transcript.
 
+        A side chat (``body.side_chat``) forked while the source answers a
+        request, or while a message is still reaching its runner, leaves that
+        request out. It copies the history before the input the running turn
+        began with, which follow-ups sent during the turn do not change, or,
+        while that request has not reached history, the history as it stands
+        when the fork is made, or none when its newest items hold nothing to
+        end the copy on. A native target rebuilds its transcript from those
+        items instead of cloning the source's live one.
+
         The dialog's run-config picks (``body.model_override``,
         ``body.reasoning_effort``, ``body.terminal_launch_args`` — the
         permission-/approval-mode selector) override what the fork would
@@ -5141,15 +5189,38 @@ def register_core_routes(
                     _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
                 )
             )
+        # A side chat must not inherit a request its source is answering or about
+        # to answer, or the side chat's model takes that request up as its own.
+        source_running = _session_status_from_cache(source.id, source.live_status) == "running"
+        # A runner that took a message counts too: its running edge can trail the reply.
+        side_chat_mid_turn = (
+            body.side_chat
+            and copy_history
+            and before_item_id is None
+            and body.up_to_response_id is None
+            and (
+                source_running
+                or _session_is_starting(source.id)
+                or source.id in _session_dispatched_turns
+            )
+        )
+        up_to_response_id = body.up_to_response_id
+        copy_items = copy_history
+        if side_chat_mid_turn:
+            # A claude-native turn that ended with background agents running reads as running.
+            turn_in_flight = source_running and not _session_background_agents_cache.get(source.id)
+            before_item_id, up_to_response_id, copy_items = await asyncio.to_thread(
+                _side_chat_cutoff, source.id, turn_in_flight
+            )
         # A fork that keeps no history has no attachments to replay.
-        if copy_history:
+        if copy_items:
             await asyncio.to_thread(
                 _require_attachment_compatible_history,
                 source_id,
                 base_agent,
                 conversation_store,
                 file_store,
-                up_to_response_id=body.up_to_response_id,
+                up_to_response_id=up_to_response_id,
                 before_item_id=before_item_id,
                 target_harness=continuation_harness,
             )
@@ -5399,6 +5470,8 @@ def register_core_routes(
             (not switching_agent or copy_model_settings)
             and (not target_is_cursor or target_forks_opencode)
             and body.host_type != "managed"
+            # A running source's native transcript holds the request a side chat skips.
+            and not side_chat_mid_turn
         )
 
         # On an agent switch, recompute the Web UI presentation labels for
@@ -5473,7 +5546,7 @@ def register_core_routes(
         # degrades — so a probe would only trade latency for the same outcome.
         fork_file_id_map: dict[str, str] = {}
         fork_source_files: list[StoredFile] = []
-        if copy_history and file_store is not None and artifact_store is not None:
+        if copy_items and file_store is not None and artifact_store is not None:
             files_after: str | None = None
             while True:
                 files_page = await asyncio.to_thread(
@@ -5567,9 +5640,9 @@ def register_core_routes(
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
-                up_to_response_id=body.up_to_response_id,
+                up_to_response_id=up_to_response_id,
                 before_item_id=before_item_id,
-                copy_items=copy_history,
+                copy_items=copy_items,
                 continue_source=continue_source,
                 conversation_id=fork_id,
                 project_id=fork_project_id,
@@ -6429,6 +6502,87 @@ def register_core_routes(
             if not page.has_more or page.last_id is None:
                 return False
             after = page.last_id
+
+    def _side_chat_cutoff(session_id: str, turn_in_flight: bool) -> _SideChatCutoff:
+        """
+        Find where a side chat forked from *session_id* now stops copying.
+
+        It stops before the input the running turn began with, so it never sees
+        that turn's request. Without a recorded start, e.g. after a restart, it
+        stops before the newest request, which still copies the turn's request
+        once a follow-up has been steered in, or copies nothing when none is in reach.
+        A turn that took up no stored request, e.g. a compaction, leaves out none.
+
+        :param session_id: The side chat's source session, e.g. ``"conv_abc"``.
+        :param turn_in_flight: Whether the source is answering a request.
+        :returns: The copy's cutoff.
+        """
+        turn_request = _session_turn_request_cache.get(session_id)
+        if turn_request:
+            return _SideChatCutoff(before_item_id=turn_request)
+        # Checked before the read too, so a request that settles meanwhile
+        # cannot make the earlier read look like the running turn.
+        delivering = pending_inputs.has_pending_turn_start(session_id)
+        newest = _newest_request(session_id)
+        # A request that lands during the read is recorded before it stops pending.
+        turn_request = _session_turn_request_cache.get(session_id)
+        delivering = delivering or pending_inputs.has_pending_turn_start(session_id)
+        if turn_request:
+            return _SideChatCutoff(before_item_id=turn_request)
+        answers_request = turn_request != _NO_TURN_REQUEST
+        if (
+            newest.item_id is not None
+            and answers_request
+            and (not newest.answered or (turn_in_flight and not delivering))
+        ):
+            return _SideChatCutoff(before_item_id=newest.item_id)
+        if delivering or not turn_in_flight or not answers_request:
+            # The request has not reached history: copy only what is there now,
+            # which is nothing when no item a copy can end on is in reach.
+            return _SideChatCutoff(
+                up_to_response_id=newest.end_response_id,
+                copy_items=newest.end_response_id is not None,
+            )
+        return _SideChatCutoff(copy_items=False)
+
+    def _newest_request(session_id: str) -> _NewestRequest:
+        """
+        Find the newest request among *session_id*'s most recent items.
+
+        A request is input a person sent (:func:`is_human_input`), so internal
+        records such as task notifications are skipped, and a skill's command
+        and prompt count as one. Reads at most
+        :data:`_SIDE_CHAT_REQUEST_LOOKBACK` items, newest first.
+
+        :param session_id: Session to search, e.g. ``"conv_abc"``.
+        :returns: The newest request and what follows it.
+        """
+        page = conversation_store.list_items(
+            session_id, limit=_SIDE_CHAT_REQUEST_LOOKBACK, order="desc"
+        )
+        request: ConversationItem | None = None
+        answered = False
+        end_response_id: str | None = None
+        for item in page.data:
+            if request is not None:
+                if not is_human_input(item.data) or item.response_id != request.response_id:
+                    break
+                request = item
+            elif is_human_input(item.data):
+                request = item
+                end_response_id = end_response_id or item.response_id
+            # Resource events share one response id with later events.
+            elif item.type != "resource_event":
+                end_response_id = end_response_id or item.response_id
+                answered = answered or (
+                    item.type in ("function_call", "function_call_output", "reasoning")
+                    or (isinstance(item.data, MessageData) and item.data.role == "assistant")
+                )
+        return _NewestRequest(
+            item_id=request.id if request is not None else None,
+            answered=answered,
+            end_response_id=end_response_id,
+        )
 
     def _rewind_prompt(session_id: str, item_id: str) -> MessageData:
         """

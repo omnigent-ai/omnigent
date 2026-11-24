@@ -245,6 +245,9 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _policy_evaluation_locks,
     _pushed_model_options_cache,
     _recent_mirrored_tool_calls,
+    _record_held_turn_start,
+    _record_sent_request,
+    _record_turn_request,
     _RelayHandle,
     _RelayStatusSnapshot,
     _runner_relay_tasks,
@@ -256,10 +259,15 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_dispatched_turns,
+    _session_held_overflow,
+    _session_held_request_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _session_turn_ends,
+    _session_turn_request_cache,
     _unbound_managed_launch_tasks,
     get_caps,
     get_server_runner_router,
@@ -3464,6 +3472,24 @@ def _drains_pending_inputs(item: NewConversationItem) -> bool:
     )
 
 
+def _begins_native_turn(item: NewConversationItem) -> bool:
+    """
+    Whether a mirrored item is input a native turn can begin with.
+
+    That is anything that settles a queued web message, or hidden input such as
+    a background task's notification, which Claude Code answers in a turn of its own.
+
+    :param item: The parsed external item.
+    :returns: ``True`` for a turn's possible first input.
+    """
+    return _drains_pending_inputs(item) or (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "user"
+        and item.data.is_meta
+    )
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -3590,6 +3616,8 @@ async def _persist_external_conversation_item_unlocked(
     :returns: Store-assigned conversation item id.
     """
     item = _new_external_conversation_item(session_id, body)
+    # A turn that ends while this input is stored was the turn the input belonged to.
+    turn_ends = _session_turn_ends.get(session_id, 0)
     source_id = body.data.get("source_id")
     is_peer_wake_marker = (
         isinstance(source_id, str)
@@ -3758,6 +3786,13 @@ async def _persist_external_conversation_item_unlocked(
         )
         await record_claude_subagent_return(session_id, persisted, conversation_store)
         return persisted.id
+    if _begins_native_turn(item) and _session_turn_ends.get(session_id, 0) == turn_ends:
+        # Before the queue entry settles, so a side chat fork that saw it pending
+        # finds the request it became.
+        _record_turn_request(session_id, persisted.id)
+        # A web message that starts a turn is in flight until the turn's next status edge.
+        if drained is not None and not drained.queued_during_turn and item.type == "message":
+            _session_dispatched_turns.add(session_id)
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
     # older messages a slash command jumped over are still on their way and
@@ -8350,6 +8385,8 @@ async def _forward_event_to_runner(
             persisted = await asyncio.to_thread(
                 conversation_store.append, session_id, [replacement]
             )
+        if not persisted[0].deduplicated:
+            _record_sent_request(session_id, persisted[0].id)
         return persisted
 
     # Run controls wait for routing and a fresh guard before entering replayable history.
@@ -8845,6 +8882,7 @@ async def _forward_event_to_runner(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+        _session_dispatched_turns.add(session_id)
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
@@ -9447,6 +9485,11 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                # A turn that ended with background agents still running reads as running.
+                queued_during_turn=(
+                    _session_status_from_cache(session_id, conv.live_status) == "running"
+                    and not _session_background_agents_cache.get(session_id)
+                ),
             )
             if queues_message
             else None
@@ -9838,6 +9881,10 @@ def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
+    _session_turn_request_cache.pop(session_id, None)
+    _session_held_request_cache.pop(session_id, None)
+    _session_held_overflow.discard(session_id)
+    _session_dispatched_turns.discard(session_id)
     _session_blocked_on_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 
@@ -10696,6 +10743,7 @@ async def _relay_runner_stream_once(
                                 from_runner=True,
                             )
                             pending_subagent_return_id = None
+                        continued = False
                         if status:
                             # Forward the runner's failure detail on a
                             # ``failed`` transition so a SETUP-phase
@@ -10758,6 +10806,7 @@ async def _relay_runner_stream_once(
                                     )
                                 else:
                                     continue
+                            continued = _session_status_cache.get(session_id) == "running"
                             _publish_status(
                                 session_id,
                                 status,
@@ -10798,6 +10847,9 @@ async def _relay_runner_stream_once(
                             # turn left un-consumed (e.g. its terminal event
                             # never reached the relay across a reconnect).
                             _llm_response_denied_turns.pop(session_id, None)
+                            _record_held_turn_start(
+                                session_id, event.get("input_item_ids"), continued=continued
+                            )
                         continue
 
                     # Terminal spin-up status from the runner's auto-create

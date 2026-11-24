@@ -290,6 +290,30 @@ def test_resolve_oldest_returns_none_when_empty() -> None:
     assert pending_inputs.resolve_oldest("conv_a") is None
 
 
+def test_only_a_message_sent_outside_a_turn_starts_one() -> None:
+    """
+    A message sent while no turn runs starts the next one; a follow-up does not.
+
+    A side chat forked meanwhile relies on this: the request starting a turn is
+    not in history yet, while a follow-up waits behind a request that is.
+    """
+    follow_up = pending_inputs.record(
+        "conv_a", [_text_block("also check the parser")], queued_during_turn=True
+    )
+    assert pending_inputs.has_pending("conv_a")
+    assert not pending_inputs.has_pending_turn_start("conv_a")
+    drained = pending_inputs.resolve("conv_a", follow_up)
+    assert drained is not None
+    pending_inputs.restore("conv_a", drained)
+    # A persist that did not land puts it back as a follow-up.
+    assert not pending_inputs.has_pending_turn_start("conv_a")
+
+    starting = pending_inputs.record("conv_a", [_text_block("fix the parser")])
+    assert pending_inputs.has_pending_turn_start("conv_a")
+    pending_inputs.mark_interrupted("conv_a", [starting])
+    assert not pending_inputs.has_pending_turn_start("conv_a")
+
+
 def test_resolve_oldest_drains_regardless_of_reformatted_text() -> None:
     """
     Regression: a queued message drains even when the transcript
