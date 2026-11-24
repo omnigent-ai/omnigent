@@ -1062,6 +1062,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     del forward_calls[0]["subagent_router"]
     assert "turn_router" in forward_calls[0]
     del forward_calls[0]["turn_router"]
+    # A thread the forwarder later starts gets a TUI on this launch's app-server.
+    relaunch_terminal = forward_calls[0].pop("relaunch_terminal")
+    assert relaunch_terminal.func is orchestration._relaunch_codex_native_tui_on_thread
+    assert relaunch_terminal.keywords["app_server"] is app_server
     assert forward_calls == [
         {
             "session_id": session_id,
