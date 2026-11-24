@@ -1979,6 +1979,16 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        from omnigent.server.work_tasks import link_created_task_session, prepare_task_session
+
+        work_tasks = await prepare_task_session(
+            request,
+            parsed_metadata.work_task_id,
+            user_id=user_id,
+            projects=project_store,
+            conversations=conversation_store,
+            permissions=permission_store,
+        )
         if parsed_metadata.sibling_source_id is not None:
             from omnigent.server.session_families import authorize_sibling_source
 
@@ -2233,6 +2243,13 @@ def register_core_routes(
                     agent_store=agent_store,
                     parent=parent_conv,
                 )
+            await link_created_task_session(
+                work_tasks,
+                parsed_metadata.work_task_id,
+                result.session_id,
+                user_id=user_id,
+                conversations=conversation_store,
+            )
             if parsed_metadata.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
 

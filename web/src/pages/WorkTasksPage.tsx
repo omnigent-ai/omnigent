@@ -1,15 +1,15 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { PlusIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects } from "@/hooks/useConversations";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { useSearchParams } from "@/lib/routing";
+import { useNavigate, useSearchParams } from "@/lib/routing";
 import { newView } from "@/lib/workViewsApi";
 import { QueriedViewResults } from "@/views/QueriedViewResults";
 import { ViewControls } from "@/views/ViewControls";
-import { WorkTaskDialog } from "@/views/WorkTaskDialog";
+import { CreateWorkTaskDialog } from "@/views/WorkTaskEditor";
 
 export function WorkTasksPage() {
   const info = useServerInfo();
@@ -31,16 +31,22 @@ export function WorkTasksPage() {
 function TaskList() {
   const [value, setValue] = useState(() => newView("tasks"));
   const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
   const projects = useProjects();
   const projectOptions = (projects.data ?? []).flatMap((project) =>
     project.id ? [{ id: project.id, name: project.name }] : [],
   );
   const taskId = searchParams.get("task");
-  const openTask = (id: string | null) => {
-    const next = new URLSearchParams(searchParams);
-    if (id) next.set("task", id);
-    else next.delete("task");
-    setSearchParams(next);
+  useEffect(() => {
+    if (taskId && taskId !== "new")
+      navigate(`/work-tasks/${encodeURIComponent(taskId)}`, { replace: true });
+  }, [taskId, navigate]);
+  const openTask = (id: string) => {
+    if (id === "new") {
+      const next = new URLSearchParams(searchParams);
+      next.set("task", "new");
+      setSearchParams(next);
+    } else navigate(`/work-tasks/${id}`);
   };
   return (
     <PageScroll maxWidthClassName="max-w-none" extraTop="0.5rem" contentClassName="px-3 sm:px-6">
@@ -71,15 +77,18 @@ function TaskList() {
           />
         </div>
       </div>
-      {taskId && (
-        <WorkTaskDialog
-          taskId={taskId}
+      {taskId === "new" && (
+        <CreateWorkTaskDialog
           projects={projectOptions}
           initialProjectId={
             value.filters.project_ids.length === 1 ? value.filters.project_ids[0] : undefined
           }
-          onClose={() => openTask(null)}
-          onSaved={openTask}
+          onClose={() => {
+            const next = new URLSearchParams(searchParams);
+            next.delete("task");
+            setSearchParams(next);
+          }}
+          onCreated={(id) => navigate(`/work-tasks/${id}`, { replace: true })}
         />
       )}
     </PageScroll>

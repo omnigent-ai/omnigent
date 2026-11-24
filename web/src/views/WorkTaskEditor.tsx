@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { LinkIcon, PlusIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -16,7 +16,6 @@ import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import type { Project } from "@/lib/projectsApi";
 import { Link } from "@/lib/routing";
 import {
-  getWorkTask,
   linkWorkSession,
   newView,
   queryWorkView,
@@ -29,25 +28,17 @@ import { ViewSelect } from "./ViewControls";
 import { PRIORITIES, TASK_STATUSES } from "./viewPresentation";
 import { StatusIcon } from "./ViewResults";
 
-export function WorkTaskDialog({
-  taskId,
+export function CreateWorkTaskDialog({
   projects,
   initialProjectId,
   onClose,
-  onSaved,
+  onCreated,
 }: {
-  taskId: string;
   projects: Pick<Project, "id" | "name">[];
   initialProjectId?: string;
   onClose: () => void;
-  onSaved: (id: string) => void;
+  onCreated: (id: string) => void;
 }) {
-  const task = useQuery({
-    queryKey: ["work-task", taskId],
-    queryFn: () => getWorkTask(taskId),
-    enabled: taskId !== "new",
-    refetchOnMount: "always",
-  });
   return (
     <Dialog
       open
@@ -57,46 +48,21 @@ export function WorkTaskDialog({
     >
       <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{taskId === "new" ? "New task" : "Task"}</DialogTitle>
-          <DialogDescription>
-            {taskId === "new"
-              ? "Track work on its own or in a project."
-              : "Keep the outcome and its agent sessions together."}
-          </DialogDescription>
+          <DialogTitle>New task</DialogTitle>
+          <DialogDescription>Track work on its own or in a project.</DialogDescription>
         </DialogHeader>
-        {task.error && task.data && (
-          <p role="alert" className="text-sm text-destructive">
-            Couldn’t refresh this task. {task.error.message}
-            <Button variant="ghost" onClick={() => void task.refetch()}>
-              Retry
-            </Button>
-          </p>
-        )}
-        {taskId !== "new" && (task.isPending || !task.isFetchedAfterMount) ? (
-          <Spinner aria-label="Loading task" />
-        ) : task.error && !task.data ? (
-          <div role="alert">
-            {task.error.message}
-            <Button variant="ghost" onClick={() => void task.refetch()}>
-              Retry
-            </Button>
-          </div>
-        ) : (
-          <TaskForm
-            key={taskId}
-            task={task.data}
-            projects={projects}
-            initialProjectId={initialProjectId}
-            onClose={onClose}
-            onSaved={onSaved}
-          />
-        )}
+        <WorkTaskForm
+          projects={projects}
+          initialProjectId={initialProjectId}
+          onClose={onClose}
+          onSaved={onCreated}
+        />
       </DialogContent>
     </Dialog>
   );
 }
 
-function TaskForm({
+export function WorkTaskForm({
   task,
   projects,
   initialProjectId,
@@ -198,12 +164,11 @@ function TaskForm({
           </div>
         </fieldset>
       </form>
-      {task && <TaskSessions task={task} />}
     </div>
   );
 }
 
-function TaskSessions({ task }: { task: WorkTask }) {
+export function TaskSessions({ task, onStart }: { task: WorkTask; onStart: () => void }) {
   const queryClient = useQueryClient();
   const [adding, setAdding] = useState(false);
   const [search, setSearch] = useState("");
@@ -237,10 +202,16 @@ function TaskSessions({ task }: { task: WorkTask }) {
         <h3 className="text-sm font-medium">
           Sessions <span className="text-muted-foreground">{task.sessions.length}</span>
         </h3>
-        <Button size="sm" variant="ghost" onClick={() => setAdding(!adding)}>
-          <PlusIcon />
-          Link session
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" variant="outline" onClick={() => setAdding(!adding)}>
+            <LinkIcon />
+            Link session
+          </Button>
+          <Button size="sm" onClick={onStart}>
+            <PlusIcon />
+            Start session
+          </Button>
+        </div>
       </div>
       {task.sessions.length === 0 && (
         <p className="text-sm text-muted-foreground">No sessions linked yet.</p>

@@ -940,6 +940,7 @@ export async function createBundledSession(
     sandbox_profile_revision?: string;
     project_id?: string;
     sibling_source_id?: string;
+    work_task_id?: string;
     labels?: Record<string, string>;
     initial_input?: SessionEventInput;
     terminal_launch_args?: string[];

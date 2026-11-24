@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from pydantic.version import version_short
 
 from omnigent.db.utils import builtin_agent_id
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native._native_supersession import clear_replacement_create_body
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -35,7 +35,9 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.work_view_store import WorkViewStore
 from tests._helpers.polling import poll_until_async
+from tests._helpers.session import post_session_bundle
 from tests.server.helpers import build_agent_bundle
 
 pytestmark = pytest.mark.asyncio
@@ -93,6 +95,84 @@ async def _project(
     )
     assert response.status_code == 200, response.text
     return response.json()["id"]
+
+
+@pytest.mark.parametrize("project_scoped", [False, True])
+async def test_sessions_created_from_task_are_linked_before_returning(
+    project_create_client: httpx.AsyncClient, db_uri: str, project_scoped: bool
+) -> None:
+    client = project_create_client
+    project_id = await _project(client, {}) if project_scoped else None
+    task = (
+        await client.post(
+            "/v1/work-tasks",
+            json={"title": "Ship release", "project_id": project_id},
+            headers=_headers(),
+        )
+    ).json()
+    metadata = {"work_task_id": task["id"], "project_id": project_id}
+    first = await client.post(
+        "/v1/sessions", json={"agent_id": CUSTOM_AGENT_ID, **metadata}, headers=_headers()
+    )
+    assert first.status_code == 201, first.text
+    second = await post_session_bundle(
+        client.post,
+        "/v1/sessions",
+        build_agent_bundle(name="task-worker"),
+        metadata=metadata,
+        headers=_headers(),
+    )
+    assert second.status_code == 201, second.text
+    ids = {first.json()["id"], second.json()["session_id"]}
+    detail = (await client.get(f"/v1/work-tasks/{task['id']}", headers=_headers())).json()
+    assert {link["session_id"] for link in detail["sessions"]} == ids
+    assert detail["status"] == "todo"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    for session_id in ids:
+        assert conversations.get_conversation(session_id).project_id == project_id
+
+
+@pytest.mark.parametrize("bundled", [False, True])
+async def test_task_session_creation_rejects_unavailable_tasks_and_rolls_back_link_failure(
+    project_create_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    bundled: bool,
+) -> None:
+    client = project_create_client
+    task = (
+        await client.post("/v1/work-tasks", json={"title": "Private"}, headers=_headers())
+    ).json()
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    async def create(user: str, task_id: str) -> httpx.Response:
+        metadata = {"work_task_id": task_id}
+        if bundled:
+            return await post_session_bundle(
+                client.post,
+                "/v1/sessions",
+                build_agent_bundle(name="task-worker"),
+                metadata=metadata,
+                headers=_headers(user),
+            )
+        return await client.post(
+            "/v1/sessions", json={"agent_id": CUSTOM_AGENT_ID, **metadata}, headers=_headers(user)
+        )
+
+    assert (await create(BOB, task["id"])).status_code == 404
+    assert (await create(ALICE, "f" * 32)).status_code == 404
+    assert conversations.list_conversations().data == []
+
+    def reject_link(*args, **kwargs):
+        raise OmnigentError("Task session limit reached", code=ErrorCode.INVALID_INPUT)
+
+    monkeypatch.setattr(WorkViewStore, "link_session", reject_link)
+    failed = await create(ALICE, task["id"])
+    assert failed.status_code == 400, failed.text
+    assert conversations.list_conversations().data == []
+    assert (await client.get(f"/v1/work-tasks/{task['id']}", headers=_headers())).json()[
+        "sessions"
+    ] == []
 
 
 async def test_omitted_values_are_filled_and_membership_is_immediate(

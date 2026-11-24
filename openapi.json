@@ -6903,6 +6903,20 @@
             "default": null,
             "title": "Title"
           },
+          "work_task_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Task to link before the session starts.",
+            "title": "Work Task Id"
+          },
           "workflow_id": {
             "anyOf": [
               {
@@ -9503,6 +9517,20 @@
             "description": "Optional human-readable title for the session, e.g. `\"debugging auth flow\"`.",
             "title": "Title"
           },
+          "work_task_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Task to link before the session starts.",
+            "title": "Work Task Id"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -9822,6 +9850,20 @@
             ],
             "default": null,
             "title": "Title"
+          },
+          "work_task_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Task to link before the session starts.",
+            "title": "Work Task Id"
           },
           "workflow_id": {
             "anyOf": [

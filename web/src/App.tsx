@@ -87,6 +87,12 @@ const WorkTasksPage = withPageView(
     lazy(() => import("@/pages/WorkTasksPage").then((m) => ({ default: m.WorkTasksPage }))),
   ),
 );
+const WorkTaskPage = withPageView(
+  "work_tasks.detail",
+  withPaneLoading(
+    lazy(() => import("@/pages/WorkTaskPage").then((m) => ({ default: m.WorkTaskPage }))),
+  ),
+);
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
@@ -280,6 +286,7 @@ function AppRoutes({ basename }: AppProps) {
           />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route path={`${prefix}/work-tasks`} element={<WorkTasksPage />} />
+          <Route path={`${prefix}/work-tasks/:taskId`} element={<WorkTaskPage />} />
           <Route path={`${prefix}/views`} element={<ViewsPage />} />
           <Route path={`${prefix}/views/:viewId`} element={<ViewsPage />} />
           <Route

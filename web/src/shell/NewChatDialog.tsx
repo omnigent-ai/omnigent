@@ -25,6 +25,7 @@ import {
   useState,
 } from "react";
 import { useNavigate, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
+import { getWorkTask, type WorkTask } from "@/lib/workViewsApi";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import { projectHomePath } from "@/projectHome/projectHomeNavigation";
@@ -2317,11 +2318,43 @@ export function NewChatLandingScreen({
   const siblingSourceId = params.get("sibling");
   const info = useServerInfo();
   const supportsNested = info !== "loading" && info.sibling_sessions === true;
+  const workTaskId = params.get("work_task");
+  const workTask = useQuery({
+    queryKey: ["work-task", workTaskId],
+    queryFn: () => getWorkTask(workTaskId!),
+    enabled: workTaskId !== null && info !== "loading" && info.work_views === true,
+  });
   const source = useQuery({
     queryKey: ["sibling-source", siblingSourceId],
     queryFn: () => getSessionSlim(siblingSourceId!),
     enabled: siblingSourceId !== null && supportsNested,
   });
+  if (workTaskId) {
+    if (info !== "loading" && !info.work_views)
+      return (
+        <div role="alert" className="p-6">
+          Tasks are unavailable on this server.
+        </div>
+      );
+    if (workTask.isPending)
+      return (
+        <div role="status" className="p-6">
+          Loading task…
+        </div>
+      );
+    if (workTask.isError)
+      return (
+        <div role="alert" className="space-y-3 p-6">
+          <p>Couldn’t load this task. {workTask.error.message}</p>
+          <Button variant="outline" onClick={() => void workTask.refetch()}>
+            Retry
+          </Button>
+          <Button variant="ghost" onClick={() => navigate("/work-tasks")}>
+            Back to tasks
+          </Button>
+        </div>
+      );
+  }
   if (siblingSourceId && info !== "loading" && !supportsNested)
     return (
       <div role="alert" className="p-6">
@@ -2351,11 +2384,12 @@ export function NewChatLandingScreen({
     );
   const content = (
     <NewChatLandingContent
-      key={siblingSourceId ?? "standalone"}
+      key={siblingSourceId ?? (workTaskId ? `task:${workTaskId}` : "standalone")}
       siblingSourceId={siblingSourceId}
       siblingSource={source.data}
       projectHomeName={projectName}
       onSessionStarted={onSessionStarted}
+      workTask={workTask.data}
     />
   );
   // The panel is a desktop window narrower than the mobile breakpoint by design.
@@ -2371,15 +2405,18 @@ function NewChatLandingContent({
   siblingSource,
   projectHomeName,
   onSessionStarted,
+  workTask,
 }: {
   siblingSourceId: string | null;
   siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
   projectHomeName?: string;
   onSessionStarted?: () => void;
+  workTask?: Pick<WorkTask, "id" | "title">;
 }) {
+  const draftScope = siblingSourceId ?? (workTask ? `task:${workTask.id}` : null);
   const [draftState] = useState<LandingDraftState>(() => {
-    const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
-    landingDrafts.set(siblingSourceId, state);
+    const state = landingDrafts.get(draftScope) ?? { draft: null, revision: 0 };
+    landingDrafts.set(draftScope, state);
     return state;
   });
   const landingDraft = draftState.draft;
@@ -2636,7 +2673,7 @@ function NewChatLandingContent({
   // same text takes over cleanup of the kept copy; a different one (e.g. a
   // failed create's recovered text) supersedes it.
   const [keptLinkedPrompt] = useState(() =>
-    handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt(siblingSourceId) : null,
+    handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt(draftScope) : null,
   );
   const restoresKeptLinkedPrompt = keptLinkedPrompt !== null && landingDraft === null;
   const [ownsKeptLinkedPrompt] = useState(
@@ -2650,9 +2687,9 @@ function NewChatLandingContent({
   const syncsParkedDraftRef = useRef(landingDraft?.fromLink === true || restoresKeptLinkedPrompt);
   useEffect(() => {
     if (keptLinkedPrompt !== null && !ownsKeptLinkedPrompt) {
-      forgetKeptLinkedPrompt(siblingSourceId, keptLinkedPrompt);
+      forgetKeptLinkedPrompt(draftScope, keptLinkedPrompt);
     }
-  }, [keptLinkedPrompt, ownsKeptLinkedPrompt, siblingSourceId]);
+  }, [keptLinkedPrompt, ownsKeptLinkedPrompt, draftScope]);
   // A handoff or prompt link replaces the parked draft's text, and with it the
   // tags that text's tokens pointed at.
   const restoresDraftText = handoff === null && !linkedPrompt?.trim() && !restoresKeptLinkedPrompt;
@@ -2677,11 +2714,11 @@ function NewChatLandingContent({
         fromLink: true,
       });
       syncsParkedDraftRef.current = true;
-      keptLinkedRef.current = keepLinkedPrompt(siblingSourceId, linkedPrompt);
+      keptLinkedRef.current = keepLinkedPrompt(draftScope, linkedPrompt);
     } else if (handoff !== null) {
       // The handoff replaced the draft, so a prompt kept for this composer is stale.
       keptLinkedRef.current = null;
-      forgetKeptLinkedPrompt(siblingSourceId, null);
+      forgetKeptLinkedPrompt(draftScope, null);
     }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
@@ -2696,7 +2733,7 @@ function NewChatLandingContent({
     searchParams,
     replaceSearchParams,
     draftState,
-    siblingSourceId,
+    draftScope,
   ]);
   // Once the user acts on the prompt, a reload must not bring the link's text
   // back over their work. Any change to the text counts (typing, dictation,
@@ -2705,8 +2742,8 @@ function NewChatLandingContent({
     const kept = keptLinkedRef.current;
     if (kept === null || message === kept.text) return;
     keptLinkedRef.current = null;
-    forgetKeptLinkedPrompt(siblingSourceId, kept);
-  }, [message, siblingSourceId]);
+    forgetKeptLinkedPrompt(draftScope, kept);
+  }, [message, draftScope]);
   // A draft parked at link consumption is the only copy a same-commit remount can
   // read, so it follows every edit; a submitted draft stays spent.
   useEffect(() => {
@@ -3159,9 +3196,9 @@ function NewChatLandingContent({
       if (draftState.nestedProvisional?.id !== id) return;
       draftState.nestedProvisional = undefined;
       writeLandingDraft(draftState, null);
-      forgetKeptLinkedPrompt(siblingSourceId, null);
+      forgetKeptLinkedPrompt(draftScope, null);
     },
-    [draftState, siblingSourceId],
+    [draftState, draftScope],
   );
   const siblingSourceRef = useRef(siblingSource);
   siblingSourceRef.current = siblingSource;
@@ -6484,6 +6521,7 @@ function NewChatLandingContent({
           bundledGitOptions = { branchName: activeWorktree!.branch!, existingWorktree: true };
         }
         const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
+        if (workTask) metadata.work_task_id = workTask.id;
         if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
         // The new sandbox's host id, minted client-side as the JSON create does.
         const managedBundleHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
@@ -6591,6 +6629,7 @@ function NewChatLandingContent({
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
         const managedHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
         const createPayload = JSON.stringify({
+          ...(workTask ? { work_task_id: workTask.id } : {}),
           ...(siblingSourceId ? { sibling_source_id: siblingSourceId } : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
           // Config-seeded agent on a `project_id` create: omitted so the
@@ -6885,7 +6924,7 @@ function NewChatLandingContent({
       // screen stashed, so the next visit starts clean.
       if (submittedLinkedPrompt !== null) {
         if (keptLinkedRef.current === submittedLinkedPrompt) keptLinkedRef.current = null;
-        forgetKeptLinkedPrompt(siblingSourceId, submittedLinkedPrompt);
+        forgetKeptLinkedPrompt(draftScope, submittedLinkedPrompt);
         submittedKeptPromptIds.delete(submittedLinkedPrompt.id);
       }
       if (submittedDraftRevisionRef.current === draftState.revision) {
@@ -6941,6 +6980,10 @@ function NewChatLandingContent({
             navigate(sessionLocation(data.id));
           }
         }
+      }
+      if (workTask) {
+        void queryClient.invalidateQueries({ queryKey: ["work-task", workTask.id] });
+        void queryClient.invalidateQueries({ queryKey: ["view-results"] });
       }
       if (onProjectHome && onScreenRef.current) onSessionStarted?.();
     } catch {
@@ -7522,6 +7565,15 @@ function NewChatLandingContent({
           /* On phones the heading yields its height first, so a long draft cannot
             push Send below the keyboard. */
           <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 max-md:min-h-0 max-md:overflow-hidden md:flex-none">
+            {workTask && (
+              <Button
+                variant="outline"
+                className="max-w-full"
+                onClick={() => navigate(`/work-tasks/${workTask.id}`)}
+              >
+                <span className="truncate">Task: {workTask.title}</span>
+              </Button>
+            )}
             {siblingSourceId ? (
               <div aria-hidden="true" className="flex h-16 shrink-0 items-center">
                 <span className="flex size-14 items-center justify-center rounded-xl bg-tag-pink">

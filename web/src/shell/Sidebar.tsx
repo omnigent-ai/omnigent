@@ -648,7 +648,8 @@ function useActiveNavItem(): {
   // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
   // match the "tasks" segment by position from the end, not an absolute path.
   const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
-  const isWorkTasksPage = !isExtensionRoute && leaf === "work-tasks";
+  const isWorkTasksPage =
+    !isExtensionRoute && (leaf === "work-tasks" || segments.at(-2) === "work-tasks");
   const isViewsPage = !isExtensionRoute && (leaf === "views" || segments.at(-2) === "views");
   // Likewise /workflows (list) and /workflows/:workflowId (a workflow's page).
   const isWorkflowsPage =

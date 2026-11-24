@@ -74,6 +74,13 @@ import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { getWorkTask } from "@/lib/workViewsApi";
+import type * as WorkViewsApiModule from "@/lib/workViewsApi";
+
+vi.mock("@/lib/workViewsApi", async (original) => ({
+  ...(await original<typeof WorkViewsApiModule>()),
+  getWorkTask: vi.fn(),
+}));
 
 // A project-driven visit (`?project=` resolved to a first-class project id)
 // creates the session WITH `project_id`: the server files it atomically and
@@ -373,6 +380,17 @@ beforeEach(() => {
   setRepoIsGit();
   setProjects([{ id: "proj_alpha", name: "Alpha" }]);
   setProjectConfig({});
+  vi.mocked(getWorkTask).mockResolvedValue({
+    id: "a".repeat(32),
+    title: "Ship release",
+    description: "Verify the rollout",
+    status: "todo",
+    priority: 0,
+    project_id: null,
+    sessions: [],
+    created_at: 1,
+    updated_at: 1,
+  });
 });
 
 afterEach(() => {
@@ -381,6 +399,49 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen project-aware create (first-class project_id)", () => {
+  it.each([false, true])("links a task when starting a session (bundled=%s)", async (bundled) => {
+    searchParams.set("work_task", "a".repeat(32));
+    setProjectConfig({ host_id: "host_1", workspace: REPO });
+    renderLanding({ work_views: true });
+    expect(await screen.findByRole("button", { name: "Task: Ship release" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    if (bundled) {
+      fireEvent.click(screen.getByTestId("test-create-pending"));
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Work on this task" },
+      });
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(createBundledSession).toHaveBeenCalled());
+      expect(vi.mocked(createBundledSession).mock.calls[0][1]).toMatchObject({
+        work_task_id: "a".repeat(32),
+        project_id: "proj_alpha",
+      });
+    } else {
+      const body = await submitAndReadBody();
+      expect(body).toMatchObject({ work_task_id: "a".repeat(32), project_id: "proj_alpha" });
+    }
+    await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+  });
+
+  it("keeps task drafts separate from the ordinary new-session composer", async () => {
+    searchParams = new URLSearchParams({ work_task: "a".repeat(32), prompt: "Task context" });
+    const first = renderLanding({ work_views: true });
+    expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("Task context");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Task draft" },
+    });
+    first.unmount();
+    searchParams = new URLSearchParams();
+    const plain = renderLanding({ work_views: true });
+    expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("");
+    plain.unmount();
+    searchParams = new URLSearchParams({ work_task: "a".repeat(32) });
+    renderLanding({ work_views: true });
+    expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("Task draft");
+  });
+
   it("sends project_id and omits config-seeded agent_id + workspace when nothing was overridden", async () => {
     setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
     renderLanding();

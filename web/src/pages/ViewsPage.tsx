@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronRightIcon,
@@ -36,7 +36,6 @@ import {
 } from "@/lib/workViewsApi";
 import { EntityTabs, ViewControls } from "@/views/ViewControls";
 import { QueriedViewResults } from "@/views/QueriedViewResults";
-import { WorkTaskDialog } from "@/views/WorkTaskDialog";
 
 function viewInput(view: SavedWorkView): ViewInput {
   const { name, description, favorite, entity_type, filters, display } = view;
@@ -297,7 +296,7 @@ function ViewDetail({ viewId }: { viewId: string }) {
 }
 
 function ViewEditor({ saved }: { saved?: SavedWorkView }) {
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const projects = useProjects();
@@ -327,14 +326,12 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
     },
   });
   const taskId = searchParams.get("task");
-  const openTask = (id: string | null) => {
-    const next = new URLSearchParams(searchParams);
-    if (id) next.set("task", id);
-    else next.delete("task");
-    setSearchParams(next);
-  };
+  useEffect(() => {
+    if (taskId && taskId !== "new")
+      navigate(`/work-tasks/${encodeURIComponent(taskId)}`, { replace: true });
+  }, [taskId, navigate]);
   const openRecord = (record: ViewRecord) => {
-    if (value.entity_type === "tasks") openTask(record.id);
+    if (value.entity_type === "tasks") navigate(`/work-tasks/${record.id}`);
     else if (value.entity_type === "sessions") navigate(`/c/${record.id}`);
     else navigate(`/views/new?type=tasks&project=${record.id}`);
   };
@@ -411,14 +408,6 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
           notice={saved && baseline !== JSON.stringify(value) ? "Unsaved changes" : undefined}
         />
       </div>
-      {taskId && taskId !== "new" && (
-        <WorkTaskDialog
-          taskId={taskId}
-          projects={projectOptions}
-          onClose={() => openTask(null)}
-          onSaved={openTask}
-        />
-      )}
     </>
   );
 }

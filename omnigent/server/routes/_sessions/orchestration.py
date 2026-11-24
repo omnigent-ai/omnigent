@@ -12997,7 +12997,17 @@ async def _create_session_from_existing_agent(
         server_sandbox_providers,
     )
     from omnigent.server.session_journal import initialize_workflow_plan, load_workflow_for_run
+    from omnigent.server.work_tasks import link_created_task_session, prepare_task_session
     from omnigent.server.workflows import require_workflows
+
+    work_tasks = await prepare_task_session(
+        request,
+        body.work_task_id,
+        user_id=user_id,
+        projects=project_store,
+        conversations=conversation_store,
+        permissions=permission_store,
+    )
 
     workflow = None
     if body.workflow_id is not None:
@@ -13789,6 +13799,13 @@ async def _create_session_from_existing_agent(
                 subagent_routing_override=subagent_routing_override,
                 harness_override=harness_override,
                 **snapshot_kwargs,
+            )
+            await link_created_task_session(
+                work_tasks,
+                body.work_task_id,
+                conv.id,
+                user_id=user_id,
+                conversations=conversation_store,
             )
             if workflow is not None:
                 try:

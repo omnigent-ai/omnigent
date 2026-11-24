@@ -1,11 +1,13 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as api from "@/lib/workViewsApi";
 import { ViewsPage } from "./ViewsPage";
 import { WorkTasksPage } from "./WorkTasksPage";
+import { WorkTaskPage } from "./WorkTaskPage";
+import { peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({ work_views: true }) }));
 vi.mock("@/hooks/useConversations", () => ({
@@ -44,6 +46,20 @@ const sessionRecords = [
 let saved: api.SavedWorkView;
 let task: api.WorkTask;
 
+function SessionSetupProbe() {
+  const { search } = useLocation();
+  const params = new URLSearchParams(search);
+  return (
+    <pre data-testid="session-setup">
+      {JSON.stringify({
+        task: params.get("work_task"),
+        project: params.get("project"),
+        prompt: peekNewSessionHandoff(params.get("handoff"))?.text,
+      })}
+    </pre>
+  );
+}
+
 function renderPage(path: string) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -52,7 +68,9 @@ function renderPage(path: string) {
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
         <Routes>
+          <Route path="/" element={<SessionSetupProbe />} />
           <Route path="/work-tasks" element={<WorkTasksPage />} />
+          <Route path="/work-tasks/:taskId" element={<WorkTaskPage />} />
           <Route path="/views" element={<ViewsPage />} />
           <Route path="/views/:viewId" element={<ViewsPage />} />
         </Routes>
@@ -232,11 +250,12 @@ it.each(["new", "saved"])("locks the %s view's inputs until saving finishes", as
 it("refreshes a cached task without replacing unsaved edits when its sessions refresh", async () => {
   const user = userEvent.setup();
   const { client } = renderPage(`/work-tasks?task=${task.id}`);
-  expect(await screen.findByLabelText("Task title")).toHaveValue("Ship release");
-  await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+  expect(await screen.findByRole("heading", { name: "Ship release" })).toBeInTheDocument();
+  await user.click(screen.getByRole("link", { name: "Tasks" }));
   task = { ...task, title: "Updated elsewhere", description: "New context" };
   await user.click(await screen.findByRole("button", { name: /Ship release/ }));
-  await waitFor(() => expect(screen.getByLabelText("Task title")).toHaveValue(task.title));
+  await screen.findByRole("heading", { name: task.title });
+  await user.click(screen.getByRole("button", { name: "Edit task" }));
   expect(screen.getByLabelText("Task description")).toHaveValue("New context");
   fireEvent.change(screen.getByLabelText("Task title"), { target: { value: "My draft" } });
   vi.mocked(api.getWorkTask).mockRejectedValueOnce(new Error("Connection lost"));
@@ -261,6 +280,7 @@ it.each(["new", record.id])("locks task inputs while saving %s", async (taskId) 
   );
   const user = userEvent.setup();
   renderPage(`/work-tasks?task=${taskId}`);
+  if (taskId !== "new") await user.click(await screen.findByRole("button", { name: "Edit task" }));
   fireEvent.change(await screen.findByLabelText("Task title"), { target: { value: "Submitted" } });
   await user.click(
     screen.getByRole("button", { name: taskId === "new" ? "Create task" : "Save task" }),
@@ -270,8 +290,9 @@ it.each(["new", record.id])("locks task inputs while saving %s", async (taskId) 
   expect(screen.getByRole("combobox", { name: "Task status" })).toBeDisabled();
   task = { ...task, ...vi.mocked(api.saveWorkTask).mock.calls[0][0] };
   await act(async () => finishSave(task));
-  await waitFor(() => expect(screen.getByLabelText("Task title")).toBeEnabled());
-  expect(screen.getByLabelText("Task title")).toHaveValue("Submitted");
+  expect(await screen.findByRole("heading", { name: "Submitted" })).toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: "Edit task" })).toBeEnabled();
 });
 
 it("edits grouped filter chips and removes only the selected field before saving", async () => {
@@ -462,23 +483,26 @@ it("creates a task from Tasks without a saved view, project or sessions, then li
   expect(screen.queryByRole("group", { name: "View item type" })).not.toBeInTheDocument();
   expect(api.listWorkViews).not.toHaveBeenCalled();
   await user.click(screen.getByRole("button", { name: "New task" }));
+  expect(screen.getByRole("dialog", { name: "New task" })).toBeInTheDocument();
   fireEvent.change(await screen.findByLabelText("Task title"), {
     target: { value: "Release checks" },
   });
   await user.click(screen.getByRole("button", { name: "Create task" }));
-  await screen.findByRole("button", { name: "Save task" });
+  await screen.findByRole("heading", { name: "Release checks" });
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   expect(api.saveWorkTask).toHaveBeenCalledWith(
     expect.objectContaining({ title: "Release checks", project_id: null }),
     undefined,
   );
   expect(screen.getByText("No sessions linked yet.")).toBeInTheDocument();
   expect(api.linkWorkSession).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("button", { name: "Edit task" }));
   await user.click(screen.getByRole("combobox", { name: "Task project" }));
   expect(screen.queryByRole("option", { name: "Legacy" })).toBeNull();
   await user.click(screen.getByRole("option", { name: "Release" }));
   await user.click(screen.getByRole("button", { name: "Save task" }));
   await waitFor(() => expect(task.project_id).toBe("a".repeat(32)));
-  await user.click(screen.getByRole("button", { name: "Link session" }));
+  await user.click(await screen.findByRole("button", { name: "Link session" }));
   fireEvent.change(screen.getByLabelText("Session contribution"), {
     target: { value: "Implementation pass" },
   });
@@ -501,9 +525,10 @@ it("creates a task from Tasks without a saved view, project or sessions, then li
   expect(screen.getByRole("link", { name: "Review" })).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Unlink Review" }));
   expect(await screen.findByText("No sessions linked yet.")).toBeInTheDocument();
-  await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+  await user.click(screen.getByRole("link", { name: "Tasks" }));
   await user.click(await screen.findByRole("button", { name: /Release checks/ }));
-  expect(await screen.findByLabelText("Task title")).toHaveValue("Release checks");
+  expect(await screen.findByRole("heading", { name: "Release checks" })).toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
 it.each(["/views/new?task=new", "/views/saved?task=new"])(
@@ -515,6 +540,8 @@ it.each(["/views/new?task=new", "/views/saved?task=new"])(
     expect(screen.queryByRole("button", { name: "New task" })).toBeNull();
     expect(screen.queryByRole("dialog")).toBeNull();
     await user.click(taskRow);
+    await user.click(await screen.findByRole("button", { name: "Edit task" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(await screen.findByLabelText("Task title")).toHaveValue("Ship release");
     fireEvent.change(screen.getByLabelText("Task title"), { target: { value: "Updated release" } });
     await user.click(screen.getByRole("button", { name: "Save task" }));
@@ -526,6 +553,24 @@ it.each(["/views/new?task=new", "/views/saved?task=new"])(
     );
   },
 );
+
+it.each([null, "Release"])("starts a session with task context and project %s", async (project) => {
+  task = {
+    ...task,
+    description: "Check the rollout",
+    project_id: project ? "a".repeat(32) : null,
+    project_name: project,
+  };
+  const user = userEvent.setup();
+  renderPage(`/work-tasks/${task.id}`);
+  await user.click(await screen.findByRole("button", { name: "Start session" }));
+  expect(JSON.parse(screen.getByTestId("session-setup").textContent!)).toEqual({
+    task: task.id,
+    project,
+    prompt: "Ship release\n\nCheck the rollout",
+  });
+  expect(api.saveWorkTask).not.toHaveBeenCalled();
+});
 
 it("filters tasks and changes their display without creating a saved view", async () => {
   const user = userEvent.setup();

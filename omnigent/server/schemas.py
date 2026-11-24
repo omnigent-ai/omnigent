@@ -1783,6 +1783,11 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     initial_input: SessionStartupInput | None = None
     workflow_id: str | None = None
+    work_task_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{32}$",
+        description="Task to link before the session starts.",
+    )
     mcp_registry_services: list[McpRegistryServiceId] = Field(
         default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
     )
@@ -2042,6 +2047,11 @@ class SessionCreateMetadata(_SandboxProfileSelection):
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
+    work_task_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{32}$",
+        description="Task to link before the session starts.",
+    )
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
