@@ -24,24 +24,27 @@ export function TicketCopyLinkButton({
 
   return (
     <Popover open={status === "failed"} onOpenChange={(open) => !open && reset()}>
-      <Tooltip>
-        <PopoverAnchor asChild>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              className="text-muted-foreground"
-              aria-label={label}
-              data-testid="ticket-copy-link"
-              onClick={() => void copy(url)}
-            >
-              {status === "copied" ? <CheckIcon aria-hidden /> : <LinkIcon aria-hidden />}
-            </Button>
-          </TooltipTrigger>
-        </PopoverAnchor>
-        <TooltipContent side="bottom">{label}</TooltipContent>
-      </Tooltip>
+      {/* A DOM anchor: React 18 function-component triggers drop the anchor's ref. */}
+      <PopoverAnchor asChild>
+        <span className="inline-flex">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="text-muted-foreground"
+                aria-label={label}
+                data-testid="ticket-copy-link"
+                onClick={() => void copy(url)}
+              >
+                {status === "copied" ? <CheckIcon aria-hidden /> : <LinkIcon aria-hidden />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{label}</TooltipContent>
+          </Tooltip>
+        </span>
+      </PopoverAnchor>
       <PopoverContent align="end" className="w-80 space-y-1.5 text-sm" role="status">
         <p className="text-muted-foreground">Couldn't copy automatically. Copy this link:</p>
         <p className="select-all break-all" data-testid="ticket-copy-link-fallback">
