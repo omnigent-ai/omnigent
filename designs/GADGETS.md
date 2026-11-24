@@ -168,8 +168,9 @@ check the policy the web app sets, not a browser enforcing it, so this rests on 
 CSP and sandbox support. It cannot stop the
 gadget's document from navigating itself (setting `location`, for example), and browsers offer
 no policy that does: that navigation's request leaves the browser before the web app can react,
-and its URL can carry anything the gadget had read. So treat gadget code as able to send out
-anything it can read:
+and its URL can carry anything the gadget had read. Peer connections are another such channel:
+the CSP's `webrtc 'none'` is not enforced everywhere, and a nested `about:blank` frame does not
+always inherit it. So treat gadget code as able to send out anything it can read:
 
 - the gadget's own records and comments, which everyone the gadget is shared with can read
   anyway;
@@ -200,7 +201,9 @@ the SDK at any time, so the web app (`gadgetGestureGate.ts`) reads only host-sid
   itself needs its own activation, and calls are spaced at least a second apart, which bounds
   what one click can start; a later call after the frame is activated again is allowed.
 
-A gesture only lets gadget code open a page; it never sends a message for the viewer. A
+A gesture lets gadget code open a page or queue one of its declared actions. A queued action
+is sent to the viewer's own gadget session as a message saying which gadget asked and with what
+params, which the session treats as a request to consider, not as instructions. A
 `newSession` prompt lands in New session's composer, and when the gadget fills the screen (so
 the composer is hidden) the Create session menu shows the whole message and the gadget it came
 from, with focus on the menu rather than on Create session, so creating the session is never

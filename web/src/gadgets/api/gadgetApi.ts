@@ -819,9 +819,9 @@ export async function listGadgetPermissions(
 ): Promise<GadgetPermission[]> {
   const all: GadgetPermission[] = [];
   let after: string | null = null;
-  // Each page provides the cursor for the next request.
+  // Each page provides the cursor for the next request; the same page budget as other lists.
   /* oxlint-disable no-await-in-loop */
-  do {
+  for (let page = 0; page < MAX_LIST_PAGES; page++) {
     const query: string = after !== null ? `?after=${encodeURIComponent(after)}` : "";
     const body = await gadgetRequest(permissionsPath(appId, query), { signal });
     if (!isRecord(body) || !Array.isArray(body.permissions)) {
@@ -830,9 +830,10 @@ export async function listGadgetPermissions(
     all.push(...body.permissions.map(parsePermission));
     after =
       typeof body.next_cursor === "string" && body.next_cursor !== "" ? body.next_cursor : null;
-  } while (after !== null);
+    if (after === null) return all;
+  }
   /* oxlint-enable no-await-in-loop */
-  return all;
+  throw malformed("permission list");
 }
 
 /**
