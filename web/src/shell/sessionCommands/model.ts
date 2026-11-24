@@ -55,6 +55,8 @@ export interface SessionCommandFacts {
   unread: boolean;
   /** The viewer muted it, which silences its unread dot. */
   muted: boolean;
+  /** It's filed in a project the viewer muted, which silences it until the project is unmuted. */
+  mutedByProject: boolean;
   /** The viewer may start an automation from it; see `canCreateAutomationFromSession`. */
   canCreateAutomation: boolean;
   /** The project it's filed under, if any. */
@@ -120,6 +122,7 @@ export const UNKNOWN_OWNER_REASON = "Can't tell who owns this session";
 
 export const PIN_SAVING_REASON = "A pin change is still saving.";
 export const PIN_CAPACITY_REASON = "Unpin a session to pin another.";
+export const MUTED_BY_PROJECT_REASON = "Its project is muted. Unmute the project to hear from it.";
 
 const KEYWORDS: Record<SessionCommandId, readonly string[]> = {
   "add-sibling": ["nested", "sibling", "new agent", "family"],
@@ -223,13 +226,17 @@ function availabilityOf(id: SessionCommandId, facts: SessionCommandFacts): Comma
       return facts.forkDisabledReason ? unavailableBecause(facts.forkDisabledReason) : AVAILABLE;
     case "rename":
       return ownerOnly(facts, OWNER_ONLY_REASONS.rename);
+    // A project's mute outranks the session's own, so the row offers neither toggle then.
     case "mute":
-      return when(server.sessionMute && !facts.muted, AVAILABLE);
+      return when(server.sessionMute && !facts.muted && !facts.mutedByProject, AVAILABLE);
     case "unmute":
+      if (server.sessionMute && facts.mutedByProject) {
+        return unavailableBecause(MUTED_BY_PROJECT_REASON);
+      }
       return when(server.sessionMute && facts.muted, AVAILABLE);
     // A muted session's dot is silenced, so it can be marked read but not flagged unread.
     case "mark-unread":
-      return when(!facts.unread && !facts.muted, AVAILABLE);
+      return when(!facts.unread && !facts.muted && !facts.mutedByProject, AVAILABLE);
     case "mark-read":
       return when(facts.unread, AVAILABLE);
     case "create-automation":
@@ -254,11 +261,17 @@ function availabilityOf(id: SessionCommandId, facts: SessionCommandFacts): Comma
   }
 }
 
+function labelOf(id: SessionCommandId, facts: SessionCommandFacts): string {
+  if (id === "move-to-project" && facts.currentProject !== null) return "Move session";
+  if (id === "unmute" && facts.mutedByProject) return "Muted with project";
+  return LABELS[id];
+}
+
 /** Every action for `facts`, in the row menu's order; hidden ones have no reason. */
 export function sessionCommands(facts: SessionCommandFacts): SessionCommand[] {
   return SESSION_COMMAND_IDS.map((id) => ({
     id,
-    label: id === "move-to-project" && facts.currentProject !== null ? "Move session" : LABELS[id],
+    label: labelOf(id, facts),
     keywords: KEYWORDS[id],
     destructive: DESTRUCTIVE.has(id),
     opensDialog: OPENS_DIALOG.has(id),

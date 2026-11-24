@@ -12,12 +12,13 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation, useMoveToProject } from "@/hooks/useConversations";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, SHARING_OFF_REASON } from "@/lib/capabilities";
-import { clearSessionMuteState, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import { clearSessionMuteState, MUTED_LABEL_KEY, setMutedProjects } from "@/lib/sessionMute";
 import { PinCapacityContext } from "@/lib/sidebarConfig";
 import { isCommandListed } from "@/store/paletteCommands";
 
 import { ConversationMenuItems } from "../Sidebar";
 import {
+  MUTED_BY_PROJECT_REASON,
   OWNER_ONLY_REASONS,
   PIN_CAPACITY_REASON,
   PIN_SAVING_REASON,
@@ -46,6 +47,7 @@ const FACTS: SessionCommandFacts = {
   pinSaving: false,
   unread: false,
   muted: false,
+  mutedByProject: false,
   canCreateAutomation: true,
   currentProject: null,
   stoppable: true,
@@ -146,6 +148,18 @@ describe("sessionCommands", () => {
     expect(listed({ ...FACTS, muted: true, unread: true })).toContain("Mark as read");
   });
 
+  it("greys Unmute as Muted with project when its project is muted, as the row does", () => {
+    for (const muted of [false, true]) {
+      const facts = { ...FACTS, muted, mutedByProject: true };
+      expect(listed(facts)).toContain("Muted with project");
+      expect(listed(facts)).not.toContain("Mute");
+      expect(listed(facts)).not.toContain("Unmute");
+      expect(listed(facts)).not.toContain("Mark as unread");
+      expect(sessionCommand(facts, "unmute").availability.available).toBe(false);
+      expect(reasonOf(facts, "unmute")).toBe(MUTED_BY_PROJECT_REASON);
+    }
+  });
+
   it("names the move after the project the session is filed in", () => {
     expect(sessionCommand({ ...FACTS, currentProject: "Payments" }, "move-to-project").label).toBe(
       "Move session",
@@ -192,7 +206,14 @@ function rowMenu(facts: SessionCommandFacts) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   onTestFinished(() => queryClient.clear());
   const labels: Record<string, string> = facts.muted ? { [MUTED_LABEL_KEY]: "1" } : {};
-  const row: Conversation = { ...conversation, labels };
+  const row: Conversation = {
+    ...conversation,
+    labels,
+    ...(facts.mutedByProject && { owner: "viewer", project_id: "proj_muted" }),
+  };
+  if (facts.mutedByProject) {
+    setMutedProjects([{ id: "proj_muted", name: "Muted project", muted: true }], "viewer");
+  }
   queryClient.setQueryData(["conversation-backfill", row.id], row);
   forkRestriction.reason = facts.forkDisabledReason;
   const noop = vi.fn();
@@ -311,6 +332,8 @@ describe("sessionCommands against the sidebar row's menu", () => {
     ["a full set of pins", { ...FACTS, atPinCapacity: true }],
     ["a muted session", { ...FACTS, muted: true }],
     ["a muted, unread session", { ...FACTS, muted: true, unread: true }],
+    ["a session in a muted project", { ...FACTS, mutedByProject: true }],
+    ["a muted session in a muted project", { ...FACTS, muted: true, mutedByProject: true }],
     [
       "a filed session that isn't running",
       { ...FACTS, currentProject: "Payments", stoppable: false },

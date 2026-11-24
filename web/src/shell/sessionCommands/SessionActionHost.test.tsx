@@ -10,6 +10,9 @@ import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import type * as PermissionsApiModule from "@/lib/permissionsApi";
 import { LEVEL_READ } from "@/lib/permissionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { clearSessionMuteState, MUTED_LABEL_KEY, setMutedProjects } from "@/lib/sessionMute";
 
 import { SessionActionHost } from "./SessionActionHost";
 import { usePublishOpenSession } from "../openSession";
@@ -90,14 +93,16 @@ function OpenSessionShell() {
 }
 
 /** On the open session's page; `remountHost` mounts the host again in the same app. */
-function renderHost(queryClient = new QueryClient()) {
+function renderHost(queryClient = new QueryClient(), info = FALLBACK_SERVER_INFO) {
   const app = (hostMounted: boolean) => (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={["/c/c1"]}>
-        <OpenSessionShell />
-        {hostMounted && <SessionActionHost />}
-        <Location />
-      </MemoryRouter>
+      <CapabilitiesProvider info={info}>
+        <MemoryRouter initialEntries={["/c/c1"]}>
+          <OpenSessionShell />
+          {hostMounted && <SessionActionHost />}
+          <Location />
+        </MemoryRouter>
+      </CapabilitiesProvider>
     </QueryClientProvider>
   );
   const { rerender } = render(app(true));
@@ -115,6 +120,7 @@ afterEach(() => {
   vi.clearAllMocks();
   useSessionActionStore.setState({ request: null });
   ui.viewing = null;
+  clearSessionMuteState();
 });
 
 function deferred() {
@@ -148,6 +154,21 @@ describe("SessionActionHost", () => {
     // Already read, so Mark as read doesn't apply.
     act(() => requestSessionAction(SESSION, "mark-read"));
     expect(readMarks.read).not.toHaveBeenCalled();
+  });
+
+  it("leaves a session muted with its project muted, as its row's greyed item does", () => {
+    renderHost(new QueryClient(), { ...FALLBACK_SERVER_INFO, session_mute: true });
+    const muted: Conversation = { ...SESSION, labels: { [MUTED_LABEL_KEY]: "1" } };
+    act(() => requestSessionAction(muted, "unmute"));
+    expect(writes.mute).toHaveBeenCalledWith({ id: "c1", muted: false });
+    writes.mute.mockClear();
+
+    act(() => setMutedProjects([{ id: "p1", name: "Payments", muted: true }], "viewer"));
+    const filed: Conversation = { ...SESSION, project_id: "p1" };
+    act(() => requestSessionAction({ ...filed, labels: muted.labels }, "unmute"));
+    act(() => requestSessionAction(filed, "unmute"));
+    act(() => requestSessionAction(filed, "mute"));
+    expect(writes.mute).not.toHaveBeenCalled();
   });
 
   it("asks nothing of the server for a session still being created", () => {
