@@ -46,6 +46,7 @@ import {
   useWorkspaceFileSearch,
   useWorkspaceServeable,
   fetchWorkspaceFolderListing,
+  listingIgnoredFiles,
   workspaceDirectoryQuery,
 } from "./useWorkspaceChangedFiles";
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
@@ -661,6 +662,100 @@ describe("useWorkspaceAllFiles without what Git ignores", () => {
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data?.ignoredHidden).toBe(expected);
+  });
+});
+
+describe("listingIgnoredFiles over a real listing query", () => {
+  const pending = new Promise<never>(() => {});
+  type Answer = "pending" | "error" | ReturnType<typeof apiListing>;
+  /** Render the listing for `id`, answering each request with what `answer` gives it. */
+  function listing(id: string, answer: (hideIgnored: boolean) => Answer, environment = true) {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockImplementation(async () =>
+      environment ? environmentResponse() : jsonResponse({ metadata: {} }),
+    );
+    vi.mocked(listDirectoryViaWorkspaceApi).mockImplementation(
+      async (_session, _path, _max, _signal, options) => {
+        const answered = answer(options?.hideIgnored === true);
+        if (answered === "pending") return pending;
+        if (answered === "error") throw new Error("The host stopped answering.");
+        return answered;
+      },
+    );
+    return renderHook(
+      ({ hideIgnored }: { hideIgnored: boolean }) => {
+        const query = useWorkspaceAllFiles(id, { hideIgnored });
+        return { query, ignored: listingIgnoredFiles(query) };
+      },
+      { wrapper: stableWrapper(), initialProps: { hideIgnored: true } },
+    );
+  }
+  const everything = apiListing(["README.md", "build"]);
+  const withoutIgnored = { ...apiListing(["README.md"]), ignoredHidden: true as const };
+
+  it.each([
+    {
+      state: "no listing asked for yet",
+      run: async () => {
+        const { result } = listing("conv_ignored_idle", () => everything, false);
+        await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+        await flushMicrotasks();
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "the listing on its way",
+      run: async () => {
+        const { result } = listing("conv_ignored_loading", () => "pending");
+        await waitFor(() => expect(result.current.query.fetchStatus).toBe("fetching"));
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "rows kept from the listing with ignored files on",
+      run: async () => {
+        const { result, rerender } = listing("conv_ignored_kept", (hide) =>
+          hide ? "pending" : everything,
+        );
+        rerender({ hideIgnored: false });
+        await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
+        rerender({ hideIgnored: true });
+        expect(result.current.query.isPlaceholderData).toBe(true);
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "a failed listing",
+      run: async () => {
+        const { result } = listing("conv_ignored_failed", () => "error");
+        await waitFor(() => expect(result.current.query.isError).toBe(true));
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "a fresh listing that left ignored files out",
+      run: async () => {
+        const { result } = listing("conv_ignored_hidden", () => withoutIgnored);
+        await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
+        return result.current;
+      },
+      expected: "hidden",
+    },
+    {
+      state: "a fresh listing that couldn't leave them out",
+      run: async () => {
+        const { result } = listing("conv_ignored_included", () => everything);
+        await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
+        return result.current;
+      },
+      expected: "included",
+    },
+  ])("says $expected for $state", async ({ run, expected }) => {
+    expect((await run()).ignored).toBe(expected);
   });
 });
 

@@ -15,7 +15,7 @@
 // (e.g. cloud-only agents).
 
 import { useCallback, useEffect, useRef } from "react";
-import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type UseQueryResult, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -505,6 +505,24 @@ async function fetchWorkspaceAllFiles(
  * `available: false` when the runner has no OS environment for this
  * session (404).
  */
+/**
+ * What a listing asked to leave out Git-ignored files says about them: `"hidden"` when its host
+ * left them out, `"included"` when it listed everything, `"unknown"` until it has answered.
+ */
+export type ListingIgnoredFiles = "hidden" | "included" | "unknown";
+
+/**
+ * Read {@link ListingIgnoredFiles} from a listing query. Only a fresh answer counts: rows kept
+ * from the other ignored-files choice, a failure, or no answer yet say nothing about this one.
+ */
+export function listingIgnoredFiles(
+  listing: Pick<UseQueryResult<WorkspaceAllFilesResult>, "status" | "data" | "isPlaceholderData">,
+): ListingIgnoredFiles {
+  if (listing.status !== "success" || listing.isPlaceholderData) return "unknown";
+  if (listing.data?.available !== true) return "unknown";
+  return listing.data.ignoredHidden === true ? "hidden" : "included";
+}
+
 export function useWorkspaceAllFiles(
   conversationId: string | undefined,
   options: WorkspaceQueryOptions = {},

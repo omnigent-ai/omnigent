@@ -85,8 +85,10 @@ function entry(path: string): WorkspaceFile {
 type FilesResult = ReturnType<typeof useWorkspaceAllFiles>;
 const listed = (entries: WorkspaceFile[], ignoredHidden = false) =>
   ({
+    status: "success",
     isPending: false,
     isError: false,
+    isPlaceholderData: false,
     data: { available: true, data: entries, ...(ignoredHidden ? { ignoredHidden: true } : {}) },
   }) as FilesResult;
 
@@ -430,9 +432,13 @@ describe("FilesPageTree", () => {
 
     it("searches without what Git ignores while the listing hasn't said whether it can", () => {
       vi.useFakeTimers();
-      renderTree({ isPending: true, isError: false, data: undefined } as never, false, {
-        showIgnored: false,
-      });
+      renderTree(
+        { status: "pending", isPending: true, isError: false, data: undefined } as never,
+        false,
+        {
+          showIgnored: false,
+        },
+      );
       fireEvent.click(filterButton());
       typeName("artifact");
       expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: true });
@@ -452,7 +458,11 @@ describe("FilesPageTree", () => {
         data: withIgnored,
         isPlaceholderData: true,
       } as never);
-      setShowIgnored(false, { isPending: true, isError: false, data: undefined });
+      // The new listing hasn't answered either, so the old unfiltered one is kept meanwhile.
+      setShowIgnored(false, {
+        ...listed([entry("README.md"), entry("build")]),
+        isPlaceholderData: true,
+      } as Partial<FilesResult>);
       expect(screen.queryByRole("button", { name: "build/out.o" })).toBeNull();
       expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: true });
     });

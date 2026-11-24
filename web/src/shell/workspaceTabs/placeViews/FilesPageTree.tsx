@@ -14,6 +14,7 @@ import {
   RunnerOfflineError,
   joinBrowseLocation,
   relativizeToWorkspace,
+  listingIgnoredFiles,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
@@ -159,9 +160,8 @@ export function FilesPageTree({
   const { session } = useSession(conversationId);
   const canBrowseOutside = isOwnerLevel(session?.permissionLevel ?? null);
   const files = useWorkspaceAllFiles(conversationId, { hideIgnored: !showIgnored }, location);
-  // Until the listing answers, assume its host can leave ignored files out, so none show early.
-  const hostListsIgnored = files.data?.available === true && files.data.ignoredHidden !== true;
-  const searchHidesIgnored = !showIgnored && !hostListsIgnored;
+  // Until this listing answers, assume its host can leave ignored files out, so none show early.
+  const searchHidesIgnored = !showIgnored && listingIgnoredFiles(files) !== "included";
   const changes = useWorkspaceChangedFiles(conversationId);
   const reveal = useTreeActiveReveal({
     conversationId,
