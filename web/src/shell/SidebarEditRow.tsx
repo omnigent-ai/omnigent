@@ -9,12 +9,12 @@ interface SidebarEditRowProps {
   onCommit: (title: string) => void;
   onCancel: () => void;
   label?: string;
-  /** Omitted for names the server doesn't limit, such as project names. */
+  /** Omit to leave length validation to the server. */
   maxLength?: number;
   inputTestId?: string;
 }
 
-/** Shared inline rename: Enter or blur saves; Escape cancels. */
+/** Shared inline rename: Enter or blur saves once; Escape cancels. */
 export function SidebarEditRow({
   initialTitle,
   onCommit,
@@ -25,8 +25,8 @@ export function SidebarEditRow({
 }: SidebarEditRowProps) {
   const [value, setValue] = useState(initialTitle);
   const inputRef = useRef<HTMLInputElement>(null);
-  // Cancelling must not commit on the subsequent blur.
-  const cancelledRef = useRef(false);
+  // Saving or cancelling ends the edit; a later blur must not save again.
+  const settledRef = useRef(false);
   // Enter confirming an IME candidate must not save the rename.
   const isComposingRef = useRef(false);
 
@@ -39,19 +39,25 @@ export function SidebarEditRow({
     if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
     if (e.key === "Enter") {
       e.preventDefault();
-      onCommit(value);
+      commit();
       return;
     }
     if (e.key === "Escape") {
       e.preventDefault();
-      cancelledRef.current = true;
-      onCancel();
+      cancel();
     }
   }
 
-  function handleBlur() {
-    if (cancelledRef.current) return;
+  function commit() {
+    if (settledRef.current) return;
+    settledRef.current = true;
     onCommit(value);
+  }
+
+  function cancel() {
+    if (settledRef.current) return;
+    settledRef.current = true;
+    onCancel();
   }
 
   return (
@@ -73,7 +79,7 @@ export function SidebarEditRow({
           isComposingRef.current = false;
         }}
         onKeyDown={handleKeyDown}
-        onBlur={handleBlur}
+        onBlur={commit}
         data-testid={inputTestId}
         className="sidebar-compact-text min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
       />
@@ -86,7 +92,7 @@ export function SidebarEditRow({
           // Prevent the input's blur from firing before the commit.
           e.preventDefault();
         }}
-        onClick={() => onCommit(value)}
+        onClick={commit}
       >
         <CheckIcon className="size-3.5" />
       </Button>
@@ -96,10 +102,7 @@ export function SidebarEditRow({
         size="icon-xs"
         aria-label="Cancel rename"
         onMouseDown={(e) => e.preventDefault()}
-        onClick={() => {
-          cancelledRef.current = true;
-          onCancel();
-        }}
+        onClick={cancel}
       >
         <XIcon className="size-3.5" />
       </Button>
