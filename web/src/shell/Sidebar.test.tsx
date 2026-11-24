@@ -5149,6 +5149,7 @@ describe("Sidebar view options", () => {
     // Without an emoji, the folder glyph stands beside the name.
     expect(meta("conv_plain")).toHaveTextContent(/^Plain$/);
     expect(within(meta("conv_plain")!).queryByTestId("project-icon")).toBeNull();
+    expect(meta("conv_plain")!.querySelector("svg")).toHaveClass("lucide-folder");
     expect(meta("conv_unfiled")).toBeNull();
 
     openViewSubmenu("session-show-menu");

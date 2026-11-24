@@ -272,7 +272,7 @@ the header menu), and each place is a separate entry point.
   (Updated / Created / Custom) and Show (Harness / Project / Updated / Environment / Repo /
   Branch) submenus, saved per device. Show → Project names a row's project (its emoji, else a
   folder glyph) under the title wherever the row isn't inside that project's folder: pins,
-  and every grouping but Default. On phone layouts a submenu replaces the menu's list under a
+  Shared with me, and every grouping but Default. On phone layouts a submenu replaces the menu's list under a
   back row with its name, and reopening the menu starts at the main list.
   Created ordering keeps sessions newest-created first as messages
   arrive;
