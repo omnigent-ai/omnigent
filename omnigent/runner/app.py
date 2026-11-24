@@ -1814,9 +1814,12 @@ def create_runner_app(
 
     # Sessions whose Claude pane reports a background shell still running after
     # its turn ended. Real work: it keeps the runner and its sandbox up, but only
-    # while that session's native pane exists, so a lost "stopped" edge cannot
-    # pin either.
+    # while that session's native pane exists, which the pane reaper bounds, so a
+    # lost "stopped" edge cannot pin either.
     _sessions_with_background_shell: set[str] = set()
+    # When a background shell became the only work sparing each native pane.
+    _background_shell_pane_hold_since: dict[str, float] = {}
+    app.state.background_shell_pane_hold_since = _background_shell_pane_hold_since
 
     _human_wait_hold_s = _resolve_human_wait_hold_s()
     # Dialog each native turn is parked on: its latest ``running`` edge's
@@ -2310,6 +2313,7 @@ def create_runner_app(
             _sessions_with_background_shell.add(session_id)
         else:
             _sessions_with_background_shell.discard(session_id)
+            _background_shell_pane_hold_since.pop(session_id, None)
         background_reports.report(session_id, running)
 
     resource_registry.set_session_background_publisher(_publish_session_background)
@@ -9739,6 +9743,7 @@ def create_runner_app(
         )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
+            BACKGROUND_SHELL_PANE_HOLD_S,
             PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
             PaneRef,
@@ -9806,6 +9811,17 @@ def create_runner_app(
             return False
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
+            conv_id = pane.conversation_id
+            if await _native_pane_busy_without_shell(pane):
+                _background_shell_pane_hold_since.pop(conv_id, None)
+                return True
+            if conv_id not in _sessions_with_background_shell:
+                return False
+            now = time.monotonic()
+            held_since = _background_shell_pane_hold_since.setdefault(conv_id, now)
+            return now - held_since < BACKGROUND_SHELL_PANE_HOLD_S
+
+        async def _native_pane_busy_without_shell(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
             if conv_id in _active_turns or (
                 process_manager is not None and process_manager.has_active_turn(conv_id)
