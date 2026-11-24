@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as host from "@/lib/host";
 import { basenamedRouting, reactRouterRouting } from "@/lib/routing";
-import { getShareableSessionLink } from "./shareLink";
+import { getShareableProjectLink, getShareableSessionLink } from "./shareLink";
 
 vi.mock("@/lib/host", async (importOriginal) => ({
   ...(await importOriginal<typeof host>()),
@@ -110,6 +110,24 @@ describe("getShareableSessionLink", () => {
     );
     expect(getShareableSessionLink("conv_1", embedded)).toBe(
       "https://host.example.com/embed#/ml/omnigent-embed/c/conv_1?o=42",
+    );
+  });
+});
+
+describe("getShareableProjectLink", () => {
+  it("builds an encoded absolute project URL under the deployment base path", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    expect(getShareableProjectLink("My project #1", standalone)).toBe(
+      `${window.location.origin}/proxy/6767/projects/My%20project%20%231`,
+    );
+  });
+
+  it("lets an embedding host produce the URL", () => {
+    vi.mocked(host.getOmnigentTransformShareLink).mockReturnValue(
+      (path: string) => `https://host.example.com${path}?o=42`,
+    );
+    expect(getShareableProjectLink("demo", embedded)).toBe(
+      "https://host.example.com/ml/omnigent-embed/projects/demo?o=42",
     );
   });
 });

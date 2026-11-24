@@ -2,10 +2,11 @@
 // everything in the project (board, tickets, files and every session).
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { UsersIcon, XIcon } from "lucide-react";
-import { type FormEvent, useState } from "react";
+import { CheckIcon, LinkIcon, UsersIcon, XIcon } from "lucide-react";
+import { type FormEvent, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { copyText } from "@/lib/clipboard";
 import {
   getProject,
   listProjectShares,
@@ -13,9 +14,60 @@ import {
   shareProject,
   updateProjectConfig,
 } from "@/lib/projectsApi";
+import { useRebasePath } from "@/lib/routing";
+import { getShareableProjectLink } from "@/lib/shareLink";
 
 function sharesKey(projectId: string) {
   return ["project-shares", projectId] as const;
+}
+
+/** Copies the project's absolute URL; shows "Copied" for 2 seconds, or the URL when copying fails. */
+function CopyProjectLinkButton({ projectName }: { projectName: string }) {
+  const rebasePath = useRebasePath();
+  const [status, setStatus] = useState<"idle" | "copied" | "failed">("idle");
+  const url = getShareableProjectLink(projectName, rebasePath);
+
+  useEffect(() => {
+    if (status !== "copied") return;
+    const id = setTimeout(() => setStatus("idle"), 2000);
+    return () => clearTimeout(id);
+  }, [status]);
+
+  const copy = async () => {
+    try {
+      await copyText(url);
+      setStatus("copied");
+    } catch (error) {
+      console.warn("Failed to copy project link", error);
+      setStatus("failed");
+    }
+  };
+
+  return (
+    <>
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="ml-auto gap-1.5 text-primary"
+        data-testid="project-share-copy-link"
+        onClick={() => void copy()}
+      >
+        {status === "copied" ? (
+          <CheckIcon className="size-3.5" />
+        ) : (
+          <LinkIcon className="size-3.5" />
+        )}
+        {status === "copied" ? "Copied" : "Copy URL"}
+      </Button>
+      {status === "failed" && (
+        <p className="w-full text-muted-foreground text-sm" role="status">
+          Couldn't copy automatically. Copy this link:{" "}
+          <span className="select-all break-all text-foreground">{url}</span>
+        </p>
+      )}
+    </>
+  );
 }
 
 /** The settings dialog's Sharing section; members see the list but can't change it. */
@@ -58,9 +110,10 @@ export function ProjectSharingSection({ projectId }: { projectId: string }) {
 
   return (
     <section className="flex flex-col gap-2 border-t pt-4" data-testid="project-sharing">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <UsersIcon className="size-4 text-muted-foreground" />
         <h3 className="font-medium text-ui">Sharing</h3>
+        {project.data && <CopyProjectLinkButton projectName={project.data.name} />}
       </div>
       <p className="text-muted-foreground text-sm">
         {isOwner

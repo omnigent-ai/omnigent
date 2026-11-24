@@ -44,3 +44,16 @@ export function getShareableSessionLink(
   if (target !== url) url.hash = `${target.pathname}${target.search}${target.hash}`;
   return url.toString();
 }
+
+/**
+ * The absolute URL of a project's home, resolved like `getShareableSessionLink`
+ * so embedded hosts and base-path deployments get a link others can open.
+ */
+export function getShareableProjectLink(
+  projectName: string,
+  rebasePath: (path: string) => string,
+): string {
+  const path = rebasePath(`/projects/${encodeURIComponent(projectName)}`);
+  const transform = getOmnigentTransformShareLink();
+  return transform ? transform(path) : `${window.location.origin}${withBasePath(path)}`;
+}
