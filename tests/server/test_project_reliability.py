@@ -59,6 +59,7 @@ class FakeTickets:
     def __init__(self, tickets: list[dict[str, Any]], links: dict[str, list[str]]) -> None:
         self.tickets, self.links = tickets, links
         self.notes: list[tuple[str, str]] = []
+        self.events_by_ticket: dict[str, list[dict[str, Any]]] = {}
 
     def list(self, project_id: str, **_: Any) -> dict[str, Any]:
         return {"stages": STAGES, "data": self.tickets}
@@ -67,7 +68,7 @@ class FakeTickets:
         return {"data": [{"session_id": sid} for sid in self.links.get(ticket_id, [])]}
 
     def events(self, project_id: str, ticket_id: str, **_: Any) -> dict[str, Any]:
-        return {"data": [], "has_more": False}
+        return {"data": self.events_by_ticket.get(ticket_id, []), "has_more": False}
 
     def update(self, project_id: str, ticket_id: str, body: Any, actor: Any) -> dict[str, Any]:
         ticket = next(t for t in self.tickets if t["id"] == ticket_id)
@@ -76,7 +77,7 @@ class FakeTickets:
         return dict(ticket)
 
     def comment(self, project_id: str, ticket_id: str, body: Any, actor: Any) -> dict[str, Any]:
-        assert body.audience == "agents"
+        assert body.audience == "agents" or body.text.startswith("Reliability check: this ticket")
         assert actor.agent_id == reliability.LOOP_AGENT_ID and actor.session_id is None
         self.notes.append((ticket_id, body.text))
         # Like the store, the returned row predates the write's updated_at stamp.
@@ -145,6 +146,7 @@ async def test_stalled_worker_is_nudged_restarted_then_escalated(world: SimpleNa
         "Reliability check: step 1/3",
         "Reliability check: step 2/3",
         "Reliability check: step 3/3",
+        "Reliability check: this ticket is waiting on you: nothing has moved for 39 min",
     ]
 
 
@@ -259,3 +261,83 @@ async def test_a_long_owner_wait_reminds_the_lead_once(world) -> None:
         await world.loop.check_project("p1", None, now=hours * 3600 + MINUTE)
     owner = [text for sid, text in world.inputs.sent if "waiting on the owner" in text]
     assert len(owner) == 1 and world.tickets.notes == []
+
+
+def _comment(session_id: str | None, text: str, audience: str = "human") -> dict[str, Any]:
+    return {
+        "kind": "comment",
+        "session_id": session_id,
+        "agent_id": None,
+        "created_at": 0,
+        "payload": {"text": text, "audience": audience},
+    }
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        ([_comment("worker", "Should I push the branch?")], "ask"),
+        ([_comment("worker", "Decision needed: A or B")], "ask"),
+        ([_comment("worker", "Plan ready: https://example.com/doc?id=1")], "maybe"),
+        ([_comment("worker", "Should I push?", audience="agents")], None),
+        ([_comment("lead", "Should I push?")], None),
+        ([_comment("worker", "Should I push?"), _comment(None, "Yes")], None),
+        (
+            [
+                _comment("worker", "Should I push?"),
+                {
+                    "kind": "updated",
+                    "session_id": "worker",
+                    "payload": {"changes": {"labels": []}},
+                },
+            ],
+            None,
+        ),
+        (
+            [
+                _comment("worker", "Should I push?"),
+                _comment("worker", "Still on it", audience="agents"),
+                {
+                    **_comment(None, "Reliability check: step 1/3"),
+                    "agent_id": reliability.LOOP_AGENT_ID,
+                },
+            ],
+            "ask",
+        ),
+    ],
+)
+def test_implied_owner_wait(events, expected) -> None:
+    found = reliability.implied_owner_wait(events, {"lead"})
+    assert (found[0] if found else None) == expected
+
+
+async def test_an_unlabeled_question_is_parked_without_nudging(world) -> None:
+    world.tickets.events_by_ticket["t1"] = [_comment("worker", "May I open the PR?")]
+    for minute in (11, 17, 23, 40, 90):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert world.inputs.sent == [] and world.restarts == []
+    assert [label["key"] for label in world.tickets.tickets[0]["labels"]] == ["needs-human"]
+    assert len(world.tickets.notes) == 1 and "question to you" in world.tickets.notes[0][1]
+
+
+async def test_an_open_update_to_the_owner_is_nudged_once_then_parked(world) -> None:
+    world.tickets.events_by_ticket["t1"] = [_comment("worker", "Plan ready for review.")]
+    await world.loop.check_project("p1", None, now=11 * MINUTE)
+    assert len(world.inputs.sent) == 1 and "needs-human" in world.inputs.sent[0][1]
+    for minute in (17, 23, 40):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert len(world.inputs.sent) == 1 and world.restarts == []
+    assert world.tickets.tickets[0]["labels"] == [{"key": "needs-human", "value": None}]
+
+
+async def test_a_stuck_ticket_is_parked_once_after_one_cycle(world) -> None:
+    world.tickets.tickets[0]["labels"] = [{"key": "keep", "value": None}]
+    for minute in (11, 17, 23, 29, 35, 60, 120):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert sum(sid == "lead" for sid, _ in world.inputs.sent) == 1
+    assert [label["key"] for label in world.tickets.tickets[0]["labels"]] == [
+        "keep",
+        "needs-human",
+    ]
+    parked = [text for _, text in world.tickets.notes if "waiting on you" in text]
+    assert len(parked) == 1 and len(world.tickets.notes) == 4

@@ -9,7 +9,9 @@ orchestrator and:
 - walks an escalation ladder for each such ticket: nudge the worker, then
   restart its runner (the Reload tools path), then escalate to the lead with a
   one-line summary. Each step waits ``step_minutes`` and is recorded on the
-  ticket as an agent note. Any new activity resets the ladder;
+  ticket as an agent note. Any new ticket activity resets the ladder. When a
+  full cycle goes unanswered, or a worker's latest human-audience comment is
+  still open, the loop parks the ticket with ``needs-human`` and stops;
 - watches the lead itself: when it failed, its main session is gone, or a
   queued message has waited ``lead_response_minutes`` while it sat idle, the
   loop restarts it, then rolls it over, or restores a deleted one;
@@ -25,6 +27,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -64,7 +67,7 @@ def _loop_actor(project: Any) -> TicketActor:
     return TicketActor(user_id=project.user_id, agent_id=LOOP_AGENT_ID)
 
 
-NUDGE, RESTART, ESCALATE = 1, 2, 3
+NUDGE, RESTART, ESCALATE, PARK = 1, 2, 3, 4
 LEAD_RESTART, LEAD_ROLLOVER = 1, 2
 
 
@@ -167,6 +170,47 @@ def owner_wait_reason(ticket: dict[str, Any]) -> str | None:
     if "risk" in keys and "risk-ok" not in keys and "approved" in keys:
         return "risk awaiting risk-ok"
     return None
+
+
+_ASK = re.compile(
+    r"\?|\b(should|may|can|shall) I\b|\bdecision\b"
+    r"|\b(waiting|blocked) on (you|the (user|owner|human))"
+    r"|\bplease (confirm|approve|decide|choose|answer|reply)\b|\bneeds? your\b",
+    re.IGNORECASE,
+)
+_URL = re.compile(r"https?://\S+")
+
+
+def implied_owner_wait(
+    events: list[dict[str, Any]], lead_sessions: set[Any]
+) -> tuple[str, dict[str, Any]] | None:
+    """An unlabeled wait on the owner: the latest worker comment addressed to them.
+
+    Returns ``("ask", event)`` when that comment reads as a question or request,
+    ``("maybe", event)`` for any other human-audience worker comment, else ``None``.
+    A later person event, stage change or label change answers or supersedes it.
+    """
+    found: dict[str, Any] | None = None
+    for event in events:
+        session_id, agent_id = event.get("session_id"), event.get("agent_id")
+        payload = event.get("payload") or {}
+        if session_id is None and agent_id != LOOP_AGENT_ID:
+            found = None
+        elif event.get("kind") == "updated":
+            changes = payload.get("changes") or {}
+            if "stage_id" in changes or "labels" in changes:
+                found = None
+        elif (
+            event.get("kind") == "comment"
+            and session_id is not None
+            and session_id not in lead_sessions
+            and payload.get("audience") == "human"
+        ):
+            found = event
+    if found is None:
+        return None
+    text = _URL.sub("", (found.get("payload") or {}).get("text") or "")
+    return ("ask" if _ASK.search(text) else "maybe"), found
 
 
 def _when(timestamp: float) -> str:
@@ -284,13 +328,15 @@ class ReliabilityLoop:
         )
         await inputs.deliver_pending(self.app, session_id)
 
-    async def _note(self, project: Any, ticket_id: str, text: str) -> int:
-        """Record *text* on the ticket as an agent note; return its new ``updated_at``."""
+    async def _note(
+        self, project: Any, ticket_id: str, text: str, *, audience: str = "agents"
+    ) -> int:
+        """Record *text* on the ticket, an agent note by default; return its ``updated_at``."""
         result = await asyncio.to_thread(
             self._notifications.tickets.comment,
             project.id,
             ticket_id,
-            CommentOnTicket(text=f"{NOTE_PREFIX}: {text}"[:2000], audience="agents"),
+            CommentOnTicket(text=f"{NOTE_PREFIX}: {text}"[:2000], audience=audience),
             _loop_actor(project),
         )
         # The returned row predates the write's own updated_at stamp.
@@ -424,6 +470,10 @@ class ReliabilityLoop:
             return
         minutes = int((now - ladder.stalled_since) // 60)
         title = (ticket.get("title") or "")[:80]
+        implied = await self._implied_owner_wait(project, ticket_id, excluded)
+        if implied is not None and (implied[0] == "ask" or ladder.step >= NUDGE):
+            await self._park(project, state, ticket, implied, minutes)
+            return
         alive = [w for w in workers if not w.dead]
         dead = [w for w in workers if w.dead]
         next_step = ladder.step + 1
@@ -432,16 +482,25 @@ class ReliabilityLoop:
         if next_step == RESTART and (not workers or replied):
             # Nothing to restart, or the worker is alive and answered.
             next_step = ESCALATE
-        if next_step > ESCALATE:
+        if next_step == PARK or (next_step == ESCALATE and ticket_id in state.escalated):
+            # One full cycle went unanswered: hand the decision to the owner, once.
+            await self._park(project, state, ticket, None, minutes)
             return
         if next_step == NUDGE:
+            addressed = (
+                " Your latest ticket comment is addressed to the owner."
+                if implied is not None
+                else ""
+            )
             for worker in alive:
                 await self._send(
                     worker.id,
                     f'[{NOTE_PREFIX}] Ticket {ticket_id} ("{title}") has had no activity for '
-                    f"{minutes} min while you were idle. If you're still on it, continue; if "
-                    "you're blocked or done, update the ticket and send your coordinator a "
-                    "handoff now.",
+                    f"{minutes} min while you were idle.{addressed} If you're waiting on the "
+                    "owner, add the `needs-human` label and post the exact question as a "
+                    "human-audience ticket comment; the checks then stop. If you're still on "
+                    "it, continue; if you're blocked or done, update the ticket and send your "
+                    "coordinator a handoff now.",
                     project.user_id,
                 )
             text = f"no activity for {minutes} min in {stage_name}; nudged " + ", ".join(
@@ -463,7 +522,8 @@ class ReliabilityLoop:
                 ", ".join(f"`{w.id[:8]}`" for w in restarted) or "nothing"
             )
         if next_step == ESCALATE:
-            if ticket_id in state.escalated or project.main_session_id is None:
+            if project.main_session_id is None:
+                await self._park(project, state, ticket, None, minutes)
                 return
             summary = (
                 f'[{NOTE_PREFIX}] Ticket {ticket_id} ("{title}", {stage_name}) has made no '
@@ -492,6 +552,70 @@ class ReliabilityLoop:
             ladder.worker_marks[worker.id] = refreshed.position if refreshed else worker.position
 
     # -- waiting on the owner --------------------------------------------------
+
+    async def _implied_owner_wait(
+        self, project: Any, ticket_id: str, lead_sessions: set[Any]
+    ) -> tuple[str, dict[str, Any]] | None:
+        events: list[dict[str, Any]] = []
+        after = -1
+        for _ in range(20):
+            page = await asyncio.to_thread(
+                self._notifications.tickets.events,
+                project.id,
+                ticket_id,
+                user_id=project.user_id,
+                after=after,
+                limit=100,
+            )
+            events += page.get("data", [])
+            if not page.get("has_more"):
+                break
+            after = page.get("last_position", after)
+        return implied_owner_wait(events, lead_sessions)
+
+    async def _park(
+        self,
+        project: Any,
+        state: ProjectState,
+        ticket: dict[str, Any],
+        implied: tuple[str, dict[str, Any]] | None,
+        minutes: int,
+    ) -> None:
+        """Mark the ticket as blocked on the owner with ``needs-human``, once, and stop."""
+        labels = [
+            TicketLabel(key=label["key"], value=label.get("value"))
+            for label in ticket.get("labels") or []
+        ]
+        await asyncio.to_thread(
+            self._notifications.tickets.update,
+            project.id,
+            ticket["id"],
+            UpdateTicket(labels=[*labels, TicketLabel(key="needs-human")]),
+            _loop_actor(project),
+        )
+        if implied is None:
+            why = (
+                f"nothing has moved for {minutes} min, even after a reminder to the worker and "
+                "a note to the orchestrator"
+            )
+        else:
+            kind, event = implied
+            asked = _when(float(event.get("created_at") or 0))
+            why = (
+                f"the worker's question to you from {asked} is still unanswered"
+                if kind == "ask"
+                else f"the worker's update to you from {asked} is still open and a reminder "
+                "changed nothing"
+            )
+        await self._note(
+            project,
+            ticket["id"],
+            f"this ticket is waiting on you: {why}. I marked it Needs response and stopped "
+            "checking on it. Reply on the ticket or remove the label to restart it.",
+            audience="human",
+        )
+        state.tickets.pop(ticket["id"], None)
+        state.escalated.discard(ticket["id"])
 
     async def _check_owner_wait(
         self,
