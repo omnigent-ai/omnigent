@@ -15,11 +15,12 @@ on. Values are at most 2,048 bytes; MySQL gets a ``VARBINARY(2048)``.
 The column is nullable with no default, so this migration runs online and
 needs no backfill: the release that records progress writes a session's value
 on its next plan or status write, and the list shows no step until then.
-Servers already running from before it keep working, since they don't read the
-column. An older server that starts after it refuses the database revision it
-doesn't know. Servers apply pending migrations when they first open the
-database; a deployment that runs migrations separately must apply this one
-before it starts a release that records progress.
+Servers already running from before it keep working, since they don't read or
+write the column. An older server that starts after it refuses the database
+revision it doesn't know. The model maps the column, so inserting a heads row
+names it, and the migration must run before any server with that mapping
+starts. Servers apply pending migrations when they first open the database; a
+deployment that runs migrations separately must apply this one first.
 
 For rollback, stop every server that has this migration and keep them from
 restarting, downgrade to ``47d3e8fc3e25`` with one of their builds, then start
