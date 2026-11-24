@@ -63,7 +63,11 @@ from omnigent.server.auth import (
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
-from omnigent.server.pull_request_viewers import OWNER_ONLY_CHANGES_MESSAGE
+from omnigent.server.pull_request_viewers import (
+    OWNER_ONLY_CHANGES_MESSAGE,
+    PullRequestViewer,
+    info_for_viewer,
+)
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -1199,6 +1203,29 @@ def register_resources_routes(
         """
         if not await _caller_is_session_owner(conv, request):
             raise OmnigentError(OWNER_ONLY_CHANGES_MESSAGE, code=ErrorCode.FORBIDDEN)
+
+    async def _pull_request_viewer(conv: Conversation, request: Request) -> PullRequestViewer:
+        """Who reads the session's pull request info; the least trusted when unsure."""
+        try:
+            if await _caller_is_session_owner(conv, request):
+                return PullRequestViewer.OWNER
+            if permission_store is not None and await asyncio.to_thread(
+                check_session_access,
+                _get_user_id(request, auth_provider),
+                conv.id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+                conv,
+            ):
+                return PullRequestViewer.EDITOR
+        except Exception:
+            _logger.warning(
+                "Could not decide who reads a session's pull requests",
+                exc_info=True,
+                extra={"session_id": conv.id},
+            )
+        return PullRequestViewer.VIEWER
 
     async def _post_pr_edit(
         session_id: str,
@@ -3930,7 +3957,9 @@ def register_resources_routes(
         :returns: The ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        return await _github_info(session_id, conv, pr_url, allow_cached=allow_cached)
+        info = await _github_info(session_id, conv, pr_url, allow_cached=allow_cached)
+        # Applied here, not in _github_info: background refreshes have no caller.
+        return info_for_viewer(info, await _pull_request_viewer(conv, request))
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",

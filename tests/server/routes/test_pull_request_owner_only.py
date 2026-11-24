@@ -7,6 +7,7 @@ past the owner check would reach the recorded host op.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -20,7 +21,7 @@ from omnigent.errors import OmnigentError
 from omnigent.runtime import set_runner_router
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
-from omnigent.server.pull_request_viewers import OWNER_ONLY_CHANGES_MESSAGE
+from omnigent.server.pull_request_viewers import OWNER_ONLY_CHANGES_MESSAGE, READ_CAPABILITIES
 from omnigent.server.routes import _host_filesystem
 from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -104,6 +105,19 @@ _READ_ROUTES = {
     ("GET", "/resources/github/review-threads"),
     ("GET", "/resources/github/review-threads/{thread_id}/comments"),
 }
+_ACCOUNTS = [
+    {"login": "owner-login", "host": "github.com", "active": True},
+    {"login": "owner-bot", "host": "github.com", "active": False},
+]
+_HOST_INFO: dict[str, Any] = {
+    "object": "session.github.info",
+    "available": True,
+    "accounts": _ACCOUNTS,
+    "selected_account": "owner-login",
+    "auth": {"authenticated": True, "accounts": _ACCOUNTS, "selected_account": "owner-login"},
+    "capabilities": {"account_switching": True, "merging": True, "line_counts": True},
+    "pr": {"number": 42, "title": "Ship it", "state": "OPEN", "url": _PR},
+}
 _ROUTE_IDS = [f"{method} {path} {sorted(options)}" for method, path, options in _OWNER_ONLY_ROUTES]
 
 
@@ -129,7 +143,7 @@ class _RecordingHost:
 
     async def read(self, *, op: str, session_id: str, **_kwargs: Any) -> dict[str, Any]:
         self.reads.append(f"{session_id}:{op}")
-        return {"object": "session.github.info", "available": True}
+        return copy.deepcopy(_HOST_INFO) if op == "github_info" else {"object": "x"}
 
     async def write(self, *, op: str, session_id: str, **_kwargs: Any) -> dict[str, Any]:
         self.writes.append(f"{session_id}:{op}")
@@ -384,3 +398,59 @@ async def test_a_refused_link_never_checks_the_session_s_room(
     assert allowed.status_code == 200, allowed.text
     assert checked == [f"{_ROOT}:{other}"]
     assert host.writes == [f"{_ROOT}:github_prs_update"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "selected"),
+    [
+        (_EDITOR, "owner-login"),
+        (_ADMIN, "owner-login"),
+        (_ADMIN_NO_GRANT, "owner-login"),
+        (_VIEWER, None),
+    ],
+)
+async def test_only_the_owner_sees_the_host_s_accounts_and_change_controls(
+    client: httpx.AsyncClient, caller: str, selected: str | None
+) -> None:
+    """An editor still sees which login the owner's changes run as; a viewer doesn't."""
+    response = await _call(client, "GET", "/resources/github", {}, caller=caller)
+
+    assert response.status_code == 200, response.text
+    info = response.json()
+    assert "accounts" not in info
+    assert info["auth"]["accounts"] is None
+    assert info.get("selected_account") == selected
+    assert info["auth"]["selected_account"] == selected
+    assert info["owner_only_changes"] is True
+    assert {name for name, on in info["capabilities"].items() if on} == {"line_counts"}
+    assert set(info["capabilities"]) >= READ_CAPABILITIES
+    assert info["pr"]["number"] == 42
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", [_OWNER, _ADMIN_OWNER])
+async def test_the_owner_sees_the_host_s_info_unchanged(
+    client: httpx.AsyncClient, caller: str
+) -> None:
+    response = await _call(client, "GET", "/resources/github", {}, caller=caller)
+
+    assert response.status_code == 200, response.text
+    info = response.json()
+    assert info["accounts"] == _ACCOUNTS
+    assert info["auth"]["accounts"] == _ACCOUNTS
+    assert info["capabilities"] == _HOST_INFO["capabilities"]
+    assert "owner_only_changes" not in info
+
+
+@pytest.mark.asyncio
+async def test_with_permissions_off_the_info_is_unchanged(
+    db_uri: str, host: _RecordingHost
+) -> None:
+    transport = httpx.ASGITransport(app=_app(db_uri, auth=False))
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
+        response = await _call(client, "GET", "/resources/github", {}, caller=None)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["accounts"] == _ACCOUNTS
+    assert host.reads == [f"{_ROOT}:github_info"]
