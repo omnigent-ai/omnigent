@@ -13432,24 +13432,6 @@ def test_model_draft_joins_soft_wraps_without_losing_hard_newlines_or_whitespace
     assert claude_model_switch._draft(logical) == draft
 
 
-def test_wrapped_draft_with_an_extra_hard_newline_is_still_foreign(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    draft = "the blocked first line\nand a long second line with wrapped words"
-    composer = _SessionModelComposer(draft=draft)
-    composer.wrap_columns = 12
-    bridge_dir = _session_model_bridge(tmp_path, composer)
-    composer.install(monkeypatch)
-
-    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused, match="unrelated draft"):
-        claude_native_bridge.inject_model_command(
-            bridge_dir, model="private-glm[1m]", owned_draft=draft.replace("\n", " ")
-        )
-
-    assert composer.text == draft
-    assert composer.sends == []
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cache_cost", [False, True], ids=["immediate", "cache-cost"])
 @pytest.mark.parametrize("busy", [False, True], ids=["idle", "active-turn"])
@@ -13626,7 +13608,6 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
     [
         ("blocked prompt", None),
         ("blocked\n\nprompt", None),
-        ("blocked prompt ", None),
         ("blocked prompt with several visually wrapped words", 12),
         ("blocked first logical line with wrapping\n\nsecond logical line with wrapping ", 12),
     ],
@@ -13644,16 +13625,6 @@ def test_model_command_clears_only_the_exact_owned_blocked_draft(
     composer.cursor = len(prompt) // 2
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
-
-    if prompt.endswith(" ") and wrap_columns is None:
-        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
-            claude_native_bridge.inject_model_command(
-                bridge_dir, model="private-glm[1m]", owned_draft=prompt
-            )
-        assert composer.sends == []
-        assert composer.submitted == []
-        assert composer.text == prompt
-        return
 
     if clear_result == "refused-attempt":
         attempts: list[int] = []
@@ -13691,16 +13662,25 @@ def test_model_command_clears_only_the_exact_owned_blocked_draft(
 
 
 @pytest.mark.parametrize(
-    ("draft", "owned", "prompt_separator"),
+    ("draft", "owned", "prompt_separator", "wrap_columns"),
     [
-        (" blocked prompt", "blocked prompt", "\u00a0"),
-        ("blocked\nprompt", "blocked prompt", " "),
-        ("blocked prompt", "blocked prompt\n", "\u00a0"),
+        (" blocked prompt", "blocked prompt", "\u00a0", None),
+        ("blocked\nprompt", "blocked prompt", " ", None),
+        ("blocked prompt", "blocked prompt\n", "\u00a0", None),
+        (
+            "the blocked first line\nand a long second line with wrapped words",
+            "the blocked first line and a long second line with wrapped words",
+            " ",
+            12,
+        ),
+        ("blocked prompt ", "blocked prompt ", " ", None),
     ],
     ids=[
         "leading-space",
         "internal-newline",
         "claimed-trailing-newline",
+        "wrapped-extra-hard-newline",
+        "ambiguous-trailing-padding",
     ],
 )
 def test_model_command_refuses_whitespace_normalized_draft_ownership(
@@ -13709,8 +13689,10 @@ def test_model_command_refuses_whitespace_normalized_draft_ownership(
     prompt_separator: str,
     draft: str,
     owned: str,
+    wrap_columns: int | None,
 ) -> None:
     composer = _SessionModelComposer(draft=draft, prompt_separator=prompt_separator)
+    composer.wrap_columns = wrap_columns
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
 
@@ -13720,6 +13702,7 @@ def test_model_command_refuses_whitespace_normalized_draft_ownership(
         )
 
     assert composer.sends == []
+    assert composer.submitted == []
     assert composer.text == draft
     assert composer.model == "claude-sonnet-5-5"
 

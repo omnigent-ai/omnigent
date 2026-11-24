@@ -330,7 +330,10 @@ def test_supported_selection_failure_never_retries_as_a_legacy_command(
     assert not any(command.startswith("/model ") for command in composer.submitted)
 
 
-@pytest.mark.parametrize("failure", ["unsupported-model", "cancelled", "after-submission"])
+@pytest.mark.parametrize(
+    "failure",
+    ["unsupported-model", "cancelled", "after-submission", "literal-space", "literal-control"],
+)
 def test_legacy_failure_never_authorizes_a_dependent_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -343,6 +346,12 @@ def test_legacy_failure_never_authorizes_a_dependent_prompt(
         cancelled.set()
     if failure == "after-submission":
         monkeypatch.setattr(bridge, "_verify_submit_accepted", Mock(return_value=False))
+    target = {
+        "unsupported-model": "absent-private-model",
+        "literal-space": "private model",
+        "literal-control": "private\x01model",
+    }.get(failure, "private-glm[1m]")
+    literal = failure.startswith("literal-")
 
     with (
         bridge.cancellable_injection(cancelled),
@@ -350,7 +359,8 @@ def test_legacy_failure_never_authorizes_a_dependent_prompt(
     ):
         bridge.inject_model_command(
             bridge_dir,
-            model="absent-private-model" if failure == "unsupported-model" else "private-glm[1m]",
+            model=target,
+            legacy_literal_model=literal,
         )
 
     assert caught.value.model_may_have_changed is (failure == "after-submission")
@@ -360,6 +370,10 @@ def test_legacy_failure_never_authorizes_a_dependent_prompt(
         assert composer.model == composer.saved_default == "private-glm[1m]"
     else:
         assert composer.sends == []
+        assert composer.submitted == []
+        if literal:
+            assert caught.value.unsupported
+            assert composer.model == composer.saved_default == "claude-sonnet-5-5"
 
 
 @pytest.mark.parametrize("fault", ["delayed-submit-echo", "late-status"])

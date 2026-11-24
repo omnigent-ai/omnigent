@@ -2008,7 +2008,7 @@ async def test_events_model_change_settles_held_metadata_lock_without_late_write
     assert config_path.read_bytes() == original
 
 
-@pytest.mark.parametrize("phase", ["preflight", "picker", "commit", "status"])
+@pytest.mark.parametrize("phase", ["preflight", "picker", "commit", "status", "dialog"])
 async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_states(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, phase: str
 ) -> None:
@@ -2022,6 +2022,11 @@ async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_sta
     def refuse(_bridge: Path, *, model: str, **_kwargs: Any) -> None:
         selections.append(model)
         assert _injection_deadline() is not None
+        if phase == "dialog":
+            error = claude_native_bridge.ClaudeTerminalDialog(
+                "Claude Code is waiting for an answer in its terminal (Trust this folder?)."
+            )
+            raise claude_native_bridge.ClaudeModelSwitchRefused(str(error)) from error
         raise claude_native_bridge.ClaudeModelSwitchRefused(
             "Session-only model selection refused; inspect the terminal before retrying.",
             phase=phase,
@@ -2040,7 +2045,14 @@ async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_sta
     assert selections == ["claude-opus-4-7"]
     assert response.status_code == 503, response.text
     assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
-    if phase in {"commit", "status"}:
+    if phase == "dialog":
+        assert response.json() == {
+            "error": "claude_native_model_failed",
+            "detail": "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+            "answer or dismiss it, then switch models again.",
+            "waiting_on_person": True,
+        }
+    elif phase in {"commit", "status"}:
         assert response.json()["error"] == "claude_native_model_unconfirmed"
         assert "may have changed" in response.json()["detail"]
         assert "Check the terminal's current model before retrying" in response.json()["detail"]
@@ -2125,27 +2137,6 @@ async def test_events_empty_catalog_overrides_stale_bridge_picker_metadata(
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "claude_native_model_unsupported"
     assert calls == [stale_model]
-
-
-async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    error = claude_native_bridge.ClaudeTerminalDialog(
-        "Claude Code is waiting for an answer in its terminal (Trust this folder?)."
-    )
-
-    def refuse(*args: Any, **kwargs: Any) -> None:
-        raise claude_native_bridge.ClaudeModelSwitchRefused(str(error)) from error
-
-    response = await _post_claude_control(monkeypatch, tmp_path, refuse)
-
-    assert response.status_code == 503, response.text
-    assert response.json() == {
-        "error": "claude_native_model_failed",
-        "detail": "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
-        "answer or dismiss it, then switch models again.",
-        "waiting_on_person": True,
-    }
 
 
 def _injection_deadline() -> float | None:

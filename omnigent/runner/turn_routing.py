@@ -175,6 +175,9 @@ REPLAY_IDLE_WAIT_S = 60.0
 #: Poll interval for both waits.
 REPLAY_POLL_S = 0.1
 
+#: Backoff before the single retry of a saved-message notice.
+REPLAY_NOTICE_RETRY_S = 0.5
+
 #: How long "no active turn" must hold before the replay trusts it, when
 #: the blocked turn was never observed as active (the harness bookkeeping
 #: may simply not have caught up yet).
@@ -1201,44 +1204,51 @@ async def _replay(
             "route-turn: required model switch refused for session=%s; the prompt stays pending",
             session_id,
         )
-        if not turn_routing_marker_present(bridge_dir, session_id) or read_pending_replay(
-            bridge_dir
-        ) != PendingReplay(session_id, prompt, blocked_turn_id, model):
-            return
-        try:
-            resp = await server_client.post(
-                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
-                json={
-                    "type": "external_conversation_item",
-                    "data": {
-                        "item_type": "error",
-                        "item_data": {
-                            "source": "harness",
-                            "code": "turn_routing_replay_pending",
-                            "level": "info",
-                            "title": "Your message is saved and has not been sent",
-                            "message": (
-                                "Smart Routing could not confirm the requested model."
-                                + refusal_detail
-                            ),
-                            "remediation": (
-                                "Open Terminal to check the current model and resolve the "
-                                "refusal, then copy and send your saved message below. "
-                                "The saved message will not retry automatically.\n\n"
-                                "Saved message:\n" + prompt
-                            ),
+        notice_id = f"turn-routing-pending-{uuid.uuid4().hex}"
+        for attempt in range(2):
+            if not turn_routing_marker_present(bridge_dir, session_id) or read_pending_replay(
+                bridge_dir
+            ) != PendingReplay(session_id, prompt, blocked_turn_id, model):
+                return
+            try:
+                resp = await server_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+                    json={
+                        "type": "external_conversation_item",
+                        "data": {
+                            "source_id": notice_id,
+                            "response_id": notice_id,
+                            "item_type": "error",
+                            "item_data": {
+                                "source": "harness",
+                                "code": "turn_routing_replay_pending",
+                                "level": "info",
+                                "title": "Your message is saved and has not been sent",
+                                "message": (
+                                    "Smart Routing could not confirm the requested model."
+                                    + refusal_detail
+                                ),
+                                "remediation": (
+                                    "Open Terminal to check the current model and resolve the "
+                                    "refusal, then copy and send your saved message below. "
+                                    "The saved message will not retry automatically.\n\n"
+                                    "Saved message:\n" + prompt
+                                ),
+                            },
                         },
                     },
-                },
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-        except Exception:
-            _logger.warning(
-                "route-turn: could not publish the pending replay notice for session=%s",
-                session_id,
-                exc_info=True,
-            )
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+                return
+            except Exception:
+                _logger.warning(
+                    "route-turn: could not publish the pending replay notice for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+                if attempt == 0:
+                    await asyncio.sleep(REPLAY_NOTICE_RETRY_S)
         return
     if not await _deliver_prompt(
         session_id, prompt=prompt, server_client=server_client, model=model
