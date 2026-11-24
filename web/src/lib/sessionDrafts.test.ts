@@ -232,6 +232,20 @@ describe("session drafts", () => {
         chipTokens: ["@image.png", "@image (3).png"],
       },
     ],
+    [
+      "two incoming files collide, and each reference keeps its own file",
+      { message: "", files: [], chips: [["@a.png", new File(["a"], "a.png")]] },
+      {
+        text: "First @a.png then second @a (2).png",
+        files: [new File(["b"], "a.png"), new File(["c"], "a (2).png")],
+        chips: [],
+      },
+      {
+        message: "First @a (3).png then second @a (2).png",
+        names: ["a (3).png", "a (2).png", "a.png"],
+        chipTokens: ["@a.png"],
+      },
+    ],
   ];
 
   it.each(recoveryRows)(

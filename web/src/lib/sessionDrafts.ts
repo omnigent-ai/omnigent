@@ -174,17 +174,28 @@ export function recoverFailedSessionDraft<
   });
   // The temporary draft's tray files are the incoming ones: each takes a name no tag or earlier
   // tray file uses.
-  let mergedText = merged.text;
+  // Every incoming name is reserved before any is chosen, so a rename never takes a name a later
+  // incoming file keeps. The typed text is rewritten once, from all the renames together.
+  const incomingNames = temporaryDraft.files.map(attachmentFilename);
+  const tokens = tagTokensOf(merged.mentions);
+  const finalNames: string[] = [];
   const incoming: File[] = [];
-  for (const file of temporaryDraft.files) {
+  temporaryDraft.files.forEach((file, index) => {
+    const others = incomingNames.filter((_, other) => other !== index);
     const named = nameAttachmentFile(file, {
-      tokens: tagTokensOf(merged.mentions),
-      trayNames: [...originalDraft.files, ...incoming].map(attachmentFilename),
+      tokens,
+      trayNames: [...originalDraft.files.map(attachmentFilename), ...finalNames, ...others],
     });
-    // A typed @name refers to the tray file it was typed for, so its spellings follow the rename.
-    if (named !== file) mergedText = respellMention(mergedText, `@${file.name}`, `@${named.name}`);
+    finalNames.push(named.name);
     incoming.push(named);
-  }
+  });
+  // A typed @name refers to the tray file it was typed for, so its spellings follow the rename.
+  const renames = temporaryDraft.files.flatMap((file, index) =>
+    file.name === incoming[index]!.name
+      ? []
+      : [[`@${file.name}`, `@${incoming[index]!.name}`] as const],
+  );
+  const mergedText = respellMentions(merged.text, renames);
   const message = [originalDraft.message, mergedText]
     .filter((part) => part.trim() !== "")
     .join("\n\n");
@@ -196,13 +207,20 @@ export function recoverFailedSessionDraft<
   };
 }
 
-/** ``text`` with each whole ``from`` mention spelled as ``to`` instead. */
-function respellMention(text: string, from: string, to: string): string {
-  let out = text;
-  for (const range of findMentionTokens(text, [from]).reverse()) {
-    out = out.slice(0, range.start) + to + out.slice(range.end);
+/**
+ * ``text`` with each whole mention in ``renames`` spelled as its new name, in one pass: a replaced
+ * spelling is never scanned again, so one rename cannot rewrite another's result.
+ */
+function respellMentions(text: string, renames: readonly (readonly [string, string])[]): string {
+  if (renames.length === 0) return text;
+  const spelled = new Map(renames);
+  let out = "";
+  let at = 0;
+  for (const range of findMentionTokens(text, [...spelled.keys()])) {
+    out += text.slice(at, range.start) + spelled.get(range.token);
+    at = range.end;
   }
-  return out;
+  return out + text.slice(at);
 }
 
 /** Move an unsent draft when a temporary conversation receives its real id. */
