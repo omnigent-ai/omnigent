@@ -2272,6 +2272,27 @@ describe("grid cell composer shares its session's draft", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
+  it("queues a cell's draft behind its backlog with Mod+Enter when Always steer is on", () => {
+    writeAlwaysSteer(true);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_cell", text: "first", conversationId: childId, agentId: "agent_side" },
+      ],
+    });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "after the turn" } });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(input).toHaveValue("");
+    expect(useChatStore.getState().queuedMessages.map(({ text }) => text)).toEqual([
+      "first",
+      "after the turn",
+    ]);
+  });
+
   it("posts a cell's send into its busy session when Always steer is on", () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
     gridCell();

@@ -4271,10 +4271,9 @@ function ComposerImpl(
       shouldSteerAllFromKeyboard,
     }: ComposerKeyIntent,
   ) => {
-    // Mod+Enter (Mod+Shift+Enter when Mod+Enter is already the send chord)
-    // inverts Always steer mid-turn. With it on, the draft waits in the queue
-    // for the turn to end. Otherwise the draft joins the queue tail (or sends
-    // when idle) and every queued message is steered into the running turn.
+    // Mod+Enter inverts Always steer mid-turn: with it on, the draft waits in the
+    // queue; otherwise the draft joins the queue tail (or sends when idle) and the
+    // whole queue is steered into the running turn.
     if (conversationId !== null && !hasPendingElicitation && shouldSteerAllFromKeyboard) {
       e.preventDefault();
       // An empty composer has nothing to queue, so it still steers the backlog.
