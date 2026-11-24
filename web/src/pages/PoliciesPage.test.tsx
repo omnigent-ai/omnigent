@@ -1,11 +1,5 @@
-// Tests for the admin PoliciesPage (global default policies: list, toggle,
-// add, delete).
-//
-// Browser e2e is impractical (admin/accounts-gated), so the surface is pinned
-// here by mocking the mode-agnostic identity probe (resolveIdentity /
-// getCurrentIsAdmin gate admin — works under OIDC too) and the react-query
-// policy hooks (useDefaultPolicies / usePolicyRegistry + add/update/delete
-// mutations) so no QueryClient or network is needed.
+// Policy controls and identity recovery. Most collaborators are mocked;
+// recovery exercises the real query hook and cache.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -139,25 +133,6 @@ describe("PoliciesPage gating", () => {
     expect(screen.getByText("Loading...")).toBeInTheDocument();
   });
 
-  it("shows policy controls when identity recovers while the page stays open", async () => {
-    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
-    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
-    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
-    const view = renderPage();
-    await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
-    expect(screen.queryByRole("button", { name: "Add policy" })).not.toBeInTheDocument();
-
-    vi.mocked(identity.getCurrentUserId).mockReturnValue("admin");
-    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
-    act(() => {
-      for (const listener of identityUpdates) listener();
-    });
-
-    expect(await screen.findByRole("button", { name: "Add policy" })).toBeInTheDocument();
-    view.unmount();
-    expect(identityUpdates.size).toBe(0);
-  });
-
   it("blocks non-admins with a permission message", async () => {
     vi.mocked(identity.resolveIdentity).mockResolvedValue("alice");
     vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
@@ -165,6 +140,7 @@ describe("PoliciesPage gating", () => {
     expect(
       await screen.findByText("You don't have permission to manage global policies."),
     ).toBeInTheDocument();
+    expect(defaultPolicies.useDefaultPolicies).toHaveBeenLastCalledWith(false);
   });
 
   it.each([true, false])(
@@ -229,6 +205,7 @@ describe("PoliciesPage gating", () => {
       }
       expect(fetch.mock.calls[0][0]).toBe("/v1/policies");
       view.unmount();
+      expect(identityUpdates.size).toBe(0);
       client.clear();
     },
   );
@@ -517,6 +494,7 @@ describe("PoliciesPage single-user mode", () => {
     expect(
       screen.queryByText("You don't have permission to manage global policies."),
     ).not.toBeInTheDocument();
+    expect(defaultPolicies.useDefaultPolicies).toHaveBeenLastCalledWith(true);
   });
 
   it("shows policies list directly without probing identity", async () => {
@@ -524,6 +502,7 @@ describe("PoliciesPage single-user mode", () => {
     renderPage();
     expect(await screen.findByText("block_canada")).toBeInTheDocument();
     expect(identity.resolveIdentity).not.toHaveBeenCalled();
+    expect(defaultPolicies.useDefaultPolicies).toHaveBeenLastCalledWith(true);
   });
 });
 
@@ -546,5 +525,6 @@ describe("PoliciesPage on a multi-user header-auth deploy", () => {
       await screen.findByText("You don't have permission to manage global policies."),
     ).toBeInTheDocument();
     expect(identity.resolveIdentity).toHaveBeenCalled();
+    expect(defaultPolicies.useDefaultPolicies).toHaveBeenLastCalledWith(false);
   });
 });
