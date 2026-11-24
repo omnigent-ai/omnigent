@@ -185,7 +185,9 @@ The project may define identities: persistent named roles such as `PM` or
 user talks to an identity from the project header; its session gets the persona
 automatically. Each identity always has **exactly one session**: the server
 starts it when the identity is created and starts a fresh one, with the same
-persona, if that session is deleted or archived.
+persona, if that session is deleted or archived. The Orchestrator (you) is
+restored the same way if its session is deleted; an archived Orchestrator is
+left for rollover to replace.
 
 - To assign a ticket to an identity, set the label `assignee: <name>` (preserve
   other labels). Keep it current when ownership changes; it is advisory and does

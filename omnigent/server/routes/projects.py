@@ -476,6 +476,7 @@ def create_projects_router(
             project_store.list_identities, project.id, user_id=user_id
         )
         # Every identity keeps one live session; this listing is what the board polls.
+        project = await heal_main_session(request, project)
         identities = await heal_identity_sessions(request, project, identities)
         orchestrator = orchestrator_identity_response(
             project, await main_session_state(project, conversation_store, permission_store)
@@ -686,6 +687,57 @@ def create_projects_router(
                 )
             healed.append(identity)
         return healed
+
+    main_heal_locks: dict[str, asyncio.Lock] = {}
+    main_heal_not_before: dict[str, float] = {}
+
+    async def heal_main_session(request: Request, project: Project) -> Project:
+        """Start a fresh Orchestrator when the project's one is deleted or was never made.
+
+        An archived main is left alone (a rollover keeps the pointer on its archived
+        predecessor until the switch), and so is any project mid-rollover.
+        """
+        from omnigent.server.project_orchestrator_rollover import (
+            rollover_in_progress,
+            start_fresh_main_session,
+        )
+
+        lock = main_heal_locks.setdefault(project.id, asyncio.Lock())
+        async with lock:
+            current = await asyncio.to_thread(
+                project_store.get, project.id, user_id=project.user_id
+            )
+            if current is None:
+                return project
+            if rollover_in_progress(current.id) or time.monotonic() < (
+                main_heal_not_before.get(current.id, 0.0)
+            ):
+                return current
+            state = await main_session_state(current, conversation_store, permission_store)
+            if state not in ("absent", "missing"):
+                return current
+            try:
+                await start_fresh_main_session(
+                    request.app,
+                    current,
+                    user_id=current.user_id,
+                    expected_main_session_id=current.main_session_id,
+                    reason="heal",
+                    template_request=request,
+                )
+            except Exception:
+                # A CONFLICT means someone else replaced it; anything else retries later.
+                main_heal_not_before[current.id] = time.monotonic() + _HEAL_RETRY_SECONDS
+                logger.warning(
+                    "Could not restore project %s's orchestrator", current.id, exc_info=True
+                )
+            else:
+                main_heal_not_before.pop(current.id, None)
+                announce_projects_changed(current.user_id)
+            healed = await asyncio.to_thread(
+                project_store.get, current.id, user_id=current.user_id
+            )
+            return healed or current
 
     @router.post("/projects/{project_id}/identities/{identity_id}/session")
     async def open_identity_session(

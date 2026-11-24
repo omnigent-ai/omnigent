@@ -556,6 +556,41 @@ async def test_identity_sessions_come_back_after_delete_or_archive(
     assert [session["id"] for session in live] == [third]
 
 
+async def test_a_deleted_orchestrator_comes_back_but_an_archived_one_waits(
+    project_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Listing identities restores a deleted main session; archive and rollover are left alone."""
+    from omnigent.server import project_orchestrator_rollover as rollover
+
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    identities = f"/v1/projects/{created['id']}/identities"
+    first = created["main_session_id"]
+
+    async def orchestrator() -> dict:
+        return (await project_client.get(identities)).json()["data"][0]
+
+    assert (await project_client.delete(f"/v1/sessions/{first}")).status_code == 200
+    monkeypatch.setitem(rollover._project_rollovers, created["id"], first)
+    waiting = await orchestrator()
+    assert (waiting["active_session_id"], waiting["active_session_state"]) == (first, "missing")
+    monkeypatch.delitem(rollover._project_rollovers, created["id"])
+
+    racing = await asyncio.gather(orchestrator(), orchestrator())
+    second = racing[0]["active_session_id"]
+    assert second not in (None, first)
+    assert {entry["active_session_id"] for entry in racing} == {second}
+    assert racing[0]["active_session_state"] == "active"
+    project = (await project_client.get(f"/v1/projects/{created['id']}")).json()
+    assert project["main_session_id"] == second
+
+    await project_client.patch(f"/v1/sessions/{second}", json={"archived": True})
+    archived = await orchestrator()
+    assert (archived["active_session_id"], archived["active_session_state"]) == (
+        second,
+        "archived",
+    )
+
+
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     """DELETE removes the project; a second delete 404s."""
     created = (await project_client.post("/v1/projects", json={"name": "Doomed"})).json()
