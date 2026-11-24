@@ -5,7 +5,8 @@ session's metadata. An append locks the session's ``session_journal_heads`` row,
 which allocates positions, so one session's appends run one at a time while
 other sessions' appends and the session's metadata updates don't wait. An
 append carries an idempotency key, so a retried append returns the entry its
-first attempt wrote instead of writing it twice.
+first attempt wrote instead of writing it twice. A plan or status write also
+rewrites the heads row's plan progress, which session lists read by primary key.
 
 An entry's content is the kind's compressed JSON, at most
 :data:`~omnigent.db.db_models.MAX_STORED_VALUE_BYTES` bytes stored. The store
@@ -33,6 +34,7 @@ from sqlalchemy.orm import Session
 from omnigent.db import compression
 from omnigent.db.db_models import (
     MAX_STORED_VALUE_BYTES,
+    PLAN_PROGRESS_MAX_STORED_BYTES,
     SqlConversationMetadata,
     SqlSessionJournalEntry,
     SqlSessionJournalHead,
@@ -46,6 +48,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.entities.plan_progress import plan_progress
 from omnigent.entities.session_journal import (
     IDEMPOTENCY_KEY_MAX_CHARS,
     JOURNAL_KINDS,
@@ -79,6 +82,8 @@ JOURNAL_DELETE_BATCH = 200
 JOURNAL_COPY_BATCH = 200
 
 _Statement = TypeVar("_Statement", bound=Select[Any])
+# Leaves a heads row's plan progress as it is.
+_UNSET: Any = object()
 
 
 def _using(statement: _Statement, index: str) -> _Statement:
@@ -106,15 +111,24 @@ class JournalSessionNotFoundError(Exception):
     """The session doesn't exist, or was deleted while the append ran."""
 
 
-def _set_next_position(session: Session, conversation_id: str, next_position: int) -> None:
-    """Advance a session's heads row, a primary-key update."""
+def _set_next_position(
+    session: Session, conversation_id: str, next_position: int, plan_progress: Any = _UNSET
+) -> None:
+    """Advance a session's heads row, a primary-key update.
+
+    :param plan_progress: The encoded progress to store with it, ``None`` to clear
+        it, or left out to keep it.
+    """
+    values: dict[str, Any] = {"next_position": next_position}
+    if plan_progress is not _UNSET:
+        values["plan_progress"] = plan_progress
     session.execute(
         update(SqlSessionJournalHead)
         .where(
             SqlSessionJournalHead.workspace_id == current_workspace_id(),
             SqlSessionJournalHead.conversation_id == conversation_id,
         )
-        .values(next_position=next_position)
+        .values(**values)
         .with_hint("FORCE INDEX (PRIMARY)", dialect_name="mysql")
     )
 
@@ -401,6 +415,44 @@ class SessionJournalStore:
             )
         ).scalar_one_or_none()
 
+    def _plan_progress_value(
+        self,
+        session: Session,
+        conversation_id: str,
+        steps: Sequence[Mapping[str, Any]],
+        *,
+        graph_revision: str | None,
+        start_position: int | None,
+        fresh_run: bool,
+        written: JournalEntry | None,
+    ) -> bytes | None:
+        """The plan's progress after a write, encoded for the session's heads row.
+
+        One kind-and-step lookup per plan step reads its newest status in the run.
+
+        :param start_position: The current run's boundary, or ``None`` for a
+            session that never started one.
+        :param fresh_run: Whether this write starts a run, so no earlier status counts.
+        :param written: The status this write appends, which the lookups don't see.
+        :returns: The encoded progress, or ``None`` when it doesn't fit the column.
+        """
+        rows = []
+        if not fresh_run:
+            for step in steps:
+                row = self._newest_status_row(
+                    session, conversation_id, step["id"], start_position=start_position
+                )
+                if row is not None:
+                    rows.append(row)
+        statuses = {entry.step: entry for entry in self._entries(rows) if entry.step}
+        if written is not None and written.step:
+            statuses[written.step] = written
+        progress = plan_progress(steps, statuses, graph_revision=graph_revision)
+        (stored,) = self._encode_contents(
+            [json.dumps(progress, ensure_ascii=False, separators=(",", ":"))]
+        )
+        return stored if len(stored) <= PLAN_PROGRESS_MAX_STORED_BYTES else None
+
     def append(
         self,
         conversation_id: str,
@@ -550,13 +602,37 @@ class SessionJournalStore:
                     **({"graph_revision": graph_revision} if graph_revision is not None else {}),
                 }
                 entry_text = self._stored_contents([entry_content])[0]
-            if (
-                position + 1 + int(starts_run) + int(copied_plan_text is not None)
-                > JOURNAL_MAX_ENTRIES
-            ):
+            entry_position = position + int(starts_run) + int(copied_plan_text is not None)
+            if entry_position + 1 > JOURNAL_MAX_ENTRIES:
                 raise JournalFullError(JOURNAL_MAX_ENTRIES)
             stamp = now_epoch()
             entry_id = uuid.uuid4().hex
+            progress = _UNSET
+            current_plan: Mapping[str, Any] | None = (
+                entry_content if kind == "plan" else previous_content
+            )
+            if (kind in ("plan", "status") or starts_run) and current_plan is not None:
+                written = None
+                if kind == "status":
+                    written = JournalEntry(
+                        id=entry_id,
+                        conversation_id=conversation_id,
+                        position=entry_position,
+                        created_at=stamp,
+                        kind=kind,
+                        step=entry_step,
+                        scheduled_task_run_id=scheduled_task_run_id,
+                        content=entry_content,
+                    )
+                progress = self._plan_progress_value(
+                    session,
+                    conversation_id,
+                    current_plan["steps"],
+                    graph_revision=graph_revision if isinstance(graph_revision, str) else None,
+                    start_position=boundary.position if boundary is not None else None,
+                    fresh_run=starts_run,
+                    written=written,
+                )
             if starts_run:
                 session.add(
                     SqlSessionJournalEntry(
@@ -605,7 +681,7 @@ class SessionJournalStore:
                 content=entry_text,
             )
             session.add(row)
-            _set_next_position(session, conversation_id, position + 1)
+            _set_next_position(session, conversation_id, position + 1, progress)
             return row, True, entry_content
 
         row, created, entry_content = run_write_transaction(
@@ -711,6 +787,38 @@ class SessionJournalStore:
         with self._session("read_current_plan") as session:
             row = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
         return None if row is None else self._entries([row])[0]
+
+    def plan_progress_by_session(
+        self, conversation_ids: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Where each session's current plan stands, for a page of session rows.
+
+        One primary-key read of the sessions' heads rows; no journal is read.
+
+        :param conversation_ids: The sessions, e.g. a page of the session list.
+        :returns: Each session's progress by ID, as
+            :func:`~omnigent.entities.plan_progress.plan_progress` returns it. A
+            session is left out until a plan or status write records it.
+        """
+        ids = list(dict.fromkeys(conversation_ids))
+        if not ids:
+            return {}
+        heads = SqlSessionJournalHead
+        with self._session("read_plan_progress") as session:
+            rows = session.execute(
+                select(heads.conversation_id, heads.plan_progress)
+                .where(
+                    heads.workspace_id == current_workspace_id(),
+                    heads.conversation_id.in_(ids),
+                )
+                .with_hint(heads, "FORCE INDEX (PRIMARY)", "mysql")
+            ).all()
+        recorded = [(row.conversation_id, row.plan_progress) for row in rows if row.plan_progress]
+        texts = self._decode_contents([stored for _, stored in recorded])
+        return {
+            conversation_id: json.loads(text)
+            for (conversation_id, _), text in zip(recorded, texts, strict=True)
+        }
 
     def run_latest_plans(self, plans: Sequence[JournalEntry]) -> list[JournalEntry]:
         """Each run's latest plan before the next invocation, in input order.

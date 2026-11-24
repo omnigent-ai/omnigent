@@ -835,6 +835,89 @@ def test_reported_pull_request_reaches_the_session_list_and_stream(
     assert item["pull_request"] == changed["items"][0]["pull_request"]
 
 
+def test_a_workflow_runs_step_reaches_the_session_list_and_stream(
+    app: FastAPI, stores, db_uri: str, fast_rescan: None
+) -> None:
+    """A step that starts reaches the sidebar through the stream's diff and the list.
+
+    Both read the progress the journal keeps on the session's heads row, so
+    neither reads the journal itself.
+    """
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+    from omnigent.stores.session_journal_store import SessionJournalStore
+
+    app.state.feature_flags = FeatureFlags(enabled_features=frozenset({Feature.WORKFLOWS}))
+    s1 = _seed_session(stores, owner=ALICE, title="Weekly dependency audit")
+    journal = SessionJournalStore(db_uri)
+    steps = [
+        {"id": "inventory", "name": "Inventory dependencies"},
+        {"id": "open-prs", "name": "Open PRs for safe upgrades", "depends_on": ["inventory"]},
+    ]
+    journal.append(s1, "plan", {"name": "Audit", "steps": steps}, idempotency_key="plan")
+    journal.append(
+        s1,
+        "status",
+        {"status": "done", "text": "37 behind"},
+        idempotency_key="k1",
+        step="inventory",
+    )
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["plan_progress"] == {
+            "total": 2,
+            "done": 1,
+            "failed": 0,
+            "started": 0,
+            "needs_input": 0,
+            "step": {"name": "Open PRs for safe upgrades", "state": "next"},
+        }
+
+        journal.append(s1, "status", {"status": "started"}, idempotency_key="k2", step="open-prs")
+        changed = _recv_until(ws, {"changed"})
+        assert changed["items"][0]["plan_progress"]["step"] == {
+            "name": "Open PRs for safe upgrades",
+            "state": "started",
+        }
+    headers = {"X-Forwarded-Email": ALICE}
+    [item] = TestClient(app).get("/v1/sessions", headers=headers).json()["data"]
+    assert item["plan_progress"] == changed["items"][0]["plan_progress"]
+
+    # Without workflows, the list reads no progress.
+    app.state.feature_flags = FeatureFlags()
+    [item] = TestClient(app).get("/v1/sessions", headers=headers).json()["data"]
+    assert "plan_progress" not in item
+
+
+def test_unreadable_plan_progress_leaves_the_list_loading(
+    app: FastAPI, stores, db_uri: str
+) -> None:
+    import sqlalchemy as sa
+
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+    from omnigent.stores.session_journal_store import SessionJournalStore
+
+    app.state.feature_flags = FeatureFlags(enabled_features=frozenset({Feature.WORKFLOWS}))
+    s1 = _seed_session(stores, owner=ALICE, title="Audit")
+    SessionJournalStore(db_uri).append(
+        s1, "plan", {"name": "Audit", "steps": [{"id": "a", "name": "A"}]}, idempotency_key="k0"
+    )
+    with sa.create_engine(db_uri).begin() as conn:
+        # Encrypted by a deployment this server has no key for.
+        conn.execute(
+            sa.text("UPDATE session_journal_heads SET plan_progress = :value"),
+            {"value": b"\x00\x02\x00\x00\x00\x02{}sealed"},
+        )
+
+    listed = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
+
+    assert listed.status_code == 200
+    [item] = listed.json()["data"]
+    assert item["id"] == s1 and "plan_progress" not in item
+
+
 def test_runner_reported_pull_requests_are_stored_without_a_read(
     app: FastAPI, stores, db_uri: str
 ) -> None:

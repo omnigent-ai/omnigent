@@ -240,6 +240,7 @@ import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { SidebarEditRow } from "./SidebarEditRow";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import { planProgressLine } from "@/lib/sessionPlanProgress";
 import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -296,6 +297,7 @@ import {
 } from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { SessionPlanLine } from "@/shell/SessionPlanLine";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -6395,10 +6397,14 @@ function ConversationRowImpl({
   ) : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
   const metaBranch = useSessionBranch(conversation, show.includes("branch"));
+  // A workflow run names the step it's on, unless the badge already says it waits for you.
+  const planLine = conversation.plan_progress
+    ? planProgressLine(conversation.plan_progress, sessionState?.kind === "awaiting")
+    : null;
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
   const overlayTop =
-    metaEnvironment !== null || metaRepo !== null || metaBranch !== null
+    planLine !== null || metaEnvironment !== null || metaRepo !== null || metaBranch !== null
       ? "top-4 md:top-3.5"
       : "top-1/2";
 
@@ -6589,6 +6595,7 @@ function ConversationRowImpl({
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>
+      {planLine && <SessionPlanLine line={planLine} />}
       {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
       <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
     </>
@@ -7153,7 +7160,11 @@ function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
     if (a[key] !== b[key]) return false;
   }
   // `labels` is an object; compare by value (rename/project moves ride here).
-  return JSON.stringify(a.labels) === JSON.stringify(b.labels);
+  // So is `plan_progress`, which every streamed row carries as a new object.
+  return (
+    JSON.stringify(a.labels) === JSON.stringify(b.labels) &&
+    JSON.stringify(a.plan_progress) === JSON.stringify(b.plan_progress)
+  );
 }
 
 // Memoized with a render-field comparator (not shallow identity): a row

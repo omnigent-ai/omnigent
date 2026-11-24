@@ -576,6 +576,53 @@ describe("Sidebar session list", () => {
     }
   });
 
+  it("names a workflow run's step under its title and keeps it current", () => {
+    const run = (progress: Conversation["plan_progress"], partial: Partial<Conversation> = {}) =>
+      conv("run", "Claude Code", { plan_progress: progress, ...partial });
+    const waiting = {
+      total: 5,
+      done: 3,
+      needs_input: 1,
+      step: { name: "Approve major upgrades", state: "needs_input" as const },
+    };
+    // A stable projects array keeps context churn from bypassing the memo comparator.
+    projectRowsRef.current = [];
+    mockConversations([
+      run({
+        total: 5,
+        done: 2,
+        started: 3,
+        step: { name: "Open PRs for safe upgrades", state: "started" },
+      }),
+      // A planning chat's proposal has no statuses yet.
+      conv("planning", "Claude Code", {
+        plan_progress: { total: 5, step: { name: "Inventory", state: "next" } },
+      }),
+    ]);
+    const { refresh } = renderSidebar();
+    const line = () =>
+      within(screen.getByText("run").closest("li")!).getByTestId("session-row-plan");
+    expect(line()).toHaveTextContent(
+      "Tasks: 2 of 5 finished, 2/5·Open PRs for safe upgrades+2 and 2 more",
+    );
+    expect(
+      within(screen.getByText("planning").closest("li")!).queryByTestId("session-row-plan"),
+    ).toBeNull();
+
+    mockConversations([run(waiting)]);
+    refresh();
+    expect(line()).toHaveTextContent("3/5·Waiting for you: Approve major upgrades");
+    // The Needs response badge already says the run waits for you.
+    mockConversations([run(waiting, { pending_elicitations_count: 1 })]);
+    refresh();
+    expect(line()).toHaveTextContent("3/5·Approve major upgrades");
+    expect(line()).not.toHaveTextContent("Waiting for you");
+
+    mockConversations([run({ total: 5, done: 4, failed: 1 })]);
+    refresh();
+    expect(line()).toHaveTextContent("5/5·Finished, 1 failed");
+  });
+
   describe.each(["legacy", "grouping", "pinned"] as const)(
     "%s hover surface sharing explanation",
     (surface) => {

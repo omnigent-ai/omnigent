@@ -3785,6 +3785,47 @@ class SessionJournalInputRequested(BaseModel):
     elicitation_id: str
 
 
+class SessionPlanStep(BaseModel):
+    """
+    The step a session's plan is on, as its row names it.
+
+    :param name: The step's name, e.g. ``"Open PRs for safe upgrades"``,
+        shortened to 120 characters.
+    :param state: ``"needs_input"`` (waiting for the user), ``"started"`` (in
+        progress, whether or not the session is working now), ``"failed"`` (it
+        holds up the steps left) or ``"next"`` (the next step to start).
+    """
+
+    name: str
+    state: Literal["needs_input", "started", "failed", "next"]
+
+
+class SessionPlanProgress(BaseModel):
+    """
+    Where a session's current plan stands, so a list shows a workflow run's step
+    without reading its journal.
+
+    Counts the plan's steps by their newest status in the current run, as the
+    session's Tasks tab does; a step with no status counts in none of them.
+
+    :param total: Steps in the plan, e.g. ``5``.
+    :param done: Steps done.
+    :param failed: Steps that failed.
+    :param started: Steps in progress.
+    :param needs_input: Steps waiting for the user.
+    :param step: The step the plan is on: one waiting for the user, else one in
+        progress, else the next one, else a failure that holds up the rest.
+        ``None`` once the plan is finished.
+    """
+
+    total: int
+    done: int = 0
+    failed: int = 0
+    started: int = 0
+    needs_input: int = 0
+    step: SessionPlanStep | None = None
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -3906,6 +3947,10 @@ class SessionListItem(BaseModel):
     :param pull_requests_synced: Whether the server has imported the session's
         PRs from its host, so a missing ``pull_request`` means "none" rather than
         "not known yet". ``None`` on servers without PR storage.
+    :param plan_progress: Where the session's current plan stands, recorded by
+        its latest plan or status write. ``None`` for a session with no plan,
+        one not written since the server began recording it, or a server
+        without workflows.
     """
 
     family: SessionFamily | None = None
@@ -3945,6 +3990,7 @@ class SessionListItem(BaseModel):
     project_id: str | None = None
     pull_request: SessionPullRequestSummary | None = None
     pull_requests_synced: bool | None = None
+    plan_progress: SessionPlanProgress | None = None
 
 
 class SessionPageBoundary(BaseModel):

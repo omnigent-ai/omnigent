@@ -103,6 +103,14 @@ the header menu), and each place is a separate entry point.
   session rows (on by default) turns them off, leaving both actions in the row
   menu and right-click menu. Pin controls, including the session header menu,
   are available only for standalone sessions and family representatives.
+- `workflow-step`: once a step of a session's plan has a status, its sidebar row
+  shows a line under the title with finished steps and the step it's on, as the
+  chat's task preview names it: "3/5 · Open PRs for safe upgrades", "+2" for more
+  steps in progress, "Waiting for you:" (dropped while the row says Needs
+  response), "Failed:", "Next:", "All done" or "Finished, 1 failed". It updates
+  through the session list's live updates; sessions the run started keep their own
+  titles. A session shows it after its next plan or status write on a server
+  that records it.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;

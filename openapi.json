@@ -11327,6 +11327,17 @@
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled.",
             "title": "Permission Level"
           },
+          "plan_progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionPlanProgress"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the session's current plan stands, recorded by its latest plan or status write. `None` for a session with no plan, one not written since the server began recording it, or a server without workflows."
+          },
           "project_id": {
             "anyOf": [
               {
@@ -11992,6 +12003,88 @@
           "permission_mode"
         ],
         "title": "SessionPermissionModeEvent",
+        "type": "object"
+      },
+      "SessionPlanProgress": {
+        "description": "Where a session's current plan stands, so a list shows a workflow run's step\nwithout reading its journal.\n\nCounts the plan's steps by their newest status in the current run, as the\nsession's Tasks tab does; a step with no status counts in none of them.",
+        "properties": {
+          "done": {
+            "default": 0,
+            "description": "Steps done.",
+            "format": "int64",
+            "title": "Done",
+            "type": "integer"
+          },
+          "failed": {
+            "default": 0,
+            "description": "Steps that failed.",
+            "format": "int64",
+            "title": "Failed",
+            "type": "integer"
+          },
+          "needs_input": {
+            "default": 0,
+            "description": "Steps waiting for the user.",
+            "format": "int64",
+            "title": "Needs Input",
+            "type": "integer"
+          },
+          "started": {
+            "default": 0,
+            "description": "Steps in progress.",
+            "format": "int64",
+            "title": "Started",
+            "type": "integer"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionPlanStep"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The step the plan is on: one waiting for the user, else one in progress, else the next one, else a failure that holds up the rest. `None` once the plan is finished."
+          },
+          "total": {
+            "description": "Steps in the plan, e.g. `5`.",
+            "format": "int64",
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total"
+        ],
+        "title": "SessionPlanProgress",
+        "type": "object"
+      },
+      "SessionPlanStep": {
+        "description": "The step a session's plan is on, as its row names it.",
+        "properties": {
+          "name": {
+            "description": "The step's name, e.g. `\"Open PRs for safe upgrades\"`, shortened to 120 characters.",
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "description": "`\"needs_input\"` (waiting for the user), `\"started\"` (in progress, whether or not the session is working now), `\"failed\"` (it holds up the steps left) or `\"next\"` (the next step to start).",
+            "enum": [
+              "needs_input",
+              "started",
+              "failed",
+              "next"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "state"
+        ],
+        "title": "SessionPlanStep",
         "type": "object"
       },
       "SessionPresenceEvent": {

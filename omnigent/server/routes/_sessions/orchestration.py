@@ -420,6 +420,7 @@ from omnigent.server.schemas import (
     SessionEventInput,
     SessionListItem,
     SessionModelEvent,
+    SessionPlanProgress,
     SessionPullRequestSummary,
     SessionResponse,
     SessionStatusEvent,
@@ -1373,6 +1374,7 @@ def _build_session_list_item(
     harness: str | None = None,
     pull_request: SessionPullRequestSummary | None = None,
     pull_requests_synced: bool | None = None,
+    plan_progress: SessionPlanProgress | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -1419,6 +1421,8 @@ def _build_session_list_item(
         from the server's PR store; ``None`` when it has none.
     :param pull_requests_synced: Whether the server has imported the
         conversation's PRs, or ``None`` without PR storage.
+    :param plan_progress: Where the conversation's current plan stands, from
+        its journal heads row; ``None`` when none is recorded.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -1492,6 +1496,7 @@ def _build_session_list_item(
         project_id=conv.project_id,
         pull_request=pull_request,
         pull_requests_synced=pull_requests_synced,
+        plan_progress=plan_progress,
     )
 
 
