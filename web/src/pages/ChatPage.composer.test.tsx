@@ -1012,6 +1012,25 @@ describe("Composer send shortcut", () => {
     }
   });
 
+  it("sends on plain Enter in a half-screen desktop browser window", () => {
+    // 1000px gets the mobile layout, but a mouse-driven browser window keeps its keyboard.
+    const base = window.matchMedia;
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...base(query),
+      media: query,
+      matches: query === "(max-width: 1180.98px)",
+    }));
+    const onSend = vi.fn();
+    try {
+      render(<Composer {...composerProps({ onSend })} />);
+      fireEvent.change(textarea(), { target: { value: "half screen" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(onSend).toHaveBeenCalledWith("half screen", undefined);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
   it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     const onSend = vi.fn();
