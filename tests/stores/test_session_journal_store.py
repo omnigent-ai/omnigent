@@ -946,6 +946,7 @@ def test_an_automation_runs_start_plan_is_its_first(
         scheduled_task_run_id=RUN,
     )
     journal.append(OTHER, "note", {"body": "x"}, idempotency_key="k3", scheduled_task_run_id=RUN)
+    assert journal.plan_progress_by_session([SESSION])[SESSION]["step"] is None
 
     plans = journal.run_start_plans([(RUN, SESSION), (other_run, SESSION), (RUN, OTHER)])
     assert [plan.id if plan else None for plan in plans] == [first.id, None, None]
@@ -990,6 +991,9 @@ def test_an_automation_runs_start_plan_is_its_first(
     second = journal.run_start_plans([(other_run, SESSION)])[0]
     assert second is not None
     assert second.content["steps"] == first.content["steps"]
+    # The next run's progress starts over, whichever write starts it.
+    progress = journal.plan_progress_by_session([SESSION])[SESSION]
+    assert (progress["done"], progress["step"]["name"]) == (0, "First")
     assert journal.run_latest_plans([first, second]) == [replan, second]
     assert not journal.is_current_run(SESSION, first.id, RUN)
     assert journal.is_current_run(SESSION, second.id, other_run)
@@ -1166,18 +1170,9 @@ def test_a_full_journal_refuses_new_entries_but_returns_retried_ones(
 # ── Plan progress ─────────────────────────────────────
 
 
-def _status(
-    journal: SessionJournalStore,
-    key: str,
-    step: str,
-    value: str,
-    *,
-    run: str | None = None,
-) -> None:
+def _status(journal: SessionJournalStore, key: str, step: str, value: str) -> None:
     content = {"status": value, **({} if value == "started" else {"text": "x"})}
-    journal.append(
-        SESSION, "status", content, idempotency_key=key, step=step, scheduled_task_run_id=run
-    )
+    journal.append(SESSION, "status", content, idempotency_key=key, step=step)
 
 
 def _progress(journal: SessionJournalStore) -> dict[str, object]:
@@ -1222,7 +1217,7 @@ def test_plan_and_status_writes_record_where_the_plan_stands(
     assert journal.plan_progress_by_session([]) == {}
 
 
-def test_a_replan_keeps_the_runs_statuses_and_a_new_run_starts_afresh(
+def test_a_replan_keeps_the_runs_statuses_and_a_rerun_starts_afresh(
     journal: SessionJournalStore,
 ) -> None:
     journal.append(SESSION, "plan", _plan("a", "b"), idempotency_key="k0", workflow_id=WORKFLOW)
@@ -1242,12 +1237,6 @@ def test_a_replan_keeps_the_runs_statuses_and_a_new_run_starts_afresh(
         0,
         {"name": "A", "state": "next"},
     )
-    _status(journal, "k5", "a", "done")
-    # So does the first write of another automation run, which copies the plan.
-    _status(journal, "k6", "b", "started", run=RUN)
-    automation_run = _progress(journal)
-    assert (automation_run["done"], automation_run["started"]) == (0, 1)
-    assert automation_run["step"] == {"name": "B", "state": "started"}
 
 
 def test_a_copied_journal_records_its_progress_when_refreshed(
@@ -1267,3 +1256,42 @@ def test_a_copied_journal_records_its_progress_when_refreshed(
     journal.refresh_plan_progress(OTHER)
     journal.refresh_plan_progress(MISSING)
     assert journal.plan_progress_by_session([OTHER, MISSING]) == {}
+
+
+def test_a_legacy_replan_before_a_done_final_step_keeps_the_plan_open(
+    journal: SessionJournalStore,
+) -> None:
+    work = {"id": "work", "name": "Work"}
+    journal.append(
+        SESSION,
+        "plan",
+        {
+            "name": "Plan",
+            "steps": [work, {"id": "report", "name": "Report", "depends_on": ["work"]}],
+        },
+        idempotency_key="k0",
+    )
+    _status(journal, "k1", "work", "done")
+    _status(journal, "k2", "report", "done")
+    inserted = [
+        work,
+        {"id": "review", "name": "Review", "depends_on": ["work"]},
+        {"id": "report", "name": "Report", "depends_on": ["review"]},
+    ]
+    journal.append(SESSION, "plan", {"name": "Plan", "steps": inserted}, idempotency_key="k3")
+    # The journal was written before graph revisions.
+    with sa.create_engine(journal.storage_location).begin() as connection:
+        for entry in journal.list_entries(SESSION).entries:
+            content = {
+                key: value for key, value in entry.content.items() if key != "graph_revision"
+            }
+            connection.execute(
+                sa.update(SqlSessionJournalEntry)
+                .where(SqlSessionJournalEntry.id == entry.id)
+                .values(content=journal._stored_contents([content])[0])
+            )
+
+    # A save that only renames it keeps the legacy graph, which began after report was done.
+    journal.append(SESSION, "plan", {"name": "Renamed", "steps": inserted}, idempotency_key="k4")
+
+    assert _progress(journal)["step"] == {"name": "Review", "state": "next"}

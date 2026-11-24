@@ -30,7 +30,7 @@ def plan_progress(
     steps: Sequence[Mapping[str, Any]],
     statuses: Mapping[str, JournalEntry],
     *,
-    graph_revision: str | None,
+    graph_revision: str | int | None,
 ) -> dict[str, Any]:
     """Count the plan's steps by where they stand and name the step it is on.
 
@@ -38,9 +38,10 @@ def plan_progress(
         ``name`` and ``depends_on``.
     :param statuses: Each step's newest status in the current run, by step ID;
         a step with none is left out. Statuses of steps not in the plan are ignored.
-    :param graph_revision: The current plan's graph revision. A done final step
-        written under an older graph doesn't finish the plan while a step before
-        it isn't done. ``None`` for a plan from before graph revisions.
+    :param graph_revision: The current plan's graph revision, or for a plan from
+        before graph revisions the position where its graph began. A done final
+        step written under an older graph doesn't finish the plan while a step
+        before it isn't done. ``None`` when that isn't known.
     :returns: ``{"total", "done", "failed", "started", "needs_input", "step"}``,
         where step is ``{"name", "state"}`` (:data:`PlanProgressStepState`), or
         ``None`` when the plan is finished.
@@ -79,7 +80,7 @@ def _is_complete(
     steps: Sequence[Mapping[str, Any]],
     statuses: Mapping[str, JournalEntry],
     states: Mapping[str, _StepState],
-    graph_revision: str | None,
+    graph_revision: str | int | None,
 ) -> bool:
     """Whether every final step is done, with no work reopened before it since.
 
@@ -96,10 +97,13 @@ def _is_complete(
         if states[final["id"]] != "done":
             return False
         final_status = statuses[final["id"]]
-        graph_changed = (
-            graph_revision is not None
-            and final_status.content.get("graph_revision") != graph_revision
-        )
+        if isinstance(graph_revision, int):
+            graph_changed = graph_revision > final_status.position
+        else:
+            graph_changed = (
+                graph_revision is not None
+                and final_status.content.get("graph_revision") != graph_revision
+            )
         pending = list(final["depends_on"])
         seen: set[str] = set()
         while pending:

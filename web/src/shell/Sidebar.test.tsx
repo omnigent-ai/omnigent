@@ -621,6 +621,12 @@ describe("Sidebar session list", () => {
     mockConversations([run({ total: 5, done: 4, failed: 1 })]);
     refresh();
     expect(line()).toHaveTextContent("5/5·Finished, 1 failed");
+    // A cleared summary takes the line away.
+    mockConversations([run(null)]);
+    refresh();
+    expect(
+      within(screen.getByText("run").closest("li")!).queryByTestId("session-row-plan"),
+    ).toBeNull();
   });
 
   describe.each(["legacy", "grouping", "pinned"] as const)(

@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from itertools import batched
 from typing import Any, TypeVar
 
@@ -418,24 +419,30 @@ class SessionJournalStore:
     def _plan_progress_value(
         self,
         session: Session,
-        conversation_id: str,
-        steps: Sequence[Mapping[str, Any]],
+        plan: JournalEntry,
         *,
-        graph_revision: str | None,
         start_position: int | None,
         fresh_run: bool,
         written: JournalEntry | None,
     ) -> bytes | None:
         """The plan's progress after a write, encoded for the session's heads row.
 
-        One kind-and-step lookup per plan step reads its newest status in the run.
+        One kind-and-step lookup per plan step reads its newest status in the run. A
+        plan from before graph revisions also reads where its graph began, in
+        bounded batches, as :meth:`plan_graph_revisions` does.
 
+        :param plan: The session's current plan, e.g. the one this write appends.
         :param start_position: The current run's boundary, or ``None`` for a
             session that never started one.
         :param fresh_run: Whether this write starts a run, so no earlier status counts.
         :param written: The status this write appends, which the lookups don't see.
         :returns: The encoded progress, or ``None`` when it doesn't fit the column.
         """
+        conversation_id = plan.conversation_id
+        steps = plan.content["steps"]
+        revision = plan.content.get("graph_revision")
+        if not isinstance(revision, str):
+            revision = self._legacy_graph_position(plan, lambda _name: nullcontext(session))
         rows = []
         if not fresh_run:
             for step in steps:
@@ -447,7 +454,7 @@ class SessionJournalStore:
         statuses = {entry.step: entry for entry in self._entries(rows) if entry.step}
         if written is not None and written.step:
             statuses[written.step] = written
-        progress = plan_progress(steps, statuses, graph_revision=graph_revision)
+        progress = plan_progress(steps, statuses, graph_revision=revision)
         (stored,) = self._encode_contents(
             [json.dumps(progress, ensure_ascii=False, separators=(",", ":"))]
         )
@@ -608,30 +615,39 @@ class SessionJournalStore:
             stamp = now_epoch()
             entry_id = uuid.uuid4().hex
             progress = _UNSET
-            current_plan: Mapping[str, Any] | None = (
-                entry_content if kind == "plan" else previous_content
+            written = JournalEntry(
+                id=entry_id,
+                conversation_id=conversation_id,
+                position=entry_position,
+                created_at=stamp,
+                kind=kind,
+                step=entry_step,
+                scheduled_task_run_id=scheduled_task_run_id,
+                content=entry_content,
             )
-            if (kind in ("plan", "status") or starts_run) and current_plan is not None:
-                written = None
-                if kind == "status":
-                    written = JournalEntry(
-                        id=entry_id,
-                        conversation_id=conversation_id,
-                        position=entry_position,
-                        created_at=stamp,
-                        kind=kind,
-                        step=entry_step,
-                        scheduled_task_run_id=scheduled_task_run_id,
-                        content=entry_content,
-                    )
+            current_plan = written if kind == "plan" else None
+            # A status's plan is the current one; a note decodes it only when it starts a run.
+            if kind != "plan" and previous is not None and previous_content:
+                # A new run's copied plan comes just before what this write appends.
+                current_plan = JournalEntry(
+                    id=previous.id,
+                    conversation_id=conversation_id,
+                    position=entry_position - 1 if starts_run else previous.position,
+                    created_at=previous.created_at,
+                    kind="plan",
+                    step=None,
+                    scheduled_task_run_id=previous.scheduled_task_run_id,
+                    content={**previous_content, "graph_revision": graph_revision}
+                    if starts_run
+                    else previous_content,
+                )
+            if current_plan is not None:
                 progress = self._plan_progress_value(
                     session,
-                    conversation_id,
-                    current_plan["steps"],
-                    graph_revision=graph_revision if isinstance(graph_revision, str) else None,
+                    current_plan,
                     start_position=boundary.position if boundary is not None else None,
                     fresh_run=starts_run,
-                    written=written,
+                    written=written if kind == "status" else None,
                 )
             if starts_run:
                 session.add(
@@ -731,12 +747,9 @@ class SessionJournalStore:
                 return
             (plan,) = self._entries([plan_row])
             boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
-            revision = plan.content.get("graph_revision")
             progress = self._plan_progress_value(
                 session,
-                conversation_id,
-                plan.content["steps"],
-                graph_revision=revision if isinstance(revision, str) else None,
+                plan,
                 start_position=boundary.position if boundary is not None else None,
                 fresh_run=False,
                 written=None,
@@ -914,50 +927,63 @@ class SessionJournalStore:
         Legacy history is read in bounded batches and stops at a changed graph
         or invocation boundary. Metadata-only saves don't reopen completed work.
         """
-        entries = SqlSessionJournalEntry
         revisions: list[str | int] = []
         for plan in plans:
             revision = plan.content.get("graph_revision")
-            if isinstance(revision, str):
-                revisions.append(revision)
-                continue
-            with self._history_session("read_plan_graph_boundary") as session:
-                boundary = self._newest_kind_row(
-                    session, plan.conversation_id, _PLAN_STATUS_KIND, before_position=plan.position
-                )
-                boundary_position = boundary.position if boundary else -1
-            graph = _plan_graph(plan.content)
-            position = plan.position
-            while True:
-                with self._history_session("read_plan_graph_revisions") as session:
-                    rows = list(
-                        session.execute(
-                            _using(
-                                select(entries)
-                                .prefix_with("/*+ MAX_EXECUTION_TIME(1000) */", dialect="mysql")
-                                .where(
-                                    entries.workspace_id == current_workspace_id(),
-                                    entries.conversation_id == plan.conversation_id,
-                                    entries.kind == _PLAN_KIND,
-                                    entries.position < position,
-                                    entries.position > boundary_position,
-                                )
-                                .order_by(entries.position.desc())
-                                .limit(JOURNAL_COPY_BATCH),
-                                "ix_session_journal_entries_kind",
-                            )
-                        ).scalars()
-                    )
-                for previous in self._entries(rows):
-                    if _plan_graph(previous.content) != graph:
-                        break
-                    position = previous.position
-                else:
-                    if len(rows) == JOURNAL_COPY_BATCH:
-                        continue
-                break
-            revisions.append(position)
+            revisions.append(
+                revision
+                if isinstance(revision, str)
+                else self._legacy_graph_position(plan, self._history_session)
+            )
         return revisions
+
+    def _legacy_graph_position(
+        self, plan: JournalEntry, sessions: Callable[[str], AbstractContextManager[Session]]
+    ) -> int:
+        """Where a plan without a graph revision got its graph: the position of the
+        earliest plan since its run's boundary with the same steps and dependencies.
+
+        Reads history in bounded batches and stops at a changed graph or the boundary.
+
+        :param sessions: Opens a session for a named query, one per read.
+        """
+        entries = SqlSessionJournalEntry
+        with sessions("read_plan_graph_boundary") as session:
+            boundary = self._newest_kind_row(
+                session, plan.conversation_id, _PLAN_STATUS_KIND, before_position=plan.position
+            )
+            boundary_position = boundary.position if boundary else -1
+        graph = _plan_graph(plan.content)
+        position = plan.position
+        while True:
+            with sessions("read_plan_graph_revisions") as session:
+                rows = list(
+                    session.execute(
+                        _using(
+                            select(entries)
+                            .prefix_with("/*+ MAX_EXECUTION_TIME(1000) */", dialect="mysql")
+                            .where(
+                                entries.workspace_id == current_workspace_id(),
+                                entries.conversation_id == plan.conversation_id,
+                                entries.kind == _PLAN_KIND,
+                                entries.position < position,
+                                entries.position > boundary_position,
+                            )
+                            .order_by(entries.position.desc())
+                            .limit(JOURNAL_COPY_BATCH),
+                            "ix_session_journal_entries_kind",
+                        )
+                    ).scalars()
+                )
+            for previous in self._entries(rows):
+                if _plan_graph(previous.content) != graph:
+                    break
+                position = previous.position
+            else:
+                if len(rows) == JOURNAL_COPY_BATCH:
+                    continue
+            break
+        return position
 
     def current_run_plan_ids(self, plans: Sequence[JournalEntry]) -> set[str]:
         """Which plans belong to their session's latest run, including its replans.

@@ -129,7 +129,13 @@ def test_a_replan_that_adds_unfinished_work_reopens_the_plan() -> None:
         "name": "Review",
         "state": "next",
     }
-    # A plan from before graph revisions can't tell, so the done final step stands.
+    # A plan from before graph revisions says where its graph began instead.
+    assert plan_progress(inserted, finished, graph_revision=4)["step"] == {
+        "name": "Review",
+        "state": "next",
+    }
+    assert plan_progress(inserted, finished, graph_revision=1)["step"] is None
+    # Without either, the done final step stands.
     assert plan_progress(inserted, finished, graph_revision=None)["step"] is None
 
 
