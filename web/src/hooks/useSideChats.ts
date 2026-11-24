@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   MAX_OPEN_TABS,
   readSessionWorkspaceState,
@@ -9,7 +9,7 @@ import { setSessionParent } from "@/lib/sessionHost";
 import { subagentTabId, subagentSessionIdFromTab } from "@/lib/subagentTabs";
 
 interface SideChatTabsState {
-  /** Open side-chat child conversation ids, in open order. */
+  /** Open side-chat child conversation ids, in strip order. */
   tabs: string[];
   /** Open sub-agent tabs (`subagentTabId` values), in open order. */
   subagentTabs: string[];
@@ -17,11 +17,44 @@ interface SideChatTabsState {
   closed: string[];
   /** The selected tab of either kind, or null when another rail view is active. */
   selected: string | null;
+  /** Each open side chat's label number ("Side chat 3"), kept until it closes. */
+  numbers: Record<string, number>;
+  /** Pinned side chats; always the leading entries of `tabs`. */
+  pinned: string[];
 }
 
 type TabsChange = (current: SideChatTabsState) => SideChatTabsState;
 
 const MAX_UNSAVED_CHANGES = 50;
+
+/**
+ * Keep pinned side chats first and give every open side chat a label number.
+ * A new tab takes the next number after the highest open one, so closing a tab
+ * never renumbers the rest; tabs saved before numbering keep their old labels.
+ * A tab missing from `state.numbers` keeps its `displayed` number when no other
+ * open tab holds it.
+ */
+function normalizeSideChatTabs(
+  state: SideChatTabsState,
+  displayed: Record<string, number> = {},
+): SideChatTabsState {
+  const pinned = state.pinned.filter((id) => state.tabs.includes(id));
+  const tabs = [...pinned, ...state.tabs.filter((id) => !pinned.includes(id))];
+  const numbers: Record<string, number> = {};
+  const used = new Set<number>();
+  const assign = (id: string, number: number | undefined) => {
+    if (numbers[id] !== undefined || number === undefined || used.has(number)) return;
+    numbers[id] = number;
+    used.add(number);
+  };
+  for (const id of tabs) assign(id, state.numbers[id]);
+  for (const id of tabs) assign(id, displayed[id]);
+  let highest = Math.max(0, ...used);
+  for (const id of tabs) {
+    if (numbers[id] === undefined) numbers[id] = ++highest;
+  }
+  return { ...state, tabs, pinned, numbers };
+}
 
 function readSideChatTabsState(conversationId: string): SideChatTabsState {
   const saved = readSessionWorkspaceState(conversationId);
@@ -30,17 +63,32 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
     (id) => subagentSessionIdFromTab(id) !== null,
   );
   const selected = saved.selectedSideChatId ?? "";
-  return {
+  return normalizeSideChatTabs({
     tabs,
     subagentTabs,
     closed: saved.closedSideChats ?? [],
     selected: tabs.includes(selected) || subagentTabs.includes(selected) ? selected : null,
-  };
+    numbers: saved.sideChatNumbers ?? {},
+    pinned: saved.pinnedSideChats ?? [],
+  });
+}
+
+/** Whether `id` and `target` are open side chats in the same (pinned or unpinned) group. */
+function sameSideChatGroup(state: SideChatTabsState, id: string, target: string): boolean {
+  return (
+    state.tabs.includes(id) &&
+    state.tabs.includes(target) &&
+    state.pinned.includes(id) === state.pinned.includes(target)
+  );
 }
 
 /** Per-session side-chat and sub-agent tabs, with browser-local selection and closure. */
 export function useSideChats(conversationId: string) {
   const [state, setState] = useState(() => readSideChatTabsState(conversationId));
+  const displayedNumbers = useRef(state.numbers);
+  useLayoutEffect(() => {
+    displayedNumbers.current = state.numbers;
+  }, [state.numbers]);
   // Changes a failed storage write couldn't save. Each update replays them on
   // fresh storage, so they survive without undoing other windows' changes.
   const unsaved = useRef<{ conversationId: string; changes: TabsChange[] } | null>(null);
@@ -59,8 +107,10 @@ export function useSideChats(conversationId: string) {
       const pending =
         unsaved.current?.conversationId === conversationId ? unsaved.current.changes : [];
       const changes = [...pending, mutate];
+      // Replayed tabs keep the numbers this window shows unless another window took them.
+      const displayed = pending.length > 0 ? displayedNumbers.current : {};
       const next = changes.reduce(
-        (current, change) => change(current),
+        (current, change) => normalizeSideChatTabs(change(current), displayed),
         readSideChatTabsState(conversationId),
       );
       const saved = saveSessionWorkspaceState(conversationId, {
@@ -69,6 +119,8 @@ export function useSideChats(conversationId: string) {
         // Omitted when empty, so a session without sub-agent tabs is stored as before.
         openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
         selectedSideChatId: next.selected,
+        sideChatNumbers: next.tabs.length > 0 ? next.numbers : undefined,
+        pinnedSideChats: next.pinned.length > 0 ? next.pinned : undefined,
       });
       // Past the cap, keep only the result so a long storage outage can't grow the replay.
       const kept = changes.length > MAX_UNSAVED_CHANGES ? [() => next] : changes;
@@ -139,20 +191,25 @@ export function useSideChats(conversationId: string) {
 
   /** Replace a tab's id in place, preserving its position and selection. Used
    *  when a `pending:` tab's fork resolves to a real child id, so the tab does
-   *  not disappear and reappear. No-op if `oldId` isn't open; if `newId` is
-   *  already a tab, the pending one is just dropped. */
+   *  not disappear and reappear. No-op if `oldId` isn't open. The started chat
+   *  keeps the pending tab's name and pin; if `newId` was already open (restored
+   *  before the fork resolved), that duplicate tab merges into this one. */
   const rekey = useCallback(
     (oldId: string, newId: string) =>
       update((current) => {
-        const index = current.tabs.indexOf(oldId);
-        if (index === -1) return current;
-        const selected = current.selected === oldId ? newId : current.selected;
-        if (current.tabs.includes(newId)) {
-          return { ...current, tabs: current.tabs.filter((id) => id !== oldId), selected };
-        }
-        const tabs = [...current.tabs];
-        tabs[index] = newId;
-        return { ...current, tabs, selected };
+        if (!current.tabs.includes(oldId)) return current;
+        const replace = (id: string) => (id === oldId ? newId : id);
+        return {
+          ...current,
+          tabs: current.tabs.filter((id) => id !== newId).map(replace),
+          selected:
+            current.selected === oldId || current.selected === newId ? newId : current.selected,
+          numbers: {
+            ...current.numbers,
+            [newId]: current.numbers[oldId] ?? current.numbers[newId],
+          },
+          pinned: current.pinned.filter((id) => id !== newId).map(replace),
+        };
       }),
     [update],
   );
@@ -172,6 +229,7 @@ export function useSideChats(conversationId: string) {
             ? (remaining[Math.max(0, index - 1)] ?? null)
             : current.selected;
         return {
+          ...current,
           closed: !childId.startsWith("pending:")
             ? [...new Set([...current.closed, subagentSessionIdFromTab(childId) ?? childId])]
             : current.closed,
@@ -183,16 +241,49 @@ export function useSideChats(conversationId: string) {
     [update],
   );
 
+  /** Pin a side chat at the end of the pinned group, or unpin it to the start of the rest. */
+  const setPinned = useCallback(
+    (childId: string, pinned: boolean) =>
+      update((current) => {
+        if (!current.tabs.includes(childId) || current.pinned.includes(childId) === pinned) {
+          return current;
+        }
+        const others = current.pinned.filter((id) => id !== childId);
+        return { ...current, pinned: pinned ? [...others, childId] : others };
+      }),
+    [update],
+  );
+
+  /** Move a side chat to `targetId`'s slot. Tabs only move within their pinned or unpinned group. */
+  const move = useCallback(
+    (childId: string, targetId: string) =>
+      update((current) => {
+        if (childId === targetId || !sameSideChatGroup(current, childId, targetId)) return current;
+        const reorder = (ids: string[]) => {
+          if (!ids.includes(childId)) return ids;
+          const without = ids.filter((id) => id !== childId);
+          const at = ids.indexOf(targetId);
+          return [...without.slice(0, at), childId, ...without.slice(at)];
+        };
+        return { ...current, tabs: reorder(current.tabs), pinned: reorder(current.pinned) };
+      }),
+    [update],
+  );
+
   // Side chats, then sub-agent tabs: the order the strip shows them in.
   const tabs = useMemo(() => [...state.tabs, ...state.subagentTabs], [state]);
   return {
     tabs,
     selected: state.selected,
+    numbers: state.numbers,
+    pinned: state.pinned,
     open,
     openPending,
     rekey,
     restore,
     close,
     select,
+    setPinned,
+    move,
   };
 }

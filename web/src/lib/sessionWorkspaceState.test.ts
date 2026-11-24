@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  MAX_OPEN_TABS,
   type SessionWorkspaceState,
   readSessionWorkspaceState,
   resetSessionWorkspaceTabSelections,
@@ -234,5 +235,38 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_c")).toEqual({
       openSubagentTabs: ["subagent:a", "subagent:b"],
     });
+  });
+
+  it("keeps valid side-chat numbers and pins, dropping malformed entries", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "conv_d",
+          state: {
+            sideChatNumbers: { conv_a: 2, conv_b: 0, conv_c: 1.5, conv_d: "3", "": 4 },
+            pinnedSideChats: ["conv_a", 5, "conv_a"],
+          },
+        },
+        { id: "conv_e", state: { sideChatNumbers: [1, 2], pinnedSideChats: "conv_a" } },
+      ]),
+    );
+    expect(readSessionWorkspaceState("conv_d")).toEqual({
+      sideChatNumbers: { conv_a: 2 },
+      pinnedSideChats: ["conv_a"],
+    });
+    expect(readSessionWorkspaceState("conv_e")).toEqual({});
+  });
+
+  it("drops unpinned side chats before pinned ones past the tab cap", () => {
+    const unpinned = Array.from({ length: MAX_OPEN_TABS + 1 }, (_, index) => `conv_${index}`);
+    saveSessionWorkspaceState("conv_a", {
+      openSideChats: ["conv_pinned", ...unpinned],
+      pinnedSideChats: ["conv_pinned"],
+    });
+    expect(readSessionWorkspaceState("conv_a").openSideChats).toEqual([
+      "conv_pinned",
+      ...unpinned.slice(-(MAX_OPEN_TABS - 1)),
+    ]);
   });
 });
