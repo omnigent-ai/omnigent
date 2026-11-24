@@ -228,9 +228,18 @@ export function ProjectTeamDialog({
                   model={draft.model}
                   effort={draft.effort}
                   disabled={busy}
+                  agentLocked={shared}
                   defaultLabel={isLead ? "Default" : "Project default"}
                   onChange={(next) => setDraft({ ...draft, ...next })}
                 />
+                {shared && (
+                  <p
+                    className="text-xs text-muted-foreground"
+                    data-testid="project-team-agent-owner"
+                  >
+                    Only the project owner chooses the agent, since these sessions run as them.
+                  </p>
+                )}
                 {isLead && (
                   <p className="text-xs text-muted-foreground" data-testid="project-team-lead-note">
                     The Lead is the project's built-in coordinator and can't be renamed or deleted.

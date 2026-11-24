@@ -1286,3 +1286,64 @@ async def test_order_endpoints_enforce_owner_and_announce_changes(
         assert alice_events == [{"type": "projects_changed"}] * 2
         await asyncio.sleep(0.05)
         assert bob_events == []
+
+
+async def test_only_the_owner_picks_the_agent_of_sessions_that_run_as_them(
+    multi_user_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A member keeps model and effort, but not the agent or launch permissions."""
+    client = multi_user_client
+    owner, member = _as_user(ALICE), _as_user(BOB)
+    config = {"agent_id": PROJECT_AGENT_ID, "model": "m1", "effort": "low"}
+    project = (
+        await client.post("/v1/projects", json={"name": "Shared", "config": config}, headers=owner)
+    ).json()
+    shared = await client.post(
+        f"/v1/projects/{project['id']}/shares", json={"user_id": BOB}, headers=owner
+    )
+    assert shared.status_code == 200, shared.text
+    path = f"/v1/projects/{project['id']}"
+    for change in (
+        {"agent_id": "another-agent"},
+        {"permission_mode": "bypassPermissions"},
+        {"terminal_launch_args": ["--permission-mode", "bypassPermissions"]},
+        {"harness": "codex"},
+    ):
+        refused = await client.patch(path, json={"config": {**config, **change}}, headers=member)
+        assert refused.status_code == 403, refused.text
+    kept = await client.patch(
+        path, json={"config": {**config, "model": "m2", "effort": "high"}}, headers=member
+    )
+    assert kept.status_code == 200, kept.text
+    assert kept.json()["config"]["agent_id"] == PROJECT_AGENT_ID
+
+    # The Lead's agent is the project's default agent.
+    lead = f"{path}/identities/orchestrator"
+    refused = await client.patch(lead, json={"agent_id": "another-agent"}, headers=member)
+    assert refused.status_code == 403, refused.text
+    resent = await client.patch(
+        lead, json={"agent_id": PROJECT_AGENT_ID, "effort": "medium"}, headers=member
+    )
+    assert resent.status_code == 200, resent.text
+
+    persona = SqlAlchemyProjectStore(db_uri).create_identity(
+        project["id"],
+        uuid.uuid4().hex,
+        user_id=ALICE,
+        name="PM",
+        instructions="x",
+        agent_id=PROJECT_AGENT_ID,
+    )
+    persona_path = f"{path}/identities/{persona.id}"
+    for agent_id in ("another-agent", ""):
+        refused = await client.patch(persona_path, json={"agent_id": agent_id}, headers=member)
+        assert refused.status_code == 403, refused.text
+    created = await client.post(
+        f"{path}/identities", json={"name": "Ops", "agent_id": "another-agent"}, headers=member
+    )
+    assert created.status_code == 403, created.text
+
+    allowed = await client.patch(
+        path, json={"config": {**config, "agent_id": "owner-choice"}}, headers=owner
+    )
+    assert allowed.status_code == 200, allowed.text

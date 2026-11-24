@@ -37,11 +37,14 @@ export function IdentityModelEffortFields({
   model,
   effort,
   disabled,
+  agentLocked = false,
   defaultLabel = "Project default",
   onChange,
 }: IdentitySessionChoice & {
   config: ProjectConfig | undefined;
   disabled: boolean;
+  /** Only the project owner picks the agent of sessions that run as them. */
+  agentLocked?: boolean;
   /** Label for the empty choice, e.g. "Default" where these are the project defaults. */
   defaultLabel?: string;
   onChange: (next: IdentitySessionChoice) => void;
@@ -109,7 +112,7 @@ export function IdentityModelEffortFields({
           <Select
             value={agentId || DEFAULT_CHOICE}
             onValueChange={selectAgent}
-            disabled={disabled || catalog.isLoading}
+            disabled={disabled || agentLocked || catalog.isLoading}
           >
             <SelectTrigger data-testid="project-team-agent">
               <SelectValue />

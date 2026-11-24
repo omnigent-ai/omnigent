@@ -166,6 +166,40 @@ def _refuse_owner_config_write(
         )
 
 
+# Session settings that decide what runs in the owner's own Lead and persona sessions.
+OWNER_SESSION_CONFIG_KEYS = ("agent_id", "harness", "permission_mode", "terminal_launch_args")
+
+
+def _refuse_member_session_config_write(
+    requested: dict[str, Any] | None, current: dict[str, Any] | None, *, is_owner: bool
+) -> None:
+    """Only the owner picks the agent and launch permissions of sessions that run as them.
+
+    The Lead and personas run as the owner (the Lead with full access), so a member
+    choosing their agent would choose what runs unprompted as someone else. Members
+    still edit model and effort, and may resend these keys unchanged.
+    """
+    if requested is None or is_owner:
+        return
+    changed = [
+        key for key in OWNER_SESSION_CONFIG_KEYS if requested.get(key) != (current or {}).get(key)
+    ]
+    if changed:
+        raise OmnigentError(
+            "Only the project owner can change " + ", ".join(f"`{key}`" for key in changed),
+            code=ErrorCode.FORBIDDEN,
+        )
+
+
+def _refuse_member_agent_choice(project: Project, user_id: str | None, changed: bool) -> None:
+    """A member can't choose the agent of the Lead or a persona, which run as the owner."""
+    if changed and project.user_id != user_id:
+        raise OmnigentError(
+            "Only the project owner can choose the agent of the Lead or a persona",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+
 def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
     """Keep the mandate owner-written: agents it bounds may only propose additions.
 
@@ -396,11 +430,12 @@ def create_projects_router(
         _refuse_agent_mandate_write(request, body.mandate)
         if body.config is not None:
             stored = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+            is_owner = stored is None or stored.user_id == user_id
             _refuse_owner_config_write(
-                request,
-                body.config,
-                stored.config if stored else None,
-                is_owner=stored is None or stored.user_id == user_id,
+                request, body.config, stored.config if stored else None, is_owner=is_owner
+            )
+            _refuse_member_session_config_write(
+                body.config, stored.config if stored else None, is_owner=is_owner
             )
         session_id = None
         if body.main_session_id is not None:
@@ -621,6 +656,7 @@ def create_projects_router(
         if body.name is None:
             raise OmnigentError("name is required", code=ErrorCode.INVALID_INPUT)
         project = await _owned_project(project_id, user_id)
+        _refuse_member_agent_choice(project, user_id, bool(body.agent_id))
         key = creation_key(request) if "Idempotency-Key" in request.headers else None
         identity_id = (
             creation_id("project-identity", user_id, key, project.id) if key else uuid.uuid4().hex
@@ -663,6 +699,11 @@ def create_projects_router(
             for field in ("agent_id", "model", "effort")
             if field in body.model_fields_set
         }
+        _refuse_member_agent_choice(
+            project,
+            user_id,
+            "agent_id" in defaults and defaults["agent_id"] != project.config.get("agent_id"),
+        )
         # A member's save resends the charter unchanged; only a real change is owner-only.
         charter_changed = body.instructions is not None and body.instructions.strip() != (
             project.lead_charter or ""
@@ -708,6 +749,15 @@ def create_projects_router(
             for field in ("agent_id", "model", "effort")
             if getattr(body, field) == "" and field in body.model_fields_set
         )
+        if "agent_id" in body.model_fields_set and project.user_id != user_id:
+            current = await asyncio.to_thread(
+                project_store.get_identity, project.id, _identity_id(identity_id), user_id=user_id
+            )
+            _refuse_member_agent_choice(
+                project,
+                user_id,
+                current is not None and (body.agent_id or None) != current.agent_id,
+            )
         identity = await asyncio.to_thread(
             project_store.update_identity,
             project.id,
