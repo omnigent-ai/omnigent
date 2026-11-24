@@ -110,6 +110,12 @@ with their own terminal retain the switcher.
   who may resume it. The strip's All tabs list shows shells under **Shells**; a row's × or
   Cmd/Ctrl+Backspace closes that one shell with the same terminal confirmation as its tab.
   Group closes there leave shells open.
+- Sidebar splits: for a session owner, ⌘D in a sidebar shell tab splits it with a new shell.
+  The split shows as one strip entry named for its focused shell, such as "zsh +1", and
+  focusing a pane selects its shell's tab. Closing the entry, from its ×, its menu's **Close
+  split** or Close tab's chord (⌥⌘W), asks once ("Close 2 shells?") and ends every shell in it;
+  a pane's own **Close Pane** ends just that pane's shell. Move Tab Left and Right move the
+  entry whole.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host or a new sandbox, then look at both the terminal strip and the
@@ -172,6 +178,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`split-panes` with `workspace_sidebar_v2`:**
   `tests/e2e_ui/shells/test_panes_view.py` splits, moves between, lists and
   closes panes in the Terminal view, and splits from Chat's composer beside a split.
+  It also splits a sidebar shell with ⌘D, keeps both shells connected across a reload,
+  and closes the split's strip entry whole; it checks the entry leaves the strip, not
+  that the runner deleted both shells.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
   `web/src/hooks/useNewShellHotkey.test.tsx`,
