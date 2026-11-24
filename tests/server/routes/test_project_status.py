@@ -122,6 +122,10 @@ async def test_summary_counts_completed_moves_and_reports_missing_sources(
     done = next(stage["id"] for stage in stages if stage["is_complete"])
     ticket = (await project_client.post(f"{project}/tickets", json={"title": "T"})).json()
     await project_client.patch(f"{project}/tickets/{ticket['id']}", json={"stage_id": done})
+    # Reopened and completed again: still one ticket done.
+    first = stages[0]["id"]
+    await project_client.patch(f"{project}/tickets/{ticket['id']}", json={"stage_id": first})
+    await project_client.patch(f"{project}/tickets/{ticket['id']}", json={"stage_id": done})
     response = await project_client.get(f"{project}/status/summary", params={"window": "30d"})
     assert response.status_code == 200
     body = response.json()

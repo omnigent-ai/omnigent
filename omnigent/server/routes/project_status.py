@@ -85,7 +85,11 @@ def tickets_done_by_member(
     moves: list[dict[str, Any]],
     conversations: ConversationStore | None,
 ) -> MemberTotals:
-    """Count moves into a completed stage per member: the session's, else the person's."""
+    """Count distinct tickets completed per member: the session's, else the person's.
+
+    A ticket reopened and completed again in the window counts once, for whoever
+    made its latest completing move (*moves* are in time order).
+    """
     cache: dict[str, MemberKey] = {}
 
     def session_member(session_id: str, user_id: str | None) -> MemberKey | None:
@@ -100,14 +104,15 @@ def tickets_done_by_member(
         cache[session_id] = key
         return key
 
+    latest = {move["ticket_id"]: move for move in moves}
     by_member: dict[MemberKey, int] = {}
-    for move in moves:
+    for move in latest.values():
         session_id = move.get("session_id")
         key = (session_member(session_id, move.get("user_id")) if session_id else None) or (
             user_member_key(move.get("user_id") or project.user_id)
         )
         by_member[key] = by_member.get(key, 0) + 1
-    return MemberTotals(total=len(moves), by_member=by_member)
+    return MemberTotals(total=len(latest), by_member=by_member)
 
 
 def _measure(source: Any, method: str, project: Project, period: StatusPeriod) -> MemberTotals:
@@ -156,7 +161,7 @@ def create_project_status_router(
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         period = status_period(window, now_epoch())
         identities = await asyncio.to_thread(
-            project_store.list_identities, project.id, user_id=project.user_id
+            project_store.list_identities, project.id, user_id=user_id
         )
         shares = await asyncio.to_thread(project_store.list_shares, project.id, user_id=user_id)
         moves = await asyncio.to_thread(
