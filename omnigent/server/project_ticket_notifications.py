@@ -14,11 +14,13 @@ import os
 import time
 from typing import Any
 
-from starlette.datastructures import Headers
-
 from omnigent.db.db_models import workspace_scope
-from omnigent.server.project_orchestrator import ticket_batch_message
-from omnigent.server.schemas import SessionEventInput
+from omnigent.entities.project import Project
+from omnigent.server.project_orchestrator import (
+    ticket_batch_message,
+    ticket_comment_for_worker_message,
+)
+from omnigent.server.session_delivery import deliver_to_session
 from omnigent.server.startup_inputs import ManagedStartupInputs
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.project_ticket_store import ProjectTicketStore
@@ -27,15 +29,28 @@ _logger = logging.getLogger(__name__)
 
 DIGEST_SECONDS_ENV = "OMNIGENT_ORCHESTRATOR_DIGEST_SECONDS"
 DEFAULT_DIGEST_SECONDS = 180.0
+WORKER_REPLY_SECONDS_ENV = "OMNIGENT_TICKET_WORKER_REPLY_SECONDS"
+DEFAULT_WORKER_REPLY_SECONDS = 600.0
 
 
-def _digest_seconds() -> float:
-    raw = os.environ.get(DIGEST_SECONDS_ENV, "").strip()
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
     try:
-        return max(0.0, float(raw)) if raw else DEFAULT_DIGEST_SECONDS
+        return max(0.0, float(raw)) if raw else default
     except ValueError:
-        _logger.warning("Ignoring invalid %s=%r", DIGEST_SECONDS_ENV, raw)
-        return DEFAULT_DIGEST_SECONDS
+        _logger.warning("Ignoring invalid %s=%r", name, raw)
+        return default
+
+
+def _routes_to_workers(event: dict[str, Any]) -> bool:
+    """A person's new comment, not yet answered by or escalated past the ticket's workers."""
+    return (
+        event["urgent"]
+        and event["kind"] == "comment"
+        and event["session_id"] is None
+        and event["agent_id"] is None
+        and not event.get("escalated")
+    )
 
 
 def _batch_stable_id(events: list[dict[str, Any]]) -> str:
@@ -54,11 +69,21 @@ class ProjectTicketNotifications:
         inputs: ManagedStartupInputs,
         *,
         digest_seconds: float | None = None,
+        worker_reply_seconds: float | None = None,
     ) -> None:
         self.tickets = tickets
         self.projects = projects
         self.inputs = inputs
-        self.digest_seconds = _digest_seconds() if digest_seconds is None else digest_seconds
+        self.digest_seconds = (
+            _env_seconds(DIGEST_SECONDS_ENV, DEFAULT_DIGEST_SECONDS)
+            if digest_seconds is None
+            else digest_seconds
+        )
+        self.worker_reply_seconds = (
+            _env_seconds(WORKER_REPLY_SECONDS_ENV, DEFAULT_WORKER_REPLY_SECONDS)
+            if worker_reply_seconds is None
+            else worker_reply_seconds
+        )
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -86,21 +111,61 @@ class ProjectTicketNotifications:
 
     async def flush_page(self, app: Any, *, force_digest: bool = False) -> None:
         """Deliver projects with an urgent event, or whose oldest batched event is due."""
+        now = time.time()
+        await asyncio.to_thread(
+            self.tickets.escalate_unanswered, before=int(now - self.worker_reply_seconds)
+        )
         pending = await asyncio.to_thread(self.tickets.pending_notification_projects)
-        due_before = time.time() - self.digest_seconds
+        due_before = now - self.digest_seconds
         for project in pending:
-            if not (project["urgent"] or force_digest or project["oldest_at"] <= due_before):
+            digest_due = force_digest or project["oldest_at"] <= due_before
+            if not (project["urgent"] or digest_due):
                 continue
             with workspace_scope(project["workspace_id"]):
                 try:
-                    await self._deliver_project(app, project["project_id"])
+                    await self._deliver_project(app, project["project_id"], digest_due=digest_due)
                 except Exception:
                     # Undelivered events stay pending; a failed session uses its normal UI.
                     _logger.exception(
                         "Could not deliver ticket events for project %s", project["project_id"]
                     )
 
-    async def _deliver_project(self, app: Any, project_id: str) -> None:
+    async def deliver_to_session(
+        self, app: Any, project: Project, session_id: str, *, stable_id: str, text: str
+    ) -> bool:
+        """
+        Queue one user turn on a session in ``project`` and wake it if idle.
+
+        :returns: ``True`` once something will drain the turn. Sessions that are
+            missing, archived or outside the project return ``False``.
+        """
+        conversation = await asyncio.to_thread(
+            self.inputs.conversations.get_conversation, session_id
+        )
+        if conversation is None or conversation.archived or conversation.project_id != project.id:
+            return False
+        return await deliver_to_session(
+            app, self.inputs, session_id, text, user_id=project.user_id, stable_id=stable_id
+        )
+
+    async def _route_to_workers(self, app: Any, project: Project, event: dict[str, Any]) -> bool:
+        """Hand a person's comment to the ticket's linked worker sessions."""
+        session_ids = await asyncio.to_thread(
+            self.tickets.ticket_session_ids, project.id, event["ticket_id"]
+        )
+        text = ticket_comment_for_worker_message(project.id, event)
+        delivered = False
+        for session_id in session_ids:
+            if session_id == project.main_session_id:
+                continue
+            stable_id = hashlib.sha256(f"{event['id']}:{session_id}".encode()).hexdigest()[:32]
+            if await self.deliver_to_session(
+                app, project, session_id, stable_id=stable_id, text=text
+            ):
+                delivered = True
+        return delivered
+
+    async def _deliver_project(self, app: Any, project_id: str, *, digest_due: bool) -> None:
         events = await asyncio.to_thread(self.tickets.project_pending_notifications, project_id)
         if not events:
             return
@@ -109,38 +174,35 @@ class ProjectTicketNotifications:
             project = await asyncio.to_thread(self.projects.get, project_id, user_id=user_id)
             if project is not None:
                 break
-        if project is None or project.main_session_id is None:
+        if project is None:
             return
-        session_id = project.main_session_id
-        conversation = await asyncio.to_thread(
-            self.inputs.conversations.get_conversation, session_id
-        )
-        if conversation is None or conversation.archived or conversation.project_id != project.id:
+        remaining = []
+        for event in events:
+            if _routes_to_workers(event) and await self._route_to_workers(app, project, event):
+                # The orchestrator hears about it in a digest once a worker replies,
+                # or urgently if none replies in time.
+                await asyncio.to_thread(
+                    self.tickets.mark_awaiting_worker, project.id, event["ticket_id"], event["id"]
+                )
+                continue
+            remaining.append(event)
+        if not remaining or project.main_session_id is None:
+            return
+        if not digest_due and not any(event["urgent"] for event in remaining):
             return
         # A stable input ID derived from the batch means a crash after enqueue but
         # before marking cannot duplicate an agent turn.
-        await self.inputs.enqueue(
-            session_id,
-            SessionEventInput(
-                type="message",
-                data={
-                    "role": "user",
-                    "stable_id": _batch_stable_id(events),
-                    "content": [
-                        {"type": "input_text", "text": ticket_batch_message(project.id, events)}
-                    ],
-                },
+        if await self.deliver_to_session(
+            app,
+            project,
+            project.main_session_id,
+            stable_id=_batch_stable_id(remaining),
+            text=ticket_batch_message(
+                project.id, remaining, worker_reply_seconds=self.worker_reply_seconds
             ),
-            user_id=project.user_id,
-            headers=Headers(),
-            first=False,
-        )
-        scheduled = await self.inputs.deliver_pending(app, session_id)
-        # Host workers recover queued inputs after reconnecting. A direct runner's
-        # owning replica must start its drain before retiring the events.
-        if conversation.host_id is not None or scheduled:
+        ):
             await asyncio.to_thread(
                 self.tickets.mark_notified_many,
                 project.id,
-                [(event["ticket_id"], event["id"]) for event in events],
+                [(event["ticket_id"], event["id"]) for event in remaining],
             )

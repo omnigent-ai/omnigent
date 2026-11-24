@@ -1451,6 +1451,92 @@ async def test_worker_notes_wait_for_digest_until_an_urgent_event_flushes_them(
     assert tickets.pending_notifications() == []
 
 
+async def test_person_comments_go_to_the_tickets_worker_and_fall_back_to_the_orchestrator(
+    project_client, project_app, db_uri
+):
+    project = (await project_client.post("/v1/projects", json={"name": "Worker replies"})).json()
+    orchestrator = project["main_session_id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(orchestrator, uuid4().hex, "/tmp/project")
+    worker = store.create_conversation(project_id=project["id"]).id
+    store.set_host_id(worker, uuid4().hex, "/tmp/project")
+    service = project_app.state.project_ticket_notifications
+    service.digest_seconds = 3600
+    service.worker_reply_seconds = 3600
+    tickets = service.tickets
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Owner asks"})).json()
+    path = f"{base}/{ticket['id']}"
+    await service.flush_page(project_app)
+    owner = (await project_client.get(f"{path}/events")).json()["data"][0]["user_id"]
+    actor = TicketActor(user_id=owner, session_id=worker)
+    tickets.link_session(project["id"], ticket["id"], worker, "attach", actor)
+    orchestrator_turns = len(store.list_pending_inputs(orchestrator))
+
+    await project_client.post(f"{path}/comments", json={"text": "Can you also cover B?"})
+    await service.flush_page(project_app)
+    [handed] = store.list_pending_inputs(worker)
+    assert "Can you also cover B?" in handed.data.content[0]["text"]
+    assert len(store.list_pending_inputs(orchestrator)) == orchestrator_turns
+    await service.flush_page(project_app)
+    assert len(store.list_pending_inputs(worker)) == 1
+
+    tickets.comment(project["id"], ticket["id"], CommentOnTicket(text="Yes, B is next."), actor)
+    events = (await project_client.get(f"{path}/events")).json()["data"]
+    assert events[-1]["payload"]["audience"] == "human"
+    await service.flush_page(project_app, force_digest=True)
+    digest = store.list_pending_inputs(orchestrator)[-1].data.content[0]["text"]
+    assert digest.startswith("Ticket update digest")
+    assert "person's comment, answered by its worker, agent note" in digest
+
+    service.worker_reply_seconds = 0
+    await project_client.post(f"{path}/comments", json={"text": "Any update?"})
+    await service.flush_page(project_app)
+    assert len(store.list_pending_inputs(worker)) == 2
+    await service.flush_page(project_app)
+    escalated = store.list_pending_inputs(orchestrator)[-1].data.content[0]["text"]
+    assert "Any update?" in escalated and "No worker linked to this ticket replied" in escalated
+
+    store.update_conversation(worker, archived=True)
+    await project_client.post(f"{path}/comments", json={"text": "Anyone there?"})
+    await service.flush_page(project_app)
+    fallback = store.list_pending_inputs(orchestrator)[-1].data.content[0]["text"]
+    assert fallback.startswith("Automatic ticket update") and "Anyone there?" in fallback
+    assert tickets.pending_notifications() == []
+
+
+async def test_final_update_must_read_as_written_for_a_person(project_client):
+    project = (await project_client.post("/v1/projects", json={"name": "Finals"})).json()
+    base = f"/v1/projects/{project['id']}/tickets"
+    stages = (await project_client.get(base + "/stages")).json()["stages"]
+    done = next(stage["id"] for stage in stages if stage["is_complete"])
+    ticket = (await project_client.post(base, json={"title": "Ship it"})).json()
+    terse = await project_client.patch(
+        f"{base}/{ticket['id']}",
+        json={"stage_id": done, "comment": "Done: `c4e5b2546` landed, tests 4/4.", "final": True},
+    )
+    assert terse.status_code == 400 and "plain-language" in terse.text
+    ids = " ".join(uuid4().hex for _ in range(12))
+    dump = await project_client.patch(
+        f"{base}/{ticket['id']}",
+        json={"stage_id": done, "comment": f"Landed {ids} in `src/a.py`.", "final": True},
+    )
+    assert dump.status_code == 400 and "mostly IDs" in dump.text
+    plain = (
+        "The board now sends your comments straight to the agent working on the ticket, and "
+        "it answers you there. The orchestrator only steps in when nobody replies within ten "
+        "minutes. Caveat: replies sent as chat messages don't count yet. Evidence is in the "
+        "live check attached to this ticket."
+    )
+    accepted = await project_client.patch(
+        f"{base}/{ticket['id']}", json={"stage_id": done, "comment": plain, "final": True}
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert (await project_client.get(f"{base}/{ticket['id']}")).json()["final_update"]["text"] == (
+        plain
+    )
+
+
 @pytest.mark.parametrize("external_host", [False, True])
 async def test_notifications_drain_through_normal_dispatch_after_reconnect(
     project_client, project_app, db_uri, monkeypatch, external_host

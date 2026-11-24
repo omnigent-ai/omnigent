@@ -15,13 +15,44 @@ def _enters_completed_stage(event: dict[str, Any]) -> bool:
     )
 
 
+def _event_section(
+    event: dict[str, Any], *, finalized: set[str], worker_reply_seconds: float | None
+) -> str:
+    note = ""
+    if event.get("escalated"):
+        minutes = round((worker_reply_seconds or 0) / 60)
+        note = (
+            f"\n\nNo worker linked to this ticket replied to this person's comment within "
+            f"{minutes} minute{'' if minutes == 1 else 's'}. Answer it or hand it on."
+        )
+    elif _enters_completed_stage(event) and event["ticket_id"] not in finalized:
+        note = f"\n\n{FINAL_UPDATE_REMINDER}"
+    return (
+        f"Ticket {event['ticket_id']} · {event['kind']}\n"
+        + json.dumps(event["payload"], ensure_ascii=False)
+        + note
+    )
+
+
 def ticket_update_message(project_id: str, event: dict[str, Any]) -> str:
     return (
         f"Automatic ticket update for project {project_id}. "
         "Use the orchestrator skill to handle it.\n\n"
-        f"Ticket {event['ticket_id']} · {event['kind']}\n"
-        + json.dumps(event["payload"], ensure_ascii=False)
-        + (f"\n\n{FINAL_UPDATE_REMINDER}" if _enters_completed_stage(event) else "")
+        + _event_section(event, finalized=set(), worker_reply_seconds=None)
+    )
+
+
+def ticket_comment_for_worker_message(project_id: str, event: dict[str, Any]) -> str:
+    """A worker's turn for a person's comment on a ticket it is linked to."""
+    title = event.get("ticket_title") or ""
+    return (
+        f'A person commented on ticket {event["ticket_id"]} "{title}" in project '
+        f"{project_id}, which you are linked to:\n\n"
+        f"{event['payload'].get('text', '')}\n\n"
+        "Reply on the ticket yourself with sys_ticket_comment; while this comment is open your "
+        "reply is shown to them as a human-facing comment, so write it in plain language. Then "
+        "act on it if it asks for work. The orchestrator is only told in its digest once you "
+        "reply. If it isn't yours to handle, say so on the ticket and message your coordinator."
     )
 
 
@@ -35,6 +66,8 @@ def _snippet(text: Any) -> str:
 
 def _digest_part(event: dict[str, Any]) -> str:
     kind, payload = event["kind"], event["payload"]
+    if kind == "comment" and event.get("session_id") is None and event.get("agent_id") is None:
+        return "person's comment, answered by its worker"
     if kind == "comment":
         return "agent note"
     if kind == "execution":
@@ -88,18 +121,26 @@ def ticket_digest_lines(events: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def ticket_batch_message(project_id: str, events: list[dict[str, Any]]) -> str:
+def ticket_batch_message(
+    project_id: str, events: list[dict[str, Any]], *, worker_reply_seconds: float | None = None
+) -> str:
     """One orchestrator turn: urgent events in full, then a digest of the batched rest."""
     urgent = [event for event in events if event.get("urgent", True)]
     batched = [event for event in events if not event.get("urgent", True)]
-    if len(urgent) == 1 and not batched:
-        return ticket_update_message(project_id, urgent[0])
-    sections = []
-    for event in urgent:
-        sections.append(
-            f"Ticket {event['ticket_id']} · {event['kind']}\n"
-            + json.dumps(event["payload"], ensure_ascii=False)
-            + (f"\n\n{FINAL_UPDATE_REMINDER}" if _enters_completed_stage(event) else "")
+    # A worker that posted its own final update in this batch needs no reminder.
+    finalized = {
+        event["ticket_id"]
+        for event in events
+        if event["kind"] in ("comment", "execution") and event["payload"].get("final") is True
+    }
+    sections = [
+        _event_section(event, finalized=finalized, worker_reply_seconds=worker_reply_seconds)
+        for event in urgent
+    ]
+    if len(sections) == 1 and not batched:
+        return (
+            f"Automatic ticket update for project {project_id}. "
+            "Use the orchestrator skill to handle it.\n\n" + sections[0]
         )
     if batched:
         sections.append(

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import builtins
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, case, func, or_, select, union_all
+from sqlalchemy import and_, case, func, or_, select, union_all, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,7 +32,9 @@ from omnigent.db.utils import (
 from omnigent.entities.project_ticket import (
     EVENT_CODES,
     LEGACY_STATUS_CODES,
+    NOTIFICATION_AWAITING_WORKER,
     NOTIFICATION_DIGEST,
+    NOTIFICATION_ESCALATED,
     NOTIFICATION_PENDING,
     NOTIFICATION_QUEUED,
     NOTIFICATION_SKIPPED,
@@ -135,7 +138,10 @@ def _note_audience(
 
 
 NEEDS_HUMAN_LABEL = "needs-human"
-_UNDELIVERED = (NOTIFICATION_PENDING, NOTIFICATION_DIGEST)
+_UNDELIVERED = (NOTIFICATION_PENDING, NOTIFICATION_DIGEST, NOTIFICATION_ESCALATED)
+_URGENT = (NOTIFICATION_PENDING, NOTIFICATION_ESCALATED)
+# Worker activity that counts as answering a person's comment on its ticket.
+_WORKER_REPLY_KINDS = ("comment", "execution", "updated")
 
 
 def _has_needs_human(labels: Any) -> bool:
@@ -223,6 +229,36 @@ def _wakes_orchestrator(
     return False
 
 
+_CODE_OR_LINK = re.compile(r"`[^`]*`|https?://\S+|\S*/\S+")
+_IDENTIFIER = re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,}\b", re.IGNORECASE)
+_PROSE_WORD = re.compile(r"[A-Za-z][A-Za-z'’-]+")
+FINAL_UPDATE_MIN_CHARS = 160
+FINAL_UPDATE_MIN_PROSE_WORDS = 25
+
+
+def final_update_problem(text: str) -> str | None:
+    """Why a final update doesn't read as written for a person, or None when it does."""
+    if len(text.strip()) < FINAL_UPDATE_MIN_CHARS:
+        return "too short to cover what was delivered, what it means, caveats and evidence"
+    prose = _IDENTIFIER.sub(" ", _CODE_OR_LINK.sub(" ", text))
+    words = len(_PROSE_WORD.findall(prose))
+    if words < FINAL_UPDATE_MIN_PROSE_WORDS:
+        return "mostly IDs, hashes, paths or code rather than plain-language sentences"
+    return None
+
+
+def _require_human_final(text: str) -> None:
+    problem = final_update_problem(text)
+    if problem is not None:
+        raise OmnigentError(
+            "A final update is for the human, so it was not posted: it reads as "
+            f"{problem}. Write a few plain-language sentences saying what was delivered or "
+            "decided, what it means for them, any caveats or follow-ups, and where the "
+            "evidence is; keep IDs and SHAs to what they need.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def _require_complete(project: SqlProject, ticket: SqlProjectTicket) -> None:
     if not _stage(_stages(project), _stage_id(ticket)).is_complete:
         raise OmnigentError(
@@ -267,7 +303,8 @@ def _event(row: SqlProjectTicketEvent) -> dict[str, Any]:
         "agent_id": row.agent_id,
         "payload": payload,
         "created_at": row.created_at,
-        "notification_pending": row.notification_state in _UNDELIVERED,
+        "notification_pending": row.notification_state
+        in (*_UNDELIVERED, NOTIFICATION_AWAITING_WORKER),
     }
 
 
@@ -322,8 +359,33 @@ class ProjectTicketStore:
         *,
         needs_human_changed: bool = False,
     ) -> None:
-        if actor.session_id is not None and actor.session_id == _orchestrator_session_id(project):
+        own = actor.session_id is not None and actor.session_id == _orchestrator_session_id(
+            project
+        )
+        answered = False
+        if not own and actor.session_id is not None and kind in _WORKER_REPLY_KINDS:
+            # A worker answered: the person's comment now only belongs in the orchestrator digest.
+            result = session.execute(
+                update(SqlProjectTicketEvent)
+                .where(
+                    SqlProjectTicketEvent.workspace_id == project.workspace_id,
+                    SqlProjectTicketEvent.project_id == project.id,
+                    SqlProjectTicketEvent.ticket_id == ticket.id,
+                    SqlProjectTicketEvent.notification_state == NOTIFICATION_AWAITING_WORKER,
+                )
+                .values(notification_state=NOTIFICATION_DIGEST)
+            )
+            answered = bool(result.rowcount)
+        if own:
             state = NOTIFICATION_SKIPPED
+        elif (
+            answered
+            and kind in ("comment", "execution")
+            and payload.get("final") is not True
+            and not needs_human_changed
+        ):
+            # The worker's answer to a person is human-facing but needs no orchestrator turn.
+            state = NOTIFICATION_DIGEST
         elif _wakes_orchestrator(kind, payload, actor, needs_human_changed=needs_human_changed):
             state = NOTIFICATION_PENDING
         else:
@@ -389,6 +451,18 @@ class ProjectTicketStore:
             actor.session_id, actor.agent_id, _orchestrator_session_id(project)
         )
         if audience == "human" or adds_needs_human:
+            return "human"
+        # A worker answering a person's comment on its ticket is talking to that person.
+        if session.scalar(
+            select(SqlProjectTicketEvent.id)
+            .where(
+                SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+                SqlProjectTicketEvent.project_id == ticket.project_id,
+                SqlProjectTicketEvent.ticket_id == ticket.id,
+                SqlProjectTicketEvent.notification_state == NOTIFICATION_AWAITING_WORKER,
+            )
+            .limit(1)
+        ):
             return "human"
         # A worker that raised needs-human is talking to the human until it is cleared.
         if _has_needs_human(ticket.labels):
@@ -822,6 +896,7 @@ class ProjectTicketStore:
                 )
             if body.final:
                 _require_complete(project, row)
+                _require_human_final(body.comment or "")
             if body.comment:
                 audience = self._comment_audience(
                     session, project, row, actor, body.audience, adds_needs_human=adds_needs_human
@@ -855,6 +930,7 @@ class ProjectTicketStore:
             row = self._row(session, project_id, ticket_id, write=True)
             if body.final:
                 _require_complete(project, row)
+                _require_human_final(body.text)
             audience = (
                 "human"
                 if body.final
@@ -1152,9 +1228,7 @@ class ProjectTicketStore:
         """Privileged delivery worker: projects with undelivered events, urgent or batched."""
         with self._session("pending_ticket_notification_projects") as session:
             urgent = func.max(
-                case(
-                    (SqlProjectTicketEvent.notification_state == NOTIFICATION_PENDING, 1), else_=0
-                )
+                case((SqlProjectTicketEvent.notification_state.in_(_URGENT), 1), else_=0)
             )
             rows = session.execute(
                 select(
@@ -1207,10 +1281,50 @@ class ProjectTicketStore:
                 {
                     **_event(row),
                     "ticket_title": title,
-                    "urgent": row.notification_state == NOTIFICATION_PENDING,
+                    "urgent": row.notification_state in _URGENT,
+                    "escalated": row.notification_state == NOTIFICATION_ESCALATED,
                 }
                 for row, title in rows
             ]
+
+    def ticket_session_ids(self, project_id: str, ticket_id: str) -> builtins.list[str]:
+        """Delivery worker: sessions linked to a ticket, oldest link first."""
+        with self._session("list_ticket_worker_sessions") as session:
+            return builtins.list(
+                session.scalars(
+                    select(SqlProjectTicketSession.session_id)
+                    .where(
+                        SqlProjectTicketSession.workspace_id == current_workspace_id(),
+                        SqlProjectTicketSession.project_id == _identifier(project_id),
+                        SqlProjectTicketSession.ticket_id == _identifier(ticket_id),
+                    )
+                    .order_by(
+                        SqlProjectTicketSession.created_at, SqlProjectTicketSession.session_id
+                    )
+                ).all()
+            )
+
+    def mark_awaiting_worker(self, project_id: str, ticket_id: str, event_id: str) -> None:
+        """A person's comment reached the ticket's workers; hold it until one replies."""
+        with self._write("mark_ticket_comment_awaiting_worker") as session:
+            event = session.get(
+                SqlProjectTicketEvent, (current_workspace_id(), project_id, ticket_id, event_id)
+            )
+            if event is not None and event.notification_state == NOTIFICATION_PENDING:
+                event.notification_state = NOTIFICATION_AWAITING_WORKER
+
+    def escalate_unanswered(self, *, before: int) -> int:
+        """Privileged delivery worker: comments no worker answered by ``before`` go urgent."""
+        with self._write("escalate_unanswered_ticket_comments") as session:
+            result = session.execute(
+                update(SqlProjectTicketEvent)
+                .where(
+                    SqlProjectTicketEvent.notification_state == NOTIFICATION_AWAITING_WORKER,
+                    SqlProjectTicketEvent.created_at <= before,
+                )
+                .values(notification_state=NOTIFICATION_ESCALATED)
+            )
+            return int(result.rowcount or 0)
 
     def mark_notified_many(self, project_id: str, events: builtins.list[tuple[str, str]]) -> None:
         """Retire a delivered batch of ``(ticket_id, event_id)`` pairs in one transaction."""

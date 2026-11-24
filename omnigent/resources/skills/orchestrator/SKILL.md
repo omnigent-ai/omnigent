@@ -433,13 +433,19 @@ with a handoff from a previous orchestrator, re-read the board before acting.
   otherwise keep it in an unfinished stage and arrange the
   next action. Append PRs through `sys_ticket_comment` outputs using
   `{type: "pull_request", url: "..."}`.
-- Every ticket that enters its completed stage needs a final update. A worker's
-  completion evidence arrives as agent notes, which the board folds away, so
-  translate them yourself: post one plain-language comment with `final: true`,
-  either with the `stage_id` move in `sys_ticket_update` or right after a worker
-  completes the ticket. Lead with what was delivered or decided and what it means
-  for the user. Then add any caveats or follow-ups, and link the key evidence or
-  artifacts. Leave out SHAs, paths and retry logs unless the user needs them to act.
+- Every ticket that enters its completed stage needs a final update. The worker
+  that completes it writes its own plain-language `final: true` comment for the
+  user; tell workers so in their assignment. The server rejects a final update that
+  is too short or mostly IDs and hashes. Write one yourself only when the worker
+  didn't, for example because it ended first: post it with the `stage_id` move in
+  `sys_ticket_update` or right after. Lead with what was delivered or decided and
+  what it means for the user. Then add any caveats or follow-ups, and link the key
+  evidence or artifacts. Leave out SHAs, paths and retry logs unless the user needs
+  them to act.
+- A person's comment on a ticket goes straight to its linked worker sessions,
+  which answer it on the ticket. You see it in a digest once a worker replies. It
+  wakes you urgently only when the ticket has no worker that can be woken, or none
+  replied in time; then answer it or hand it to a worker.
   The board pins the latest final update under the description and on the card.
   Reopening the ticket unpins it and keeps it in history; post a new one when the
   ticket completes again. A `next_step` in an update's result, or a completion

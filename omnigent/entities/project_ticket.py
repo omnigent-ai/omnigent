@@ -39,6 +39,10 @@ NOTIFICATION_QUEUED = 1
 NOTIFICATION_SKIPPED = 2
 # Pending, but batched into the orchestrator's next digest instead of waking it.
 NOTIFICATION_DIGEST = 3
+# A person's comment handed to the ticket's worker sessions; resolved by a worker reply.
+NOTIFICATION_AWAITING_WORKER = 4
+# A person's comment no worker answered in time; urgent for the orchestrator only.
+NOTIFICATION_ESCALATED = 5
 TICKET_PAGE_MAX = 100
 STAGE_EDIT_TICKET_MAX = 500
 
