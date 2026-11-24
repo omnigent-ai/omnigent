@@ -4495,9 +4495,7 @@ async def test_a_schedule_saved_with_a_workflow_starts_every_run_in_a_new_sessio
         headers=_headers(),
     )
     assert reworded.status_code == 400, reworded.text
-    assert (
-        reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_PROMPT_OWNED_MSG
-    )
+    assert reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_PROMPT_OWNED_MSG
     saved = (await client.get(url, headers=_headers())).json()
     assert (saved["prompt"], saved["session_mode"]) == (task["prompt"], "new")
 
@@ -4527,9 +4525,7 @@ async def test_only_an_explicit_null_stops_a_schedule_running_its_workflow(
         url, json={"prompt": "Summarize overnight activity"}, headers=_headers()
     )
     assert reworded.status_code == 400, reworded.text
-    assert (
-        reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_PROMPT_OWNED_MSG
-    )
+    assert reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_PROMPT_OWNED_MSG
     for change in (
         {"workflow_id": None},
         {"workflow_id": None, "prompt": _workflow_run_prompt(workflow_id)},
@@ -4579,7 +4575,9 @@ async def test_a_prompt_in_the_exact_form_saves_the_workflow_it_runs(
     assert (await client.get(url, headers=_headers())).json()["workflow_id"] == workflow_id
     continuing = await client.patch(url, json={"session_mode": "continue"}, headers=_headers())
     assert continuing.status_code == 400, continuing.text
-    detailed = await client.patch(url, json={"workflow_details": "Only flakes"}, headers=_headers())
+    detailed = await client.patch(
+        url, json={"workflow_details": "Only flakes"}, headers=_headers()
+    )
     assert detailed.status_code == 200, detailed.text
     assert store.get(legacy.id).workflow_id == workflow_id
 
@@ -4590,7 +4588,9 @@ async def test_a_workflow_runs_with_its_agents_skill_prefix(
     workflow_id = await _save_workflow(workflows_client)
     created = await workflows_client.post(
         "/v1/scheduled-tasks",
-        json=_workflow_create_body(workflow_id, agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME)),
+        json=_workflow_create_body(
+            workflow_id, agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+        ),
         headers=_headers(),
     )
     assert created.status_code == 200, created.text

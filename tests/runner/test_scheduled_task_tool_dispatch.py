@@ -442,7 +442,9 @@ async def test_a_saved_workflow_is_refused_before_an_older_server_sees_it(
 ) -> None:
     """The refusal gives the prompt that runs a saved workflow on such a server."""
     client = _RecordingClient(info=info)
-    out = await _execute_scheduled_task_tool(tool_name, json.dumps(arguments), server_client=client)
+    out = await _execute_scheduled_task_tool(
+        tool_name, json.dumps(arguments), server_client=client
+    )
 
     assert [url for _, url, _ in client.calls] == ["/v1/info"]
     error = json.loads(out)["error"]

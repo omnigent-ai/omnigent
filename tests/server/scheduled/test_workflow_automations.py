@@ -137,11 +137,17 @@ WORKFLOW_ID = "0123456789abcdef0123456789abcdef"
 
 @pytest.mark.parametrize(
     ("prefix", "details"),
-    [("/", ""), ("$", "Only bugs"), ("/", " Only bugs\n\nand flakes \N{ZERO WIDTH NO-BREAK SPACE}")],
+    [
+        ("/", ""),
+        ("$", "Only bugs"),
+        ("/", " Only bugs\n\nand flakes \N{ZERO WIDTH NO-BREAK SPACE}"),
+    ],
 )
 def test_writes_the_run_message_the_server_reads_back(prefix: str, details: str) -> None:
     message = saved_workflow_run_message(prefix, "Triage", WORKFLOW_ID, details)
-    assert message.startswith(f'{prefix}workflow Run the saved workflow "Triage" (ID {WORKFLOW_ID}).')
+    assert message.startswith(
+        f'{prefix}workflow Run the saved workflow "Triage" (ID {WORKFLOW_ID}).'
+    )
     # Like the web form, details are trimmed as JavaScript trims them.
     expected_details = details.strip(" \N{ZERO WIDTH NO-BREAK SPACE}")
     assert saved_workflow_run(message) == SavedWorkflowRun(WORKFLOW_ID, "Triage", expected_details)
@@ -187,6 +193,7 @@ def test_a_task_runs_the_workflow_it_was_saved_with() -> None:
 def test_a_task_saved_with_a_workflow_cant_continue_a_session_whatever_its_prompt_says(
     prompt: str,
 ) -> None:
-    assert workflow_session_reuse_error(prompt, "continue", WORKFLOW_ID) == CONTINUED_SESSION_MESSAGE
+    assert (
+        workflow_session_reuse_error(prompt, "continue", WORKFLOW_ID) == CONTINUED_SESSION_MESSAGE
+    )
     assert workflow_session_reuse_error(prompt, "new", WORKFLOW_ID) is None
-

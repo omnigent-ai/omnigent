@@ -7381,6 +7381,70 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(updateMutateAsync.mock.calls[0][0].input.prompt).toBe(run("The download tests"));
   });
 
+  // A server that stores the saved workflow a schedule runs, and writes its prompt.
+  const STORED_WORKFLOW_INFO = {
+    features: { automations_v2: true, workflows: true },
+    scheduled_task_workflow_id: true,
+  };
+  const storedWorkflowTask = () =>
+    scheduledTask({
+      prompt: run("The upload tests"),
+      workflowId: WORKFLOW.id,
+      workflowDetails: "The upload tests",
+    });
+
+  it("sends a schedule's saved workflow as itself to a server that stores it", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, {
+      info: STORED_WORKFLOW_INFO,
+    });
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    chooseWorkflow();
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const created = mutateAsync.mock.calls[0][0];
+    expect(created).toMatchObject({ workflowId: WORKFLOW.id, workflowDetails: "" });
+    expect(created.prompt).toBeUndefined();
+  });
+
+  it("edits the details of a stored workflow's runs, not its prompt", async () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.change(screen.getByLabelText("Additional instructions (optional)"), {
+      target: { value: "The download tests" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited).toMatchObject({
+      workflowId: WORKFLOW.id,
+      workflowDetails: "The download tests",
+    });
+    expect(edited.prompt).toBeUndefined();
+  });
+
+  it("stops running a stored workflow only by clearing it", async () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    // Its instructions become the prompt every run sends.
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      workflowId: null,
+      prompt: "The upload tests",
+    });
+  });
+
   it("stops showing saved instructions once they're saved empty", async () => {
     const view = renderWithWorkflows(
       <CreateScheduledTaskDialog

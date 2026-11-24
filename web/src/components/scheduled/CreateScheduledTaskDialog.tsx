@@ -1107,6 +1107,21 @@ export function CreateScheduledTaskDialog({
       workflowChoice);
   const withoutWorkflow = (text: string) =>
     (workflowChoice && parseSavedWorkflowMessage(text)?.details) ?? text;
+  // A schedule's saved workflow, sent as itself to a server that stores it: the server
+  // writes the prompt, and only workflowId null stops running the workflow.
+  const scheduledWorkflowInput = () => {
+    if (!scheduledWorkflowSupported || trigger !== null || isTriggerPrompt(freeTextPrompt)) {
+      return {};
+    }
+    if (workflowChoice !== null) {
+      return {
+        prompt: undefined,
+        workflowId: workflowChoice.id,
+        workflowDetails: keepsWorkflowDetails ? prompt.trim() : "",
+      };
+    }
+    return editingTask?.workflowId ? { workflowId: null } : {};
+  };
   const workflowField =
     workflowsEnabled && (savedWorkflows.workflows.length > 0 || workflowChoice) ? (
       <WorkflowField
@@ -1126,6 +1141,9 @@ export function CreateScheduledTaskDialog({
   // Whether each match's session can start as a run of the trigger's saved workflow.
   const workflowIdSupported =
     workflowsEnabled && info !== "loading" && info.session_create_workflow_id === true;
+  // The server stores the saved workflow a schedule runs and writes the prompt for it.
+  const scheduledWorkflowSupported =
+    workflowsEnabled && info !== "loading" && info.scheduled_task_workflow_id === true;
   // The prompt when no trigger form is open: as typed, or an older trigger's instructions
   // inside its saved template text, whose creation call follows the workflow they run.
   const syncedFreeTextPrompt = syncTriggerWorkflowId(
@@ -1712,6 +1730,7 @@ export function CreateScheduledTaskDialog({
         ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
         ...workspacePatch,
         ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
+        ...scheduledWorkflowInput(),
       };
       const projectInput = await projectChangeInput(
         // Saving over a deleted project clears it, matching the "No project" shown.
