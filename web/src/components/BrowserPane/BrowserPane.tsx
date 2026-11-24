@@ -58,10 +58,12 @@ import {
   type ChromeCookieImportResult,
   type ChromeCookiePreviewResult,
 } from "@/lib/nativeBridge";
+import { readSavedBrowserPage } from "@/lib/browserTabPages";
 import { browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
-import { previewHostOptions, withPreviewHostRetry } from "@/lib/previewHostOptions";
+import { resolveIdentity, subscribeIdentity } from "@/lib/identity";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
+import { previewHostOptions, withPreviewHostRetry } from "@/lib/previewHostOptions";
 import { cn } from "@/lib/utils";
 // Say when the tab's page is open in another desktop window.
 import { OpenElsewhereHint } from "@/components/BrowserPane/agentTools/OpenElsewhereHint";
@@ -135,6 +137,8 @@ interface BrowserPaneBridge {
   ) => () => void;
   browserHasView?: (conversationId: string) => Promise<{
     exists: boolean;
+    /** The page is open in another desktop window, not this one. */
+    elsewhere?: boolean;
     url?: string;
     canGoBack?: boolean;
     canGoForward?: boolean;
@@ -264,6 +268,7 @@ export function BrowserPane({
   const urlEditingRef = useRef(false);
   // Counts url-changed events, so an older view probe can't overwrite a newer URL.
   const urlEventsRef = useRef(0);
+  const urlEditsRef = useRef(0);
   const submitSequenceRef = useRef(0);
   useEffect(
     () => () => {
@@ -306,21 +311,46 @@ export function BrowserPane({
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
+    let unsubscribeIdentity: (() => void) | undefined;
     const urlEvents = urlEventsRef.current;
+    const urlEdits = urlEditsRef.current;
+    // Recover the address after sign-out; loading it requires Reload or Enter.
+    const restoreSavedAddress = () => {
+      const saved = readSavedBrowserPage(conversationId);
+      if (
+        !saved ||
+        cancelled ||
+        viewChanged ||
+        urlEventsRef.current !== urlEvents ||
+        urlEditsRef.current !== urlEdits
+      )
+        return;
+      setCurrentUrl(saved.url);
+    };
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && !viewChanged && r?.exists) {
-        setHasView(true);
-        // A navigation since it asked brought its own URL and back/forward state.
-        const fresh = urlEventsRef.current === urlEvents;
-        const url = fresh ? r.url : undefined;
-        if (url) setPageUrl(url);
-        if (!urlEditingRef.current && url) setCurrentUrl(url);
-        if (fresh) {
-          setCanGoBack(!!r.canGoBack);
-          setCanGoForward(!!r.canGoForward);
+      if (cancelled || viewChanged || !r) return;
+      if (!r.exists) {
+        // A page open in another window stays there.
+        if (!r.elsewhere) {
+          // Keep the original edit/event guards across transient identity failures.
+          unsubscribeIdentity = subscribeIdentity(restoreSavedAddress);
+          void resolveIdentity()
+            .then(restoreSavedAddress)
+            .catch(() => {});
         }
+        return;
+      }
+      setHasView(true);
+      // A navigation since it asked brought its own URL and back/forward state.
+      const fresh = urlEventsRef.current === urlEvents;
+      const url = fresh ? r.url : undefined;
+      if (url) setPageUrl(url);
+      if (!urlEditingRef.current && url) setCurrentUrl(url);
+      if (fresh) {
+        setCanGoBack(!!r.canGoBack);
+        setCanGoForward(!!r.canGoForward);
       }
     });
 
@@ -339,6 +369,7 @@ export function BrowserPane({
     });
     return () => {
       cancelled = true;
+      unsubscribeIdentity?.();
       unsubCreated?.();
       unsubClosed?.();
     };
@@ -429,9 +460,13 @@ export function BrowserPane({
   }, [conversationId]);
 
   const handleReload = useCallback(() => {
+    if (!hasView) {
+      submitUrl();
+      return;
+    }
     const bridge = getBridge();
     void bridge?.browserReload?.(conversationId);
-  }, [conversationId]);
+  }, [conversationId, hasView, submitUrl]);
 
   // Desktop Reload (⌘R) from this toolbar reloads the page rather than the app;
   // Focus Address Bar (⌘L) selects the address. (A focused page reloads itself in the shell.)
@@ -734,8 +769,8 @@ export function BrowserPane({
   //     keep the native view positioned over the container. NO containerRef is
   //     mounted while !hasView, so nothing measures an empty div.
   //   - !hasView: a centered hint. Back/forward are already disabled off
-  //     canGoBack/canGoForward (both false with no view); reload + DevTools are
-  //     explicitly disabled (nothing to reload / no devtools target yet). The
+  //     canGoBack/canGoForward (both false with no view); Reload can open a saved
+  //     address, while DevTools stays disabled until a view exists. The
   //     URL bar stays editable so the user can open the first page.
   const cookieProfiles = cookieProfileOptions(cookiePreview);
   const selectedCookieProfile =
@@ -781,7 +816,7 @@ export function BrowserPane({
         <button
           type="button"
           onClick={handleReload}
-          disabled={!hasView}
+          disabled={!hasView && !currentUrl.trim()}
           aria-label="Reload"
           title={chord("Reload", RELOAD_KEYS)}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
@@ -798,7 +833,10 @@ export function BrowserPane({
           placeholder="Enter a URL"
           aria-label="Address bar"
           title={chord("Address bar", ADDRESS_BAR_KEYS)}
-          onChange={(e) => setCurrentUrl(e.target.value)}
+          onChange={(e) => {
+            urlEditsRef.current++;
+            setCurrentUrl(e.target.value);
+          }}
           onFocus={() => {
             urlEditingRef.current = true;
           }}
@@ -883,8 +921,9 @@ export function BrowserPane({
       ) : (
         <div className="flex min-h-0 flex-1 items-center justify-center bg-card px-6 py-8 text-center text-muted-foreground text-ui">
           <OpenElsewhereHint viewId={conversationId}>
-            Enter a URL above to get started
-            {agentBrowser ? " — the agent will open pages here too." : "."}
+            {currentUrl.trim()
+              ? "Click Reload or press Enter in the address bar to load this page."
+              : `Enter a URL above to get started${agentBrowser ? " — the agent will open pages here too." : "."}`}
           </OpenElsewhereHint>
         </div>
       )}
