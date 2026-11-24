@@ -661,11 +661,18 @@ def test_the_reader_follows_a_real_conversation_store(db_uri: str) -> None:
     assert not reader.available("0" * 32)
 
 
+@pytest.mark.parametrize("many_sessions", [False, True], ids=["few", "many_sessions"])
 def test_a_gadget_session_that_fails_on_delivery_reports_its_failure_at_once(
-    gadgets: Fixture, clock: dict
+    gadgets: Fixture, clock: dict, monkeypatch: pytest.MonkeyPatch, many_sessions: bool
 ) -> None:
     conversations = FakeConversations()
     conversations.add("s_gadget", seen=None)
+    if many_sessions:
+        # More sessions than the recent-session listing holds, none related: the listing is
+        # incomplete, but the gadget session's own failure is known and says what happened.
+        monkeypatch.setattr(progress_module, "MAX_RECENT_SESSIONS", 2)
+        for n in range(4):
+            conversations.add(f"s_other{n}", created=NOW - 900 + n, updated=NOW - 900 + n)
     service = progress_service(gadgets, conversations)
     app = publish_actions_board(service)
     service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
@@ -684,6 +691,11 @@ def test_a_gadget_session_that_fails_on_delivery_reports_its_failure_at_once(
     assert status(service, app, action_id) == ("interrupted", "runner_failed_to_start")
     conversations.set("s_gadget", labels={})
     assert status(service, app, action_id) == ("interrupted", "session_failed")
+    # Asking again starts a fresh request instead of joining the failed one.
+    again = service.request_action(
+        app["id"], {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "again"}
+    )
+    assert again["merged"] is False and again["id"] != action_id
 
 
 def test_a_repeat_of_an_undelivered_action_says_it_was_never_delivered(

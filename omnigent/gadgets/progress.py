@@ -217,6 +217,19 @@ def derive_progress(
         if earlier_open:
             return ActionProgress("queued", None, tuple(ids))
         return ActionProgress("running", None, tuple(ids))
+    # A session that failed at or after the delivery failed on this action, even in the same
+    # second: posting the message marks a session working, so an older failure would not
+    # still show. That is known, so it counts before any sessions that weren't read; other
+    # activity counts only after that second, which the post itself fills.
+    failed = [
+        state
+        for state in states
+        if state.status == "failed"
+        and state.updated_at >= delivery.delivered_at
+        and not _working(state)
+    ]
+    if failed and not any(_working(state) for state in states):
+        return ActionProgress("interrupted", failed[0].error_code or "session_failed", tuple(ids))
     # Not every session that could do the work was read: one of them may still run it.
     if not getattr(sessions, "complete", True) and now - delivery.delivered_at < (
         SILENT_RUNNING_LIMIT_S
@@ -235,16 +248,6 @@ def derive_progress(
         return ActionProgress(
             "interrupted", "runner_offline" if offline else "no_activity", tuple(ids)
         )
-    # A session that failed at or after the delivery failed on this action, even in the same
-    # second: posting the message marks a session working, so an older failure would not
-    # still show. Other activity counts only after that second, which the post itself fills.
-    failed = [
-        state
-        for state in states
-        if state.status == "failed" and state.updated_at >= delivery.delivered_at
-    ]
-    if failed:
-        return ActionProgress("interrupted", failed[0].error_code or "session_failed", tuple(ids))
     acted = [state for state in states if state.updated_at > delivery.delivered_at + 1]
     if acted:
         return ActionProgress("finished_unreported", None, tuple(ids))
