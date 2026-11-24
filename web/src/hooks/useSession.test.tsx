@@ -209,6 +209,39 @@ describe("prefetchSessionHostChain", () => {
     expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
   });
 
+  it("cancels the snapshot read it started when its lookup times out", async () => {
+    const { client } = harness();
+    const reads: (AbortSignal | undefined)[] = [];
+    getSessionSlimMock.mockImplementation((_id, options) => {
+      reads.push(options?.signal);
+      return new Promise<Session>(() => {});
+    });
+    const lookup = new AbortController();
+
+    const walk = prefetchSessionHostChain(client, "lost_read", { signal: lookup.signal });
+    await vi.waitFor(() => expect(reads).toHaveLength(1));
+    lookup.abort();
+
+    await expect(walk).rejects.toThrow();
+    expect(reads[0]?.aborted).toBe(true);
+    expect(client.isFetching({ queryKey: ["session", "lost_read"], exact: true })).toBe(0);
+  });
+
+  it("leaves another caller's snapshot read running when its lookup times out", async () => {
+    const { client } = harness();
+    void client.fetchQuery({
+      queryKey: ["session", "shared_read"],
+      queryFn: () => new Promise<Session>(() => {}),
+    });
+    const lookup = new AbortController();
+
+    const walk = prefetchSessionHostChain(client, "shared_read", { signal: lookup.signal });
+    lookup.abort();
+
+    expect(client.isFetching({ queryKey: ["session", "shared_read"], exact: true })).toBe(1);
+    void walk.catch(() => undefined);
+  });
+
   it.each([false, true])("resolves nested side chats after reload (cached: %s)", async (cached) => {
     const { client } = harness();
     const side = {

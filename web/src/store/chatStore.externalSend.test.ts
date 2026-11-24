@@ -3,13 +3,8 @@ import type * as IdentityModule from "@/lib/identity";
 import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { conversationRegistry } from "./conversationRegistry";
-import {
-  handleSessionEvent,
-  initChatStore,
-  onSendDelivered,
-  SESSION_READ_TIMEOUT_MS,
-  useChatStore,
-} from "./chatStore";
+import { handleSessionEvent, initChatStore, onSendDelivered, useChatStore } from "./chatStore";
+import { SESSION_READ_TIMEOUT_MS } from "@/lib/identity";
 import { peekUnsentSend } from "@/lib/unsentSends";
 
 vi.mock("@/lib/identity", async (importOriginal) => ({
