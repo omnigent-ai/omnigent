@@ -401,6 +401,7 @@ describe("Files tab", () => {
       "Sort Files Tree by Size",
       "Sort Files Tree by Type",
       "Hide Hidden Files",
+      "Show Git-Ignored Files",
     ]);
     act(() => listed.find((row) => row.label === "Sort Files Tree by Type")!.run());
     expect(fileSettings.onSortChange).toHaveBeenCalledWith("type");
@@ -416,7 +417,34 @@ describe("Files tab", () => {
       "Sort Files Tree by Last edited",
       "Sort Files Tree by Size",
       "Show Hidden Files",
+      "Show Git-Ignored Files",
     ]);
+  });
+
+  it("shows git-ignored files from the options and ⌘K, off by default and kept per device", async () => {
+    renderView({ kind: "files", path: "a.ts" });
+    expect(captured.tree!.showIgnored).toBe(false);
+    const options = () =>
+      within(screen.getByTestId("file-viewer")).getByRole("button", { name: "Files tree options" });
+
+    await userEvent.click(options());
+    const showIgnored = screen.getByRole("menuitemcheckbox", { name: "Show git-ignored files" });
+    expect(showIgnored).not.toBeChecked();
+    await userEvent.click(showIgnored);
+    expect(captured.tree!.showIgnored).toBe(true);
+    expect(window.localStorage.getItem("omnigent:files-tree-show-ignored")).toBe("true");
+
+    const hide = registeredPaletteCommands().find((row) => row.id === "files-tree-ignored")!;
+    expect(hide.label).toBe("Hide Git-Ignored Files");
+    act(() => hide.run());
+    expect(captured.tree!.showIgnored).toBe(false);
+    expect(window.localStorage.getItem("omnigent:files-tree-show-ignored")).not.toBe("true");
+  });
+
+  it("shows git-ignored files when a tree with nothing else asks", () => {
+    renderView({ kind: "files", path: "a.ts" });
+    act(() => captured.tree!.onShowIgnored!());
+    expect(captured.tree!.showIgnored).toBe(true);
   });
 
   it("leaves ⌘K and ⇧⌘E to the keyboard target when two Files places are on screen", () => {

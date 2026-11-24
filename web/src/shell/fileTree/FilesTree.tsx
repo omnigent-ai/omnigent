@@ -30,7 +30,7 @@ import {
   visibleEntries,
   withChangedFiles,
 } from "./filesTreeListings";
-import { treeChangeStatuses } from "./treeChangeStatus";
+import { treeChangeStatuses, treeIgnoredStatuses } from "./treeChangeStatus";
 import { SingleSelection, opensRow, rowClickAction, rowKeyAction } from "./treeSelection";
 import { treeComparator, treeOrderSignature } from "./treeSort";
 import { scrollRowIntoView } from "./revealScroll";
@@ -60,6 +60,8 @@ export interface FilesTreeProps {
   changedFiles: readonly TreeChange[];
   sort: ChangedSort;
   showHidden: boolean;
+  /** List what Git ignores, marked as ignored; otherwise the host leaves it out. */
+  showIgnored: boolean;
   refreshToken: number;
   /** `newTab` for a ⌘-click (Ctrl-click off macOS) or a middle click, which want the file in its own tab. */
   onFileSelect: (path: string, options?: { newTab: true }) => void;
@@ -118,13 +120,14 @@ const FILES_TREE_THEME = {
 } as CSSProperties;
 
 export function FilesTree(props: FilesTreeProps) {
-  const { conversationId, browseLocation, showHidden, refreshToken } = props;
+  const { conversationId, browseLocation, showHidden, showIgnored, refreshToken } = props;
   const cacheKey = cacheKeyFor(conversationId, browseLocation);
   const dark = useResolvedThemeMode() === "dark";
   const prefetch = useWorkspacePrefetch({
     conversationId,
     location: browseLocation,
     refreshToken,
+    hideIgnored: !showIgnored,
   });
 
   const rootListing = useMemo<FolderListing>(
@@ -166,7 +169,10 @@ export function FilesTree(props: FilesTreeProps) {
     flattenEmptyDirectories: true,
     initialExpansion: "closed",
     initialExpandedPaths: expandedAtStart,
-    gitStatus: treeChangeStatuses(props.changedFiles),
+    gitStatus: [
+      ...treeIgnoredStatuses(rootListing.entries),
+      ...treeChangeStatuses(props.changedFiles),
+    ],
     sort: (left, right) =>
       treeComparator(sortState.current.sort, sortState.current.meta)(left, right),
     // Opening is driven by the input that chose a row; selection changes only stay single.
@@ -192,6 +198,7 @@ export function FilesTree(props: FilesTreeProps) {
     loadingFolders,
     browseLocation,
     refreshToken,
+    !showIgnored,
   );
   // Keyed on the listings' own data, so a fresh result map holding the same data changes nothing.
   const rawListings: FolderListing[] = [{ folder: "", entries: props.rootEntries }];
@@ -255,10 +262,13 @@ export function FilesTree(props: FilesTreeProps) {
     return model.subscribe(record);
   }, [model, cacheKey]);
 
-  // Change marks follow the panel's changed files.
+  // Change marks follow the panel's changed files, after the ignored marks so they win.
   useEffect(() => {
-    model.setGitStatus(treeChangeStatuses(props.changedFiles));
-  }, [model, props.changedFiles]);
+    model.setGitStatus([
+      ...treeIgnoredStatuses(listings.flatMap(({ entries }) => entries)),
+      ...treeChangeStatuses(props.changedFiles),
+    ]);
+  }, [model, listings, props.changedFiles]);
 
   // A new sort, or metadata it orders by, re-sorts in place, keeping where the reader was.
   const meta = useMemo(() => treeMetadata(listings), [listings]);

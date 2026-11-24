@@ -337,6 +337,14 @@ class WorkspaceReader:
         """
         return _resolve_workspace_path(self._root, path)
 
+    def resolve_directory(self, path: str) -> Path:
+        """The confined directory :meth:`list_directory` reads for ``path``, symlinks resolved.
+
+        :param path: Relative directory path (``""`` for the workspace root).
+        :raises WorkspaceReaderError: 400 when the path escapes the root or is invalid.
+        """
+        return self._resolve(path)
+
     # ── Directory listing / file content ──────────────────────────
 
     def list_or_read(
