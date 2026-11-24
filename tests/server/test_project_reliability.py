@@ -198,6 +198,23 @@ def test_settings_defaults_and_overrides() -> None:
     )
     assert config.threshold("in_progress") == 120 and config.threshold("review") == 5400
     assert config.step_s == 15 * 60 and config.enabled
+    off = reliability.settings(
+        {"reliability": {"stage_minutes": {"verified": 0, "merged": False, "review": -3}}}
+    )
+    assert off.unwatched_stages == {"verified", "merged"}
+    assert off.threshold("review") == 30 * 60  # invalid values keep the default
+
+
+async def test_an_unwatched_stage_gets_no_ladder_but_wake_ups_still_fire(world) -> None:
+    # A stage that only waits on a push, like Verified, is switched off with 0 minutes.
+    project = world.projects.get()
+    project.config["reliability"]["stage_minutes"] = {"in_progress": 0}
+    for minute in (11, 17, 23, 40):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert world.inputs.sent == [] and world.tickets.notes == [] and world.restarts == []
+    _wait_label(world, 60 * MINUTE)
+    await world.loop.check_project("p1", None, now=61 * MINUTE)
+    assert [sid for sid, _ in world.inputs.sent] == ["lead"]
 
 
 def _wait_label(world: SimpleNamespace, wake_at: float, note: str = "release is out") -> None:

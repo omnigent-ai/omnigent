@@ -18,7 +18,9 @@ orchestrator and:
 - gives the lead a short periodic review turn every ``review_hours`` when the
   board changed since the last one.
 
-Settings live in project config ``reliability`` (see :func:`settings`). Ticket
+Settings live in project config ``reliability`` (see :func:`settings`). A stage
+whose ``stage_minutes`` is 0 or false gets no stall ladder, for stages like
+Verified that only wait on a push; a ``waiting`` wake-up there still fires. Ticket
 ladders are saved under the data directory so a server restart resumes them.
 """
 
@@ -84,6 +86,8 @@ class Settings:
     enabled: bool
     stall_s: float
     stage_s: dict[str, float]
+    # Stages the stall ladder skips, e.g. a Verified stage that only waits on a push.
+    unwatched_stages: frozenset[str]
     step_s: float
     lead_response_s: float
     review_s: float
@@ -105,15 +109,21 @@ def settings(config: dict[str, Any]) -> Settings:
         return float(value) if ok else float(_DEFAULTS[key])
 
     stages = raw.get("stage_minutes")
+    stage_items = list(stages.items()) if isinstance(stages, dict) else []
     stage_s = {
         str(stage): float(minutes) * 60
-        for stage, minutes in (stages.items() if isinstance(stages, dict) else [])
+        for stage, minutes in stage_items
         if isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and minutes > 0
     }
+    # 0 or false turns the stall ladder off for that stage.
+    unwatched = frozenset(
+        str(stage) for stage, minutes in stage_items if minutes is False or minutes == 0
+    )
     return Settings(
         enabled=raw.get("enabled", True) is not False,
         stall_s=number("stall_minutes") * 60,
         stage_s=stage_s,
+        unwatched_stages=unwatched,
         step_s=number("step_minutes") * 60,
         lead_response_s=number("lead_response_minutes") * 60,
         review_s=number("review_hours") * 3600,
@@ -481,6 +491,12 @@ class ReliabilityLoop:
                 continue
             seen.add(ticket["id"])
             if await self._check_wait(project, state, config, ticket, now):
+                continue
+            if ticket["stage_id"] in config.unwatched_stages:
+                # A `waiting` wake-up still fires above; no stall ladder or owner-wait park.
+                state.tickets.pop(ticket["id"], None)
+                state.escalated.discard(ticket["id"])
+                state.owner_waits.pop(ticket["id"], None)
                 continue
             if await self._check_owner_wait(project, state, config, ticket, now):
                 continue
