@@ -2110,7 +2110,7 @@ describe("PermissionsModal", () => {
       );
       fireEvent.click(screen.getByRole("button", { name: /grant/i }));
       await waitFor(() =>
-        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "carol@example.com", 3),
+        expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, "carol@example.com", 3, true),
       );
 
       await chooseLevel(
@@ -2172,6 +2172,35 @@ describe("PermissionsModal", () => {
           await screen.findByText("Bob already has Can manage. Change it in the list above."),
         ).toBeInTheDocument();
         expect(grantShareMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ["while the list is still loading", "bob@example.com", "pending"],
+      ["over a stale list that lacks the grant", "bob@example.com", "stale"],
+      ["for the viewer themselves", "me@example.com", "self"],
+    ] as const)(
+      "adds without lowering access the server already holds, %s",
+      async (_case, typed, state) => {
+        const own = { ...gadget, owner_id: "alice@example.com", viewer_id: "me@example.com" };
+        if (state === "pending") listGadgetMock.mockReturnValue(new Promise(() => {}));
+        else listGadgetMock.mockResolvedValue(grantList([]));
+        grantShareMock.mockResolvedValue(
+          grantee(typed, 3, typed === "me@example.com" ? "You" : "Bob"),
+        );
+        render(<PermissionsModal gadget={own} open onOpenChange={() => {}} />, {
+          wrapper: createInfoWrapper({ features: { gadgets: true } }),
+        });
+        const box = await screen.findByPlaceholderText("alice@example.com");
+        fireEvent.change(box, { target: { value: typed } });
+        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+        // Can view is the default; the server keeps the Can manage it already holds.
+        await waitFor(() =>
+          expect(grantShareMock).toHaveBeenCalledWith(gadgetTarget, typed, 1, true),
+        );
+        expect(
+          await screen.findByText(/already has Can manage\. Change it in the list above\./),
+        ).toBeInTheDocument();
       },
     );
 

@@ -150,6 +150,24 @@ describe("grantPermission", () => {
     expect(result.level).toBe(2);
   });
 
+  it("asks for at least a level on a gadget and returns the higher grant kept", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ user_id: "bob", gadget_id: "g1", level: 3, display_name: "Bob" }),
+    );
+
+    const result = await grantSharePermission({ kind: "gadget", id: "g1" }, "bob", 1, true);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/v1/gadgets/g1/permissions");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({
+      user_id: "bob",
+      level: 1,
+      ensure_minimum: true,
+    });
+    expect(result.level).toBe(3);
+  });
+
   it("PUTs /v1/sessions/{id}/permissions with user_id and level", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({ user_id: "bob", conversation_id: "conv_abc", level: 2 }),

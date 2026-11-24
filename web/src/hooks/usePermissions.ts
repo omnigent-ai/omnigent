@@ -133,7 +133,10 @@ export function useGrantPermission(target: ShareTarget) {
       level: number;
       ensureMinimum?: boolean;
     }): Promise<ShareGrant> => {
-      if (target.kind === "gadget") return grantSharePermission(target, userId, level);
+      if (target.kind === "gadget")
+        return ensureMinimum
+          ? grantSharePermission(target, userId, level, true)
+          : grantSharePermission(target, userId, level);
       if (target.kind !== "session") return grantSharePermission(target, userId, LEVEL_READ);
       return ensureMinimum
         ? grantPermission(target.id, userId, level, true)

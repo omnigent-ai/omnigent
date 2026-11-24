@@ -269,8 +269,14 @@ export function PermissionsModal(props: PermissionsModalProps) {
     let accessGranted = existingLevel >= level;
     try {
       if (!accessGranted) {
-        await grant.mutateAsync({ userId, level, ensureMinimum });
+        const saved = await grant.mutateAsync({ userId, level, ensureMinimum });
         accessGranted = true;
+        // The server kept a higher grant than the one asked for: say so instead of lowering it.
+        if (gadget && saved.level > level) {
+          const name = saved.display_name ?? saved.user_id;
+          const current = GADGET_LEVELS.find((l) => l.value === saved.level)?.label;
+          setError(`${name} already has ${current ?? "more access"}. Change it in the list above.`);
+        }
       }
       await prepareFileShare();
       return true;
@@ -314,7 +320,16 @@ export function PermissionsModal(props: PermissionsModalProps) {
         setError(`${name} already has ${current ?? "more access"}. Change it in the list above.`);
         return;
       }
-      if (await grantAccess(trimmed, parseInt(newLevel, 10), existingGrant?.level, !!filePath)) {
+      // An add never lowers access: the server keeps a higher grant, even one this list hasn't
+      // loaded yet or one another manager just made.
+      if (
+        await grantAccess(
+          trimmed,
+          parseInt(newLevel, 10),
+          existingGrant?.level,
+          !!filePath || !!gadget,
+        )
+      ) {
         setNewUserId("");
         setNewLevel("1");
       }
