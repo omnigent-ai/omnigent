@@ -16,6 +16,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
+    HostModelOptionsFrame,
     HostStatFrame,
     decode_host_frame,
 )
@@ -51,7 +52,6 @@ from tests.server.routes.test_projects_crud import multi_user_client as multi_us
 from tests.server.routes.test_projects_crud import project_agents as project_agents
 from tests.server.routes.test_projects_crud import project_app as project_app
 from tests.server.routes.test_projects_crud import project_client as project_client
-
 
 # Viewer seen state on reads after the viewer's own direct edits.
 NOTHING_NEW = {
@@ -125,7 +125,7 @@ async def test_project_creation_has_one_normal_main_session(project_client, db_u
 
 async def test_ticket_response_summary_is_owner_private(multi_user_client, db_uri):
     project = SqlAlchemyProjectStore(db_uri).create(uuid4().hex, "Summary", ALICE)
-    ProjectTicketStore(db_uri).create(
+    ticket = ProjectTicketStore(db_uri).create(
         project.id,
         CreateTicket(title="Needs a decision", labels=[{"key": "needs-human"}]),
         TicketActor(ALICE),
@@ -133,7 +133,11 @@ async def test_ticket_response_summary_is_owner_private(multi_user_client, db_ur
     path = f"/v1/projects/{project.id}/tickets/summary"
     response = await multi_user_client.get(path, headers=_as_user(ALICE))
     assert response.status_code == 200
-    assert response.json() == {"needs_response_count": 1, "is_complete": True}
+    assert response.json() == {
+        "needs_response_count": 1,
+        "is_complete": True,
+        "latest_created_at": ticket["created_at"],
+    }
     assert (await multi_user_client.get(path, headers=_as_user(BOB))).status_code == 404
     info = (await multi_user_client.get("/v1/info", headers=_as_user(ALICE))).json()
     assert info["project_ticket_summary"] is True
@@ -764,6 +768,11 @@ async def test_name_only_project_uses_owned_host_home_and_normal_launch(
                 ) == (None, "gpt-5.4-mini", "high")
             launches.append(frame)
             connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        elif isinstance(frame, HostModelOptionsFrame):
+            # The server fills the new Lead's model picker from its host.
+            connection.pending_model_options[frame.request_id].set_result(
+                {"status": "ok", "models": []}
+            )
         else:
             pytest.fail(f"Unexpected host frame: {frame}")
 
@@ -855,11 +864,15 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
         rejected = await project_client.request(method, url, json=body)
         assert rejected.status_code == 422
         assert any(error["loc"] == ["body", field] for error in rejected.json()["detail"])
+    # A read adds what an edit's response omits: the final-update state and approvers.
     assert (await project_client.get(path)).json() == {
         **completed.json(),
         "agents": [],
         "agents_has_more": False,
         "has_running_agents": False,
+        "final_update": None,
+        "needs_final_update": True,
+        "product_approvers": [],
         **NOTHING_NEW,
     }
     assert (await project_client.get(path + "/events")).json() == events_before
@@ -941,6 +954,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         "has_running_agents": False,
         "final_update": None,
         "needs_final_update": False,
+        "product_approvers": [],
         **NOTHING_NEW,
     }
     assert (await project_client.get(f"{base}/{ticket['id']}/events")).json() == events_before

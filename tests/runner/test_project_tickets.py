@@ -29,14 +29,14 @@ TICKET = "c" * 32
             {"ticket_id": TICKET, "labels": [{"key": "needs-human"}]},
             "PATCH",
             f"/{TICKET}",
-            {"labels": [{"key": "needs-human"}]},
+            {"labels": [{"key": "needs-human"}], "final": False},
         ),
         (
             "sys_ticket_comment",
             {"ticket_id": TICKET, "text": "Progress"},
             "POST",
             f"/{TICKET}/comments",
-            {"text": "Progress", "kind": "comment", "outputs": []},
+            {"text": "Progress", "kind": "comment", "outputs": [], "final": False},
         ),
         (
             "sys_session_link_ticket",
@@ -75,14 +75,14 @@ TICKET = "c" * 32
             },
             "PATCH",
             f"/{TICKET}",
-            {"stage_id": "planning", "description": "Agreed scope"},
+            {"stage_id": "planning", "description": "Agreed scope", "final": False},
         ),
         (
             "sys_ticket_update",
             {"ticket_id": TICKET, "stage_id": "review", "comment": "Check the demo"},
             "PATCH",
             f"/{TICKET}",
-            {"stage_id": "review", "comment": "Check the demo"},
+            {"stage_id": "review", "comment": "Check the demo", "final": False},
         ),
         (
             "sys_ticket_stages_update",
