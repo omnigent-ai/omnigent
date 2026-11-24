@@ -40,6 +40,14 @@ const unbuilt = new Set<string>();
 // screen too, so creating it from the Create session menu keeps the view.
 const fullScreenStarts = new Set<string>();
 let listening = false;
+// Discards waiting on the server, by gadget: going back to the gadget's New session, a create
+// beginning for it or a session adopting it takes the gadget out, so the discard stops.
+const discarding = new Map<string, number>();
+let discardCount = 0;
+
+function stopDiscard(gadgetId: string): boolean {
+  return discarding.delete(gadgetId);
+}
 
 /** Notes whether the gadget beside New session fills the screen, for the session started there. */
 export function noteGadgetStartFullScreen(gadgetId: string, fullScreen: boolean): void {
@@ -60,14 +68,24 @@ function creating(gadgetId: string): boolean {
 async function discardIfUnbuilt(gadgetId: string, queryClient: QueryClient): Promise<void> {
   // A sent Build whose session is still being created keeps its gadget.
   if (creating(gadgetId) || !unbuilt.delete(gadgetId)) return;
+  const token = ++discardCount;
+  discarding.set(gadgetId, token);
+  // Still to be deleted: the viewer hasn't returned to its New session and no create or
+  // session has taken it since this discard began.
+  const stillDiscarding = () =>
+    discarding.get(gadgetId) === token && !creating(gadgetId) && starting?.gadgetId !== gadgetId;
   try {
     const gadget = await getGadget(gadgetId);
+    if (!stillDiscarding()) return;
     if (gadget.published_revision !== null || !gadget.permissions.manage) return;
     if ((await getGadgetGadgetSession(gadgetId)) !== null) return;
+    if (!stillDiscarding()) return;
     await deleteGadget(gadgetId);
     invalidateGadgets(queryClient);
   } catch {
     // It stays in the list, unpublished; the viewer can delete it there.
+  } finally {
+    if (discarding.get(gadgetId) === token) discarding.delete(gadgetId);
   }
 }
 
@@ -89,11 +107,14 @@ export function resetGadgetStarts(): void {
   adopted.clear();
   unbuilt.clear();
   fullScreenStarts.clear();
+  discarding.clear();
 }
 
 function beginGadgetStart(gadgetId: string, queryClient: QueryClient): void {
   if (starting?.gadgetId === gadgetId) return;
   if (starting !== null) leaveGadgetStart(starting.gadgetId, queryClient);
+  // Back on New session before the discard finished: the gadget is unbuilt again.
+  if (stopDiscard(gadgetId)) unbuilt.add(gadgetId);
   starting = { gadgetId };
 }
 
@@ -109,7 +130,7 @@ function onAttempt(attempt: number, outcome: "begun" | "failed"): void {
   }
   if (starting === null) return;
   const gadgetId = starting.gadgetId;
-  const wasUnbuilt = unbuilt.delete(gadgetId);
+  const wasUnbuilt = unbuilt.delete(gadgetId) || stopDiscard(gadgetId);
   attempts.set(attempt, { gadgetId, fullScreen: fullScreenStarts.has(gadgetId), wasUnbuilt });
 }
 
@@ -124,6 +145,7 @@ function adopt(
   adopted.add(pair);
   if (starting?.gadgetId === gadgetId) starting = null;
   unbuilt.delete(gadgetId);
+  stopDiscard(gadgetId);
   fullScreenStarts.delete(gadgetId);
   madeFor.set(sessionId, { gadgetId, firstMessage, fullScreen });
   adoptStartedGadgetSession(gadgetId, sessionId, firstMessage)

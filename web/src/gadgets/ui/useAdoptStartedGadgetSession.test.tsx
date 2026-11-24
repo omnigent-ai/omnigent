@@ -87,6 +87,9 @@ function Shell() {
       <button type="button" onClick={() => navigate("/c/conv_old")}>
         Existing session
       </button>
+      <button type="button" onClick={() => navigate("/?prompt=Build&gadget_start=board")}>
+        Back to New session
+      </button>
     </>
   );
 }
@@ -304,6 +307,32 @@ describe("a session started beside a gadget", () => {
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
     await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("board"));
+  });
+
+  it("keeps the gadget when the viewer returns and sends Build while the discard is waiting", async () => {
+    vi.mocked(getGadget).mockResolvedValue(
+      gadgetFixture({ id: "board", published_revision: null }),
+    );
+    let answerSessionLookup: (session: string | null) => void = () => {};
+    vi.mocked(getGadgetGadgetSession).mockReturnValue(
+      new Promise<string | null>((resolve) => {
+        answerSessionLookup = resolve;
+      }),
+    );
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    rememberUnbuiltGadget("board");
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    await waitFor(() => expect(getGadgetGadgetSession).toHaveBeenCalledWith("board"));
+    fireEvent.click(screen.getByRole("button", { name: "Back to New session" }));
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    // The lookup made before the viewer came back answers "no session" late.
+    answerSessionLookup(null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(deleteGadget).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    await waitFor(() => expect(adoptStartedGadgetSession).toHaveBeenCalled());
+    expect(deleteGadget).not.toHaveBeenCalled();
   });
 
   it("keeps a gadget that has a version or a session, or that a session started from", async () => {
