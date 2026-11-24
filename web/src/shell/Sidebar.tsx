@@ -6591,7 +6591,7 @@ function ConversationRowImpl({
     enclosingFolder !== null && sessionBelongsToProject(conversation, enclosingFolder, viewerId);
   const metaProject =
     show.includes("project") && !inOwnProjectFolder && currentProject !== null
-      ? { name: currentProject, icon: projectFlyoutIcon }
+      ? { name: currentProject, icon: projectFlyoutMark?.icon ?? null }
       : null;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
