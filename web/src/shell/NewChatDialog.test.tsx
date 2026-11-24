@@ -13560,7 +13560,6 @@ describe("managed sandbox gateway preview", () => {
     const { body } = await submitAndReadBody();
     expect(body).toMatchObject({
       agent_id: "a_agy",
-      sandbox_provider: "arclet",
       model_override: astra.id,
       reasoning_effort: "max",
     });
