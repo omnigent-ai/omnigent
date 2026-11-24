@@ -12,8 +12,10 @@ import threading
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from starlette.requests import Request
+from starlette.routing import BaseRoute, Match
+from starlette.types import Scope
 
 from omnigent import debug_logging as dl
 from omnigent.server.app import _resolve_audit_route
@@ -73,6 +75,59 @@ def test_resolve_audit_route_non_session_route() -> None:
     operation, _template, session_id = _resolve_audit_route(_request(app, "GET", "/v1/hosts"))
     assert operation == "list_hosts"
     assert session_id is None
+
+
+class _IncludedRouterStandIn(BaseRoute):
+    """What FastAPI 0.137+ leaves in ``app.router.routes`` for an included router:
+    a nameless entry that matches as a whole and exposes its routes through
+    ``effective_candidates()``."""
+
+    def __init__(self, routes: list[BaseRoute]) -> None:
+        self._routes = routes
+
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        return (Match.FULL, {}) if str(scope["path"]).startswith("/v1/") else (Match.NONE, {})
+
+    def effective_candidates(self) -> list[BaseRoute]:
+        return self._routes
+
+
+def test_resolve_audit_route_looks_through_an_included_router() -> None:
+    # Under FastAPI 0.137+ the audit lookup met the included-router entry first
+    # and named every request "unmatched"; it must resolve the route inside it.
+    app = _app()
+    app.router.routes[:] = [_IncludedRouterStandIn(list(app.router.routes))]
+    operation, template, session_id = _resolve_audit_route(
+        _request(app, "GET", "/v1/sessions/abc123")
+    )
+    assert (operation, template, session_id) == (
+        "get_session",
+        "/v1/sessions/{session_id}",
+        "abc123",
+    )
+    assert _resolve_audit_route(_request(app, "GET", "/v1/hosts")) == (
+        "list_hosts",
+        "/v1/hosts",
+        None,
+    )
+
+
+def test_resolve_audit_route_through_include_router() -> None:
+    # The real shape, whichever FastAPI is installed: routes added with
+    # ``include_router`` resolve to the handler name and the prefixed template.
+    app = FastAPI()
+    router = APIRouter()
+
+    @router.get("/sessions/{session_id}")
+    def get_session(session_id: str) -> dict[str, str]:  # pragma: no cover - not called
+        return {}
+
+    app.include_router(router, prefix="/v1")
+    assert _resolve_audit_route(_request(app, "GET", "/v1/sessions/abc123")) == (
+        "get_session",
+        "/v1/sessions/{session_id}",
+        "abc123",
+    )
 
 
 def test_resolve_audit_route_unmatched() -> None:
