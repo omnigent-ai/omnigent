@@ -249,6 +249,23 @@ describe("NewProjectButton", () => {
     expect(mocks.createDirectory).toHaveBeenCalledTimes(1);
   });
 
+  it("opens a fresh dialog each time, without what was typed or picked before", async () => {
+    renderButton();
+    fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+      target: { value: "Garden" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByPlaceholderText("Project name…")).toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "New project" }));
+
+    expect(screen.getByPlaceholderText("Project name…")).toHaveValue("");
+    expect(
+      screen.queryByRole("checkbox", { name: "Create a folder using the project name" }),
+    ).toBeNull();
+  });
+
   it("does not finish a dismissed folder submission or clear a reopened modal", async () => {
     let resolveDirectory: ((path: string) => void) | undefined;
     mocks.createDirectory.mockReturnValueOnce(
