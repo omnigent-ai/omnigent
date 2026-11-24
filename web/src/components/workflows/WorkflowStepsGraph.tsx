@@ -136,7 +136,6 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
               goal={data.goal}
               onChange={graph.timeLimit?.onChange}
               disabled={graph.timeLimit?.saving}
-              canApplyToAll={graph.total > 1}
               onOpenChange={setMenuOpen}
             />
             {menuAction && (

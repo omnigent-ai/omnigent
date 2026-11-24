@@ -214,9 +214,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     saveTimeLimit.mutate(
       {
         steps: workflow.steps.map((step) =>
-          stepId === null || step.id === stepId
-            ? { ...step, goal: withStepTimeLimit(step.goal, limit) }
-            : step,
+          step.id === stepId ? { ...step, goal: withStepTimeLimit(step.goal, limit) } : step,
         ),
       },
       { onError: (saveError) => showToast(`Couldn’t save the time limit. ${saveError.message}`) },

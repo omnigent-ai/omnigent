@@ -212,7 +212,7 @@ describe("a step's time limit", () => {
     expect(within(fix!).queryByRole("button")).toBeNull();
   });
 
-  it("sets, spreads and clears a limit from the step's menu", () => {
+  it("sets and clears a limit from the step's menu", () => {
     const onTimeLimitChange = vi.fn();
     const { rerender } = render(
       <WorkflowStepsGraph
@@ -225,12 +225,11 @@ describe("a step's time limit", () => {
       fireEvent.pointerDown(screen.getByRole("button", { name }), { button: 0 });
 
     open("Set a time limit for Explore the failures");
+    expect(screen.getByRole("menu")).toHaveTextContent(/^Time limit/);
     expect(screen.getByRole("menuitemradio", { name: "No limit" })).toHaveAttribute(
       "aria-checked",
       "true",
     );
-    // A step without a limit has none to use for every step.
-    expect(screen.queryByRole("menuitem", { name: /for every step/ })).toBeNull();
     fireEvent.click(screen.getByRole("menuitemradio", { name: "30 minutes" }));
     expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "explore", limit: "30 minutes" });
 
@@ -239,10 +238,7 @@ describe("a step's time limit", () => {
       "aria-checked",
       "true",
     );
-    fireEvent.click(screen.getByRole("menuitem", { name: "Use 2 hours for every step" }));
-    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: null, limit: "2 hours" });
-
-    open("Time limit for Fix the test: 2 hours");
+    expect(screen.queryAllByRole("menuitem")).toEqual([]);
     fireEvent.click(screen.getByRole("menuitemradio", { name: "No limit" }));
     expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "fix", limit: null });
 
@@ -277,8 +273,8 @@ describe("a step's time limit", () => {
       "aria-checked",
       "true",
     );
-    fireEvent.click(screen.getByRole("menuitem", { name: "Use 4 hours for every step" }));
-    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: null, limit: "4 hours" });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "8 hours" }));
+    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "fix", limit: "8 hours" });
   });
 });
 

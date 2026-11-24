@@ -4,11 +4,9 @@ import { TimerIcon } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -20,9 +18,9 @@ import {
 } from "@/lib/stepTimeLimit";
 import { cn } from "@/lib/utils";
 
-/** A time limit chosen in a step's menu: for that step, or with `stepId` null for every step. */
+/** A time limit chosen in a step's menu. */
 export interface StepTimeLimitChange {
-  stepId: string | null;
+  stepId: string;
   /** e.g. "2 hours"; null for no limit. */
   limit: string | null;
 }
@@ -44,7 +42,6 @@ export function StepTimeLimit({
   goal,
   onChange,
   disabled = false,
-  canApplyToAll = false,
   onOpenChange,
 }: {
   stepId: string;
@@ -52,8 +49,6 @@ export function StepTimeLimit({
   goal: string | null;
   onChange?: (change: StepTimeLimitChange) => void;
   disabled?: boolean;
-  /** Whether the workflow has other steps for "Use … for every step". */
-  canApplyToAll?: boolean;
   onOpenChange?: (open: boolean) => void;
 }) {
   const openRef = useRef(false);
@@ -113,9 +108,7 @@ export function StepTimeLimit({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
-        <DropdownMenuLabel className="text-xs font-normal">
-          Alert me if it runs longer than
-        </DropdownMenuLabel>
+        <DropdownMenuLabel>Time limit</DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={choice}
           onValueChange={(value) => onChange({ stepId, limit: value === NO_LIMIT ? null : value })}
@@ -127,15 +120,6 @@ export function StepTimeLimit({
             </DropdownMenuRadioItem>
           ))}
         </DropdownMenuRadioGroup>
-        {length && canApplyToAll && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={() => onChange({ stepId: null, limit: length })}>
-              <TimerIcon />
-              Use {length} for every step
-            </DropdownMenuItem>
-          </>
-        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
