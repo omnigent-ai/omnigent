@@ -2590,8 +2590,18 @@ def _pi_args_have_session_control(args: list[str]) -> bool:
 
 
 def _pi_args_have_thinking(args: list[str]) -> bool:
-    """Return whether user Pi args already set ``--thinking``."""
-    return any(arg == "--thinking" or arg.startswith("--thinking=") for arg in args)
+    """Return whether user Pi args set thinking via ``--thinking`` or a ``--model`` suffix."""
+    from omnigent.util.reasoning_effort import PI_THINKING_LADDER
+
+    for index, arg in enumerate(args):
+        if arg == "--thinking" or arg.startswith("--thinking="):
+            return True
+        model = args[index + 1] if arg == "--model" and index + 1 < len(args) else None
+        if arg.startswith("--model="):
+            model = arg.removeprefix("--model=")
+        if model is not None and model.rpartition(":")[2] in PI_THINKING_LADDER:
+            return True
+    return False
 
 
 def _pi_args_have_provider(args: list[str]) -> bool:

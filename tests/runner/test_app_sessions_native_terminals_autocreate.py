@@ -708,12 +708,14 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("terminal_args", "effort", "expected_thinking"),
+    ("terminal_args", "effort", "expected_levels", "expected_notices"),
     [
-        (None, "high", ["--thinking", "high"]),
-        (["--provider", "p", "--model", "m"], "high", ["--thinking", "high"]),
-        (["--thinking", "low"], "high", None),
-        (None, "bogus", None),
+        (None, "high", ["high"], []),
+        (["--provider", "p", "--model", "m"], "high", ["high"], []),
+        (["--thinking", "low"], "high", ["low"], []),
+        (["--thinking=low"], "high", [], []),
+        (["--model", "p/m:low"], "high", [], []),
+        (None, "bogus", [], ["pi_native_effort_ignored"]),
     ],
 )
 async def test_auto_create_pi_terminal_unmanaged_applies_session_effort(
@@ -721,7 +723,8 @@ async def test_auto_create_pi_terminal_unmanaged_applies_session_effort(
     monkeypatch: pytest.MonkeyPatch,
     terminal_args: list[str] | None,
     effort: str,
-    expected_thinking: list[str] | None,
+    expected_levels: list[str],
+    expected_notices: list[str],
 ) -> None:
     """Own-login and terminal-pinned launches still pass session effort as --thinking."""
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
@@ -745,6 +748,15 @@ async def test_auto_create_pi_terminal_unmanaged_applies_session_effort(
         )
 
     monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    notice_codes: list[str] = []
+
+    async def _record_notice(**kwargs: Any) -> None:
+        notice_codes.append(kwargs["code"])
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._post_native_launch_notice", _record_notice
+    )
 
     captured: dict[str, Any] = {}
 
@@ -771,13 +783,10 @@ async def test_auto_create_pi_terminal_unmanaged_applies_session_effort(
     )
 
     args = captured["spec"].args
-    if expected_thinking is None:
-        assert args.count("--thinking") == (1 if terminal_args == ["--thinking", "low"] else 0)
-        if terminal_args:
-            assert args[args.index("--thinking") + 1] == "low"
-    else:
-        assert args[args.index("--thinking") + 1] == expected_thinking[1]
-        assert args.count("--thinking") == 1
+    levels = [args[i + 1] for i, arg in enumerate(args) if arg == "--thinking"]
+    assert levels == expected_levels
+    assert notice_codes == expected_notices
+
 
 
 @pytest.mark.asyncio
