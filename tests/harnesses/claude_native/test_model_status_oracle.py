@@ -14,23 +14,139 @@ from tests.harnesses.claude_native._model_switch_support import (
 
 
 @pytest.mark.parametrize(
-    ("expected", "actual", "reported_session", "matches"),
+    ("expected", "actual", "reported_session", "expected_status", "window_size", "matches"),
     [
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", "native-session", True),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8[1m]", "native-session", True),
-        ("system.ai.claude-opus-4-8", "system.ai.claude-opus-4-8[1m]", "native-session", False),
-        ("system.ai.claude-opus-5[1m]", "system.ai.claude-opus-5", "native-session", False),
-        ("private-model[1m]", "private-model", "native-session", False),
-        ("private-model[1m]", "private-model[1m]", "native-session", True),
+        (
+            "system.ai.claude-opus-4-8[1m]",
+            "system.ai.claude-opus-4-8",
+            "native-session",
+            None,
+            1_000_000,
+            True,
+        ),
+        (
+            "system.ai.claude-opus-4-8[1m]",
+            "system.ai.claude-opus-4-8[1m]",
+            "native-session",
+            None,
+            1_000_000,
+            True,
+        ),
+        (
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-opus-4-8[1m]",
+            "native-session",
+            None,
+            1_000_000,
+            False,
+        ),
+        (
+            "system.ai.claude-opus-5[1m]",
+            "system.ai.claude-opus-5",
+            "native-session",
+            None,
+            1_000_000,
+            False,
+        ),
+        ("private-model[1m]", "private-model", "native-session", None, 1_000_000, False),
+        ("private-model[1m]", "private-model[1m]", "native-session", None, 1_000_000, True),
         (
             "system.ai.claude-opus-4-8-Private[1m]",
             "system.ai.claude-opus-4-8-Private",
             "native-session",
+            None,
+            1_000_000,
             False,
         ),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-5", "native-session", False),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", None, False),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", "earlier-session", False),
+        (
+            "system.ai.claude-opus-4-8[1m]",
+            "system.ai.claude-opus-5",
+            "native-session",
+            None,
+            1_000_000,
+            False,
+        ),
+        (
+            "system.ai.claude-opus-4-8[1m]",
+            "system.ai.claude-opus-4-8",
+            None,
+            None,
+            1_000_000,
+            False,
+        ),
+        (
+            "system.ai.claude-opus-4-8[1m]",
+            "system.ai.claude-opus-4-8",
+            "earlier-session",
+            None,
+            1_000_000,
+            False,
+        ),
+        (
+            "system.ai.claude-opus-5[1m]",
+            "system.ai.claude-opus-5",
+            "native-session",
+            "system.ai.claude-opus-5",
+            1_000_000,
+            True,
+        ),
+        ("private-model[1m]", "private-model", "native-session", "private-model", 1_000_000, True),
+        (
+            "system.ai.claude-opus-5[1m]",
+            "system.ai.claude-opus-5",
+            "native-session",
+            "system.ai.claude-opus-5",
+            200_000,
+            False,
+        ),
+        (
+            "system.ai.claude-opus-5[1m]",
+            "system.ai.claude-opus-5",
+            "native-session",
+            "system.ai.claude-opus-5",
+            None,
+            False,
+        ),
+        (
+            "system.ai.claude-opus-5[1m]",
+            "system.ai.claude-opus-4-8",
+            "native-session",
+            "system.ai.claude-opus-4-8",
+            1_000_000,
+            False,
+        ),
+        (
+            "private-Model[1m]",
+            "private-model",
+            "native-session",
+            "private-model",
+            1_000_000,
+            False,
+        ),
+        (
+            "system.ai.claude-opus-5[1m]",
+            "system.ai.claude-opus-5",
+            "earlier-session",
+            "system.ai.claude-opus-5",
+            1_000_000,
+            False,
+        ),
+        (
+            "system.ai.glm-5-3",
+            "system.ai.glm-5-3",
+            "native-session",
+            "system.ai.glm-5-3",
+            200_000,
+            True,
+        ),
+        (
+            "private-model",
+            "private-model[1m]",
+            "native-session",
+            "private-model[1m]",
+            1_000_000,
+            False,
+        ),
     ],
     ids=[
         "documented-native-context-spelling",
@@ -43,6 +159,15 @@ from tests.harnesses.claude_native._model_switch_support import (
         "wrong-generation",
         "missing-status-session",
         "different-status-session",
+        "declared-other-generation-context-spelling",
+        "declared-private-context-spelling",
+        "declared-context-needs-million-token-window",
+        "declared-context-needs-window-evidence",
+        "declared-spelling-cannot-change-generation",
+        "declared-spelling-cannot-change-private-case",
+        "declared-spelling-needs-the-same-native-session",
+        "declared-plain-spelling-remains-literal",
+        "declared-spelling-cannot-add-context",
     ],
 )
 def test_managed_model_status_check_preserves_exact_context_identity(
@@ -51,6 +176,8 @@ def test_managed_model_status_check_preserves_exact_context_identity(
     expected: str,
     actual: str,
     reported_session: str | None,
+    expected_status: str | None,
+    window_size: int | None,
     matches: bool,
 ) -> None:
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
@@ -64,7 +191,10 @@ def test_managed_model_status_check_preserves_exact_context_identity(
         raw.pop("session_id")
     else:
         raw["session_id"] = reported_session
-    raw["context_window"] = {"context_window_size": 1_000_000}
+    if window_size is None:
+        raw.pop("context_window", None)
+    else:
+        raw["context_window"] = {"context_window_size": window_size}
     raw_path.write_text(json.dumps(raw))
 
-    assert _status_model_matches(bridge_dir, expected) is matches
+    assert _status_model_matches(bridge_dir, expected, expected_status=expected_status) is matches

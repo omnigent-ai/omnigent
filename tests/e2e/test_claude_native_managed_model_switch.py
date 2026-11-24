@@ -1,4 +1,10 @@
-"""Switch a real Claude terminal to a managed picker model through the runner."""
+"""Switch a real Claude terminal to a managed picker model through the runner.
+
+Model overrides can declare the exact native status ID with
+``OMNIGENT_E2E_CLAUDE_INITIAL_STATUS_MODEL`` and
+``OMNIGENT_E2E_CLAUDE_TARGET_STATUS_MODEL``. A markerless 1M spelling needs
+the same literal ID and a reported million-token window.
+"""
 
 from __future__ import annotations
 
@@ -41,6 +47,16 @@ _INITIAL_MODEL = os.environ.get(
     "OMNIGENT_E2E_CLAUDE_INITIAL_MODEL", "system.ai.claude-opus-4-8[1m]"
 )
 _TARGET_MODEL = os.environ.get("OMNIGENT_E2E_CLAUDE_TARGET_MODEL", "system.ai.glm-5-3")
+_EXPECTED_STATUS_MODELS = {
+    _INITIAL_MODEL: os.environ.get("OMNIGENT_E2E_CLAUDE_INITIAL_STATUS_MODEL"),
+    _TARGET_MODEL: os.environ.get("OMNIGENT_E2E_CLAUDE_TARGET_STATUS_MODEL"),
+}
+
+
+def _configured_status_matches(bridge_dir: Path, expected: str) -> bool:
+    return _status_model_matches(
+        bridge_dir, expected, expected_status=_EXPECTED_STATUS_MODELS.get(expected)
+    )
 
 
 def _capture_pane(socket_path: Path, target: str = "model-switch:0.0") -> str:
@@ -68,7 +84,7 @@ async def _wait_for_model(
 ) -> None:
     deadline = asyncio.get_running_loop().time() + 30
     while asyncio.get_running_loop().time() < deadline:
-        if _status_model_matches(bridge_dir, expected):
+        if _configured_status_matches(bridge_dir, expected):
             native_session = bridge.read_claude_session_id(bridge_dir)
             assert any(
                 record.event_name == "SessionStart" and record.claude_session_id == native_session
@@ -271,7 +287,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 assert response.status_code == 204, response.text
                 await _wait_for_model(bridge_dir, model, socket_path)
                 await poll_until_async(lambda: _saved_model_matches(settings_path, _INITIAL_MODEL))
-                assert _status_model_matches(bridge_dir, model)
+                assert _configured_status_matches(bridge_dir, model)
                 if model.lower().endswith("[1m]"):
                     context = bridge.read_claude_context_state(bridge_dir)
                     assert context is not None and context["context_window_size"] == 1_000_000, (
@@ -296,7 +312,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 refused_picker.split("Select model", 1)[1]
                 == open_picker.split("Select model", 1)[1]
             )
-            assert _status_model_matches(bridge_dir, _INITIAL_MODEL)
+            assert _configured_status_matches(bridge_dir, _INITIAL_MODEL)
             assert settings_path.read_bytes() == saved_settings
             (tmp_path / "refused-model-picker.txt").write_text(refused_picker)
             # The person dismisses their picker before retrying the web selection.
@@ -318,7 +334,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             assert recovered.status_code == 204, recovered.text
             await _wait_for_model(bridge_dir, _TARGET_MODEL, socket_path)
             await poll_until_async(lambda: _saved_model_matches(settings_path, _INITIAL_MODEL))
-            assert _status_model_matches(bridge_dir, _TARGET_MODEL)
+            assert _configured_status_matches(bridge_dir, _TARGET_MODEL)
             (tmp_path / "after-switch.txt").write_text(_capture_pane(socket_path))
             (tmp_path / "live-model.json").write_text(
                 json.dumps({"model": bridge.read_claude_status_model(bridge_dir)})
@@ -365,7 +381,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
         (tmp_path / "fresh-model.json").write_text(
             json.dumps({"model": bridge.read_claude_status_model(fresh_bridge_dir)})
         )
-        assert _status_model_matches(bridge_dir, _TARGET_MODEL)
+        assert _configured_status_matches(bridge_dir, _TARGET_MODEL)
         assert json.loads(settings_path.read_text())["model"] == _INITIAL_MODEL
     finally:
         subprocess.run(

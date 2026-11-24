@@ -14,7 +14,9 @@ def native_claude_wire_model(model: str) -> str:
     return {"system.ai.claude-opus-4-8[1m]": "system.ai.claude-opus-4-8"}.get(model, model)
 
 
-def _status_model_matches(bridge_dir: Path, expected: str) -> bool:
+def _status_model_matches(
+    bridge_dir: Path, expected: str, *, expected_status: str | None = None
+) -> bool:
     try:
         raw = json.loads((bridge_dir / bridge.CONTEXT_RAW_FILE).read_text())
     except (OSError, ValueError):
@@ -24,4 +26,15 @@ def _status_model_matches(bridge_dir: Path, expected: str) -> bool:
         return False
     sync_raw_status_context(bridge_dir, None)
     actual = bridge.read_claude_status_model(bridge_dir)
+    if expected_status is not None:
+        if expected_status != expected:
+            window = raw.get("context_window")
+            if (
+                not expected.endswith("[1m]")
+                or expected_status != expected.removesuffix("[1m]")
+                or not isinstance(window, dict)
+                or window.get("context_window_size") != 1_000_000
+            ):
+                return False
+        return actual == expected_status
     return actual in (expected, native_claude_wire_model(expected))
