@@ -4,7 +4,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { conversationRegistry } from "./conversationRegistry";
 import { handleSessionEvent, initChatStore, onSendDelivered, useChatStore } from "./chatStore";
-import { SESSION_READ_TIMEOUT_MS } from "@/lib/identity";
+import { SESSION_READ_TIMEOUT_MS } from "@/lib/sessionReadTimeout";
 import { peekUnsentSend } from "@/lib/unsentSends";
 
 vi.mock("@/lib/identity", async (importOriginal) => ({

@@ -83,10 +83,10 @@ import {
 import {
   getCurrentAuthorId,
   getCurrentUserId,
-  SESSION_READ_TIMEOUT_MS,
   setSessionHostResolver,
   subscribeIdentity,
 } from "@/lib/identity";
+import { SESSION_READ_TIMEOUT_MS } from "@/lib/sessionReadTimeout";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {

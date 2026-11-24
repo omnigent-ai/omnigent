@@ -7,6 +7,7 @@
 // state into each other through the cached `currentUserId`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SESSION_READ_TIMEOUT_MS } from "./sessionReadTimeout";
 import type * as HostApi from "./host";
 
 function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
@@ -931,8 +932,7 @@ describe("OSS host routing", () => {
 
   it("sends a cold session's request once a host lookup that never answers times out", async () => {
     vi.useFakeTimers();
-    const { authenticatedFetch, SESSION_READ_TIMEOUT_MS, setSessionHostResolver } =
-      await import("./identity");
+    const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
     const lookups: (AbortSignal | undefined)[] = [];
     setSessionHostResolver((_id, options) => {
       lookups.push(options?.signal);

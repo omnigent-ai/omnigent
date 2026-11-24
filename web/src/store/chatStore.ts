@@ -188,10 +188,9 @@ import {
   getCurrentUserId,
   isSignInExpired,
   resolveSessionHost,
-  SESSION_READ_TIMEOUT_MS,
   subscribeIdentity,
-  withReadTimeout,
 } from "@/lib/identity";
+import { SESSION_READ_TIMEOUT_MS, withReadTimeout } from "@/lib/sessionReadTimeout";
 import { isDatabricksWorkspace, isHostRoutingEnabled } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).

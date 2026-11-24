@@ -235,10 +235,13 @@ export async function prefetchSessionHostChain(
       // starting the fresh read, without cancelling other snapshot consumers.
       // oxlint-disable-next-line no-await-in-loop
       await queryClient.fetchQuery(queryOptions).catch(() => undefined);
+      // Timed out during the wait: a fresh read now could no longer be cancelled.
+      if (options.signal?.aborted) return;
     }
     // A lookup that times out drops the read it started, so later reads don't
-    // join a request that never answers. A read it joined stays with its caller.
-    const startsRead = queryClient.getQueryState(queryOptions.queryKey)?.fetchStatus !== "fetching";
+    // join a request that never answers. A read it joined (even paused) stays with its caller.
+    const startsRead =
+      (queryClient.getQueryState(queryOptions.queryKey)?.fetchStatus ?? "idle") === "idle";
     const dropRead = () =>
       void queryClient.cancelQueries({ queryKey: queryOptions.queryKey, exact: true });
     if (startsRead) options.signal?.addEventListener("abort", dropRead, { once: true });

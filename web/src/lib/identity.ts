@@ -25,6 +25,7 @@ import {
   isHostRoutingEnabled,
 } from "./host";
 import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
+import { withReadTimeout } from "./sessionReadTimeout";
 import {
   clearHostKeyless,
   getSessionHost,
@@ -121,32 +122,6 @@ function hostScopeForUrl(url: string): UrlHostScope {
 // does for the SSE stream (store/chatStore.ts). The resolver is injected (not
 // imported) so identity.ts keeps no import dependency on sessionsApi.ts, which
 // imports `authenticatedFetch` from here — importing back would be a cycle.
-
-// A session snapshot, items or host read still unanswered after this counts as
-// failed, so its caller retries instead of waiting on a request the server never answers.
-export const SESSION_READ_TIMEOUT_MS = 15_000;
-
-/** Run a session read, rejecting with a retryable timeout if the server never answers. */
-export async function withReadTimeout<T>(
-  read: (signal: AbortSignal) => Promise<T>,
-  timeoutMs = SESSION_READ_TIMEOUT_MS,
-): Promise<T> {
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      const error = new DOMException("session read timed out", "TimeoutError");
-      controller.abort(error);
-      reject(error);
-    }, timeoutMs);
-  });
-  try {
-    // The race also bounds a read that is stuck before it reaches the signal.
-    return await Promise.race([read(controller.signal), timedOut]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 /** Options for resolving a session's routing host. */
 export interface SessionHostResolveOptions {
