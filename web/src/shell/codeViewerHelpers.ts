@@ -922,29 +922,70 @@ function textSourceSpan(node: Text, owner: SourceSpan): SourceSpan {
   return { start, end };
 }
 
+// A character reference such as `&amp;`, `&#42;` or `&#x2A;`, matched where it starts.
+const CHARACTER_REFERENCE = /&(?:#\d{1,7}|#[xX][\dA-Fa-f]{1,6}|[A-Za-z][A-Za-z\d]{1,31});/y;
+// ASCII punctuation, which a backslash escapes.
+const ESCAPABLE = /[!-/:-@[-`{-~]/;
+
 /**
- * Each character of *text*'s offset in *source*, the Markdown it renders from.
- * Verbatim text is found whole; otherwise characters match in order, skipping
- * syntax such as escapes, entities and quote markers. Null when a character
- * has no source of its own, like an emoji shortcode's glyph.
+ * The first stretch of *source*, from *from* on, that renders as *text* at
+ * *index*: an escape (`\*`), a character reference (`&amp;`) or the character
+ * itself. A reference can render as two code units, e.g. an emoji's pair.
  */
-function alignText(text: string, source: string): number[] | null {
-  const verbatim = source.indexOf(text);
-  if (verbatim !== -1) return Array.from({ length: text.length }, (_, i) => verbatim + i);
-  const offsets: number[] = [];
-  let at = 0;
-  for (let i = 0; i < text.length; i++) {
-    at = source.indexOf(text[i], at);
-    if (at === -1) return null;
-    offsets.push(at++);
+function nextCharacterSource(
+  text: string,
+  index: number,
+  source: string,
+  from: number,
+): { span: SourceSpan; units: number } | null {
+  const char = text[index];
+  for (let at = from; at < source.length; at++) {
+    if (source[at] === "\\" && source[at + 1] === char && ESCAPABLE.test(char)) {
+      return { span: { start: at, end: at + 2 }, units: 1 };
+    }
+    CHARACTER_REFERENCE.lastIndex = at;
+    const reference = source[at] === "&" ? CHARACTER_REFERENCE.exec(source) : null;
+    if (reference) {
+      const decoded = new DOMParser().parseFromString(reference[0], "text/html").body.textContent;
+      if (decoded && text.startsWith(decoded, index)) {
+        return { span: { start: at, end: at + reference[0].length }, units: decoded.length };
+      }
+    }
+    if (source[at] === char) return { span: { start: at, end: at + 1 }, units: 1 };
   }
-  return offsets;
+  return null;
 }
 
 /**
- * Where *point* falls in the Markdown *source*. A point the source can't place,
- * such as one inside a rendered formula, takes its stamped element's *side* edge.
- * Null when no stamped element holds the point.
+ * The stretch of *source*, the Markdown *text* renders from, behind each of its
+ * characters. Verbatim text is found whole; otherwise characters match in
+ * order, skipping syntax such as markers and quote prefixes. Null when a
+ * character has no source of its own, like an emoji shortcode's glyph.
+ */
+function alignText(text: string, source: string): SourceSpan[] | null {
+  const verbatim = source.indexOf(text);
+  // A match right after a backslash would drop that escape of its first character.
+  if (verbatim !== -1 && source[verbatim - 1] !== "\\") {
+    return Array.from({ length: text.length }, (_, i) => ({
+      start: verbatim + i,
+      end: verbatim + i + 1,
+    }));
+  }
+  const spans: SourceSpan[] = [];
+  let at = 0;
+  while (spans.length < text.length) {
+    const next = nextCharacterSource(text, spans.length, source, at);
+    if (!next) return null;
+    for (let unit = 0; unit < next.units; unit++) spans.push(next.span);
+    at = next.span.end;
+  }
+  return spans;
+}
+
+/**
+ * Where *point* falls in the Markdown *source*, as the selection's *side* edge.
+ * A point the source can't place, such as one inside a rendered formula, takes
+ * its stamped element's *side* edge. Null when no stamped element holds the point.
  */
 function sourceOffset(point: TextPoint, side: SelectionSide, source: string): number | null {
   const parent = point.node.parentElement;
@@ -952,12 +993,12 @@ function sourceOffset(point: TextPoint, side: SelectionSide, source: string): nu
   const ownerSpan = owner ? stampedSpan(owner) : null;
   if (!parent || !ownerSpan) return null;
   const span = owner === parent ? textSourceSpan(point.node, ownerSpan) : ownerSpan;
-  const offsets =
+  const characters =
     owner === parent ? alignText(point.node.data, source.slice(span.start, span.end)) : null;
-  if (!offsets) return side === "start" ? span.start : span.end;
-  // Just past the character before the point, so syntax leading the next one
-  // (an escape's backslash) stays with it.
-  return span.start + (point.offset === 0 ? offsets[0] : offsets[point.offset - 1] + 1);
+  if (!characters) return side === "start" ? span.start : span.end;
+  // A start takes its first character's whole source, an end its last one's.
+  const character = side === "start" ? characters[point.offset] : characters[point.offset - 1];
+  return span.start + (side === "start" ? character.start : character.end);
 }
 
 /** Whether *element* renders text before (start) or after (end) *point*. */
@@ -999,8 +1040,9 @@ function widenOverLeftElements(
  * Within one block the selection copies its slice of source, and a partially
  * selected bold, italic, link or code span widens to its whole source. Across
  * blocks, each block the selection covers from its edge copies whole, markers
- * included, while one entered mid-text starts or ends mid-line. Code blocks and
- * tables are never cut.
+ * included, while one entered mid-text starts or ends mid-line. A code block
+ * copies whole when the selection leaves it, while text inside one copies
+ * verbatim. A table copies whole once the selection spans its cells or leaves it.
  *
  * :param range: The selection, e.g. `window.getSelection().getRangeAt(0)`.
  * :param root: The element holding the rendered document.
@@ -1021,8 +1063,23 @@ export function markdownPreviewSelectionSource(
   if (start === null || end === null) return null;
   const from = widenOverLeftElements(bounds.start, bounds.end.node, "start", start, root);
   const to = widenOverLeftElements(bounds.end, bounds.start.node, "end", end, root);
-  const markdown = source.slice(from, to);
+  const table = tableAcrossCells(bounds.start.node, bounds.end.node, root);
+  const markdown = table
+    ? source.slice(Math.min(from, table.start), Math.max(to, table.end))
+    : source.slice(from, to);
   return markdown.trim() ? markdown : null;
+}
+
+/**
+ * The span of the table whose cells a selection from *start* to *end* spans;
+ * rows without their header don't read as a table. Null when the selection
+ * stays inside one cell or leaves the table, where widening already applies.
+ */
+function tableAcrossCells(start: Text, end: Text, root: Element): SourceSpan | null {
+  const cell = start.parentElement?.closest("td, th");
+  if (cell?.contains(end)) return null;
+  const table = start.parentElement?.closest("table");
+  return table && root.contains(table) && table.contains(end) ? stampedSpan(table) : null;
 }
 
 /**

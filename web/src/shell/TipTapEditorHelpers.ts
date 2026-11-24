@@ -324,17 +324,21 @@ function soleTextblock(content: Fragment): ProseMirrorNode | null {
  * The Markdown a copy of *slice* puts on the clipboard as plain text, written by
  * the editor's own serializer so unsaved edits come along. Text within one
  * paragraph, heading or list item copies as inline Markdown, without the block's
- * `#`s or list marker; text within a code block copies as the code itself.
+ * `#`s or list marker; text within a code block copies as the code itself. A
+ * whole selected block, such as a selected heading node, keeps its marker.
  *
  * :param editor: A TipTap editor with the Markdown extension.
  * :param slice: What the copy takes, e.g. ``editor.state.selection.content()``,
  *     whose content is cut from the top of the document.
- * :returns: The Markdown, or null when nothing but whitespace would be copied.
+ * :returns: The Markdown, or null when *slice* can't stand as a document (a few
+ *     table cells' bare rows) or nothing but whitespace would be copied.
  */
 export function selectionMarkdown(editor: Editor, slice: Slice): string | null {
   const manager = editor.markdown;
-  if (!manager) return null;
-  const textblock = soleTextblock(slice.content);
+  if (!manager || !editor.schema.topNodeType.validContent(slice.content)) return null;
+  // Only a slice open down to its textblock lies inside it.
+  const open = slice.openStart > 0 && slice.openEnd > 0;
+  const textblock = open ? soleTextblock(slice.content) : null;
   if (textblock?.type.spec.code) return textblock.textContent.trim() ? textblock.textContent : null;
   const content = textblock
     ? [{ type: "paragraph", content: textblock.content.toJSON() }]

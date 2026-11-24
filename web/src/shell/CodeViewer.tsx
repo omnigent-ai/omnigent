@@ -227,8 +227,9 @@ function MarkdownPreviewLink({
   }
   const target = filePath === null ? "" : resolveWorkspacePath(filePath, href);
   if (!openFile || !target) {
+    // Spread keeps the source-offset stamps that copy maps a selection through.
     return (
-      <span className={props.className} title={href}>
+      <span {...props} title={href}>
         {children}
       </span>
     );

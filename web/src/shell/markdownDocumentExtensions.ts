@@ -20,7 +20,8 @@ const SafeListItem = ListItem.extend({ content: "block+" });
 
 // A copy's plain text is the selection's Markdown; its HTML stays ProseMirror's,
 // which a paste back into an editor reads. Priority 101 puts it ahead of
-// TipTap's core plain-text serializer (100), since the first one answers.
+// TipTap's core plain-text serializer (100): ProseMirror takes the first
+// non-empty answer, so an empty one leaves the copy to that serializer.
 const MarkdownClipboardText = Extension.create({
   name: "markdownClipboardText",
   priority: 101,
@@ -29,9 +30,7 @@ const MarkdownClipboardText = Extension.create({
     return [
       new Plugin({
         props: {
-          clipboardTextSerializer: (slice) =>
-            selectionMarkdown(editor, slice) ??
-            slice.content.textBetween(0, slice.content.size, "\n\n"),
+          clipboardTextSerializer: (slice) => selectionMarkdown(editor, slice) ?? "",
         },
       }),
     ];

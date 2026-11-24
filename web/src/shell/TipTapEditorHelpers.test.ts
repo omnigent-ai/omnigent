@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { NodeSelection } from "@tiptap/pm/state";
+import { CellSelection } from "@tiptap/pm/tables";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import {
   installMarkdownParserPatch,
@@ -484,6 +485,11 @@ describe("selectionMarkdown on copy", () => {
   /** Selects from the start of *from* through the end of *to*, copies, and returns each flavor. */
   function copySelection(ed: Editor, from: string, to: string): Map<string, string> {
     ed.commands.setTextSelection({ from: textPosition(ed, from), to: textPosition(ed, to, true) });
+    return copyCurrentSelection(ed);
+  }
+
+  /** Copies the editor's current selection through ProseMirror and returns each flavor. */
+  function copyCurrentSelection(ed: Editor): Map<string, string> {
     const flavors = new Map<string, string>();
     const event = new Event("copy", { bubbles: true, cancelable: true });
     Object.defineProperty(event, "clipboardData", {
@@ -573,5 +579,24 @@ describe("selectionMarkdown on copy", () => {
     const ed = openMarkdown("Plain words here.");
     const flavors = copySelection(ed, " ", " ");
     expect(flavors.get("text/plain")).toBe(" ");
+  });
+
+  it("copies a selected heading node whole, marker included", () => {
+    const ed = openMarkdown("# Release notes\n\nBody text.");
+    ed.commands.setNodeSelection(0);
+    expect(copyCurrentSelection(ed).get("text/plain")).toBe("# Release notes");
+  });
+
+  it("leaves a few table cells' bare rows to TipTap's plain text", () => {
+    const ed = openMarkdown("| Name | Value |\n| --- | --- |\n| alpha | 1 |");
+    // Position before the cell holding *needle*: its text sits in the cell's paragraph.
+    const cell = (needle: string) => {
+      const $text = ed.state.doc.resolve(textPosition(ed, needle));
+      return $text.before($text.depth - 1);
+    };
+    ed.view.dispatch(
+      ed.state.tr.setSelection(CellSelection.create(ed.state.doc, cell("Name"), cell("alpha"))),
+    );
+    expect(copyCurrentSelection(ed).get("text/plain")).toBe("Name\n\nalpha");
   });
 });

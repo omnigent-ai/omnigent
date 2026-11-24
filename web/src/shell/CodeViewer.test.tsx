@@ -473,6 +473,8 @@ describe("CodeViewer Cmd+A select-all and copy interception", () => {
 });
 
 describe("CodeViewer markdown preview copy", () => {
+  const TWO_ROW_TABLE = "| Name | Value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |";
+
   /** The first rendered text node holding *needle*, and where it starts in it. */
   function previewText(needle: string): { node: Text; offset: number } {
     const root = document.querySelector(".markdown-preview");
@@ -529,8 +531,24 @@ describe("CodeViewer markdown preview copy", () => {
       "now",
       "[the docs](https://example.com/docs) now",
     ],
+    [
+      "a selection leaving a workspace link",
+      "See [notes](notes.md) here",
+      "otes",
+      "here",
+      "[notes](notes.md) here",
+    ],
     ["a selection crossing inline code", "Run `make test` today", "Run", "make", "Run `make test`"],
     ["an escaped character", "Price is 5\\*3 today", "*3", "today", "\\*3 today"],
+    ["text after an entity", "AT&amp;T rocks", "T rocks", "rocks", "T rocks"],
+    ["an entity on its own", "a &amp; b", "&", "&", "&amp;"],
+    [
+      "a selection starting at an escape",
+      "\\*literal\\* here",
+      "*literal*",
+      "*literal*",
+      "\\*literal\\*",
+    ],
     ["TeX delimiters", "Inline \\(x^2\\) math", "Inline", "math", "Inline \\(x^2\\) math"],
     [
       "whole list items",
@@ -583,10 +601,22 @@ describe("CodeViewer markdown preview copy", () => {
       "Name",
       "Intro\n\n| Name | Value |\n| ---- | ----- |\n| alpha | 1 |",
     ],
+    ["text inside a table cell", TWO_ROW_TABLE, "alpha", "alpha", "alpha"],
+    ["cells within one table row", TWO_ROW_TABLE, "alpha", "1", TWO_ROW_TABLE],
+    ["table body rows", TWO_ROW_TABLE, "alpha", "2", TWO_ROW_TABLE],
   ])("copies %s as its Markdown source", (_shape, markdown, from, to, expected) => {
     renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
     const setData = copyPreviewSelection(from, to);
     expect(setData).toHaveBeenCalledWith("text/plain", expected);
+  });
+
+  it("keeps the selected cells' HTML inside their table, without source stamps", () => {
+    renderViewer(TWO_ROW_TABLE, true, "doc.md", { viewMode: "preview" });
+    const setData = copyPreviewSelection("alpha", "1");
+    expect(setData).toHaveBeenCalledWith(
+      "text/html",
+      "<table><tbody><tr><td>alpha</td><td>1</td></tr></tbody></table>",
+    );
   });
 
   it("keeps the selection's rendered HTML, wrapped in its list, for rich paste", () => {
@@ -607,8 +637,11 @@ describe("CodeViewer markdown preview copy", () => {
     range.setStart(previewText("words").node, 0);
     range.setEnd(outside.firstChild as Text, 7);
     window.getSelection()?.addRange(range);
-    expect(fireCopyEvent(previewText("words").node)).not.toHaveBeenCalled();
-    outside.remove();
+    try {
+      expect(fireCopyEvent(previewText("words").node)).not.toHaveBeenCalled();
+    } finally {
+      outside.remove();
+    }
   });
 
   it("keeps the browser's copy when only whitespace is selected", () => {
