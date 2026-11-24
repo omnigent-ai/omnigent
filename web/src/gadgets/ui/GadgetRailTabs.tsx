@@ -48,9 +48,12 @@ import { GadgetActions, GadgetName, GadgetPinButton } from "./GadgetToolbar";
 import { GadgetUnavailable } from "./GadgetUnavailable";
 import { GadgetView } from "./GadgetView";
 import {
+  type UnfinishedGadgetBuild,
   setGadgetDraft,
   setGadgetDraftText,
+  setUnfinishedGadgetBuild,
   gadgetDraftText,
+  unfinishedGadgetBuild,
   useHasGadgetDraft,
 } from "./gadgetDrafts";
 import {
@@ -180,8 +183,16 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
   const show = (gadget: Gadget) =>
     showInSession.mutateAsync({ gadgetId: gadget.id, sessionId, shown: true });
   // A build that failed after creating its gadget: Try again continues with that gadget
-  // rather than leave it behind and make another.
-  const unfinished = useRef<{ description: string; gadget: Gadget } | null>(null);
+  // rather than leave it behind and make another. Kept per session, so it survives a visit to
+  // another session.
+  const unfinished = {
+    get current() {
+      return unfinishedGadgetBuild(sessionId);
+    },
+    set current(build: UnfinishedGadgetBuild | null) {
+      setUnfinishedGadgetBuild(sessionId, build);
+    },
+  };
   // Cancel ends the build in progress: each step checks it is still the current one, and a
   // gadget it made after Cancel is deleted. Once the build message is on its way it can't be
   // taken back, so that step finishes and shows the gadget the session is building.

@@ -2004,3 +2004,70 @@ def test_a_large_accounts_gadgets_go_a_bounded_number_per_call_and_the_rest_late
     assert alice.shelf()["pinned"] == []
     assert [g["id"] for g in alice.list_owned()["items"]] == [mine["id"]]
     assert permissions.list_for_gadget(boards[4]["id"]) == ([], None)
+
+
+def test_a_cleanup_resumed_from_another_workspace_removes_that_workspaces_grants(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.access import workspace_registration
+    from omnigent.gadgets.service import GadgetService, GadgetViewer
+
+    monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 1)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store, access, _ = _gadgets(db_uri, tmp_path, accounts)
+    with workspace_scope(202):
+        accounts.create_user_with_password("alice", "alice-hash")
+        raw = permissions.account_registrations(["alice"]).get("alice")
+        permissions.ensure_user("bob")
+        registration = workspace_registration(raw)
+        alice = GadgetService(store, access, GadgetViewer("alice", registration))
+        boards = [alice.create(f"Synthetic board {n}") for n in range(3)]
+        for board in boards:
+            permissions.grant_for_gadget("bob", board["id"], 1)
+        assert accounts.delete_user("alice") is True
+        assert len(list(store.iter_owned("alice", owner_registration=registration))) == 2
+    # Calls made in another workspace finish it, and the grants go with the gadgets.
+    for _ in range(3):
+        accounts._gadgets.resume()
+    with workspace_scope(202):
+        assert list(store.iter_owned("alice", owner_registration=registration)) == []
+        for board in boards:
+            assert permissions.list_for_gadget(board["id"]) == ([], None)
+
+
+def test_a_cleanup_that_keeps_failing_never_blocks_the_others(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.stores.gadget_store import CorruptData
+
+    monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 1)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    gadgets = accounts._gadgets
+    # An unreadable note, and a deleted account whose gadgets can't be listed.
+    pending = store._user_dir(gadget_accounts._CLEANUP_SCOPE) / "pending"
+    pending.mkdir(parents=True)
+    (pending / ("0" * 32 + ".json")).write_text("{not json")
+    gadgets._note("mallory", None)
+    real_page = store.list_owned_page
+
+    def page(user_id, **kwargs):  # type: ignore[no-untyped-def]
+        if user_id == "mallory":
+            raise CorruptData("Invalid gadget metadata")
+        return real_page(user_id, **kwargs)
+
+    monkeypatch.setattr(store, "list_owned_page", page)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    alice = service("alice")
+    boards = [alice.create(f"Synthetic board {n}") for n in range(3)]
+    assert accounts.delete_user("alice") is True
+    for _ in range(3):
+        gadgets.resume()
+    assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
+    assert all(store.get(board["id"]) is None for board in boards)

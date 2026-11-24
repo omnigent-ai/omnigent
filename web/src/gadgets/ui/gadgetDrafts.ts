@@ -3,6 +3,8 @@
 // to another session keeps the tab and its text.
 import { create } from "zustand";
 
+import type { Gadget } from "@/gadgets/api/gadgetApi";
+
 const STORAGE_KEY = "omnigent:gadget-drafts";
 // Keeps the store small if many sessions leave a draft open.
 const MAX_DRAFTS = 20;
@@ -77,8 +79,31 @@ export function setGadgetDraftText(sessionId: string, text: string): void {
   });
 }
 
+/** A build that failed after creating its gadget, and the description it was for. */
+export interface UnfinishedGadgetBuild {
+  description: string;
+  gadget: Gadget;
+}
+
+// Per session, in memory: switching sessions and back keeps it, so Try again reuses the gadget
+// and Cancel deletes it, instead of leaving it behind.
+const unfinishedBuilds = new Map<string, UnfinishedGadgetBuild>();
+
+export function unfinishedGadgetBuild(sessionId: string): UnfinishedGadgetBuild | null {
+  return unfinishedBuilds.get(sessionId) ?? null;
+}
+
+export function setUnfinishedGadgetBuild(
+  sessionId: string,
+  build: UnfinishedGadgetBuild | null,
+): void {
+  if (build === null) unfinishedBuilds.delete(sessionId);
+  else unfinishedBuilds.set(sessionId, build);
+}
+
 /** Forgets every draft; for tests. */
 export function resetGadgetDrafts(): void {
   writeDrafts(new Map());
+  unfinishedBuilds.clear();
   useGadgetDrafts.setState({ drafts: new Map() });
 }

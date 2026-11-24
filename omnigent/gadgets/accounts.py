@@ -17,10 +17,15 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
+import secrets
 from collections.abc import Callable
 
+from omnigent.db.db_models import DEFAULT_WORKSPACE_ID, current_workspace_id, workspace_scope
 from omnigent.gadgets.access import GadgetAccess
-from omnigent.stores.gadget_store import Conflict, GadgetStore, NotFound
+from omnigent.stores.gadget_store import Conflict, CorruptData, GadgetStore, NotFound
+
+_LOG = logging.getLogger(__name__)
 
 GADGETS_PER_CLEANUP = 50
 """The most gadgets one cleanup step deletes, whatever the account owned."""
@@ -67,12 +72,24 @@ class DeletedAccountGadgets:
         return done
 
     def resume(self, skip: tuple[str, str | None] | None = None) -> None:
-        """Go on with up to :data:`PENDING_PER_RESUME` cleanups earlier calls left."""
+        """Go on with up to :data:`PENDING_PER_RESUME` cleanups earlier calls left.
+
+        Each runs in the workspace its account was deleted in, whatever this call's, so its
+        grants go too. One that fails (a corrupt note or gadget) is logged and left for a later
+        call, and each call starts at a random note, so a cleanup that keeps failing never
+        keeps the others from running.
+        """
         if not self._enabled():
             return
         files = self._store.user_files(_CLEANUP_SCOPE)
+        start = f"{secrets.token_hex(16)}.json"
         try:
-            names, _ = files.list_page("pending", after=None, limit=PENDING_PER_RESUME + 1)
+            names, _ = files.list_page("pending", after=start, limit=PENDING_PER_RESUME + 1)
+            if len(names) < PENDING_PER_RESUME + 1:
+                wrapped, _ = files.list_page(
+                    "pending", after=None, limit=PENDING_PER_RESUME + 1 - len(names)
+                )
+                names += [name for name in wrapped if name <= start and name not in names]
         except NotFound:
             return
         resumed = 0
@@ -83,15 +100,25 @@ class DeletedAccountGadgets:
                 note = files.read_json(f"pending/{name}")
             except NotFound:
                 continue
+            except CorruptData:
+                _LOG.warning("Skipping an unreadable gadget cleanup note %s", name)
+                continue
             user_id, registration = note.get("user_id"), note.get("registration")
-            if not isinstance(user_id, str) or not (
-                registration is None or isinstance(registration, str)
+            workspace = note.get("workspace", DEFAULT_WORKSPACE_ID)
+            if (
+                not isinstance(user_id, str)
+                or not (registration is None or isinstance(registration, str))
+                or type(workspace) is not int
             ):
                 continue
             if skip == (user_id, registration):
                 continue
             resumed += 1
-            self._step(user_id, registration)
+            try:
+                with workspace_scope(workspace):
+                    self._step(user_id, registration)
+            except (CorruptData, Conflict) as error:
+                _LOG.warning("Gadget cleanup of a deleted account stopped: %s", error)
 
     @staticmethod
     def _note_name(user_id: str, registration: str | None) -> str:
@@ -104,7 +131,11 @@ class DeletedAccountGadgets:
         with contextlib.suppress(Conflict):  # Already noted.
             files.create_json(
                 self._note_name(user_id, registration),
-                {"user_id": user_id, "registration": registration},
+                {
+                    "user_id": user_id,
+                    "registration": registration,
+                    "workspace": current_workspace_id(),
+                },
             )
 
     def _step(self, user_id: str, registration: str | None) -> bool:

@@ -298,6 +298,10 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   Repeat through the row menu and detail page, including at a narrow viewport.
 - For managed, repeat in a deployment containing this UI version; local
   standalone evidence does not verify host styling or navigation integration.
+- `prefilled-link`: no browser test drives it. `web/src/pages/TasksPage.test.tsx`
+  ("opens it filled in once, and New afterwards starts empty") opens
+  `/tasks?new=1&name=…&prompt=…&schedule=…` and checks the form and a later New.
+  By hand: open such a link, check the filled-in form, cancel, and press New.
 
 ## Gotchas
 

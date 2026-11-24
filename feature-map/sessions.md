@@ -1513,6 +1513,15 @@ outside the checkout to retain recordings.
 The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
 `web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and
 its discoverability.
+- **`gadgets`:** no browser test drives it. `web/src/shell/AppShell.test.tsx`
+  ("gadget full screen contract") renders the real shell: an in-app open keeps the
+  sidebar as it was, a fresh link collapses it. `web/src/gadgets/host/gadgetSession.test.ts`
+  (same name) covers actions staying full screen and the Create session menu;
+  `web/src/gadgets/ui/GadgetRailTabs.test.tsx` covers the tabs, New → Gadget and
+  full screen, and `web/src/gadgets/ui/GadgetOpenSessionButton.test.tsx` the menu.
+  By hand: start a local server with `OMNIGENT_FEATURES=gadgets`, create a gadget
+  from the Gadget page, open it from the sidebar pin (sidebar stays) and from its
+  copied link in a new tab (sidebar collapses).
 
 ## Gotchas
 

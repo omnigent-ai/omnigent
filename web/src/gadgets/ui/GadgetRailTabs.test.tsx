@@ -443,6 +443,15 @@ describe("New gadget tab", () => {
     expect(within(content).getByRole("textbox", { name: "Describe the gadget" })).toHaveValue(
       "A tracker",
     );
+    // Back in A, Try again reuses A's gadget rather than make a third.
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    expect(await within(content).findByText("Link failed")).toBeVisible();
+    expect(createGadget).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(linkGadgetToSession).mock.calls.at(-1)?.[0]).toBe(madeInA.id);
+    // And Cancel there deletes A's gadget, leaving B's alone.
+    fireEvent.click(within(content).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith(madeInA.id));
+    expect(deleteGadget).not.toHaveBeenCalledWith(madeInB.id);
   });
 
   it("deletes, without linking or sending, a gadget whose create finishes after Cancel", async () => {
