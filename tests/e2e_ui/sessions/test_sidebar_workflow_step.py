@@ -1,9 +1,10 @@
-"""E2E: a workflow run's sidebar row names the step it's on.
+"""E2E: a workflow run's sidebar hover card names the step it's on.
 
 The agent writes its plan and step statuses with the journal tools in a
 scripted turn. Each write records where the plan stands on the session's
-journal heads row, and the session list carries it to the row's line under
-the title, live and after a reload, without the sidebar reading the journal.
+journal heads row, and the session list carries it to the Tasks row of the
+sidebar row's card, live and after a reload, without the sidebar reading the
+journal.
 """
 
 from __future__ import annotations
@@ -22,12 +23,12 @@ def _one_call(call_id: str, tool: str, /, **arguments: object) -> dict[str, obje
 
 
 @pytest.mark.min_server_version("0.24.0")
-def test_a_runs_sidebar_row_follows_its_steps(
+def test_a_runs_sidebar_card_follows_its_steps(
     page: Page,
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """The row counts finished steps and names the one in progress, then says the run is done.
+    """The card counts finished steps and names the one in progress, then says the run is done.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
@@ -62,18 +63,20 @@ def test_a_runs_sidebar_row_follows_its_steps(
     )
 
     page.goto(f"{base_url}/c/{session_id}")
-    line = page.locator(f'[data-sidebar-session-id="{session_id}"]').get_by_test_id(
-        "session-row-plan"
-    )
+    row = page.locator(f'[data-sidebar-session-id="{session_id}"]').get_by_role("link").first
+    tasks = page.get_by_test_id("session-tooltip-content").get_by_test_id("session-tooltip-tasks")
     composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
-    # A session with no plan has no line.
-    expect(line).to_have_count(0)
     composer.fill(f"Audit the dependencies, tracking each step. ({prompt_marker})")
     page.get_by_role("button", name="Send", exact=True).click()
 
-    expect(line).to_contain_text("1/2·Open PRs for safe upgrades", timeout=30_000)
-    expect(line).to_contain_text("2/2·All done", timeout=60_000)
+    # The card stays open on the row and follows the run while the step runs.
+    row.hover()
+    expect(tasks).to_contain_text("1/2 · Open PRs for safe upgrades", timeout=30_000)
+    expect(tasks).to_contain_text("2/2 · All done", timeout=60_000)
+    # The row itself stays one line.
+    expect(row).not_to_contain_text("All done")
     # The list a reload reads carries it too.
     page.reload()
-    expect(line).to_contain_text("2/2·All done", timeout=15_000)
+    row.hover()
+    expect(tasks).to_contain_text("2/2 · All done", timeout=15_000)

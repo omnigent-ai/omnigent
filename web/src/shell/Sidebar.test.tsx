@@ -576,15 +576,9 @@ describe("Sidebar session list", () => {
     }
   });
 
-  it("names a workflow run's step under its title and keeps it current", () => {
+  it("names a workflow run's step on its card, not its row, and keeps it current", async () => {
     const run = (progress: Conversation["plan_progress"], partial: Partial<Conversation> = {}) =>
       conv("run", "Claude Code", { plan_progress: progress, ...partial });
-    const waiting = {
-      total: 5,
-      done: 3,
-      needs_input: 1,
-      step: { name: "Approve major upgrades", state: "needs_input" as const },
-    };
     // A stable projects array keeps context churn from bypassing the memo comparator.
     projectRowsRef.current = [];
     mockConversations([
@@ -594,39 +588,54 @@ describe("Sidebar session list", () => {
         started: 3,
         step: { name: "Open PRs for safe upgrades", state: "started" },
       }),
-      // A planning chat's proposal has no statuses yet.
-      conv("planning", "Claude Code", {
-        plan_progress: { total: 5, step: { name: "Inventory", state: "next" } },
-      }),
     ]);
-    const { refresh } = renderSidebar();
-    const line = () =>
-      within(screen.getByText("run").closest("li")!).getByTestId("session-row-plan");
-    expect(line()).toHaveTextContent(
-      "Tasks: 2 of 5 finished, 2/5·Open PRs for safe upgrades+2 and 2 more",
-    );
-    expect(
-      within(screen.getByText("planning").closest("li")!).queryByTestId("session-row-plan"),
-    ).toBeNull();
+    const { refresh } = renderGroupingSidebar();
+    const link = screen.getByRole("link", { name: "run" });
+    expect(link).not.toHaveTextContent("Open PRs");
 
-    mockConversations([run(waiting)]);
-    refresh();
-    expect(line()).toHaveTextContent("3/5·Waiting for you: Approve major upgrades");
-    // The Needs response badge already says the run waits for you.
-    mockConversations([run(waiting, { pending_elicitations_count: 1 })]);
-    refresh();
-    expect(line()).toHaveTextContent("3/5·Approve major upgrades");
-    expect(line()).not.toHaveTextContent("Waiting for you");
+    fireEvent.pointerMove(link, { pointerType: "mouse" });
+    const card = await screen.findByTestId("session-tooltip-content");
+    const tasks = () => within(card).getByTestId("session-tooltip-tasks");
+    expect(tasks()).toHaveTextContent("Tasks2/5 · Open PRs for safe upgrades+2");
 
+    mockConversations([
+      run(
+        {
+          total: 5,
+          done: 3,
+          needs_input: 1,
+          step: { name: "Approve major upgrades", state: "needs_input" },
+        },
+        { pending_elicitations_count: 1 },
+      ),
+    ]);
+    refresh();
+    expect(tasks()).toHaveTextContent("3/5 · Waiting for you: Approve major upgrades");
     mockConversations([run({ total: 5, done: 4, failed: 1 })]);
     refresh();
-    expect(line()).toHaveTextContent("5/5·Finished, 1 failed");
-    // A cleared summary takes the line away.
+    expect(tasks()).toHaveTextContent("5/5 · Finished, 1 failed");
+    // A cleared summary takes the row away.
     mockConversations([run(null)]);
     refresh();
-    expect(
-      within(screen.getByText("run").closest("li")!).queryByTestId("session-row-plan"),
-    ).toBeNull();
+    expect(within(card).queryByTestId("session-tooltip-tasks")).toBeNull();
+  });
+
+  it("names a pinned workflow run's step on its project card", async () => {
+    projectsMock.push("Customer X");
+    seedPins(["pinned_run"]);
+    mockConversations([
+      conv("pinned_run", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        plan_progress: { total: 3, done: 1, step: { name: "Ship it", state: "next" } },
+      }),
+    ]);
+    renderSidebar();
+
+    fireEvent.focus(screen.getByRole("link", { name: "pinned_run" }));
+    const card = await screen.findByTestId("pinned-project-flyout");
+    expect(within(card).getByTestId("session-tooltip-tasks")).toHaveTextContent(
+      "1/3 · Next: Ship it",
+    );
   });
 
   describe.each(["legacy", "grouping", "pinned"] as const)(

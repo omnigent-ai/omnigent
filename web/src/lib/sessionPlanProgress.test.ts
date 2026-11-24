@@ -24,7 +24,7 @@ describe("planProgressLine", () => {
     expect(line?.more).toBe(2);
   });
 
-  it("says a step waits for the user unless the badge already does", () => {
+  it("says a step waits for the user", () => {
     const progress = {
       total: 5,
       done: 3,
@@ -32,13 +32,14 @@ describe("planProgressLine", () => {
       needs_input: 1,
       step: step("Approve major upgrades", "needs_input"),
     };
-    expect(planProgressLine(progress, false)).toMatchObject({
-      lead: { text: "Waiting for you", tone: "waiting" },
-      text: "Approve major upgrades",
-      // A step in progress doesn't count as waiting.
-      more: 0,
-    });
-    expect(planProgressLine(progress, true)?.lead).toBeNull();
+    for (const promptWaiting of [false, true]) {
+      expect(planProgressLine(progress, promptWaiting)).toMatchObject({
+        lead: { text: "Waiting for you", tone: "waiting" },
+        text: "Approve major upgrades",
+        // A step in progress doesn't count as waiting.
+        more: 0,
+      });
+    }
   });
 
   it("names a failure holding up the rest, and the next step between steps", () => {

@@ -1,5 +1,5 @@
 // Where a session's plan stands, as the session list reports it, and the line
-// a sidebar row shows for it: "3/5 · Open PRs for safe upgrades".
+// its sidebar hover card shows for it: "3/5 · Open PRs for safe upgrades".
 
 import { WAITING_FOR_YOU } from "@/lib/sessionJournal";
 
@@ -23,7 +23,7 @@ export interface SessionPlanProgress {
   step?: { name: string; state: PlanProgressStepState } | null;
 }
 
-/** The parts of a row's plan line, which renders them in order. */
+/** The parts of a card's plan line, which renders them in order. */
 export interface PlanProgressLine {
   /** Finished steps, failed ones included, as the chat's task preview counts them. */
   finished: number;
@@ -37,17 +37,16 @@ export interface PlanProgressLine {
 }
 
 /**
- * The line for a row whose plan has started: null while no step has a status,
- * such as a planning chat's proposal or a run whose first step hasn't begun.
- * Also null for a finished plan with a step still in progress while the badge
- * says it needs a response, where the chat's preview names that step instead.
+ * The line for a session whose plan has started: null while no step has a
+ * status, such as a planning chat's proposal or a run whose first step hasn't
+ * begun. Also null for a finished plan with a step still in progress while a
+ * prompt waits, where the chat's preview names that step instead.
  *
- * @param badgeAwaiting - Whether the row's badge already says it needs a
- *   response, so a step waiting for the user needn't say so again.
+ * @param promptWaiting - Whether a prompt in the session waits for the user.
  */
 export function planProgressLine(
   progress: SessionPlanProgress,
-  badgeAwaiting: boolean,
+  promptWaiting: boolean,
 ): PlanProgressLine | null {
   const done = progress.done ?? 0;
   const failed = progress.failed ?? 0;
@@ -57,14 +56,14 @@ export function planProgressLine(
   const line = { finished: done + failed, total: progress.total, lead: null, more: 0 };
   const step = progress.step;
   if (!step) {
-    if (badgeAwaiting && started > 0) return null;
+    if (promptWaiting && started > 0) return null;
     return { ...line, text: failed === 0 ? "All done" : `Finished, ${failed} failed` };
   }
   switch (step.state) {
     case "needs_input":
       return {
         ...line,
-        lead: badgeAwaiting ? null : { text: WAITING_FOR_YOU, tone: "waiting" },
+        lead: { text: WAITING_FOR_YOU, tone: "waiting" },
         text: step.name,
         more: Math.max(needsInput - 1, 0),
       };
