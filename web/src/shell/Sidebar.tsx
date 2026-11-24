@@ -1995,6 +1995,8 @@ function ProjectFolder({
       onProjectRenamed?.(name, newName);
     } catch (error) {
       if (error instanceof ProjectMembersNotMovedError) {
+        // The unmoved sessions keep this folder alive under its old name.
+        setPendingName(null);
         onProjectRenamed?.(name, newName);
         showToast(error.message);
         return;
