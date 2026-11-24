@@ -3497,6 +3497,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
               }));
               forgetUnsentSend(parkedIn, stableId);
+              // The files already stored for this message would otherwise stay on the session.
+              for (const file of files ?? []) {
+                const stored = uploadedFileBlockCache.get(file)?.get(parkedIn);
+                if (stored === undefined) continue;
+                uploadedFileBlockCache.get(file)?.delete(parkedIn);
+                deleteSessionFile(parkedIn, stored.file_id).catch((error: unknown) =>
+                  console.warn("Couldn't remove a removed message's upload", error),
+                );
+              }
             },
           },
         };

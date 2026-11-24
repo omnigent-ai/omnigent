@@ -4908,6 +4908,15 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
       message: "Upload cancelled",
     });
     expect(useChatStore.getState().failedUploads[0]?.uploadFailure?.fileId).toBeUndefined();
+
+    useChatStore.getState().failedUploads[0]!.uploadFailure!.remove();
+    await flush();
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) =>
+          String(input).endsWith("/resources/files/file_done") && init?.method === "DELETE",
+      ),
+    ).toBe(true);
   });
 
   it("a Cancel during the cleanup of a real failure keeps the server's reason", async () => {
