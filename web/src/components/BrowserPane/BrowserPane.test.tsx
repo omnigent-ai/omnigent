@@ -9,14 +9,32 @@ import {
   within,
 } from "@testing-library/react";
 import type * as NativeBridge from "@/lib/nativeBridge";
+import type * as Identity from "@/lib/identity";
+import { resolveIdentity } from "@/lib/identity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { BrowserPane } from "./BrowserPane";
 
 const getSessionSlim = vi.fn();
+const identity = vi.hoisted(() => ({
+  userId: "user-a" as string | null,
+  listeners: new Set<() => void>(),
+}));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof Identity>()),
+  getCurrentUserId: () => identity.userId,
+  resolveIdentity: vi.fn(async () => identity.userId),
+  subscribeIdentity: (listener: () => void) => {
+    identity.listeners.add(listener);
+    return () => identity.listeners.delete(listener);
+  },
+}));
 vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
+// Host discovery is external; these tests exercise the pane's navigation requests.
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
 
 // Desktop menu commands (Reload, Focus Address Bar); off unless a test turns them on.
 const desktop = vi.hoisted(() => ({
@@ -62,6 +80,7 @@ vi.mock("sonner", () => ({ toast }));
 function installBridge(overrides: Record<string, unknown> = {}) {
   const noopUnsub = () => {};
   const bridge = {
+    getDesktopFeatures: vi.fn().mockResolvedValue({}),
     browserHasView: vi.fn().mockResolvedValue({ exists: false }),
     onBrowserViewCreated: vi.fn().mockReturnValue(noopUnsub),
     onBrowserHostActiveChanged: vi.fn().mockReturnValue(noopUnsub),
@@ -106,6 +125,12 @@ afterEach(() => {
   resetDesktopCommandsForTests();
   desktop.enabled = false;
   vi.clearAllMocks();
+  localStorage.clear();
+  identity.userId = "user-a";
+  identity.listeners.clear();
+  vi.mocked(resolveIdentity)
+    .mockReset()
+    .mockImplementation(async () => identity.userId);
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 });
 
@@ -138,6 +163,140 @@ describe("BrowserPane cold-start (no view yet)", () => {
     cleanup();
     expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
   });
+
+  const savedReport = (owner = "user-a", url = "https://example.com/report") =>
+    writeSessionWorkspaceState("conv_a", {
+      openBrowsers: ["two"],
+      browserPages: { two: { url, title: "Report", owner } },
+    });
+  it.each(["Reload", "Enter"] as const)(
+    "keeps the saved address unloaded until %s, including on older shells",
+    async (action) => {
+      getSessionSlim.mockResolvedValue({
+        id: "conv_a",
+        hostId: "local-host",
+        parentSessionId: null,
+      });
+      savedReport();
+      const bridge = installBridge({
+        getDesktopFeatures: action === "Enter" ? undefined : vi.fn().mockResolvedValue({}),
+      });
+      await act(async () => {
+        render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+      });
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      expect(bar).toHaveValue("https://example.com/report");
+      expect(screen.getByText(/Click Reload or press Enter/)).toBeInTheDocument();
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+      expect(getSessionSlim).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled();
+
+      if (action === "Reload") fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+      else fireEvent.keyDown(bar, { key: "Enter" });
+      await waitFor(() =>
+        expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+          "browser-tab:conv_a:two",
+          "https://example.com/report",
+          undefined,
+          { force: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
+        ),
+      );
+      expect(bridge.browserReload).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["another account", "another window"])(
+    "does not prefill a page for %s",
+    async (reason) => {
+      savedReport(reason === "another account" ? "user-b" : "user-a");
+      const bridge = installBridge({
+        browserHasView: vi
+          .fn()
+          .mockResolvedValue({ exists: false, elsewhere: reason === "another window" }),
+      });
+      await act(async () => {
+        render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+      });
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
+      expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["delayed", "unchanged"],
+    ["delayed", "focused"],
+    ["delayed", "edited"],
+    ["delayed", "cleared"],
+    ["delayed", "navigated"],
+    ["delayed", "created"],
+    ["delayed", "unmounted"],
+    ["retried", "unchanged"],
+    ["retried", "edited"],
+    ["retried", "navigated"],
+    ["retried", "unmounted"],
+  ] as const)(
+    "handles %s saved-address identity when the pane is %s",
+    async (resolution, change) => {
+      savedReport();
+      let finishIdentity!: (userId: string) => void;
+      const pendingIdentity = new Promise<string>((resolve) => {
+        finishIdentity = resolve;
+      });
+      identity.userId = null;
+      vi.mocked(resolveIdentity).mockReturnValue(
+        resolution === "retried" ? Promise.resolve(null) : pendingIdentity,
+      );
+      const bridge = installBridge();
+      const { unmount } = render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+      await waitFor(() => expect(resolveIdentity).toHaveBeenCalled());
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      expect(bar).toHaveValue("");
+      if (change === "focused") {
+        fireEvent.focus(bar);
+      } else if (change === "edited" || change === "cleared") {
+        fireEvent.focus(bar);
+        fireEvent.change(bar, { target: { value: "https://example.org/chosen" } });
+        if (change === "cleared") fireEvent.change(bar, { target: { value: "" } });
+        fireEvent.blur(bar);
+      } else if (change === "navigated") {
+        act(() =>
+          bridge.onBrowserUrlChanged.mock.calls.at(-1)![0]({
+            conversationId: "browser-tab:conv_a:two",
+            url: "https://example.org/chosen",
+          }),
+        );
+      } else if (change === "created") {
+        act(() =>
+          bridge.onBrowserViewCreated.mock.calls.at(-1)![0]({
+            conversationId: "browser-tab:conv_a:two",
+          }),
+        );
+      } else if (change === "unmounted") {
+        unmount();
+        expect(identity.listeners.size).toBe(0);
+      }
+      await act(async () => {
+        identity.userId = "user-a";
+        finishIdentity("user-a");
+        await pendingIdentity;
+        if (resolution === "retried") {
+          for (const listener of identity.listeners) listener();
+        }
+      });
+      if (change !== "unmounted") {
+        expect(bar).toHaveValue(
+          change === "unchanged" || change === "focused"
+            ? "https://example.com/report"
+            : change === "edited" || change === "navigated"
+              ? "https://example.org/chosen"
+              : "",
+        );
+      }
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+      expect(getSessionSlim).not.toHaveBeenCalled();
+    },
+  );
 
   it("reattaches the retained page without navigating when its rail is reopened", async () => {
     let fireActive: ((p: { conversationId: string | null }) => void) | undefined;
@@ -291,7 +450,7 @@ describe("BrowserPane retained-view lifecycle", () => {
     bridge.browserSetActive.mockClear();
 
     rerender(<BrowserPane conversationId="conv_closed" />);
-    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled();
     expect(bridge.browserSetActive).not.toHaveBeenCalled();
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
   });

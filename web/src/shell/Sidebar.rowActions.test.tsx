@@ -14,7 +14,7 @@ import { useSyncExternalStore, type ReactElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
@@ -239,6 +239,11 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     dictation_available: false,
     ...overrides,
   };
+}
+
+function CurrentPath() {
+  const location = useLocation();
+  return <span data-testid="current-path">{`${location.pathname}${location.search}`}</span>;
 }
 
 // `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
@@ -1432,6 +1437,39 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("offers no new window on a mobile viewport", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("open-session-window")).toBeNull();
+  });
+
+  it.each([
+    ["while it shows that session", "conv_1", false],
+    ["after it moved to another session", "conv_2", true],
+  ])("offers a pop-out's own session a new window only %s", (_name, shownId, offered) => {
+    mockConversations([CONV, { ...CONV, id: "conv_2", title: "Other Session" }]);
+    document.documentElement.dataset.sessionWindow = "true";
+    document.documentElement.dataset.sessionWindowFor = "conv_1";
+    try {
+      renderSidebar(shownId);
+
+      fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+      expect(screen.queryByTestId("open-session-window") !== null).toBe(offered);
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+      fireEvent.contextMenu(screen.getByRole("link", { name: /Other Session/ }));
+      expect(screen.getByTestId("open-session-window")).toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.sessionWindow;
+      delete document.documentElement.dataset.sessionWindowFor;
+    }
+  });
+
   it("offers Fork for a managed source", () => {
     mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
     renderSidebar();
@@ -1499,6 +1537,40 @@ describe("right-click context menu", () => {
       // inline rename input appears.
       fireEvent.click(screen.getByTestId("rename-conversation"));
       expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+    },
+  );
+
+  it.each(["kebab", "context"])(
+    "opens another session in its own window from %s without leaving the current page",
+    (menu) => {
+      const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
+      const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+      try {
+        mockConversations([CONV, { ...CONV, id: "conv_2", title: "Current Session" }]);
+        renderSidebar("conv_2", undefined, { header: <CurrentPath /> });
+        const targetRow = screen.getByRole("link", { name: /My Session/ });
+
+        if (menu === "kebab") {
+          fireEvent.pointerDown(
+            within(targetRow.closest("li")!).getByTestId("conversation-actions"),
+            { button: 0 },
+          );
+        } else {
+          fireEvent.contextMenu(targetRow);
+        }
+        fireEvent.click(screen.getByTestId("open-session-window"));
+
+        expect(open).toHaveBeenCalledWith(
+          "",
+          "omnigent-session-conv_1",
+          "popup,width=960,height=820",
+        );
+        expect(popup.location.href).toBe("/c/conv_1?window=session");
+        expect(popup.focus).toHaveBeenCalled();
+        expect(screen.getByTestId("current-path")).toHaveTextContent(/^\/c\/conv_2$/);
+      } finally {
+        open.mockRestore();
+      }
     },
   );
 

@@ -611,6 +611,37 @@ that resolve to any of them, and non-web schemes remain restricted. Existing
 tool approvals are unchanged; whether a tool call asks for approval depends on
 the harness and its policy.
 
+### Agent previews on trusted remote hosts
+
+Sessions on a remote host can open localhost previews once the user explicitly
+trusts that host. Add `trusted_remote_hosts` to the desktop's `settings.json`,
+preserving any other settings:
+
+```json
+{
+  "trusted_remote_hosts": [{ "server_url": "https://server.example.com", "host_id": "abc123" }]
+}
+```
+
+The file lives in the desktop user-data directory: on macOS,
+`~/Library/Application Support/Omnigent/settings.json`; on Linux,
+`~/.config/Omnigent/settings.json`; on Windows, `%APPDATA%/Omnigent/settings.json`.
+Development builds use `Omnigent Dev` instead of `Omnigent`.
+
+`server_url` is the resolved server URL after sign-in and `host_id` is that session's
+host ID; a denied agent loopback preview gives the exact entry to add. Save the
+file and retry the preview; restarting is unnecessary. This grants sessions on
+that host access to permitted desktop localhost URLs across ports, including
+agent inspection and interaction. Only add hosts you trust with that access.
+
+Trust is scoped to one server and host ID. A changed host identity requires a
+new entry. Removing the entry blocks future requests and revokes agent access
+to the loaded page on its next operation. Both the desktop and server's web app
+must support this feature; older web apps cannot use the grant.
+The remote app's port must already be forwarded to the desktop; Omnigent does
+not establish or verify forwarding. The URL restrictions described above still
+apply.
+
 ### Local network permission
 
 Sites in the embedded pane can ask for **local network access**, including

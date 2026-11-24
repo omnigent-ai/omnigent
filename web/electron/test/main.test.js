@@ -903,6 +903,7 @@ describe("Arca extend IPC", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,
+        trustedRemoteLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -5820,6 +5821,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,
+        trustedRemoteLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -7862,6 +7864,21 @@ describe("New Window keeps its source's server (src/main.js)", () => {
     h.calls.appMenu.getMenuItemById("new_window").click();
     assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
   });
+
+  it("opens a window cloned from a session pop-out as a normal window", async (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.createWindow("https://host.example/ml/omnigents");
+    h.setUrl("https://host.example/ml/omnigents/c/conv_1?window=session&tab=files");
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    h.calls.appMenu.getMenuItemById("new_window").click();
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(h.calls.loadURL.at(-1)[0], "https://host.example/ml/omnigents/c/conv_1?tab=files");
+    assert.equal(h.api.windows.get(h.win).sessionWindowId, undefined);
+  });
 });
 
 describe("floating panel loading", () => {
@@ -7874,5 +7891,182 @@ describe("floating panel loading", () => {
       (h.calls.loading ?? []).some((call) => call.action === "show"),
       false,
     );
+  });
+});
+
+describe("session windows (src/main.js)", () => {
+  const serverUrl = "https://host.example/omnigent";
+  const flush = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+  function openSessionWindow(h, sessionId, frameUrl = h.webContents.getURL()) {
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: frameUrl } };
+    return h.ipc.get("omnigent:open-session-window")(event, sessionId);
+  }
+
+  it("opens the session in a new window on the sender's server", async (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    await flush();
+    assert.deepEqual(
+      { width: h.calls.windowOptions.at(-1).width, height: h.calls.windowOptions.at(-1).height },
+      { width: 960, height: 820 },
+    );
+    assert.equal(h.calls.loadURL.at(-1)[0], `${serverUrl}/c/conv_1?window=session`);
+    const state = h.api.windows.get(h.win);
+    assert.equal(state.serverUrl, serverUrl);
+    assert.equal(state.sessionWindowId, "conv_1");
+    assert.equal(state.role, "main");
+  });
+
+  it("keeps the main window's saved bounds when a session window moves or closes", async (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    const saved = { x: 10, y: 20, width: 1400, height: 900, maximized: false };
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ window_bounds: saved }));
+    openSessionWindow(h, "conv_1");
+    await flush();
+    assert.equal(h.calls.windowOptions.at(-1).x, undefined);
+    for (const eventName of ["move", "resize", "close"]) h.emitWindow(eventName);
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).window_bounds, saved);
+  });
+
+  it("brings an open window for the session forward instead of opening another", (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    h.api.windows.get(h.win).sessionWindowId = "conv_1";
+    h.setUrl(`${serverUrl}/c/conv_1?window=session`);
+    const before = h.calls.windowOptions?.length ?? 0;
+    const focusedBefore = h.calls.focused ?? 0;
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    assert.equal(h.calls.windowOptions?.length ?? 0, before);
+    assert.equal(h.calls.focused, focusedBefore + 1);
+  });
+
+  it("focuses a pop-out that is still loading instead of opening a duplicate", (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    const popOut = {
+      focused: 0,
+      isDestroyed: () => false,
+      isMinimized: () => false,
+      show: () => {},
+      focus: () => (popOut.focused += 1),
+      webContents: { getURL: () => "" },
+    };
+    h.api.windows.set(popOut, { serverUrl, role: "main", sessionWindowId: "conv_1" });
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    assert.equal(h.calls.windowOptions, undefined);
+    assert.equal(popOut.focused, 2);
+  });
+
+  it("refuses untrusted pages and malformed session ids", (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    assert.equal(openSessionWindow(h, "conv_1", "https://evil.example"), false);
+    assert.equal(openSessionWindow(h, "../settings"), false);
+    assert.equal(openSessionWindow(h, { id: "conv_1" }), false);
+    assert.equal(h.calls.windowOptions, undefined);
+  });
+});
+
+describe("settings-based remote previews", () => {
+  for (const redirected of [false, true]) {
+    it(`requires matching provenance and rereads settings (redirected: ${redirected})`, async (t) => {
+      const server = "https://server.example.com/preview";
+      const host = "sandbox-host";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.api.createBrowserRegistryForWindow(h.win);
+      const deps = h.browserIpcDeps();
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      const opts = { sourceHostId: host, sessionHostProtocol: 1, trustedRemotePreviewProtocol: 1 };
+      const pickedServer = redirected ? "https://account.example.com/preview" : server;
+      await h.api.loadServerUrl(h.win, pickedServer);
+      h.api.setWindowServerUrl(h.win, server);
+      h.api.pinWindow(h.win, new URL(server).origin);
+      await h.win.loadURL(server);
+      const context = (options = opts) => deps.getAgentContextForEvent(event, options);
+      const allowed = h.browserRegistryDeps().allowsLocalhost;
+      const save = (serverUrl, hostId) =>
+        fs.writeFileSync(
+          h.settingsPath,
+          JSON.stringify({
+            trusted_remote_hosts: [{ server_url: serverUrl, host_id: hostId }],
+          }),
+        );
+      assert.equal(allowed(context()), false);
+      const hint = deps.getAgentNavigationHintForEvent(
+        event,
+        "http://localhost:5173",
+        host,
+        undefined,
+        false,
+        true,
+        1,
+      );
+      const advertised = JSON.parse(hint.match(/add (\{.*\}) to trusted_remote_hosts/)[1]);
+      assert.deepEqual(advertised, { server_url: server, host_id: host });
+      save(advertised.server_url, advertised.host_id);
+      assert.equal(context().serverTarget, server);
+      assert.equal(context().hostIsTrustedRemotePreview, true);
+      assert.equal(context().hostIsThisMachine, false);
+      assert.equal(allowed(context()), true);
+      for (const trustedRemotePreviewProtocol of [undefined, 0, 2]) {
+        assert.equal(allowed(context({ ...opts, trustedRemotePreviewProtocol })), false);
+      }
+      assert.equal(allowed(context({ ...opts, sourceHostId: "another-host" })), false);
+      const loaded = context();
+      h.api.setWindowServerUrl(h.win, "https://other.example.com");
+      assert.equal(allowed(loaded), false);
+      h.api.setWindowServerUrl(h.win, server);
+      assert.equal(allowed(loaded), true);
+      save("https://other.example.com", host);
+      assert.equal(allowed(loaded), false);
+      save(server, "another-host");
+      assert.equal(allowed(loaded), false);
+      fs.writeFileSync(h.settingsPath, "{}");
+      assert.equal(allowed(loaded), false);
+      assert.equal(context().hostIsTrustedRemotePreview, undefined);
+    });
+  }
+
+  it("offers an exact settings entry only for a denied localhost permission", (t) => {
+    const server = "https://server.example.com";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const hint = (url, blocked, options = { trustedRemotePreviewProtocol: 1 }) =>
+      h
+        .browserIpcDeps()
+        .getAgentNavigationHintForEvent(
+          event,
+          url,
+          'host"quoted',
+          undefined,
+          false,
+          blocked,
+          options.trustedRemotePreviewProtocol,
+        );
+    assert.match(hint("http://localhost:5173", true), /trusted_remote_hosts/);
+    assert.ok(
+      hint("http://localhost:5173", true).includes(
+        JSON.stringify({
+          server_url: `${server}/`,
+          host_id: 'host"quoted',
+        }),
+      ),
+    );
+    assert.equal(hint("http://localhost:5173", false), null);
+    assert.equal(hint("https://example.com", true), null);
+    assert.match(hint("http://localhost:5173", true, {}), /web app.*Update it/);
+    assert.doesNotMatch(hint("http://localhost:5173", true, {}), /trusted_remote_hosts/);
   });
 });

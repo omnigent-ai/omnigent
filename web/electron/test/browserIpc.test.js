@@ -2249,6 +2249,7 @@ describe("browser IPC sessions on this machine", () => {
     live = true,
     protocol = 1,
     sshPreview = false,
+    trustedRemotePreview = false,
   } = {}) {
     const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
     const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
@@ -2276,6 +2277,7 @@ describe("browser IPC sessions on this machine", () => {
         sourceHostId: opts?.sourceHostId,
         hostIsThisMachine:
           !sshPreview &&
+          !trustedRemotePreview &&
           opts?.sessionHostProtocol === 1 &&
           isHostThisMachine(
             { hostId: opts?.sourceHostId, serverUrl: "https://server.example" },
@@ -2284,6 +2286,12 @@ describe("browser IPC sessions on this machine", () => {
               liveDaemonRecordFor: () => (liveEnrollment ? { host_id: "local" } : null),
             },
           ),
+        hostIsTrustedRemotePreview:
+          trustedRemotePreview &&
+          liveEnrollment &&
+          opts?.sessionHostProtocol === 1 &&
+          opts?.trustedRemotePreviewProtocol === 1 &&
+          opts?.sourceHostId === "local",
         hostIsSshPreview:
           sshPreview &&
           liveEnrollment &&
@@ -2298,6 +2306,7 @@ describe("browser IPC sessions on this machine", () => {
         sourceHostId: hostId,
         sessionHostProtocol: protocol,
         ...(sshPreview ? { sshPreviewProtocol: 1 } : {}),
+        ...(trustedRemotePreview ? { trustedRemotePreviewProtocol: 1 } : {}),
       },
     ) =>
       ipcMain.invoke(
@@ -2316,7 +2325,9 @@ describe("browser IPC sessions on this machine", () => {
     };
   }
 
-  for (const sshPreview of [false, true]) {
+  for (const privilege of ["local", "SSH", "trusted remote"]) {
+    const sshPreview = privilege === "SSH";
+    const trustedRemotePreview = privilege === "trusted remote";
     for (const transport of ["screenshot", "snapshot", "click", "type", "legacy"]) {
       for (const scenario of [
         {
@@ -2339,8 +2350,11 @@ describe("browser IPC sessions on this machine", () => {
         },
         { name: "no marker", opts: { sourceHostId: "local" }, allowed: false, blank: false },
       ]) {
-        it(`${sshPreview ? "SSH" : "local"} ${transport}: ${scenario.name} ${scenario.allowed ? "can" : "cannot"} read a privileged view`, async () => {
-          const { navigate, ipcMain, registry, webContents } = localNavigation({ sshPreview });
+        it(`${privilege} ${transport}: ${scenario.name} ${scenario.allowed ? "can" : "cannot"} read a privileged view`, async () => {
+          const { navigate, ipcMain, registry, webContents } = localNavigation({
+            sshPreview,
+            trustedRemotePreview,
+          });
           // Click is trusted input; type without real input stays a page script.
           const trustedInput = transport === "click";
           if (trustedInput) withFakeDebugger(webContents);
@@ -2371,7 +2385,7 @@ describe("browser IPC sessions on this machine", () => {
             {},
             {
               conversationId: "conv",
-              opts: sshPreview ? { ...scenario.opts, sshPreviewProtocol: 1 } : scenario.opts,
+              opts: { ...scenario.opts, sshPreviewProtocol: 1, trustedRemotePreviewProtocol: 1 },
               action: transport === "screenshot" || transport === "legacy" ? undefined : transport,
               params:
                 transport === "click"
@@ -2393,11 +2407,15 @@ describe("browser IPC sessions on this machine", () => {
           assert.deepEqual(loads, scenario.blank ? ["about:blank"] : []);
           assert.equal(
             entry.agentContext?.hostIsThisMachine === true,
-            !sshPreview && !scenario.blank,
+            !sshPreview && !trustedRemotePreview && !scenario.blank,
           );
           assert.equal(
             entry.agentContext?.hostIsSshPreview === true,
             sshPreview && !scenario.blank,
+          );
+          assert.equal(
+            entry.agentContext?.hostIsTrustedRemotePreview === true,
+            trustedRemotePreview && !scenario.blank,
           );
         });
       }
@@ -2472,19 +2490,21 @@ describe("browser IPC sessions on this machine", () => {
     assert.equal(registry.get("conv").agentContext.hostIsSshPreview, false);
   });
 
-  it("revokes an SSH preview on reads after its destination grant stops matching", async () => {
-    const { navigate, ipcMain, registry, webContents, setLive } = localNavigation({
-      sshPreview: true,
+  for (const trust of [{ sshPreview: true }, { trustedRemotePreview: true }]) {
+    it(`revokes a remote preview when its grant is removed: ${JSON.stringify(trust)}`, async () => {
+      const { navigate, ipcMain, registry, webContents, setLive } = localNavigation({
+        ...trust,
+      });
+      await navigate("http://localhost:5173");
+      assert.equal((await readView(ipcMain, "screenshot")).ok, true);
+      const loads = [];
+      webContents.loadURL = async (url) => loads.push(url);
+      setLive(false);
+      assert.equal((await readView(ipcMain, "screenshot")).ok, false);
+      assert.deepEqual(loads, ["about:blank"]);
+      assert.equal(registry.get("conv").agentContext, null);
     });
-    await navigate("http://localhost:5173");
-    assert.equal((await readView(ipcMain, "screenshot")).ok, true);
-    const loads = [];
-    webContents.loadURL = async (url) => loads.push(url);
-    setLive(false);
-    assert.equal((await readView(ipcMain, "screenshot")).ok, false);
-    assert.deepEqual(loads, ["about:blank"]);
-    assert.equal(registry.get("conv").agentContext, null);
-  });
+  }
 
   it("refuses a tab check from a different host without blanking its page", async () => {
     const { navigate, ipcMain, registry, webContents } = localNavigation();
@@ -2517,7 +2537,12 @@ describe("browser IPC sessions on this machine", () => {
         conversationId: "conv",
         action,
         params: { ref: 1, text: "hello" },
-        opts: { sessionHostProtocol: 1, sshPreviewProtocol: 1, sourceHostId },
+        opts: {
+          sessionHostProtocol: 1,
+          sshPreviewProtocol: 1,
+          trustedRemotePreviewProtocol: 1,
+          sourceHostId,
+        },
       },
     );
   }

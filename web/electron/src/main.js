@@ -84,11 +84,14 @@ const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
+const { isTrustedRemoteContext, readTrustedRemoteHosts } = require("./trustedRemoteHosts");
+const { normalizedServerTarget } = require("./hostStatusIdentity");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const {
   createHostThisMachineChecker,
   SESSION_HOST_PROTOCOL,
   SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
 } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
@@ -159,6 +162,12 @@ const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
+const {
+  SESSION_WINDOW_SIZE,
+  findSessionWindow,
+  sessionWindowPath,
+  withoutSessionWindowQuery,
+} = require("./sessionWindows");
 const omnigentCli = require("./omnigent_cli");
 const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
@@ -2997,6 +3006,7 @@ function registerNavigationFallbacks(win) {
  *   path?: string,
  *   role?: string,
  *   windowOptions?: Electron.BrowserWindowConstructorOptions,
+ *   sessionWindowId?: string,
  * }} [opts]
  *   ``ephemeral: true`` creates a debug multi-server window: it opens on the
  *   setup page (ignoring the saved server) and a URL connected from it is
@@ -3005,16 +3015,21 @@ function registerNavigationFallbacks(win) {
  *   A ``role`` other than ``"main"`` builds a panel from ``windowOptions``: it
  *   loads and signs in like any window, but skips the main window's saved
  *   bounds, placement and update overlay, and app-level actions skip it.
+ *   ``sessionWindowId`` marks a main window popped out for one session: it
+ *   opens at the session-window size and never saves its bounds as the main
+ *   window's.
  * @returns {BrowserWindow}
  */
 function createWindow(targetUrl, opts = {}) {
   const ephemeral = opts.ephemeral === true;
   const role = opts.role ?? "main";
   const isMain = role === "main";
-  const savedBounds = isMain ? loadSavedWindowBounds() : null;
+  const sessionWindowId = isMain ? opts.sessionWindowId : undefined;
+  const savedBounds = isMain && !sessionWindowId ? loadSavedWindowBounds() : null;
+  const defaultSize = sessionWindowId ? SESSION_WINDOW_SIZE : { width: 1280, height: 860 };
   const mainWindowOptions = {
-    width: savedBounds?.width ?? 1280,
-    height: savedBounds?.height ?? 860,
+    width: savedBounds?.width ?? defaultSize.width,
+    height: savedBounds?.height ?? defaultSize.height,
     // Without saved coordinates Electron centers the window.
     ...(savedBounds ? { x: savedBounds.x, y: savedBounds.y } : {}),
     minWidth: 720,
@@ -3110,6 +3125,7 @@ function createWindow(targetUrl, opts = {}) {
     serverUrl: destination ? serverUrl : null,
     ephemeral,
     role,
+    ...(sessionWindowId ? { sessionWindowId } : {}),
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
@@ -3290,7 +3306,7 @@ function createWindow(targetUrl, opts = {}) {
   if (isMain) {
     cascadeIfCovering(win);
     if (savedBounds?.maximized) win.maximize();
-    trackWindowBounds(win);
+    if (!sessionWindowId) trackWindowBounds(win);
     closePanelsOnSignIn(win);
   }
   return win;
@@ -3566,7 +3582,7 @@ function isFindBarSender(event) {
  */
 function newWindow() {
   const win = activeWindow();
-  const current = win?.webContents.getURL();
+  const current = withoutSessionWindowQuery(win?.webContents.getURL());
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
   // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).
@@ -4749,6 +4765,12 @@ function createBrowserRegistryForWindow(win) {
             isDatabricksManagedServerUrl(target),
           serverTarget: target,
         }) ||
+        (context?.hostIsTrustedRemotePreview === true &&
+          isTrustedRemoteContext(
+            readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+            context,
+            windows.get(win)?.serverUrl,
+          )) ||
         context?.hostIsThisMachine === true ||
         (context?.hostIsSshPreview === true &&
           sshPreviewHosts.allows(windows.get(win)?.serverUrl, context?.sourceHostId))
@@ -5405,6 +5427,27 @@ function registerIpc() {
     return true;
   });
 
+  // "Open in new window": the session in its own window on the sender's server. The server
+  // comes from main's window state, never the page; a session already popped out comes forward.
+  ipcMain.handle("omnigent:open-session-window", (event, sessionId) => {
+    if (!isPinnedOriginSender(event)) return false;
+    const routePath = sessionWindowPath(sessionId);
+    const state = windows.get(BrowserWindow.fromWebContents(event.sender));
+    if (routePath === null || !state?.serverUrl) return false;
+    const existing = findSessionWindow(windows, { serverUrl: state.serverUrl, sessionId });
+    if (existing) {
+      focusAndRestore(existing);
+      return true;
+    }
+    createWindow(undefined, {
+      serverUrl: state.serverUrl,
+      path: routePath,
+      ephemeral: state.ephemeral === true,
+      sessionWindowId: sessionId,
+    });
+    return true;
+  });
+
   // Quit (⌘Q), once the page's own dialog confirmed it.
   ipcMain.handle("omnigent:confirm-quit", (event, options) => {
     if (!isPinnedOriginSender(event)) return false;
@@ -6053,6 +6096,7 @@ function registerIpc() {
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
       sshLocalhostPreview: process.platform !== "win32",
+      trustedRemoteLocalhostPreview: true,
       // The floating New Agent panel is a macOS panel window.
       floatingComposer: process.platform === "darwin",
       // Settings can read and change the panel's shortcut by id.
@@ -6301,10 +6345,21 @@ function registerIpc() {
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
+      // Explicit grants follow the resolved server, including sign-in redirects.
+      const serverTarget = normalizedServerTarget(senderServerUrl(event));
       // Page supplies the session host ID; main verifies this machine's identity and live enrollment.
       return {
         serverTarget: arcaTarget(windowArcaServerUrl(win)),
         sourceHostId,
+        ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+        opts?.trustedRemotePreviewProtocol === TRUSTED_REMOTE_PREVIEW_PROTOCOL &&
+        isTrustedRemoteContext(
+          readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+          { serverTarget, sourceHostId },
+          serverTarget,
+        )
+          ? { hostIsTrustedRemotePreview: true, serverTarget }
+          : {}),
         ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
         opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
         sshPreviewHosts.allows(windows.get(win)?.serverUrl, sourceHostId)
@@ -6387,13 +6442,24 @@ function registerIpc() {
       sourceHostId,
       rememberedArcaHostId,
       sourceIsArcaHost,
+      localhostBlocked = false,
+      trustedRemotePreviewProtocol,
     ) => {
       const previewHint = isLoopbackPreviewUrl(url)
         ? sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)
         : null;
       if (previewHint) return previewHint;
       const targetContext = previewRecoveryTargetForEvent(event, url);
-      if (!targetContext) return null;
+      if (!targetContext) {
+        if (!localhostBlocked || !isLoopbackPreviewUrl(url) || !sourceHostId) return null;
+        if (trustedRemotePreviewProtocol !== TRUSTED_REMOTE_PREVIEW_PROTOCOL) {
+          return "This server's web app does not support settings-based localhost previews. Update it, then retry.";
+        }
+        const serverUrl = normalizedServerTarget(senderServerUrl(event));
+        if (!serverUrl) return null;
+        const entry = JSON.stringify({ server_url: serverUrl, host_id: sourceHostId });
+        return `To allow localhost previews from this session's host, add ${entry} to trusted_remote_hosts in the desktop settings.json, then retry the preview.`;
+      }
       if (typeof rememberedArcaHostId !== "string") {
         return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";
       }

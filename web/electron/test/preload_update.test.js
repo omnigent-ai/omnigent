@@ -274,7 +274,7 @@ describe("desktop command bridge", () => {
     assert.equal(h.hasListener("omnigent:desktop-command"), false);
   });
 
-  it("reports command state as plain values and asks main to close the window or quit", async () => {
+  it("reports command state as plain values and asks main to open a session window, close the window or quit", async () => {
     const h = loadPreload();
     h.desktop.setDesktopCommandState({
       commands: ["close", 3],
@@ -295,6 +295,9 @@ describe("desktop command bridge", () => {
 
     await h.desktop.closeWindow();
     assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:close-window", args: undefined });
+
+    await h.desktop.openSessionWindow("conv_1");
+    assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:open-session-window", args: "conv_1" });
 
     await h.desktop.confirmQuit({ dontAskAgain: "yes" });
     assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {

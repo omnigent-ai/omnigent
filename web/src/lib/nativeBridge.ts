@@ -30,11 +30,13 @@ export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 // Mirrors the protocol versions in electron/src/hostIdentity.js.
 export const SESSION_HOST_PROTOCOL = 1;
 export const SSH_PREVIEW_PROTOCOL = 1;
+export const TRUSTED_REMOTE_PREVIEW_PROTOCOL = 1;
 
 export interface BrowserHostOptions {
   sourceHostId?: string | null;
   sessionHostProtocol?: number;
   sshPreviewProtocol?: number;
+  trustedRemotePreviewProtocol?: number;
   navigationRetryToken?: string;
   sourceSshTarget?: string;
 }
@@ -44,6 +46,7 @@ export interface BrowserNavigationResult {
   created?: boolean;
   hostIsThisMachine?: boolean;
   sshPreviewHost?: boolean;
+  trustedRemotePreviewHost?: boolean;
   retryWithFreshHost?: boolean;
   navigationRetryToken?: string;
   error?: string;
@@ -315,6 +318,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   reportConversationShown?: (conversationId: string | null) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow?: () => Promise<boolean>;
+  /** Open a session in its own desktop window on this server. Resolves whether it opened. */
+  openSessionWindow?: (sessionId: string) => Promise<boolean>;
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
   confirmQuit?: (options: { dontAskAgain: boolean }) => Promise<boolean>;
   /**
@@ -603,6 +608,7 @@ export interface DesktopFeatures {
   chromeCookieImport?: boolean;
   /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */
   sshLocalhostPreview?: boolean;
+  trustedRemoteLocalhostPreview?: boolean;
   /** This shell can show the floating New Agent panel (macOS). */
   floatingComposer?: boolean;
   /** This shell's shortcut calls take the "floatingComposer" id (macOS). */
@@ -985,6 +991,23 @@ export async function closeDesktopWindow(): Promise<boolean> {
     return (await electron.closeWindow()) === true;
   } catch (err) {
     console.warn("[nativeBridge] closeWindow failed:", err);
+    return false;
+  }
+}
+
+/** True when the desktop shell can open a session in its own app window. */
+export function supportsDesktopSessionWindows(): boolean {
+  return typeof electronApi()?.openSessionWindow === "function";
+}
+
+/** Ask the desktop shell to open ``sessionId`` in its own window; resolves whether it did. */
+export async function openDesktopSessionWindow(sessionId: string): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.openSessionWindow) return false;
+  try {
+    return (await electron.openSessionWindow(sessionId)) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] openSessionWindow failed:", err);
     return false;
   }
 }
