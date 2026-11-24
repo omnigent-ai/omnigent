@@ -535,13 +535,7 @@ function mentionItemIdentity(item: MentionItem): string {
   return `${item.path}|${item.isDir}|${range}`;
 }
 
-/**
- * Every name an attachment must avoid, so chip tokens stay unique and each one names its own
- * file. ``tokens`` are the draft's tag tokens (live and released); ``trayNames`` are the filenames
- * already in a tray. ``text`` is the typed text a *new chip* must not capture: a chip is the
- * composer's own reference, so a spelling the user typed must not start resolving to it. A tray
- * file is referenced by the literal name the user typed, so tray files pass no ``text``.
- */
+/** The names a new attachment must avoid: tag tokens, tray filenames, and typed spellings for chips. */
 export interface AttachmentNamespace {
   tokens: readonly string[];
   trayNames: readonly string[];

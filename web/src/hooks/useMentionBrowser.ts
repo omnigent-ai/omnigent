@@ -24,6 +24,7 @@ import {
   type LiveMentions,
   type TaggedMentions,
   nameAttachmentFile,
+  tagTokensOf,
 } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -39,14 +40,6 @@ const NO_ATTACHMENTS: PastedAttachment[] = [];
 
 function attachmentsOf(tags: LiveMentions): readonly PastedAttachment[] {
   return tags.attachments ?? NO_ATTACHMENTS;
-}
-
-function tagTokens(tags: LiveMentions): string[] {
-  return [
-    ...tags.files.map(fileMentionToken),
-    ...tags.sessions.map(sessionTagToken),
-    ...attachmentsOf(tags).map((it) => it.token),
-  ];
 }
 
 /**
@@ -68,7 +61,7 @@ function tokensIn(segments: readonly string[], tokens: readonly string[]): Set<s
 
 /** `tags` without anything `removed` names by token. */
 function withoutTags(tags: LiveMentions, removed: LiveMentions): Required<LiveMentions> {
-  const gone = new Set(tagTokens(removed));
+  const gone = new Set(tagTokensOf(removed));
   return {
     files: tags.files.filter((it) => !gone.has(fileMentionToken(it))),
     sessions: tags.sessions.filter((it) => !gone.has(sessionTagToken(it))),
@@ -116,13 +109,13 @@ export interface MentionBrowserParams {
    * a literal, not the deleted tag.
    */
   segments?: readonly string[];
+  /** Takes the Files of chips a reset drops, so they go out as tray files. */
+  onDemoteChips?: (files: File[]) => void;
   /**
    * Tags the caller keeps (a grid cell's session draft) instead of this hook's
    * own state. The caller's draft drops a tag once its token leaves the text,
-   * so the release pass is skipped.
+   * so the release pass skips file and session tags.
    */
-  /** Takes the Files of chips a reset drops, so they go out as tray files. */
-  onDemoteChips?: (files: File[]) => void;
   tags?: {
     mentions: TaggedMentions;
     /** Applies ``update`` to the latest stored tags, not the rendered ones. */
@@ -165,8 +158,7 @@ export interface MentionBrowser {
   setMentionedSessions: React.Dispatch<React.SetStateAction<SessionMention[]>>;
   /** Tag a session, replacing the typed ``@query`` with its token. */
   attachSession: (session: SessionMention) => void;
-  /** Pasted files, each inserted as a chip at its input's selection. Files are validated already. */
-  /** Returns the files it could not insert, so the caller can keep them in the tray. */
+  /** Inserts pasted files as chips at the input's selection; returns those it could not insert. */
   attachPastedFiles: (
     files: readonly File[],
     target: ComposerTextTarget,
@@ -245,7 +237,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
           sessions: resolveUpdate(update, current.sessions),
         }))
     : setLocalSessions;
-  // A caller's draft gains an attachments key only once a chip exists, so its stored shape is unchanged.
+  // Pasted chips live in this hook, not in a caller's tags, so they are kept here in both modes.
   const setMentionedAttachments = setLocalAttachments;
   // An opened list stays open for the "@" token it was opened from.
   const [browse, setBrowse] = useState<{ start: number; level: SessionMenuLevel } | null>(null);
@@ -296,7 +288,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionIndex(kept >= 0 ? kept : mentionEntryKeys.length > 0 ? 0 : -1);
   }
 
-  const mentionTokens = tagTokens({
+  const mentionTokens = tagTokensOf({
     files: mentionedItems,
     sessions: mentionedSessions,
     attachments: mentionedAttachments,
@@ -321,16 +313,16 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     };
   });
 
-  // Every token a tag owns, active or released; new tags take none of them.
   // The pasted-chip tokens, live and released: the names a picked file must not take.
   const ownedChipTokens = () =>
     [...attachmentsOf(activeRef.current), ...attachmentsOf(releasedRef.current)].map(
       (attachment) => attachment.token,
     );
 
+  // Every token a tag owns, active or released; new tags take none of them.
   const ownedMentionTokens = () => [
-    ...tagTokens(activeRef.current),
-    ...tagTokens(releasedRef.current),
+    ...tagTokensOf(activeRef.current),
+    ...tagTokensOf(releasedRef.current),
   ];
 
   // Release tags whose last token was deleted (Backspace, cut, select-and-type).
@@ -339,12 +331,14 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const draftSegments = segments ?? [text];
   const segmentsKey = draftSegments.join("\u0000");
   useEffect(() => {
-    if (tags) return;
     const owned = ownedMentionTokens();
     if (owned.length === 0) return;
     const present = tokensIn(draftSegments, owned);
-    const goneFiles = mentionedItems.filter((it) => !present.has(fileMentionToken(it)));
-    const goneSessions = mentionedSessions.filter((it) => !present.has(sessionTagToken(it)));
+    // A caller that owns the file and session tags releases its own; chips are local in both modes.
+    const goneFiles = tags ? [] : mentionedItems.filter((it) => !present.has(fileMentionToken(it)));
+    const goneSessions = tags
+      ? []
+      : mentionedSessions.filter((it) => !present.has(sessionTagToken(it)));
     const goneAttachments = mentionedAttachments.filter((it) => !present.has(it.token));
     if (goneFiles.length === 0 && goneSessions.length === 0 && goneAttachments.length === 0) return;
     const gone = { files: goneFiles, sessions: goneSessions, attachments: goneAttachments };
@@ -373,7 +367,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       return;
     }
     releasedRef.current = withoutTags(releasedRef.current, restored);
-    for (const token of tagTokens(restored)) restorePointsRef.current.delete(token);
+    for (const token of tagTokensOf(restored)) restorePointsRef.current.delete(token);
     if (restored.files.length > 0) setMentionedItems((prev) => [...prev, ...restored.files]);
     if (restored.sessions.length > 0) {
       setMentionedSessions((prev) => [...prev, ...restored.sessions]);
@@ -427,7 +421,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     // removal leaves its text ahead in history, so a redo reclaims it; any other removal leaves it
     // behind, so an undo does.
     const afterTokens = tokensIn([after], owned);
-    const active = new Set(tagTokens(activeRef.current));
+    const active = new Set(tagTokensOf(activeRef.current));
     for (const token of tokensIn([before], owned)) {
       if (afterTokens.has(token)) continue;
       if (active.has(token)) {
@@ -532,6 +526,11 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
         return files.slice(index);
       }
       added.push({ token, file: named });
+      // Record the chip now: a file refused later in this paste must see it when it is named.
+      activeRef.current = {
+        ...activeRef.current,
+        attachments: [...attachmentsOf(activeRef.current), { token, file: named }],
+      };
       addedNames.push(named.name);
     }
     if (added.length > 0) {

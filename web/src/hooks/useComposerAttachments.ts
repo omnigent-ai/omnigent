@@ -125,7 +125,7 @@ export function useComposerAttachments({
   // renamed. Files that clash only with each other keep their names, as they do with no chips.
   const nameIncoming = useCallback((incoming: File[]): File[] => {
     const tokens = chipTokensRef.current?.() ?? [];
-    // No chips: the files pass through untouched, as before chips existed.
+    // A name changes only to avoid a chip, so with no chips a pick keeps the name it came with.
     if (tokens.length === 0) return incoming;
     return incoming.map((file) => nameAttachmentFile(file, { tokens, trayNames: [] }));
   }, []);

@@ -1807,7 +1807,9 @@ describe("NewChatLandingScreen create flow", () => {
     } as unknown as Response);
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
-    const sentFiles = hydrateLocalConversationMock.mock.calls.at(-1)![4] as File[];
+    const sentCall = hydrateLocalConversationMock.mock.calls.at(-1)!;
+    expect(sentCall[3]).toBe("@shot.png");
+    const sentFiles = sentCall[4] as File[];
     expect(sentFiles).toHaveLength(1);
     expect(sentFiles[0]).toBe(shot);
   });
@@ -2359,6 +2361,7 @@ describe("NewChatLandingScreen create flow", () => {
     const handoffUrl = String(navigateMock.mock.calls.at(-1)![0]);
     const token = new URL(handoffUrl, "http://localhost").searchParams.get("handoff");
     expect(token).not.toBeNull();
+    expect(peekNewSessionHandoff(token)!.text.trim()).toBe("@shot.png");
     expect(peekNewSessionHandoff(token)!.files).toEqual([shot]);
     expect(peekNewSessionHandoff(token)!.files[0]!.name).toBe("shot.png");
   });

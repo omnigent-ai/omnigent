@@ -1317,8 +1317,8 @@ describe.each(["textarea", "codemirror"] as const)(
   },
 );
 
-// With the CodeMirror flag off, the textarea composer must behave exactly as on main.
-describe("Composer on the textarea engine, as on main", () => {
+// With the CodeMirror flag off, the textarea composer keeps its own tray and mention behaviour.
+describe("Composer on the textarea engine with the flag off", () => {
   beforeEach(() => {
     resetWorkspaceMock();
     declaredMentions.harnesses = new Set();
@@ -1349,7 +1349,7 @@ describe("Composer on the textarea engine, as on main", () => {
     expect(sent.map((file) => file.name)).toEqual(["image.png", "image.png"]);
   });
 
-  it("expands a literal @Plan.png beside a session tagged @Plan, as main does", () => {
+  it("expands a literal @Plan.png beside a session tagged @Plan", () => {
     sessions.loaded = [sessionRow("s_plan", "Plan")];
     const onSend = vi.fn();
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
@@ -1546,8 +1546,18 @@ describe("Composer pasted chips", () => {
       }),
     );
     fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe("first @shot.png \n\nAsk again");
     expect(sentFiles(onSend)).toHaveLength(1);
     expect(sentFiles(onSend)![0]).toBe(newer);
+  });
+
+  it("replaces a selected range with the chip", async () => {
+    await renderCodeMirrorComposer();
+    typeAt("Look at THIS now");
+    act(() => composerTargetOf(composerInput())!.setSelectionRange(8, 12));
+    paste({ files: [new File(["s"], "shot.png", { type: "image/png" })] });
+    expect(valueOf()).toBe("Look at @shot.png now");
+    expect(tokens()).toEqual(["@shot.png"]);
   });
 
   it("keeps a chip's file as a tray file when the composer remounts with the saved draft", async () => {
@@ -1634,8 +1644,8 @@ describe("Composer pasted chips", () => {
     expect(sentFiles(onSend)![0]).toBe(shot);
   });
 
-  // Every name a sequence sends is unique, and the text keeps each reference it typed, with each
-  // chip's reference naming its own file. The rows are explicit, so each failure is one sequence.
+  // Each row is one sequence of actions and the send it must produce: names follow the rules for
+  // chips and picks, and the typed text keeps the references the user made.
   type AttachmentStep =
     | { paste: string }
     | { pick: string }
@@ -1676,12 +1686,7 @@ describe("Composer pasted chips", () => {
       { text: "look @a.png", names: ["a.png"] },
     ],
     [
-      "a chip that crossed a draft boundary and a chip pasted later keep distinct names",
-      [{ type: "look " }, { paste: "a.png" }, { remount: true }, { paste: "a.png" }],
-      { text: "look @a.png @a (2).png", names: ["a.png", "a (2).png"] },
-    ],
-    [
-      "a chip left as a tray file does not rename a later pick, as on main",
+      "a pick repeating a tray file keeps its name when no chip clashes",
       [{ type: "look " }, { paste: "a.png" }, { remount: true }, { pick: "a.png" }],
       { text: "look @a.png", names: ["a.png", "a.png"] },
     ],

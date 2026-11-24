@@ -1783,16 +1783,6 @@ describe("grid cell composer shares its session's draft", () => {
     expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt"]);
   });
 
-  it("keeps a grid cell's text and tray file names unchanged when it sends", () => {
-    const notes = new File(["n"], "notes.txt", { type: "text/plain" });
-    const shot = new File(["s"], "shot.png", { type: "image/png" });
-    bridgedCell({ text: "Summarize @notes.txt and @shot.png", files: [notes, shot] });
-    fireEvent.click(screen.getByTestId("side-chat-send"));
-    const sent = send.mock.calls[0]!;
-    expect(sent[0]).toBe("Summarize @notes.txt and @shot.png");
-    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt", "shot.png"]);
-  });
-
   it("keeps an ordinary side chat's tray file name when the text refers to it", () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     renderPane(<SideChatPane childId={childId} />);
@@ -1808,7 +1798,7 @@ describe("grid cell composer shares its session's draft", () => {
     expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt"]);
   });
 
-  it("keeps a file pasted into a cell under its own name, as on main", () => {
+  it("keeps a grid cell's text and file names, including a file pasted into it", () => {
     const shot = new File(["c"], "image.png", { type: "image/png" });
     const pasted = new File(["t"], "image.png", { type: "image/png" });
     bridgedCell({ text: "Look @image.png", files: [shot] });

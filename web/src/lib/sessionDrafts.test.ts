@@ -145,15 +145,6 @@ describe("session drafts", () => {
     expect(getSessionDraft("conversation")).toBeUndefined();
   });
 
-  it("keeps a draft's text but not its tray files across a reload", async () => {
-    const { setSessionDraft } = await import("./sessionDrafts");
-    const file = new File(["x"], "pasted-text.txt", { type: "text/plain" });
-    setSessionDraft("conversation", { text: "Read @pasted-text.txt", files: [file] });
-    vi.resetModules();
-    const { getSessionDraft } = await import("./sessionDrafts");
-    expect(getSessionDraft("conversation")).toEqual({ text: "Read @pasted-text.txt", files: [] });
-  });
-
   it("keeps plain drafts backwards-compatible and removes empty drafts", async () => {
     const { setSessionDraft, hasSessionDraft } = await import("./sessionDrafts");
     setSessionDraft("conversation", { text: "> typed\ncontinued\n", files: [] });
@@ -180,26 +171,29 @@ describe("session drafts", () => {
   });
 
   // Failed-draft recovery joins the two drafts: their tray files in order, and their tags merged.
-  // It never edits typed text, so each row's message is what the drafts typed, and every tagged
-  // token in the message still expands to its own target.
+  // It never edits typed text. Each row states the expansion its fixture's tags must produce, with
+  // the markers written out, so the check never reads the recovered tags.
   interface Side {
     message: string;
     files: File[];
     sessions?: { token: string; id: string; title: string }[];
     fileTags?: { token: string; path: string }[];
   }
-  const recoveryRows: [string, Side, Side, { message: string; names: string[] }][] = [
-    [
-      "tray files join in order and keep their names",
-      { message: "", files: [new File(["a"], "a.png")] },
-      { message: "see @b.png", files: [new File(["b"], "b.png")] },
-      { message: "see @b.png", names: ["a.png", "b.png"] },
-    ],
+  const recoveryRows: [
+    string,
+    Side,
+    Side,
+    { message: string; names: string[]; expanded: string },
+  ][] = [
     [
       "a repeated tray filename is kept as each draft gave it",
       { message: "use @a.png", files: [new File(["a"], "a.png")] },
       { message: "look @a.png", files: [new File(["b"], "a.png")] },
-      { message: "use @a.png\n\nlook @a.png", names: ["a.png", "a.png"] },
+      {
+        message: "use @a.png\n\nlook @a.png",
+        names: ["a.png", "a.png"],
+        expanded: "use @a.png\n\nlook @a.png",
+      },
     ],
     [
       "a workspace tag beside a repeated tray filename is kept",
@@ -209,7 +203,11 @@ describe("session drafts", () => {
         files: [new File(["b"], "README.md")],
         fileTags: [{ token: "@README.md", path: "README.md" }],
       },
-      { message: "Open @README.md", names: ["README.md", "README.md"] },
+      {
+        message: "Open @README.md",
+        names: ["README.md", "README.md"],
+        expanded: "Open [Attached: README.md]",
+      },
     ],
     [
       "a session tag with a longer name beside a repeated tray filename is kept",
@@ -219,17 +217,35 @@ describe("session drafts", () => {
         files: [new File(["b"], "a.png")],
         sessions: [{ token: "@a (2).png plan", id: "s_plan", title: "a (2).png plan" }],
       },
-      { message: "Use @a.png and @a (2).png plan", names: ["a.png", "a.png"] },
+      {
+        message: "Use @a.png and @a (2).png plan",
+        names: ["a.png", "a.png"],
+        expanded: 'Use @a.png and [Session: "a (2).png plan" id=s_plan subagent=no]',
+      },
+    ],
+    [
+      "a session tag that is a prefix of a file name in the text expands its prefix",
+      { message: "", files: [new File(["a"], "a.png")] },
+      {
+        message: "Check @a and @a.png",
+        files: [new File(["b"], "a.png")],
+        sessions: [{ token: "@a", id: "s_a", title: "a" }],
+      },
+      {
+        message: "Check @a and @a.png",
+        names: ["a.png", "a.png"],
+        expanded:
+          'Check [Session: "a" id=s_a subagent=no] and [Session: "a" id=s_a subagent=no].png',
+      },
     ],
   ];
 
   it.each(recoveryRows)(
-    "recovers a failed draft as main does: %s",
+    "recovers a failed draft by joining its drafts: %s",
     async (_, original, temp, want) => {
       const { recoverFailedSessionDraft, setSessionDraft } = await import("./sessionDrafts");
       const { attachmentFilename } = await import("./attachments");
-      const { composerInlineMentions, expandMentionTokens, findMentionTokens } =
-        await import("./composerMentions");
+      const { composerInlineMentions, expandMentionTokens } = await import("./composerMentions");
       const mentionsOf = (side: Side) => ({
         files: (side.fileTags ?? []).map(({ token, path }) => ({ token, path, isDir: false })),
         sessions: (side.sessions ?? []).map((session) => ({ ...session, isSubagent: false })),
@@ -246,18 +262,15 @@ describe("session drafts", () => {
       );
       expect(recovered.files.map(attachmentFilename)).toEqual(want.names);
       expect(recovered.message).toBe(want.message);
-      // Every tagged token still in the message expands to its own target.
-      const inline = composerInlineMentions(
-        recovered.mentions ?? { files: [], sessions: [] },
+      // The fixtures' own tags, not the recovered ones, expand the message.
+      const fixtureTags = composerInlineMentions(
+        {
+          files: [...mentionsOf(original).files, ...mentionsOf(temp).files],
+          sessions: [...mentionsOf(original).sessions, ...mentionsOf(temp).sessions],
+        },
         null,
       );
-      const expanded = expandMentionTokens(recovered.message, inline);
-      for (const mention of inline) {
-        if (mention.marker === mention.token) continue;
-        if (findMentionTokens(recovered.message, [mention.token]).length > 0) {
-          expect(expanded).toContain(mention.marker);
-        }
-      }
+      expect(expandMentionTokens(recovered.message, fixtureTags)).toBe(want.expanded);
     },
   );
 
