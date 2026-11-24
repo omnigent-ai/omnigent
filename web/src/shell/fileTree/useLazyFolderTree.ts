@@ -22,6 +22,18 @@ export interface LazyFolderTreeState {
   currentPresent: () => ReadonlySet<string>;
 }
 
+/**
+ * How many paths one sync adds or removes before rebuilding the tree beats changing
+ * it one path at a time: each insert reorders its folder's rows, so a folder of
+ * thousands costs quadratic time inserted, against one sort rebuilt.
+ */
+export const BULK_SYNC_OPERATIONS = 500;
+
+export interface LazyFolderTreeOptions {
+  /** Rebuilds the tree to hold `paths`, for a sync of at least {@link BULK_SYNC_OPERATIONS}. */
+  rebuild?: (paths: ReadonlySet<string>) => void;
+}
+
 /** The model's starting state for `listings`, before any sync. */
 export function initialFolderTree(listings: readonly FolderListing[]): FolderTreeSync {
   return syncFolderListings(new Set(), listings);
@@ -29,7 +41,8 @@ export function initialFolderTree(listings: readonly FolderListing[]): FolderTre
 
 /**
  * Applies `listings` to `model` whenever `listingVersion` changes. `required`
- * folders are the caller's own and are never reported as wanted.
+ * folders are the caller's own and are never reported as wanted. A sync of
+ * hundreds of paths goes through `rebuild` when the caller gives one.
  */
 export function useLazyFolderTree(
   model: FileTreeModel,
@@ -37,6 +50,7 @@ export function useLazyFolderTree(
   listings: readonly FolderListing[],
   listingVersion: string,
   required: readonly string[],
+  { rebuild }: LazyFolderTreeOptions = {},
 ): LazyFolderTreeState {
   const present = useRef<Set<string>>(initial.present);
   const loadedFolders = useRef<Set<string>>(initial.loadedFolders);
@@ -46,13 +60,14 @@ export function useLazyFolderTree(
     loadedFolders: initial.loadedFolders as ReadonlySet<string>,
     present: initial.present as ReadonlySet<string>,
   });
-  const latest = useRef({ listings, required });
-  latest.current = { listings, required };
+  const latest = useRef({ listings, required, rebuild });
+  latest.current = { listings, required, rebuild };
 
   useEffect(() => {
-    const { listings: listingsNow, required: requiredNow } = latest.current;
+    const { listings: listingsNow, required: requiredNow, rebuild: rebuildNow } = latest.current;
     const sync = syncFolderListings(present.current, listingsNow);
-    if (sync.operations.length > 0) model.batch(sync.operations);
+    if (rebuildNow && sync.operations.length >= BULK_SYNC_OPERATIONS) rebuildNow(sync.present);
+    else if (sync.operations.length > 0) model.batch(sync.operations);
     // A folder a chain hint no longer describes may have gained entries: list it.
     const relisted = [...loadedFolders.current].filter(
       (folder) =>

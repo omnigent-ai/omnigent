@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
+import type { ChangedSort } from "../FlatFileList";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -8,6 +9,7 @@ import {
   type WorkspaceFile,
   type WorkspaceListing,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { FileTreeModel } from "@/components/file-tree/vendored";
 import { isMacPlatform } from "@/lib/hotkeys";
 import type * as IdentityModule from "@/lib/identity";
 import { authenticatedFetch } from "@/lib/identity";
@@ -299,5 +301,100 @@ describe("FilesTree", () => {
     renderTree(entries);
     await screen.findByRole("treeitem", { name: "f0.txt" });
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  describe("opening a folder of hundreds of entries", () => {
+    const COUNT = 600;
+    /** `big/` with files whose name, age and size each give a different order. */
+    const bigFolder = () =>
+      Array.from({ length: COUNT }, (_, index) => ({
+        ...file(`big/f${String(index).padStart(3, "0")}.txt`),
+        modified_at: index,
+        bytes: (index * 37) % COUNT,
+      }));
+
+    // Each test takes its own session, as the tree remembers open folders per session.
+    function renderSorted(
+      session: string,
+      sort: ChangedSort,
+      rootEntries: readonly WorkspaceFile[],
+    ) {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={client}>
+          <FilesTree
+            conversationId={session}
+            browseLocation=""
+            rootEntries={rootEntries}
+            changedFiles={[]}
+            sort={sort}
+            showHidden={false}
+            showIgnored
+            refreshToken={0}
+            onFileSelect={vi.fn()}
+            reveal={null}
+            label="Workspace files"
+          />
+        </QueryClientProvider>,
+      );
+    }
+
+    /** The first rendered rows inside `parent`, in the order the tree shows them. */
+    const firstRows = (parent: string, count: number) =>
+      [...document.querySelectorAll('[role="treeitem"][data-item-path]')]
+        .map((row) => row.getAttribute("data-item-path") ?? "")
+        .filter((path) => path.startsWith(`${parent}/`) && path !== `${parent}/`)
+        .slice(0, count);
+
+    afterEach(() => vi.restoreAllMocks());
+
+    it.each<[ChangedSort, (a: WorkspaceFile, b: WorkspaceFile) => number]>([
+      ["alpha", (a, b) => a.path.localeCompare(b.path)],
+      ["recent", (a, b) => (b.modified_at ?? 0) - (a.modified_at ?? 0)],
+      ["size", (a, b) => (b.bytes ?? 0) - (a.bytes ?? 0)],
+    ])(
+      "rebuilds the tree once under %s, in the order the sort gives, instead of inserting each entry",
+      async (sort, order) => {
+        const entries = bigFolder();
+        serveListings({ big: entries });
+        const batch = vi.spyOn(FileTreeModel.prototype, "batch");
+        const reset = vi.spyOn(FileTreeModel.prototype, "resetPaths");
+        renderSorted(`conv_big_${sort}`, sort, [folder("big")]);
+        const opened = await screen.findByRole("treeitem", { name: "big" });
+        batch.mockClear();
+        reset.mockClear();
+
+        fireEvent.click(opened);
+        const expected = [...entries].sort(order).map((entry) => entry.path);
+        await waitFor(() => expect(firstRows("big", 3)).toEqual(expected.slice(0, 3)), {
+          timeout: 5000,
+        });
+        expect(
+          Math.max(0, ...batch.mock.calls.map(([operations]) => operations.length)),
+        ).toBeLessThan(500);
+        expect(reset).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it("keeps the reader's place across the rebuild: focus, selection and other open folders", async () => {
+      serveListings({ big: bigFolder(), assets: [file("assets/a.ts")] });
+      renderSorted("conv_big_place", "alpha", [folder("assets"), folder("big")]);
+      fireEvent.click(await screen.findByRole("treeitem", { name: "assets" }));
+      await screen.findByRole("treeitem", { name: "a.ts" });
+
+      const big = screen.getByRole("treeitem", { name: "big" });
+      act(() => big.focus());
+      fireEvent.click(big);
+      await waitFor(() => expect(firstRows("big", 1)).toEqual(["big/f000.txt"]), { timeout: 5000 });
+
+      const reopened = screen.getByRole("treeitem", { name: "big" });
+      expect(reopened).toHaveFocus();
+      expect(reopened).toHaveAttribute("aria-selected", "true");
+      expect(screen.getByRole("treeitem", { name: "assets" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      expect(screen.getByRole("treeitem", { name: "a.ts" })).toBeInTheDocument();
+    });
   });
 });
