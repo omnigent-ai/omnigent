@@ -30,6 +30,25 @@ function gadgetContentKey(gadget: Gadget, revision: string) {
   return [...GADGETS_KEY, "content", gadget.id, revision, permissionsKey(gadget)] as const;
 }
 
+/**
+ * While a newly published revision loads, the page keeps running the one before it, so a
+ * design change doesn't blank the gadget. Only for the same gadget seen with the same access:
+ * another gadget, or changed access, waits for its own content.
+ */
+function previousRevisionOfSameGadget(gadget: Gadget) {
+  const key = gadgetContentKey(gadget, "");
+  return (
+    previous: GadgetContent | undefined,
+    previousQuery: { queryKey: readonly unknown[] } | undefined,
+  ) => {
+    const before = previousQuery?.queryKey;
+    if (!previous || !before) return undefined;
+    const sameGadget = before[key.length - 3] === key[key.length - 3];
+    const sameAccess = before[key.length - 1] === key[key.length - 1];
+    return sameGadget && sameAccess ? previous : undefined;
+  };
+}
+
 function PublishedGadget({
   gadget,
   revision,
@@ -45,12 +64,18 @@ function PublishedGadget({
   onContentLoaded?: (content: GadgetContent) => void;
   onAddComment?: Parameters<typeof GadgetFrame>[0]["onAddComment"];
 }) {
-  const content = useQuery({
+  const content = useQuery<GadgetContent, Error, GadgetContent, readonly unknown[]>({
     queryKey: gadgetContentKey(gadget, revision),
     queryFn: ({ signal }) => getGadgetContent(gadget.id, signal),
     staleTime: Infinity,
+    placeholderData: previousRevisionOfSameGadget(gadget),
   });
   const [revisionChanged, setRevisionChanged] = useState(false);
+  const shownRevision = content.isPlaceholderData ? undefined : content.data?.revision_id;
+  // The new version arrived: its notice is done.
+  useEffect(() => {
+    if (shownRevision !== undefined) setRevisionChanged(false);
+  }, [shownRevision]);
   // The page learned that a newer revision is published: load it now rather than at the next
   // poll, so the page does not sit on errors about a revision that is gone.
   const onRevisionChanged = useCallback(() => {
@@ -58,8 +83,8 @@ function PublishedGadget({
     onReloadGadget();
   }, [onReloadGadget]);
   useEffect(() => {
-    if (content.data) onContentLoaded?.(content.data);
-  }, [content.data, onContentLoaded]);
+    if (content.data && !content.isPlaceholderData) onContentLoaded?.(content.data);
+  }, [content.data, content.isPlaceholderData, onContentLoaded]);
 
   if (content.isPending) {
     return (
@@ -90,6 +115,15 @@ function PublishedGadget({
   }
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {content.isPlaceholderData && !revisionChanged && (
+        <div
+          role="status"
+          className="flex shrink-0 items-center gap-2 border-b border-border bg-muted/40 px-3 py-1.5 text-sm text-muted-foreground"
+        >
+          <Loader2Icon className="size-3.5 shrink-0 animate-spin" />
+          Updating to the new version…
+        </div>
+      )}
       {revisionChanged && (
         <div
           role="status"
@@ -197,7 +231,8 @@ export function GadgetView({
         <div className="flex min-w-0 flex-1 flex-col">
           {gadget.published_revision ? (
             <PublishedGadget
-              key={gadget.published_revision}
+              // A new revision of this gadget keeps its state; another gadget starts afresh.
+              key={gadget.id}
               gadget={gadget}
               revision={gadget.published_revision}
               sessionId={sessionId}

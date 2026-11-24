@@ -1087,6 +1087,18 @@ ${GADGET_KIT_HELPERS}
     if (/^[A-Z][a-z]*$/.test(first) && !/^[A-Z][a-z]+[A-Z]/.test(first)) text = text.charAt(0).toLowerCase() + text.slice(1);
     return text.length > WAITS_MAX ? text.slice(0, WAITS_MAX - 1).replace(/\\s+\\S*$/, '') + '…' : text;
   }
+  // Whether waiting_on only names a task depends_on already shows ("the SDK PR" beside a chip
+  // for the SDK task), so the task doesn't say it waits twice.
+  function squash(value) { return plain(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+  function namesAWaitedTask(task, known) {
+    var waiting = squash(task.waiting_on);
+    if (!waiting) return false;
+    return (task.depends_on || []).some(function (other) {
+      if (!owns(known, other)) return false;
+      var names = [squash(known[other].title), squash(other)];
+      return names.some(function (name) { return name && (waiting === name || waiting.indexOf(name) !== -1 || name.indexOf(waiting) !== -1); });
+    });
+  }
   // Links, what the task waits on and what waits on it, as one element (empty when there are
   // none), so a design can put it anywhere.
   function taskChips(task) {
@@ -1096,7 +1108,7 @@ ${GADGET_KIT_HELPERS}
       if (!owns(known, other)) return;
       chips.push(el('button', { type: 'button', class: 'chip', 'data-kind': 'waits', title: 'Waits on this task', on: { click: function () { focusTask(other); } } }, ['Waits on ' + known[other].title]));
     });
-    if (task.waiting_on) chips.push(el('span', { class: 'chip', 'data-kind': 'waits', title: plain(task.waiting_on), text: 'Waits on ' + waitsOnText(task.waiting_on) }));
+    if (task.waiting_on && !namesAWaitedTask(task, known)) chips.push(el('span', { class: 'chip', 'data-kind': 'waits', title: plain(task.waiting_on), text: 'Waits on ' + waitsOnText(task.waiting_on) }));
     dependents(task).forEach(function (other) {
       if (task.state === 'done') return;
       chips.push(el('button', { type: 'button', class: 'chip', 'data-kind': 'blocks', title: 'This task waits on it', on: { click: function () { focusTask(other.id); } } }, ['Blocks ' + other.title]));
@@ -1905,8 +1917,9 @@ throws, the kit switches the design's styles off, shows its plain view and repor
 render_reports.
 
 model: radar (the radar record: headline, tasks, sessions, scanned_at, window_days), tasks (the
-tasks that have an id and a title), open (those not shipped yet: draw these), shipped (the kit
-lists them itself), others (sessions that are not part of a task; the kit lists them too), sessions (an object of the radar's sessions keyed by ID, not an array: use
+tasks that have an id and a title, shipped ones included), open (those not shipped yet: draw
+these), shipped (the kit lists them itself under Shipped recently: a design that draws from
+tasks must skip them, so none shows twice), others (sessions that are not part of a task; the kit lists them too), sessions (an object of the radar's sessions keyed by ID, not an array: use
 Object.values(model.sessions) to list them), stages (pre_pr, post_pr, post_merge, post_rollout),
 layout (the layout record or null), patterns (how each project ships, from the patterns record),
 width (root's width in pixels), preview.
@@ -2005,7 +2018,7 @@ export const WHERE_WAS_I_GUIDE = [
   "",
   "The `patterns` record is `{updated_at, history_days, sessions_seen, patterns, ledger}`.",
   "",
-  '- `patterns` (up to 10): how a project ships, `{id, name, project, summary, steps, evidence, seen, bar, hits}`. `steps` (up to 16, in order) are `{id, label, stage, when, after_days, done_rate, forgotten}`: `when` says when the step applies ("flagged changes"), `after_days` the usual delay after the previous step, `done_rate` how often it was done when it applied, `forgotten` true when they usually skip it or do it late. `evidence` is `{session_id, quote}` from past changes and `seen` counts them. `hits` is `{shown, clicked, dismissed, ignored}`; `bar` (0.5 to 0.95) is its calibrated bar.',
+  '- `patterns` (up to 10): how a project ships, `{id, name, project, summary, steps, evidence, seen, bar, hits}`. `steps` (up to 16, in order) are `{id, label, stage, when, after_days, done_rate, forgotten}`: `when` says when the step applies ("flagged changes"), `after_days` the usual delay after the previous step, `done_rate` how often it was done when it applied, counting finished changes only (a change still in flight never counts against its own step), `forgotten` true when they usually skip it or do it late. `evidence` is `{session_id, quote}` from past changes and `seen` counts them. `hits` is `{shown, clicked, dismissed, ignored}`; `bar` (0.5 to 0.95) is its calibrated bar.',
   "- `ledger` (up to 40, newest first): one entry per step Next up showed, `{step, pattern, label, shown_at, outcome, reason, resolved_at}`, with `outcome` `open`, `clicked`, `dismissed` or `ignored`.",
   "",
   "On each scan, learn lightly: sessions active in the last `history_days` (default 30), at most 60, reading journals or last items only for those that look like a step of a change. Find each project's steps from changes that went further than the current ones, with the gaps between them and which steps it skips. Never add a pattern from general knowledge alone. Keep IDs stable, update evidence and rates, drop patterns not seen within `history_days`, and keep the record under 24 KiB.",
@@ -2014,8 +2027,8 @@ export const WHERE_WAS_I_GUIDE = [
   "",
   "Next up is judged by its hit ratio, the share of shown steps the viewer clicks, not by how many it shows. A wrong step costs more than a missing one; the best step is one the viewer would otherwise miss or do late.",
   "",
-  "1. Propose a step only when it is due: the task's previous step is done, its pattern's `after_days` has passed, and no later session shows it done or under way.",
-  "2. Estimate `confidence`: how sure you are of the task's place and that the step is due, times the pattern's hit ratio (`clicked / (clicked + dismissed + ignored)`; about 0.8 with fewer than five resolved). Lower it after a `not_relevant` dismissal of a similar step.",
+  "1. Propose a step only when it is due: the task's previous step is done, its pattern's `after_days` has passed, and no later session shows it done or under way. A `forgotten` step is due as soon as its previous step is done: catching it before it is missed is the point.",
+  "2. Estimate `confidence`: how sure you are of the task's place and that the step is due, times the pattern's hit ratio (`clicked / (clicked + dismissed + ignored)`; about 0.8 with fewer than five resolved). Lower it after a `not_relevant` dismissal of a similar step. A low `done_rate` on a `forgotten` step is why to offer it, not a reason to lower `confidence`.",
   '3. Offer every step that is due and at or above the bar, at most one per task, including steps due by a pattern: an impact report the usual days after the last ramp, or the pattern\'s next ramp after a clean metric check. Name the exact next value from the pattern ("Ramp to 50%", not "beyond 10%"). No step is the right answer when nothing is due; never fill the list.',
   '4. `why_now` is one sentence from the evidence ("Two quiet days at 5%; you ramp after two."). Cite the session and a short quote in `evidence`.',
   "5. Keep the ledger: mark each `open` entry `clicked` when a `do_next_step` action or `step_runs` record exists for it, `dismissed` with its reason when it is in `dismissed`, `ignored` once it is seven days old; add an `open` entry for each new step and update each pattern's `hits`.",
@@ -2029,7 +2042,7 @@ export const WHERE_WAS_I_GUIDE = [
   "1. Read the `layout` record, and the `render_reports` record for the published revision from `sys_gadget_get`. If it says `failed`, restore the previous look first (Restoring).",
   "2. List sessions with `sys_session_list` (visibility `mine`). Rows are ordered by creation, not activity: read at most 4 pages with `cursor` and keep the sessions whose `last_activity_at` (Unix seconds) is within `window_days`, at most 30, most recent first. When pages remain, set `sessions_unchecked`. Skip this gadget session and sessions you started for its next steps.",
   "3. For each kept session read a little: title and status, then its journal with `sys_journal_read` when available, else `sys_session_get_history` limited to its last few items. Never read whole transcripts. On a rescan, read again only sessions active since `scanned_at`.",
-  "4. Coverage first: every kept session goes in `sessions`, under a task or with `other`. A change the viewer is actively working on must never be missing; when unsure whether a session is a change, make it a task.",
+  "4. Coverage first: every kept session goes in `sessions`, under a task or with `other`. Another gadget's session (its first message says it is a gadget session, or it carries a gadget's actions) is `other` (\"a gadget session\"), not evidence of a change: ignore its hides, and use its step failures only when it worked on the same change's code. A change the viewer is actively working on must never be missing; when unsure whether a session is a change, make it a task.",
   "5. Place each task on its track from evidence: commits and pushes, a PR opened, review comments, CI runs, merges, deploys, flag ramps, metric checks, an impact write-up. Several sessions about one change are one task; link tasks that wait on each other with `depends_on`.",
   "6. Update the patterns record and choose next steps (Patterns, Next up). Leave out steps in `dismissed`; drop steps whose `step_runs` say done.",
   "7. Keep the IDs of tasks and next steps that are still the same thing, so the page moves them instead of redrawing, and keep a finished task as `done` for one more scan.",
@@ -2047,7 +2060,7 @@ export const WHERE_WAS_I_GUIDE = [
   "- Make it glanceable in the docked side panel (about 400 px wide) and full screen. Use the kit's colors, respect `kit.calm`, and use inline SVG and CSS only: the frame's CSP blocks external requests. Keep the HTML well under 1 MiB.",
   "- Include at least one visual element that carries meaning, such as `kit.track(task)` or your own stage columns.",
   "- Animate changes in place with `kit.keyed` and stable IDs, and scope your CSS to your own classes.",
-  "- Draw `model.open`; shipped work, Next up, the other sessions, Done recently, what the session learned, the hit ratio, the scan status, Rescan, the look line and the guide are the kit's: do not draw them again. Kit pieces that draw return elements; pass data only to your own code. Next up owns its steps: draw only `kit.laterSteps(task)`, with `kit.stepButton` or `kit.stepCard`, and use `kit.sessionLink` or `kit.sessionCard` for sessions, so their actions and progress keep working.",
+  "- Draw `model.open`. `model.tasks` also holds shipped work, which the kit lists under Shipped recently: a design that draws from `model.tasks` must skip shipped tasks so none shows twice. Shipped work, Next up, the other sessions, Done recently, what the session learned, the hit ratio, the scan status, Rescan, the look line and the guide are the kit's: do not draw them again. Kit pieces that draw return elements; pass data only to your own code. Next up owns its steps: draw only `kit.laterSteps(task)`, with `kit.stepButton` or `kit.stepCard`, and use `kit.sessionLink` or `kit.sessionCard` for sessions, so their actions and progress keep working.",
   "",
   "To publish a design:",
   "",

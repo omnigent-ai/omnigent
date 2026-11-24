@@ -978,6 +978,25 @@ describe("where was I tasks", () => {
     expect(byId("card-client").getAttribute("data-focused")).toBe("true");
   });
 
+  it("says a task waits once when waiting_on names the task it depends on", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    const value = {
+      ...TRACKED,
+      tasks: TRACKED.tasks.map((task) =>
+        task.id === "cache-fix" ? { ...task, waiting_on: "the Client 4.2 release to merge" } : task,
+      ),
+    };
+    emit("radar", [{ id: "current", version: "v1", value }]);
+
+    await waitFor(() => expect(byId("card-cache-fix")).toBeTruthy());
+    const waits = Array.from(
+      byId("card-cache-fix").querySelectorAll('.chip[data-kind="waits"]'),
+      (chip) => chip.textContent,
+    );
+    expect(waits).toEqual(["Waits on Client 4.2 release"]);
+  });
+
   it("lists every session the scan kept, under its task or among the others", async () => {
     const { emit, ready } = startRadar();
     await waitFor(() => expect(ready()).toBe(true));

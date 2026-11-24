@@ -78,6 +78,75 @@ describe("a gadget beside a session", () => {
     expect(onReload).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps the previous version running while a newly published one loads", async () => {
+    const { rerender } = renderWithGadgets(
+      <GadgetView
+        gadget={BOARD}
+        sessionId="conv_1"
+        onReloadGadget={vi.fn()}
+        toolbarTarget={null}
+        renderToolbar={(commentsButton) => commentsButton}
+      />,
+    );
+    expect(await screen.findByTestId("gadget-frame")).toHaveTextContent("<p>board</p>");
+    let finish: (content: Awaited<ReturnType<typeof getGadgetContent>>) => void = () => {};
+    vi.mocked(getGadgetContent).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    rerender(
+      <GadgetView
+        gadget={{ ...BOARD, published_revision: "rev-2" }}
+        sessionId="conv_1"
+        onReloadGadget={vi.fn()}
+        toolbarTarget={null}
+        renderToolbar={(commentsButton) => commentsButton}
+      />,
+    );
+    // No "Loading gadget…" in between: the old page stays, with a quiet note.
+    expect(screen.queryByText("Loading gadget…")).toBeNull();
+    expect(screen.getByTestId("gadget-frame")).toHaveTextContent("<p>board</p>");
+    expect(screen.getByText("Updating to the new version…")).toBeVisible();
+    await act(async () => {
+      finish({
+        revision_id: "rev-2",
+        html: "<p>new look</p>",
+        sdk_version: GADGET_SDK_VERSION,
+        capabilities: ["data.read"],
+      });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("gadget-frame")).toHaveTextContent("<p>new look</p>"),
+    );
+    expect(screen.queryByText("Updating to the new version…")).toBeNull();
+  });
+
+  it("waits for another gadget's own page instead of showing the previous gadget's", async () => {
+    const { rerender } = renderWithGadgets(
+      <GadgetView
+        gadget={BOARD}
+        sessionId="conv_1"
+        onReloadGadget={vi.fn()}
+        toolbarTarget={null}
+        renderToolbar={(commentsButton) => commentsButton}
+      />,
+    );
+    await screen.findByTestId("gadget-frame");
+    vi.mocked(getGadgetContent).mockReturnValueOnce(new Promise(() => {}));
+    rerender(
+      <GadgetView
+        gadget={gadgetFixture({ id: "other" })}
+        sessionId="conv_1"
+        onReloadGadget={vi.fn()}
+        toolbarTarget={null}
+        renderToolbar={(commentsButton) => commentsButton}
+      />,
+    );
+    expect(screen.getByText("Loading gadget…")).toBeVisible();
+    expect(screen.queryByTestId("gadget-frame")).toBeNull();
+  });
+
   it("opens the comments beside it, starting from a selection", async () => {
     renderView();
     await waitFor(() => expect(frameProps?.onAddComment).toBeDefined());
