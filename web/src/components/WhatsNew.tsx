@@ -66,11 +66,11 @@ export function WhatsNew({ entries = WHATS_NEW_ENTRIES }: { entries?: WhatsNewEn
       {badgeVisible && (
         <div
           role="status"
-          className="fixed left-1/2 top-[calc(0.5rem+var(--omnigent-safe-top,0px))] z-50 flex -translate-x-1/2 items-center gap-1 rounded-full bg-success py-1 pr-1 pl-3 text-sm text-white shadow-md"
+          className="fixed left-1/2 top-[calc(4.25rem+var(--omnigent-safe-top,0px))] sm:top-[calc(0.5rem+var(--omnigent-safe-top,0px))] z-50 flex -translate-x-1/2 items-center gap-1 rounded-full bg-success py-1 pr-1 pl-3 text-sm text-white shadow-md"
         >
           <button
             type="button"
-            className="flex items-center gap-1.5 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-white/70"
+            className="flex items-center gap-1.5 whitespace-nowrap rounded-full outline-none focus-visible:ring-2 focus-visible:ring-white/70"
             onClick={() => {
               markSeen();
               setOpen(true);
@@ -78,7 +78,10 @@ export function WhatsNew({ entries = WHATS_NEW_ENTRIES }: { entries?: WhatsNewEn
           >
             <SparklesIcon className="size-4" aria-hidden="true" />
             <span className="font-semibold">What&apos;s New?</span>
-            <span>See features released since your last visit.</span>
+            {/* Narrow screens show just the label so the pill fits beside the header controls. */}
+            <span className="sr-only sm:not-sr-only">
+              See features released since your last visit.
+            </span>
           </button>
           <Button
             variant="ghost"
