@@ -128,6 +128,9 @@ import {
   SESSION_READ_TIMEOUT_MS,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
+  isListeningForInitialPrompt,
+  onPendingInitialPrompt,
+  returnPendingInitialPrompt,
   setPendingInitialPrompt,
   startStreamPump,
   useChatStore,
@@ -19350,8 +19353,36 @@ describe("pending initial prompt transport", () => {
     expect(consumePendingInitialPrompt("conv_abc")).toBeNull();
   });
 
+  it("keeps stashed prompts in order, and a returned one goes back to the front", () => {
+    setPendingInitialPrompt("conv_order", { text: "one", skill: null });
+    setPendingInitialPrompt("conv_order", { text: "two", skill: null });
+    const one = consumePendingInitialPrompt("conv_order");
+    setPendingInitialPrompt("conv_order", { text: "three", skill: null });
+    returnPendingInitialPrompt("conv_order", one!);
+    expect(consumePendingInitialPrompt("conv_order")?.text).toBe("one");
+    expect(consumePendingInitialPrompt("conv_order")?.text).toBe("two");
+    expect(consumePendingInitialPrompt("conv_order")?.text).toBe("three");
+    expect(consumePendingInitialPrompt("conv_order")).toBeNull();
+  });
+
   it("returns null for a conversation with no pending prompt", () => {
     expect(consumePendingInitialPrompt("conv_never_set")).toBeNull();
+  });
+
+  it("tells a page's listener about prompts stashed for its conversation, until it unsubscribes", () => {
+    const heard: string[] = [];
+    const stop = onPendingInitialPrompt("conv_listened", () => heard.push("conv_listened"));
+    expect(isListeningForInitialPrompt("conv_listened")).toBe(true);
+    expect(isListeningForInitialPrompt("conv_other")).toBe(false);
+    setPendingInitialPrompt("conv_listened", { text: "first", skill: null });
+    setPendingInitialPrompt("conv_other", { text: "elsewhere", skill: null });
+    stop();
+    expect(isListeningForInitialPrompt("conv_listened")).toBe(false);
+    setPendingInitialPrompt("conv_listened", { text: "second", skill: null });
+    expect(heard).toEqual(["conv_listened"]);
+    expect(consumePendingInitialPrompt("conv_listened")?.text).toBe("first");
+    expect(consumePendingInitialPrompt("conv_listened")?.text).toBe("second");
+    expect(consumePendingInitialPrompt("conv_other")).toEqual({ text: "elsewhere", skill: null });
   });
 
   it("ignores a blank prompt so a blank message never auto-sends", () => {

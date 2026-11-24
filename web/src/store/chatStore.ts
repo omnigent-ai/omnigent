@@ -2257,7 +2257,10 @@ export interface PendingInitialPrompt {
 // host-provided routing (the host router may not carry react-router
 // state through navigate() → useLocation()). Both surfaces share this
 // module-level singleton, so it works identically standalone and embedded.
-const pendingInitialPrompts = new Map<string, PendingInitialPrompt>();
+// Stashed prompts per conversation, oldest first; each is consumed once, in order.
+const pendingInitialPrompts = new Map<string, PendingInitialPrompt[]>();
+// Pages showing a conversation, each listening for prompts stashed for it.
+const initialPromptListeners = new Map<string, Set<() => void>>();
 
 /**
  * Stash the first message for a freshly created conversation so ChatPage
@@ -2278,7 +2281,34 @@ export function setPendingInitialPrompt(
   prompt: PendingInitialPrompt,
 ): void {
   if (!prompt.text && !prompt.files?.length) return;
-  pendingInitialPrompts.set(conversationId, prompt);
+  pendingInitialPrompts.set(conversationId, [
+    ...(pendingInitialPrompts.get(conversationId) ?? []),
+    prompt,
+  ]);
+  for (const listener of initialPromptListeners.get(conversationId) ?? []) listener();
+}
+
+/**
+ * Hear each prompt stashed for `conversationId` while the listener is subscribed, so a page
+ * already showing the session takes a floating-panel launch that arrives after its route.
+ *
+ * @returns An unsubscribe function.
+ */
+export function onPendingInitialPrompt(conversationId: string, listener: () => void): () => void {
+  const listeners = initialPromptListeners.get(conversationId) ?? new Set<() => void>();
+  listeners.add(listener);
+  initialPromptListeners.set(conversationId, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && initialPromptListeners.get(conversationId) === listeners) {
+      initialPromptListeners.delete(conversationId);
+    }
+  };
+}
+
+/** Whether a page is showing `conversationId` and would take a prompt stashed for it now. */
+export function isListeningForInitialPrompt(conversationId: string): boolean {
+  return (initialPromptListeners.get(conversationId)?.size ?? 0) > 0;
 }
 
 /**
@@ -2293,10 +2323,25 @@ export function setPendingInitialPrompt(
  *   already consumed).
  */
 export function consumePendingInitialPrompt(conversationId: string): PendingInitialPrompt | null {
-  const prompt = pendingInitialPrompts.get(conversationId);
+  const [prompt, ...rest] = pendingInitialPrompts.get(conversationId) ?? [];
   if (prompt === undefined) return null;
-  pendingInitialPrompts.delete(conversationId);
+  if (rest.length === 0) pendingInitialPrompts.delete(conversationId);
+  else pendingInitialPrompts.set(conversationId, rest);
   return prompt;
+}
+
+/**
+ * Put back a prompt a page consumed but didn't send, ahead of any stashed since. It doesn't notify
+ * listeners, so the page putting it back doesn't take it again.
+ */
+export function returnPendingInitialPrompt(
+  conversationId: string,
+  prompt: PendingInitialPrompt,
+): void {
+  pendingInitialPrompts.set(conversationId, [
+    prompt,
+    ...(pendingInitialPrompts.get(conversationId) ?? []),
+  ]);
 }
 
 const HARNESS_CATALOG_QUERY = {
