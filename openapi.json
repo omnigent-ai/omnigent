@@ -7002,6 +7002,36 @@
         "title": "PullRequestCommentAnchor",
         "type": "object"
       },
+      "PullRequestLinksInfo": {
+        "description": "Where this deployment opens pull requests instead of on their code host.",
+        "properties": {
+          "applies_to": {
+            "description": "Lowercase `host`, `host/owner` or `host/owner/repo` prefixes whose pull requests open there, e.g. `[\"github.com/acme\"]`.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Applies To",
+            "type": "array"
+          },
+          "name": {
+            "description": "What links call the destination, e.g. `\"Code Review\"`.",
+            "title": "Name",
+            "type": "string"
+          },
+          "url_template": {
+            "description": "Destination with `{host}`, `{owner}`, `{repo}` and `{number}` fields, e.g. `\"https://review.example.com/{owner}/{repo}/pull/{number}\"`.",
+            "title": "Url Template",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url_template",
+          "name",
+          "applies_to"
+        ],
+        "title": "PullRequestLinksInfo",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -8179,6 +8209,16 @@
             ],
             "title": "Public Sharing Max Level",
             "type": "string"
+          },
+          "pull_request_links": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PullRequestLinksInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "request_managed_sandbox_host_id": {
             "default": true,

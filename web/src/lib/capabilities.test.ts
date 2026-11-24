@@ -615,6 +615,30 @@ describe("picker curation", () => {
   });
 });
 
+describe("pull request links", () => {
+  const LINKS = {
+    url_template: "https://review.example.com/{owner}/{repo}/pull/{number}",
+    name: "Code Review",
+    applies_to: ["github.com/example-org"],
+  };
+
+  it("reads the destination off the probe", async () => {
+    expect((await probe({ pull_request_links: LINKS })).pull_request_links).toEqual(LINKS);
+  });
+
+  it.each([
+    undefined,
+    null,
+    { ...LINKS, name: 7 },
+    { ...LINKS, url_template: null },
+    { ...LINKS, url_template: "javascript:alert({number})" },
+    { ...LINKS, applies_to: "github.com" },
+    { ...LINKS, applies_to: ["github.com", 42] },
+  ])("keeps code-host links for an older server or a malformed block: %j", async (links) => {
+    expect((await probe({ pull_request_links: links })).pull_request_links).toBeNull();
+  });
+});
+
 describe("resolveServerInfo scheduled_task_worktrees", () => {
   it.each([
     [true, true],

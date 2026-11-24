@@ -2,6 +2,7 @@
 // override resolves once session info loads; Streamdown won't re-parse a settled message.
 
 import type { PullRequestInfo } from "@/hooks/usePullRequests";
+import { GITHUB_OWNER, GITHUB_REPO } from "@/lib/codeHosts";
 
 /**
  * Href prefix of a parked reference, then `1234` or `owner/repo/12`. The per-load
@@ -29,9 +30,6 @@ const UNSPACED_CHAR = new RegExp(`^[${UNSPACED_SCRIPT}]$`, "u");
 const PATH_SEPARATOR = /[/\\]/;
 const BARE_NUMBER = /^[1-9]\d{3,9}$/;
 const EXPLICIT_NUMBER = /^[1-9]\d{0,9}$/;
-// GitHub owners can't end in `-`.
-const GITHUB_OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
-const GITHUB_REPO = /^[A-Za-z0-9._-]{1,100}$/;
 // `docs/setup.md#3` and `assets/logo.png#3` are file paths; an extensionless `src/foo#12`
 // still links. This also leaves dotted repos like `vercel/next.js#1` as text; a wrong link
 // is worse than none.

@@ -54,10 +54,18 @@ together in Comments.
   A compact **Loading review threads** spinner beside the layout toggle indicates
   an in-flight read. Conversation navigation shares the diff toolbar.
 - `chat-references`: `#1234` and `owner/repo#12` in agent replies, user messages
-  and /btw answers link to the github.com PR. Bare references use the session's
+  and /btw answers link to the github.com PR, or to the deployment's configured
+  destination (`link-destination`). Bare references use the session's
   own repo, including in a side chat. They stay text in tool output, code, existing
   links, after an escaped `#`, and in Enterprise, other-forge or unrecognized-remote
   checkouts, and while the runner hasn't reported the workspace repo.
+- `link-destination`: A deployment's `pull_request_links` server config sends PR
+  links under its `applies_to` prefixes to a code-review tool instead of the code
+  host: chat references and PR links, the composer preview, the panel's
+  **Open in** menu, open-PR fallback and titles, Canvas cards, automation runs
+  and Inbox links. Labels name the tool. **Copy PR link**, links to a PR's files,
+  commits, checks or comments, and links inside PR bodies stay on the code host.
+  See "Pull request links" in `deploy/README.md`.
 - `render-recovery`: A panel render failure shows **Try again** while chat,
   Workspace tabs and mobile Close remain usable.
 
@@ -175,12 +183,15 @@ Chat references have component coverage in
 repo choice is in `tests/runner/test_pr_resource.py`. Manually, in a github.com
 checkout, send `See #4242 and acme/lib#7` and have the agent repeat it; both link
 to github.com. Repeat in a side chat and through /btw. In a checkout whose origin
-is an Enterprise host, references stay text.
+is an Enterprise host, references stay text. With `pull_request_links` set, the
+same references and the panel's **Open in** menu open the configured tool, while
+**Copy PR link** still copies the github.com URL.
 
 ## Gotchas
 
-- Chat references link only to github.com. A tracked PR's repo doesn't decide the
-  workspace: an Enterprise origin with a github.com upstream stays text.
+- Chat references resolve only against github.com repos, though a configured
+  `pull_request_links` destination may then open them elsewhere. A tracked PR's repo
+  doesn't decide the workspace: an Enterprise origin with a github.com upstream stays text.
 
 - Browser stubs prove UI behavior; runner/host tests prove provider transport.
   They do not constitute a live GitHub write test.

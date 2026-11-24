@@ -2,6 +2,7 @@ import { useState } from "react";
 import { PullRequestStatusIcon } from "@/components/PullRequestStatusIcon";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { stateAsOf } from "@/hooks/useSessionPullRequests";
+import { usePullRequestLink } from "@/lib/codeHosts";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import {
@@ -96,6 +97,7 @@ export function RunPullRequests({
 }
 
 function RunPullRequestRow({ pr, nowMs }: { pr: ScheduledTaskRunPullRequest; nowMs: number }) {
+  const pullRequestLinkFor = usePullRequestLink();
   const status = getPullRequestStatus(pr);
   const copy = gitProviderCopy(pr.provider, undefined, pr.provider_display);
   const number = `${copy.prNumberPrefix}${pr.number}`;
@@ -111,7 +113,8 @@ function RunPullRequestRow({ pr, nowMs }: { pr: ScheduledTaskRunPullRequest; now
   ]
     .filter(Boolean)
     .join(" · ");
-  const href = parseHttpUrl(pr.url)?.href;
+  const codeHostHref = parseHttpUrl(pr.url)?.href;
+  const href = codeHostHref && pullRequestLinkFor(codeHostHref).href;
   const content = (
     <>
       <PullRequestStatusIcon status={status} className="mt-0.5" />

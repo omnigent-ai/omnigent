@@ -6,6 +6,8 @@ import { ComposerPrLink } from "./ComposerPrLink";
 import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type * as OpenLinkInAppModule from "@/lib/openLinkInApp";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 
@@ -179,6 +181,54 @@ describe("ComposerPrLink", () => {
     await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
     fireEvent.click(link);
     expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens each previewed PR on the deployment's pull request destination", async () => {
+    const pullRequest = (owner: string, number: number): ComposerPullRequest => ({
+      url: `https://github.com/${owner}/app/pull/${number}`,
+      host: "github.com",
+      repository: `${owner}/app`,
+      number,
+      relationship: "created",
+      title: `Change ${number}`,
+      state: "OPEN",
+    });
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          pull_request_links: {
+            url_template: "https://review.example.com/{owner}/{repo}/pull/{number}",
+            name: "Code Review",
+            applies_to: ["github.com/example"],
+          },
+        }}
+      >
+        <ComposerPrLink
+          state="ready"
+          prCount={2}
+          prNumber={42}
+          prs={[pullRequest("example", 42), pullRequest("elsewhere", 7)]}
+          onOpen={() => {}}
+          conversationId="conv_1"
+        />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.focus(screen.getByTestId("composer-pr-link"));
+    await screen.findByTestId("composer-pr-preview");
+
+    const moved = screen.getByRole("link", { name: "Open example/app #42 in a new tab" });
+    expect(moved).toHaveAttribute("href", "https://review.example.com/example/app/pull/42");
+    // Outside `applies_to` keeps its code-host link.
+    expect(
+      screen.getByRole("link", { name: "Open elsewhere/app #7 in a new tab" }),
+    ).toHaveAttribute("href", "https://github.com/elsewhere/app/pull/7");
+    fireEvent.click(moved);
+    expect(followLinkWithPopupFallback).toHaveBeenCalledWith(
+      expect.anything(),
+      "https://review.example.com/example/app/pull/42",
+      "conv_1",
+    );
   });
 
   it("opens previewed PRs in the sidebar and keeps the new-tab links separate", async () => {

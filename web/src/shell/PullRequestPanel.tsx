@@ -96,6 +96,7 @@ import {
   useUnlinkSessionPr,
 } from "@/hooks/useSessionPullRequests";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { usePullRequestLink } from "@/lib/codeHosts";
 import { gitProviderCopy, type GitProviderCopy } from "@/lib/gitProviders";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
@@ -740,7 +741,9 @@ function PullRequestCommentsTab({
 }) {
   const commentKeys = listKeys(comments, (c) => [c.url, c.created_at, c.author_id ?? c.author]);
   const authorHues = useMemo(() => pullRequestAuthorHues(comments), [comments]);
+  const pullRequestLinkFor = usePullRequestLink();
   const prHref = parseHttpUrl(prUrl)?.href;
+  const prLink = prHref ? pullRequestLinkFor(prHref) : undefined;
   const entries = [
     ...comments.map((comment, index) => ({
       created_at: comment.created_at,
@@ -777,9 +780,9 @@ function PullRequestCommentsTab({
       {timelinePartial && (
         <p role="status" className="text-ui text-muted-foreground">
           Some commit and push history is unavailable.{" "}
-          {prHref && (
-            <a href={prHref} target="_blank" rel="noreferrer" className="underline">
-              View on {providerLabel}
+          {prLink && (
+            <a href={prLink.href} target="_blank" rel="noreferrer" className="underline">
+              View on {prLink.destination ?? providerLabel}
             </a>
           )}
         </p>
@@ -830,6 +833,7 @@ function PullRequestListRow({
   sandboxAsleep: boolean;
 }) {
   const sandboxStarting = useSandboxStarting(conversationId);
+  const pullRequestLinkFor = usePullRequestLink();
   const info = usePullRequestInfo(conversationId, {
     poll: active ? "list" : false,
     prUrl: association.url,
@@ -867,6 +871,7 @@ function PullRequestListRow({
   const href = /^https:\/\//.test(association.url)
     ? parseHttpUrl(association.url)?.href
     : undefined;
+  const link = href ? pullRequestLinkFor(href) : undefined;
   return (
     <li className="flex min-w-0 items-center gap-2 rounded-md px-1.5 hover:bg-muted/50">
       <button
@@ -977,10 +982,10 @@ function PullRequestListRow({
               <DropdownMenuSeparator />
             </>
           )}
-          {href && (
+          {link && (
             <DropdownMenuItem asChild>
-              <a href={href} target="_blank" rel="noreferrer">
-                <ExternalLinkIcon aria-hidden /> Open in {providerCopy.label}
+              <a href={link.href} target="_blank" rel="noreferrer">
+                <ExternalLinkIcon aria-hidden /> Open in {link.destination ?? providerCopy.label}
               </a>
             </DropdownMenuItem>
           )}
@@ -1055,6 +1060,7 @@ export function PullRequestPanel({
   const mobileHeaderTarget = useMobilePanelHeaderTarget();
   const inMobileDrawer = mobileHeaderTarget !== undefined;
   const queryClient = useQueryClient();
+  const pullRequestLinkFor = usePullRequestLink();
   const viewKey = ["pull-request-panel-view", conversationId];
   const { data: cachedView = DEFAULT_PANEL_VIEW } = useQuery<PullRequestPanelView>({
     queryKey: viewKey,
@@ -1303,17 +1309,18 @@ export function PullRequestPanel({
     undefined,
     selectedPr?.provider_display ?? associations?.provider_display,
   );
+  const fallbackLink = selected ? pullRequestLinkFor(selected) : undefined;
   const openPrFallback =
-    associations?.tracking_available && selected && !info.isLoading && !info.data?.pr ? (
+    associations?.tracking_available && fallbackLink && !info.isLoading && !info.data?.pr ? (
       <div className="mt-2 flex flex-col items-center gap-2 text-ui">
         <span className="text-muted-foreground">or</span>
         <a
-          href={selected}
+          href={fallbackLink.href}
           target="_blank"
           rel="noreferrer"
           className="text-foreground underline underline-offset-4"
         >
-          Open the PR on {fallbackCopy.label}
+          Open the PR on {fallbackLink.destination ?? fallbackCopy.label}
         </a>
       </div>
     ) : undefined;
@@ -1527,8 +1534,9 @@ function StoredPullRequestDetails({
   showHeading: boolean;
   refreshButton?: React.ReactNode;
 }) {
+  const pullRequestLinkFor = usePullRequestLink();
   const title = pr.title?.trim() || `${pr.repository} ${copy.prNumberPrefix}${pr.number}`;
-  const href = /^https:\/\//.test(pr.url) ? pr.url : undefined;
+  const href = /^https:\/\//.test(pr.url) ? pullRequestLinkFor(pr.url).href : undefined;
   const label = (
     <>
       <span className="truncate">{title}</span>

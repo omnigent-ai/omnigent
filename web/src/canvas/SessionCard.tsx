@@ -11,6 +11,7 @@ import { getSessionState, withUnreadState, type SessionState } from "@/hooks/use
 import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
 import { showsUnreadFor, useMutedProjects } from "@/lib/sessionMute";
+import { usePullRequestLink } from "@/lib/codeHosts";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { cn } from "@/lib/utils";
@@ -49,6 +50,7 @@ function pullRequestTooltip(pr: CanvasPullRequest): string {
 function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   const { conversation, pullRequest, onOpen } = data;
   const optimisticTitle = useOptimisticTitle(conversation.id);
+  const pullRequestLinkFor = usePullRequestLink();
   const readState = useConversationReadState(
     conversation.id,
     conversation.updated_at,
@@ -130,7 +132,7 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
       )}
       {pullRequest && (
         <a
-          href={pullRequest.url}
+          href={pullRequestLinkFor(pullRequest.url).href}
           target="_blank"
           rel="noopener noreferrer"
           // `nodrag` keeps React Flow from turning a click on the link into a card drag.

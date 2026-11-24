@@ -11,6 +11,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import type { Components } from "streamdown";
 import { MessageResponse } from "@/components/ai-elements/message";
+import { usePullRequestLink } from "@/lib/codeHosts";
 import { cn } from "@/lib/utils";
 import {
   uploadPullRequestAttachment,
@@ -215,6 +216,7 @@ export function PullRequestTitle({
   editable: boolean;
 }) {
   const update = useUpdatePullRequestDetails(conversationId);
+  const pullRequestLinkFor = usePullRequestLink();
   const [draft, setDraft] = useState<string | null>(null);
   const errorId = useId();
 
@@ -279,7 +281,7 @@ export function PullRequestTitle({
   return (
     <div className="flex min-w-0 items-center gap-1">
       <a
-        href={url}
+        href={pullRequestLinkFor(url).href}
         target="_blank"
         rel="noreferrer"
         className="flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"

@@ -15,6 +15,7 @@
  * Unauthed by design — must work before any cookie is present.
  */
 
+import type { PullRequestLinks } from "./codeHosts";
 import { hostFetch } from "./host";
 
 /**
@@ -437,6 +438,11 @@ export interface ServerInfo {
    * an older server, which means no restriction.
    */
   picker?: PickerCuration;
+  /**
+   * Where the deployment opens pull requests instead of on their code host, or
+   * null to keep code-host links. Absent on an older server.
+   */
+  pull_request_links?: PullRequestLinks | null;
 }
 
 /** The deployment's New Chat picker curation, as reported by ``/v1/info``. */
@@ -503,6 +509,19 @@ function parseFilesystemAttachments(raw: unknown): FilesystemAttachmentsInfo | n
     extensions: value.extensions.filter((ext): ext is string => typeof ext === "string"),
     all_types: value.all_types === true,
   };
+}
+
+function parsePullRequestLinks(raw: unknown): PullRequestLinks | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  const { url_template, name, applies_to } = value;
+  if (typeof url_template !== "string" || typeof name !== "string") return null;
+  // The template becomes PR links' href; never let a `javascript:` URL through.
+  if (!/^https?:\/\//i.test(url_template)) return null;
+  if (!Array.isArray(applies_to) || !applies_to.every((prefix) => typeof prefix === "string")) {
+    return null;
+  }
+  return { url_template, name, applies_to };
 }
 
 function parseBranding(raw: unknown): Branding | null {
@@ -817,6 +836,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             data.scheduled_task_approval_skipping_modes === true,
           branding: parseBranding(data.branding),
           picker: parsePicker(data.picker),
+          pull_request_links: parsePullRequestLinks(data.pull_request_links),
         };
         return cachedServerInfo;
       }

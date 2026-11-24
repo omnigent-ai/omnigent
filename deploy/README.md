@@ -761,6 +761,37 @@ packaged built-in agents](docker/README.md#trimming-the-packaged-built-in-agents
 an agent it removes stays hidden even when `restrict_to_agent_names` lists it.
 Both keys are served on the unauthenticated `GET /v1/info`.
 
+## Pull request links
+
+By default, a pull request link opens on its code host. To send people to a
+code-review tool instead, add a `pull_request_links:` block to the same server
+config. It takes effect on the next server start.
+
+```yaml
+pull_request_links:
+  url_template: "https://review.example.com/{owner}/{repo}/pull/{number}"
+  name: "Code Review"           # links read "Open in Code Review"
+  applies_to:                   # host, host/owner or host/owner/repo prefixes
+    - github.com/example-org
+    - ghe.example.com
+```
+
+`url_template` must be an http(s) URL with a `{number}` field. It may also use
+`{host}`, `{owner}` and `{repo}`. Fields go after the host, in the path, query or
+fragment. Only GitHub-style pull request links
+(`https://<host>/<owner>/<repo>/pull/<number>`) under an `applies_to` prefix
+move. That covers the composer, the Pull Requests panel, Canvas cards,
+automation runs, the Inbox, `#123` references in chat, and pull request links
+that agents write in chat. Everything else keeps its code-host link:
+
+- other pull requests;
+- links to a pull request's files, commits, checks or comments;
+- **Copy PR link**;
+- the URLs agents see in tool results.
+
+The server refuses to start when the block is malformed. The block is served on
+the unauthenticated `GET /v1/info`.
+
 ## Adding a new deploy target
 
 Drop a new subdirectory under `deploy/<target>/` with a `README.md`

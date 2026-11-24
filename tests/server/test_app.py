@@ -3308,6 +3308,45 @@ async def test_info_publishes_the_picker_curation(
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_config", "expected"),
+    [
+        ({}, None),
+        (
+            {
+                "pull_request_links": {
+                    "url_template": "https://review.example.com/{owner}/{repo}/pull/{number}",
+                    "name": "Code Review",
+                    "applies_to": ["github.com/example-org"],
+                }
+            },
+            {
+                "url_template": "https://review.example.com/{owner}/{repo}/pull/{number}",
+                "name": "Code Review",
+                "applies_to": ["github.com/example-org"],
+            },
+        ),
+    ],
+    ids=["unset", "configured"],
+)
+async def test_info_publishes_the_pull_request_links(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    server_config: dict[str, object],
+    expected: dict[str, object] | None,
+) -> None:
+    """``GET /v1/info`` carries the destination the web sends pull request links to."""
+    app = _build_branding_app(db_uri, tmp_path, "pull-request-links", server_config=server_config)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/v1/info")
+
+    assert resp.status_code == 200
+    assert resp.json()["pull_request_links"] == expected
+
+
 @pytest.mark.parametrize(
     ("names", "expected", "absent"),
     [

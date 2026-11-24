@@ -275,6 +275,22 @@ class PickerInfo(BaseModel):
     default_agent_name: str | None = None
 
 
+class PullRequestLinksInfo(BaseModel):
+    """
+    Where this deployment opens pull requests instead of on their code host.
+
+    :param url_template: Destination with ``{host}``, ``{owner}``, ``{repo}`` and
+        ``{number}`` fields, e.g. ``"https://review.example.com/{owner}/{repo}/pull/{number}"``.
+    :param name: What links call the destination, e.g. ``"Code Review"``.
+    :param applies_to: Lowercase ``host``, ``host/owner`` or ``host/owner/repo``
+        prefixes whose pull requests open there, e.g. ``["github.com/acme"]``.
+    """
+
+    url_template: str
+    name: str
+    applies_to: list[str]
+
+
 class FilesystemAttachmentsInfo(BaseModel):
     """Which uploads native sessions receive as files, for client-side checks."""
 
@@ -465,6 +481,8 @@ class ServerInfoResponse(BaseModel):
     memory: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
+    # Absent keeps every pull request link on its code host.
+    pull_request_links: PullRequestLinksInfo | None = None
 
 
 def _resolve_extension_state(
@@ -2158,6 +2176,7 @@ def create_app(
         automation_trigger_poll_minutes,
         load_branding_snapshot,
         load_picker_curation,
+        load_pull_request_links,
         load_server_config,
         session_title_instructions,
     )
@@ -2165,6 +2184,7 @@ def create_app(
     resolved_server_config = load_server_config() if server_config is None else server_config
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     picker_curation = load_picker_curation(resolved_server_config)
+    pull_request_links = load_pull_request_links(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     trigger_poll_minutes = automation_trigger_poll_minutes(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
@@ -4246,6 +4266,7 @@ def create_app(
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
+                "pull_request_links": pull_request_links.config() if pull_request_links else None,
             }
         )
 
