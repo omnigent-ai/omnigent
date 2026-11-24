@@ -1594,6 +1594,13 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     marker, reply = f"after-busy-user-{nonce}", f"after-busy-reply-{nonce}"
     model = _PINNED_CLAUDE_MODELS["opus"]
     set_fallback_mock_llm(mock_llm_server_url, _native_claude_wire_model(model), reply)
+    # Native requests include earlier turns that still match the exhausted busy queue.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": reply}],
+        match=marker,
+        required_tools=tool_names[:1],
+    )
     _send_turn_and_settle(
         page,
         mock_llm_server_url,
