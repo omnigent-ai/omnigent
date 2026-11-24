@@ -1,4 +1,5 @@
 import { GoogleDocsWorkspacePane } from "./GoogleDocsWorkspacePane";
+import { useGoogleDocsSession } from "./GoogleDocsSessionContext";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { type FilePosition, FileViewerContext, type OpenFileOptions } from "./FileViewerContext";
@@ -953,6 +954,7 @@ function WorkspacePanelImpl({
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
   const showGoogleDocs = isFeatureEnabled(useServerInfo(), "google_docs");
+  const displayedGoogleDoc = useGoogleDocsSession()?.displayed;
   const [docsVisited, setDocsVisited] = useState<string[]>([]);
   const [docsDrawerOpen, setDocsDrawerOpen] = useState(false);
   const [docsDrawerTarget, setDocsDrawerTarget] = useState<HTMLDivElement | null>(null);
@@ -966,7 +968,7 @@ function WorkspacePanelImpl({
     setDocsVisited([...docsVisited, conversationId]);
   useEffect(() => {
     if (isMobile && rightRailTab === "google-docs") setDocsDrawerOpen(true);
-  }, [isMobile, rightRailTab]);
+  }, [isMobile, rightRailTab, displayedGoogleDoc]);
   const activeView = resolveWorkspaceActiveView(
     {
       rightRailTab,

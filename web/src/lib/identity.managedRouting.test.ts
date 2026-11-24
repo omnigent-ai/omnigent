@@ -50,6 +50,34 @@ async function setup() {
 }
 
 describe("managed first-message routing", () => {
+  it.each(["bootstrap", "recovery"])(
+    "rechecks a guarded message POST after %s before dispatch",
+    async (stage) => {
+      const identity = await setup();
+      const { postEvent } = await import("./sessionsApi");
+      let current = true;
+      if (stage === "recovery") await identity.resolveSessionHost(SESSION_ID);
+      identity.setSessionHostResolver(async () => {
+        current = false;
+      });
+      if (stage === "recovery") {
+        fetchMock.mockResolvedValueOnce(wrongReplica());
+      }
+      await expect(
+        postEvent(
+          SESSION_ID,
+          { type: "message", data: { role: "user", content: [] } },
+          {
+            beforeDispatch: () => {
+              if (!current) throw new Error("Departed request scope");
+            },
+          },
+        ),
+      ).rejects.toThrow("Departed request scope");
+      expect(fetchMock).toHaveBeenCalledTimes(stage === "bootstrap" ? 0 : 1);
+    },
+  );
+
   it("refreshes an attempted hostless lookup and replays the same message with its new host", async () => {
     const { authenticatedFetch, resolve, resolveSessionHost } = await setup();
     await resolveSessionHost(SESSION_ID);

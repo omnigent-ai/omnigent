@@ -281,6 +281,8 @@ export interface SendOptions {
   retriesRefused?: boolean;
   /** Asked once uploads are done, just before posting: a reason given fails the send unposted. */
   beforePost?: () => Promise<string | null>;
+  /** Recheck captured ownership at each HTTP dispatch, including routing retries. */
+  beforeDispatch?: () => void;
 }
 
 // Who hears of each send the runner takes, by its committed item's id and by the pending
@@ -707,6 +709,7 @@ export interface PendingUserMessage {
  * directly (no serialization concern).
  */
 export interface QueuedMessage {
+  sendOptions?: Pick<SendOptions, "external" | "beforePost" | "beforeDispatch">;
   /** Captured at enqueue time so background dispatch preserves the control. */
   command?: "compact";
   /** Client-only id, e.g. `q_1`. */
@@ -1369,7 +1372,7 @@ export interface ChatActions {
     files?: File[],
     replyDraft?: StoredReplyDraft,
     conversationId?: string,
-    opts?: { waitingForHost?: boolean },
+    opts?: { waitingForHost?: boolean; sendOptions?: QueuedMessage["sendOptions"] },
   ) => void;
   /** Let a conversation's messages held for an offline host flush again. */
   releaseHostHeldMessages: (conversationId: string) => void;
@@ -2431,10 +2434,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       boundAgentId &&
       !isCompactControl(sessionHarness, text, files)
     ) {
-      void get().send(text, boundAgentId, files, {
-        replyDraft,
-        pinnedConversationId: conversationId,
-      });
+      void get().send(
+        text,
+        boundAgentId,
+        files,
+        opts?.sendOptions
+          ? queuedSendOptions({
+              queueId: `q_${++queueSeq}`,
+              text,
+              files,
+              replyDraft,
+              conversationId,
+              agentId: boundAgentId,
+              sendOptions: opts.sendOptions,
+            })
+          : { replyDraft, pinnedConversationId: conversationId },
+      );
       return;
     }
     queueSeq += 1;
@@ -2452,6 +2467,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...s.queuedMessages,
         {
           queueId,
+          ...(opts?.sendOptions ? { sendOptions: opts.sendOptions } : {}),
           text,
           ...(isCompactControl(sessionHarness, text, files) ? { command: "compact" as const } : {}),
           stableId,
@@ -2705,18 +2721,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
       if (head === undefined || head.requiresRetry) continue;
       if (waitsForHost(get().queuedMessages, conversationId)) continue;
-      const compactAgentId = head.agentId ?? local?.boundAgentId;
-      if (head.command === "compact" && !compactAgentId) continue;
+      const queuedAgentId = head.agentId ?? local?.boundAgentId;
+      if ((head.command === "compact" || head.sendOptions) && !queuedAgentId) continue;
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
       setActive((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
-      if (head.command === "compact") {
+      if (head.command === "compact" || head.sendOptions) {
         conversationRegistry.acquire(conversationId);
         void s
-          .send(head.text, compactAgentId!, head.files, queuedSendOptions(head))
+          .send(head.text, queuedAgentId!, head.files, queuedSendOptions(head))
           .finally(() => backgroundFlushInFlight.delete(conversationId));
         continue;
       }
@@ -3135,7 +3151,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               stable_id: stableId,
             },
           },
-          { holdWhenHostOffline: true },
+          { holdWhenHostOffline: true, beforeDispatch: opts?.beforeDispatch },
         );
         // Given up on while out, it may still be accepted: the caller hears of that.
         post.then(
@@ -4366,11 +4382,35 @@ function queuedSendOptions(
 ): SendOptions {
   const stableId = message.stableId ?? randomUUID().replace(/-/g, "");
   return {
+    ...message.sendOptions,
     command: message.command,
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,
+    ...(message.sendOptions
+      ? {
+          onDenied: () => {
+            try {
+              message.sendOptions?.beforeDispatch?.();
+            } catch {
+              return;
+            }
+            setterFor(message.conversationId)((s) => ({
+              blocks: [
+                ...s.blocks,
+                makeClientErrorBlock("The session’s policy blocked the queued request.", ""),
+              ],
+            }));
+          },
+        }
+      : {}),
     onError: (error) => {
+      // A departed caller's request must not enter another identity's queue.
+      try {
+        message.sendOptions?.beforeDispatch?.();
+      } catch {
+        return;
+      }
       setActive((s) => {
         if (s.queuedMessages.some((m) => m.queueId === message.queueId)) return {};
         // Keep failed sends in batch order, ahead of newly queued messages.

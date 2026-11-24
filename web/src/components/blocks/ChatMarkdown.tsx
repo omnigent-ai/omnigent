@@ -41,6 +41,7 @@ import {
   WORKSPACE_IMAGE_ATTR,
 } from "@/components/ai-elements/streamdown-security";
 import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
+import { GoogleDocsChatLink } from "./GoogleDocsChatLink";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
@@ -409,27 +410,31 @@ function WorkspaceFileLink({
     const blankHref = props.target === "_blank" && typeof rebased === "string" ? rebased : null;
     const pullRequest = githubPullRequest(rebased);
     return (
-      <a
-        href={rebased}
-        className={cn(STREAMDOWN_LINK_CLASS, className)}
-        title={title ?? (pullRequest ? rebased : undefined)}
-        data-streamdown="link"
-        {...props}
-        onClick={
-          blankHref === null
-            ? props.onClick
-            : (event) => {
-                props.onClick?.(event);
-                followLinkWithPopupFallback(event, blankHref, conversationId);
-              }
-        }
-      >
-        {pullRequest ? (
-          <PullRequestLinkLabel>{children === href ? pullRequest : children}</PullRequestLinkLabel>
-        ) : (
-          children
-        )}
-      </a>
+      <GoogleDocsChatLink url={rebased} sessionId={conversationId}>
+        <a
+          href={rebased}
+          className={cn(STREAMDOWN_LINK_CLASS, className)}
+          title={title ?? (pullRequest ? rebased : undefined)}
+          data-streamdown="link"
+          {...props}
+          onClick={
+            blankHref === null
+              ? props.onClick
+              : (event) => {
+                  props.onClick?.(event);
+                  followLinkWithPopupFallback(event, blankHref, conversationId);
+                }
+          }
+        >
+          {pullRequest ? (
+            <PullRequestLinkLabel>
+              {children === href ? pullRequest : children}
+            </PullRequestLinkLabel>
+          ) : (
+            children
+          )}
+        </a>
+      </GoogleDocsChatLink>
     );
   }
 

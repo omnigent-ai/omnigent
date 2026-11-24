@@ -13,6 +13,7 @@ import { confirmGoogleDocsNavigation } from "@/components/GoogleDocsPane/editorL
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { classifyGoogleDocsUrl } from "@/lib/googleDocs";
+import { getOmnigentHostConfig } from "@/lib/host";
 import { subscribeIdentity } from "@/lib/identity";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import {
@@ -45,6 +46,7 @@ export interface GoogleDocsSession {
   error: string | null;
   loadError: string | null;
   canEdit: boolean;
+  isCurrent: () => boolean;
   membership: (url: string) => "linked" | "unlinked" | "unknown";
   refresh: () => void;
   addAndOpen: (url: string) => Promise<boolean>;
@@ -77,16 +79,22 @@ function SessionState({
   sessionId,
   permissionLevel,
   scope,
+  onReveal,
   children,
 }: {
   sessionId: string;
   permissionLevel: number | null;
   scope: string;
+  onReveal?: (isCurrent: () => boolean) => void;
   children: ReactNode;
 }) {
+  const fetcher = getOmnigentHostConfig().fetcher;
+  const reveal = useRef(onReveal);
+  reveal.current = onReveal;
   const [boundScope, setBoundScope] = useState(scope);
-  const activation = useRef({ scope, token: Symbol() });
-  if (activation.current.scope !== scope) activation.current = { scope, token: Symbol() };
+  const activation = useRef({ scope, fetcher, token: Symbol() });
+  if (activation.current.scope !== scope || activation.current.fetcher !== fetcher)
+    activation.current = { scope, fetcher, token: Symbol() };
   const activationToken = activation.current.token;
   const [entries, setEntries] = useState<SessionDocumentEntry[]>([]);
   const [displayed, setDisplayed] = useState<DisplayedDocument | null>(null);
@@ -125,10 +133,13 @@ function SessionState({
     () =>
       mounted.current &&
       activation.current.token === activationToken &&
+      getOmnigentHostConfig().fetcher === fetcher &&
       scopeOf(sessionId) === scope,
-    [sessionId, scope, activationToken],
+    [sessionId, scope, activationToken, fetcher],
   );
   const canEdit = isEditorLevel(permissionLevel);
+  const editable = useRef(canEdit);
+  editable.current = canEdit;
   const refresh = useCallback(async () => {
     // A new helper generation must not supersede an accepted mutation's navigation.
     if (!current()) return;
@@ -210,7 +221,10 @@ function SessionState({
         loaded.current = true;
         restored.current = true;
         setLoadError(null);
-        if (mutation.open) setDisplayed(mutation.open);
+        if (mutation.open) {
+          setDisplayed(mutation.open);
+          reveal.current?.(current);
+        }
         if (mutation.remove && selected.current?.documentId === mutation.remove) setDisplayed(null);
         return true;
       } catch (reason) {
@@ -249,7 +263,7 @@ function SessionState({
   );
   const addAndOpen = useCallback(
     async (url: string): Promise<boolean> => {
-      if (!canEdit || busyRef.current || !current()) return false;
+      if (!editable.current || busyRef.current || !current()) return false;
       try {
         const next = reference(url);
         if (!confirmOpen(next)) return false;
@@ -265,7 +279,7 @@ function SessionState({
         return false;
       }
     },
-    [canEdit, current, confirmOpen, sessionId, perform],
+    [current, confirmOpen, sessionId, perform],
   );
   const openLinked = useCallback(
     (url: string): boolean => {
@@ -275,13 +289,14 @@ function SessionState({
       restored.current = true;
       setDisplayed(next);
       setError(null);
+      reveal.current?.(current);
       return true;
     },
     [current, membership, confirmOpen],
   );
   const remove = useCallback(
     async (entry: SessionDocumentEntry): Promise<boolean> => {
-      if (!canEdit || busyRef.current || !current()) return false;
+      if (!editable.current || busyRef.current || !current()) return false;
       const id = reference(entry.documentUrl).documentId;
       if (!confirmRemove(id)) return false;
       const pending = failure.current;
@@ -293,7 +308,7 @@ function SessionState({
         remove: id,
       });
     },
-    [canEdit, current, confirmRemove, sessionId, perform],
+    [current, confirmRemove, sessionId, perform],
   );
   const retry = useCallback(() => {
     if (busyRef.current || !current()) return;
@@ -303,13 +318,13 @@ function SessionState({
       return;
     }
     if (
-      !canEdit ||
+      !editable.current ||
       (pending.open && !confirmOpen(pending.open)) ||
       (pending.remove && !confirmRemove(pending.remove))
     )
       return;
     void perform({ ...pending, request: pending.request.retry() });
-  }, [current, refresh, canEdit, confirmOpen, confirmRemove, perform]);
+  }, [current, refresh, confirmOpen, confirmRemove, perform]);
   const registerEditor = useCallback(() => {
     const token = Symbol();
     editors.current.add(token);
@@ -328,6 +343,7 @@ function SessionState({
       error,
       loadError,
       canEdit,
+      isCurrent: current,
       membership,
       refresh,
       addAndOpen,
@@ -346,6 +362,7 @@ function SessionState({
       error,
       loadError,
       canEdit,
+      current,
       membership,
       refresh,
       addAndOpen,
@@ -362,15 +379,22 @@ function SessionState({
 export function GoogleDocsSessionProvider({
   sessionId,
   permissionLevel,
+  onReveal,
   children,
 }: {
   sessionId: string;
   permissionLevel: number | null;
+  onReveal?: (isCurrent: () => boolean) => void;
   children: ReactNode;
 }) {
   const scope = useSyncExternalStore(subscribeIdentity, () => scopeOf(sessionId));
   return scope ? (
-    <SessionState scope={scope} sessionId={sessionId} permissionLevel={permissionLevel}>
+    <SessionState
+      scope={scope}
+      sessionId={sessionId}
+      permissionLevel={permissionLevel}
+      onReveal={onReveal}
+    >
       {children}
     </SessionState>
   ) : (
@@ -381,15 +405,21 @@ export function GoogleDocsSessionProvider({
 export function GoogleDocsSessionBoundary({
   sessionId,
   permissionLevel,
+  onReveal,
   children,
 }: {
   sessionId?: string;
   permissionLevel: number | null;
+  onReveal?: (isCurrent: () => boolean) => void;
   children: ReactNode;
 }) {
   const enabled = isFeatureEnabled(useServerInfo(), "google_docs");
   return enabled && sessionId ? (
-    <GoogleDocsSessionProvider sessionId={sessionId} permissionLevel={permissionLevel}>
+    <GoogleDocsSessionProvider
+      sessionId={sessionId}
+      permissionLevel={permissionLevel}
+      onReveal={onReveal}
+    >
       {children}
     </GoogleDocsSessionProvider>
   ) : (

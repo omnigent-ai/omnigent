@@ -1843,17 +1843,21 @@ const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
 export async function postEvent(
   sessionId: string,
   event: SessionEventInput,
-  opts?: { holdWhenHostOffline?: boolean },
+  opts?: { holdWhenHostOffline?: boolean; beforeDispatch?: () => void },
 ): Promise<PostEventResponse> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...backgroundSessionTitlesRequestHeaders(),
-      ...(opts?.holdWhenHostOffline ? { [HOST_OFFLINE_HOLD_HEADER]: "on" } : {}),
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/events`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...backgroundSessionTitlesRequestHeaders(),
+        ...(opts?.holdWhenHostOffline ? { [HOST_OFFLINE_HOLD_HEADER]: "on" } : {}),
+      },
+      body: JSON.stringify(event),
     },
-    body: JSON.stringify(event),
-  });
+    opts?.beforeDispatch,
+  );
   // Throw a typed ApiError (not the bare status line) so callers can branch
   // on `code` — e.g. surface a friendly "runner didn't come online" message
   // for the 503 the server returns when a host-bound runner never connects.

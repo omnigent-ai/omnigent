@@ -10,10 +10,12 @@ type CommandContextInputs = Omit<ComponentProps<typeof CommandContextProvider>, 
 export function AppShellRootProviders({
   command,
   fileViewer,
+  revealGoogleDocs,
   children,
 }: {
   command: CommandContextInputs;
   fileViewer: ComponentProps<typeof FileViewerContext.Provider>["value"];
+  revealGoogleDocs?: (isCurrent: () => boolean) => void;
   children: ReactNode;
 }) {
   return (
@@ -26,6 +28,7 @@ export function AppShellRootProviders({
       <FileViewerContext.Provider value={fileViewer}>
         <GoogleDocsSessionBoundary
           sessionId={command.session?.id}
+          onReveal={revealGoogleDocs}
           permissionLevel={
             command.session?.permissionResolved ? command.session.permissionLevel : 1
           }

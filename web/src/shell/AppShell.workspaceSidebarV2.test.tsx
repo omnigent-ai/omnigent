@@ -20,6 +20,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { GoogleDocsChatLink } from "@/components/blocks/GoogleDocsChatLink";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
@@ -266,11 +267,18 @@ function resizeTo(width: number) {
 
 function ChatProbe() {
   const openGithubTab = useOpenGithubTab();
+  const sessionId = useContext(FileViewerContext)?.conversationId;
   const openFile = useContext(FileViewerContext)?.openFile;
   const location = useLocation();
   const navigate = useNavigate();
   return (
     <>
+      <GoogleDocsChatLink
+        url="https://docs.google.com/document/d/example/edit"
+        sessionId={sessionId}
+      >
+        <a href="https://docs.google.com/document/d/example/edit">Google Doc</a>
+      </GoogleDocsChatLink>
       <output data-testid="search">{location.search}</output>
       {/* As the new session's hydration moves it to its real id, its query with it. */}
       <button
@@ -888,5 +896,57 @@ describe("workspace_sidebar_v2", () => {
     } finally {
       delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
     }
+  });
+});
+
+describe("explicit Docs pane reveal", () => {
+  it.each([
+    [false, DESKTOP],
+    [true, DESKTOP],
+    [false, NARROW_DESKTOP],
+    [true, NARROW_DESKTOP],
+  ])("opens a linked Doc in its session with tabs=%s at width=%s", async (enabled, width) => {
+    const url = "https://docs.google.com/document/d/example/edit";
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) =>
+        String(input).includes("/session-documents")
+          ? Response.json({ session_id: "conv_ws", entries: [{ document_url: url, added_at: 1 }] })
+          : Response.json({ error: "Unavailable" }, { status: 503 }),
+      );
+    vi.stubGlobal("fetch", fetcher);
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    writeWorkspacePanelDefault("collapsed");
+    setViewport(width);
+    const info = withFlag(enabled);
+    renderShell({ ...info, features: { ...info.features, google_docs: true } });
+    fireEvent.click(await screen.findByRole("button", { name: "Open in Docs pane" }));
+    if (enabled) {
+      await waitFor(() =>
+        expect(workspaceTabsSessions.openWorkspacePage).toHaveBeenCalledWith(
+          "conv_ws",
+          "google-docs",
+        ),
+      );
+      if (width === NARROW_DESKTOP)
+        expect(screen.getByTestId("workspace-tabs-drawer")).toHaveAttribute("data-state", "open");
+      else await screen.findByRole("button", { name: "Collapse right panel" });
+    } else {
+      expect(await screen.findByTitle("Google Docs editor")).toHaveAttribute(
+        "src",
+        url + "?embedded=true",
+      );
+      if (width === NARROW_DESKTOP) {
+        const drawer = screen.getByTestId("google-docs-panel-drawer");
+        expect(drawer).toHaveAttribute("data-state", "open");
+        fireEvent.click(within(drawer).getByRole("button", { name: "Close", hidden: true }));
+        expect(drawer).toHaveAttribute("data-state", "closed");
+        fireEvent.click(screen.getByRole("button", { name: "Open in Docs pane" }));
+        await waitFor(() => expect(drawer).toHaveAttribute("data-state", "open"));
+      } else await screen.findByRole("button", { name: "Collapse right panel" });
+    }
+    expect(fetcher.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
   });
 });

@@ -38,6 +38,9 @@ import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { gridCellComposerKey, useChatStore } from "@/store/chatStore";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { GoogleDocsChatLink } from "@/components/blocks/GoogleDocsChatLink";
 
 const queryClient = new QueryClient();
 const LINKED_PR = "https://github.com/example/app/pull/42";
@@ -192,6 +195,12 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     if (childId === fixture.failedChat) throw fixture.renderError;
     return (
       <>
+        <GoogleDocsChatLink
+          url="https://docs.google.com/document/d/example/edit"
+          sessionId={childId}
+        >
+          <a href="https://docs.google.com/document/d/example/edit">Google Doc</a>
+        </GoogleDocsChatLink>
         <textarea
           aria-label="Message"
           data-composer-input=""
@@ -1070,3 +1079,42 @@ it("shows each cell's sidebar as tabs with the flag on, routing its links there"
   );
   expect(selectPullRequestInPanel).not.toHaveBeenCalled();
 });
+
+it.each([false, true])(
+  "reveals linked Docs only in the originating grid cell (tabs=%s)",
+  async (enabled) => {
+    tabsRouting.enabled = enabled;
+    tabsRouting.routes = [];
+    tabsRouting.hosts = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockImplementation(async (input) => {
+        const id = String(input).split("/sessions/")[1]?.split("/")[0];
+        return Response.json({
+          session_id: id,
+          entries: [
+            { document_url: "https://docs.google.com/document/d/example/edit", added_at: 1 },
+          ],
+        });
+      }),
+    );
+    onTestFinished(() => {
+      tabsRouting.enabled = false;
+      vi.unstubAllGlobals();
+    });
+    render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features: { google_docs: true } }}>
+        {twoCellGrid()}
+      </CapabilitiesProvider>,
+    );
+    const second = within(screen.getByRole("region", { name: "second" }));
+    fireEvent.click(await second.findByRole("button", { name: "Open in Docs pane" }));
+    if (enabled)
+      await waitFor(() =>
+        expect(tabsRouting.routes).toEqual([["openWorkspacePage", "second", "google-docs"]]),
+      );
+    else expect(screen.getByTestId("workspace-second")).toHaveAttribute("data-tab", "google-docs");
+    if (!enabled)
+      expect(screen.getByTestId("workspace-first")).not.toHaveAttribute("data-tab", "google-docs");
+  },
+);

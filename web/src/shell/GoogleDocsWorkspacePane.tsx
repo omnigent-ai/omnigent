@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { ExternalLink, MoreHorizontal, Plus, Trash2 } from "lucide-react";
 import { useGoogleDocsEditorLifecycle } from "@/components/GoogleDocsPane/editorLifecycle";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { classifyGoogleDocsUrl } from "@/lib/googleDocs";
+import { requestGoogleDocReview } from "@/lib/googleDocsRequests";
 import { GoogleDocsSessionProvider, useGoogleDocsSession } from "./GoogleDocsSessionContext";
 import type { LeaveGuard } from "./workspaceTabs/workspaceTabsSessions";
 
@@ -36,6 +37,28 @@ function PaneContent({ visible = true, registerLeaveGuard }: GoogleDocsWorkspace
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const inputId = useId();
+  const latest = useRef(state);
+  latest.current = state;
+  const reviewing = useRef(false);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  async function requestReview() {
+    if (!displayed || !canEdit || reviewing.current || !state.isCurrent()) return;
+    const captured = state;
+    const current = () => captured.isCurrent() && latest.current.canEdit;
+    reviewing.current = true;
+    setReviewBusy(true);
+    setReviewError(null);
+    try {
+      await requestGoogleDocReview(state.sessionId, displayed.originalUrl, 2, current);
+    } catch (reason) {
+      if (current())
+        setReviewError(reason instanceof Error ? reason.message : "Could not request review.");
+    } finally {
+      reviewing.current = false;
+      if (captured.isCurrent()) setReviewBusy(false);
+    }
+  }
   useGoogleDocsEditorLifecycle(displayed !== null, state.sessionId);
   useEffect(() => (editorOpen ? registerEditor() : undefined), [editorOpen, registerEditor]);
   useEffect(() => {
@@ -128,6 +151,18 @@ function PaneContent({ visible = true, registerLeaveGuard }: GoogleDocsWorkspace
                 Open in Google Docs
               </a>
             </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="hidden @min-[36rem]/google-docs:inline-flex"
+              disabled={!canEdit || busy || reviewBusy}
+              title={
+                !canEdit ? "Session edit access is required to request agent review" : undefined
+              }
+              onClick={() => void requestReview()}
+            >
+              Request agent review
+            </Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
@@ -140,12 +175,23 @@ function PaneContent({ visible = true, registerLeaveGuard }: GoogleDocsWorkspace
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  disabled={!canEdit || busy || reviewBusy}
+                  onSelect={() => void requestReview()}
+                >
+                  Request agent review
+                </DropdownMenuItem>
                 <DropdownMenuItem asChild>{external}</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </>
         )}
       </div>
+      {reviewError && (
+        <p role="alert" className="p-2 text-sm text-destructive">
+          {reviewError}
+        </p>
+      )}
       {(state.loadError || state.error) && (
         <div role="alert" className="p-2 text-sm text-destructive">
           {state.error ?? state.loadError}{" "}

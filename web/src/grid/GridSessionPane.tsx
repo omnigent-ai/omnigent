@@ -439,7 +439,26 @@ export function GridSessionPane({
       }}
     >
       <FileViewerContext.Provider value={fileContext}>
-        <GoogleDocsSessionBoundary sessionId={sessionId} permissionLevel={permissionLevel}>
+        <GoogleDocsSessionBoundary
+          sessionId={sessionId}
+          permissionLevel={permissionLevel}
+          onReveal={(isCurrent) => {
+            if (!isCurrent()) return;
+            if (tabsSidebar) {
+              void routeToWorkspaceTabs(async (tabs) => {
+                if (!isCurrent()) return { ok: true };
+                const result = await tabs.openWorkspacePage(sessionId, "google-docs");
+                if (result.ok && isCurrent()) onOpenWorkspace();
+                return result;
+              });
+            } else
+              navigateWorkspace("", undefined, () => {
+                if (!isCurrent()) return;
+                showTab("google-docs");
+                onOpenWorkspace();
+              });
+          }}
+        >
           <section
             ref={setPaneRef}
             style={{ gridArea: area }}

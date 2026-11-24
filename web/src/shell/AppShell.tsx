@@ -2990,6 +2990,29 @@ function AppShellImpl() {
         : undefined,
     [canShare, shareableFilePath],
   );
+  const revealGoogleDocs = useCallback(
+    (isCurrent: () => boolean) => {
+      if (!isCurrent()) return;
+      if (tabsModeRef.current) {
+        const id = tabsSessionRef.current;
+        if (!id) return;
+        void routeToWorkspaceTabs(async (tabs) => {
+          if (!isCurrent()) return { ok: true };
+          const result = await tabs.openWorkspacePage(id, "google-docs");
+          if (result.ok && isCurrent()) revealTabsSidebar();
+          return result;
+        });
+        return;
+      }
+      guardFileNavigation("", undefined, () => {
+        if (!isCurrent()) return;
+        handleRightRailTabChange("google-docs");
+        setFilesPanelOpen(false);
+        setRightPanelOpenAnimated(true);
+      });
+    },
+    [guardFileNavigation, handleRightRailTabChange, revealTabsSidebar, setRightPanelOpenAnimated],
+  );
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
@@ -3252,6 +3275,7 @@ function AppShellImpl() {
         filePath: selectedFilePath,
       }}
       fileViewer={fileViewerContextValue}
+      revealGoogleDocs={revealGoogleDocs}
     >
       {/* One for the whole window, so a grid of sidebars runs each request once. */}
       {/* A host that breaks only disables the file actions. */}

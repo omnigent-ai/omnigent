@@ -1,6 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryClient } from "@tanstack/react-query";
+import { initChatStore, useChatStore } from "@/store/chatStore";
+import { writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { resolveIdentity, setSessionHostResolver } from "@/lib/identity";
 import { GoogleDocsWorkspacePane } from "./GoogleDocsWorkspacePane";
@@ -378,4 +381,104 @@ it("rejects captured intents after leaving and returning to the same session", a
   expect(staleOpen(B)).toBe(false);
   expect(fetchMock).toHaveBeenCalledTimes(before);
   expect(frame()).toHaveAttribute("src", canonicalA);
+});
+
+describe("Request agent review", () => {
+  beforeEach(() => {
+    writeAlwaysSteer(false);
+    initChatStore(new QueryClient({ defaultOptions: { queries: { retry: false } } }));
+    useChatStore.setState({
+      conversationId: sessionId,
+      boundAgentId: "agent",
+      abortController: new AbortController(),
+      blocks: [],
+      pendingUserMessages: [],
+      queuedMessages: [],
+      status: "idle",
+      sessionStatus: "idle",
+      startupPending: false,
+    });
+    fetchMock.mockImplementation(async (input, init) =>
+      String(input).endsWith("/events")
+        ? Response.json({ queued: true, item_id: "review_input" })
+        : server(input, init),
+    );
+  });
+  afterEach(() => {
+    useChatStore.getState().abortController?.abort();
+  });
+  const posts = () =>
+    fetchMock.mock.calls.filter(
+      ([input, init]) => String(input).endsWith("/events") && init?.method === "POST",
+    );
+
+  it("captures the displayed original URL while queued, even when another document opens", async () => {
+    useChatStore.setState({ status: "streaming", sessionStatus: "running" });
+    render(tree());
+    const editor = await screen.findByTitle("Google Docs editor");
+    fireEvent.click(screen.getByRole("button", { name: "Request agent review" }));
+    await waitFor(() => expect(useChatStore.getState().queuedMessages).toHaveLength(1));
+    expect(useChatStore.getState().queuedMessages[0].text).toContain(A);
+    expect(frame()).toBe(editor);
+    fireEvent.click(screen.getByRole("button", { name: "Open B intent" }));
+    useChatStore.setState({ status: "idle", sessionStatus: "idle" });
+    useChatStore.getState().maybeFlushQueuedHead();
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(String(posts()[0][1]?.body)).toContain(A);
+    expect(String(posts()[0][1]?.body)).not.toContain(B);
+    expect(frame()).toHaveAttribute("src", B + "&embedded=true");
+  });
+
+  it("provides the same captured review action in the compact menu and disables it for readers", async () => {
+    const view = render(tree(sessionId, 1));
+    await screen.findByTitle("Google Docs editor");
+    expect(screen.getByRole("button", { name: "Request agent review" })).toBeDisabled();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Document actions" }));
+    expect(screen.getByRole("menuitem", { name: "Request agent review" })).toHaveAttribute(
+      "data-disabled",
+    );
+    await user.keyboard("{Escape}");
+    view.rerender(tree());
+    await user.click(screen.getByRole("button", { name: "Document actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Request agent review" }));
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(String(posts()[0][1]?.body)).toContain(A);
+  });
+
+  it("surfaces policy denial without replacing the iframe", async () => {
+    render(tree());
+    const editor = await screen.findByTitle("Google Docs editor");
+    fetchMock.mockImplementation(async (input, init) =>
+      String(input).endsWith("/events") ? Response.json({ denied: true }) : server(input, init),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Request agent review" }));
+    await screen.findByText("The session’s policy blocked the document review request.");
+    expect(frame()).toBe(editor);
+  });
+
+  it("rejects queued review after permission loss and a departed activation", async () => {
+    useChatStore.setState({ status: "streaming", sessionStatus: "running" });
+    const view = render(tree());
+    await screen.findByTitle("Google Docs editor");
+    fireEvent.click(screen.getByRole("button", { name: "Request agent review" }));
+    await waitFor(() => expect(useChatStore.getState().queuedMessages).toHaveLength(1));
+    view.rerender(tree(sessionId, 1));
+    useChatStore.setState({ status: "idle", sessionStatus: "idle" });
+    useChatStore.getState().maybeFlushQueuedHead();
+    await waitFor(() => expect(useChatStore.getState().queuedMessages).toEqual([]));
+    expect(posts()).toHaveLength(0);
+  });
+});
+
+it("rejects captured mutation callbacks after session edit access is revoked", async () => {
+  const view = render(tree());
+  await screen.findByTitle("Google Docs editor");
+  const captured = observedSession;
+  view.rerender(tree(sessionId, 1));
+  await act(async () => {
+    expect(await captured.addAndOpen(B)).toBe(false);
+    expect(await captured.remove(captured.entries[0])).toBe(false);
+  });
+  expect(methods()).toEqual(["GET"]);
 });
