@@ -187,6 +187,15 @@ describe("useFeaturePaletteCommands", () => {
       expect(events).toEqual(["close", "run focus"]);
     });
 
+    it("never runs a command that moves focus once it's dropped", async () => {
+      const { hook, events, accept } = await acceptingRows();
+      accept("focus");
+      hook.result.current.dropPendingCommand();
+      hook.result.current.onCloseAutoFocus();
+      await Promise.resolve();
+      expect(events).toEqual(["close"]);
+    });
+
     it("only closes the palette for a row whose command was withdrawn", async () => {
       const { events, accept } = await acceptingRows();
       accept("withdrawn");

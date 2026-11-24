@@ -39,6 +39,8 @@ export interface FeaturePaletteCommands {
   accept: (row: FeaturePaletteRow, close: () => void) => void;
   /** The palette dialog's `onCloseAutoFocus`: a command that moves focus runs once it's back. */
   onCloseAutoFocus: () => void;
+  /** Forget a command waiting for the palette to close, as a reopening supersedes it. */
+  dropPendingCommand: () => void;
 }
 
 export function useFeaturePaletteCommands(open: boolean): FeaturePaletteCommands {
@@ -83,5 +85,11 @@ export function useFeaturePaletteCommands(open: boolean): FeaturePaletteCommands
     // The dialog returns focus right after this handler, so the command runs after that.
     if (run) queueMicrotask(run);
   }, []);
-  return useMemo(() => ({ rows, accept, onCloseAutoFocus }), [rows, accept, onCloseAutoFocus]);
+  const dropPendingCommand = useCallback(() => {
+    runAfterClose.current = null;
+  }, []);
+  return useMemo(
+    () => ({ rows, accept, onCloseAutoFocus, dropPendingCommand }),
+    [rows, accept, onCloseAutoFocus, dropPendingCommand],
+  );
 }

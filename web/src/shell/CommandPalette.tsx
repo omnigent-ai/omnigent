@@ -148,9 +148,11 @@ export function CommandPalette({
       active instanceof HTMLElement && !active.closest(COMMAND_PALETTE_SELECTOR) ? active : null;
   }, [open]);
   const returnFocus = (event: Event) => {
-    // Removed by a reopening during its exit: focus belongs to the new content.
+    // Removed by a reopening during its exit: focus belongs to the new content, so a command
+    // waiting to move focus doesn't run, now or at the next close.
     if (event.currentTarget !== contentRef.current) {
       event.preventDefault();
+      featureCommands.dropPendingCommand();
       return;
     }
     const { movedOn, restore } = closingDialogFocus(openerRef.current, COMMAND_PALETTE_SELECTOR);

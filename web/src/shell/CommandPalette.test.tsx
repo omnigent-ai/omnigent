@@ -1425,6 +1425,28 @@ describe("CommandPalette — commands a mounted feature offers", () => {
     expect(document.activeElement).toBe(screen.getByText("Where the command moves focus"));
   });
 
+  it("drops one that moves focus when ⌘K reopens before the palette finished closing", async () => {
+    withSidebarFlag(true);
+    const animation = stubExitAnimation();
+    const go = vi.fn();
+    const opener = openPalette(go);
+    animation.exitNext();
+    fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
+    expect(document.querySelector(PALETTE_CONTENT)).not.toBeNull();
+
+    // Reopened during the exit: the user wants the palette now.
+    fireEvent.click(opener);
+    await vi.waitFor(() => expect(screen.getByTestId("command-palette-input")).toHaveFocus());
+    animation.stop();
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Escape" });
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    // Not run late, by the reopened palette's Escape.
+    expect(go).not.toHaveBeenCalled();
+  });
+
   // The QuickPick palette lists them under its own flag; its own test covers that.
   it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
     "lists none without the workspace_sidebar_v2 flag",
