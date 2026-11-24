@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -231,7 +232,7 @@ def test_wait_prints_the_final_reply_once_the_turn_ends(router: respx.MockRouter
     # answer is never a reply.
     assert session.calls[:3] == [
         ("state", session.calls[0][1]),
-        ("items", {"limit": "1", "order": "desc", "type": "message"}),
+        ("items", {"limit": "1", "order": "desc"}),
         ("post", message_event("Fix it")),
     ]
 
@@ -387,19 +388,25 @@ def _terminal_command(item_id: str, kind: str, **fields: str) -> dict:
     return {"id": item_id, "type": "terminal_command", "kind": kind, **fields}
 
 
+_PREVIOUS_MODEL_SWITCH = _slash_command("slash_0", "model", "opus")
+
+
 @pytest.mark.parametrize(
-    ("text", "states"),
+    ("text", "earlier", "states", "reply"),
     [
         pytest.param(
             "/compact",
+            [],
             [
                 ({"status": "running"}, [_slash_command("slash_1", "compact")]),
                 ({"status": "idle"}, []),
             ],
+            None,
             id="slash-command-turn",
         ),
         pytest.param(
             "!ls",
+            [],
             [
                 (
                     {"status": "running"},
@@ -410,29 +417,63 @@ def _terminal_command(item_id: str, kind: str, **fields: str) -> dict:
                 ),
                 ({"status": "idle"}, []),
             ],
+            None,
             id="shell-command",
         ),
         pytest.param(
             "/model opus",
+            [],
             [({"status": "idle"}, [_slash_command("slash_1", "model", "opus")])],
+            None,
             id="built-in-without-a-turn",
+        ),
+        pytest.param(
+            "/model opus",
+            # The same built-in ran before the send and left no message after it.
+            [_PREVIOUS_MODEL_SWITCH],
+            [({"status": "idle"}, [_slash_command("slash_1", "model", "opus")])],
+            None,
+            id="built-in-repeated",
+        ),
+        pytest.param(
+            "/simplify",
+            [],
+            [
+                (
+                    {"status": "running"},
+                    [_slash_command("slash_1", "example:simplify", kind="skill")],
+                ),
+                ({"status": "idle"}, [_message("msg_3", "assistant", "Simplified")]),
+            ],
+            "Simplified",
+            id="plugin-skill-short-name",
         ),
     ],
 )
 def test_wait_ends_on_a_native_command_recorded_instead_of_a_message(
-    router: respx.MockRouter, text: str, states: list[tuple[dict, list[dict]]]
+    router: respx.MockRouter,
+    text: str,
+    earlier: list[dict],
+    states: list[tuple[dict, list[dict]]],
+    reply: str | None,
 ) -> None:
     """A native terminal records /commands and !commands as their own items, not messages."""
-    _FakeSession(
+    session = _FakeSession(
         ack=(202, {"queued": True, "pending_id": "pending_1"}),
         stores_sent_message=False,
         states=states,
-    ).install(router)
+    )
+    session.items.extend(earlier)
+    session.install(router)
 
     result = _invoke(["send", _SESSION, "-m", text, "--wait"])
 
     assert result.exit_code == 0, result.output
-    assert "turn ended without a reply" in result.stderr
+    if reply is None:
+        assert result.stdout == ""
+        assert "turn ended without a reply" in result.stderr
+    else:
+        assert result.stdout == f"{reply}\n"
 
 
 def test_wait_ignores_metadata_written_before_the_turn_starts(router: respx.MockRouter) -> None:
@@ -440,10 +481,10 @@ def test_wait_ignores_metadata_written_before_the_turn_starts(router: respx.Mock
     resource_event = {"id": "res_1", "type": "resource_event", "event": "child_completed"}
     _FakeSession(states=[({"status": "idle"}, [resource_event])]).install(router)
 
-    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.2"])
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.5"])
 
     assert result.exit_code == 1
-    assert "Timed out after 0.2s waiting for session conv_worker to reply" in result.stderr
+    assert "Timed out after 0.5s waiting for session conv_worker to reply" in result.stderr
 
 
 def test_wait_reports_a_held_message_the_session_never_delivered(
@@ -609,21 +650,22 @@ def test_wait_retrying_a_failed_session_ignores_its_old_failure(
 def test_wait_gives_up_after_the_timeout(router: respx.MockRouter) -> None:
     _FakeSession(states=[({"status": "running"}, [])]).install(router)
 
-    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.05"])
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.5"])
 
     assert result.exit_code == 1
-    assert "Timed out after 0.05s waiting for session conv_worker to reply" in result.stderr
+    assert "Timed out after 0.5s waiting for session conv_worker to reply" in result.stderr
     assert result.stdout == ""
 
 
 def test_wait_timeout_bounds_slow_reads(router: respx.MockRouter) -> None:
     """A reply that would arrive after the deadline is not reported as a success."""
-    _FakeSession(state_delay_s=0.1, states=[({"status": "idle"}, [_FIXED])]).install(router)
+    # The reply is in by the second poll, which can only finish after the deadline.
+    _FakeSession(state_delay_s=0.2, states=[({"status": "idle"}, [_FIXED])]).install(router)
 
-    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.25"])
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.5"])
 
     assert result.exit_code == 1
-    assert "Timed out after 0.25s waiting for session conv_worker to reply" in result.stderr
+    assert "Timed out after 0.5s waiting for session conv_worker to reply" in result.stderr
 
 
 def test_wait_timeout_before_the_send_says_nothing_was_sent(router: respx.MockRouter) -> None:
@@ -664,6 +706,33 @@ def test_wait_timeout_covers_renewing_an_expired_login(
     assert session.calls == []
 
 
+def test_wait_timeout_does_not_wait_out_a_refresh_stuck_on_the_lock(
+    router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another process holding the token file's lock can't keep the command past --timeout."""
+    lock_released = threading.Event()
+
+    def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | None:
+        # The lock is taken before the refresh's HTTP timeout applies.
+        lock_released.wait(timeout=10)
+        return None
+
+    monkeypatch.setattr("omnigent.session_cli._renew_stored_login", _renew_stored_login)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda server_url, **_: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_stored_token)
+    _FakeSession().install(router)
+    try:
+        started = time.monotonic()
+        result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.1"])
+        elapsed = time.monotonic() - started
+    finally:
+        lock_released.set()
+
+    assert result.exit_code == 1
+    assert "Timed out after 0.1s" in result.stderr
+    assert elapsed < 1
+
+
 def test_wait_gives_each_login_renewal_only_the_time_left(
     router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -698,10 +767,10 @@ def test_wait_timeout_covers_a_send_the_server_holds(router: respx.MockRouter) -
     """An approval policy can hold the POST itself."""
     _FakeSession(post_delay_s=5.0).install(router)
 
-    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.05"])
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.5"])
 
     assert result.exit_code == 1
-    assert "Timed out after 0.05s before the server confirmed the message" in result.stderr
+    assert "Timed out after 0.5s before the server confirmed the message" in result.stderr
 
 
 @pytest.mark.parametrize(

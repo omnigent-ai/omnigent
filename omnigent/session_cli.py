@@ -11,8 +11,10 @@ replica holding the session's host.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import threading
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -128,7 +130,7 @@ async def open_session_client(
     from omnigent.cli_auth import open_server_client
 
     # An already-expired login must be renewed before choosing how to authenticate.
-    await asyncio.to_thread(_renew_stored_login, base_url, _remaining(deadline))
+    await _renew_in_background(base_url, _remaining(deadline))
     auth = _server_auth(server_url=base_url)
     async with open_server_client(
         base_url,
@@ -165,6 +167,38 @@ def _renew_stored_login(server_url: str, budget_s: float | None = None) -> None:
         refresh_stored_token(server_url, timeout=limit)
 
 
+async def _renew_in_background(server_url: str, budget_s: float | None) -> None:
+    """
+    Renew the stored login in a daemon thread and wait for it.
+
+    The refresh can block on the token file's lock with no deadline, so a wait the
+    caller's deadline cancels leaves the thread behind rather than joining it at exit.
+    The token file is replaced atomically, so an abandoned refresh can't corrupt it.
+    """
+    loop = asyncio.get_running_loop()
+    done: asyncio.Future[None] = loop.create_future()
+
+    def _settle(error: BaseException | None) -> None:
+        if done.done():
+            return
+        if error is None:
+            done.set_result(None)
+        else:
+            done.set_exception(error)
+
+    def _renew() -> None:
+        error: BaseException | None = None
+        try:
+            _renew_stored_login(server_url, budget_s)
+        except Exception as exc:  # noqa: BLE001 - re-raised in the awaiting task
+            error = exc
+        with contextlib.suppress(RuntimeError):  # the loop closed after giving up
+            loop.call_soon_threadsafe(_settle, error)
+
+    threading.Thread(target=_renew, name="omnigent-login-renewal", daemon=True).start()
+    await done
+
+
 class _RenewingAuth(httpx.Auth):
     """The CLI's server auth, with the stored login renewed before each request."""
 
@@ -177,7 +211,7 @@ class _RenewingAuth(httpx.Auth):
         self, request: httpx.Request
     ) -> AsyncGenerator[httpx.Request, httpx.Response]:
         """Renew the login off the event loop, then authenticate as the CLI does."""
-        await asyncio.to_thread(_renew_stored_login, self._server_url, _remaining(self._deadline))
+        await _renew_in_background(self._server_url, _remaining(self._deadline))
         flow = self._inner.async_auth_flow(request)
         outgoing = await anext(flow)
         while True:
@@ -365,17 +399,26 @@ def project_message(item: object) -> JsonObject | None:
     }
 
 
-async def latest_message_id(client: httpx.AsyncClient, session_id: str) -> str | None:
+async def latest_item_id(client: httpx.AsyncClient, session_id: str) -> str | None:
     """
-    Return the newest message's id, the point a reply wait reads after.
+    Return the newest transcript item's id, the point a reply wait reads after.
+
+    Any item type: a native built-in command records only its command item, so an
+    earlier identical command must fall before the cursor too.
 
     :param client: Client from :func:`open_session_client`.
     :param session_id: The session, e.g. ``"conv_abc123"``.
-    :returns: The id, or ``None`` when the session has no messages yet.
+    :returns: The id, or ``None`` when the session has no items yet.
     """
-    messages = await list_messages(client, session_id, last=1)
-    message_id = messages[-1].get("id") if messages else None
-    return message_id if isinstance(message_id, str) else None
+    page = await _read_json(
+        client,
+        session_id,
+        f"/v1/sessions/{session_id}/items",
+        {"limit": 1, "order": "desc"},
+    )
+    items = _page_items(page, session_id)
+    item_id = items[0].get("id") if items else None
+    return item_id if isinstance(item_id, str) else None
 
 
 async def send_and_wait(
@@ -409,7 +452,7 @@ async def send_and_wait(
             open_session_client(base_url, deadline=deadline) as client,
         ):
             baseline = await _read_state(client, session_id)
-            after = await latest_message_id(client, session_id)
+            after = await latest_item_id(client, session_id)
             posting = True
             message = await send_message(client, session_id, text)
             sent = True
@@ -456,7 +499,7 @@ async def _wait_for_reply(
     status since, reports a different error, or has an error item after the message.
     A held message the session listed as failed to deliver ends the wait too.
 
-    :param after: The newest message id before the send, or ``None``.
+    :param after: The newest item id before the send, or ``None``.
     :param baseline: The session's state read before the send.
     :param sent: The posted message.
     """
@@ -589,10 +632,14 @@ async def _sent_commands(
         return []
     if words[0].startswith("/"):
         items = await _items_after(client, session_id, after, "slash_command")
+        # A plugin skill typed by its short name is recorded as ``/<plugin>:<name>``.
         return [
             item
             for item in items
-            if [f"/{item.get('name')}", *str(item.get("arguments") or "").split()] == words
+            if any(
+                [f"/{name}", *str(item.get("arguments") or "").split()] == words
+                for name in {str(item.get("name")), str(item.get("name")).rpartition(":")[2]}
+            )
         ]
     if words[0].startswith("!"):
         items = await _items_after(client, session_id, after, "terminal_command")

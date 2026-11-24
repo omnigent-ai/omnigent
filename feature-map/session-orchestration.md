@@ -55,7 +55,9 @@ MCP independent creation.
   from before the turn doesn't end the wait. The sent message is found by the ack's
   item id, or by its text for a held input, never by someone else's message; a
   native terminal's `/command` or `!command` is found by the command item it records
-  instead. A held text that more than one item matches is refused (exit 1). Turn
+  instead, a plugin skill under its qualified name too. The cursor is the newest item
+  of any type, so an earlier identical command stays before it. A held text that more
+  than one item matches is refused (exit 1). Turn
   output means tool calls, reasoning, errors, compaction, terminal output or assistant
   messages, not metadata such as resource events. A stored `omnigent
   login` token is renewed from its refresh grant during the wait. It prints
