@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, Literal
 
-from omnigent.entities.project_routing import LEAD_IDENTITY_ID
+from omnigent.entities.project_routing import LEAD_IDENTITY_ID, LEAD_NAME
 from omnigent.errors import OmnigentError
 from omnigent.server.auth import LEVEL_READ
 from omnigent.server.routes._auth_helpers import require_access
@@ -73,14 +73,17 @@ def identity_response(identity: ProjectIdentity, state: IdentitySessionState) ->
 def orchestrator_identity_response(
     project: Project, state: IdentitySessionState
 ) -> dict[str, Any]:
-    """The built-in Lead identity, backed by the project's main session."""
+    """The built-in Lead identity, backed by the project's main session.
+
+    Its ``instructions`` are the owner's charter, which only the owner edits.
+    """
     return {
         "id": ORCHESTRATOR_IDENTITY_ID,
         "object": "project.identity",
         "project_id": project.id,
-        "name": "Lead",
+        "name": LEAD_NAME,
         "builtin": True,
-        "instructions": "",
+        "instructions": project.lead_charter or "",
         "agent_id": project.config.get("agent_id"),
         "model": project.config.get("model"),
         "effort": project.config.get("effort"),

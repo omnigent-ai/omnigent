@@ -7,6 +7,7 @@ from omnigent.runner.native.orchestration import _native_startup_instructions
 from omnigent.runner.project_orchestrator import (
     PROJECT_ORCHESTRATOR_INSTRUCTION,
     append_project_instructions,
+    project_lead_charter_instruction,
     project_mandate_instruction,
 )
 from omnigent.runtime.project_ticket_instructions import (
@@ -171,6 +172,34 @@ async def test_mandate_is_labeled_and_ordered_before_ticket_guidance_and_role(pr
             )
         else:
             assert prompt.endswith(mandate)
+
+
+async def test_lead_charter_follows_the_mandate_and_precedes_ticket_guidance_and_role():
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=True))
+    snapshot = {
+        "project_id": "project",
+        "project_main_session": True,
+        "project_mandate": "Stay in docs/.",
+        "project_lead_charter": "  Batch reviews daily.  ",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=snapshot)),
+        base_url="http://server.test",
+    ) as client:
+        prompt = await append_project_instructions("Author", client, "session", spec)
+    charter = project_lead_charter_instruction(snapshot["project_lead_charter"])
+    assert charter is not None
+    assert charter.endswith("<lead_charter>\nBatch reviews daily.\n</lead_charter>")
+    assert "never widens it" in charter
+    mandate = project_mandate_instruction("Stay in docs/.")
+    assert mandate is not None
+    assert (
+        prompt.index(mandate)
+        < prompt.index(charter)
+        < prompt.index(PROJECT_CONVERSATION_INSTRUCTION)
+        < prompt.index(PROJECT_ORCHESTRATOR_INSTRUCTION)
+    )
+    assert project_lead_charter_instruction("  ") is None
 
 
 @pytest.mark.parametrize("mandate", [None, "", "   ", 7])

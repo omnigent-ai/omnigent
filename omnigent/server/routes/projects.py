@@ -642,6 +642,36 @@ def create_projects_router(
         [identity] = await heal_identity_sessions(request, project, [identity])
         return await _identity_payload(project, identity)
 
+    async def _update_lead_charter(
+        request: Request, project: Project, user_id: str | None, body: ProjectIdentityRequest
+    ) -> dict[str, Any]:
+        """Edit the built-in Lead's charter, the only Lead field Team edits. Owner only.
+
+        Like the mandate, agents never write it: it shapes the coordinator's behavior.
+        """
+        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+            raise OmnigentError(
+                "Only the project owner can edit the Lead's charter", code=ErrorCode.FORBIDDEN
+            )
+        if body.name is not None and body.name.strip() != LEAD_NAME:
+            raise OmnigentError("The Lead can't be renamed", code=ErrorCode.INVALID_INPUT)
+        if any(getattr(body, field) for field in ("agent_id", "model", "effort")):
+            raise OmnigentError(
+                "The Lead's agent, model and effort come from the project's settings",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if body.instructions is not None:
+            project = await asyncio.to_thread(
+                project_store.set_lead_charter,
+                project.id,
+                user_id=user_id,
+                charter=body.instructions,
+            )
+            announce_projects_changed(user_id)
+        return orchestrator_identity_response(
+            project, await main_session_state(project, conversation_store, permission_store)
+        )
+
     @router.patch("/projects/{project_id}/identities/{identity_id}")
     async def update_identity(
         request: Request, project_id: str, identity_id: str, body: ProjectIdentityRequest
@@ -653,6 +683,8 @@ def create_projects_router(
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
         project = await _owned_project(project_id, user_id)
+        if identity_id == LEAD_IDENTITY_ID:
+            return await _update_lead_charter(request, project, user_id, body)
         clear = frozenset(
             field
             for field in ("agent_id", "model", "effort")
@@ -684,6 +716,11 @@ def create_projects_router(
         user_id = require_user(request, auth_provider)
         _refuse_agent_identity_delete(request)
         project = await _owned_project(project_id, user_id)
+        if identity_id == LEAD_IDENTITY_ID:
+            raise OmnigentError(
+                "The Lead can't be deleted; choose another router to remove it",
+                code=ErrorCode.INVALID_INPUT,
+            )
         normalized = _identity_id(identity_id)
         deleted = await asyncio.to_thread(
             project_store.delete_identity, project.id, normalized, user_id=user_id

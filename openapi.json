@@ -13609,6 +13609,17 @@
             ],
             "title": "Project Identity"
           },
+          "project_lead_charter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Lead Charter"
+          },
           "project_main_session": {
             "default": false,
             "title": "Project Main Session",

@@ -2710,6 +2710,9 @@ class SessionResponse(BaseModel):
     project_orchestrator: bool = False
     # The project's mandate, only when requested with ``include_project_mandate``.
     project_mandate: str | None = None
+    # The owner's charter for the Lead, on the Lead's own session and only when
+    # requested with ``include_project_mandate``.
+    project_lead_charter: str | None = None
     # The identity this session works for, when it is that identity's active
     # session: ``{"id", "name"}``, plus ``instructions`` for runner requests.
     project_identity: dict[str, str] | None = None

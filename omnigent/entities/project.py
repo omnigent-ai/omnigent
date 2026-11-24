@@ -41,6 +41,8 @@ class Project:
     :param router_identity_id: The owner-chosen persona that receives routed
         events (``"orchestrator"`` for the Lead), or ``None`` for the default.
     :param lead_removed: Whether the owner removed the built-in Lead persona.
+    :param lead_charter: The owner's charter for the Lead, added to its session's
+        instructions beside the orchestrator role, or ``None`` when unset.
     """
 
     id: str
@@ -55,6 +57,7 @@ class Project:
     retired_main_session_ids: list[str] = field(default_factory=list)
     router_identity_id: str | None = None
     lead_removed: bool = False
+    lead_charter: str | None = None
 
 
 @dataclass(frozen=True)

@@ -188,6 +188,10 @@ class ProjectStore(ABC):
         """Set the project's router persona and whether its Lead was removed (owner-only)."""
         raise NotImplementedError
 
+    def set_lead_charter(self, project_id: str, *, user_id: str | None, charter: str) -> Project:
+        """Set the owner's charter for the built-in Lead; blank clears it (owner-only)."""
+        raise NotImplementedError
+
     def propose_mandate_addition(
         self,
         project_id: str,

@@ -467,6 +467,42 @@ async def test_agents_create_and_edit_their_own_identities_but_not_the_owners(
     assert names[0] == "Lead" and sorted(names[1:]) == ["Ops", "PM"]
 
 
+async def test_only_the_owner_edits_the_leads_charter_and_only_the_lead_reads_it(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """The Lead lists with its charter; agents can't write it, nobody renames or deletes it."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    agent = {ORCHESTRATION_SOURCE_HEADER: created["main_session_id"]}
+    lead_path = f"/v1/projects/{created['id']}/identities/orchestrator"
+    saved = await project_client.patch(lead_path, json={"instructions": "  Batch reviews.  "})
+    assert (saved.json()["name"], saved.json()["instructions"]) == ("Lead", "Batch reviews.")
+    refused = await project_client.patch(lead_path, json={"instructions": "x"}, headers=agent)
+    assert refused.status_code == 403
+    renamed = await project_client.patch(lead_path, json={"name": "Boss", "instructions": "x"})
+    assert renamed.status_code == 400
+    assert (await project_client.delete(lead_path)).status_code == 400
+    # A client config replace keeps the server-owned charter.
+    await project_client.patch(f"/v1/projects/{created['id']}", json={"config": {"model": "m"}})
+    listed = (await project_client.get(f"/v1/projects/{created['id']}/identities")).json()
+    assert listed["data"][0]["instructions"] == "Batch reviews."
+    params = {"include_project_mandate": "true"}
+    snapshot = await project_client.get(
+        f"/v1/sessions/{created['main_session_id']}", params=params
+    )
+    assert snapshot.json()["project_lead_charter"] == "Batch reviews."
+    persona = (
+        await project_client.post(
+            f"/v1/projects/{created['id']}/identities", json={"name": "PM", "instructions": "y"}
+        )
+    ).json()
+    worker = await project_client.get(
+        f"/v1/sessions/{persona['active_session_id']}", params=params
+    )
+    assert worker.json()["project_lead_charter"] is None
+    cleared = await project_client.patch(lead_path, json={"instructions": " "})
+    assert cleared.json()["instructions"] == ""
+
+
 async def test_the_owner_routes_events_to_a_persona_and_can_remove_the_lead(
     project_client: httpx.AsyncClient,
 ) -> None:

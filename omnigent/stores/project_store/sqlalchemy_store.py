@@ -68,8 +68,15 @@ _RETIRED_MAIN_SESSIONS_MAX = 50
 # built-in Lead was removed. Owner-set only, through ``set_routing``.
 ROUTER_IDENTITY_CONFIG_KEY = "_omnigent_router_identity"
 LEAD_REMOVED_CONFIG_KEY = "_omnigent_lead_removed"
+# Server-owned: the owner's charter for the Lead, set only through ``set_lead_charter``.
+LEAD_CHARTER_CONFIG_KEY = "_omnigent_lead_charter"
 _SERVER_CONFIG_KEYS = frozenset(
-    {RETIRED_MAIN_SESSIONS_CONFIG_KEY, ROUTER_IDENTITY_CONFIG_KEY, LEAD_REMOVED_CONFIG_KEY}
+    {
+        RETIRED_MAIN_SESSIONS_CONFIG_KEY,
+        ROUTER_IDENTITY_CONFIG_KEY,
+        LEAD_REMOVED_CONFIG_KEY,
+        LEAD_CHARTER_CONFIG_KEY,
+    }
 )
 
 
@@ -93,6 +100,11 @@ def _with_retired(config: dict[str, Any], retired: list[str]) -> dict[str, Any]:
     if not retired:
         return config
     return {**config, RETIRED_MAIN_SESSIONS_CONFIG_KEY: retired[-_RETIRED_MAIN_SESSIONS_MAX:]}
+
+
+def _lead_charter(raw: str | None) -> str | None:
+    value = _decode_config(raw).get(LEAD_CHARTER_CONFIG_KEY)
+    return value if isinstance(value, str) and value else None
 
 
 def _router_identity_id(raw: str | None) -> str | None:
@@ -261,6 +273,7 @@ def _to_entity(row: SqlProject) -> Project:
         retired_main_session_ids=_retired_ids(row.config),
         router_identity_id=_router_identity_id(row.config),
         lead_removed=_decode_config(row.config).get(LEAD_REMOVED_CONFIG_KEY) is True,
+        lead_charter=_lead_charter(row.config),
     )
 
 
@@ -721,6 +734,32 @@ class SqlAlchemyProjectStore(ProjectStore):
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "set_project_routing", write)
+
+    def set_lead_charter(self, project_id: str, *, user_id: str | None, charter: str) -> Project:
+        """Set the owner's charter for the built-in Lead; blank clears it. Owner-only.
+
+        :raises OmnigentError: ``NOT_FOUND`` for an unknown project, ``FORBIDDEN``
+            for a shared member, ``INVALID_INPUT`` for oversized text.
+        """
+        stored = _normalize_identity_instructions(charter)
+        updated_at = now_epoch()
+
+        def write(session: Session) -> Project:
+            row = self._require_owner(
+                session, project_id, user_id, action="edit the Lead's charter"
+            )
+            config = _decode_config(row.config)
+            config.pop(LEAD_CHARTER_CONFIG_KEY, None)
+            if stored:
+                config[LEAD_CHARTER_CONFIG_KEY] = stored
+            encoded = _encode_config(config)
+            if row.config != encoded:
+                row.config = encoded
+                row.updated_at = updated_at
+            session.flush()
+            return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "set_project_lead_charter", write)
 
     def list_main_sessions(self) -> builtins.list[tuple[str, str | None, str]]:
         with self._session("list_project_main_sessions") as session:

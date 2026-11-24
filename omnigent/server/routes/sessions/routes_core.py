@@ -2760,6 +2760,8 @@ def register_core_routes(
             snapshot.project_orchestrator = snapshot.project_main_session
             if include_project_mandate and project is not None:
                 snapshot.project_mandate = project.mandate
+                if snapshot.project_main_session:
+                    snapshot.project_lead_charter = project.lead_charter
             identity_id = (conv.labels or {}).get(PROJECT_IDENTITY_LABEL_KEY)
             if project is not None and identity_id and not conv.archived:
                 identity = await asyncio.to_thread(

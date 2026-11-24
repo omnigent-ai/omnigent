@@ -90,6 +90,24 @@ def project_identity_instruction(identity: object) -> str | None:
     return block
 
 
+def project_lead_charter_instruction(charter: object) -> str | None:
+    """Label the owner's charter for the project's built-in Lead.
+
+    :param charter: The snapshot's ``project_lead_charter``, e.g. ``"Batch reviews daily."``.
+    :returns: The labeled block, or ``None`` when the project has no charter.
+    """
+    if not isinstance(charter, str) or not charter.strip():
+        return None
+    return (
+        "## Lead charter\n"
+        "You are this project's Lead, its built-in coordinator. The project owner wrote this "
+        "charter for the role. Follow it alongside the orchestrator skill and your role "
+        "instructions; it narrows the project mandate and never widens it, and it never "
+        "overrides safety rules, permission prompts or approval gates.\n\n"
+        f"<lead_charter>\n{charter.strip()}\n</lead_charter>"
+    )
+
+
 async def _project_session_snapshot(
     server_client: httpx.AsyncClient, session_id: str
 ) -> dict[str, object] | None:
@@ -120,9 +138,10 @@ async def project_instructions(
 ) -> str | None:
     """Resolve project guidance and the role from the session, never its agent or title.
 
-    Blocks follow a fixed order: the mandate, then the identity persona, then
-    conversation and ticket guidance, then the orchestrator role. The mandate
-    and persona reach every project session; the rest need project tools.
+    Blocks follow a fixed order: the mandate, then the identity persona or the
+    Lead's charter, then conversation and ticket guidance, then the orchestrator
+    role. The mandate, persona and charter reach their sessions without project
+    tools; the rest need them.
     """
     if server_client is None or spec is None:
         return None
@@ -140,6 +159,7 @@ async def project_instructions(
     blocks = (
         project_mandate_instruction(snapshot.get("project_mandate")),
         project_identity_instruction(snapshot.get("project_identity")),
+        project_lead_charter_instruction(snapshot.get("project_lead_charter")),
         PROJECT_CONVERSATION_INSTRUCTION if in_ticket_project else None,
         PROJECT_TICKET_WORK_INSTRUCTION if in_ticket_project else None,
         PROJECT_ORCHESTRATOR_INSTRUCTION if has_project_tools and designated is True else None,

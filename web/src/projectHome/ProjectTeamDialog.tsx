@@ -24,6 +24,7 @@ import {
 } from "@/lib/projectsApi";
 import { ProjectRoutingSection } from "./ProjectRoutingSection";
 import { TicketError } from "./TicketControls";
+import { useProjectRecord } from "./useProjectAgentSession";
 import { projectIdentitiesKey, useProjectIdentities } from "./useProjectIdentities";
 
 const encoder = new TextEncoder();
@@ -46,7 +47,9 @@ function draftOf(identity: ProjectIdentity): IdentityDraft {
   };
 }
 
-function inputOf(draft: IdentityDraft): ProjectIdentityInput {
+function inputOf(draft: IdentityDraft, builtin: boolean): ProjectIdentityInput {
+  // The Lead's name and session defaults are fixed here; Team edits only its charter.
+  if (builtin) return { instructions: draft.instructions };
   return {
     name: draft.name.trim(),
     instructions: draft.instructions,
@@ -66,6 +69,7 @@ export function ProjectTeamDialog({
   onClose: () => void;
 }) {
   const identities = useProjectIdentities(projectId);
+  const shared = useProjectRecord(projectId).data?.shared === true;
   // `null` is the new-identity form; an id edits that identity.
   const [selected, setSelected] = useState<string | null>(null);
   const [draft, setDraft] = useState<IdentityDraft>(EMPTY_DRAFT);
@@ -90,8 +94,13 @@ export function ProjectTeamDialog({
       setDraft(EMPTY_DRAFT);
     },
   });
-  const roles = (identities.data ?? []).filter((identity) => !identity.builtin);
-  const selectedIdentity = roles.find((identity) => identity.id === selected);
+  const all = identities.data ?? [];
+  const roles = all.filter((identity) => !identity.builtin);
+  const lead = all.find((identity) => identity.builtin);
+  const selectedIdentity = all.find((identity) => identity.id === selected);
+  const isLead = selectedIdentity?.builtin === true;
+  // Only the owner edits the Lead's charter, as with the mandate.
+  const readOnly = isLead && shared;
   const bytes = encoder.encode(draft.instructions.trim()).length;
   const tooLarge = bytes > PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES;
   const busy = save.isPending || remove.isPending;
@@ -103,7 +112,7 @@ export function ProjectTeamDialog({
   };
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
-    if (draft.name.trim() && !tooLarge) save.mutate(inputOf(draft));
+    if (draft.name.trim() && !tooLarge && !readOnly) save.mutate(inputOf(draft, isLead));
   };
   return (
     <Dialog
@@ -120,9 +129,9 @@ export function ProjectTeamDialog({
           <DialogTitle>Team</DialogTitle>
           <DialogDescription>
             Persistent roles in <span className="font-medium">{projectName}</span> you can talk to,
-            beside the Lead. Agents can add roles too. Each works in one session at a time and
-            follows the project mandate. Assign a ticket with the label{" "}
-            <span className="font-mono">assignee: Name</span>.
+            including the built-in Lead, whose charter you can edit. Agents can add roles too. Each
+            works in one session at a time and follows the project mandate. Assign a ticket with the
+            label <span className="font-mono">assignee: Name</span>.
           </DialogDescription>
         </DialogHeader>
         {identities.isLoading ? (
@@ -142,6 +151,20 @@ export function ProjectTeamDialog({
                   <PlusIcon />
                   New identity
                 </Button>
+                {lead && (
+                  <Button
+                    type="button"
+                    variant={selected === lead.id ? "secondary" : "ghost"}
+                    size="sm"
+                    className="justify-start"
+                    data-testid="project-team-lead"
+                    onClick={() => choose(lead)}
+                  >
+                    <PersonaAvatar name={lead.name} size="xs" />
+                    <span className="truncate">{lead.name}</span>
+                    <span className="ml-auto text-xs text-muted-foreground">Built-in</span>
+                  </Button>
+                )}
                 {roles.map((identity) => (
                   <Button
                     key={identity.id}
@@ -165,19 +188,23 @@ export function ProjectTeamDialog({
                     maxLength={60}
                     placeholder="e.g. PM, Designer"
                     onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                    disabled={busy}
+                    disabled={busy || isLead}
                   />
                 </label>
                 <label className="flex flex-col gap-1 text-sm">
-                  Persona
+                  {isLead ? "Charter" : "Persona"}
                   <Textarea
                     data-testid="project-team-persona"
                     value={draft.instructions}
-                    placeholder="e.g. You are the product manager. Own scope, priorities and acceptance criteria; write tickets, don't write code."
+                    placeholder={
+                      isLead
+                        ? "e.g. Batch reviews into one daily summary. Prefer fewer, larger tickets."
+                        : "e.g. You are the product manager. Own scope, priorities and acceptance criteria; write tickets, don't write code."
+                    }
                     className="min-h-36 max-h-[45dvh] text-sm"
                     aria-invalid={tooLarge || undefined}
                     onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
-                    disabled={busy}
+                    disabled={busy || readOnly}
                   />
                   <span
                     className={
@@ -188,26 +215,35 @@ export function ProjectTeamDialog({
                     {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES.toLocaleString()} bytes
                   </span>
                 </label>
-                <div className="flex gap-3">
-                  <label className="flex flex-1 flex-col gap-1 text-sm">
-                    Model
-                    <Input
-                      value={draft.model}
-                      placeholder="Project default"
-                      onChange={(event) => setDraft({ ...draft, model: event.target.value })}
-                      disabled={busy}
-                    />
-                  </label>
-                  <label className="flex flex-1 flex-col gap-1 text-sm">
-                    Effort
-                    <Input
-                      value={draft.effort}
-                      placeholder="Project default"
-                      onChange={(event) => setDraft({ ...draft, effort: event.target.value })}
-                      disabled={busy}
-                    />
-                  </label>
-                </div>
+                {isLead ? (
+                  <p className="text-xs text-muted-foreground" data-testid="project-team-lead-note">
+                    The Lead is the project's built-in coordinator. Your charter is added to its
+                    instructions beside the built-in orchestrator role and takes effect on its next
+                    turn or session start. Only you can edit it; agents can't. The Lead can't be
+                    renamed or deleted here, and its model comes from the project's settings.
+                  </p>
+                ) : (
+                  <div className="flex gap-3">
+                    <label className="flex flex-1 flex-col gap-1 text-sm">
+                      Model
+                      <Input
+                        value={draft.model}
+                        placeholder="Project default"
+                        onChange={(event) => setDraft({ ...draft, model: event.target.value })}
+                        disabled={busy}
+                      />
+                    </label>
+                    <label className="flex flex-1 flex-col gap-1 text-sm">
+                      Effort
+                      <Input
+                        value={draft.effort}
+                        placeholder="Project default"
+                        onChange={(event) => setDraft({ ...draft, effort: event.target.value })}
+                        disabled={busy}
+                      />
+                    </label>
+                  </div>
+                )}
                 {selectedIdentity?.created_by_session_id && (
                   <p
                     className="text-xs text-muted-foreground"
@@ -219,7 +255,7 @@ export function ProjectTeamDialog({
                 )}
                 <TicketError error={save.error ?? remove.error ?? identities.error} />
                 <DialogFooter className="border-t-0 bg-transparent">
-                  {selected !== null && (
+                  {selected !== null && !isLead && (
                     <Button
                       type="button"
                       variant="ghost"
@@ -239,7 +275,7 @@ export function ProjectTeamDialog({
                     type="submit"
                     data-testid="project-team-save"
                     loading={save.isPending}
-                    disabled={!draft.name.trim() || tooLarge || remove.isPending}
+                    disabled={!draft.name.trim() || tooLarge || readOnly || remove.isPending}
                   >
                     {selected === null ? "Add" : "Save"}
                   </Button>
