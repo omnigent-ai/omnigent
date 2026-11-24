@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useSession } from "@/hooks/useSession";
 import {
+  IgnoredFilesSearchError,
   RunnerOfflineError,
   joinBrowseLocation,
   relativizeToWorkspace,
@@ -345,26 +346,32 @@ export function FilesPageTree({
     const unsearchable =
       result?.unavailable || (!result && search.isPending && search.fetchStatus === "idle");
     let content: React.ReactNode;
-    if (search.isError && !result) {
-      content = (
-        <TreeMessage alert>{`Couldn’t search the files: ${search.error.message}`}</TreeMessage>
-      );
-    } else if (result?.ignoredUnfiltered) {
+    if (search.isError && !result && search.error instanceof IgnoredFilesSearchError) {
+      // Retried already; the reader can try again, or search with ignored files too.
       content = (
         <div className="flex flex-col items-start gap-2 pb-2">
-          <TreeMessage>The files can’t be searched without what Git ignores right now.</TreeMessage>
-          {onShowIgnored ? (
+          <TreeMessage>{search.error.message}</TreeMessage>
+          <div className="mx-3 flex flex-wrap gap-2">
             <Button
               type="button"
               variant="outline"
               size="sm"
-              className="mx-3"
-              onClick={onShowIgnored}
+              disabled={search.isFetching}
+              onClick={() => void search.refetch()}
             >
-              Show git-ignored files
+              Try again
             </Button>
-          ) : null}
+            {onShowIgnored ? (
+              <Button type="button" variant="outline" size="sm" onClick={onShowIgnored}>
+                Show git-ignored files
+              </Button>
+            ) : null}
+          </div>
         </div>
+      );
+    } else if (search.isError && !result) {
+      content = (
+        <TreeMessage alert>{`Couldn’t search the files: ${search.error.message}`}</TreeMessage>
       );
     } else if (unsearchable) {
       content = (

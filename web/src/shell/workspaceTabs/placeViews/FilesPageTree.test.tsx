@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  IgnoredFilesSearchError,
   RunnerOfflineError,
   type WorkspaceFile,
   useWorkspaceAllFiles,
@@ -475,16 +476,15 @@ describe("FilesPageTree", () => {
       expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: false });
     });
 
-    it("says it can't search without ignored files right now, and offers them", () => {
+    it("says it can't search without ignored files right now, and offers a retry or them", () => {
       vi.useFakeTimers();
+      const refetch = vi.fn();
       vi.mocked(useWorkspaceFileSearch).mockReturnValue({
-        data: {
-          files: [],
-          truncated: false,
-          hasMore: false,
-          unavailable: false,
-          ignoredUnfiltered: true,
-        },
+        data: undefined,
+        isError: true,
+        isFetching: false,
+        error: new IgnoredFilesSearchError(),
+        refetch,
       } as never);
       const { onShowIgnored } = renderTree(listed([entry("README.md")], true), false, {
         showIgnored: false,
@@ -494,6 +494,8 @@ describe("FilesPageTree", () => {
       expect(
         screen.getByText("The files can’t be searched without what Git ignores right now."),
       ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      expect(refetch).toHaveBeenCalledTimes(1);
       fireEvent.click(screen.getByRole("button", { name: "Show git-ignored files" }));
       expect(onShowIgnored).toHaveBeenCalledTimes(1);
     });

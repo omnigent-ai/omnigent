@@ -46,6 +46,7 @@ import {
   useWorkspaceFileSearch,
   useWorkspaceServeable,
   fetchWorkspaceFolderListing,
+  IgnoredFilesSearchError,
   listingIgnoredFiles,
   workspaceDirectoryQuery,
 } from "./useWorkspaceChangedFiles";
@@ -257,6 +258,9 @@ beforeEach(() => {
   stubChatStore();
   hostOnlineMock.mockReturnValue(null);
   stubSession(null);
+  // Every case starts with a workspace API that declines, whatever the last one set.
+  vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValue(null);
+  vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -1222,8 +1226,44 @@ describe("useWorkspaceFileSearch through the workspace API", () => {
       },
     );
 
-    await waitFor(() => expect(result.current.data).toBeDefined());
-    expect(result.current.data).toMatchObject({ files: [], ignoredUnfiltered: true });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error).toBeInstanceOf(IgnoredFilesSearchError);
+    expect(result.current.data).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("recovers on its own once the API answers a search without ignored files again", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: "src/main.ts",
+            name: "main.ts",
+            path: "src/main.ts",
+            type: "file",
+            bytes: 1,
+            modified_at: 1,
+          },
+        ],
+        hasMore: false,
+        truncated: false,
+      });
+    // Retried as the app's queries are, without the wait between tries.
+    const client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } });
+    const { result } = renderHook(
+      () => useWorkspaceFileSearch("conv_live", "main", "", "", { hideIgnored: true }, ""),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.files.map((file) => file.path)).toEqual(["src/main.ts"]);
+    expect(vi.mocked(searchFilesViaWorkspaceApi)).toHaveBeenCalledTimes(2);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -1251,8 +1291,6 @@ describe("useWorkspaceFileSearch through the workspace API", () => {
 
     const asked = vi.mocked(searchFilesViaWorkspaceApi).mock.calls.map(([, , options]) => options);
     expect(asked.map((options) => options.includeGitIgnored)).toEqual([false, true]);
-    vi.mocked(searchFilesViaWorkspaceApi).mockReset();
-    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValue(null);
   });
 
   it("falls back to REST when the workspace API declines a folder search", async () => {
