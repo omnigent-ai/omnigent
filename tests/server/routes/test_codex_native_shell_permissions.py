@@ -76,9 +76,12 @@ class _ShellRunnerClient(_FakeRunnerClient):
 
 @pytest.fixture
 async def codex_client(
+    request: pytest.FixtureRequest,
     runner_globals_reset: None,  # noqa: F811 — imported fixture
 ) -> AsyncIterator[tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation]]:
     del runner_globals_reset
+    # Indirect parametrization adds release features, e.g. {Feature.MESSAGE_SENDER_CONTEXT}.
+    extra_features: frozenset[Feature] = getattr(request, "param", frozenset())
     store = _ConversationStore()
     conv = store.get_conversation(_SESSION_ID)
     assert conv is not None
@@ -107,7 +110,7 @@ async def codex_client(
         permission_store=permissions,
     )
     app.state.feature_flags = FeatureFlags(
-        frozenset({Feature.SESSION_ORCHESTRATION, Feature.PEER_SESSION_MESSAGING})
+        frozenset({Feature.SESSION_ORCHESTRATION, Feature.PEER_SESSION_MESSAGING}) | extra_features
     )
     pending_inputs.reset_for_tests()
     try:
@@ -180,11 +183,13 @@ async def test_codex_editor_model_input_keeps_edit_access(
     assert response.status_code == 202, response.text
     messages = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
     assert len(messages) == 1
-    # Shell-looking input stays as typed; the editor's ordinary message names them.
-    assert messages[0]["content"] == with_message_sender(content, "editor@example.com")
+    assert messages[0]["content"] == content
     assert dict(runner.post_headers)[_EVENT_PATH] == {}
 
 
+@pytest.mark.parametrize(
+    "codex_client", [frozenset({Feature.MESSAGE_SENDER_CONTEXT})], indirect=True
+)
 @pytest.mark.parametrize(
     ("caller", "named"), [("owner", False), ("editor", True), ("admin", True)]
 )

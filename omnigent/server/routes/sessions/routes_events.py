@@ -121,6 +121,7 @@ from omnigent.server.failed_status_diagnostics import (
     bound_runner_connection,
     failed_status_intake_attributes,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -4171,6 +4172,9 @@ def register_events_routes(
         message_sender = (
             created_by
             if created_by is not None
+            and getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
+                Feature.MESSAGE_SENDER_CONTEXT
+            )
             and body.type == "message"
             and body.data.get("role", "user") == "user"
             and not await asyncio.to_thread(

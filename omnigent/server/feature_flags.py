@@ -66,6 +66,7 @@ class Feature(StrEnum):
     SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
     FLOATING_PANES = "floating_panes"
     SHARED_SESSION_UPDATES_SOCKET = "shared_session_updates_socket"
+    MESSAGE_SENDER_CONTEXT = "message_sender_context"
 
 
 class FeatureIntent(StrEnum):
@@ -386,6 +387,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Share one session-updates WebSocket between a browser's tabs",
         owner="web",
         review_by_release="0.28.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MESSAGE_SENDER_CONTEXT,
+        description="Name a collaborator to the agent ahead of each message they send",
+        owner="server",
+        review_by_release="0.28.0",
+        frontend_visible=False,
     ),
 )
 
