@@ -38,6 +38,12 @@ function renderDialog() {
   return { onClose };
 }
 
+/** An existing mandate opens rendered; switch to the text editor. */
+async function openEditor() {
+  await userEvent.click(await screen.findByTestId("project-mandate-edit-tab"));
+  return screen.getByLabelText("Project mandate");
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   projects.data = [{ id: "project", name: "Shipping" }];
@@ -60,9 +66,36 @@ afterEach(() => {
 });
 
 describe("Project mandate editor", () => {
+  it("opens an existing mandate rendered as markdown, proposals included", async () => {
+    vi.mocked(api.getProject).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "## Scope\n\n- Only edit **docs/**.\n- Run `tsc` before [review](https://example.com).",
+      mandate_proposals: [{ ...PROPOSAL, text: "Attach a **video** to every change." }],
+    });
+    renderDialog();
+    const preview = await screen.findByTestId("project-mandate-preview");
+    expect(screen.queryByLabelText("Project mandate")).toBeNull();
+    expect(preview.querySelector("[data-streamdown=heading-2]")).toHaveTextContent("Scope");
+    expect(preview.querySelectorAll("[data-streamdown=list-item]")).toHaveLength(2);
+    expect(preview.querySelector("[data-streamdown=strong]")).toHaveTextContent("docs/");
+    expect(preview.querySelector("[data-streamdown=inline-code]")).toHaveTextContent("tsc");
+    expect(preview.querySelector("[data-streamdown=link]")).toHaveAttribute("href", "https://example.com/");
+    const proposal = screen.getByTestId("project-mandate-proposal");
+    expect(proposal.querySelector("[data-streamdown=strong]")).toHaveTextContent("video");
+    const input = await openEditor();
+    expect(input).toHaveValue(
+      "## Scope\n\n- Only edit **docs/**.\n- Run `tsc` before [review](https://example.com).",
+    );
+    await userEvent.type(input, " Never push.");
+    await userEvent.click(screen.getByTestId("project-mandate-preview-tab"));
+    expect(screen.getByTestId("project-mandate-preview")).toHaveTextContent("Never push.");
+  });
+
+
   it("edits the stored mandate and saves only that field", async () => {
     const { onClose } = renderDialog();
-    const input = await screen.findByLabelText("Project mandate");
+    const input = await openEditor();
     expect(input).toHaveValue("Only edit docs/.");
     await userEvent.clear(input);
     await userEvent.type(input, "Never push.");
@@ -87,7 +120,7 @@ describe("Project mandate editor", () => {
 
   it("counts trimmed UTF-8 bytes and blocks an oversized save", async () => {
     renderDialog();
-    const input = await screen.findByLabelText("Project mandate");
+    const input = await openEditor();
     const size = screen.getByTestId("project-mandate-size");
     fireEvent.change(input, { target: { value: `  ${"é".repeat(8_000)}  ` } });
     expect(size).toHaveTextContent(/^16,000 \/ 32,000 bytes$/);
@@ -105,7 +138,7 @@ describe("Project mandate editor", () => {
   it("keeps the draft and shows the server's error when saving fails", async () => {
     vi.mocked(api.updateProjectMandate).mockRejectedValue(new Error("project mandate too large"));
     const { onClose } = renderDialog();
-    const input = await screen.findByLabelText("Project mandate");
+    const input = await openEditor();
     await userEvent.type(input, " More.");
     await userEvent.click(screen.getByTestId("project-mandate-save"));
     expect(await screen.findByRole("alert")).toHaveTextContent("project mandate too large");
@@ -127,7 +160,7 @@ describe("Project mandate editor", () => {
       mandate_proposals: [],
     });
     renderDialog();
-    const input = await screen.findByLabelText("Project mandate");
+    const input = await openEditor();
     expect(screen.getByTestId("project-mandate-proposal")).toHaveTextContent(PROPOSAL.text);
     expect(input).toHaveValue("Only edit docs/.");
     await userEvent.click(screen.getByRole("button", { name: "Accept" }));
@@ -153,7 +186,7 @@ describe("Project mandate editor", () => {
       mandate_proposals: [],
     });
     const { onClose } = renderDialog();
-    const input = await screen.findByLabelText("Project mandate");
+    const input = await openEditor();
     await userEvent.type(input, " Never push.");
     await userEvent.click(screen.getByRole("button", { name: "Accept" }));
     await waitFor(() =>
@@ -181,7 +214,7 @@ describe("Project mandate editor", () => {
       mandate_proposals: [],
     });
     renderDialog();
-    const input = await screen.findByLabelText("Project mandate");
+    const input = await openEditor();
     await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     await waitFor(() => expect(screen.queryByTestId("project-mandate-proposals")).toBeNull());
     expect(api.dismissMandateProposal).toHaveBeenCalledWith("project", "proposal");

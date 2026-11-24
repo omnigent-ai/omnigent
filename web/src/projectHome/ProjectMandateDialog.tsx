@@ -1,5 +1,6 @@
 import { useEffect, useState, type ComponentProps, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { FilePathAwareMessageResponse, ProseMarkdown } from "@/components/blocks/ChatMarkdown";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -10,6 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import {
   acceptMandateProposal,
@@ -25,6 +27,10 @@ import { TicketError } from "./TicketControls";
 import { useTicketProject } from "./useProjectTickets";
 
 const encoder = new TextEncoder();
+
+// Document-scale headings for a long mandate: distinct from body text, but sized for a dialog.
+const MANDATE_PREVIEW_CLASS =
+  "text-sm [&_[data-streamdown=heading-1]]:text-lg [&_[data-streamdown=heading-2]]:text-base [&_[data-streamdown=heading-3]]:text-sm [&_[data-streamdown^=heading]]:mt-5 [&_[data-streamdown^=heading]]:mb-1.5";
 
 /** Bytes the server counts against the limit: it stores the trimmed text. */
 function mandateBytes(text: string): number {
@@ -56,6 +62,8 @@ export function ProjectMandateDialog({
   // The text the draft started from, to tell unsaved edits apart from server changes.
   const [loaded, setLoaded] = useState<string | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
+  // An existing mandate opens rendered for reading; a blank one opens ready to write.
+  const [mode, setMode] = useState<"preview" | "edit">("preview");
   useEffect(() => {
     if (draft !== null || projects.isLoading || projects.error) return;
     // A label-only folder has no row yet; it starts blank and saving creates it.
@@ -63,6 +71,7 @@ export function ProjectMandateDialog({
     if (initial === null) return;
     setLoaded(initial);
     setDraft(initial);
+    if (!initial.trim()) setMode("edit");
   }, [draft, projects.isLoading, projects.error, projectId, query.data]);
   const loadError = projects.error ?? query.error;
   const client = useQueryClient();
@@ -139,7 +148,7 @@ export function ProjectMandateDialog({
                     className="flex flex-col gap-2 rounded-lg border border-border p-2.5 sm:flex-row sm:items-start"
                     data-testid="project-mandate-proposal"
                   >
-                    <p className="min-w-0 flex-1 whitespace-pre-wrap text-sm">{proposal.text}</p>
+                    <ProseMarkdown className="min-w-0 flex-1 text-sm">{proposal.text}</ProseMarkdown>
                     <div className="flex shrink-0 gap-1">
                       <Button
                         type="button"
@@ -165,16 +174,47 @@ export function ProjectMandateDialog({
                 <TicketError error={resolve.error} />
               </section>
             )}
-            <Textarea
-              aria-label="Project mandate"
-              data-testid="project-mandate-input"
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              placeholder="e.g. Only change files under docs/. Never push or open pull requests."
-              aria-invalid={tooLarge || undefined}
-              className="min-h-48 max-h-[55dvh] font-mono text-sm"
-              disabled={busy}
-            />
+            <Tabs value={mode} onValueChange={(value) => setMode(value as "preview" | "edit")}>
+              <TabsList aria-label="Mandate view">
+                <TabsTrigger value="preview" data-testid="project-mandate-preview-tab">
+                  Preview
+                </TabsTrigger>
+                <TabsTrigger value="edit" data-testid="project-mandate-edit-tab">
+                  Edit
+                </TabsTrigger>
+              </TabsList>
+            </Tabs>
+            {mode === "edit" ? (
+              <Textarea
+                aria-label="Project mandate"
+                data-testid="project-mandate-input"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder="e.g. Only change files under docs/. Never push or open pull requests."
+                aria-invalid={tooLarge || undefined}
+                className="min-h-48 max-h-[55dvh] font-mono text-sm"
+                disabled={busy}
+              />
+            ) : (
+              <div
+                role="region"
+                aria-label="Mandate preview"
+                data-testid="project-mandate-preview"
+                className="min-h-48 max-h-[55dvh] overflow-y-auto rounded-md border border-border px-4 py-3"
+              >
+                {draft.trim() ? (
+                  <FilePathAwareMessageResponse
+                    mode="static"
+                    literalHtml
+                    className={MANDATE_PREVIEW_CLASS}
+                  >
+                    {draft}
+                  </FilePathAwareMessageResponse>
+                ) : (
+                  <p className="text-sm text-muted-foreground">No mandate yet. Choose Edit to write one.</p>
+                )}
+              </div>
+            )}
             <p
               className={tooLarge ? "text-sm text-destructive" : "text-sm text-muted-foreground"}
               data-testid="project-mandate-size"
