@@ -394,3 +394,11 @@ def test_other_gpt_models_keep_default_thinking_levels(model_id: str) -> None:
     )
 
     assert "thinkingLevelMap" not in entry
+
+
+def test_explicit_thinking_level_map_wins_over_gpt_level_map() -> None:
+    from omnigent.models.pi_model_compatibility import pi_model_with_level_map
+
+    entry = {"id": "system.ai.gpt-6-2-astra", "thinkingLevelMap": {"off": "low"}}
+
+    assert pi_model_with_level_map(entry) is entry

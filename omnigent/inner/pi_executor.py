@@ -78,6 +78,7 @@ from omnigent.models.pi_model_compatibility import (
     pi_generic_model_json_entry,
     pi_model_is_reasoning,
     pi_model_json_entry,
+    pi_model_with_level_map,
     pi_model_with_thinking_defaults,
     unsupported_in_pi,
 )
@@ -1050,6 +1051,7 @@ def _build_models_json(
                     and model_catalog.model_family_token(model) == "claude"
                 ):
                     model_entry["reasoning"] = True
+            model_entry = pi_model_with_level_map(model_entry)
             if provider["api"] == "anthropic-messages":
                 model_entry = pi_model_with_thinking_defaults(model_entry)
             entry = dict(model_entry)

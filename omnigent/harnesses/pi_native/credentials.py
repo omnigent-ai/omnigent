@@ -59,6 +59,7 @@ from omnigent.models.pi_model_compatibility import (
     enrich_databricks_model_catalog,
     pi_generic_model_json_entry,
     pi_model_json_entry,
+    pi_model_with_level_map,
     pi_model_with_thinking_defaults,
     unsupported_in_pi,
 )
@@ -427,6 +428,7 @@ class PiProviderConfig:
             # when the model entry declares reasoning.
             if "deepseek" in self.model.lower():
                 entry["reasoning"] = True
+            entry = pi_model_with_level_map(entry)
         existing = additional.get(provider_id)
         if existing is not None:
             # Copy rather than mutate: the payload is shared with

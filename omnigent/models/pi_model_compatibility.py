@@ -141,6 +141,14 @@ def pi_thinking_level_map(model_id: str) -> dict[str, str | None] | None:
     return {"off": None, "minimal": None, "xhigh": "xhigh", "max": "max"}
 
 
+def pi_model_with_level_map(entry: PiModelEntry) -> PiModelEntry:
+    """Add the known thinking-level restrictions unless the entry already maps levels."""
+    level_map = pi_thinking_level_map(entry["id"])
+    if level_map is None or "thinkingLevelMap" in entry:
+        return entry
+    return {**entry, "reasoning": True, "thinkingLevelMap": level_map}
+
+
 def pi_model_is_reasoning(model_id: str) -> bool:
     """Return whether *model_id* needs Pi's ``reasoning: true`` model flag.
 
@@ -184,10 +192,7 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["maxTokens"] = model.metadata.max_output_tokens
     if pi_model_entry_is_reasoning(model):
         entry["reasoning"] = True
-    if level_map := pi_thinking_level_map(model.id):
-        entry["reasoning"] = True
-        entry["thinkingLevelMap"] = level_map
-    return entry
+    return pi_model_with_level_map(entry)
 
 
 def pi_generic_model_json_entry(

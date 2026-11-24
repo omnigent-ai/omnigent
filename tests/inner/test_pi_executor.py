@@ -7459,3 +7459,16 @@ async def test_generic_catalog_discovery_does_not_block_runtime(
             beat.cancel()
             await asyncio.gather(beat, return_exceptions=True)
         await executor.close()
+
+
+def test_models_json_uncatalogued_gpt_without_none_effort_maps_levels() -> None:
+    """A fallback-registered GPT-6 Astra still declares the levels its endpoint rejects."""
+    models = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        model="databricks-gpt-6-2-astra",
+    )
+
+    [entry] = models["providers"]["databricks-openai"]["models"]
+    assert entry["reasoning"] is True
+    assert entry["thinkingLevelMap"]["off"] is None

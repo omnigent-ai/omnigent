@@ -4609,3 +4609,24 @@ def test_global_agent_root_uses_launch_environment_and_workspace(
     if not expected.is_absolute():
         expected = tmp_path / expected
     assert creds.global_pi_agent_dir(env=env, workspace=tmp_path) == expected
+
+
+def test_uncataloged_gpt_without_none_effort_maps_levels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The family fallback entry carries the same level map as a cataloged one."""
+    provider = _databricks_provider_without_catalog(monkeypatch, "databricks-gpt-6-2-astra")
+
+    cfg = provider.to_models_config()
+
+    [entry] = [
+        model
+        for payload in cfg["providers"].values()
+        for model in payload["models"]
+        if model["id"] == "databricks-gpt-6-2-astra"
+    ]
+    assert entry["reasoning"] is True
+    assert entry["thinkingLevelMap"] == {
+        "off": None,
+        "minimal": None,
+        "xhigh": "xhigh",
+        "max": "max",
+    }
