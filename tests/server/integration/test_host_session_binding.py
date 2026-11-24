@@ -3833,6 +3833,19 @@ async def test_managed_launch_waits_for_runner_a_message_relaunched(
     assert fake.terminated == []
 
 
+class _ManualMonotonicClock:
+    """Stands in for a module's ``time`` so a test advances ``monotonic()`` explicitly."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
 @pytest.mark.parametrize(
     "binding",
     ["other_host", "move_claim", "unbound", "same_runner", "deleted", "read_past_deadline"],
@@ -3844,6 +3857,7 @@ async def test_managed_runner_wait_does_not_follow_a_binding_it_cannot_serve(
     """Only a new runner on the launch's host, read before the deadline, takes over."""
     from omnigent.server.managed_hosts import new_move_claim
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as helpers_module
 
     bound = {
         "other_host": SimpleNamespace(host_id="host_other", runner_id="runner_elsewhere"),
@@ -3854,14 +3868,17 @@ async def test_managed_runner_wait_does_not_follow_a_binding_it_cannot_serve(
         "read_past_deadline": SimpleNamespace(host_id="host_launch", runner_id="runner_replaced"),
     }[binding]
     awaited: list[str] = []
-    if binding == "read_past_deadline":
-        monkeypatch.setattr(sessions_module, "_MANAGED_RUNNER_REPLACEMENT_WAIT_S", 0.05)
+    reads: list[str] = []
+    clock = _ManualMonotonicClock()
+    monkeypatch.setattr(helpers_module, "time", clock)
 
     def _read_binding(session_id: str) -> SimpleNamespace:
+        reads.append(session_id)
         if bound is None:
             raise ConversationNotFoundError(session_id)
         if binding == "read_past_deadline":
-            time.sleep(0.2)
+            # The read itself outlasts the follow deadline.
+            clock.now += sessions_module._MANAGED_RUNNER_REPLACEMENT_WAIT_S
         return bound
 
     class _TunnelRegistry:
@@ -3881,6 +3898,7 @@ async def test_managed_runner_wait_does_not_follow_a_binding_it_cannot_serve(
 
     assert connected is False
     assert awaited == ["runner_launched"]
+    assert reads == ["session_1"]
 
 
 async def test_managed_launch_stops_following_relaunched_runners_at_its_deadline(
@@ -3890,6 +3908,8 @@ async def test_managed_launch_stops_following_relaunched_runners_at_its_deadline
     """Runners that never connect, however often relaunched, still fail the launch."""
     from omnigent.server.managed_hosts import launch_managed_host
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as helpers_module
+    from omnigent.server.routes.sessions import routes_events
 
     host_store = HostStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -3916,6 +3936,8 @@ async def test_managed_launch_stops_following_relaunched_runners_at_its_deadline
     launch = tracker.get(conv.id)
     assert launch is not None
     awaited: list[str] = []
+    timeouts: list[float] = []
+    clock = _ManualMonotonicClock()
 
     async def _launch_runner(launched: Conversation, *_args: object, **_kwargs: object) -> object:
         conversations.replace_runner_id(launched.id, "runner_0")
@@ -3928,14 +3950,14 @@ async def test_managed_launch_stops_following_relaunched_runners_at_its_deadline
     class _TunnelRegistry:
         async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> None:
             awaited.append(runner_id)
+            timeouts.append(timeout_s)
             # Every wait ends with a message relaunching the runner, which never connects.
             conversations.replace_runner_id(conv.id, f"runner_{len(awaited)}")
-            await asyncio.sleep(timeout_s)
+            clock.now += timeout_s
 
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
     monkeypatch.setattr(sessions_module, "_publish_sandbox_status", lambda *_a, **_kw: None)
-    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.02)
-    monkeypatch.setattr(sessions_module, "_MANAGED_RUNNER_REPLACEMENT_WAIT_S", 0.1)
+    monkeypatch.setattr(helpers_module, "time", clock)
 
     await asyncio.wait_for(
         sessions_module._bind_and_launch_managed_runner(
@@ -3951,7 +3973,10 @@ async def test_managed_launch_stops_following_relaunched_runners_at_its_deadline
         timeout=10,
     )
 
-    assert len(awaited) > 1
+    # Replacements get the relaunching message's wait until the deadline cuts the last one short.
+    assert len(awaited) > 2
+    assert max(timeouts[1:]) == routes_events._relaunch_connect_timeout_s(acknowledged=True)
+    assert sum(timeouts) == sessions_module._MANAGED_RUNNER_REPLACEMENT_WAIT_S
     assert launch.settled.is_set()
     assert launch.error == "managed runner did not connect after launch"
     remaining = conversations.get_conversation(conv.id)
