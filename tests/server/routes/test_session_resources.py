@@ -12170,3 +12170,44 @@ async def test_collaborator_message_names_its_sender_to_the_runner_only(
         {"type": "input_text", "text": '[Message sender: "bob@example.com"]'},
         *typed,
     ]
+
+
+@pytest.mark.parametrize("first_named", [True, False], ids=["named-then-off", "off-then-named"])
+@pytest.mark.asyncio
+async def test_stable_id_retry_keeps_its_first_delivery(
+    db_uri: str, runner_globals_reset: None, first_named: bool
+) -> None:
+    """A retry after the rollout changes is the same message, delivered as first sent."""
+    from omnigent.runtime.message_sender import with_message_sender
+    from omnigent.server.routes._sessions.orchestration import _forward_event_to_runner
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Review")
+    runner = _FakeRunnerClient(payload={})
+    typed = [{"type": "input_text", "text": "Review this"}]
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": typed, "stable_id": "0" * 31 + "1"},
+    )
+
+    item_ids = [
+        await _forward_event_to_runner(
+            conv.id,
+            conv,
+            body,
+            store,
+            runner,  # type: ignore[arg-type]
+            created_by="bob@example.com",
+            message_sender="bob@example.com" if named else None,
+        )
+        for named in (first_named, not first_named)
+    ]
+
+    [item] = store.list_items(conv.id, type="message").data
+    assert item_ids == [item.id, item.id]
+    assert item.data.sender_in_context is first_named
+    expected = with_message_sender(typed, "bob@example.com" if first_named else None)
+    forwarded = [
+        call[1]["content"] for call in runner.post_json_calls if call[0].endswith("/events")
+    ]
+    assert forwarded == [expected, expected]

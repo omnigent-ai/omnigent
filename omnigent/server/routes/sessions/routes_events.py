@@ -92,6 +92,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.content_resolver import _resolve_message_content
+from omnigent.runtime.message_sender import message_sender_for
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import presence
 from omnigent.server import session_pull_requests as server_prs
@@ -4170,7 +4171,7 @@ def register_events_routes(
             return {"queued": True, "item_id": item_id}
         # Name a collaborator to the agent; the owner's own messages go as typed.
         message_sender = (
-            created_by
+            message_sender_for(body.data.get("content"), created_by)
             if created_by is not None
             and getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
                 Feature.MESSAGE_SENDER_CONTEXT

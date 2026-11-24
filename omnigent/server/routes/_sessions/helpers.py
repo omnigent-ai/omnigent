@@ -5011,28 +5011,29 @@ def _strip_echoed_message_sender(
     sender: str | None,
 ) -> NewConversationItem:
     """
-    Drop the sender line typed ahead of a web message from its transcript echo.
+    Drop the sender line the server typed ahead of a web message from its echo.
 
     :param item: The mirrored user-message item about to be persisted.
-    :param sender: ``created_by`` of the pending entry the echo matched.
+    :param sender: ``named_sender`` of the pending entry the echo drained, or
+        ``None`` when the message was delivered as typed.
     :returns: A copy of *item* without that line, or *item* when it has none.
     """
-    if not isinstance(item.data, MessageData):
+    if sender is None or not isinstance(item.data, MessageData):
         return item
-    content: list[dict[str, Any]] = []
-    for block in item.data.content:
+    content = list(item.data.content)
+    for index, block in enumerate(content):
         text = block.get("text") if isinstance(block, dict) else None
         if not isinstance(text, str):
-            content.append(block)
             continue
         stripped = strip_message_sender(text, sender)
         if stripped == text:
-            content.append(block)
-        elif stripped.strip():
-            content.append({**block, "text": stripped})
-    if content == item.data.content:
-        return item
-    return item.model_copy(update={"data": item.data.model_copy(update={"content": content})})
+            return item
+        if stripped.strip():
+            content[index] = {**block, "text": stripped}
+        else:
+            del content[index]
+        return item.model_copy(update={"data": item.data.model_copy(update={"content": content})})
+    return item
 
 
 def _message_text(content: list[dict[str, Any]]) -> str | None:
@@ -8631,8 +8632,12 @@ def _stable_id_reuse_is_exact_retry(
             f"stable_id {item.stable_id!r} already names another author's item in this session",
             code=ErrorCode.CONFLICT,
         )
-    persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
-    request_payload = item.data.model_dump(mode="json", by_alias=True)
+    # The server decides sender_in_context per delivery, so a retry may differ there.
+    server_derived = {"sender_in_context"}
+    persisted_payload = persisted.data.model_dump(
+        mode="json", by_alias=True, exclude=server_derived
+    )
+    request_payload = item.data.model_dump(mode="json", by_alias=True, exclude=server_derived)
     return persisted.type == item.type and persisted_payload == request_payload
 
 

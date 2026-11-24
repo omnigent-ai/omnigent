@@ -3680,7 +3680,7 @@ async def _persist_external_conversation_item_unlocked(
                 pending_inputs.mark_uncertain(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
-            item = _strip_echoed_message_sender(item, drained.created_by)
+            item = _strip_echoed_message_sender(item, drained.named_sender)
             item = _merge_pending_file_blocks(item, drained.content)
             # A text match preserves the sender recorded at POST time. FIFO
             # settlement alone does not establish authorship of the mirror.
@@ -8374,6 +8374,11 @@ async def _forward_event_to_runner(
 
     # Run controls wait for routing and a fresh guard before entering replayable history.
     persisted_items = await persist_input() if body.workflow_run_id is None else None
+    stored = persisted_items[0] if persisted_items else None
+    if stored is not None and stored.deduplicated and isinstance(stored.data, MessageData):
+        # A retry is delivered the way its first send was, whatever the feature says now.
+        sender_in_context = stored.data.sender_in_context
+        message_sender = stored.created_by if sender_in_context else None
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -9473,6 +9478,7 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                named_sender=message_sender,
             )
             if queues_message
             else None

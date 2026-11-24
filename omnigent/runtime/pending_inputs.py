@@ -116,7 +116,7 @@ from typing import Any, Literal
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
-from omnigent.runtime.message_sender import strip_message_sender
+from omnigent.runtime.message_sender import message_sender_line
 
 # A pending entry is evicted this many seconds after it was recorded
 # if it was never drained by a matching persisted message. Covers the
@@ -234,12 +234,15 @@ class DrainedInput:
         hidden and settles quietly as an uncertain entry.
     :param uncertain: Whether a positional drain may already have mirrored
         this entry. Restore must preserve that evidence even after eviction.
+    :param named_sender: Identity the server typed ahead of this message for
+        the agent (see :mod:`omnigent.runtime.message_sender`), or ``None``.
     """
 
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    named_sender: str | None = None
     background_titles_enabled: bool = True
     interrupted: bool = False
     # Reconstructed entries without original delivery metadata must remain unknown.
@@ -308,12 +311,15 @@ class _Entry:
         pending, is left out of the snapshot, and a later match that jumps over
         it must not call it undelivered. A mirror of its own text still drains
         it normally: the agent did record it.
+    :param named_sender: Identity the server typed ahead of the message, so its
+        mirror carries that line before the content's own text.
     """
 
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    named_sender: str | None = None
     background_titles_enabled: bool = True
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
@@ -377,6 +383,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    named_sender: str | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -400,6 +407,8 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param named_sender: Identity the server types ahead of the message for
+        the agent, or ``None`` when it is delivered as typed.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -422,6 +431,7 @@ def record(
             content=copy.deepcopy(content),
             created_by=created_by,
             stable_id=stable_id,
+            named_sender=named_sender,
             background_titles_enabled=background_titles_enabled,
         )
         entries = _pending.setdefault(conversation_id, {})
@@ -784,6 +794,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         content=copy.deepcopy(drained.content),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
+        named_sender=drained.named_sender,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
         uncertain=drained.uncertain,
@@ -879,12 +890,12 @@ def resolve_matching_text(
         texts = [
             _shell_command_text(entry.content)
             if shell_command
-            else _collapse_whitespace(_content_text(entry.content))
+            else _collapse_whitespace(_delivered_text(entry))
             for _pid, entry in ordered
         ]
-        # Exact match first, so typed marker-like text stays distinct. Then drop
-        # only what the executor generated for the entry (one marker per file
-        # block, the line naming its sender) and compare with the entry's text.
+        # Each entry is compared as delivered (behind its sender line, if any). Exact
+        # match first, so typed marker-like text stays distinct; then drop the
+        # executor's one marker line per file block and compare again.
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
@@ -893,17 +904,14 @@ def resolve_matching_text(
             marker_matches: list[int] = []
             for index, (_pid, entry) in enumerate(ordered):
                 attachments = 0 if shell_command else _attachment_count(entry.content)
-                mirror = strip_message_sender(text, entry.created_by)
-                if (attachments == 0 and mirror == text) or not texts[index]:
+                if attachments == 0 or not texts[index]:
                     continue
                 if (
-                    _collapse_whitespace(_strip_generated_markers(mirror, attachments))
+                    _collapse_whitespace(_strip_generated_markers(text, attachments))
                     == texts[index]
                 ):
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
-            if match_index is not None and not _attachment_count(ordered[match_index][1].content):
-                match_method = "sender_normalized_text"
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
         # Bound one drain's work: report at most a cap's worth of skipped
@@ -1010,6 +1018,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,
         stable_id=entry.stable_id,
+        named_sender=entry.named_sender,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
         uncertain=entry.uncertain,
@@ -1035,6 +1044,13 @@ def _content_text(content: list[dict[str, Any]]) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def _delivered_text(entry: _Entry) -> str:
+    """Text the executor typed for *entry*: any sender line, then the entry's own text."""
+    text = _content_text(entry.content)
+    line = message_sender_line(entry.named_sender)
+    return f"{line}\n{text}" if line else text
 
 
 def _first_match(texts: list[str], needle: str, interrupted: list[bool]) -> int | None:

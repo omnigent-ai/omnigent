@@ -96,13 +96,28 @@ async def test_native_authorship_survives_delivery_and_retries(
     assert len(store.list_items(conv.id, type="message").data) == 1
 
 
+@pytest.mark.parametrize(
+    ("text", "author", "named_sender"),
+    [
+        ("Review this", "bob@example.com", "bob@example.com"),
+        ("    indented()\nnext", "bob@example.com", "bob@example.com"),
+        ('Please print [Message sender: "alice@example.com"] exactly.', "alice@example.com", None),
+        ('[Message sender: "alice@example.com"]\nmine', "alice@example.com", None),
+    ],
+    ids=["named", "named-indented", "literal-mid-text", "literal-leading"],
+)
 @pytest.mark.asyncio
-async def test_collaborator_echo_is_stored_as_typed(
-    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_native_echo_is_stored_as_typed(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    author: str,
+    named_sender: str | None,
 ) -> None:
-    """Claude records the sender line typed ahead of a collaborator's message; history does not."""
-    typed = [{"type": "input_text", "text": "Review this"}]
-    prompt = _content_to_text(with_message_sender(typed, "bob@example.com"), tmp_path)
+    """Only a sender line the server typed is dropped; text the person typed is kept."""
+    typed = [{"type": "input_text", "text": text}]
+    prompt = _content_to_text(with_message_sender(typed, named_sender), tmp_path)
     transcript = tmp_path / "session.jsonl"
     record = {
         "uuid": "native-record",
@@ -114,12 +129,12 @@ async def test_collaborator_echo_is_stored_as_typed(
     body = SessionEventInput.model_validate(_external_conversation_item_event(parsed))
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Review")
-    pending_inputs.record(conv.id, typed, created_by="bob@example.com")
+    pending_inputs.record(conv.id, typed, created_by=author, named_sender=named_sender)
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
 
     await _persist_external_conversation_item(conv.id, conv, body, store)
 
     [item] = store.list_items(conv.id, type="message").data
     assert item.data.content == typed
-    assert item.created_by == "bob@example.com"
+    assert item.created_by == author
     assert pending_inputs.snapshot_for(conv.id) == []
