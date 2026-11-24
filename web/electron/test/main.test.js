@@ -8093,6 +8093,8 @@ describe("desktop notifications", () => {
       title: "Done",
       navigatePath: "/c/conv_abc",
     });
+    // A toast can report `close` and still be clicked later from Notification Center.
+    h.calls.shownNotifications.at(-1).deref().emit("close");
     await wait();
     collectGarbage();
     await wait();
@@ -8112,17 +8114,21 @@ describe("desktop notifications", () => {
     t.after(h.cleanup);
     h.api.registerIpc();
     h.webContents.isDestroyed = () => false;
-    for (let i = 0; i <= h.api.maxRetainedNotifications(); i++) {
+    const max = h.api.maxRetainedNotifications();
+    for (let i = 0; i <= max; i++) {
       h.ipc.get("omnigent:notify")(pageEvent(h), { title: "Done", navigatePath: `/c/${i}` });
     }
     const shown = h.calls.shownNotifications.map((ref) => ref.deref());
+    const retainedIndexes = () =>
+      [...h.api.retainedNotifications()].map((notification) => shown.indexOf(notification));
+    const newestIndexes = shown.map((_, index) => index).slice(1);
+    assert.deepEqual(retainedIndexes(), newestIndexes);
+
     shown.at(-1).emit("click");
     shown.at(-3).emit("failed");
-
-    const retained = shown.map((notification) => h.api.retainedNotifications().has(notification));
     assert.deepEqual(
-      [retained[0], retained[1], retained.at(-3), retained.at(-2), retained.at(-1)],
-      [false, true, false, true, false],
+      retainedIndexes(),
+      newestIndexes.filter((index) => index !== max && index !== max - 2),
     );
   });
 });
