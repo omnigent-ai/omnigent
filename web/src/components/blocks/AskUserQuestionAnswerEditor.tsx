@@ -9,6 +9,7 @@ import {
   useEffect,
   useState,
 } from "react";
+import { useScopedConversationId } from "@/components/chat/conversationScope";
 import { ComposerEngineContext, ComposerEngineInput } from "@/components/composer/ChatComposer";
 import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -130,11 +131,9 @@ export function AskUserQuestionAnswerEditor({
 }: AskUserQuestionAnswerEditorProps) {
   const { browser, mention, setMention, debouncedQuery, onSessionEntries } = mentions;
   // The session search needs the app's query client, so it runs only while the editor is mounted.
-  const sessionEntries = useSessionMentionEntries({
-    mention,
-    debouncedQuery,
-    currentSessionId: null,
-  });
+  // The session's own row is left out, as the chat composer leaves it out.
+  const currentSessionId = useScopedConversationId();
+  const sessionEntries = useSessionMentionEntries({ mention, debouncedQuery, currentSessionId });
   useEffect(() => onSessionEntries(sessionEntries), [sessionEntries, onSessionEntries]);
   const {
     mentionIndex,

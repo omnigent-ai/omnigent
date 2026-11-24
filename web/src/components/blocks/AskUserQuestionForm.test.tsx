@@ -12,6 +12,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
 import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
@@ -1144,6 +1145,68 @@ describe("AskUserQuestionForm — prompt editor", () => {
       framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
       notes: "Ship @Fix CI",
     });
+  });
+
+  it("keeps undo within each answer: a restore in one question stays there", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const notes: ClaudeQuestion = {
+      id: "notes",
+      question: "Any notes?",
+      multiSelect: false,
+      options: [{ label: "None" }],
+    };
+    const { onSubmit } = renderForm([framework, notes], { codeMirror: true });
+    const first = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(first)!, "Use @Fix"));
+    fireEvent.keyDown(first, { key: "Enter" });
+    act(() => composerTargetOf(first)!.setSelectionRange(11, 11));
+    fireEvent.keyDown(first, { key: "Backspace" });
+    expect(composerTargetOf(first)!.value).toBe("Use  ");
+    // Undo in the same answer brings the tag back, before any navigation.
+    act(() => void undo(EditorView.findFromDOM(first)!));
+    expect(composerTargetOf(first)!.value).toBe("Use @Fix CI ");
+
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    const second = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(second)!, "Ship"));
+    // Undo in the second answer restores nothing from the first.
+    act(() => void undo(EditorView.findFromDOM(second)!));
+    expect(composerTargetOf(second)!.value).toBe("");
+
+    fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+    expect(composerTargetOf(await promptEditor())!.value).toBe("Use @Fix CI ");
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    fireEvent.click(screen.getByLabelText("None"));
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+      notes: "None",
+    });
+  });
+
+  it("leaves the card's own session out of the @ menu", async () => {
+    sessionList.loaded = [sessionRow("s_here", "This session"), sessionRow("s_ci", "Fix CI")];
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <ConversationScopeContext.Provider value="s_here">
+          <AskUserQuestionForm
+            elicitationId={nextElicitationId()}
+            questions={[framework]}
+            onSubmit={vi.fn()}
+            onReject={vi.fn()}
+          />
+        </ConversationScopeContext.Provider>
+      </CapabilitiesProvider>,
+    );
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "@This"));
+    expect(screen.queryByTitle("Tag session This session")).toBeNull();
+    act(() => composerTargetOf(editor)!.setSelectionRange(0, 0));
+    act(() =>
+      insertComposerText(composerTargetOf(editor)!, "", 0, composerTargetOf(editor)!.value.length),
+    );
+    act(() => insertComposerText(composerTargetOf(editor)!, "@Fix"));
+    expect(screen.getByTitle("Tag session Fix CI")).toBeInTheDocument();
   });
 
   it("keeps a tagged session when the card remounts with its draft", async () => {

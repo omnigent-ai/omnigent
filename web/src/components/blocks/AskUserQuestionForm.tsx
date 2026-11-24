@@ -622,6 +622,7 @@ export function AskUserQuestionForm({
                 />
               </label>
               <AnswerMentionScope
+                key={currentKey}
                 currentKey={currentKey}
                 customText={customRowValue}
                 onCustomTextChange={(text) => handleCustomInput(currentKey, text)}
