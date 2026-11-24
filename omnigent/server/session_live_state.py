@@ -473,15 +473,14 @@ def reconcile_pending_count(
     if store is None:
         return None
     handoffs = _handoffs.get(conversation_id, 0)
-    repair = _PendingCountRepair(
-        store, runner_id, owned=lambda: _handoffs.get(conversation_id, 0) == handoffs
-    )
+    repair = _PendingCountRepair(store, runner_id)
     return _submit_while_owned(
         conversation_id,
         "pending_count_repair",
         repair.repair,
         conversation_id,
         stored_count or 0,
+        lambda: _handoffs.get(conversation_id, 0) == handoffs,
         handoffs=handoffs,
     )
 
@@ -489,43 +488,42 @@ def reconcile_pending_count(
 class _PendingCountRepair:
     """One repair of a session's stored pending count and its same-runner children."""
 
-    def __init__(
-        self, store: ConversationStore, runner_id: str | None, *, owned: Callable[[], bool]
-    ) -> None:
+    def __init__(self, store: ConversationStore, runner_id: str | None) -> None:
         """
         :param store: Store holding the session and its children.
         :param runner_id: The runner this replica holds for the session, or ``None``.
-        :param owned: Whether this replica still owns the session.
         """
         self._store = store
         self._runner_id = runner_id
-        self._owned = owned
         self._budget = _PENDING_COUNT_REPAIR_SESSION_BUDGET
 
-    def repair(self, conversation_id: str, stored: int) -> int:
+    def repair(self, conversation_id: str, stored: int, owned: Callable[[], bool]) -> int:
         """
         Repair one stored count on the writer thread.
 
         :param conversation_id: Session whose stored count to repair.
         :param stored: Its stored count as last read.
+        :param owned: Whether this replica still owns the session, checked
+            before every write.
         :returns: The count the row holds after the repair.
         """
         self._budget -= 1
         live = pending_elicitations.count_for(conversation_id)
         if live == stored or (
-            live < stored and self._children_may_count_prompts(conversation_id, correct=True)
+            live < stored
+            and self._children_may_count_prompts(conversation_id, owned, correct=True)
         ):
             return stored
         # Read again: a prompt published during the child reads is counted now.
         count = pending_elicitations.count_for(conversation_id)
-        if not self._write(conversation_id, count):
+        if not self._write(conversation_id, count, owned):
             return stored
         if count >= stored:
             return count
         # A child prompt published elsewhere after the check wrote the child's
         # count before its mirror into this row, so a second look finds it.
         try:
-            restore = self._children_may_count_prompts(conversation_id, correct=False)
+            restore = self._children_may_count_prompts(conversation_id, owned, correct=False)
         except Exception:
             _logger.warning(
                 "pending-count repair could not confirm children; restoring the count",
@@ -535,11 +533,11 @@ class _PendingCountRepair:
         if not restore:
             return count
         restored = max(stored, pending_elicitations.count_for(conversation_id))
-        return restored if self._write(conversation_id, restored) else count
+        return restored if self._write(conversation_id, restored, owned) else count
 
-    def _write(self, conversation_id: str, count: int) -> bool:
+    def _write(self, conversation_id: str, count: int, owned: Callable[[], bool]) -> bool:
         """Store *count* unless the session has been handed off; report whether it did."""
-        if not self._owned():
+        if not owned():
             return False
         self._store.set_pending_elicitation_count(conversation_id, count)
         # This replica's last write no longer describes the row, so the next
@@ -547,11 +545,35 @@ class _PendingCountRepair:
         _last_pending.pop(conversation_id, None)
         return True
 
-    def _children_may_count_prompts(self, conversation_id: str, *, correct: bool) -> bool:
+    def _child_owned(
+        self, child_id: str, handoffs: int, parent_owned: Callable[[], bool]
+    ) -> Callable[[], bool]:
+        """
+        Build the ownership check for a same-runner child being repaired.
+
+        :param child_id: The child session.
+        :param handoffs: The child's handoff count from before its activity was read.
+        :param parent_owned: The ownership check of the session being repaired.
+        :returns: A check that this replica still owns the child.
+        """
+
+        def owned() -> bool:
+            if not parent_owned() or _handoffs.get(child_id, 0) != handoffs:
+                return False
+            # A rebind to another runner can land before this replica notices it.
+            activity = self._store.get_session_activity([child_id]).get(child_id)
+            return activity is not None and activity.runner_id == self._runner_id
+
+        return owned
+
+    def _children_may_count_prompts(
+        self, conversation_id: str, owned: Callable[[], bool], *, correct: bool
+    ) -> bool:
         """
         Report whether a child of the session may count an outstanding prompt.
 
         :param conversation_id: Parent session identifier.
+        :param owned: The parent's ownership check, which every child write also passes.
         :param correct: Repair the stored counts of same-runner children first.
         :returns: ``True`` when a child's stored count or this replica's index
             counts a prompt, or when there are too many children to tell.
@@ -564,6 +586,8 @@ class _PendingCountRepair:
         child_ids = [child_id for child_id, _ in children]
         if any(pending_elicitations.counts_for(child_ids).values()):
             return True
+        # Taken before the activity read, so a handoff during it fences the child.
+        child_handoffs = {child_id: _handoffs.get(child_id, 0) for child_id in child_ids}
         for child_id, activity in self._store.get_session_activity(child_ids).items():
             child_stored = activity.pending_elicitation_count or 0
             if child_stored == 0:
@@ -574,7 +598,12 @@ class _PendingCountRepair:
                 or self._runner_id is None
                 or activity.runner_id != self._runner_id
                 or self._budget <= 0
-                or self.repair(child_id, child_stored) > 0
+                or self.repair(
+                    child_id,
+                    child_stored,
+                    self._child_owned(child_id, child_handoffs.get(child_id, 0), owned),
+                )
+                > 0
             ):
                 return True
         return False

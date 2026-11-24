@@ -4769,15 +4769,7 @@ async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
     child_read_fails: bool,
     expected_count: int,
 ) -> None:
-    """Opening a session repairs its stored pending count only from a complete index.
-
-    A prompt recorded on one replica and resolved on another leaves the stored
-    count at 1, so the list keeps showing a prompt the snapshot no longer has.
-    The replica holding the session's runner repairs the count, unless a child on
-    another runner counts a prompt: another replica may have recorded that prompt
-    and mirrored it into this session's count. A stale child on the same runner is
-    repaired with its parent. A replica without the runner leaves the count alone,
-    and a repair that fails never fails the snapshot.
+    """Detail reads repair stale pending counts without clearing prompts owned elsewhere.
 
     :param app: The app behind ``client``; its tunnel registry gets the runner.
     :param client: Test HTTP client backed by the real app.

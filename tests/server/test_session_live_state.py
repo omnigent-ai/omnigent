@@ -18,6 +18,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -506,24 +507,43 @@ def test_reconcile_pending_count_repairs_same_runner_children_first(
     assert recording_store.pending_writes == expected
 
 
-@pytest.mark.parametrize("handed_off", ["while-queued", "during-child-read"])
+@pytest.mark.parametrize(
+    "handed_off",
+    [
+        "while-queued",
+        "during-child-read",
+        "child-during-activity-read",
+        "child-rebound-during-activity-read",
+    ],
+)
 def test_reconcile_pending_count_writes_nothing_after_a_handoff(
     recording_store: _RecordingStore,
     handed_off: str,
 ) -> None:
-    """A repair writes nothing once the session is handed to another replica.
+    """A repair writes nothing for a session once another replica may own it.
 
     The new owner may already have stored a genuine prompt, which this replica's
-    index never saw, so a repair queued or running across the handoff must not
-    overwrite it.
+    index never saw. That holds for the session itself and for a same-runner child
+    handed off or rebound on its own, so neither stale count is cleared.
     """
     pending_elicitations.reset_for_tests()
+    recording_store.children["conv_1"] = ["child_1"]
+    recording_store.child_pending["child_1"] = 1
+    recording_store.child_runner["child_1"] = "runner_a"
     release = threading.Event()
     blocker = session_live_state.submit("test blocker", lambda: release.wait(10))
     if handed_off == "during-child-read":
         recording_store.on_child_read = lambda: session_live_state.forget_live_status("conv_1")
+    elif handed_off == "child-during-activity-read":
+        recording_store.after_activity_read = lambda: session_live_state.forget_live_status(
+            "child_1"
+        )
+    elif handed_off == "child-rebound-during-activity-read":
+        recording_store.after_activity_read = lambda: recording_store.child_runner.update(
+            child_1="runner_b"
+        )
 
-    repair = session_live_state.reconcile_pending_count("conv_1", 1)
+    repair = session_live_state.reconcile_pending_count("conv_1", 1, runner_id="runner_a")
     assert repair is not None
     if handed_off == "while-queued":
         session_live_state.forget_live_status("conv_1")
@@ -532,6 +552,32 @@ def test_reconcile_pending_count_writes_nothing_after_a_handoff(
     repair.result(timeout=10)
 
     assert recording_store.pending_writes == []
+
+
+def test_reconcile_pending_count_keeps_counts_past_its_session_budget(
+    recording_store: _RecordingStore,
+) -> None:
+    """A chain of stale same-runner children longer than the budget keeps every count.
+
+    The repair stops descending once its session budget is spent and treats the
+    unexamined child as possibly holding a prompt, so it reads a bounded number of
+    sessions and lowers none.
+    """
+    chain = ["conv_1"] + [f"child_{depth}" for depth in range(40)]
+    for parent, child in pairwise(chain):
+        recording_store.children[parent] = [child]
+        recording_store.child_pending[child] = 1
+        recording_store.child_runner[child] = "runner_a"
+    child_reads: list[None] = []
+    recording_store.on_child_read = lambda: child_reads.append(None)
+    pending_elicitations.reset_for_tests()
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1, runner_id="runner_a")
+    assert repair is not None
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == []
+    assert len(child_reads) <= 32
 
 
 def test_reconcile_pending_count_restores_a_child_prompt_published_after_its_check(
