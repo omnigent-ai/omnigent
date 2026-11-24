@@ -11,7 +11,9 @@ orchestrator and:
   one-line summary. Each step waits ``step_minutes`` and is recorded on the
   ticket as an agent note. Any new ticket activity resets the ladder. When a
   full cycle goes unanswered, or a worker's latest human-audience comment is
-  still open, the loop parks the ticket with ``needs-human`` and stops;
+  still open, the loop parks the ticket with ``needs-human`` and stops. A park
+  the loop raised clears itself once a session moves the ticket or, for a
+  silent stall, a worker runs again;
 - watches the lead itself: when it failed, its main session is gone, or a
   queued message has waited ``lead_response_minutes`` while it sat idle, the
   loop restarts it, then rolls it over, or restores a deleted one;
@@ -228,6 +230,77 @@ def implied_owner_wait(
     return ("ask" if _ASK.search(text) else "maybe"), found
 
 
+def _event_labels(event: dict[str, Any]) -> list[Any] | None:
+    payload = event.get("payload") or {}
+    if event.get("kind") == "created":
+        labels = payload.get("labels")
+    else:
+        labels = (payload.get("changes") or {}).get("labels")
+    return labels if isinstance(labels, list) else None
+
+
+def _has_needs_human(labels: list[Any]) -> bool:
+    return any(isinstance(label, dict) and label.get("key") == "needs-human" for label in labels)
+
+
+@dataclass
+class LoopPark:
+    """An open ``needs-human`` that this loop added, and what has happened since."""
+
+    at: float
+    # Parked on a worker's open question, not on silence.
+    asked: bool
+    # The first later worker event on the ticket (comment, execution or edit), or a
+    # lead's stage move.
+    progress: dict[str, Any] | None
+    # A session's human-audience question to the owner after the park.
+    new_ask: bool
+
+
+def loop_park(events: list[dict[str, Any]], lead_sessions: set[Any]) -> LoopPark | None:
+    """The loop's own still-open ``needs-human`` park, or ``None`` if the flag isn't the loop's.
+
+    A session that edits labels and keeps ``needs-human`` makes the ask its own.
+    """
+    park: LoopPark | None = None
+    start = 0
+    flagged = False
+    for index, event in enumerate(events):
+        labels = _event_labels(event)
+        from_session = event.get("session_id") is not None
+        if labels is not None:
+            has = _has_needs_human(labels)
+            by_loop = not from_session and event.get("agent_id") == LOOP_AGENT_ID
+            if has and not flagged:
+                implied = implied_owner_wait(events[:index], lead_sessions)
+                park = (
+                    LoopPark(
+                        at=float(event.get("created_at") or 0),
+                        asked=implied is not None and implied[0] == "ask",
+                        progress=None,
+                        new_ask=False,
+                    )
+                    if by_loop
+                    else None
+                )
+                start = index + 1
+            elif not has or not by_loop:
+                # Cleared, or someone else re-asserted the ask and now owns it.
+                park = None
+            flagged = has
+            continue
+        if park is not None and from_session and park.progress is None:
+            # A lead restating the ask isn't progress; its stage move is.
+            moved = "stage_id" in ((event.get("payload") or {}).get("changes") or {})
+            if event.get("session_id") not in lead_sessions or moved:
+                if event.get("kind") in ("comment", "execution", "updated"):
+                    park.progress = event
+    if park is not None:
+        later = implied_owner_wait(events[start:], lead_sessions)
+        park.new_ask = later is not None and later[0] == "ask"
+    return park
+
+
 def _when(timestamp: float) -> str:
     from datetime import UTC, datetime
 
@@ -240,6 +313,8 @@ class ProjectState:
     waits: dict[str, Wait] = field(default_factory=dict)
     # Ticket id -> (when the loop first saw it waiting on the owner, reminder sent).
     owner_waits: dict[str, tuple[float, bool]] = field(default_factory=dict)
+    # Ticket id -> (ticket updated_at when read, the loop's own open park or None).
+    parks: dict[str, tuple[int, LoopPark | None]] = field(default_factory=dict)
     lead: LeadLadder = field(default_factory=LeadLadder)
     started_at: float = field(default_factory=time.time)
     last_review_at: float = 0.0
@@ -498,13 +573,15 @@ class ReliabilityLoop:
                 state.escalated.discard(ticket["id"])
                 state.owner_waits.pop(ticket["id"], None)
                 continue
-            if await self._check_owner_wait(project, state, config, ticket, now):
+            if await self._check_owner_wait(project, state, config, ticket, excluded, now):
                 continue
             await self._check_ticket(
                 project, state, config, ticket, working[ticket["stage_id"]], excluded, now
             )
         for ticket_id in set(state.owner_waits) - seen:
             state.owner_waits.pop(ticket_id, None)
+        for ticket_id in set(state.parks) - seen:
+            state.parks.pop(ticket_id, None)
         for ticket_id in set(state.waits) - seen:
             state.waits.pop(ticket_id, None)
         for ticket_id in set(state.tickets) - seen:
@@ -655,6 +732,9 @@ class ReliabilityLoop:
     async def _implied_owner_wait(
         self, project: Any, ticket_id: str, lead_sessions: set[Any]
     ) -> tuple[str, dict[str, Any]] | None:
+        return implied_owner_wait(await self._events(project, ticket_id), lead_sessions)
+
+    async def _events(self, project: Any, ticket_id: str) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         after = -1
         for _ in range(20):
@@ -670,7 +750,7 @@ class ReliabilityLoop:
             if not page.get("has_more"):
                 break
             after = page.get("last_position", after)
-        return implied_owner_wait(events, lead_sessions)
+        return events
 
     async def _park(
         self,
@@ -722,13 +802,19 @@ class ReliabilityLoop:
         state: ProjectState,
         config: Settings,
         ticket: dict[str, Any],
+        lead_sessions: set[Any],
         now: float,
     ) -> bool:
         """Leave a ticket alone while it waits on the owner; remind the lead once, much later."""
         reason = owner_wait_reason(ticket)
         ticket_id = ticket["id"]
+        if reason == "needs-human" and await self._unpark_if_moving(
+            project, state, ticket, lead_sessions
+        ):
+            reason = None
         if reason is None:
             state.owner_waits.pop(ticket_id, None)
+            state.parks.pop(ticket_id, None)
             return False
         state.tickets.pop(ticket_id, None)
         state.escalated.discard(ticket_id)
@@ -749,6 +835,57 @@ class ReliabilityLoop:
             )
             reminded = True
         state.owner_waits[ticket_id] = (since, reminded)
+        return True
+
+    async def _unpark_if_moving(
+        self, project: Any, state: ProjectState, ticket: dict[str, Any], lead_sessions: set[Any]
+    ) -> bool:
+        """Clear a ``needs-human`` this loop added once the work moves again.
+
+        A transient failure, such as a worker stuck on gateway errors, gets parked; when a
+        session then updates the ticket, or a stalled worker runs again, the park is stale.
+        Asks that an agent or person raised are never touched.
+        """
+        ticket_id = ticket["id"]
+        updated = int(ticket.get("updated_at") or 0)
+        cached = state.parks.get(ticket_id)
+        if cached is not None and cached[0] == updated:
+            park = cached[1]
+        else:
+            park = loop_park(await self._events(project, ticket_id), lead_sessions)
+            state.parks[ticket_id] = (updated, park)
+        if park is None or park.new_ask:
+            return False
+        why: str | None = None
+        if park.progress is not None:
+            why = "the work has moved on the ticket since"
+        elif not park.asked:
+            workers = await self._workers(project, ticket_id, lead_sessions)
+            if any(
+                not w.dead and (w.status in _MID_TURN or w.activity_at > park.at) for w in workers
+            ):
+                why = "its worker is active again"
+        if why is None:
+            return False
+        labels = [
+            TicketLabel(key=label["key"], value=label.get("value"))
+            for label in ticket.get("labels") or []
+            if label.get("key") != "needs-human"
+        ]
+        await asyncio.to_thread(
+            self._notifications.tickets.update,
+            project.id,
+            ticket_id,
+            UpdateTicket(labels=labels),
+            _loop_actor(project),
+        )
+        await self._note(
+            project,
+            ticket_id,
+            f"this ticket is moving again ({why}), so I removed the Needs response flag I "
+            "added earlier. Nothing is waiting on you here.",
+            audience="human",
+        )
         return True
 
     # -- deliberate waits ----------------------------------------------------

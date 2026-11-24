@@ -74,10 +74,22 @@ class FakeTickets:
         ticket = next(t for t in self.tickets if t["id"] == ticket_id)
         ticket["labels"] = [label.model_dump() for label in body.labels]
         ticket["updated_at"] = int(time.time())
+        self.events_by_ticket.setdefault(ticket_id, []).append(
+            {
+                "kind": "updated",
+                "session_id": actor.session_id,
+                "agent_id": actor.agent_id,
+                "created_at": ticket["updated_at"],
+                "payload": {"changes": {"labels": ticket["labels"]}},
+            }
+        )
         return dict(ticket)
 
     def comment(self, project_id: str, ticket_id: str, body: Any, actor: Any) -> dict[str, Any]:
         assert body.audience == "agents" or body.text.startswith("Reliability check: this ticket")
+        self.events_by_ticket.setdefault(ticket_id, []).append(
+            {**_comment(None, body.text, body.audience), "agent_id": actor.agent_id}
+        )
         assert actor.agent_id == reliability.LOOP_AGENT_ID and actor.session_id is None
         self.notes.append((ticket_id, body.text))
         # Like the store, the returned row predates the write's updated_at stamp.
@@ -413,3 +425,90 @@ def test_an_unreadable_ladder_file_is_ignored(world) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('{"p1": {"tickets": {"t1": {"step": "x"}}}}')
     assert world.new_loop().state == {}
+
+
+async def _park_on_silence(world: SimpleNamespace) -> None:
+    world.conversations.convs["worker"].live_status = "failed"  # e.g. stuck on 502s
+    for minute in (11, 17, 23, 29, 35):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert world.tickets.tickets[0]["labels"] == [{"key": "needs-human", "value": None}]
+
+
+def _keys(world: SimpleNamespace) -> list[str]:
+    return [label["key"] for label in world.tickets.tickets[0]["labels"]]
+
+
+async def test_a_park_clears_when_its_worker_comes_back(world) -> None:
+    await _park_on_silence(world)
+    await world.loop.check_project("p1", None, now=40 * MINUTE)
+    assert _keys(world) == ["needs-human"]  # still dead: nothing moved
+    worker = world.conversations.convs["worker"]
+    worker.live_status, worker.updated_at = "running", int(time.time()) + 5
+    await world.loop.check_project("p1", None, now=45 * MINUTE)
+    assert _keys(world) == []
+    assert "moving again" in world.tickets.notes[-1][1]
+
+
+async def test_a_park_clears_when_a_session_moves_the_ticket(world) -> None:
+    await _park_on_silence(world)
+    world.tickets.events_by_ticket["t1"].append(
+        _comment("worker", "Recovered, tests pass", "agents")
+    )
+    world.tickets.tickets[0]["updated_at"] += 1
+    await world.loop.check_project("p1", None, now=45 * MINUTE)
+    assert _keys(world) == []
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        _comment("worker", "Should I drop the migration?"),  # a fresh question to the owner
+        {  # the worker kept needs-human in its own label edit: the ask is now theirs
+            "kind": "updated",
+            "session_id": "worker",
+            "agent_id": None,
+            "payload": {"changes": {"labels": [{"key": "needs-human", "value": None}]}},
+        },
+    ],
+)
+async def test_a_park_an_agent_took_over_stays(world, later) -> None:
+    await _park_on_silence(world)
+    world.tickets.events_by_ticket["t1"].append(later)
+    world.tickets.tickets[0]["updated_at"] += 1
+    world.conversations.convs["worker"].live_status = "idle"
+    world.conversations.convs["worker"].updated_at = int(time.time()) + 5
+    await world.loop.check_project("p1", None, now=45 * MINUTE)
+    assert _keys(world) == ["needs-human"]
+
+
+async def test_a_lead_restating_the_park_keeps_it(world) -> None:
+    await _park_on_silence(world)
+    world.tickets.events_by_ticket["t1"].append(_comment("lead", "Still waiting on the owner"))
+    world.tickets.tickets[0]["updated_at"] += 1
+    await world.loop.check_project("p1", None, now=45 * MINUTE)
+    assert _keys(world) == ["needs-human"]
+
+
+async def test_an_agent_raised_ask_is_never_cleared(world) -> None:
+    world.tickets.tickets[0]["labels"] = [{"key": "needs-human", "value": None}]
+    world.tickets.events_by_ticket["t1"] = [
+        {
+            "kind": "updated",
+            "session_id": "worker",
+            "agent_id": None,
+            "payload": {"changes": {"labels": [{"key": "needs-human", "value": None}]}},
+        },
+        _comment("worker", "Blocked on 502s, retrying", "agents"),
+    ]
+    world.conversations.convs["worker"].live_status = "running"
+    await world.loop.check_project("p1", None, now=45 * MINUTE)
+    assert _keys(world) == ["needs-human"] and world.tickets.notes == []
+
+
+async def test_a_park_on_a_question_ignores_mere_worker_activity(world) -> None:
+    world.tickets.events_by_ticket["t1"] = [_comment("worker", "May I open the PR?")]
+    await world.loop.check_project("p1", None, now=11 * MINUTE)
+    assert _keys(world) == ["needs-human"]
+    world.conversations.convs["worker"].live_status = "running"
+    await world.loop.check_project("p1", None, now=20 * MINUTE)
+    assert _keys(world) == ["needs-human"]
