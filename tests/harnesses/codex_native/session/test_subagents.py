@@ -739,6 +739,74 @@ def test_forwarder_child_usage_excludes_inherited_totals_across_restart(
     ]
 
 
+@pytest.mark.parametrize(
+    ("started_model", "requested_model", "resumed_model", "child_model"),
+    [
+        pytest.param("gpt-child", None, None, "gpt-child", id="thread-started"),
+        pytest.param(None, "gpt-child", None, "gpt-child", id="spawn-request"),
+        pytest.param(None, None, "gpt-child", "gpt-child", id="resume"),
+        pytest.param("gpt-child", "gpt-requested", None, "gpt-child", id="report-beats-request"),
+        pytest.param(None, None, None, None, id="inherits-parent"),
+    ],
+)
+def test_forwarder_reports_and_prices_child_with_its_own_model(
+    tmp_path: Path,
+    started_model: str | None,
+    requested_model: str | None,
+    resumed_model: str | None,
+    child_model: str | None,
+) -> None:
+    """A sub-agent running another model reports and prices it on its own session.
+
+    A child without a model of its own keeps the parent's for pricing and
+    reports none, rather than claiming the parent's model as its own.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    child_resume = _child_resume_response()
+    if resumed_model is not None:
+        child_resume["result"]["thread"]["model"] = resumed_model
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={
+            "thread_parent": {
+                "result": {"model": "gpt-parent", "thread": {"id": "thread_parent", "turns": []}}
+            },
+            "thread_child": child_resume,
+        }
+    )
+    child_thread: dict[str, Any] = {
+        "id": "thread_child",
+        "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "thread_parent"}}},
+    }
+    if started_model is not None:
+        child_thread["model"] = started_model
+    spawn = _collab_item_completed_event()
+    if requested_model is not None:
+        spawn["params"]["item"]["model"] = requested_model
+    codex_client.events = [
+        {"method": "thread/started", "params": {"thread": child_thread}},
+        spawn,
+        _usage_event("thread_child", (300, 0, 30), (300, 0, 30)),
+    ]
+
+    _run_forwarder(tmp_path, codex_client, posted)
+
+    def reported_models(session_id: str) -> list[str]:
+        return [
+            body["data"]["model"]
+            for path, body in posted
+            if path == f"/v1/sessions/{session_id}/events"
+            and body["type"] == "external_model_change"
+        ]
+
+    assert reported_models("conv_parent") == ["gpt-parent"]
+    assert reported_models("conv_child") == ([child_model] if child_model else [])
+    assert [
+        body["data"].get("model")
+        for path, body in posted
+        if path == "/v1/sessions/conv_child/events" and body["type"] == "external_session_usage"
+    ] == [child_model or "gpt-parent"]
+
+
 def test_forwarder_does_not_double_write_stable_id_item_delivered_twice(
     tmp_path: Path,
 ) -> None:
