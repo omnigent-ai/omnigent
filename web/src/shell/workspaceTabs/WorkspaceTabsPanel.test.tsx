@@ -123,6 +123,8 @@ vi.mock("../panesViewGate", async (importOriginal) => ({
 }));
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+// A shell that couldn't end is still running, so its toast stays until the person dismisses it.
+const STAYS_UNTIL_DISMISSED = { duration: Number.POSITIVE_INFINITY, closeButton: true };
 
 type PanelOverrides = Partial<WorkspaceTabsPanelProps> & { conversationId: string };
 
@@ -1002,7 +1004,7 @@ describe("a shell's tab", () => {
       await waitFor(() =>
         expect(failed).toHaveBeenCalledExactlyOnceWith(
           "Couldn't close term_b:s. It's still running.",
-          expect.anything(),
+          STAYS_UNTIL_DISMISSED,
         ),
       );
       // a's tab went; b's and c's stay, with the selection on one of them and history agreeing.
@@ -1027,7 +1029,7 @@ describe("a shell's tab", () => {
       await waitFor(() =>
         expect(failed).toHaveBeenCalledExactlyOnceWith(
           "Couldn't close term_a:s and term_b:s. They're still running.",
-          expect.anything(),
+          STAYS_UNTIL_DISMISSED,
         ),
       );
       expect(store.tabs()).toHaveLength(3);
@@ -1253,7 +1255,7 @@ describe("a shell's tab", () => {
     await waitFor(() =>
       expect(failed).toHaveBeenCalledExactlyOnceWith(
         "Couldn't close term_a:s. It's still running.",
-        expect.anything(),
+        STAYS_UNTIL_DISMISSED,
       ),
     );
     expect(endShell).toHaveBeenCalledExactlyOnceWith("terminal:term_a");
