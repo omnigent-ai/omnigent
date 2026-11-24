@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
+import { ProjectMembersNotMovedError } from "@/lib/projectsApi";
 import * as identity from "@/lib/identity";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
@@ -720,7 +721,7 @@ describe("useRenameProject", () => {
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    return renderHook(() => useRenameProject(), { wrapper });
+    return { queryClient, ...renderHook(() => useRenameProject(), { wrapper }) };
   }
 
   // Regression: promoting a label-only folder must return the created id so a
@@ -752,6 +753,22 @@ describe("useRenameProject", () => {
     });
 
     expect(id).toBe("proj_1");
+  });
+
+  it("refetches projects when re-filing a member fails after the rename", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_1", name: "Renamed" })); // PATCH rename
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [{ id: "conv_1" }], first_id: null, last_id: null, has_more: false }),
+    );
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 })); // re-file
+
+    const { queryClient, result } = renderRenameHook();
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    await expect(
+      result.current.mutateAsync({ id: "proj_1", oldName: "old", newName: "Renamed" }),
+    ).rejects.toThrow(ProjectMembersNotMovedError);
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
 });
 

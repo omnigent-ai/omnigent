@@ -39,6 +39,7 @@ function renderTree(rootEntries: readonly WorkspaceFile[], onFileSelect = vi.fn(
     changedFiles: [],
     sort: "alpha",
     showHidden: false,
+    showIgnored: true,
     refreshToken: 0,
     onFileSelect,
     reveal,
@@ -67,6 +68,20 @@ describe("FilesTree", () => {
     fireEvent.click(row);
 
     expect(tree.onFileSelect.mock.calls.map(([path]) => path)).toEqual(["README.md"]);
+  });
+
+  it("marks the files and folders Git ignores as ignored", async () => {
+    renderTree([
+      { ...folder("build"), ignored: true },
+      { ...file("debug.log"), ignored: true },
+      file("main.ts"),
+    ]);
+
+    const status = async (name: RegExp) =>
+      (await screen.findByRole("treeitem", { name })).getAttribute("data-item-git-status");
+    expect(await status(/^build/)).toBe("ignored");
+    expect(await status(/debug\.log/)).toBe("ignored");
+    expect(await status(/main\.ts/)).toBeNull();
   });
 
   it("opens a file in a new tab on ⌘-click (Ctrl-click off macOS) or a middle click, as browsers do", async () => {

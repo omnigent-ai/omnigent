@@ -185,3 +185,11 @@ export async function saveProjectOrder(ids: string[] | null): Promise<ProjectOrd
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as ProjectOrder;
 }
+
+/** The project was renamed, but some of its sessions weren't moved to the new name. */
+export class ProjectMembersNotMovedError extends Error {
+  constructor(reason: string) {
+    super(`Renamed the project, but some of its sessions weren't moved: ${reason}`);
+    this.name = "ProjectMembersNotMovedError";
+  }
+}

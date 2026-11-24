@@ -6,6 +6,7 @@ import {
   selectCharRight,
   undo,
 } from "@codemirror/commands";
+import { Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -359,6 +360,67 @@ describe("CodeMirrorComposerInput change events", () => {
   });
 });
 
+describe("CodeMirrorComposerInput mention edges", () => {
+  const painted = ["@readme.md"];
+  function insertAt(from: number, insert: string, userEvent: string, tokens: string[]) {
+    const { content } = mount({ value: "Read @readme.md", mentionTokens: tokens });
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => void editor.dispatch({ changes: { from, insert }, userEvent }));
+    return editor.state.doc.toString();
+  }
+
+  it("adds the space to a typed insert beside a painted token", () => {
+    expect(insertAt(15, "x", "input.type", painted)).toBe("Read @readme.md x");
+  });
+
+  it("adds no space beside a token the editor does not paint", () => {
+    expect(insertAt(15, "x", "input.type", [])).toBe("Read @readme.mdx");
+  });
+
+  it("keeps a programmatic insert beside a painted token as its own undo step", () => {
+    const { content, target } = mount({ value: "", mentionTokens: painted });
+    const editor = EditorView.findFromDOM(content)!;
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 0, insert: "Read @readme.md" },
+          userEvent: "input.type",
+        }),
+    );
+    act(() => insertComposerText(target(), "x", 15, 15));
+    expect(editor.state.doc.toString()).toBe("Read @readme.md x");
+    act(() => void undo(editor));
+    expect(editor.state.doc.toString()).toBe("Read @readme.md");
+  });
+
+  it("keeps an adjusted insert that is marked out of history out of undo", () => {
+    const { content } = mount({ value: "", mentionTokens: painted });
+    const editor = EditorView.findFromDOM(content)!;
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 0, insert: "Read @readme.md" },
+          userEvent: "input.type",
+        }),
+    );
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 15, insert: "x" },
+          userEvent: "input",
+          annotations: Transaction.addToHistory.of(false),
+        }),
+    );
+    expect(editor.state.doc.toString()).toBe("Read @readme.md x");
+    act(() => void undo(editor));
+    expect(editor.state.doc.toString()).toBe(" x");
+  });
+
+  it("leaves an IME composition insert beside a painted token unchanged", () => {
+    expect(insertAt(15, "x", "input.type.compose", painted)).toBe("Read @readme.mdx");
+  });
+});
+
 describe("CodeMirrorComposerInput ref", () => {
   it("transfers the live surface when the forwarded ref changes", () => {
     const first = vi.fn<(target: ComposerTextTarget | null) => void>();
@@ -441,7 +503,7 @@ describe("CodeMirrorComposerInput mention tokens", () => {
     expect(tokenMarks(view.container)).toEqual([]);
   });
 
-  it("marks a token typed after mount, and drops it once the text no longer matches", () => {
+  it("marks a token typed after mount, and drops it once an edit breaks the match", () => {
     const { container, target } = mount({ mentionTokens: ["@a.ts"] });
     expect(tokenMarks(container)).toEqual([]);
 
@@ -451,7 +513,7 @@ describe("CodeMirrorComposerInput mention tokens", () => {
     expect(tokenMarks(container)).toHaveLength(1);
 
     act(() => {
-      insertComposerText(target(), "x", "@a.ts".length, "@a.ts".length);
+      insertComposerText(target(), "", 0, 1);
     });
     expect(tokenMarks(container)).toEqual([]);
   });

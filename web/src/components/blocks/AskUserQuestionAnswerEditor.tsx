@@ -37,7 +37,10 @@ export const NO_FILE_ENTRIES: WorkspaceFile[] = [];
  * composer sends, with its tool hint. Only the tags of that answer are considered.
  */
 export function expandAnswerMentions(text: string, sessions: readonly SessionMention[]): string {
-  const mentions = presentMentions(composerInlineMentions([], sessions, null), [text]);
+  const mentions = presentMentions(
+    composerInlineMentions({ files: [], sessions: [...sessions] }, null),
+    [text],
+  );
   return withSessionMentionHint(expandMentionTokens(text, mentions), mentions.length > 0);
 }
 

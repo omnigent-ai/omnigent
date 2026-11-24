@@ -49,6 +49,8 @@ export interface Refusal {
   ok: false;
   reason: string;
 }
+const STALE_RESULT = { ok: false, stale: true } as const;
+
 export type GuardedResult =
   { ok: true } | Refusal | { ok: false; cancelled: true } | { ok: false; stale: true };
 export type OpenResult =
@@ -79,6 +81,7 @@ export interface RecentPlace {
 
 /** How many recent places the new-tab page lists. */
 export const MAX_RECENT_PLACES = 5;
+export const ALREADY_CLOSING_REASON = "Those shells are already closing.";
 export const LAST_NEW_TAB_REASON = "This is the last tab. To hide the sidebar, use its toggle.";
 
 /** Whether a batch close takes `tab`: pinned tabs and shells stay, as each closes on its own. */
@@ -237,6 +240,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   );
   const endedTerminals = new Set<string>();
   // Shells a group close is ending: the list catching up on them isn't a newer change.
+  const closingTerminals = new Set<string>();
   // Side-chat and sub-agent sessions, as their last lookup said.
   const sessionStates = new Map<string, ResourceState>();
   // Most recently selected first, for "the most recently selected tab showing that file".
@@ -637,6 +641,28 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     return true;
   }
 
+  /**
+   * Move the selection between tabs shown together, such as a split's shells as focus moves
+   * between their panes, in place of the current step. Changes nothing and returns false once
+   * the selected tab isn't one of `together`, so a selection made meanwhile stands.
+   */
+  function selectAmong(tabId: TabId, together: readonly TabId[]): boolean {
+    if (tabId === selectedTabId) return true;
+    if (selectedTabId === null || !together.includes(selectedTabId) || !together.includes(tabId))
+      return false;
+    const tab = findTab(tabId);
+    if (!tab) return false;
+    const onSelected = history.state.visits[history.state.cursor]?.tabId === selectedTabId;
+    markSelected(tabId);
+    const shown = tab.unseen ? withoutUnseen(tab) : tab;
+    if (shown !== tab) replaceTab(shown);
+    // The cursor is on the tab it leaves unless history lost it; then this is a step after all.
+    if (onSelected) history.swapCurrent(visitOf(shown));
+    else history.recordStep(visitOf(shown));
+    commit();
+    return true;
+  }
+
   /** Land after the selected tab went away: the nearest surviving visit, a neighbour, or none. */
   function landAfterRemoval(removedIndex: number, restore: Visit | null) {
     if (restore && tabs.some((tab) => tab.id === restore.tabId)) {
@@ -720,6 +746,77 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     });
     releaseDetached(closeOptions.release, tabId);
     return { ok: true };
+  }
+
+  /**
+   * Close a split's shells and every tab of them as one action: one confirm, then each shell
+   * ends in turn, and only once it has do its tabs go. A shell that fails to end keeps its tabs
+   * and is named in `failed`; anything else changing meanwhile stops the close as stale.
+   */
+  async function closeTerminalGroup(
+    tabIds: readonly TabId[],
+    {
+      terminalKeys = [],
+      confirm,
+      teardownFor,
+    }: {
+      /** Every shell the split names, ended too though it has no tab here. */
+      terminalKeys?: readonly string[];
+      confirm?: () => Promise<boolean>;
+      /** Ends one shell; false when it couldn't. */
+      teardownFor: (terminalKey: string) => Promise<boolean>;
+    },
+  ): Promise<GuardedResult | { ok: false; failed: string[]; stale?: true }> {
+    const keyOf = (tabId: TabId) => {
+      const binding = findTab(tabId)?.binding;
+      return binding?.kind === "terminal" ? binding.key : null;
+    };
+    const present = tabIds.filter((tabId) => keyOf(tabId) !== null);
+    if (present.length === 0) return { ok: false, reason: MISSING_TAB_REASON };
+    const keys = [...new Set([...present.map(keyOf), ...terminalKeys])].filter(
+      (key): key is string => key !== null,
+    );
+    if (keys.some((key) => closingTerminals.has(key))) {
+      return { ok: false, reason: ALREADY_CLOSING_REASON };
+    }
+    // Reserved before asking, so a second close of the same shells meanwhile is refused.
+    for (const key of keys) closingTerminals.add(key);
+    const failed: string[] = [];
+    // Stopped as stale, the shells that failed to end are still named: they're still running.
+    const stale = () =>
+      failed.length > 0 ? { ok: false as const, stale: true as const, failed } : STALE_RESULT;
+    try {
+      let planned = stamp();
+      const guarded = await guardThen(present, "close", () => ({ ok: true as const }));
+      if (!guarded.ok) return guarded;
+      if (confirm && !(await confirm())) return { ok: false, cancelled: true };
+      for (const key of keys) {
+        if (stamp() !== planned) return stale();
+        // oxlint-disable-next-line no-await-in-loop -- one shell at a time, each checked after
+        const ended = await teardownFor(key);
+        const changedMeanwhile = stamp() !== planned;
+        if (!ended) {
+          failed.push(key);
+          if (changedMeanwhile) return stale();
+          continue;
+        }
+        // The shell is gone now, so its tabs go even if something else moved meanwhile.
+        const closing = tabs.filter(
+          (tab) =>
+            !isUnknownTab(tab) && tab.binding?.kind === "terminal" && tab.binding.key === key,
+        );
+        if (closing.length > 0)
+          transact(() => {
+            for (const tab of closing) removeTab(tab.id, false);
+            commit();
+          });
+        if (changedMeanwhile) return stale();
+        planned = stamp();
+      }
+    } finally {
+      for (const key of keys) closingTerminals.delete(key);
+    }
+    return failed.length > 0 ? { ok: false, failed } : { ok: true };
   }
 
   /** Tear down a closed tab's resource without holding the store; a failure is only logged. */
@@ -1024,12 +1121,15 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   function setTerminalInventory(inventory: TerminalInventory) {
     // Only a change a shell tab shows counts as a revision, so an unrelated list
     // doesn't overturn an action the user is confirming.
-    const shellStates = () =>
+    const shellStates = (except: ReadonlySet<string> = new Set()) =>
       knownTabs()
+        .filter((tab) => !(tab.binding?.kind === "terminal" && except.has(tab.binding.key)))
         .map((tab) => (tab.binding?.kind === "terminal" ? resourceState(tab.id) : ""))
         .join();
     const before = shellStates();
+    const othersBefore = shellStates(closingTerminals);
     let removed = false;
+    let removedOther = false;
     terminalInventory = inventory;
     if (inventory.status === "loaded") {
       for (const key of inventory.keys) {
@@ -1043,10 +1143,17 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
           endedTerminals.add(binding.key);
           removeTab(tab.id, false);
           removed = true;
+          if (!closingTerminals.has(binding.key)) removedOther = true;
         }
       }
     }
-    if (removed || shellStates() !== before) commit();
+    if (!removed && shellStates() === before) return;
+    commit();
+    // Only the shells a group close is ending went, and nothing else changed: that close stays
+    // current.
+    const othersChanged = shellStates(closingTerminals) !== othersBefore;
+    if (removed && !removedOther && !othersChanged && closingTerminals.size > 0)
+      excusedChanges += 1;
   }
 
   /** The first send created the side chat: fill in its ID, once. */
@@ -1172,8 +1279,10 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     /** Whether `tabId` is selected right now, even inside a transition not yet published. */
     isSelected: (tabId: TabId) => selectedTabId === tabId,
     select,
+    selectAmong,
     go,
     close,
+    closeTerminalGroup,
     closeOthers,
     closeMany,
     setPinned,

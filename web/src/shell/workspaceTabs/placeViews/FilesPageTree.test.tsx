@@ -32,13 +32,18 @@ function entry(path: string): WorkspaceFile {
 }
 
 type FilesResult = ReturnType<typeof useWorkspaceAllFiles>;
-const listed = (entries: WorkspaceFile[]) =>
-  ({ isPending: false, isError: false, data: { available: true, data: entries } }) as FilesResult;
+const listed = (entries: WorkspaceFile[], ignoredHidden = false) =>
+  ({
+    isPending: false,
+    isError: false,
+    data: { available: true, data: entries, ...(ignoredHidden ? { ignoredHidden: true } : {}) },
+  }) as FilesResult;
 
-function renderTree(files: Partial<FilesResult>, showHidden = false) {
+function renderTree(files: Partial<FilesResult>, showHidden = false, showIgnored = true) {
   vi.mocked(useWorkspaceAllFiles).mockReturnValue(files as FilesResult);
   const onFileSelect = vi.fn();
   const onShowHidden = vi.fn();
+  const onShowIgnored = vi.fn();
   render(
     <FilesPageTree
       conversationId="conv_1"
@@ -46,10 +51,12 @@ function renderTree(files: Partial<FilesResult>, showHidden = false) {
       sort="alpha"
       showHidden={showHidden}
       onShowHidden={onShowHidden}
+      showIgnored={showIgnored}
+      onShowIgnored={onShowIgnored}
       onFileSelect={onFileSelect}
     />,
   );
-  return { onFileSelect, onShowHidden };
+  return { onFileSelect, onShowHidden, onShowIgnored };
 }
 
 beforeEach(() => {
@@ -92,6 +99,43 @@ describe("FilesPageTree", () => {
     cleanup();
     renderTree(listed([entry(".env")]), true);
     expect(screen.getByTestId("files-tree")).toBeInTheDocument();
+  });
+
+  it("lists without what Git ignores while ignored files are off, and offers them when nothing's left", () => {
+    renderTree(listed([entry("README.md")]), false, false);
+    expect(useWorkspaceAllFiles).toHaveBeenLastCalledWith("conv_1", { hideIgnored: true });
+    expect(captured.tree?.showIgnored).toBe(false);
+    cleanup();
+
+    const { onShowIgnored } = renderTree(listed([], true), false, false);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "No files here, apart from any that Git ignores.",
+    );
+    expect(screen.queryByRole("button", { name: "Show hidden files" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show git-ignored files" }));
+    expect(onShowIgnored).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    // A host that couldn't leave anything out listed everything there is.
+    renderTree(listed([]), false, false);
+    expect(screen.getByRole("status")).toHaveTextContent("No files in the workspace.");
+    expect(screen.queryByRole("button")).toBeNull();
+    cleanup();
+
+    // Only dotfiles are left once Git's are out: either action brings files back.
+    const both = renderTree(listed([entry(".git"), entry(".gitignore")], true), false, false);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Every file here is hidden or ignored by Git.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show hidden files" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show git-ignored files" }));
+    expect(both.onShowHidden).toHaveBeenCalledTimes(1);
+    expect(both.onShowIgnored).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    renderTree(listed([entry("README.md")]), false, true);
+    expect(useWorkspaceAllFiles).toHaveBeenLastCalledWith("conv_1", { hideIgnored: false });
+    expect(captured.tree?.showIgnored).toBe(true);
   });
 
   it("shows the listing with its changes, open down to the page's file", () => {

@@ -277,6 +277,13 @@ _CHILD_DELIVERY_CONCURRENCY = 8
 _CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
 # Upper bound on draining queued child events at forwarder shutdown.
 _CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS = 10.0
+_ChildModelSource = Literal["requested", "snapshot", "started"]
+# Weakest first: a weaker source never replaces a child model from a stronger one.
+_CHILD_MODEL_SOURCE_RANK: dict[_ChildModelSource, int] = {
+    "requested": 0,
+    "snapshot": 1,
+    "started": 2,
+}
 # Bounds the inline Codex reads that link an unregistered thread to the parent.
 _CODEX_THREAD_LINEAGE_READ_TIMEOUT_SECONDS = 5.0
 _CODEX_THREAD_LINEAGE_MAX_DEPTH = 4
@@ -627,6 +634,11 @@ class _CodexForwarderState:
         multiple times).
     :param child_turn_status_by_thread: Latest status from each child's own
         lifecycle or initial resume, which outranks conflicting collab snapshots.
+    :param child_models: Model each Codex child thread runs, keyed by child
+        thread id, e.g. ``{"thread_child": "gpt-5.5"}``. A child absent here is
+        assumed to run the parent's ``model``.
+    :param child_model_sources: Where each entry in ``child_models`` came from:
+        ``"requested"``, ``"snapshot"`` or ``"started"``.
     :param lineage_checked_threads: Unregistered Codex thread ids already
         checked for descent from the forwarder's thread this connection, so
         each costs at most one lineage lookup.
@@ -752,6 +764,8 @@ class _CodexForwarderState:
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     child_turn_status_by_thread: dict[str, str] = field(default_factory=dict)
+    child_models: dict[str, str] = field(default_factory=dict)
+    child_model_sources: dict[str, _ChildModelSource] = field(default_factory=dict)
     lineage_checked_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     child_delivery_slots: asyncio.Semaphore = field(
@@ -985,6 +999,41 @@ class _CodexForwarderState:
         self.subagents_by_thread[thread_id] = session_id
         self.pending_child_threads.pop(thread_id, None)
 
+    def note_child_model(
+        self, thread_id: str, model: object, *, source: _ChildModelSource
+    ) -> None:
+        """
+        Record the model a Codex child thread runs.
+
+        :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
+        :param model: Model from ``source``, e.g. ``"gpt-5.5"``. Non-string or
+            empty values are ignored.
+        :param source: ``"started"`` for the child's ``thread/started``,
+            ``"snapshot"`` for a ``thread/resume`` or ``thread/read`` result, or
+            ``"requested"`` for its spawn item. A weaker source never replaces
+            the model, and no source replaces one a live
+            ``thread/settings/updated`` set.
+        :returns: None.
+        """
+        if not isinstance(model, str) or not model:
+            return
+        recorded = self.child_model_sources.get(thread_id)
+        if recorded is not None and (
+            _CHILD_MODEL_SOURCE_RANK[source] < _CHILD_MODEL_SOURCE_RANK[recorded]
+        ):
+            return
+        stream = self.child_streams.get(thread_id)
+        if stream is not None and stream.state.settings_model:
+            return
+        self.child_models[thread_id] = model
+        self.child_model_sources[thread_id] = source
+        if stream is not None:
+            stream.state.model = model
+
+    def child_model(self, thread_id: str) -> str | None:
+        """Return a child's own model, else the parent's model it inherits by default."""
+        return self.child_models.get(thread_id, self.model)
+
     def child_stream(
         self, client: httpx.AsyncClient, thread_id: str, session_id: str
     ) -> _CodexChildStream:
@@ -992,7 +1041,10 @@ class _CodexForwarderState:
         stream = self.child_streams.get(thread_id)
         if stream is None:
             stream = _CodexChildStream(
-                state=_CodexForwarderState(model=self.model, codex_client=self.codex_client),
+                state=_CodexForwarderState(
+                    model=self.child_model(thread_id),
+                    codex_client=self.codex_client,
+                ),
                 delta_coalescer=_OutputTextDeltaCoalescer(client, session_id),
             )
             self.child_streams[thread_id] = stream
@@ -4100,6 +4152,10 @@ async def _handle_event(
                 child_thread_id,
                 _parent_thread_id_from_started_event(event),
             )
+            forwarder_state.note_child_model(
+                child_thread_id, params["thread"].get("model"), source="started"
+            )
+            _queue_child_model_sync(client, forwarder_state, child_thread_id)
         return
     if method == _CODEX_MCP_STARTUP_STATUS_METHOD:
         # MCP startup is bridge-level state, surfaced on the parent
@@ -7818,6 +7874,7 @@ async def _handle_collab_item(
         return
     parent_thread_id = _collab_parent_thread_id(params, item)
     for child_thread_id in _collab_receiver_thread_ids(item):
+        forwarder_state.note_child_model(child_thread_id, item.get("model"), source="requested")
         await _ensure_child_session(
             client,
             parent_session_id=parent_session_id,
@@ -7916,6 +7973,35 @@ async def _ensure_child_session(
             child_thread_id=child_thread_id,
             forwarder_state=forwarder_state,
         )
+    _queue_child_model_sync(client, forwarder_state, child_thread_id)
+
+
+def _queue_child_model_sync(
+    client: httpx.AsyncClient,
+    forwarder_state: _CodexForwarderState,
+    child_thread_id: str,
+) -> None:
+    """
+    Queue a report of a registered Codex child's own model on its session.
+
+    The report rides the child's ordered lane, like the child's other posts.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param forwarder_state: Connection state holding child mappings and models.
+    :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
+    :returns: None. Skips a child without a session or a known model.
+    """
+    child_session_id = forwarder_state.session_for_child_thread(child_thread_id)
+    if child_session_id is None or child_thread_id not in forwarder_state.child_models:
+        return
+    stream = forwarder_state.child_stream(client, child_thread_id, child_session_id)
+    queued = _QueuedChildEvent(
+        deliver=functools.partial(
+            _sync_model_change, client, session_id=child_session_id, forwarder_state=stream.state
+        ),
+        enqueued_at=asyncio.get_running_loop().time(),
+    )
+    stream.enqueue(queued, forwarder_state.child_delivery_slots)
 
 
 async def _register_child_session(
@@ -8052,6 +8138,8 @@ async def _reattach_descendant_thread(
     # mirrored any other thread's, and replaying it inline would stall the parent.
     announced = thread_id in forwarder_state.pending_child_threads
     forwarder_state.note_child_thread(thread_id, child_session_id)
+    forwarder_state.note_child_model(thread_id, thread.get("model"), source="snapshot")
+    _queue_child_model_sync(client, forwarder_state, thread_id)
     if not announced:
         forwarder_state.note_child_thread_subscribed(thread_id)
     _logger.warning(
@@ -8288,9 +8376,20 @@ async def _apply_child_resume(
         child_thread_id=child_thread_id,
         response=response,
     )
-    # Seed the session model (sub-agents inherit it) so replayed child token
-    # usage is priced into the child's total_cost_usd — see _SessionUsageCoalescer.
-    usage_coalescer = _SessionUsageCoalescer(client, child_session_id, model=forwarder_state.model)
+    result = response.get("result")
+    if isinstance(result, dict):
+        thread = result.get("thread")
+        thread_model = thread.get("model") if isinstance(thread, dict) else None
+        forwarder_state.note_child_model(
+            child_thread_id, thread_model or result.get("model"), source="snapshot"
+        )
+    # Seed the child's model so replayed child token usage is priced into the
+    # child's total_cost_usd — see _SessionUsageCoalescer.
+    usage_coalescer = _SessionUsageCoalescer(
+        client,
+        child_session_id,
+        model=forwarder_state.child_model(child_thread_id),
+    )
     # A fresh tracker is used for child replay rather than the parent's,
     # because child items do not trigger elicitation requests on the parent.
     child_elicitation_tracker = _CodexElicitationTaskTracker()

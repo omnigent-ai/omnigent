@@ -370,18 +370,30 @@ export interface ListedEntry {
   modified_at: number | null;
   /** The deepest directory of a single-child chain, when the host reports it. */
   leaf_directory_path?: string;
+  /** Git ignores the entry, as a host offering the "gitignore" feature reports. */
+  ignored?: true;
+}
+
+/** How a directory is listed. */
+export interface ListDirectoryOptions {
+  signal?: AbortSignal;
+  /** Leave out entries Git ignores, where the host can tell; others list them all. */
+  hideIgnored?: boolean;
+  /** Ask the host to report each single-folder chain's end, where it offers that. */
+  collapseSingleChildDirectories?: boolean;
 }
 
 const LIST_PAGE_SIZE = 1000;
 /** The ListDirectory feature that fills each entry's `leaf_directory_path`. */
 const DIRECTORY_CHAINS = "list_directory.collapse_single_child_directories";
+/** The ListDirectory feature that marks, and can leave out, what Git ignores. */
+const IGNORED_FEATURE = "gitignore";
 
 async function listDirectory(
   client: WorkspaceClient,
   path: string,
   maxEntries: number,
-  collapseSingleChildDirectories: boolean,
-  signal?: AbortSignal,
+  { signal, hideIgnored = false, collapseSingleChildDirectories = false }: ListDirectoryOptions,
 ): Promise<{ data: ListedEntry[]; hasMore: boolean }> {
   const data: ListedEntry[] = [];
   let pageToken = "";
@@ -394,6 +406,7 @@ async function listDirectory(
         pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length),
         pageToken,
         collapseSingleChildDirectories,
+        hideIgnored,
       },
       { signal },
     );
@@ -509,23 +522,33 @@ async function viaWorkspaceApi<T>(
  * :param sessionId: The session whose workspace to list.
  * :param path: Workspace-relative directory, ``""`` for the root.
  * :param maxEntries: Stop after this many entries, e.g. ``1000``; must be positive.
- * :returns: The entries and whether more remain, or null when the caller
- *     should list through REST (see :func:`readFileViaWorkspaceApi`).
+ * :param options: ``hideIgnored`` leaves out what Git ignores, where the host can tell.
+ * :returns: The entries, whether more remain and whether Git-ignored ones were left
+ *     out, or null when the caller should list through REST (see :func:`readFileViaWorkspaceApi`).
  */
 export function listDirectoryViaWorkspaceApi(
   sessionId: string,
   path: string,
   maxEntries: number,
   signal?: AbortSignal,
-): Promise<{ data: ListedEntry[]; hasMore: boolean } | null> {
+  { hideIgnored = false }: Omit<ListDirectoryOptions, "signal"> = {},
+): Promise<{ data: ListedEntry[]; hasMore: boolean; ignoredHidden?: true } | null> {
   // The host reads a page size of 0 as its default, so a 0 limit would still return entries.
   if (!(maxEntries > 0)) return Promise.reject(new RangeError("maxEntries must be positive"));
   return viaWorkspaceApi(
     sessionId,
     "listDirectory",
-    (client, served) =>
-      listDirectory(client, path, maxEntries, served.has(DIRECTORY_CHAINS), signal),
-    { signal, usesFeatures: [DIRECTORY_CHAINS] },
+    async (client, served) => {
+      // Only a host offering the feature leaves ignored entries out; others list them all.
+      const ignoredHidden = hideIgnored && served.has(IGNORED_FEATURE);
+      const listed = await listDirectory(client, path, maxEntries, {
+        signal,
+        hideIgnored: ignoredHidden,
+        collapseSingleChildDirectories: served.has(DIRECTORY_CHAINS),
+      });
+      return ignoredHidden ? { ...listed, ignoredHidden: true as const } : listed;
+    },
+    { signal, usesFeatures: [DIRECTORY_CHAINS, ...(hideIgnored ? [IGNORED_FEATURE] : [])] },
   );
 }
 
@@ -565,6 +588,7 @@ function listedEntry(entry: Entry): ListedEntry {
     bytes: entry.size === undefined ? null : Number(entry.size),
     modified_at: entry.modifyTime ? Number(entry.modifyTime.seconds) : null,
     ...(entry.leafDirectoryPath ? { leaf_directory_path: entry.leafDirectoryPath } : {}),
+    ...(entry.ignored ? { ignored: true as const } : {}),
   };
 }
 

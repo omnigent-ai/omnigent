@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -405,6 +406,85 @@ async def test_usage_snapshot_accepts_read_only_collaborator(
     )
     assert response.status_code == 200, response.text
     assert response.json()["total_cost_usd"] == 7.75
+
+
+@pytest.mark.parametrize(
+    ("node", "expected_cost", "expected_input_tokens"),
+    [("parent_id", 7.75, 40), ("child_id", 2.75, 20)],
+)
+async def test_session_get_info_tool_reports_the_cost_badge_totals(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    node: str,
+    expected_cost: float,
+    expected_input_tokens: int,
+) -> None:
+    """The agent tool reads the same subtree totals the session's cost badge shows."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_id = getattr(usage_app, node)
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": session_id, "include_usage": True}),
+            server_client=usage_client,
+            conversation_id=usage_app.parent_id,
+        )
+    )
+    badge = (
+        await usage_client.get(f"/v1/sessions/{session_id}", params=_USAGE_SNAPSHOT_PARAMS)
+    ).json()
+
+    assert info["session_id"] == session_id
+    assert info["usage"]["total_cost_usd"] == badge["total_cost_usd"] == expected_cost
+    assert info["usage"]["by_model"] == badge["usage_by_model"]
+    assert info["usage"]["input_tokens"] == expected_input_tokens
+    assert info["usage"]["cost_hidden"] is False
+
+
+async def test_session_get_info_tool_keeps_tokens_when_the_operator_hides_cost(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setenv("OMNIGENT_HIDE_COST", "1")
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"include_usage": True}),
+            server_client=usage_client,
+            conversation_id=usage_app.parent_id,
+        )
+    )
+
+    assert info["usage"]["total_cost_usd"] is None
+    assert info["usage"]["cost_hidden"] is True
+    assert info["usage"]["input_tokens"] == 40
+
+
+async def test_session_get_info_tool_reveals_no_usage_without_session_access(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    load_usage = Mock(side_effect=AssertionError("must authorize before loading usage"))
+    monkeypatch.setattr(orchestration, "load_session_usage", load_usage)
+    usage_client.headers["X-Forwarded-Email"] = _READER
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": usage_app.parent_id, "include_usage": True}),
+            server_client=usage_client,
+            conversation_id="conv_other_user",
+        )
+    )
+
+    assert info == {"error": "session_not_found", "session_id": usage_app.parent_id}
+    load_usage.assert_not_called()
 
 
 async def test_usage_opt_out_does_not_authorize_read_only_metadata_writes(

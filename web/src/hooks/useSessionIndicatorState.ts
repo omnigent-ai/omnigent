@@ -59,8 +59,9 @@ export function useSessionIndicatorState(
   const isStartingUp = useChatStore(
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
+  // A send waking the session shows its startup spinner over background work.
   const sessionState: SessionState | null =
-    badgeState?.kind === "awaiting" || badgeState?.kind === "running"
+    badgeState?.kind === "awaiting" || (badgeState?.kind === "running" && !badgeState.background)
       ? badgeState
       : isStartingUp
         ? { kind: "starting" }

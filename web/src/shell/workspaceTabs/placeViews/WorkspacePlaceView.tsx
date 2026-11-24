@@ -11,6 +11,7 @@ import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { cn } from "@/lib/utils";
 import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 import { requestFileFinder, useFileFinderAvailable } from "@/store/fileFinder";
+import { useShowIgnoredFiles, writeShowIgnoredFiles } from "@/lib/filesTreeIgnoredPreferences";
 import type { ChangedSort } from "@/lib/changedSort";
 import type { CommentSelectionRequest } from "@/shell/commentSelectionHandoff";
 import { useFilesTreePageCommands } from "@/shell/fileTree/useFilesTreePageCommands";
@@ -189,7 +190,10 @@ function FilesPlaceView({
     enabled: commandsActive,
   });
   useFilesTreeShowRequests(active ? conversationId : undefined, tree.show);
-  useFilesTreeOptionCommands(files, commandsActive);
+  // Git-ignored files are a per-device choice of the Files tree, beside the panel's settings.
+  const showIgnored = useShowIgnoredFiles();
+  const treeOptions = { ...files, showIgnored, onShowIgnoredChange: writeShowIgnoredFiles };
+  useFilesTreeOptionCommands(treeOptions, commandsActive);
   // Every Files place, the Files tab or a file tab, shows the same tree beside its file; a
   // docked tree's options sit beside its toggle.
   const treeToggle = (
@@ -199,7 +203,7 @@ function FilesPlaceView({
         showLabel={SHOW_FILES_TREE_LABEL}
         hideLabel={HIDE_FILES_TREE_LABEL}
       />
-      {tree.wide && tree.shown ? <FilesTreeOptionsMenu {...files} /> : null}
+      {tree.wide && tree.shown ? <FilesTreeOptionsMenu {...treeOptions} /> : null}
     </>
   );
   return (
@@ -215,6 +219,8 @@ function FilesPlaceView({
           sort={files.sort}
           showHidden={files.showHidden}
           onShowHidden={() => files.onShowHiddenChange(true)}
+          showIgnored={showIgnored}
+          onShowIgnored={() => writeShowIgnoredFiles(true)}
           onFileSelect={(path, options) => {
             tree.dismissPopover();
             // A file tab's tree steps that tab; the Files tab's opens there as before.

@@ -1,6 +1,7 @@
 /** Standard mounted Sidebar with a fresh query cache for each test; `setOpen` rerenders it. */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -21,6 +22,8 @@ export function renderSidebar(
     dragProgress?: number | null;
     features?: Record<string, boolean>;
     info?: ServerInfo;
+    /** Rendered inside the router after the sidebar, e.g. a location probe. */
+    children?: ReactNode;
   } = {},
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -35,6 +38,7 @@ export function renderSidebar(
           <TooltipProvider>
             <MemoryRouter initialEntries={[props.route ?? "/"]}>
               <Sidebar open={open} onClose={onClose} dragProgress={props.dragProgress} />
+              {props.children}
             </MemoryRouter>
           </TooltipProvider>
         </SidebarDataProvider>

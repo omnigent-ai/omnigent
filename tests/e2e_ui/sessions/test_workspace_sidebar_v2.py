@@ -677,3 +677,40 @@ def test_files_shows_a_folder_chain_as_one_row_through_the_workspace_api(
     expect(sidebar.get_by_role("treeitem", name="Main.java", exact=True)).to_be_visible(
         timeout=15_000
     )
+
+
+def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
+    page: Page, git_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """Files leaves out what Git ignores; the options switch lists it, marked, until it's off."""
+    base_url, session_id = git_session
+    repository = tmp_path / "repository"
+    (repository / ".gitignore").write_text("build/\n")
+    (repository / "build").mkdir()
+    (repository / "build" / "app.bin").write_text("x")
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Files")
+    # A full-screen workspace docks the tree, with its options beside the toggle.
+    page.get_by_role("button", name="Full screen", exact=True).click()
+    build = sidebar.get_by_role("treeitem", name=re.compile(r"^build\b"))
+    expect(sidebar.get_by_role("treeitem", name="base.txt", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    expect(build).to_have_count(0)
+
+    def switch_ignored_files() -> None:
+        sidebar.get_by_role("button", name="Files tree options", exact=True).click()
+        page.get_by_role("menuitemcheckbox", name="Show git-ignored files").click()
+
+    switch_ignored_files()
+    expect(build).to_have_attribute("data-item-git-status", "ignored", timeout=30_000)
+    expect(sidebar.get_by_role("treeitem", name="base.txt", exact=True)).not_to_have_attribute(
+        "data-item-git-status", "ignored"
+    )
+
+    switch_ignored_files()
+    expect(build).to_have_count(0, timeout=30_000)

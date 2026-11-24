@@ -6519,24 +6519,28 @@ async def _record_agent_startup_pending(
     terminal_instance: TerminalInstance,
     routing_summary: str,
     waited_seconds: float,
-) -> None:
+) -> bool:
     """
     Record that Codex is still starting behind a live pane, noting a sign-in prompt it shows.
 
     A launcher wrapper can park the pane on a sign-in prompt. The wait records
-    this as soon as the prompt is stable on screen, or at the thread-start
-    budget when the pane shows something else. Chat turns read the record and
-    fail fast with the next step instead of the generic "thread never
-    started"; the discovery wait then continues without a deadline and clears
-    the record once the thread starts.
+    this as soon as the prompt is stable on screen, including after the
+    thread-start budget, and records a still-starting cause at the budget when
+    the pane shows something else. Chat turns fail fast on a sign-in record with
+    the next step, and wait on a still-starting one; the discovery wait then
+    continues without a deadline and clears the record once the thread starts.
 
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Codex bridge directory for this session.
     :param terminal_instance: The live TUI pane, read once for its screen text.
     :param routing_summary: One-line description of the resolved launch routing.
     :param waited_seconds: How long discovery has waited for the thread so far.
+    :returns: ``True`` when the pane showed a sign-in prompt and that was recorded.
     """
-    from omnigent.harnesses.codex_native.bridge import write_bridge_startup_error
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_STARTUP_PENDING_CODE,
+        write_bridge_startup_error,
+    )
     from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
 
     prompt = detect_sign_in_prompt(await _codex_pane_screen(terminal_instance))
@@ -6546,14 +6550,16 @@ async def _record_agent_startup_pending(
         message = "Codex is waiting for a sign-in in this session's terminal."
         remediation = sign_in_next_step("Codex")
     else:
-        code = "agent_startup_pending"
+        # Nothing on screen asks for a sign-in, so report a slow start rather than a login wait.
+        code = CODEX_STARTUP_PENDING_CODE
         title = "Codex is still starting"
         message = (
-            "Codex is still starting in this session's terminal and may be waiting "
-            "for a sign-in there."
+            "Codex hasn't finished starting in this session's terminal after "
+            f"{waited_seconds:.0f}s."
         )
         remediation = (
-            "Finish any sign-in shown in the session terminal, then send your message again."
+            "Your message is sent once Codex is ready. If the session terminal is "
+            "waiting for input, answer it there."
         )
     write_bridge_startup_error(
         bridge_dir,
@@ -6579,6 +6585,7 @@ async def _record_agent_startup_pending(
         " (a sign-in prompt is on screen)" if prompt is not None else "",
         extra=pending_event,
     )
+    return prompt is not None
 
 
 async def _apply_codex_launch_plan_mode(
@@ -6674,8 +6681,9 @@ async def _codex_discover_thread_and_forward(
         default. While *terminal_instance* is running, a stable sign-in
         prompt on its screen, or the budget expiring, records a pending
         cause (see :func:`_record_agent_startup_pending`) and the wait
-        continues without a deadline; only a pane exit or an ended event
-        stream tears down.
+        continues without a deadline, still watching for a sign-in prompt
+        until one is recorded; only a pane exit or an ended event stream
+        tears down.
     :param apply_plan_mode: Switches the discovered thread into Plan mode, or
         ``None``. Awaited before the bridge state is written, because the
         executor gates the first queued web turn on that state.
@@ -6690,6 +6698,7 @@ async def _codex_discover_thread_and_forward(
         CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
         CodexNativeBridgeState,
         clear_bridge_startup_error,
+        end_startup_pending,
         record_app_server_stopped,
         write_bridge_startup_error,
         write_bridge_state,
@@ -6730,6 +6739,7 @@ async def _codex_discover_thread_and_forward(
 
     discovery_started_at = time.monotonic()
     startup_pending_recorded = False
+    sign_in_recorded = False
     cancelled = False
     try:
         while True:
@@ -6756,26 +6766,26 @@ async def _codex_discover_thread_and_forward(
                             if login_required or startup_pending_recorded
                             else _TERMINAL_INTERACTIVE_POLL_INTERVAL_S
                         ),
-                        # Once the cause is recorded there is nothing more to
-                        # learn from the pane until the thread starts.
-                        watch_sign_in=not (login_required or startup_pending_recorded),
+                        # Turns wait on a still-starting record, so a sign-in prompt
+                        # shown later must still replace it with the sign-in step.
+                        watch_sign_in=not (login_required or sign_in_recorded),
                     )
                 )
                 break
             except (TimeoutError, RuntimeError) as exc:
-                if (
-                    terminal_instance is not None
-                    and not startup_pending_recorded
-                    and (
-                        isinstance(exc, _CodexSignInPromptSeen)
-                        or (isinstance(exc, TimeoutError) and await terminal_instance.is_alive())
+                if terminal_instance is not None and (
+                    isinstance(exc, _CodexSignInPromptSeen)
+                    or (
+                        not startup_pending_recorded
+                        and isinstance(exc, TimeoutError)
+                        and await terminal_instance.is_alive()
                     )
                 ):
                     # The pane is still running: parked on a launcher sign-in
                     # prompt, or slow past its budget. Record why chat turns
                     # cannot run yet and keep listening; a pane exit still ends
                     # discovery below.
-                    await _record_agent_startup_pending(
+                    sign_in_recorded = await _record_agent_startup_pending(
                         session_id=session_id,
                         bridge_dir=bridge_dir,
                         terminal_instance=terminal_instance,
@@ -6922,9 +6932,8 @@ async def _codex_discover_thread_and_forward(
                     )
                 return
 
-        if login_required or startup_pending_recorded:
-            # The user signed in (or the TUI otherwise started a thread):
-            # the pre-recorded fail-fast cause no longer applies.
+        if login_required or sign_in_recorded:
+            # The sign-in is done: a turn arriving during Plan setup waits for the state.
             clear_bridge_startup_error(bridge_dir)
         if apply_plan_mode is not None:
             await apply_plan_mode(thread_id)
@@ -6940,6 +6949,10 @@ async def _codex_discover_thread_and_forward(
                 cwd=workspace,
             ),
         )
+        if startup_pending_recorded:
+            # A still-starting record goes only once the state is up, so a turn held on it
+            # sees one or the other.
+            clear_bridge_startup_error(bridge_dir)
 
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = await asyncio.to_thread(_make_auth_token_factory)
@@ -7022,6 +7035,8 @@ async def _codex_discover_thread_and_forward(
         leftover_app_server = app_server
         if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
             leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            # A turn waiting on a still-starting record must not outlive this launch.
+            end_startup_pending(bridge_dir)
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)

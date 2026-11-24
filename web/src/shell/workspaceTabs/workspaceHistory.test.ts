@@ -17,6 +17,7 @@ import {
   replaceNewTab,
   restoreHistory,
   serializeHistory,
+  swapCurrent,
   WORKSPACE_HISTORY_LIMIT,
   WorkspaceHistory,
   type WorkspaceHistoryState,
@@ -100,6 +101,29 @@ describe("replaceCurrent", () => {
     );
     const replaced = replaceCurrent(state, visit("W", { kind: "web", url: "https://x.test/a" }));
     expect(describeHistory(replaced)).toBe("[W:/a*]");
+  });
+});
+
+describe("swapCurrent", () => {
+  it("puts another tab's visit at the cursor, keeping Back and Forward", () => {
+    const state = goBack(
+      recordStep(
+        recordStep(historyStartingAt(visit("P", pull())), visit("A", file("a"))),
+        visit("F", file("f")),
+      ),
+    );
+    expect(describeHistory(swapCurrent(state, visit("B", file("b"))))).toBe("[P:#12, B:b*, F:f]");
+  });
+
+  it("collapses into an identical neighbour instead of leaving a no-op Back", () => {
+    const state = recordStep(historyStartingAt(visit("B", file("b"))), visit("A", file("a")));
+    expect(describeHistory(swapCurrent(state, visit("B", file("b"))))).toBe("[B:b*]");
+  });
+
+  it("starts a timeline when there is none", () => {
+    expect(describeHistory(swapCurrent(EMPTY_WORKSPACE_HISTORY, visit("B", file("b"))))).toBe(
+      "[B:b*]",
+    );
   });
 });
 
