@@ -52,6 +52,8 @@ export interface ShortcutPageContext {
   siblingSessions: boolean;
   /** The shell's menus hand desktop commands (Close, Pin, Quit) to the page. */
   desktopCommands: boolean;
+  /** quick_pick_palette is on, whose ⌘K and Settings search read the registry's own rows. */
+  quickPick: boolean;
 }
 
 /** The registry's title and note for page group `id`. */
@@ -160,6 +162,8 @@ export function shortcutPageGroups(
         {
           label: shortcutBinding("session.number").label,
           keys: shortcutRowKeys("session.number", environment, context),
+          // Settings search finds the row by its binding only with ⌘K's QuickPick on.
+          ...(context.quickPick ? { shortcutId: "session.number" as const } : {}),
         },
       ],
     },
@@ -175,6 +179,7 @@ export function shortcutPageGroups(
         {
           label: shortcutBinding("workspace.tab").label,
           keys: shortcutRowKeys("workspace.tab", environment, context),
+          ...(context.quickPick ? { shortcutId: "workspace.tab" as const } : {}),
         },
         // ⌘T is the desktop menu's New Browser Tab, so older shells have no chord.
         ...when(context.browser && context.desktopCommands, [

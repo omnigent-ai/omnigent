@@ -420,6 +420,7 @@ import {
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
+import { SearchableShortcutsList } from "./settings/SearchableShortcutsList";
 import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 import { GlobalShortcutControl } from "./settings/GlobalShortcutControl";
 import { WidenWindowForRightSidebarControl } from "./settings/WidenWindowForRightSidebarControl";
@@ -2758,9 +2759,11 @@ function StepperButton({
 }
 
 function ShortcutsSection() {
+  // The search field comes with ⌘K's QuickPick; without it the page lists as it did.
+  const quickPick = isFeatureEnabled(useServerInfo(), "quick_pick_palette");
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList variant="settings" />
+      {quickPick ? <SearchableShortcutsList /> : <KeyboardShortcutsList variant="settings" />}
     </Section>
   );
 }
