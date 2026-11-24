@@ -151,6 +151,7 @@ _READ_ONLY_SANDBOX = {"type": "readOnly", "networkAccess": False}
     [
         ("never", "user", _WORKSPACE_WRITE_SANDBOX, None),
         ("never", "auto_review", _WORKSPACE_WRITE_SANDBOX, None),
+        ("untrusted", "auto_review", _WORKSPACE_WRITE_SANDBOX, None),
         ("never", "user", _READ_ONLY_SANDBOX, "read-only"),
         ("never", "user", {"type": "dangerFullAccess"}, "full-access"),
         ("on-request", "user", _READ_ONLY_SANDBOX, "read-only"),
@@ -163,7 +164,7 @@ def test_preset_from_thread_settings_follows_the_sandbox(
     sandbox: dict,
     expected: str | None,
 ) -> None:
-    """Only a full-access sandbox reads as Full Access, whatever the approval policy."""
+    """Full Access follows the sandbox; only an on-request policy maps to an approval preset."""
     settings = {
         "approvalPolicy": approval_policy,
         "approvalsReviewer": reviewer,
