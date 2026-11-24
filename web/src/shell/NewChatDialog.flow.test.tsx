@@ -16,7 +16,11 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   })),
 }));
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { onSessionCreatedHere, onSessionCreationAttempt } from "@/lib/sessionCreations";
+import {
+  onFirstInputAccepted,
+  onSessionCreatedHere,
+  onSessionCreationAttempt,
+} from "@/lib/sessionCreations";
 import { REVIEW_PLAN_FIRST } from "@/lib/workflow";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
@@ -653,6 +657,41 @@ describe("NewChatLandingScreen in the floating panel", () => {
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
     expect(onOpenSession).not.toHaveBeenCalled();
+  });
+
+  it("names the session a gadget's Create session made, but not its first message accepted before it is sent", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // The panel has the session but hasn't sent its first message, or the send fails.
+    const panel = floatingPanel();
+    const outcomes: string[] = [];
+    const stopCreated = onSessionCreatedHere((sessionId) => outcomes.push(`created:${sessionId}`));
+    const stopAccepted = onFirstInputAccepted((sessionId) =>
+      outcomes.push(`accepted:${sessionId}`),
+    );
+    try {
+      renderLanding(
+        [],
+        {},
+        panel,
+        <GadgetOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />,
+      );
+      await waitForWorkspaceSeed();
+      typeMessage("inspect the repo");
+      act(() => {
+        requestGadgetCreateSessionMenu();
+      });
+      const create = await screen.findByTestId("gadget-create-session");
+      await waitFor(() => expect(create).toBeEnabled());
+      fireEvent.click(create);
+      await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+      expect(outcomes).toEqual(["created:conv_new"]);
+    } finally {
+      stopCreated();
+      stopAccepted();
+    }
   });
 
   it("tells a gadget's Create session its create failed, and names no session", async () => {

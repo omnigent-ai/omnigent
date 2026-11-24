@@ -1,6 +1,7 @@
 // Links a gadget to the session this tab creates from its New session (`gadget_start`), and
 // only that one: the create that begins while that New session is open is the gadget's
-// attempt, and only the session it makes, once that session took its first message, is linked.
+// attempt, and only the session it makes is linked. Its requests count as delivered only once
+// the server accepted that session's first message.
 // An existing session, a session another create made, or a create that failed stays unlinked.
 // A gadget made only to be built there is deleted again if New session is left unsent.
 import { useEffect } from "react";
@@ -11,11 +12,17 @@ import { noteGadgetStartFailed, requestGadgetRailTab } from "@/lib/gadgetRailTab
 import { deleteGadget, getGadget, getGadgetGadgetSession } from "@/gadgets/api/gadgetApi";
 import { GADGET_START_PARAM, sessionIdFromPath } from "@/gadgets/host/gadgetPages";
 import {
+  acknowledgeStartedGadgetInput,
   adoptStartedGadgetSession,
   isStartedSessionId,
   gadgetRailKey,
 } from "@/gadgets/host/gadgetSession";
-import { onSessionCreatedHere, onSessionCreationAttempt } from "@/lib/sessionCreations";
+import {
+  firstInputAccepted,
+  onFirstInputAccepted,
+  onSessionCreatedHere,
+  onSessionCreationAttempt,
+} from "@/lib/sessionCreations";
 import { invalidateGadgets, useGadgetsEnabled } from "./gadgetQueries";
 
 // The gadget whose New session this tab is on, until it starts a session or goes elsewhere.
@@ -31,6 +38,9 @@ const madeFor = new Map<
   string,
   { gadgetId: string; firstMessage: string | null; fullScreen: boolean }
 >();
+// Sessions an attempt made for a gadget whose first message the server hasn't accepted yet:
+// the requests that message carries count as delivered only once it has.
+const awaitingInput = new Map<string, { gadgetId: string; firstMessage: string | null }>();
 // Gadget and session pairs linked or being linked, so a page that sees the session again does
 // nothing.
 const adopted = new Set<string>();
@@ -108,6 +118,7 @@ export function resetGadgetStarts(): void {
   unbuilt.clear();
   fullScreenStarts.clear();
   discarding.clear();
+  awaitingInput.clear();
 }
 
 function beginGadgetStart(gadgetId: string, queryClient: QueryClient): void {
@@ -148,7 +159,9 @@ function adopt(
   stopDiscard(gadgetId);
   fullScreenStarts.delete(gadgetId);
   madeFor.set(sessionId, { gadgetId, firstMessage, fullScreen });
-  adoptStartedGadgetSession(gadgetId, sessionId, firstMessage)
+  awaitingInput.set(sessionId, { gadgetId, firstMessage });
+  if (firstInputAccepted(sessionId)) onAccepted(sessionId);
+  adoptStartedGadgetSession(gadgetId, sessionId)
     .then(() => {
       madeFor.delete(sessionId);
       const key = gadgetRailKey(gadgetId);
@@ -162,6 +175,16 @@ function adopt(
       adopted.delete(pair);
       if (fullScreen) noteGadgetStartFailed(gadgetId);
     });
+}
+
+// The first message of a session made for a gadget was accepted: its requests were delivered.
+function onAccepted(sessionId: string): void {
+  const waiting = awaitingInput.get(sessionId);
+  if (waiting === undefined) return;
+  awaitingInput.delete(sessionId);
+  void acknowledgeStartedGadgetInput(waiting.gadgetId, sessionId, waiting.firstMessage).catch(
+    () => undefined,
+  );
 }
 
 // A session this tab created: the gadget's when the create that made it was the gadget's.
@@ -192,6 +215,7 @@ export function useAdoptStartedGadgetSession(): void {
       listening = true;
       onSessionCreatedHere(onCreated);
       onSessionCreationAttempt(onAttempt);
+      onFirstInputAccepted(onAccepted);
     }
     const params = new URLSearchParams(search);
     const marked = params.get(GADGET_START_PARAM);

@@ -235,28 +235,38 @@ async function recordDelivery(appId: string, actionId: string, sessionId: string
 export async function adoptStartedGadgetSession(
   appId: string,
   sessionId: string,
-  firstMessage: string | null,
 ): Promise<boolean> {
   if (!isStartedSessionId(sessionId)) {
     return false; // A temporary ID while the session is created.
   }
   await showGadgetInSession(appId, sessionId);
-  const started = pendingStarts.get(appId);
-  if (started !== undefined && Date.now() - started.at <= PENDING_TTL_MS) {
-    pendingStarts.delete(appId);
-    const carried = (message: string) => firstMessage !== null && firstMessage.includes(message);
-    const sent = started.actionIds.filter((actionId) =>
-      started.messages.some(
-        (message) =>
-          message.includes(`"action_id":${JSON.stringify(actionId)}`) && carried(message),
-      ),
-    );
-    await Promise.all(sent.map((actionId) => recordDelivery(appId, actionId, sessionId)));
-    for (const { message, callback } of started.onDelivered) {
-      if (carried(message)) callback(sessionId);
-    }
-  }
   return true;
+}
+
+/**
+ * Counts as delivered the requests carried in `firstMessage`, the first message of the session
+ * New session started for the gadget, once the server accepted that message: their actions
+ * are recorded delivered and their `onDelivered` callbacks run (Address all marks its comments
+ * addressed). Requests not in it stay queued.
+ */
+export async function acknowledgeStartedGadgetInput(
+  appId: string,
+  sessionId: string,
+  firstMessage: string | null,
+): Promise<void> {
+  const started = pendingStarts.get(appId);
+  if (started === undefined || Date.now() - started.at > PENDING_TTL_MS) return;
+  pendingStarts.delete(appId);
+  const carried = (message: string) => firstMessage !== null && firstMessage.includes(message);
+  const sent = started.actionIds.filter((actionId) =>
+    started.messages.some(
+      (message) => message.includes(`"action_id":${JSON.stringify(actionId)}`) && carried(message),
+    ),
+  );
+  await Promise.all(sent.map((actionId) => recordDelivery(appId, actionId, sessionId)));
+  for (const { message, callback } of started.onDelivered) {
+    if (carried(message)) callback(sessionId);
+  }
 }
 
 /** Whether `sessionId` is a created session's ID, not the temporary one New session shows first. */

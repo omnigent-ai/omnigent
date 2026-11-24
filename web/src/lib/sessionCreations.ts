@@ -1,14 +1,8 @@
-// Sessions this tab created, with the first message each was created with. A page that
-// starts work in a new session (a gadget's New session) checks here that the session it
-// lands on is the one it created, not one the viewer navigated to instead, and which of
-// its requests that first message carried. Each creation gets a sequence number, so a page
-// can tell a session created after it began waiting from one created earlier.
-//
-// A create is an attempt: `beginSessionCreation` numbers it before its request goes out,
-// and it ends either as a created session (`noteSessionCreatedHere` with that number, once
-// the session took its first message) or as a failure (`noteSessionCreationFailed`). A page
-// can bind its work to the attempt it saw begin, so another create, or a failed one, is
-// never taken for it.
+// Sessions this tab created, with each one's first message. A create is an attempt:
+// `beginSessionCreation` numbers it, and it ends as a created session
+// (`noteSessionCreatedHere`) or a failure (`noteSessionCreationFailed`). A page can bind its
+// work to the attempt it saw begin. That a session exists is not that its first message was
+// taken: `noteFirstInputAccepted` reports that, once the server accepted it.
 type CreatedListener = (
   sessionId: string,
   firstMessage: string | null,
@@ -18,6 +12,9 @@ type CreatedListener = (
 const created = new Map<string, { firstMessage: string | null; seq: number }>();
 const listeners = new Set<CreatedListener>();
 const attemptListeners = new Set<(attempt: number, outcome: "begun" | "failed") => void>();
+// Created sessions whose first message the server accepted.
+const accepted = new Set<string>();
+const acceptedListeners = new Set<(sessionId: string) => void>();
 let lastSeq = 0;
 let lastAttempt = 0;
 // Enough for any session a page in this tab is still waiting on.
@@ -63,12 +60,34 @@ export function noteSessionCreatedHere(
     const oldest = created.keys().next().value;
     if (oldest === undefined) break;
     created.delete(oldest);
+    accepted.delete(oldest);
   }
   if (known === undefined) {
     for (const listener of [...listeners]) {
       listener(sessionId, record.firstMessage, record.seq, attempt);
     }
   }
+}
+
+/**
+ * Records that the server accepted the first message of `sessionId`, a session this tab
+ * created: a create that carried it, or the first send to it. Later calls do nothing.
+ */
+export function noteFirstInputAccepted(sessionId: string): void {
+  if (!created.has(sessionId) || accepted.has(sessionId)) return;
+  accepted.add(sessionId);
+  for (const listener of [...acceptedListeners]) listener(sessionId);
+}
+
+/** Whether the server accepted the first message of `sessionId`, a session this tab created. */
+export function firstInputAccepted(sessionId: string): boolean {
+  return accepted.has(sessionId);
+}
+
+/** Calls `listener` as created sessions' first messages are accepted. Returns an unsubscribe. */
+export function onFirstInputAccepted(listener: (sessionId: string) => void): () => void {
+  acceptedListeners.add(listener);
+  return () => acceptedListeners.delete(listener);
 }
 
 /** The session this tab created, or `undefined` for one it didn't. */
@@ -92,6 +111,7 @@ export function onSessionCreatedHere(listener: CreatedListener): () => void {
 /** Forgets every created session; for tests. */
 export function resetSessionCreations(): void {
   created.clear();
+  accepted.clear();
   lastSeq = 0;
   lastAttempt = 0;
 }

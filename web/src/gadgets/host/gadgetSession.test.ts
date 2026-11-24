@@ -6,6 +6,7 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { BridgeError } from "./gadgetBridge";
 import {
+  acknowledgeStartedGadgetInput,
   adoptStartedGadgetSession,
   forgetGadgetSessionStarts,
   onSessionGadgetsChanged,
@@ -381,10 +382,11 @@ describe("gadget session", () => {
       ),
     ).toBe(true);
 
-    expect(await adoptStartedGadgetSession("app-1", "temp:123", prompt)).toBe(false);
+    expect(await adoptStartedGadgetSession("app-1", "temp:123")).toBe(false);
     const linked = waitForRequest("put", `${API}/app-1/sessions/s_new`);
     const delivered = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
-    expect(await adoptStartedGadgetSession("app-1", "s_new", prompt)).toBe(true);
+    expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+    await acknowledgeStartedGadgetInput("app-1", "s_new", prompt);
     // Shown beside the started session, which also makes it the viewer's gadget session.
     expect(await (await linked).json()).toEqual({ linked: true });
     // The action rode in the started session's first message, so it was delivered there.
@@ -469,7 +471,8 @@ describe("gadget session", () => {
       const linked = waitForRequest("put", `${API}/app-1/sessions/s_new`);
       const delivered = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
       const firstMessage = opened.searchParams.get("prompt");
-      expect(await adoptStartedGadgetSession("app-1", "s_new", firstMessage)).toBe(true);
+      expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+      await acknowledgeStartedGadgetInput("app-1", "s_new", firstMessage);
       expect(await (await linked).json()).toEqual({ linked: true });
       expect(await (await delivered).json()).toEqual({ session_id: "s_new" });
       expect(exitGadgetRailFullScreen).not.toHaveBeenCalled();
@@ -503,9 +506,38 @@ describe("gadget session", () => {
     expect(prompt.match(/Load the gadget skill/g)).toHaveLength(1);
     const first = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
     const other = waitForRequest("post", `${API}/app-1/actions/act2/delivery`);
-    expect(await adoptStartedGadgetSession("app-1", "s_new", prompt)).toBe(true);
+    expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+    await acknowledgeStartedGadgetInput("app-1", "s_new", prompt);
     expect(await (await first).json()).toEqual({ session_id: "s_new" });
     expect(await (await other).json()).toEqual({ session_id: "s_new" });
+  });
+
+  it("links the started session without counting its requests delivered until its first message is accepted", async () => {
+    const deliveries: string[] = [];
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: null, version: null })),
+      ),
+      rest.put(`${API}/app-1/sessions/:sessionId`, (_req, res, ctx) =>
+        res(ctx.json({ items: [] })),
+      ),
+      rest.post(`${API}/app-1/actions/:actionId/delivery`, (req, res, ctx) => {
+        deliveries.push((req as { path: string }).path.split("/actions/")[1].split("/")[0]);
+        return res(ctx.json({ items: [] }));
+      }),
+    );
+    await requestGadgetAction(EDITOR, { action: "run_card", params: { cardId: "c1" } }, navigate);
+    const prompt = parse(navigate.mock.calls[0][0]).searchParams.get("prompt") ?? "";
+    const linked = waitForRequest("put", `${API}/app-1/sessions/s_new`);
+    expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+    await linked;
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(deliveries).toEqual([]);
+    await acknowledgeStartedGadgetInput("app-1", "s_new", prompt);
+    await waitFor(() => expect(deliveries).toEqual(["act1"]));
   });
 
   it("acknowledges only the requests the session's first message carried", async () => {
@@ -533,7 +565,8 @@ describe("gadget session", () => {
     // The viewer deleted the second request from New session's prompt before sending it.
     const edited = prompt.slice(0, prompt.indexOf('Gadget action\n{"action_id":"act2"'));
     const linked = waitForRequest("put", `${API}/app-1/sessions/s_new`);
-    expect(await adoptStartedGadgetSession("app-1", "s_new", edited)).toBe(true);
+    expect(await adoptStartedGadgetSession("app-1", "s_new")).toBe(true);
+    await acknowledgeStartedGadgetInput("app-1", "s_new", edited);
     await linked;
     await waitFor(() => expect(deliveries).toEqual(["act1"]));
 
@@ -541,7 +574,8 @@ describe("gadget session", () => {
     deliveries.length = 0;
     next = ENTRY;
     await requestGadgetAction(EDITOR, { action: "run_card", params: { cardId: "c1" } }, navigate);
-    expect(await adoptStartedGadgetSession("app-1", "s_other", null)).toBe(true);
+    expect(await adoptStartedGadgetSession("app-1", "s_other")).toBe(true);
+    await acknowledgeStartedGadgetInput("app-1", "s_other", null);
     await new Promise((resolve) => {
       setTimeout(resolve, 20);
     });

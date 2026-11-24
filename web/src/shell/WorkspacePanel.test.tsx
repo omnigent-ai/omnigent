@@ -24,6 +24,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UsePermissionsModule from "@/hooks/usePermissions";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as GadgetRailTabsModule from "@/gadgets/ui/GadgetRailTabs";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
@@ -140,9 +141,11 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 // Tabs the gadget rail reports, for the cases that keep a gadget open; null uses the real hook.
-const gadgetRailTabs = vi.hoisted(() => ({ value: null as { key: string; label: string }[] | null }));
+const gadgetRailTabs = vi.hoisted(() => ({
+  value: null as { key: string; label: string }[] | null,
+}));
 vi.mock("@/gadgets/ui/GadgetRailTabs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/gadgets/ui/GadgetRailTabs")>();
+  const actual = await importOriginal<typeof GadgetRailTabsModule>();
   return {
     ...actual,
     useGadgetRailTabState: (...args: Parameters<typeof actual.useGadgetRailTabState>) => {

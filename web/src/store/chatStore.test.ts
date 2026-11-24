@@ -15,6 +15,11 @@
 // Session metadata and item pages are shimmed through `seedSession`
 // helpers so tests can model capped snapshots and full transcripts.
 
+import {
+  noteSessionCreatedHere,
+  onFirstInputAccepted,
+  resetSessionCreations,
+} from "@/lib/sessionCreations";
 import type * as IdentityModule from "@/lib/identity";
 import { sideChatSettingsMutationKey } from "@/lib/sideChat";
 
@@ -4217,6 +4222,37 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.status).toBe("idle");
     expect(state.sessionStatus).toBe("idle");
   });
+
+  it.each([
+    ["accepts", { queued: false }, ["conv_existing"]],
+    ["denies", { queued: false, denied: true }, []],
+  ])(
+    "reports a created session's first message accepted only when the server %s it",
+    async (_case, reply, expected) => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+        status: "idle",
+        sessionStatus: "idle",
+      });
+      noteSessionCreatedHere("conv_existing", "first");
+      const accepted: string[] = [];
+      const stop = onFirstInputAccepted((sessionId) => accepted.push(sessionId));
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+          return mockResponse(reply);
+        }
+        return defaultFetchHandler(input, init);
+      });
+      try {
+        await useChatStore.getState().send("first", "agent_xyz");
+        expect(accepted).toEqual(expected);
+      } finally {
+        stop();
+        resetSessionCreations();
+      }
+    },
+  );
 
   it("does not settle a later active chat when an old denied send resolves after navigation", async () => {
     useChatStore.setState({

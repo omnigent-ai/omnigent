@@ -8,7 +8,10 @@ import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ServerInfo } from "@/lib/capabilities";
 import { resetGadgetRailRequests, useGadgetRailRequest } from "@/lib/gadgetRailTabs";
 import { deleteGadget, getGadget, getGadgetGadgetSession } from "@/gadgets/api/gadgetApi";
-import { adoptStartedGadgetSession } from "@/gadgets/host/gadgetSession";
+import {
+  acknowledgeStartedGadgetInput,
+  adoptStartedGadgetSession,
+} from "@/gadgets/host/gadgetSession";
 import {
   noteGadgetStartFullScreen,
   rememberUnbuiltGadget,
@@ -18,6 +21,7 @@ import {
 import {
   beginSessionCreation,
   noteSessionCreatedHere,
+  noteFirstInputAccepted,
   noteSessionCreationFailed,
   resetSessionCreations,
 } from "@/lib/sessionCreations";
@@ -28,6 +32,7 @@ import type * as GadgetSessionModule from "@/gadgets/host/gadgetSession";
 vi.mock("@/gadgets/host/gadgetSession", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetSessionModule>()),
   adoptStartedGadgetSession: vi.fn(async () => true),
+  acknowledgeStartedGadgetInput: vi.fn(async () => undefined),
 }));
 vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GadgetApiModule>()),
@@ -122,13 +127,31 @@ describe("a session started beside a gadget", () => {
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Created" }));
-    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9", "Build");
+    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9");
     await waitFor(() =>
       expect(useGadgetRailRequest.getState().requested).toMatchObject({
         conversationId: "conv_9",
         key: "gadget:board",
       }),
     );
+  });
+
+  it("counts the gadget's requests delivered only once the session's first message is accepted", async () => {
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9");
+    // Created, but its first message is still on its way, was refused or was cancelled:
+    // nothing it carried counts as delivered, and Address all's comments stay open.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(acknowledgeStartedGadgetInput).not.toHaveBeenCalled();
+
+    noteFirstInputAccepted("conv_9");
+    expect(acknowledgeStartedGadgetInput).toHaveBeenCalledWith("board", "conv_9", "Build");
+    noteFirstInputAccepted("conv_9");
+    expect(acknowledgeStartedGadgetInput).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a gadget full screen in the session started beside it in full screen", async () => {
@@ -171,7 +194,7 @@ describe("a session started beside a gadget", () => {
     );
     expect(screen.getByLabelText("location").textContent).toBe("/c/conv_9?o=1");
     expect(adoptStartedGadgetSession).toHaveBeenCalledTimes(1);
-    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9", "Build");
+    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9");
   });
 
   it("forgets the gadget when New session is left without starting it", () => {
@@ -224,7 +247,7 @@ describe("a session started beside a gadget", () => {
 
     // The create finishes while the viewer is on another page.
     finishCreate("conv_9", "Build");
-    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9", "Build");
+    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9");
     await waitFor(() =>
       expect(useGadgetRailRequest.getState().requested).toMatchObject({
         conversationId: "conv_9",
@@ -281,7 +304,7 @@ describe("a session started beside a gadget", () => {
     expect(adoptStartedGadgetSession).not.toHaveBeenCalled();
     noteSessionCreatedHere("conv_9", "Build", gadgets);
     expect(adoptStartedGadgetSession).toHaveBeenCalledTimes(1);
-    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9", "Build");
+    expect(adoptStartedGadgetSession).toHaveBeenCalledWith("board", "conv_9");
   });
 
   it("links the gadget again when its session shows after a link that failed", async () => {
@@ -294,7 +317,7 @@ describe("a session started beside a gadget", () => {
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
     fireEvent.click(screen.getByRole("button", { name: "Created, query kept" }));
     await waitFor(() => expect(adoptStartedGadgetSession).toHaveBeenCalledTimes(2));
-    expect(adoptStartedGadgetSession).toHaveBeenLastCalledWith("board", "conv_9", "Build");
+    expect(adoptStartedGadgetSession).toHaveBeenLastCalledWith("board", "conv_9");
   });
 
   it("deletes a gadget Build made when New session is left without sending it", async () => {
@@ -328,7 +351,9 @@ describe("a session started beside a gadget", () => {
     fireEvent.click(screen.getByRole("button", { name: "Creating" }));
     // The lookup made before the viewer came back answers "no session" late.
     answerSessionLookup(null);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
     expect(deleteGadget).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Created" }));
     await waitFor(() => expect(adoptStartedGadgetSession).toHaveBeenCalled());

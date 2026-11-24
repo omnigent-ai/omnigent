@@ -213,6 +213,7 @@ import {
   beginSessionCreation,
   noteSessionCreatedHere,
   noteSessionCreationFailed,
+  noteFirstInputAccepted,
 } from "@/lib/sessionCreations";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { DesktopWindowContext, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -6557,10 +6558,12 @@ function NewChatLandingContent({
         if (!siblingSourceId && !sandboxSelected && selectedHostId && workspaceTrimmed) {
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, bundledGitOptions);
         }
-        // Only now did the session take its first message: a runner that failed to launch
+        // Only now does the session exist for this create: a runner that failed to launch
         // leaves the draft with the viewer, and nothing counts it delivered.
         noteSessionCreatedHere(data.id, initialPrompt, creationAttempt);
         creationNoted = true;
+        // A create that carried the first message is its acceptance; otherwise the first send is.
+        if (serverOwnsInitialInput) noteFirstInputAccepted(data.id);
         // Clear pending agent after successful creation.
         setPendingAgent(null);
       } else {
@@ -6786,6 +6789,7 @@ function NewChatLandingContent({
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
         noteSessionCreatedHere(created.id, initialPrompt, creationAttempt);
         creationNoted = true;
+        if (serverOwnsInitialInput) noteFirstInputAccepted(created.id);
         if (sandboxSelected) {
           const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
           markSandboxLaunch(created.id, {
