@@ -150,7 +150,7 @@ async def default_project_agent_id(
     suppressed = getattr(request.app.state, "suppressed_agent_names", ())
     registry = getattr(request.app.state, "host_registry", None)
     host = registry.get(host_id) if registry and host_id else None
-    readiness = (host.configured_harnesses or {}) if host else {}
+    readiness = (host.hello.configured_harnesses or {}) if host else {}
     for native in NATIVE_CODING_AGENTS:
         if native.agent_name in suppressed:
             continue
