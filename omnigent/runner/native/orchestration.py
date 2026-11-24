@@ -6454,15 +6454,16 @@ async def _record_agent_startup_pending(
         message = "Codex is waiting for a sign-in in this session's terminal."
         remediation = sign_in_next_step("Codex")
     else:
+        # Nothing on screen asks for a sign-in, so report a slow start rather than a login wait.
         code = CODEX_STARTUP_PENDING_CODE
         title = "Codex is still starting"
         message = (
-            "Codex is still starting in this session's terminal and may be waiting "
-            "for a sign-in there."
+            "Codex hasn't finished starting in this session's terminal after "
+            f"{waited_seconds:.0f}s."
         )
         remediation = (
-            "Finish any sign-in shown in the session terminal. Your message is sent "
-            "once Codex is ready."
+            "Your message is sent once Codex is ready. If the session terminal is "
+            "waiting for input, answer it there."
         )
     write_bridge_startup_error(
         bridge_dir,

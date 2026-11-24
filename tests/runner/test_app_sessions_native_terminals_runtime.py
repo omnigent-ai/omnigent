@@ -4644,6 +4644,11 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     assert "http" not in pending.remediation
     if expected_code == "databricks_sign_in_pending":
         assert pending.remediation.startswith("Open the sign-in link and sign in. Codex continues")
+    else:
+        # A slow start with no prompt on screen must not send the user to sign in.
+        assert "sign-in" not in pending.message
+        assert "sign-in" not in pending.remediation
+        assert pending.remediation.startswith("Your message is sent once Codex is ready.")
     # The backend outlived the deadline and closed only after forwarding ended.
     assert timeline == ["thread_started", "app_server_closed"]
     # The thread start cleared the pending record and published bridge state.
