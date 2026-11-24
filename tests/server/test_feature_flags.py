@@ -69,6 +69,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "floating_composer": False,
         "sidebar_saved_views": False,
         "floating_panes": False,
+        "shared_session_updates_socket": False,
     }
 
 
@@ -237,6 +238,15 @@ def test_workspace_sidebar_v2_is_an_opt_in_frontend_feature() -> None:
 
     assert flags.enabled(Feature.WORKSPACE_SIDEBAR_V2)
     assert flags.frontend_dict()["workspace_sidebar_v2"] is True
+
+
+def test_shared_session_updates_socket_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.SHARED_SESSION_UPDATES_SOCKET)
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "shared_session_updates_socket"})
+
+    assert flags.enabled(Feature.SHARED_SESSION_UPDATES_SOCKET)
+    assert flags.frontend_dict()["shared_session_updates_socket"] is True
 
 
 def test_sidebar_saved_views_is_an_opt_in_frontend_feature() -> None:
