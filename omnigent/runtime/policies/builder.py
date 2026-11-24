@@ -142,6 +142,28 @@ def _required_approval_specs(
     return _REQUIRED_APPROVAL_SPECS
 
 
+def _session_harness(conversation: Conversation | None, spec: AgentSpec) -> str | None:
+    """
+    The harness *conversation* runs, as the server resolves a native session's.
+
+    A native wrapper's label wins, since a wrapper-only session can keep a non-native
+    agent declaration; then the session's harness override, then the agent's executor.
+
+    :param conversation: The refreshed conversation row, or ``None`` when there is none.
+    :param spec: The agent spec the session runs, the child's for a sub-agent.
+    :returns: The harness, e.g. ``"claude-native"``.
+    """
+    from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
+    from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+
+    if conversation is None:
+        return spec.executor.harness_kind
+    wrapper = native_coding_agent_for_wrapper_label(conversation.labels.get(WRAPPER_LABEL_KEY))
+    if wrapper is not None:
+        return wrapper.harness
+    return conversation.harness_override or spec.executor.harness_kind
+
+
 # The policy caches below are pure caches over the DB and are reached from
 # ``asyncio.to_thread`` workers, so they reset themselves if the backing
 # cache ever raises instead of turning every evaluation into a deny.
@@ -775,12 +797,7 @@ def build_policy_engine(
     child_spec = _resolve_sub_agent_spec(spec, conv)
     # Mandatory approval guards, appended even when no guardrails are declared.
     # Chosen from the refreshed row: the scheduled-task review follows its mode.
-    session_harness = (
-        conv.harness_override
-        if conv is not None and conv.harness_override
-        else (child_spec or spec).executor.harness_kind
-    )
-    required_specs = _required_approval_specs(conv, session_harness)
+    required_specs = _required_approval_specs(conv, _session_harness(conv, child_spec or spec))
     all_policy_specs.extend(required_specs)
     child_guardrails = child_spec.guardrails if child_spec is not None else None
     if child_guardrails is not None and child_guardrails.policies:

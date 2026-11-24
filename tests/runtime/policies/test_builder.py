@@ -31,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent._wrapper_labels import CLAUDE_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.entities import Conversation
 from omnigent.entities.pagination import PagedList, paginate_in_memory
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
@@ -199,6 +200,28 @@ def test_scheduled_task_review_follows_the_session_mode(
         labels=labels or None,
         terminal_launch_args=launch_args or None,
     )
+    engine = build_policy_engine(
+        spec=parse(agent_dir),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+    scheduled = "__ask_on_scheduled_task_change" if reviewed else "__check_scheduled_task_change"
+    assert [p.spec.name for p in engine.policies] == ["__ask_on_add_policy", scheduled]
+
+
+@pytest.mark.parametrize(("wrapped", "reviewed"), [(True, False), (False, True)])
+def test_a_wrapper_only_claude_session_follows_its_live_mode(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+    wrapped: bool,
+    reviewed: bool,
+) -> None:
+    """A Claude wrapper session with a non-native agent declaration counts as Claude Code."""
+    agent_dir = _write_spec(tmp_path, "spec_version: 1\nname: no-guardrails\n")
+    labels = {_CLAUDE_MODE_LABEL: "auto"}
+    if wrapped:
+        labels[WRAPPER_LABEL_KEY] = CLAUDE_NATIVE_WRAPPER_VALUE
+    conv = conversation_store.create_conversation(labels=labels)
     engine = build_policy_engine(
         spec=parse(agent_dir),
         conversation_id=conv.id,
