@@ -31,6 +31,20 @@ PI_ANTHROPIC_THINKING_REQUIRED = StaticModelFallback(
 )
 
 
+# Reasoning-only GPT models: ``none``/``minimal`` are rejected with a 400, and
+# ``xhigh``/``max`` are accepted. Pi sends ``none`` for its ``off`` level unless
+# the model entry marks it unsupported.
+PI_GPT_NO_NONE_EFFORT = StaticModelFallback(
+    model_ids=("gpt-6-astra", "gpt-6-2-astra", "gpt-6-1-sol"),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance=(
+        "OpenAI GPT-6 Astra upgrade guide (none/minimal unsupported; low..max); "
+        "Databricks gateway 400 listing low, medium, high, xhigh, max"
+    ),
+    discovery_gap="model listings advertise reasoning but not the supported effort levels",
+)
+
+
 # Custom providers do not inherit Pi's built-in per-model compatibility flags.
 # On Pi upgrades, refresh adaptive/budget entries from pi-ai/dist/providers/data/anthropic.json.
 # Keep the thinking-required list above limited to gateway-verified restrictions.

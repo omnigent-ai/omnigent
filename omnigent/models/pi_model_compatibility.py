@@ -14,6 +14,7 @@ from omnigent.models.model_fallbacks import (
     PI_ANTHROPIC_ADAPTIVE_THINKING,
     PI_ANTHROPIC_BUDGET_THINKING,
     PI_ANTHROPIC_THINKING_REQUIRED,
+    PI_GPT_NO_NONE_EFFORT,
 )
 from omnigent.models.model_metadata import ModelCapability, ModelMetadata
 
@@ -125,6 +126,21 @@ def pi_model_with_thinking_defaults(entry: PiModelEntry) -> PiModelEntry:
     return entry
 
 
+def pi_thinking_level_map(model_id: str) -> dict[str, str | None] | None:
+    """Return Pi's ``thinkingLevelMap`` for models that cannot disable reasoning.
+
+    Pi sends ``none`` for ``off`` and offers ``minimal`` unless the entry marks
+    them unsupported, and treats unmapped ``xhigh``/``max`` as unsupported.
+
+    :param model_id: A model id, e.g. ``"system.ai.gpt-6-2-astra"``.
+    :returns: The level map, or ``None`` when no known restriction applies.
+    """
+    bare = model_id.lower().removeprefix("system.ai.").removeprefix("databricks-")
+    if bare not in PI_GPT_NO_NONE_EFFORT.model_ids:
+        return None
+    return {"off": None, "minimal": None, "xhigh": "xhigh", "max": "max"}
+
+
 def pi_model_is_reasoning(model_id: str) -> bool:
     """Return whether *model_id* needs Pi's ``reasoning: true`` model flag.
 
@@ -168,6 +184,9 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["maxTokens"] = model.metadata.max_output_tokens
     if pi_model_entry_is_reasoning(model):
         entry["reasoning"] = True
+    if level_map := pi_thinking_level_map(model.id):
+        entry["reasoning"] = True
+        entry["thinkingLevelMap"] = level_map
     return entry
 
 
