@@ -1,9 +1,3 @@
-// These suites render question cards without the app's QueryClient; the card's @-menu
-// listing is not under test here, so it lists nothing.
-vi.mock("@/hooks/useSessionMentionEntries", async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  useSessionMentionEntries: () => [],
-}));
 // Tests for ExecutionLogsPanel — the right-side raw-JSON viewer for a
 // conversation and its sub-agent sessions. The data hooks (useChildSessions,
 // useSessionItems) and the chat store are mocked so the panel's own logic is

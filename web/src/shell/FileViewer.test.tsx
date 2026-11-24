@@ -1,9 +1,3 @@
-// These suites render question cards without the app's QueryClient; the card's @-menu
-// listing is not under test here, so it lists nothing.
-vi.mock("@/hooks/useSessionMentionEntries", async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  useSessionMentionEntries: () => [],
-}));
 // Tests for FileViewer's comments-panel open/close semantics and URL sync:
 //
 //   1. Panel stays closed on fresh open regardless of whether the file has comments.

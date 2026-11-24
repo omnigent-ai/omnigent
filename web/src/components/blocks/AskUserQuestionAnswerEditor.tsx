@@ -1,11 +1,23 @@
 // The custom-answer field on the CodeMirror prompt editor, with the chat composer's @-session
-// menu. The form owns the mention state, so session tags outlive a question change.
+// menu. AnswerMentionScope owns the session tags above the questions, so they outlive a question.
 
-import type { RefObject } from "react";
+import {
+  type Dispatch,
+  type ReactNode,
+  type RefObject,
+  type SetStateAction,
+  useEffect,
+  useState,
+} from "react";
 import { ComposerEngineContext, ComposerEngineInput } from "@/components/composer/ChatComposer";
 import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
-import type { MentionBrowser } from "@/hooks/useMentionBrowser";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { type MentionBrowser, useMentionBrowser } from "@/hooks/useMentionBrowser";
+import {
+  MENTION_SEARCH_DEBOUNCE_MS,
+  useSessionMentionEntries,
+} from "@/hooks/useSessionMentionEntries";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import {
   composerInlineMentions,
@@ -28,25 +40,85 @@ export function expandAnswerMentions(text: string, sessions: readonly SessionMen
   return withSessionMentionHint(expandMentionTokens(text, mentions), mentions.length > 0);
 }
 
+/** The @-mention state the custom answer's editor and menu share. */
+export interface AnswerMentions {
+  browser: MentionBrowser;
+  mention: MentionState | null;
+  setMention: (next: MentionState | null) => void;
+  sessionEntries: readonly SessionMention[];
+}
+
+/**
+ * Holds the custom answers' session tags on the prompt editor path. It sits above the questions,
+ * so a tag survives a question change, and mirrors the tags out for submit and the draft.
+ */
+export function AnswerMentionScope({
+  currentKey,
+  customText,
+  onCustomTextChange,
+  segments,
+  initialSessions,
+  isMobile,
+  inputRef,
+  onSessionsChange,
+  children,
+}: {
+  currentKey: string;
+  customText: string;
+  onCustomTextChange: (text: string) => void;
+  /** Every answer's text; a tag whose token is in none of them is released. */
+  segments: readonly string[];
+  initialSessions: SessionMention[];
+  isMobile: boolean;
+  inputRef: RefObject<ComposerTextTarget | null>;
+  onSessionsChange: Dispatch<SetStateAction<SessionMention[]>>;
+  children: (mentions: AnswerMentions) => ReactNode;
+}) {
+  // The open menu belongs to one question.
+  const [typedMention, setTypedMention] = useState<{ key: string; state: MentionState } | null>(
+    null,
+  );
+  const mention = typedMention?.key === currentKey ? typedMention.state : null;
+  const setMention = (next: MentionState | null) =>
+    setTypedMention(next ? { key: currentKey, state: next } : null);
+  const debouncedQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
+  const sessionEntries = useSessionMentionEntries({
+    mention,
+    debouncedQuery,
+    currentSessionId: null,
+  });
+  // The hook releases a tag once its token is gone from every answer, and an undo brings it back.
+  const browser = useMentionBrowser({
+    mention,
+    setMention,
+    mentionEntries: NO_FILE_ENTRIES,
+    sessionEntries,
+    text: customText,
+    setText: onCustomTextChange,
+    textareaRef: inputRef,
+    isMobile,
+    initialMentions: { files: [], sessions: initialSessions },
+    segments,
+  });
+  const sessions = browser.mentionedSessions;
+  useEffect(() => onSessionsChange(sessions), [sessions, onSessionsChange]);
+  return <>{children({ browser, mention, setMention, sessionEntries })}</>;
+}
+
 interface AskUserQuestionAnswerEditorProps {
   inputRef: RefObject<ComposerTextTarget | null>;
   value: string;
   onValueChange: (text: string) => void;
-  mention: MentionState | null;
-  setMention: (next: MentionState | null) => void;
-  sessionEntries: readonly SessionMention[];
-  browser: MentionBrowser;
+  mentions: AnswerMentions;
 }
 
 export function AskUserQuestionAnswerEditor({
   inputRef,
   value,
   onValueChange,
-  mention,
-  setMention,
-  sessionEntries,
-  browser,
+  mentions,
 }: AskUserQuestionAnswerEditorProps) {
+  const { browser, mention, setMention, sessionEntries } = mentions;
   const {
     mentionIndex,
     mentionOpen,

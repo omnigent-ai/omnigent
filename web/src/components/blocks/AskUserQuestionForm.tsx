@@ -33,25 +33,16 @@ import {
   isTextEntry,
 } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import {
-  presentTaggedMentions,
-  type MentionState,
-  type SessionMention,
-} from "@/lib/composerMentions";
-import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import { useDebouncedValue } from "@/hooks/useDebouncedValue";
-import {
-  MENTION_SEARCH_DEBOUNCE_MS,
-  useSessionMentionEntries,
-} from "@/hooks/useSessionMentionEntries";
+import { presentTaggedMentions, type SessionMention } from "@/lib/composerMentions";
 import {
   type ComposerTextTarget,
   isComposerInput,
 } from "@/components/composer/engine/composerInput";
 import {
+  AnswerMentionScope,
   AskUserQuestionAnswerEditor,
   expandAnswerMentions,
-  NO_FILE_ENTRIES,
+  type AnswerMentions,
 } from "./AskUserQuestionAnswerEditor";
 
 /**
@@ -195,52 +186,30 @@ export function AskUserQuestionForm({
     draft?.customSelected ?? initial.customSelected,
   );
   const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
-  // The @-mention state of the custom answer. The open menu belongs to one question.
-  const [typedMention, setTypedMention] = useState<{ key: string; state: MentionState } | null>(
-    null,
+  // The custom answers' session tags, shared by every question. On the editor path
+  // AnswerMentionScope owns them and mirrors them here for submit and the draft.
+  const [sessionMentions, setSessionMentions] = useState<SessionMention[]>(
+    draft?.sessionMentions ?? [],
   );
-  const questionKeyNow = questions[currentIndex] ? questionKey(questions[currentIndex]) : "";
-  const mention = typedMention?.key === questionKeyNow ? typedMention.state : null;
-  const setMention = (next: MentionState | null) =>
-    setTypedMention(next ? { key: questionKeyNow, state: next } : null);
+  const currentQuestionKey = questions[currentIndex] ? questionKey(questions[currentIndex]) : "";
   const rememberTextareaCaret = (element: HTMLTextAreaElement) => {
     textareaHandoffRef.current = {
-      key: questionKeyNow,
+      key: currentQuestionKey,
       focused: document.activeElement === element,
       start: element.selectionStart,
       end: element.selectionEnd,
     };
   };
-  const debouncedMentionQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
-  const sessionEntries = useSessionMentionEntries({
-    mention,
-    debouncedQuery: debouncedMentionQuery,
-    currentSessionId: null,
-  });
-  // Session tags are shared by every question; the hook releases one once its token is gone from
-  // every answer, and an undo brings it back.
-  const mentionBrowser = useMentionBrowser({
-    mention,
-    setMention,
-    mentionEntries: NO_FILE_ENTRIES,
-    sessionEntries,
-    text: customInputs[questionKeyNow] ?? "",
-    setText: (text) => setCustomInputs((prev) => ({ ...prev, [questionKeyNow]: text })),
-    textareaRef: customInputRef,
-    isMobile: isMobileViewport,
-    initialMentions: { files: [], sessions: draft?.sessionMentions ?? [] },
-    segments: questions.map((q) => customInputs[questionKey(q)] ?? ""),
-  });
-  const mentionedSessions = mentionBrowser.mentionedSessions;
   // After the editor replaces the textarea, the user's caret and focus go with it.
   useLayoutEffect(() => {
     const snapshot = textareaHandoffRef.current;
     textareaHandoffRef.current = null;
     const editor = customInputRef.current;
-    if (engine !== "codemirror" || !snapshot || snapshot.key !== questionKeyNow || !editor) return;
+    if (engine !== "codemirror" || !snapshot || snapshot.key !== currentQuestionKey || !editor)
+      return;
     editor.setSelectionRange(snapshot.start, snapshot.end);
     if (snapshot.focused) editor.focus();
-  }, [engine, questionKeyNow]);
+  }, [engine, currentQuestionKey]);
 
   useEffect(() => {
     const answers = {
@@ -263,7 +232,7 @@ export function AskUserQuestionForm({
     }
     // Only tags whose token still shows in a saved answer are kept.
     answers.sessionMentions =
-      presentTaggedMentions({ files: [], sessions: mentionedSessions }, savedTexts)?.sessions ?? [];
+      presentTaggedMentions({ files: [], sessions: sessionMentions }, savedTexts)?.sessions ?? [];
     // Untouched cards keep no draft, so they cannot evict real ones.
     if (currentIndex === 0 && JSON.stringify(answers) === JSON.stringify(initial)) {
       clearAskUserQuestionDraft(elicitationId, signature);
@@ -279,7 +248,7 @@ export function AskUserQuestionForm({
     selections,
     customSelected,
     customInputs,
-    mentionedSessions,
+    sessionMentions,
   ]);
 
   useEffect(() => {
@@ -373,7 +342,7 @@ export function AskUserQuestionForm({
         q,
         selections[key] ?? "",
         customSelected[key] ?? false,
-        expandAnswerMentions(customInputs[key] ?? "", mentionedSessions),
+        expandAnswerMentions(customInputs[key] ?? "", sessionMentions),
       );
       if (answer === null) return; // unreachable while ``allAnswered`` gates the button
       finalAnswers[key] = answer;
@@ -524,7 +493,7 @@ export function AskUserQuestionForm({
   const customRowChecked = customSelected[currentKey] ?? false;
   const customRowValue = customInputs[currentKey] ?? "";
 
-  return (
+  const renderBody = (mentions: AnswerMentions | null) => (
     <div
       ref={rootRef}
       className="flex flex-col gap-2 text-foreground"
@@ -649,15 +618,12 @@ export function AskUserQuestionForm({
                   data-testid="ask-user-question-custom-toggle"
                 />
               </label>
-              {engine === "codemirror" ? (
+              {mentions ? (
                 <AskUserQuestionAnswerEditor
                   inputRef={customInputRef}
                   value={customRowValue}
                   onValueChange={(text) => handleCustomInput(currentKey, text)}
-                  mention={mention}
-                  setMention={setMention}
-                  sessionEntries={sessionEntries}
-                  browser={mentionBrowser}
+                  mentions={mentions}
                 />
               ) : (
                 /* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
@@ -766,5 +732,20 @@ export function AskUserQuestionForm({
         </Button>
       </div>
     </div>
+  );
+  if (engine !== "codemirror") return renderBody(null);
+  return (
+    <AnswerMentionScope
+      currentKey={currentQuestionKey}
+      customText={customInputs[currentQuestionKey] ?? ""}
+      onCustomTextChange={(text) => handleCustomInput(currentQuestionKey, text)}
+      segments={questions.map((q) => customInputs[questionKey(q)] ?? "")}
+      initialSessions={draft?.sessionMentions ?? []}
+      isMobile={isMobileViewport}
+      inputRef={customInputRef}
+      onSessionsChange={setSessionMentions}
+    >
+      {renderBody}
+    </AnswerMentionScope>
   );
 }
