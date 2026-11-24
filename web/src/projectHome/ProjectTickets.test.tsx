@@ -532,6 +532,31 @@ describe("Project ticket board", () => {
     },
   );
 
+  it("shows a collapsed complete stage's load error and retries it, instead of a count", async () => {
+    let failDone = true;
+    vi.mocked(api.listTickets).mockImplementation(async (_projectId, options) => {
+      if (options?.stage_id === "done" && failDone) throw new Error("Server unavailable");
+      return {
+        data: options?.stage_id === "done" ? [{ ...ticket, id: "shipped", stage_id: "done" }] : [],
+        has_more: false,
+        last_id: null,
+      };
+    });
+    const user = userEvent.setup();
+    renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+    const done = await screen.findByRole("region", { name: "Done" });
+    expect(within(done).getByRole("button", { name: "Expand Done" })).toBeInTheDocument();
+    const retry = await within(done).findByRole("button", {
+      name: "Couldn't load Done tickets: Server unavailable. Try again",
+    });
+    expect(within(done).queryByText("0")).toBeNull();
+    failDone = false;
+    await user.click(retry);
+    expect(await within(done).findByText("1")).toBeInTheDocument();
+    expect(within(done).queryByRole("button", { name: /Couldn't load/ })).toBeNull();
+    expect(within(done).getByRole("button", { name: "Expand Done" })).toBeInTheDocument();
+  });
+
   it("filters to the viewer's tickets on request and remembers it per project", async () => {
     vi.mocked(api.listTickets).mockImplementation(async (_projectId, options) => ({
       data:

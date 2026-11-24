@@ -10,6 +10,7 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import {
+  CircleAlertIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   MessageSquareIcon,
@@ -287,6 +288,7 @@ function TicketColumn({
   const { setNodeRef, isOver } = useDroppable({ id: stage.id, disabled });
   const [collapsedPreference, toggleCollapsed] = useStageCollapsed(projectId, stage);
   const collapsed = collapsedPreference && !filteredTickets?.length;
+  const loadError = filteredTickets === undefined && query.isError ? query.error : null;
   if (collapsed) {
     return (
       <section
@@ -307,10 +309,25 @@ function TicketColumn({
         >
           <ChevronLeftIcon />
         </Button>
-        <span className="text-sm font-medium text-muted-foreground tabular-nums">
-          {tickets.length}
-          {hasNextPage ? "+" : ""}
-        </span>
+        {loadError ? (
+          // A count would make a failed load look like an empty column, so show the error.
+          <Button
+            variant="ghost"
+            size="icon"
+            className="text-destructive hover:text-destructive"
+            aria-label={`Couldn't load ${stage.name} tickets: ${loadError.message}. Try again`}
+            title={`Couldn't load tickets: ${loadError.message}. Click to try again.`}
+            loading={query.isFetching}
+            onClick={() => void query.refetch()}
+          >
+            <CircleAlertIcon />
+          </Button>
+        ) : (
+          <span className="text-sm font-medium text-muted-foreground tabular-nums">
+            {tickets.length}
+            {hasNextPage ? "+" : ""}
+          </span>
+        )}
         <button
           type="button"
           onClick={toggleCollapsed}
