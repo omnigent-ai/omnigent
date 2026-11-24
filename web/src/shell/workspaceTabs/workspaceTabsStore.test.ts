@@ -764,6 +764,93 @@ describe("closing races", () => {
   });
 });
 
+describe("closing a group of tabs", () => {
+  const a: WorkspaceTab = { id: "A", place: file("a.ts"), openedBy: "user" };
+  const b: WorkspaceTab = { id: "B", place: file("b.ts"), openedBy: "user" };
+  const shell: WorkspaceTab = {
+    id: "T",
+    place: { kind: "terminal", key: "k" },
+    binding: { kind: "terminal", key: "k" },
+    openedBy: "user",
+  };
+
+  it("closes the asked tabs in one commit but keeps pinned tabs and shells", async () => {
+    const { store } = makeStore({ initial: initial([files, a, b, shell, pulls], "F") });
+    store.setPinned(["B"], true);
+    const notified = vi.fn();
+    store.subscribe(notified);
+    await expect(store.closeMany(["A", "B", "T", "P"], () => undefined)).resolves.toEqual({
+      ok: true,
+    });
+    expect(notified).toHaveBeenCalledTimes(1);
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["B", "F", "T"]);
+    expectInvariant(store);
+  });
+
+  it("asks once about all unsaved edits, and Keep editing closes none", async () => {
+    const { store, dirty, requestLeave } = makeStore({ initial: initial([files, a, b], "F") });
+    dirty.add("A");
+    dirty.add("B");
+    requestLeave.mockResolvedValue("cancel");
+    const before = store.serialize();
+    await expect(store.closeMany(["A", "B"], () => undefined)).resolves.toEqual({
+      ok: false,
+      cancelled: true,
+    });
+    expect(requestLeave).toHaveBeenCalledOnce();
+    expect(requestLeave).toHaveBeenCalledWith(["A", "B"], "close");
+    expect(store.serialize()).toEqual(before);
+  });
+
+  it("closes nothing when a tab is pinned while it asks about unsaved edits", async () => {
+    const { store, dirty, requestLeave } = makeStore({ initial: initial([files, a, b], "F") });
+    dirty.add("A");
+    requestLeave.mockImplementation(async () => {
+      store.setPinned(["B"], true);
+      return "leave";
+    });
+    await expect(store.closeMany(["A", "B"], () => undefined)).resolves.toEqual({
+      ok: false,
+      stale: true,
+    });
+    expect(store.findTab("A")).toBeDefined();
+    expect(store.findTab("B")).toBeDefined();
+    expectInvariant(store);
+  });
+
+  it("selects a neighbour when the selected tab closes, and reopens each one", async () => {
+    const { store } = makeStore({ initial: initial([files, a, b], "A") });
+    await store.closeMany(["A", "B"], () => undefined);
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["F"]);
+    expect(store.selectedTabId()).toBe("F");
+    const reopened = [store.reopenClosed(), store.reopenClosed()].map(
+      (tabId) => store.findTab(tabId!)?.place,
+    );
+    expect(reopened).toEqual(expect.arrayContaining([a.place, b.place]));
+    expectInvariant(store);
+  });
+
+  it("does nothing for tabs that are gone or can't close as a group", async () => {
+    const { store, requestLeave } = makeStore({ initial: initial([files, shell], "F") });
+    const notified = vi.fn();
+    store.subscribe(notified);
+    await expect(store.closeMany(["T", "missing"], () => undefined)).resolves.toEqual({
+      ok: true,
+    });
+    expect(notified).not.toHaveBeenCalled();
+    expect(requestLeave).not.toHaveBeenCalled();
+  });
+
+  it("asks once in Close other tabs too", async () => {
+    const { store, dirty, requestLeave } = makeStore({ initial: initial([files, a, b], "F") });
+    dirty.add("A");
+    requestLeave.mockResolvedValue("leave");
+    await expect(store.closeOthers("F", () => undefined)).resolves.toEqual({ ok: true });
+    expect(requestLeave).toHaveBeenCalledOnce();
+    expect(store.tabs().map((tab) => tab.id)).toEqual(["F"]);
+  });
+});
+
 describe("the tab cap with tabs from a newer app", () => {
   it("counts kept tabs it can't show", async () => {
     const opaque = Array.from({ length: MAX_WORKSPACE_TABS - 1 }, (_, index) => ({

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { PullRequest, PullRequestAssociation } from "@/hooks/usePullRequests";
 
 import {
+  knownPullRequestStatus,
   recentPullRequestRows,
   recentPullRequestUrl,
   type RecentPullRequestFacts,
@@ -162,5 +163,37 @@ describe("recentPullRequestUrl", () => {
       recentPullRequestUrl({ kind: "pull", url: URL_338, view: "changes", path: "a.ts" }),
     ).toBeUndefined();
     expect(recentPullRequestUrl({ kind: "pulls" })).toBeUndefined();
+  });
+});
+
+describe("knownPullRequestStatus", () => {
+  // Details read at 10:00; the link's state checked at 10:05.
+  const readAt = Date.UTC(2026, 0, 1, 10, 0);
+  const checkedAt = Date.UTC(2026, 0, 1, 10, 5) / 1000;
+
+  it("takes the link's newer lifecycle over details read before it merged", () => {
+    const known: RecentPullRequestFacts = {
+      linked: [linked(URL_338, { state: "MERGED", state_checked_at: checkedAt })],
+      details: new Map([[URL_338, details(URL_338, { state: "OPEN" })]]),
+      detailsUpdatedAt: new Map([[URL_338, readAt]]),
+    };
+    expect(knownPullRequestStatus(URL_338, known)?.state).toBe("MERGED");
+  });
+
+  it("keeps details read after the link last checked", () => {
+    const known: RecentPullRequestFacts = {
+      linked: [linked(URL_338, { state: "OPEN", state_checked_at: checkedAt })],
+      details: new Map([[URL_338, details(URL_338, { state: "MERGED" })]]),
+      detailsUpdatedAt: new Map([[URL_338, checkedAt * 1000 + 60_000]]),
+    };
+    expect(knownPullRequestStatus(URL_338, known)?.state).toBe("MERGED");
+  });
+
+  it("uses whichever it has, and nothing for a PR it doesn't know", () => {
+    const onlyLinked = facts([linked(URL_338, { state: "CLOSED" })]);
+    expect(knownPullRequestStatus(URL_338, onlyLinked)?.state).toBe("CLOSED");
+    const onlyDetails = facts([], [[URL_338, details(URL_338, { state: "OPEN" })]]);
+    expect(knownPullRequestStatus(URL_338, onlyDetails)?.state).toBe("OPEN");
+    expect(knownPullRequestStatus(ENTERPRISE_338, onlyDetails)).toBeUndefined();
   });
 });

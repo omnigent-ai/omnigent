@@ -1,4 +1,6 @@
 import {
+  BellIcon,
+  BellOffIcon,
   MessageCirclePlusIcon,
   MoreHorizontalIcon,
   PencilIcon,
@@ -173,6 +175,21 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
             <PencilIcon className="size-3.5" />
             Rename project
           </DropdownMenuItem>
+          {actions.mute && (
+            <DropdownMenuItem
+              className={itemClass}
+              data-testid="mute-project"
+              disabled={actions.mute.disabled}
+              onSelect={actions.mute.toggle}
+            >
+              {actions.mute.muted ? (
+                <BellIcon className="size-3.5" />
+              ) : (
+                <BellOffIcon className="size-3.5" />
+              )}
+              {actions.mute.muted ? "Unmute project" : "Mute project"}
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem
             className={itemClass}

@@ -81,6 +81,11 @@ export interface RecentPlace {
 export const MAX_RECENT_PLACES = 5;
 export const LAST_NEW_TAB_REASON = "This is the last tab. To hide the sidebar, use its toggle.";
 
+/** Whether a batch close takes `tab`: pinned tabs and shells stay, as each closes on its own. */
+export function isBatchClosable(tab: WorkspaceTabRecord): boolean {
+  return !isPinnedTab(tab) && (isUnknownTab(tab) || tab.binding?.kind !== "terminal");
+}
+
 /**
  * The strip holds only an empty New tab, the sidebar's resting state: it can't close,
  * and a reopened or restored tab takes its place. A New tab on its shells page is not empty.
@@ -731,28 +736,15 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   }
 
   /**
-   * Close every tab but `keepTabId` and shells, as one action: ask about all their
-   * unsaved edits first, and Keep editing closes nothing. Then every tab goes in one
-   * commit, with history and selection landing there too, so nothing half-closed is
-   * ever on screen. Their resources (browser views) are released afterwards, without
-   * holding the store; a failed release never brings a tab back.
+   * Remove `targetIds` in one commit, with history and selection landing there too, so nothing
+   * half-closed is ever on screen; `after` runs inside it. Their resources (browser views) are
+   * released afterwards, without holding the store; a failed release never brings a tab back.
    */
-  async function closeOthers(
-    keepTabId: TabId,
+  function removeBatch(
+    targetIds: readonly TabId[],
     releaseFor: (tab: WorkspaceTab) => (() => Promise<boolean>) | undefined,
-  ): Promise<GuardedResult> {
-    if (!tabs.some((tab) => tab.id === keepTabId)) return { ok: false, reason: MISSING_TAB_REASON };
-    const targetIds = tabs
-      .filter(
-        (tab) =>
-          tab.id !== keepTabId &&
-          !isPinnedTab(tab) &&
-          (isUnknownTab(tab) || tab.binding?.kind !== "terminal"),
-      )
-      .map((tab) => tab.id);
-    const guarded = await guardThen(targetIds, "close", () => ({ ok: true as const }));
-    if (!guarded.ok) return guarded;
-    if (!tabs.some((tab) => tab.id === keepTabId)) return { ok: false, stale: true };
+    after?: () => void,
+  ) {
     const releases: { tabId: TabId; release: (() => Promise<boolean>) | undefined }[] = [];
     transact(() => {
       for (const tabId of targetIds) {
@@ -761,14 +753,51 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
         releases.push({ tabId, release: tab ? releaseFor(tab) : undefined });
         removeTab(tabId, true);
       }
+      after?.();
+      commit();
+    });
+    for (const { tabId, release } of releases) releaseDetached(release, tabId);
+  }
+
+  /**
+   * Close `tabIds` as one action, such as a group in the tab list: ask about all their unsaved
+   * edits first, and Keep editing closes nothing. Pinned tabs and shells stay open; Reopen
+   * closed tab brings the others back one at a time.
+   */
+  async function closeMany(
+    tabIds: readonly TabId[],
+    releaseFor: (tab: WorkspaceTab) => (() => Promise<boolean>) | undefined,
+  ): Promise<GuardedResult> {
+    const wanted = new Set(tabIds);
+    const targetIds = tabs
+      .filter((tab) => wanted.has(tab.id) && isBatchClosable(tab))
+      .map((tab) => tab.id);
+    if (targetIds.length === 0) return { ok: true };
+    const guarded = await guardThen(targetIds, "close", () => ({ ok: true as const }));
+    if (!guarded.ok) return guarded;
+    removeBatch(targetIds, releaseFor);
+    return { ok: true };
+  }
+
+  /** Close every tab but `keepTabId`, pinned tabs and shells, as one action, then select it. */
+  async function closeOthers(
+    keepTabId: TabId,
+    releaseFor: (tab: WorkspaceTab) => (() => Promise<boolean>) | undefined,
+  ): Promise<GuardedResult> {
+    if (!tabs.some((tab) => tab.id === keepTabId)) return { ok: false, reason: MISSING_TAB_REASON };
+    const targetIds = tabs
+      .filter((tab) => tab.id !== keepTabId && isBatchClosable(tab))
+      .map((tab) => tab.id);
+    const guarded = await guardThen(targetIds, "close", () => ({ ok: true as const }));
+    if (!guarded.ok) return guarded;
+    if (!tabs.some((tab) => tab.id === keepTabId)) return { ok: false, stale: true };
+    removeBatch(targetIds, releaseFor, () => {
       if (selectedTabId !== keepTabId) {
         markSelected(keepTabId);
         const kept = findTab(keepTabId);
         if (kept) history.recordStep(visitOf(kept));
       }
-      commit();
     });
-    for (const { tabId, release } of releases) releaseDetached(release, tabId);
     return { ok: true };
   }
 
@@ -1146,6 +1175,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     go,
     close,
     closeOthers,
+    closeMany,
     setPinned,
     invalidate,
     noteDirtyChange,

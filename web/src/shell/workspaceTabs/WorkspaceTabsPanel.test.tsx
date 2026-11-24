@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type { PullRequest, PullRequestAssociation } from "@/hooks/usePullRequests";
 import { LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ } from "@/lib/permissionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
 import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/ReconnectSessionDialog";
@@ -15,8 +16,10 @@ import { usePullRequestListCounts } from "@/store/pullRequestListCounts";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import type { WorkspacePlaceViewProps } from "./placeViews/WorkspacePlaceView";
+import type { RecentPullRequestFacts } from "./recentPullRequestRow";
 import { SHELL_LIST_LIMIT_MS } from "./terminalTabConnection";
 import { OWNER_RECONNECT_HINT, VIEWER_RESUME_HINT } from "./TerminalTabStatus";
+import type * as UseRecentPullRequestFacts from "./useRecentPullRequestFacts";
 import { resetSessionResumes } from "./useTerminalTabConnection";
 import { WorkspaceTabsPanel, type WorkspaceTabsPanelProps } from "./WorkspaceTabsPanel";
 import {
@@ -53,6 +56,19 @@ vi.mock("../ContentSearchPanel", () => ({
     return <input aria-label="Search text in workspace" ref={props.inputRef} />;
   },
 }));
+// Pull request facts a test knows already, as if the session had read them; null reads the cache.
+const knownPullRequests = vi.hoisted(() => ({
+  facts: null as null | RecentPullRequestFacts,
+}));
+vi.mock("./useRecentPullRequestFacts", async (importOriginal) => {
+  const original = await importOriginal<typeof UseRecentPullRequestFacts>();
+  return {
+    useRecentPullRequestFacts: (conversationId: string, urls: readonly string[]) => {
+      const real = original.useRecentPullRequestFacts(conversationId, urls);
+      return knownPullRequests.facts ?? real;
+    },
+  };
+});
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: () => <div data-testid="browser-pane-stub" />,
 }));
@@ -161,6 +177,7 @@ afterEach(() => {
   usePullRequestListCounts.setState({ counts: {} });
   queryClient.clear();
   resetSessionResumes();
+  knownPullRequests.facts = null;
 });
 
 describe("WorkspaceTabsPanel keyboard target", () => {
@@ -829,4 +846,128 @@ describe("a shell's tab", () => {
       await waitFor(() => expect(resume).not.toBeDisabled());
     },
   );
+});
+
+describe("closing a group of tabs", () => {
+  it("closes every file tab from ⌘K and every page from the All tabs heading", async () => {
+    const conversationId = "s-close-groups";
+    renderPanels([{ conversationId }]);
+    const { store } = workspaceTabsSession(conversationId);
+    await act(async () => {
+      await store.open({ place: { kind: "files", path: "a.md" } }, { opener: "user" });
+      await store.open({ place: { kind: "files", path: "b.md" } }, { opener: "user" });
+      await store.open({ place: { kind: "web", url: "https://example.com" } }, { opener: "user" });
+      await store.open({ place: { kind: "agents" } }, { opener: "user" });
+    });
+    const kinds = () => store.tabs().map((tab) => ("place" in tab ? tab.place.kind : "unknown"));
+    expect(kinds()).toEqual(expect.arrayContaining(["files", "files", "web", "agents"]));
+
+    const closeFiles = await waitFor(() => {
+      const command = listedPaletteCommands().find(
+        (candidate) => candidate.id === `workspace:${conversationId}:tab-action:close-file-tabs`,
+      );
+      expect(command?.label).toBe("Close all file tabs");
+      return command!;
+    });
+    act(() => closeFiles.run());
+    await waitFor(() => expect(kinds()).not.toContain("files"));
+    expect(kinds()).toEqual(expect.arrayContaining(["web", "agents"]));
+
+    await userEvent.click(screen.getByRole("button", { name: "All tabs" }));
+    expect(await screen.findByRole("group", { name: /^Pages 1/ })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Close all page tabs" }));
+    await waitFor(() => expect(kinds()).not.toContain("web"));
+    // The list stays open on what's left: the tab on screen, which leads outside any group.
+    expect(screen.getByRole("option", { name: /Current/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Close all/ })).toBeNull();
+  });
+
+  it("closes the merged pull requests' tabs, PR files too, but keeps open and pinned ones", async () => {
+    const conversationId = "s-close-merged";
+    const merged = "https://github.example.com/acme/repo/pull/1";
+    const open = "https://github.example.com/acme/repo/pull/2";
+    const pinnedMerged = "https://github.example.com/acme/repo/pull/3";
+    const pr = (url: string, number: number, state: string) =>
+      ({ url, number, title: `Change ${number}`, state, is_draft: false }) as PullRequest;
+    knownPullRequests.facts = {
+      linked: [],
+      details: new Map([
+        [merged, pr(merged, 1, "MERGED")],
+        [open, pr(open, 2, "OPEN")],
+        [pinnedMerged, pr(pinnedMerged, 3, "MERGED")],
+      ]),
+    };
+    renderPanels([{ conversationId }]);
+    const { store } = workspaceTabsSession(conversationId);
+    await act(async () => {
+      // One at a time, so the tabs open in this order.
+      await store.open(
+        { place: { kind: "pull", url: merged, view: "summary" } },
+        { opener: "user" },
+      );
+      await store.open({ place: { kind: "pull", url: open, view: "summary" } }, { opener: "user" });
+      await store.open(
+        { place: { kind: "pull", url: pinnedMerged, view: "summary" } },
+        { opener: "user" },
+      );
+      await store.open(
+        { place: { kind: "pull", url: merged, view: "changes", path: "a.ts" } },
+        { opener: "user", disposition: "new" },
+      );
+      await store.open({ place: { kind: "agents" } }, { opener: "user" });
+    });
+    const pinned = store
+      .tabs()
+      .find((tab) => "place" in tab && "url" in tab.place && tab.place.url === pinnedMerged)!;
+    act(() => store.setPinned([pinned.id], true));
+    const urls = () =>
+      store
+        .tabs()
+        .flatMap((tab) => ("place" in tab && tab.place.kind === "pull" ? [tab.place.url] : []));
+
+    await userEvent.click(screen.getByRole("button", { name: "All tabs" }));
+    const pulls = await screen.findByRole("group", { name: /^Pull requests 4/ });
+    expect(within(pulls).getByRole("option", { name: /#2 Change 2/ })).toHaveTextContent("Open");
+    await userEvent.click(screen.getByRole("button", { name: "Close merged pull request tabs" }));
+    await waitFor(() => expect(urls()).toEqual([pinnedMerged, open]));
+    // Nothing merged is left to close but the pinned tab, which stays.
+    expect(screen.queryByRole("button", { name: "Close merged pull request tabs" })).toBeNull();
+  });
+
+  it("counts a PR as merged when the session saw it merge after its details were read", async () => {
+    const conversationId = "s-close-merged-later";
+    const url = "https://github.example.com/acme/repo/pull/7";
+    knownPullRequests.facts = {
+      linked: [
+        {
+          url,
+          host: "github.example.com",
+          repository: "acme/repo",
+          number: 7,
+          title: "Change 7",
+          relationship: "created",
+          state: "MERGED",
+          state_checked_at: Date.UTC(2026, 0, 1, 10, 5) / 1000,
+        } as PullRequestAssociation,
+      ],
+      details: new Map([
+        [url, { url, number: 7, title: "Change 7", state: "OPEN", is_draft: false } as PullRequest],
+      ]),
+      detailsUpdatedAt: new Map([[url, Date.UTC(2026, 0, 1, 10, 0)]]),
+    };
+    renderPanels([{ conversationId }]);
+    const { store } = workspaceTabsSession(conversationId);
+    await act(async () => {
+      await store.open({ place: { kind: "pull", url, view: "summary" } }, { opener: "user" });
+      await store.open({ place: { kind: "agents" } }, { opener: "user" });
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "All tabs" }));
+    const pulls = await screen.findByRole("group", { name: /^Pull requests 1/ });
+    expect(within(pulls).getByRole("option", { name: /#7 Change 7/ })).toHaveTextContent("Merged");
+    await userEvent.click(screen.getByRole("button", { name: "Close merged pull request tabs" }));
+    await waitFor(() =>
+      expect(store.tabs().some((tab) => "place" in tab && tab.place.kind === "pull")).toBe(false),
+    );
+  });
 });

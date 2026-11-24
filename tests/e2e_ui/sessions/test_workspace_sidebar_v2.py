@@ -250,6 +250,57 @@ def test_tabs_sidebar_files_history_and_pull_request(
         assert any(marker in body for body in bodies), marker
 
 
+def test_all_tabs_groups_the_tabs_and_closes_them_by_row_and_by_group(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """A file tab, a PR tab, then a new tab → All tabs lists them under Pull requests, Files
+    and Other, the new one marked Current → ⌘⌫ closes the file → Close all closes the PR's tab.
+    """
+    base_url, session_id = workspace_session
+    _stub_github(page)
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+
+    _open_app(page, sidebar, "Files")
+    sidebar.get_by_role("treeitem", name=re.compile(re.escape(_FILE))).click()
+    expect(sidebar.locator(".cm-content")).to_contain_text("print('hello')", timeout=30_000)
+    file_tab = sidebar.get_by_role("tab", name=re.compile(rf"^{re.escape(_FILE)}"))
+    _open_app(page, sidebar, "Pull Requests")
+    sidebar.get_by_role("button", name=re.compile(rf"#{_PR_NUMBER}\b")).first.click()
+    pr_tab = sidebar.get_by_role("tab", name=re.compile(rf"#{_PR_NUMBER}"))
+    expect(pr_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
+    sidebar.get_by_role("button", name="New tab", exact=True).click()
+    expect(sidebar.get_by_role("combobox", name="Open an app in this tab")).to_be_focused()
+
+    sidebar.get_by_role("button", name="All tabs").click()
+    tab_list = page.get_by_role("listbox", name="Search tabs")
+    other = tab_list.get_by_role("group", name=re.compile(r"^Other"))
+    expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
+    files = tab_list.get_by_role("group", name=re.compile(r"^Files 1"))
+    file_row = files.get_by_role("option", name=re.compile(re.escape(_FILE)))
+    expect(file_row).to_be_visible()
+    pulls = tab_list.get_by_role("group", name=re.compile(r"^Pull requests 1"))
+    pr_row = pulls.get_by_role("option", name=re.compile(rf"#{_PR_NUMBER} {_PR_TITLE}"))
+    expect(pr_row).to_contain_text("octocat")
+    expect(pr_row).to_contain_text("Checks failing")
+
+    # The pointer picks the file's row; the query keeps the keys, and ⌘⌫ closes that tab.
+    file_row.hover()
+    expect(file_row).to_have_attribute("aria-selected", "true")
+    page.keyboard.press("ControlOrMeta+Backspace")
+    expect(file_tab).to_have_count(0)
+    expect(files).to_have_count(0)
+
+    page.get_by_role("button", name="Close all pull request tabs").click()
+    expect(pr_tab).to_have_count(0)
+    expect(pulls).to_have_count(0)
+    # The list stays open on what's left, with the new tab on screen.
+    expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
+
+
 def test_files_menu_copies_the_path_and_a_link_to_the_file(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:

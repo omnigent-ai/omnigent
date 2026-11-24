@@ -8133,6 +8133,11 @@
             "title": "Proactive Agent Available",
             "type": "boolean"
           },
+          "project_mute": {
+            "default": true,
+            "title": "Project Mute",
+            "type": "boolean"
+          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
@@ -12059,6 +12064,12 @@
             ],
             "description": "First-class project id when one exists, or `None` for a label-only project not yet promoted to the `projects` table.",
             "title": "Id"
+          },
+          "muted": {
+            "default": false,
+            "description": "Whether the owner muted notifications for every session in the project, read from its `config`; `False` for a label-only folder.",
+            "title": "Muted",
+            "type": "boolean"
           },
           "name": {
             "description": "Project name (the folder's display name and union key).",
@@ -16909,6 +16920,17 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "automation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunAutomation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation whose scheduled run started its session, when the caller owns that automation or it is shared with them."
+          },
           "background_work_running": {
             "default": false,
             "description": "Whether background work outlives the session's turn.",
@@ -17066,6 +17088,27 @@
           "progress"
         ],
         "title": "WorkflowRun",
+        "type": "object"
+      },
+      "WorkflowRunAutomation": {
+        "description": "The automation whose scheduled run started a workflow run.",
+        "properties": {
+          "id": {
+            "description": "The automation's ID, e.g. `\"0123456789abcdef0123456789abcdef\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "Its name, e.g. `\"Nightly triage\"`.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "WorkflowRunAutomation",
         "type": "object"
       },
       "WorkflowRunList": {

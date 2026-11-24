@@ -470,6 +470,55 @@ describe("workspaceTabActionCommands", () => {
       unavailableBecause(SIDEBAR_CLOSED_REASON),
     );
   });
+
+  it("offers a group's close only where the tab list groups tabs, counting what it closes", () => {
+    const base = { canReopen: false, selectedIndex: 0, tabCount: 4 };
+    expect(
+      workspaceTabActionCommands(base).some((command) =>
+        [
+          "close-merged-pull-requests",
+          "close-pull-request-tabs",
+          "close-file-tabs",
+          "close-page-tabs",
+        ].includes(command.action),
+      ),
+    ).toBe(false);
+    const commands = workspaceTabActionCommands({
+      ...base,
+      groupCloseCounts: {
+        "close-merged-pull-requests": 1,
+        "close-pull-request-tabs": 3,
+        "close-file-tabs": 0,
+        "close-page-tabs": 2,
+      },
+    });
+    const merged = tabActionCommandFor(commands, "close-merged-pull-requests");
+    expect(merged).toMatchObject({
+      label: "Close merged pull request tabs",
+      menuLabel: "Close merged (1)",
+      availability: AVAILABLE,
+    });
+    expect(tabActionCommandFor(commands, "close-pull-request-tabs").label).toBe(
+      "Close all pull request tabs",
+    );
+    expect(tabActionCommandFor(commands, "close-page-tabs").menuLabel).toBe("Close all");
+    expect(tabActionCommandFor(commands, "close-file-tabs").availability).toEqual(
+      unavailableBecause("No file tabs can close."),
+    );
+    const closed = workspaceTabActionCommands({
+      ...base,
+      sidebarOpen: false,
+      groupCloseCounts: {
+        "close-merged-pull-requests": 1,
+        "close-pull-request-tabs": 1,
+        "close-file-tabs": 1,
+        "close-page-tabs": 1,
+      },
+    });
+    expect(tabActionCommandFor(closed, "close-merged-pull-requests").availability).toEqual(
+      unavailableBecause(SIDEBAR_CLOSED_REASON),
+    );
+  });
 });
 
 describe("the chorded tab actions", () => {

@@ -18,6 +18,9 @@
     <string name="about_action">About</string>
     <string name="about_title">About Omnigent</string>
     <string name="about_version">Version %1$s\nBuild %2$d</string>
+    <string name="deep_link_consent_title">Open this Omnigent link?</string>
+    <string name="deep_link_consent_message">This link will connect Omnigent to %1$s and open a conversation.\n\nOnly open links from a server you trust.</string>
+    <string name="deep_link_open">Open</string>
     <string name="oauth_completing">Completing Databricks sign-in…</string>
     <string name="oidc_completing">Completing sign-in…</string>
     <string name="oauth_invalid_callback">Databricks returned an invalid sign-in callback.</string>

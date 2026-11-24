@@ -26,6 +26,7 @@ from omnigent.server.sharing_settings import SharingMode
 from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -38,6 +39,7 @@ from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent
 from tests.server.integration.test_scheduled_tasks_routes import (
     _build_app,
+    _create_body,
     _headers,
     _make_user,
     _serve,
@@ -740,6 +742,41 @@ async def test_runs_list_the_workflow_runs_their_sessions_started(
     (viewed,) = shared.json()["data"]
     assert viewed["session_id"] == second and viewed["started_by"] is None
     assert viewed["workflow_name"] is None
+
+
+async def test_a_run_an_automation_started_names_the_automation_to_whoever_may_see_it(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    workflow = await _save_workflow(client, "Release")
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            host_id=None,
+            workspace=None,
+            name="Nightly release",
+            prompt=f'/workflow Run the saved workflow "Release" (ID {workflow["id"]}).',
+        ),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    # A scheduled run's session records the automation that started it.
+    scheduled = _session(db_uri, labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id})
+    manual = _session(db_uri)
+    for session_id in (scheduled, manual):
+        await _run(client, session_id, workflow, session_id)
+    await _share(client, workflow["id"])
+    SqlAlchemyPermissionStore(db_uri).grant(BOB, scheduled, LEVEL_READ)
+
+    runs_url = f"/v1/workflows/{workflow['id']}/runs"
+    alices = (await client.get(runs_url, headers=_headers())).json()["data"]
+    assert {run["session_id"]: run["automation"] for run in alices} == {
+        scheduled: {"id": task_id, "name": "Nightly release"},
+        manual: None,
+    }
+    # Bob reads the session, but the automation isn't shared with him.
+    (bobs,) = (await client.get(runs_url, headers=_headers(BOB))).json()["data"]
+    assert (bobs["session_id"], bobs["automation"]) == (scheduled, None)
 
 
 async def test_a_runs_descendants_continue_page_by_page_in_order(
