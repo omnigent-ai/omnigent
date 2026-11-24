@@ -158,13 +158,7 @@ export function SplitPanesLayout({
     session && split && !maximized && holdsItsDividers(session, split.layout) ? session : null;
   // Why the layout ended a drag it no longer shows, named in the log a snapped-back report holds.
   const layoutEnded: LayoutDragEnd | null =
-    session && !liveSession
-      ? !split
-        ? "split-hidden"
-        : maximized
-          ? "pane-maximized"
-          : "divider-gone"
-      : null;
+    session && !liveSession ? layoutDragEnd(split !== undefined, maximized) : null;
   useEffect(() => {
     if (!session || layoutEnded === null) return;
     reportDividerDragEnd(conversationId, handleOf(session), layoutEnded);
@@ -580,4 +574,11 @@ function ChatPaneBodyHost({
       style={{ top }}
     />
   );
+}
+
+/** Why the layout ends a held divider's drag: the split went, a pane is maximized, or the divider went. */
+function layoutDragEnd(splitShown: boolean, maximized: boolean): LayoutDragEnd {
+  if (!splitShown) return "split-hidden";
+  if (maximized) return "pane-maximized";
+  return "divider-gone";
 }
