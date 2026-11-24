@@ -74,16 +74,19 @@ MODEL_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
 _server_log_path: list[Path] = []
 
 
-@pytest.fixture(autouse=True)
-def _require_opt_in(request: pytest.FixtureRequest) -> None:
-    """Require opt-in for gateway cases; mock-only cases own isolated providers."""
-    if request.node.get_closest_marker("mock_only") is not None:
-        return
+def _require_gateway_opt_in() -> None:
     if os.environ.get(_RUN_GATE_ENV) != "1":
         pytest.skip(
             f"set {_RUN_GATE_ENV}=1 to run the Smart Routing e2e CUJs "
             "(they launch real claude/codex TUIs and a real host daemon)"
         )
+
+
+@pytest.fixture(autouse=True)
+def _require_opt_in(request: pytest.FixtureRequest) -> None:
+    """Require opt-in for gateway cases; mock-only cases own isolated providers."""
+    if request.node.get_closest_marker("mock_only") is None:
+        _require_gateway_opt_in()
 
 
 @pytest.fixture(scope="session")
@@ -93,6 +96,7 @@ def mock_router() -> Iterator[MockRouter]:
     :yields: The router handle; ``base_url`` goes into the server's
         ``routing.base_url``.
     """
+    _require_gateway_opt_in()
     yield from serve_mock_router()
 
 
