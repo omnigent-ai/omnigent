@@ -3829,6 +3829,84 @@ async def test_managed_launch_waits_for_runner_a_message_relaunched(
     assert fake.terminated == []
 
 
+async def test_managed_launch_stops_following_relaunched_runners_at_its_deadline(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runners that never connect, however often relaunched, still fail the launch."""
+    from omnigent.server.managed_hosts import launch_managed_host
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation()
+    fake = FakeSandboxLauncher(
+        on_host_start=lambda invocation: host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=RESERVED_USER_LOCAL,
+        ),
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+        )
+    )
+    managed = await launch_managed_host(
+        config=config, owner=RESERVED_USER_LOCAL, host_store=host_store
+    )
+    tracker = ManagedLaunchTracker()
+    tracker.begin(conv.id)
+    launch = tracker.get(conv.id)
+    assert launch is not None
+    awaited: list[str] = []
+
+    async def _launch_runner(launched: Conversation, *_args: object, **_kwargs: object) -> object:
+        conversations.replace_runner_id(launched.id, "runner_0")
+        return sessions_module._HostLaunchAttempt(runner_id="runner_0")
+
+    class _HostRegistry:
+        def get(self, _host_id: str) -> object:
+            return object()
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> None:
+            awaited.append(runner_id)
+            # Every wait ends with a message relaunching the runner, which never connects.
+            conversations.replace_runner_id(conv.id, f"runner_{len(awaited)}")
+            await asyncio.sleep(timeout_s)
+
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(sessions_module, "_publish_sandbox_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(sessions_module, "_MANAGED_RUNNER_REPLACEMENT_WAIT_S", 0.1)
+
+    await asyncio.wait_for(
+        sessions_module._bind_and_launch_managed_runner(
+            session_id=conv.id,
+            managed=managed,
+            sandbox_config=config,
+            tracker=tracker,
+            conversation_store=conversations,
+            host_store=host_store,
+            host_registry=_HostRegistry(),  # type: ignore[arg-type]
+            tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+        ),
+        timeout=10,
+    )
+
+    assert len(awaited) > 1
+    assert launch.settled.is_set()
+    assert launch.error == "managed runner did not connect after launch"
+    remaining = conversations.get_conversation(conv.id)
+    assert remaining is not None
+    assert remaining.host_id is None
+    assert host_store.get_host(managed.host_id) is None
+    assert fake.terminated == ["sb-fake-1"]
+
+
 async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -442,6 +442,11 @@ _HOST_RECONNECT_GRACE_S = 30.0
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
 
 
+# A launch stops following runners that messages relaunch after this long, so a
+# host that keeps failing to start one still settles the launch and its rollback.
+_MANAGED_RUNNER_REPLACEMENT_WAIT_S = 15 * 60.0
+
+
 _HOST_RUNNER_STATUS_TIMEOUT_S = 3.0
 
 
@@ -1231,6 +1236,7 @@ __all__ = [
     "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
     "_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
+    "_MANAGED_RUNNER_REPLACEMENT_WAIT_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
     "_MCP_ELICITATION_TYPE",

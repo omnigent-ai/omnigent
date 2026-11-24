@@ -7521,7 +7521,8 @@ async def _wait_for_managed_runner_tunnel(
     A message that finds the runner slow to connect relaunches it on the same
     host, and the host stops the runner it replaced. Given *conversation_store*
     and *host_id*, the wait moves on to the runner the session is now bound to
-    on that host rather than failing on one that can no longer connect.
+    on that host rather than failing on one that can no longer connect. It stops
+    following replacements after ``_MANAGED_RUNNER_REPLACEMENT_WAIT_S``.
 
     :param session_id: Session/conversation identifier.
     :param runner_id: Runner id returned by the host launch frame.
@@ -7538,16 +7539,16 @@ async def _wait_for_managed_runner_tunnel(
     from omnigent.server.managed_hosts import is_move_claim
     from omnigent.server.routes import sessions as _facade
 
+    connect_timeout_s = _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+    follow_deadline = time.monotonic() + _facade._MANAGED_RUNNER_REPLACEMENT_WAIT_S
     awaited_runner_ids: set[str] = set()
     while True:
-        runner = await tunnel_registry.wait_for_runner(
-            runner_id,
-            timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
-        )
+        runner = await tunnel_registry.wait_for_runner(runner_id, timeout_s=connect_timeout_s)
         if runner is not None:
             return True
         awaited_runner_ids.add(runner_id)
-        if conversation_store is None or host_id is None:
+        remaining_s = follow_deadline - time.monotonic()
+        if conversation_store is None or host_id is None or remaining_s <= 0:
             break
         bound = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if (
@@ -7566,6 +7567,7 @@ async def _wait_for_managed_runner_tunnel(
             extra={"session_id": session_id},
         )
         runner_id = bound.runner_id
+        connect_timeout_s = min(_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S, remaining_s)
     _logger.error(
         "Managed runner connection timed out",
         extra=debug_event(
