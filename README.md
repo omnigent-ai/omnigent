@@ -221,10 +221,10 @@ treats WSL2 as Linux, so the Linux prerequisites apply:
    WSL doesn't read Windows-side CLI config (such as a gateway base URL), and
    Omnigent refuses to launch a Windows `claude.exe` from WSL.
 4. From the WSL shell, run `omnigent login https://your-host` and then
-   `omnigent host https://your-host`. The WSL host gets the Windows machine's
-   hostname, so stop any Windows-side host for the same server
-   (`omnigent host stop`) to keep the two from being confused in the host
-   picker.
+   `omnigent host https://your-host`. By default the WSL host gets the Windows
+   machine's hostname, so stop any Windows-side host for the same server
+   (`omnigent host stop --server https://your-host` in PowerShell) to keep the
+   two from being confused in the host picker.
 
 </details>
 
