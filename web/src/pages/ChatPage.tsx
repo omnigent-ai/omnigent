@@ -3940,9 +3940,7 @@ function ComposerImpl(
   const replyQuoteInsertedRef = useRef(false);
   // A quote a gadget queued while this composer couldn't take one (its draft still
   // restoring, a Quick Answer open, the host unreachable) is tried again once it can.
-  const quoteBlocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
-  const canTakeQuoteNow =
-    settledConversationId === conversationId && !composerLockedByBtw && !quoteBlocked;
+  const canTakeQuoteNow = settledConversationId === conversationId && !inputDisabled;
   useEffect(() => {
     if (canTakeQuoteNow) retryGadgetComposerQuotes();
   }, [canTakeQuoteNow]);

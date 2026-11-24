@@ -497,6 +497,31 @@ class ImmutableDocumentStore:
             self._check_link(ref, self._read_revision(ref, number - 1), revision)
         return None if revision.kind in _GONE else self._document(ref, revision)
 
+    def incarnation(
+        self, collection: str, id: str, version: str | None = None
+    ) -> tuple[str, int] | None:
+        """Which life of the record the newest version (or *version*) belongs to.
+
+        A record created again after a delete starts a new generation, and one created
+        again after its history was removed starts a new chain: two versions of one record
+        with the same incarnation are edits of the same record. ``None`` when the record is
+        absent or deleted now; a *version* that is gone or never existed raises
+        :class:`InvalidInput`.
+        """
+        ref = self._ref(collection, id)
+        head = self._load_head(ref)
+        if version is None:
+            if head is None or head.latest.kind in _GONE:
+                return None
+            return head.first_digest, head.latest.generation
+        number = self._validate_version(version, ref)
+        if head is None or not 1 <= number <= head.count:
+            raise InvalidInput("The requested version does not exist")
+        revision = self._read_revision(ref, number)
+        if self._version_of(ref, revision) != version:
+            raise InvalidInput("The requested version does not match its stored revision")
+        return head.first_digest, revision.generation
+
     def list(self, collection: str, limit: int = 100, cursor: str | None = None) -> DocumentPage:
         """One page of live documents in the order they were first created; not a snapshot.
 

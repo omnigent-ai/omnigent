@@ -13,6 +13,12 @@ AUTOMATIONS_HEADER = "X-Omnigent-Automations"
 USER_INBOX_HEADER = "X-Omnigent-User-Inbox"
 # Same, for the gadget tools; runners keep them only when it is "1".
 GADGETS_HEADER = "X-Omnigent-Gadgets"
+# Sent by the runner on its bundle download: the tool groups added after older runners
+# that it accepts in a spec's ``tool_groups``. The server takes the others out of the
+# bundle, because an older runner's parser refuses a group it doesn't know.
+ACCEPTED_TOOL_GROUPS_HEADER = "X-Omnigent-Accepted-Tool-Groups"
+# Tool groups a runner may not know; ones it doesn't list in that header are taken out.
+NEGOTIATED_TOOL_GROUPS: frozenset[str] = frozenset({"gadgets"})
 
 
 def without_scheduled_task_tools(spec: AgentSpec) -> AgentSpec:

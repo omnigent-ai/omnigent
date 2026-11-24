@@ -215,6 +215,7 @@ import {
   noteSessionCreationFailed,
   noteFirstInputAccepted,
 } from "@/lib/sessionCreations";
+import { useGadgetRailRequest } from "@/lib/gadgetRailTabs";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { DesktopWindowContext, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
@@ -5010,6 +5011,14 @@ function NewChatLandingContent({
     selectedAgent?.harness,
     harnessWarningHost,
   );
+  // What Create session in a full screen gadget's menu sends: the composer's own text, which
+  // full screen hides, however it got there (typed, a prompt link, or the gadget). The menu
+  // shows it unless it already shows the same text as one the gadget wrote.
+  const gadgetWrittenReview = useGadgetRailRequest((state) => state.createSessionReview);
+  const gadgetCreateDraft = message.trim();
+  const gadgetCreateDraftShown =
+    gadgetCreateDraft !== "" &&
+    (gadgetWrittenReview === null || gadgetWrittenReview.prompt.trim() !== gadgetCreateDraft);
   // New session only warns about a harness the host can't run (the host re-checks at launch),
   // but a full screen gadget's menu hides that warning: there Create session waits for one the
   // host can run, and says why.
@@ -8208,6 +8217,20 @@ function NewChatLandingContent({
                           <p role="alert" className="text-xs text-destructive">
                             {createError}
                           </p>
+                        )}
+                        {gadgetCreateDraftShown && (
+                          <div
+                            data-testid="gadget-create-session-draft"
+                            data-gadget-draft-review
+                            className="max-w-[min(36rem,calc(100vw-2rem))] rounded-md border bg-muted/50 p-2 text-sm"
+                          >
+                            <p className="mb-1 text-xs text-muted-foreground">
+                              Create session sends this to your agent.
+                            </p>
+                            <p className="max-h-48 overflow-y-auto break-words whitespace-pre-wrap">
+                              {message}
+                            </p>
+                          </div>
                         )}
                         {submitDisabledReason !== null && !creating && (
                           <p className="text-xs text-muted-foreground">{submitDisabledReason}</p>

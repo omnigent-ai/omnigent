@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import gzip
 import hashlib
 import io
@@ -268,6 +269,65 @@ def redacted_agent_bundle(
         member.size = len(config)
         member.mode = 0o644
         archive.addfile(member, io.BytesIO(config))
+    return output.getvalue()
+
+
+def bundle_without_tool_groups(source_bundle: bytes, groups: frozenset[str]) -> bytes:
+    """*source_bundle* with *groups* taken out of every config's ``tool_groups``.
+
+    For runners released before those groups: their spec parser refuses a ``tool_groups``
+    key it doesn't know, so an author's opt-out would stop the session from starting. Such
+    a runner offers none of those tools anyway, so dropping the key loses nothing. A
+    bundle that names none of *groups* is returned as it is; other files are copied
+    unchanged.
+    """
+    import yaml
+
+    from omnigent.spec.parser import _ConfigYamlLoader
+
+    def stripped(data: bytes) -> bytes | None:
+        try:
+            config = yaml.load(data.decode("utf-8"), Loader=_ConfigYamlLoader)
+        except (UnicodeDecodeError, yaml.YAMLError):
+            return None  # Not ours to fix; the runner reports it as it would have.
+        tool_groups = config.get("tool_groups") if isinstance(config, dict) else None
+        if not isinstance(tool_groups, dict) or not groups & tool_groups.keys():
+            return None
+        kept = {key: value for key, value in tool_groups.items() if key not in groups}
+        if kept:
+            config["tool_groups"] = kept
+        else:
+            del config["tool_groups"]
+        return yaml.safe_dump(config, sort_keys=False, allow_unicode=True).encode("utf-8")
+
+    with (
+        gzip.GzipFile(fileobj=io.BytesIO(source_bundle)) as source,
+        tarfile.open(fileobj=source, mode="r") as archive,
+    ):
+        members = [
+            (member, archive.extractfile(member).read() if member.isfile() else None)  # type: ignore[union-attr]
+            for member in archive.getmembers()
+        ]
+    changed = False
+    rewritten = []
+    for member, data in members:
+        if data is not None and PurePosixPath(member.name).name in ("config.yaml", "agent.yaml"):
+            replacement = stripped(data)
+            if replacement is not None:
+                member = copy.copy(member)
+                member.size = len(replacement)
+                data = replacement
+                changed = True
+        rewritten.append((member, data))
+    if not changed:
+        return source_bundle
+    output = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed,
+        tarfile.open(fileobj=compressed, mode="w") as archive,
+    ):
+        for member, data in rewritten:
+            archive.addfile(member, io.BytesIO(data) if data is not None else None)
     return output.getvalue()
 
 

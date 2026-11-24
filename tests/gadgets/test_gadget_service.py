@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -998,6 +999,109 @@ def test_a_late_index_removal_from_a_finished_change_keeps_a_newer_entry(
     with pytest.raises(ConstraintViolation):
         rpc(service, app, "delete", id="x", if_version=target["version"], operation_id="d-x")
     assert _run(service, app, "d")["value"]["cardId"] == "x"
+
+
+@pytest.mark.parametrize("on_delete", ["cascade", "unset"])
+def test_a_late_rule_update_leaves_a_dependent_created_again_alone(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch, on_delete: str
+) -> None:
+    # A writer deletes a card and stops before its rule updates the run that names it.
+    # Another writer finishes that change; the card and the run are then created again under
+    # the same IDs and edited past the store's replay window. When the first writer resumes,
+    # its stale update must not touch the new run, which is not the record its plan saw.
+    import threading
+
+    service = gadgets.service()
+    app = publish_ruled_board(service, [{**_UNSET_RUN_CARD, "on_delete": on_delete}])
+    target = card(service, app, "x", "todo")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="d",
+        value={"cardId": "x", "state": "done"},
+        operation_id="d",
+    )
+    real_apply = ConstraintGuard._apply
+    paused = threading.Event()
+    resume = threading.Event()
+    late = threading.current_thread()
+
+    def apply(self, operation):
+        if (
+            operation["kind"] in ("delete", "unset")
+            and operation["collection"] == "runs"
+            and threading.current_thread() is not late
+            and not paused.is_set()
+        ):
+            paused.set()
+            assert resume.wait(10)
+        return real_apply(self, operation)
+
+    monkeypatch.setattr(ConstraintGuard, "_apply", apply)
+    late_writer = gadgets.service()
+    with ThreadPoolExecutor(1) as pool:
+        stopped = pool.submit(
+            rpc,
+            late_writer,
+            app,
+            "delete",
+            id="x",
+            if_version=target["version"],
+            operation_id="x-1",
+        )
+        assert paused.wait(10)
+        # Another writer finishes the change (its own write helps finish the pending one).
+        card(service, app, "z", "todo")
+        if on_delete == "unset":
+            gone = _run(service, app, "d")
+            rpc(
+                service,
+                app,
+                "delete",
+                collection="runs",
+                id="d",
+                if_version=gone["version"],
+                operation_id="d-gone",
+            )
+        rpc(
+            service,
+            app,
+            "create",
+            id="x",
+            value={"title": "x again", "column": "todo"},
+            operation_id="x-again",
+        )
+        rpc(
+            service,
+            app,
+            "create",
+            collection="runs",
+            id="d",
+            value={"cardId": "x", "state": "done"},
+            operation_id="d-again",
+        )
+        # Past the replay window, so the stale update is not answered as a repeat.
+        for edit in range(18):
+            current = _run(service, app, "d")
+            rpc(
+                service,
+                app,
+                "replace",
+                collection="runs",
+                id="d",
+                value={"cardId": "x", "state": f"done-{edit}"},
+                if_version=current["version"],
+                operation_id=f"d-edit-{edit}",
+            )
+        resume.set()
+        with contextlib.suppress(Exception):
+            stopped.result(10)
+    after = _run(service, app, "d")
+    assert after is not None
+    assert after["value"]["cardId"] == "x"
+    assert after["value"]["state"] == "done-17"
 
 
 @pytest.mark.parametrize("gone", ["deleted", "version_reclaimed"])

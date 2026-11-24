@@ -17,8 +17,10 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.automations_availability import (
+    ACCEPTED_TOOL_GROUPS_HEADER,
     AUTOMATIONS_HEADER,
     GADGETS_HEADER,
+    NEGOTIATED_TOOL_GROUPS,
     USER_INBOX_HEADER,
 )
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
@@ -46,7 +48,12 @@ from omnigent.server.auth import (
     AuthProvider,
     local_single_user_enabled,
 )
-from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
+from omnigent.server.bundles import (
+    bundle_location,
+    bundle_without_tool_groups,
+    redacted_agent_bundle,
+    validate_agent_bundle,
+)
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
@@ -284,6 +291,15 @@ def register_agent_routes(
                 agent.name,
                 bundle_bytes,
                 operator_authored=agent.operator_authored,
+            )
+        accepted = {
+            group.strip()
+            for group in request.headers.get(ACCEPTED_TOOL_GROUPS_HEADER, "").split(",")
+        }
+        unknown_groups = NEGOTIATED_TOOL_GROUPS - accepted
+        if unknown_groups:
+            bundle_bytes = await asyncio.to_thread(
+                bundle_without_tool_groups, bundle_bytes, frozenset(unknown_groups)
             )
         selection_headers = {}
         if request.headers.get(MCP_SELECTION_HEADER) == "1":

@@ -747,6 +747,16 @@ class ConstraintGuard:
         current = self.data.get(collection, record_id)
         if current is None:
             return {}
+        # Only edits of the record the plan saw: one deleted and created again since (by a
+        # writer that finished this change, then others) is not the plan's to update, even
+        # when it names the same target again. Its later write conflicts if the record is
+        # recreated after this check, and the next attempt checks again.
+        try:
+            planned = self.data.incarnation(collection, record_id, operation["if_version"])
+        except InvalidInput:
+            return {}  # The planned version's history is gone: the record was removed since.
+        if planned != self.data.incarnation(collection, record_id):
+            return {}
         naming = [field for field, target in targets.items() if current.value.get(field) == target]
         if not naming:
             return {}

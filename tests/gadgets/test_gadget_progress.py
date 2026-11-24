@@ -30,6 +30,7 @@ class FakeConversations:
     def __init__(self) -> None:
         self.rows: dict[str, SimpleNamespace] = {}
         self.seen: dict[str, int | None] = {}
+        self.reads: list[tuple] = []
         # Sessions bound to a runner or host, which a missing stamp then means is not running.
         self.bound: set[str] = set()
 
@@ -86,6 +87,7 @@ class FakeConversations:
         owned_by: str | None = None,
     ):
         assert kind is None and include_archived
+        self.reads.append(("list", root_conversation_id, owned_by, limit))
         rows = [
             row
             for row in self.rows.values()
@@ -93,6 +95,17 @@ class FakeConversations:
         ]
         ordered = sorted(rows, key=lambda row: -row.created_at)
         return SimpleNamespace(data=ordered[:limit], has_more=len(ordered) > limit)
+
+    def list_spawn_tree(self, root_conversation_id: str, *, limit: int):
+        self.reads.append(("tree", root_conversation_id, limit))
+        rows = [
+            row for row in self.rows.values() if row.root_conversation_id == root_conversation_id
+        ]
+        ordered = sorted(rows, key=lambda row: -row.created_at)
+        return SimpleNamespace(data=ordered[:limit], has_more=len(ordered) > limit)
+
+    def get_session_families(self, family_ids: list[str]) -> dict:
+        raise NotImplementedError
 
     def get_session_connectivity(self, ids: list[str]) -> dict:
         return {
@@ -648,11 +661,31 @@ def test_the_reader_follows_a_real_conversation_store(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation(title="Gadget session")
     child = store.create_conversation(title="Worker", parent_conversation_id=parent.id)
-    reader = SessionStateReader(store, lambda _session_id: True)
+    # A session it started on its own, linked only by the creator label.
+    independent = store.create_conversation(
+        title="Independent worker", labels={"omnigent.created_by_session_id": parent.id}
+    )
+    store.create_conversation(title="Someone else's work")
+    listings: list[dict] = []
+    real_list = store.list_conversations
+
+    def list_conversations(**kwargs):
+        listings.append(kwargs)
+        return real_list(**kwargs)
+
+    store.list_conversations = list_conversations  # type: ignore[method-assign]
+    reader = SessionStateReader(store, lambda _session_id: True, user_id="viewer@example.com")
 
     states = reader.read([parent.id])
-    assert set(states) == {parent.id, child.id}
+    assert set(states) == {parent.id, child.id, independent.id}
     assert states[child.id].parent_id == parent.id
+    # Bounded reads only: trees through the root index (list_spawn_tree reads it in id order),
+    # and no per-owner listing, which loads every one of the owner's permissions first.
+    assert all(call.get("owned_by") is None for call in listings)
+    assert all(
+        call.get("root_conversation_id") is None or call.get("sort_by") == "id"
+        for call in listings
+    )
     assert states[parent.id].status == "idle"
     assert reader.available(parent.id)
     store.update_conversation(parent.id, archived=True)

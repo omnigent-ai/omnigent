@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent.errors import OmnigentError
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY as CREATED_BY_SESSION_LABEL,
 )
@@ -43,8 +44,9 @@ SILENT_RUNNING_LIMIT_S = 60 * 60
 # A message to a stopped gadget session marks it working before its runner is back; for this long
 # after the delivery that session is starting, not interrupted. Sandboxes can take minutes to wake.
 RUNNER_START_GRACE_S = 10 * 60
-# Child sessions considered per gadget session, and the caller's recent sessions searched for
-# independent ones it started.
+# Child sessions considered per gadget session tree (one bounded spawn-tree read), and the
+# workspace's newest sessions searched for independent ones a gadget session started outside
+# its family.
 MAX_CHILD_SESSIONS = 100
 MAX_RECENT_SESSIONS = 50
 
@@ -372,45 +374,61 @@ class SessionStateReader:
         conversations = dict(self._store.get_conversations(roots))
         complete = True
         truncated: set[str] = set()
-        for conversation in list(conversations.values()):
-            page = self._store.list_conversations(
-                limit=MAX_CHILD_SESSIONS,
-                kind=None,
-                root_conversation_id=conversation.root_conversation_id,
-                include_archived=True,
-            )
+        trees_read: set[str] = set()
+
+        def read_tree(conversation: Any) -> None:
+            # One bounded read of the root index (list_spawn_tree), not a listing sorted by
+            # time, so the rows examined stay within the limit however large the tree is.
+            nonlocal complete
+            root = conversation.root_conversation_id
+            if root in trees_read:
+                return
+            trees_read.add(root)
+            page = self._store.list_spawn_tree(root, limit=MAX_CHILD_SESSIONS)
             complete = complete and not page.has_more
             if page.has_more:
-                truncated.add(conversation.root_conversation_id)
+                truncated.add(root)
             for child in page.data:
                 conversations.setdefault(child.id, child)
+
+        for conversation in list(conversations.values()):
+            read_tree(conversation)
         # Independent sessions have no parent link, only a label naming the session that started
-        # them, and the store cannot filter on labels, so look through the caller's recent ones.
+        # them. Sessions a session starts join its family, which is one bounded read; ones
+        # started outside a family are looked for among the workspace's newest sessions (also
+        # bounded: no per-owner permission scan).
+        candidates: dict[str, Any] = {}
+        families = sorted(
+            {family for c in conversations.values() if (family := getattr(c, "family_id", None))}
+        )
+        if families:
+            try:
+                for members in self._store.get_session_families(families).values():
+                    for member in members:
+                        candidates.setdefault(member.id, member)
+            except NotImplementedError:
+                pass
+            except OmnigentError:
+                complete = False  # A family too large to read: some members are unknown.
         recent = self._store.list_conversations(
-            limit=MAX_RECENT_SESSIONS, kind=None, owned_by=self._user_id, include_archived=True
+            limit=MAX_RECENT_SESSIONS, kind=None, include_archived=True
         )
         # Older sessions may have been started from these too; that can't be ruled out.
         complete = complete and not recent.has_more
-        started = [
-            conversation
-            for conversation in recent.data
-            if conversation.id not in conversations
-            and (conversation.labels or {}).get(CREATED_BY_SESSION_LABEL) in conversations
-            and self._can_read(conversation.id)
-        ]
-        for conversation in started:
-            conversations[conversation.id] = conversation
-            page = self._store.list_conversations(
-                limit=MAX_CHILD_SESSIONS,
-                kind=None,
-                root_conversation_id=conversation.root_conversation_id,
-                include_archived=True,
-            )
-            complete = complete and not page.has_more
-            if page.has_more:
-                truncated.add(conversation.root_conversation_id)
-            for child in page.data:
-                conversations.setdefault(child.id, child)
+        for conversation in recent.data:
+            candidates.setdefault(conversation.id, conversation)
+        # A worker can start workers of its own: follow the labels until nothing new is found.
+        found = True
+        while found:
+            found = False
+            for conversation in candidates.values():
+                if conversation.id in conversations:
+                    continue
+                starter = (conversation.labels or {}).get(CREATED_BY_SESSION_LABEL)
+                if starter in conversations and self._can_read(conversation.id):
+                    conversations[conversation.id] = conversation
+                    read_tree(conversation)
+                    found = True
         connectivity = self._store.get_session_connectivity(list(conversations))
         now = int(time.time())
         own_liveness: dict[str, bool] = {}

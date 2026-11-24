@@ -1709,6 +1709,10 @@ async def _resolve_agent_spec_from_server(
     :raises RuntimeError: If the server returns a non-200 status
         other than 404, including a 429 that outlasts the retries.
     """
+    from omnigent.automations_availability import (
+        ACCEPTED_TOOL_GROUPS_HEADER,
+        NEGOTIATED_TOOL_GROUPS,
+    )
     from omnigent.mcp_selection import MCP_SELECTION_HEADER
     from omnigent.native.native_terminal import request_with_429_retry
 
@@ -1723,7 +1727,14 @@ async def _resolve_agent_spec_from_server(
     # Every runner re-initializes its sessions when the server restarts, and the
     # resulting burst gets throttled; a failed fetch here fails the session's init.
     resp = await request_with_429_retry(
-        lambda: server_client.get(path, headers={MCP_SELECTION_HEADER: "1"}),
+        lambda: server_client.get(
+            path,
+            headers={
+                MCP_SELECTION_HEADER: "1",
+                # This runner parses every group, so the bundle comes as written.
+                ACCEPTED_TOOL_GROUPS_HEADER: ",".join(sorted(NEGOTIATED_TOOL_GROUPS)),
+            },
+        ),
         delays_s=_SPEC_FETCH_429_RETRY_DELAYS_S,
         max_retry_after_s=_SPEC_FETCH_MAX_RETRY_AFTER_S,
     )

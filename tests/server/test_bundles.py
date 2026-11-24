@@ -668,3 +668,46 @@ def test_uploaded_agent_reports_the_rewrite_failure_when_the_store_is_down(
         )
 
     assert excinfo.value is put_error
+
+
+# ── tool groups an older runner doesn't know ───────────────
+
+
+def test_a_runner_that_predates_a_tool_group_gets_a_bundle_it_can_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An author's ``tool_groups.gadgets: false`` must not stop an older runner starting.
+
+    Such a runner's parser refuses a group it doesn't know, before the session starts; it
+    also has no gadget tools to offer, so the bundle it gets drops the key and keeps the rest.
+    """
+    from omnigent.server.bundles import bundle_without_tool_groups
+    from omnigent.spec import parser as spec_parser
+
+    config = _MIN_CONFIG.format(name="opted-out") + (
+        "tool_groups:\n  gadgets: false\n  browser: false\nguardrails:\n  policies: {}\n"
+    )
+    notes = "notes kept as written\n"
+    bundle = _make_bundle_bytes({"config.yaml": config, "notes.md": notes})
+    # An older runner: its accepted group set lacks gadgets.
+    monkeypatch.setattr(
+        spec_parser, "_TOOL_GROUP_NAMES", spec_parser._TOOL_GROUP_NAMES - {"gadgets"}
+    )
+    with pytest.raises(OmnigentError, match="unknown group"):
+        validate_agent_bundle(bundle)
+
+    delivered = bundle_without_tool_groups(bundle, frozenset({"gadgets"}))
+
+    spec = validate_agent_bundle(delivered)
+    assert spec.tool_groups.browser is False
+    with tarfile.open(fileobj=io.BytesIO(delivered), mode="r:gz") as archive:
+        assert archive.extractfile("notes.md").read().decode() == notes  # type: ignore[union-attr]
+
+
+def test_a_bundle_that_names_no_new_group_is_delivered_as_it_is() -> None:
+    from omnigent.server.bundles import bundle_without_tool_groups
+
+    bundle = _make_bundle_bytes(
+        {"config.yaml": _MIN_CONFIG.format(name="plain") + "tool_groups:\n  browser: false\n"}
+    )
+    assert bundle_without_tool_groups(bundle, frozenset({"gadgets"})) is bundle

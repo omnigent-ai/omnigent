@@ -166,8 +166,13 @@ export function GadgetOpenSessionButton({
         return;
       }
       // Without Create session (no host yet, say), the menu itself: a control would show its
-      // tooltip, which takes the first Escape.
-      const create = createSlotRef.current?.querySelector<HTMLElement>(FOCUSABLE);
+      // tooltip, which takes the first Escape. With a message to read first (one a prompt
+      // link filled in, say), the menu too: confirming the session must not confirm text the
+      // viewer hasn't seen.
+      const slot = createSlotRef.current;
+      const create = slot?.querySelector("[data-gadget-draft-review]")
+        ? null
+        : slot?.querySelector<HTMLElement>(FOCUSABLE);
       (create ?? contentRef.current)?.focus({ preventScroll: true });
     });
   }, []);

@@ -689,6 +689,45 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(panel.launch).not.toHaveBeenCalled();
   });
 
+  it("shows a prompt link's message in a full screen gadget's Create session menu before it is sent", async () => {
+    // A link that fills the composer and opens a gadget full screen over it: nothing the
+    // gadget wrote, so only the composer's own text can say what Create session sends.
+    searchParams = new URLSearchParams("prompt=LINK_PREFILL_PROBE&gadget_start=g1&gadget=g1");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} gadgetId="g1" onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    act(() => {
+      requestGadgetCreateSessionMenu();
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    const popover = screen.getByTestId("gadget-open-session-popover");
+    expect(within(popover).getByTestId("gadget-create-session-draft")).toHaveTextContent(
+      "LINK_PREFILL_PROBE",
+    );
+    await waitFor(() => expect(create).toBeEnabled());
+    // Focus stays on the menu, so a stray Enter doesn't send text the viewer hasn't read.
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+    expect(document.activeElement).not.toBe(create);
+    fireEvent.click(create);
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "LINK_PREFILL_PROBE" }),
+      ),
+    );
+  });
+
   it("shows a message the gadget wrote in its Create session menu before Create session sends it", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
