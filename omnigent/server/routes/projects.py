@@ -248,32 +248,25 @@ def _bound_lead_session(
     return runner_id in {session.runner_id, root.runner_id}
 
 
-def _refuse_description_write(
+def refuse_unless_owner_or_lead(
     request: Request,
     project: Project | None,
-    description: str | None,
+    refused: OmnigentError,
     *,
     user_id: str | None,
     conversation_store: ConversationStore | None,
-) -> None:
-    """Keep the description the owner's or the Lead's: members and other agents only read it.
+) -> str | None:
+    """Allow a write only from the project owner or the project's current Lead session.
 
     A call made by an agent's runner (it carries a source or runner token header)
     passes only when the server can bind it to the current Lead session; an
     agent that omits its source header is refused rather than treated as the owner.
 
-    :param project: The stored project, or ``None`` on create (agents may not set it then).
-    :param description: The requested description, or ``None`` when unchanged.
-    :raises OmnigentError: 403 for a shared member or an agent outside the Lead's session,
-        400 for an oversized description.
+    :param project: The stored project, or ``None`` on create (agents are refused then).
+    :param refused: The error to raise when the caller may not write.
+    :returns: The Lead session's ID for an agent call, else ``None``.
+    :raises OmnigentError: *refused* for a shared member or an agent outside the Lead's session.
     """
-    if description is None:
-        return
-    normalize_project_description(description)
-    refused = OmnigentError(
-        "Only the project owner or its Lead can change the project description",
-        code=ErrorCode.FORBIDDEN,
-    )
     agent_call = (
         ORCHESTRATION_SOURCE_HEADER in request.headers
         or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
@@ -284,6 +277,37 @@ def _refuse_description_write(
         raise refused
     if project is not None and project.user_id != user_id:
         raise refused
+    return normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER)) if agent_call else None
+
+
+def _refuse_description_write(
+    request: Request,
+    project: Project | None,
+    description: str | None,
+    *,
+    user_id: str | None,
+    conversation_store: ConversationStore | None,
+) -> None:
+    """Keep the description the owner's or the Lead's: members and other agents only read it.
+
+    :param project: The stored project, or ``None`` on create (agents may not set it then).
+    :param description: The requested description, or ``None`` when unchanged.
+    :raises OmnigentError: 403 for a shared member or an agent outside the Lead's session,
+        400 for an oversized description.
+    """
+    if description is None:
+        return
+    normalize_project_description(description)
+    refuse_unless_owner_or_lead(
+        request,
+        project,
+        OmnigentError(
+            "Only the project owner or its Lead can change the project description",
+            code=ErrorCode.FORBIDDEN,
+        ),
+        user_id=user_id,
+        conversation_store=conversation_store,
+    )
 
 
 def create_projects_router(

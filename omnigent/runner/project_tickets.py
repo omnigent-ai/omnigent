@@ -78,6 +78,13 @@ async def execute_ticket_tool(
                 },
                 ensure_ascii=False,
             )
+        if name in ("sys_project_kpis_get", "sys_project_kpis_set"):
+            path = f"/v1/projects/{project_id}/kpis"
+            if name == "sys_project_kpis_get":
+                result = await request("GET", path, params=body)
+            else:
+                result = await request("PUT", path, json=body)
+            return json.dumps(result, ensure_ascii=False)
         if name == "sys_project_identity_list":
             roles = await _list_roles(f"/v1/projects/{project_id}/identities", request)
             return json.dumps(

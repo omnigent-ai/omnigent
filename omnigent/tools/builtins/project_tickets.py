@@ -1,6 +1,6 @@
 """Ticket tools share their validation contracts with the project board API."""
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -8,6 +8,7 @@ from omnigent.entities.project import (
     MANDATE_PROPOSAL_MAX_BYTES,
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
 )
+from omnigent.entities.project_kpi import SetProjectKpis
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
@@ -495,6 +496,35 @@ class SysProjectFileViewTool(_TicketTool):
     arguments = ViewProjectFile
 
 
+class GetProjectKpis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    window: Literal["7d", "30d", "all"] = Field(
+        default="7d", description="The UTC window values are measured over, as on the Summary."
+    )
+
+
+class SysProjectKpisGetTool(_TicketTool):
+    tool_name = "sys_project_kpis_get"
+    read_only = True
+    help_text = (
+        "Read this project's KPIs: each one's name, metric, why it matters, target and "
+        "direction, with its current value and whether it meets the target over the window. "
+        "Also returns the current revision, who set it, and the metrics a KPI may track."
+    )
+    arguments = GetProjectKpis
+
+
+class SysProjectKpisSetTool(_TicketTool):
+    tool_name = "sys_project_kpis_set"
+    help_text = (
+        "Replace this project's KPIs with a complete new set (3-4 is typical), stored as a "
+        "new revision; earlier revisions are kept. Only the project's Lead may call it, and "
+        "only when the owner asked for the change. Read the KPIs first and pass their "
+        "revision as base_revision so a concurrent edit isn't overwritten."
+    )
+    arguments = SetProjectKpis
+
+
 TICKET_TOOL_CLASSES = (
     SysTicketListTool,
     SysTicketGetTool,
@@ -513,6 +543,8 @@ TICKET_TOOL_CLASSES = (
     SysProjectIdentitySessionTool,
     SysProjectArtifactSaveTool,
     SysProjectFileViewTool,
+    SysProjectKpisGetTool,
+    SysProjectKpisSetTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}
 READ_ONLY_TICKET_TOOLS: tuple[str, ...] = tuple(

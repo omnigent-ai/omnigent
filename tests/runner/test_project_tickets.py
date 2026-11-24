@@ -377,6 +377,7 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
             "sys_project_file_view",
             {"url": f"/v1/projects/{PROJECT}/ticket-attachments/{TICKET}/content"},
         ),
+        ("sys_project_kpis_get", {"window": "30d"}),
     ],
 )
 async def test_read_only_tools_only_send_gets(name, args):
@@ -386,6 +387,7 @@ async def test_read_only_tools_only_send_gets(name, args):
         "sys_ticket_get",
         "sys_project_identity_list",
         "sys_project_file_view",
+        "sys_project_kpis_get",
     )
     methods = []
 
@@ -404,7 +406,7 @@ async def test_read_only_tools_only_send_gets(name, args):
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 17
+    assert len(TICKET_TOOLS) == 19
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (
@@ -727,6 +729,43 @@ async def test_file_view_returns_a_ticket_screenshot_as_an_image(url):
         f"/v1/projects/{PROJECT}/ticket-attachments/{TICKET}/content",
         SOURCE,
     )
+
+
+async def test_kpi_tools_read_and_replace_the_projects_kpis():
+    seen: list = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.url.query, request.content))
+        if request.url.path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        return httpx.Response(200, json={"object": "project.kpis", "revision": 2})
+
+    kpi = {"name": "Spend", "metric": "spend_usd", "why": "Budget.", "target": 50}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        read = await execute_ticket_tool("sys_project_kpis_get", {}, client, SOURCE)
+        written = await execute_ticket_tool(
+            "sys_project_kpis_set",
+            {"kpis": [{**kpi, "direction": "at_most"}], "base_revision": 1},
+            client,
+            SOURCE,
+        )
+        invalid = await execute_ticket_tool(
+            "sys_project_kpis_set", {"kpis": [kpi]}, client, SOURCE
+        )
+    assert json.loads(read)["revision"] == 2
+    assert json.loads(written)["revision"] == 2
+    assert "error" in json.loads(invalid)
+    kpi_calls = [call for call in seen if call[1] == f"/v1/projects/{PROJECT}/kpis"]
+    assert [(method, query) for method, _, query, _ in kpi_calls] == [
+        ("GET", b"window=7d"),
+        ("PUT", b""),
+    ]
+    assert json.loads(kpi_calls[1][3]) == {
+        "kpis": [{**kpi, "direction": "at_most"}],
+        "base_revision": 1,
+    }
 
 
 async def test_file_view_refuses_another_projects_file_without_fetching_it():

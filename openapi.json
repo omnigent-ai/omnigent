@@ -4804,6 +4804,49 @@
         "title": "IncompleteEvent",
         "type": "object"
       },
+      "KpiMetric": {
+        "description": "One entry of the fixed metric catalog.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "enum": [
+              "merged_prs",
+              "spend_usd",
+              "tickets_shipped",
+              "rework_tickets",
+              "time_to_merged_median_hours",
+              "time_to_merged_p90_hours",
+              "none"
+            ],
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "unit": {
+            "enum": [
+              "count",
+              "usd",
+              "hours"
+            ],
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "unit",
+          "description"
+        ],
+        "title": "KpiMetric",
+        "type": "object"
+      },
       "LaunchRunnerRequest": {
         "description": "Request body for `POST /v1/hosts/{host_id}/runners`.",
         "properties": {
@@ -6877,6 +6920,442 @@
           }
         },
         "title": "ProjectIdentitySessionRequest",
+        "type": "object"
+      },
+      "ProjectKpi": {
+        "additionalProperties": false,
+        "description": "One KPI definition.",
+        "properties": {
+          "direction": {
+            "anyOf": [
+              {
+                "enum": [
+                  "at_least",
+                  "at_most"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "at_least: the value should reach the target; at_most: stay under it.",
+            "title": "Direction"
+          },
+          "metric": {
+            "description": "The computed metric this KPI tracks, or 'none' when it can't be measured yet (then give not_measured_reason).",
+            "enum": [
+              "merged_prs",
+              "spend_usd",
+              "tickets_shipped",
+              "rework_tickets",
+              "time_to_merged_median_hours",
+              "time_to_merged_p90_hours",
+              "none"
+            ],
+            "title": "Metric",
+            "type": "string"
+          },
+          "name": {
+            "description": "Short name, e.g. 'Weekly PRs'.",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "not_measured_reason": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required when metric is 'none': why it isn't measured yet.",
+            "title": "Not Measured Reason"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "format": "double",
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The target value in the metric's unit (count, USD or hours).",
+            "title": "Target"
+          },
+          "why": {
+            "description": "Why it matters to the project, in a sentence.",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Why",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "metric",
+          "why"
+        ],
+        "title": "ProjectKpi",
+        "type": "object"
+      },
+      "ProjectKpiRevision": {
+        "description": "A stored revision of the KPI set: the set itself and who wrote it, when.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By Session Id"
+          },
+          "created_by_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By User Id"
+          },
+          "kpis": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectKpi"
+            },
+            "title": "Kpis",
+            "type": "array"
+          },
+          "revision": {
+            "format": "int64",
+            "title": "Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "kpis",
+          "created_by_user_id",
+          "created_by_session_id",
+          "created_at"
+        ],
+        "title": "ProjectKpiRevision",
+        "type": "object"
+      },
+      "ProjectKpiRevisionPage": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectKpiRevision"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "object": {
+            "const": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object",
+          "data",
+          "has_more"
+        ],
+        "title": "ProjectKpiRevisionPage",
+        "type": "object"
+      },
+      "ProjectKpiValue": {
+        "description": "One KPI with its value for the window.",
+        "properties": {
+          "direction": {
+            "anyOf": [
+              {
+                "enum": [
+                  "at_least",
+                  "at_most"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Direction"
+          },
+          "metric": {
+            "enum": [
+              "merged_prs",
+              "spend_usd",
+              "tickets_shipped",
+              "rework_tickets",
+              "time_to_merged_median_hours",
+              "time_to_merged_p90_hours",
+              "none"
+            ],
+            "title": "Metric",
+            "type": "string"
+          },
+          "metric_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The metric's display name; null for 'none'.",
+            "title": "Metric Label"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "not_measured_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Not Measured Reason"
+          },
+          "position": {
+            "format": "int64",
+            "title": "Position",
+            "type": "integer"
+          },
+          "sample_size": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Tickets behind a time-to-merged value; null for other metrics.",
+            "title": "Sample Size"
+          },
+          "status": {
+            "description": "met or missed against the target; no_data when nothing happened to measure; unavailable when the metric's source isn't on this server; not_measured for 'none'.",
+            "enum": [
+              "met",
+              "missed",
+              "no_data",
+              "unavailable",
+              "not_measured"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "enum": [
+                  "count",
+                  "usd",
+                  "hours"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "count, usd or hours; null for 'none'.",
+            "title": "Unit"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The window's value in the unit; null when unmeasured or without data.",
+            "title": "Value"
+          },
+          "why": {
+            "title": "Why",
+            "type": "string"
+          }
+        },
+        "required": [
+          "position",
+          "name",
+          "metric",
+          "metric_label",
+          "unit",
+          "why",
+          "target",
+          "direction",
+          "not_measured_reason",
+          "value",
+          "sample_size",
+          "status"
+        ],
+        "title": "ProjectKpiValue",
+        "type": "object"
+      },
+      "ProjectKpis": {
+        "description": "The project's current KPI set with each value over a UTC window.",
+        "properties": {
+          "can_edit": {
+            "description": "Whether the caller (the owner) may change the KPIs.",
+            "title": "Can Edit",
+            "type": "boolean"
+          },
+          "generated_at": {
+            "format": "int64",
+            "title": "Generated At",
+            "type": "integer"
+          },
+          "kpis": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectKpiValue"
+            },
+            "title": "Kpis",
+            "type": "array"
+          },
+          "metrics": {
+            "description": "The metrics a KPI may track.",
+            "items": {
+              "$ref": "#/components/schemas/KpiMetric"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "object": {
+            "const": "project.kpis",
+            "title": "Object",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "revision": {
+            "description": "The current revision; 0 when KPIs were never set.",
+            "format": "int64",
+            "title": "Revision",
+            "type": "integer"
+          },
+          "since_day_utc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since Day Utc"
+          },
+          "today_utc": {
+            "title": "Today Utc",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "updated_by_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated By Session Id"
+          },
+          "updated_by_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated By User Id"
+          },
+          "window": {
+            "enum": [
+              "7d",
+              "30d",
+              "all"
+            ],
+            "title": "Window",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object",
+          "project_id",
+          "window",
+          "today_utc",
+          "since_day_utc",
+          "generated_at",
+          "revision",
+          "updated_at",
+          "updated_by_user_id",
+          "updated_by_session_id",
+          "can_edit",
+          "kpis",
+          "metrics"
+        ],
+        "title": "ProjectKpis",
         "type": "object"
       },
       "ProjectOrderRequest": {
@@ -15510,6 +15989,40 @@
         "title": "SetProactiveAgentPrompt",
         "type": "object"
       },
+      "SetProjectKpis": {
+        "additionalProperties": false,
+        "description": "Replace the project's KPI set by appending a new revision.",
+        "properties": {
+          "base_revision": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The revision this edit starts from (0 when none exists yet). When given and it isn't the current revision, the write is refused so a concurrent edit isn't overwritten.",
+            "title": "Base Revision"
+          },
+          "kpis": {
+            "description": "The complete new set, in display order; an empty list clears it.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectKpi"
+            },
+            "maxItems": 6,
+            "title": "Kpis",
+            "type": "array"
+          }
+        },
+        "required": [
+          "kpis"
+        ],
+        "title": "SetProjectKpis",
+        "type": "object"
+      },
       "SetSharingRequest": {
         "description": "Body for `PUT /v1/sharing`.\n\nEvery field is optional so an admin can update each setting\nindependently; at least one must be present.",
         "properties": {
@@ -22791,6 +23304,208 @@
           }
         },
         "summary": "Open Identity Session",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/kpis": {
+      "get": {
+        "description": "The current KPIs, each with its value, target and status for the window.\n\nAny project member may read them.",
+        "operationId": "get_project_kpis_v1_projects__project_id__kpis_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+              "enum": [
+                "7d",
+                "30d",
+                "all"
+              ],
+              "title": "Window",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectKpis"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Kpis",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Replace the KPI set by appending a revision; returns the new set's values.\n\nOnly the project owner, or the project's Lead session, may write.",
+        "operationId": "set_project_kpis_v1_projects__project_id__kpis_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+              "enum": [
+                "7d",
+                "30d",
+                "all"
+              ],
+              "title": "Window",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProjectKpis"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectKpis"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Project Kpis",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/kpis/revisions": {
+      "get": {
+        "description": "The KPI set's history, newest first, with who changed it and when.",
+        "operationId": "list_project_kpi_revisions_v1_projects__project_id__kpis_revisions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only revisions older than this one.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only revisions older than this one.",
+              "title": "Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectKpiRevisionPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Project Kpi Revisions",
         "tags": [
           "projects"
         ]

@@ -1137,6 +1137,22 @@ class SqlProjectTicketRead(OmnigentBase):
     seen_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class SqlProjectKpiRevision(OmnigentBase):
+    """One append-only revision of a project's KPI set; the highest revision is current."""
+
+    __tablename__ = "project_kpi_revisions"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # 1, 2, 3... per project; the primary key makes concurrent appends collide.
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kpis: Mapped[list[dict[str, Any]]] = mapped_column(EnvelopedJSON(16383), nullable=False)
+    created_by_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # The agent session that wrote it, or NULL for a person in the UI.
+    created_by_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class SqlProjectTicketLink(OmnigentBase):
     """An untyped, undirected link stored once with the smaller ticket ID first."""
 

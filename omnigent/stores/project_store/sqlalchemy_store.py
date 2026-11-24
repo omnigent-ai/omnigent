@@ -18,6 +18,7 @@ from omnigent.db.db_models import (
     SqlPreference,
     SqlProject,
     SqlProjectIdentity,
+    SqlProjectKpiRevision,
     SqlProjectShare,
     SqlProjectTicket,
     SqlProjectTicketEvent,
@@ -643,12 +644,13 @@ class SqlAlchemyProjectStore(ProjectStore):
                 )
             for identity in self._identity_rows(session, project_id):
                 session.delete(identity)
-            session.execute(
-                delete(SqlProjectShare).where(
-                    SqlProjectShare.workspace_id == current_workspace_id(),
-                    SqlProjectShare.project_id == project_id,
+            for model in (SqlProjectShare, SqlProjectKpiRevision):
+                session.execute(
+                    delete(model).where(
+                        model.workspace_id == current_workspace_id(),
+                        model.project_id == project_id,
+                    )
                 )
-            )
             session.delete(row)
             return True
 

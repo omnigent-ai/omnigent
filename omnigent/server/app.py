@@ -4690,6 +4690,22 @@ def create_app(
                 prefix="/v1",
                 tags=["projects"],
             )
+            kpi_location = getattr(project_store, "storage_location", None)
+            if kpi_location:
+                from omnigent.server.routes.project_kpis import create_project_kpis_router
+                from omnigent.stores.project_kpi_store import ProjectKpiStore
+
+                app.include_router(
+                    create_project_kpis_router(
+                        project_store,
+                        ProjectKpiStore(kpi_location),
+                        ticket_store,
+                        conversation_store,
+                        auth_provider=auth_provider,
+                    ),
+                    prefix="/v1",
+                    tags=["projects"],
+                )
             from omnigent.server.routes.ticket_requests import create_ticket_requests_router
 
             app.include_router(

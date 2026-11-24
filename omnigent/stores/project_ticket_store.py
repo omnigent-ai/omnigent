@@ -483,6 +483,50 @@ class ProjectTicketStore:
                 )
             return moves
 
+    def stage_histories(
+        self, project_id: str, *, user_id: str | None
+    ) -> builtins.dict[str, builtins.list[dict[str, Any]]]:
+        """Each ticket's stages in time order, starting with the one it was created in.
+
+        Readable by any project member. Maps ticket ID to ``{"stage_id",
+        "is_complete", "at", "created"}`` entries; ``created`` marks the ticket's
+        creation, missing for tickets created before stages were recorded.
+        """
+        with self._session("list_ticket_stage_histories") as session:
+            self._project(session, project_id, user_id)
+            stmt = (
+                select(SqlProjectTicketEvent)
+                .where(
+                    SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                    SqlProjectTicketEvent.project_id == _identifier(project_id),
+                    SqlProjectTicketEvent.kind.in_(
+                        (EVENT_CODES["created"], EVENT_CODES["updated"])
+                    ),
+                )
+                .order_by(SqlProjectTicketEvent.ticket_id, SqlProjectTicketEvent.position)
+            )
+            histories: dict[str, builtins.list[dict[str, Any]]] = {}
+            for row in session.scalars(stmt):
+                payload = row.payload or {}
+                stage = payload.get("stage")
+                if not isinstance(stage, dict) or not isinstance(stage.get("id"), str):
+                    continue
+                if row.kind == EVENT_CODES["updated"]:
+                    changes = payload.get("changes")
+                    if not isinstance(changes, dict) or "stage_id" not in changes:
+                        continue
+                elif row.ticket_id in histories:
+                    continue
+                histories.setdefault(row.ticket_id, []).append(
+                    {
+                        "stage_id": stage["id"],
+                        "is_complete": stage.get("is_complete") is True,
+                        "at": row.created_at,
+                        "created": row.kind == EVENT_CODES["created"],
+                    }
+                )
+            return histories
+
     @classmethod
     def _human_asks(cls, session: Session, ticket: SqlProjectTicket) -> builtins.list[_HumanAsk]:
         return cls._human_asks_for(session, ticket, ticket.id)
