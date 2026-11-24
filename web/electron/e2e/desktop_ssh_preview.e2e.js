@@ -1,6 +1,6 @@
 "use strict";
 
-const { it } = require("node:test");
+const { after, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
@@ -15,8 +15,29 @@ const { openSessionBrowserTab } = require("./desktopBrowserTabHarness");
 const deps = desktopDepsAvailable();
 const HOST = "c".repeat(32);
 const OTHER_HOST = "d".repeat(32);
+const trustSources = ["SSH", "settings"];
+const journeyResults = {};
 
-for (const trustSource of ["SSH", "settings"]) {
+after(() => {
+  const recordRoot = process.env.OMNIGENT_DESKTOP_RECORD_DIR;
+  if (!recordRoot) return;
+  fs.mkdirSync(recordRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(recordRoot, "evidence.json"),
+    JSON.stringify(
+      {
+        result: trustSources.every((source) => journeyResults[source] === "passed")
+          ? "passed"
+          : "incomplete",
+        journeys: journeyResults,
+      },
+      null,
+      2,
+    ),
+  );
+});
+
+for (const trustSource of trustSources) {
   const settingsTrust = trustSource === "settings";
   it(
     `opens a remote localhost preview through ${trustSource} trust`,
@@ -344,6 +365,7 @@ for (const trustSource of ["SSH", "settings"]) {
             path.join(recordRoot, "evidence.json"),
             JSON.stringify(evidence, null, 2),
           );
+          journeyResults[trustSource] = evidence.result || "failed";
           fs.rmSync(scratch, { recursive: true, force: true });
           console.log(`${trustSource} preview evidence: ${recordRoot}`);
         }

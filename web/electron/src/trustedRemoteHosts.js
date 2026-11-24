@@ -28,13 +28,7 @@ function readTrustedRemoteHosts(value) {
   return hosts;
 }
 
-/**
- * True when the session runs on a host the user explicitly trusted for its
- * server: the trusted entry must match both the window's server and the
- * session's own server target, and the session's host ID must match the
- * trusted host ID exactly. A host whose identity changes matches no entry,
- * so its trust lapses without any stored state to revoke.
- */
+/** Match explicit trust against both server targets and the session host. */
 function isTrustedRemoteContext(entries, context, serverTarget) {
   if (!Array.isArray(entries) || context == null) return false;
   const target = trustedRemoteTarget(serverTarget);

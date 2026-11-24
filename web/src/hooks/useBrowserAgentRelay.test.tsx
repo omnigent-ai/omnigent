@@ -413,9 +413,17 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
   });
 
-  it.each([false, true])("isolates SSH identity: %s", async (ssh) => {
+  it.each([
+    { name: "recovery", response: { ok: true }, remembersHost: true },
+    { name: "SSH", response: { ok: true, sshPreviewHost: true }, remembersHost: false },
+    {
+      name: "trusted remote",
+      response: { ok: true, trustedRemotePreviewHost: true },
+      remembersHost: false,
+    },
+  ])("isolates preview identity: $name", async ({ response, remembersHost }) => {
     const bridge = installBridge({
-      browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, sshPreviewHost: ssh }),
+      browserOpenOrNavigate: vi.fn().mockResolvedValue(response),
     });
     const client = new QueryClient();
     client.setQueryData(
@@ -456,7 +464,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
         sourceIsArcaHost: true,
       },
     );
-    if (ssh) {
+    if (!remembersHost) {
       expect({ ...localStorage }).toEqual(storageBefore);
       return;
     }
