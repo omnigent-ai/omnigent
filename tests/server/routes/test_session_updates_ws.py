@@ -843,6 +843,9 @@ def test_a_workflow_runs_step_reaches_the_session_list_and_stream(
     Both read the progress the journal keeps on the session's heads row, so
     neither reads the journal itself.
     """
+    import sqlalchemy as sa
+
+    from omnigent.db.db_models import SqlSessionJournalHead
     from omnigent.server.feature_flags import Feature, FeatureFlags
     from omnigent.stores.session_journal_store import SessionJournalStore
 
@@ -881,9 +884,32 @@ def test_a_workflow_runs_step_reaches_the_session_list_and_stream(
             "name": "Open PRs for safe upgrades",
             "state": "started",
         }
+
+        # A server that doesn't record progress writes next, so the open
+        # sidebar's step clears instead of going stale.
+        with sa.create_engine(db_uri).begin() as connection:
+            connection.execute(
+                sa.update(SqlSessionJournalHead).values(
+                    next_position=SqlSessionJournalHead.next_position + 1
+                )
+            )
+        cleared = _recv_until(ws, {"changed"})
+        assert cleared["items"][0]["plan_progress"] is None
+        journal.append(
+            s1,
+            "status",
+            {"status": "done", "text": "3 PRs"},
+            idempotency_key="k3",
+            step="open-prs",
+        )
+        changed = _recv_until(ws, {"changed"})
     headers = {"X-Forwarded-Email": ALICE}
     [item] = TestClient(app).get("/v1/sessions", headers=headers).json()["data"]
-    assert item["plan_progress"] == changed["items"][0]["plan_progress"]
+    # The list leaves out null fields, such as a finished plan's step; the stream sends them.
+    streamed = changed["items"][0]["plan_progress"]
+    assert item["plan_progress"] == {
+        key: value for key, value in streamed.items() if value is not None
+    }
 
     # Without workflows, the list reads no progress.
     app.state.feature_flags = FeatureFlags()

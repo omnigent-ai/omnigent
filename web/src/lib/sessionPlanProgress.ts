@@ -74,5 +74,8 @@ export function planProgressLine(
       return { ...line, lead: { text: "Failed", tone: "failed" }, text: step.name };
     case "next":
       return { ...line, lead: { text: "Next", tone: "muted" }, text: step.name };
+    default:
+      // A state from a newer server still names its step.
+      return { ...line, text: step.name };
   }
 }

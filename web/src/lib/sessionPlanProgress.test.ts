@@ -72,6 +72,11 @@ describe("planProgressLine", () => {
     expect(planProgressLine(progress, false)?.text).toBe("All done");
   });
 
+  it("names the step for a state it doesn't know", () => {
+    const progress = { total: 2, started: 1, step: { name: "Deploy", state: "paused" as never } };
+    expect(planProgressLine(progress, false)).toMatchObject({ lead: null, text: "Deploy" });
+  });
+
   it("shows nothing until a step has a status", () => {
     // A planning chat's proposal, or a run whose first step hasn't started.
     expect(planProgressLine({ total: 5, step: step("Inventory", "next") }, false)).toBeNull();
