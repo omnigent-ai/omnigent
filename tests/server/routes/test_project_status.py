@@ -134,8 +134,9 @@ async def test_summary_counts_completed_moves_and_reports_missing_sources(
         "UTC",
         1,
     )
-    assert body["sources"] == {"spend": "unavailable", "prs_merged": "unavailable"}
-    assert body["totals"]["spend_cents"] is None
+    # The spend source is installed; this project has no recorded spend yet.
+    assert body["sources"] == {"spend": "available", "prs_merged": "unavailable"}
+    assert body["totals"]["spend_cents"] == 0
     owner = next(row for row in body["members"] if row["kind"] == "human")
     assert owner["tickets_done"] == 1
     assert (await project_client.get(f"{project}/status/summary?window=1d")).status_code == 422

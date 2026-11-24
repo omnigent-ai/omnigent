@@ -1,0 +1,115 @@
+"""Project spend in cents, attributed per member through each root session."""
+
+from __future__ import annotations
+
+import dataclasses
+import uuid
+
+from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
+from omnigent.server import session_live_state
+from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.project_status import (
+    LEAD_MEMBER_KEY,
+    UNAVAILABLE,
+    WORKERS_MEMBER_KEY,
+    status_period,
+)
+from omnigent.server.project_status_spend import ProjectSpend, build_source, usd_to_cents
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+# 2026-06-10T12:00:00Z
+NOW = 1781092800
+
+
+def test_spend_sums_cents_per_member_and_day_through_root_sessions(db_uri: str) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    project = SqlAlchemyProjectStore(db_uri).create(uuid.uuid4().hex, "zz-spend", "owner")
+    other_project = SqlAlchemyProjectStore(db_uri).create(uuid.uuid4().hex, "zz-other", "owner")
+
+    lead = conversations.create_conversation(project_id=project.id)
+    project = dataclasses.replace(project, main_session_id=lead.id)
+    persona = conversations.create_conversation(
+        project_id=project.id, labels={PROJECT_IDENTITY_LABEL_KEY: "reviewer-id"}
+    )
+    human = conversations.create_conversation(project_id=project.id)
+    permissions.grant("alice", human.id, LEVEL_OWNER)
+    # A sub-agent with no project of its own still counts for its root's member.
+    sub_agent = conversations.create_conversation(parent_conversation_id=human.id)
+    elsewhere = conversations.create_conversation(project_id=other_project.id)
+
+    conversations.add_session_daily_cost(lead.id, "2026-06-10", 0.105)
+    conversations.add_session_daily_cost(persona.id, "2026-06-09", 0.333)
+    conversations.add_session_daily_cost(persona.id, "2026-06-10", 0.333)
+    conversations.add_session_daily_cost(human.id, "2026-06-04", 1.00)
+    conversations.add_session_daily_cost(sub_agent.id, "2026-06-10", 2.004)
+    # Outside the 7-day window (it starts 2026-06-04) and in another project.
+    conversations.add_session_daily_cost(human.id, "2026-06-03", 50.0)
+    conversations.add_session_daily_cost(elsewhere.id, "2026-06-10", 9.0)
+
+    source = ProjectSpend(conversations)
+    period = status_period("7d", NOW)
+    breakdown = source.breakdown(project, period)
+    assert breakdown is not None
+    # 0.105 + 0.666 + 1.00 + 2.004 = 3.775, rounded once.
+    assert breakdown.total == 378
+    assert breakdown.by_member == {
+        LEAD_MEMBER_KEY: 11,
+        "identity:reviewer-id": 67,
+        "user:alice": 300,
+    }
+    assert breakdown.by_day == {"2026-06-04": 100, "2026-06-09": 33, "2026-06-10": 244}
+    assert breakdown.by_member_day["user:alice"] == {"2026-06-04": 100, "2026-06-10": 200}
+
+    totals = source.spend(project, period)
+    assert (totals.total, totals.by_member, totals.available) == (
+        378,
+        breakdown.by_member,
+        True,
+    )
+    # "all" has no lower bound, so the older day counts too.
+    assert source.spend(project, status_period("all", NOW)).total == 5378
+
+
+def test_family_sessions_count_for_the_workers_pool(db_uri: str) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    project = SqlAlchemyProjectStore(db_uri).create(uuid.uuid4().hex, "zz-spend", "owner")
+    worker = conversations.create_conversation(project_id=project.id)
+    worker = dataclasses.replace(worker, family_id=uuid.uuid4().hex)
+    conversations.add_session_daily_cost(worker.id, "2026-06-10", 1.0)
+
+    class FamilyStore:
+        """Reports the worker as part of a session family."""
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(conversations, name)
+
+        def get_conversation(self, conversation_id: str):  # type: ignore[no-untyped-def]
+            return worker if conversation_id == worker.id else None
+
+    totals = ProjectSpend(FamilyStore()).spend(project, status_period("7d", NOW))  # type: ignore[arg-type]
+    assert totals.by_member == {WORKERS_MEMBER_KEY: 100}
+
+
+def test_spend_is_unavailable_without_a_store(db_uri: str, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class NoStores:
+        """App state without a conversation store."""
+
+    monkeypatch.setattr(session_live_state, "conversation_store", lambda: None)
+    project = SqlAlchemyProjectStore(db_uri).create(uuid.uuid4().hex, "zz-spend", "owner")
+    source = build_source(NoStores())
+    assert source.spend(project, status_period("7d", NOW)) is UNAVAILABLE
+
+
+def test_usd_to_cents_rounds_to_the_nearest_cent() -> None:
+    # Halves round up, including amounts floats can't represent exactly.
+    assert [usd_to_cents(value) for value in (0.0, 0.004, 0.005, 0.006, 1.0, 53.775)] == [
+        0,
+        0,
+        1,
+        1,
+        100,
+        5378,
+    ]

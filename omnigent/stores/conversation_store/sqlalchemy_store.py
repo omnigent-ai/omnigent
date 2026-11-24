@@ -32,7 +32,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.orm import QueryableAttribute, Session, load_only
+from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.selectable import Subquery
 
@@ -2607,6 +2607,47 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlSessionDailyCost.day_utc >= since_day_utc)
             ).scalar_one()
             return float(total or 0.0)
+
+    def list_project_root_daily_costs(
+        self, project_id: str, since_day_utc: str | None
+    ) -> list[tuple[str, str, float]]:
+        """See :meth:`ConversationStore.list_project_root_daily_costs`."""
+        own_meta = aliased(SqlConversationMetadata)
+        root_meta = aliased(SqlConversationMetadata)
+        workspace_id = current_workspace_id()
+        query = (
+            select(
+                SqlConversation.root_conversation_id,
+                SqlSessionDailyCost.day_utc,
+                SqlSessionDailyCost.cost_usd,
+            )
+            .join(
+                SqlConversation,
+                (SqlConversation.workspace_id == SqlSessionDailyCost.workspace_id)
+                & (SqlConversation.id == SqlSessionDailyCost.conversation_id),
+            )
+            .outerjoin(
+                own_meta,
+                (own_meta.workspace_id == SqlConversation.workspace_id)
+                & (own_meta.id == SqlConversation.id),
+            )
+            .outerjoin(
+                root_meta,
+                (root_meta.workspace_id == SqlConversation.workspace_id)
+                & (root_meta.id == SqlConversation.root_conversation_id),
+            )
+            .where(SqlSessionDailyCost.workspace_id == workspace_id)
+            .where(or_(own_meta.project_id == project_id, root_meta.project_id == project_id))
+            # Daily rows only; longer keys would be period rollups.
+            .where(func.length(SqlSessionDailyCost.day_utc) == 10)
+        )
+        if since_day_utc is not None:
+            query = query.where(SqlSessionDailyCost.day_utc >= since_day_utc)
+        with self._session("list_project_root_daily_costs") as session:
+            return [
+                (str(root_id), str(day), float(cost or 0.0))
+                for root_id, day, cost in session.execute(query)
+            ]
 
     def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
         """

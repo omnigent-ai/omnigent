@@ -1781,6 +1781,23 @@ class ConversationStore(ABC):
         del project_id, since_day_utc
         return 0.0
 
+    def list_project_root_daily_costs(
+        self, project_id: str, since_day_utc: str | None
+    ) -> list[tuple[str, str, float]]:
+        """
+        List a project's spend per root session and UTC day.
+
+        A sub-agent's spend is reported under its root session, and a session
+        counts for the project when it or its root belongs to it.
+
+        :param project_id: The project, as a 32-char hex id.
+        :param since_day_utc: Inclusive lower-bound UTC day, or ``None`` for all days.
+        :returns: ``(root_conversation_id, day_utc, cost_usd)`` rows; the same
+            root and day may repeat (one row per sub-agent).
+        """
+        del project_id, since_day_utc
+        return []
+
     @abstractmethod
     def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
         """
