@@ -88,7 +88,11 @@ def stores_gadget_grants(permission_store: PermissionStore | None) -> bool:
 
 
 def _grantee_to_remove(store: PermissionStore, gadget_id: str, user_id: str) -> str:
-    """The spelling under which the gadget holds *user_id*'s grant (see workflows)."""
+    """The spelling under which the gadget holds *user_id*'s grant (see workflows).
+
+    The same case-insensitive match a grant uses, so a revoke in another letter case
+    removes the grant it would have replaced instead of answering 204 and keeping it.
+    """
     if store.resolve_gadget_access([user_id], gadget_id) is not None:
         return user_id
     try:
@@ -97,8 +101,8 @@ def _grantee_to_remove(store: PermissionStore, gadget_id: str, user_id: str) -> 
         _logger.warning(
             "could not resolve %r to remove it; using it as given", user_id, exc_info=True
         )
-        return user_id
-    return grantee
+        grantee = user_id
+    return store.gadget_grantee_spelling(gadget_id, grantee) or grantee
 
 
 def _permission_object(grant: GadgetPermission, names: dict[str, str]) -> GadgetPermissionObject:

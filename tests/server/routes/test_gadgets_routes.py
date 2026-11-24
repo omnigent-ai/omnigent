@@ -571,6 +571,25 @@ async def test_a_re_share_in_another_case_updates_a_non_ascii_grantees_grant(
     assert stores.permissions.resolve_gadget_access([grantee], gadget["id"]) == 1
 
 
+async def test_a_revoke_in_another_case_removes_the_grant_held_under_the_stored_id(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    grantee = "Ömer@Example.com"
+    stores.permissions.ensure_user(grantee)
+    gadget = await _published(client)
+    base = f"/v1/gadgets/{gadget['id']}"
+    granted = await client.put(
+        f"{base}/permissions", json={"user_id": grantee, "level": 2}, headers=_as(ALICE)
+    )
+    assert granted.status_code == 200, granted.text
+    revoked = await client.delete(f"{base}/permissions/ömer@EXAMPLE.com", headers=_as(ALICE))
+    assert revoked.status_code == 204, revoked.text
+    # Gone under the ID the grant was stored with, not only under the spelling revoked.
+    assert stores.permissions.resolve_gadget_access([grantee], gadget["id"]) is None
+    grants, _ = stores.permissions.list_for_gadget(gadget["id"])
+    assert grants == []
+
+
 async def test_a_grant_finds_an_existing_spelling_without_reading_the_grant_list(
     client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
