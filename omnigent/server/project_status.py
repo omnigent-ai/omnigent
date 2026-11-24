@@ -9,7 +9,8 @@ Every number on a project's Summary page comes from here, so they agree:
 - **Members:** the project's people (owner and shared members) and its agent
   identities (the Lead and personas), side by side. Agent sessions that belong
   to no identity, such as ad-hoc workers, count as one ``agents:workers`` member.
-- **Money:** integer US cents.
+- **Money:** integer US cents. Sum exactly, then round each reported figure
+  once, half up ($0.105 is 11 cents); never round a float sum with ``round``.
 
 Spend and PRs merged come from pluggable sources. Each lives in its own module
 (:data:`SPEND_SOURCE_MODULE`, :data:`PRS_MERGED_SOURCE_MODULE`) exposing
@@ -178,9 +179,10 @@ def load_status_sources(app_state: Any) -> StatusSources:
 
 
 def _cents_per_pr(spend: int | None, prs: int | None) -> int | None:
+    """Spend per merged PR, rounded half up like every other cents figure."""
     if spend is None or not prs:
         return None
-    return round(spend / prs)
+    return (2 * spend + prs) // (2 * prs)
 
 
 def summary_members(

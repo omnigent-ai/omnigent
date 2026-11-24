@@ -109,8 +109,8 @@ def test_unavailable_sources_report_null_not_zero() -> None:
         prs_merged=MemberTotals(2, {LEAD_MEMBER_KEY: 2}),
     )
     lead = next(row for row in with_prs["members"] if row["key"] == LEAD_MEMBER_KEY)
-    assert (lead["prs_merged"], lead["cost_per_merged_pr_cents"]) == (2, 500)
-    assert with_prs["totals"]["cost_per_merged_pr_cents"] == 500
+    assert (lead["prs_merged"], lead["cost_per_merged_pr_cents"]) == (2, 501)
+    assert with_prs["totals"]["cost_per_merged_pr_cents"] == 501
 
 
 async def test_summary_counts_completed_moves_and_reports_missing_sources(
