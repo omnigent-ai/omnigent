@@ -48,7 +48,7 @@ from omnigent.server.persona_mentions import (
     deliver_mentions,
     find_mentions,
 )
-from omnigent.server.project_landing import RISK_OK_LABEL
+from omnigent.server.project_landing import RISK_OK_LABEL, is_pure_rebase
 from omnigent.server.project_status_spend import project_total_cents
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
@@ -218,6 +218,15 @@ def _spawn_mention_delivery(
 _review_limiter = RouteLimiter()
 # Reviewer rounds since the ticket last entered Review, for the escalation reminder.
 _review_rounds: dict[str, int] = {}
+# Tickets whose next Reviewer round only re-approves a pure rebase, so it isn't counted.
+_rebase_only_rounds: set[str] = set()
+
+
+def _count_review_round(ticket_id: str) -> None:
+    if ticket_id in _rebase_only_rounds:
+        _rebase_only_rounds.discard(ticket_id)
+        return
+    _review_rounds[ticket_id] = _review_rounds.get(ticket_id, 0) + 1
 
 
 def _stable_id(*parts: object) -> str:
@@ -256,6 +265,7 @@ def _spawn_review_routing(
         event = f"{ticket['id']}:{ticket['comment_count']}:{ticket.get('updated_at')}"
         if entered_review:
             _review_rounds[ticket["id"]] = 0
+            _rebase_only_rounds.discard(ticket["id"])
             session_id = await targets.open(request, project, reviewer)
             if session_id and session_id != who.session_id:
                 message = reviewer_handoff_message(ticket, text, who.session_id)
@@ -263,7 +273,7 @@ def _spawn_review_routing(
             return
         assert text is not None
         if author_is_reviewer:
-            _review_rounds[ticket["id"]] = _review_rounds.get(ticket["id"], 0) + 1
+            _count_review_round(ticket["id"])
             linked = await asyncio.to_thread(
                 notifications.tickets.ticket_session_ids, project.id, ticket["id"]
             )
@@ -478,6 +488,10 @@ def create_project_tickets_router(
         approved = label_value(ticket.get("labels"), APPROVED_LABEL)
         newer = None if author_is_reviewer else superseding_sha(text, approved)
         if newer is not None:
+            assert approved is not None
+            rebase_only = await asyncio.to_thread(is_pure_rebase, project.config, approved, newer)
+            if rebase_only:
+                _rebase_only_rounds.add(ticket["id"])
             kept = [
                 TicketLabel(**label)
                 for label in ticket.get("labels") or []
@@ -492,7 +506,14 @@ def create_project_tickets_router(
                         labels=kept,
                         comment=(
                             f"Approval cleared: commit `{newer}` supersedes the approved "
-                            f"`{approved}`. The Reviewer re-reviews it."
+                            f"`{approved}`. "
+                            + (
+                                "It is the identical patch rebased, so the landing queue "
+                                "carries the approval; re-review is optional and doesn't "
+                                "count as a review round."
+                                if rebase_only
+                                else "The Reviewer re-reviews it."
+                            )
                         ),
                     ),
                     who,

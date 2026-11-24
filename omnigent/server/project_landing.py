@@ -9,7 +9,13 @@ Submissions that arrive close together form one batch: each is fast-forwarded in
 turn, the web app is rebuilt once if any landed change touched ``web/``, the
 tickets move to the stage before the completed one, and one detached restart
 runs. Any git, build or restart failure stops the queue for that project and
-escalates to the lead. The queue never pushes, resets, rebases or forces.
+escalates to the lead. The queue never pushes, resets or forces.
+
+An approval carries to another SHA only as the identical patch: the same commits by
+``git patch-id --stable``, in order, with the same trailers, fast-forwarding the tip.
+When an approved SHA no longer fast-forwards, the queue cherry-picks it onto the tip
+in a scratch worktree. A carried approval lands only after ``tsc`` and ``oxlint``
+(when ``web/`` changed) and the ticket's ``targeted-tests`` pass on the new SHA.
 
 Project config ``landing`` (owner-only): ``enabled``, plus optional ``checkout``
 and ``branch`` for a throwaway target (a worktree of the same repository) and
@@ -25,6 +31,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -32,7 +39,12 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
-from omnigent.entities.project_ticket import CommentOnTicket, TicketActor, UpdateTicket
+from omnigent.entities.project_ticket import (
+    CommentOnTicket,
+    TicketActor,
+    TicketLabel,
+    UpdateTicket,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.github_pr_intake import OWNER_OK_LABEL, is_outside_requester
 from omnigent.server.product_approval import (
@@ -49,6 +61,8 @@ APPROVED_LABEL = "approved"
 RISK_LABEL = "risk"
 RISK_OK_LABEL = "risk-ok"
 REVIEWER_IDENTITY = "reviewer"
+TARGETED_TESTS_LABEL = "targeted-tests"
+_TEST_TIMEOUT_S = 20 * 60
 NOTE_PREFIX = "Landing queue"
 LANDING_AGENT_ID = uuid.uuid5(uuid.NAMESPACE_URL, "omnigent:project-landing-queue").hex
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -117,6 +131,173 @@ def _common_dir(checkout: Path) -> Path:
 
 def refuse(message: str) -> OmnigentError:
     return OmnigentError(message, code=ErrorCode.CONFLICT)
+
+
+# -- approval carry: identical patches across rebases ------------------------------------
+
+
+def _is_ancestor(checkout: Path, ancestor: str, descendant: str) -> bool:
+    return (
+        _git(checkout, "merge-base", "--is-ancestor", ancestor, descendant, check=False).returncode
+        == 0
+    )
+
+
+def _patch_id(checkout: Path, commit: str) -> str | None:
+    diff = _git(checkout, "diff-tree", "--patch", "--no-color", "--full-index", commit).stdout
+    result = subprocess.run(
+        ["git", "-C", str(checkout), "patch-id", "--stable"],
+        input=diff,
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT_S,
+        check=False,
+    )
+    words = result.stdout.split()
+    return words[0] if result.returncode == 0 and words else None
+
+
+def _branch_commits(checkout: Path, head: str, onto: str) -> list[str] | None:
+    """*head*'s own commits since it forked from *onto*, oldest first; None with a merge."""
+    base = _git(checkout, "merge-base", onto, head).stdout.strip()
+    if _git(checkout, "rev-list", "--merges", f"{base}..{head}").stdout.strip():
+        return None
+    return _git(checkout, "rev-list", "--reverse", f"{base}..{head}").stdout.split()
+
+
+def patch_identity_problem(checkout: Path, source: str, candidate: str, onto: str) -> str | None:
+    """Why *candidate* isn't the approved *source* re-applied commit for commit, else None.
+
+    Each branch's commits are taken from where it forked from *onto* (the integration
+    tip). A carry needs the same count, the same ``git patch-id --stable`` in order,
+    and the same trailers on each commit.
+    """
+    old = _branch_commits(checkout, source, onto)
+    new = _branch_commits(checkout, candidate, onto)
+    if old is None or new is None:
+        return "a merge commit is in the range"
+    if not old:
+        return f"the approved `{source[:12]}` has no commits left to land"
+    if len(old) != len(new):
+        return f"{len(new)} commit(s) where {len(old)} were approved"
+    for position, (before, after) in enumerate(zip(old, new, strict=True), start=1):
+        before_id, after_id = _patch_id(checkout, before), _patch_id(checkout, after)
+        if before_id is None or after_id is None or before_id != after_id:
+            return f"commit {position} (`{after[:12]}`) changes a different patch"
+        trailers = [
+            _git(checkout, "log", "-1", "--format=%(trailers:unfold)", sha).stdout.strip()
+            for sha in (before, after)
+        ]
+        if trailers[0] != trailers[1]:
+            return f"commit {position} (`{after[:12]}`) has different trailers"
+    return None
+
+
+@contextlib.contextmanager
+def _scratch_worktree(checkout: Path, commit: str) -> Any:
+    """A detached throwaway worktree at *commit*, removed afterwards."""
+    path = _state_dir() / "scratch" / uuid.uuid4().hex
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _git(checkout, "worktree", "add", "--detach", str(path), commit)
+    try:
+        yield path
+    finally:
+        _git(checkout, "worktree", "remove", "--force", str(path), check=False)
+        _git(checkout, "worktree", "prune", check=False)
+
+
+def rebase_onto_tip(checkout: Path, sha: str, tip: str) -> str | None:
+    """Cherry-pick *sha*'s own commits onto *tip* in a scratch worktree; None on conflict.
+
+    Only objects are written; no branch moves. The approved head's committer is kept.
+    """
+    commits = _branch_commits(checkout, sha, tip)
+    if not commits:
+        return None
+    committer = _git(checkout, "log", "-1", "--format=%cn%x00%ce", sha).stdout.strip()
+    name, _, email = committer.partition("\x00")
+    env = {**os.environ, "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
+    with _scratch_worktree(checkout, tip) as scratch:
+        result = subprocess.run(
+            ["git", "-C", str(scratch), "cherry-pick", *commits],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+            check=False,
+            env=env,
+        )
+        if result.returncode != 0:
+            _git(scratch, "cherry-pick", "--abort", check=False)
+            return None
+        return _git(scratch, "rev-parse", "HEAD").stdout.strip()
+
+
+_TEST_TARGET = re.compile(r"tests/[A-Za-z0-9_./-]+\.py(::[A-Za-z0-9_\[\]-]+)*")
+
+
+def targeted_tests(ticket: dict[str, Any]) -> list[str] | None:
+    """The ticket's recorded targeted tests (label ``targeted-tests``); None if malformed."""
+    raw = next(
+        (
+            label.get("value") or ""
+            for label in ticket.get("labels") or []
+            if label.get("key") == TARGETED_TESTS_LABEL
+        ),
+        "",
+    )
+    tests = raw.replace(",", " ").split()
+    if any(not _TEST_TARGET.fullmatch(test) or ".." in test for test in tests):
+        return None
+    return tests
+
+
+def _run(command: list[str], cwd: Path, timeout: float) -> str | None:
+    try:
+        result = subprocess.run(
+            command, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"`{' '.join(command)}`: {str(exc)[:200]}"
+    if result.returncode != 0:
+        return f"`{' '.join(command)}`: {(result.stdout + result.stderr).strip()[-300:]}"
+    return None
+
+
+def safety_net(checkout: Path, sha: str, tip: str, tests: list[str]) -> str | None:
+    """Checks for a carried approval at *sha*; the first failure, or None.
+
+    ``tsc`` and ``oxlint`` run when ``web/`` changed since *tip*, then the targeted tests.
+    """
+    web_changed = bool(
+        _git(checkout, "diff", "--name-only", tip, sha, "--", "web/").stdout.strip()
+    )
+    if not web_changed and not tests:
+        return None
+    with _scratch_worktree(checkout, sha) as scratch:
+        if web_changed:
+            modules = checkout / "web" / "node_modules"
+            if not modules.is_dir():
+                return "web/node_modules is missing in the landing checkout"
+            (scratch / "web" / "node_modules").symlink_to(modules)
+            for script in ("type-check", "lint"):
+                error = _run(["npm", "run", "--silent", script], scratch / "web", _BUILD_TIMEOUT_S)
+                if error:
+                    return error
+        if tests:
+            return _run(
+                [sys.executable, "-m", "pytest", "-q", "-x", *tests], scratch, _TEST_TIMEOUT_S
+            )
+    return None
+
+
+@dataclass
+class Plan:
+    """What landing a submitted SHA means now."""
+
+    tip: str
+    land_sha: str
+    carried_from: str | None = None
+    rebased: bool = False
 
 
 def resolve_target(config: dict[str, Any]) -> Target:
@@ -257,16 +438,12 @@ class LandingQueue:
 
     # -- gates -----------------------------------------------------------------
 
-    async def _label_setters(
+    async def _label_events(
         self, project: Any, ticket_id: str
-    ) -> dict[tuple[str, str], list[dict]]:
-        """Each current ``(key, value)`` label, with every event that set or kept it since it
-        last appeared. Edits replace the whole label list, so a later edit that merely keeps a
-        label is listed too. ``approved`` is trusted if any of those events is trusted, since
-        the Reviewer may re-assert it; owner sign-offs only by the event that introduced them.
-        """
+    ) -> list[tuple[dict[str, Any], set[tuple[str, str]]]]:
+        """Every label edit on the ticket, oldest first, with the full label state it left."""
         tickets = self._notifications.tickets
-        setters: dict[tuple[str, str], list[dict]] = {}
+        edits: list[tuple[dict[str, Any], set[tuple[str, str]]]] = []
         after = -1
         for _ in range(50):
             page = await asyncio.to_thread(
@@ -289,11 +466,49 @@ class LandingQueue:
                     for label in labels
                     if isinstance(label, dict) and isinstance(label.get("key"), str)
                 }
-                setters = {pair: [*setters.get(pair, []), event] for pair in state}
+                edits.append((event, state))
             if not page.get("has_more"):
                 break
             after = page.get("last_position", after)
+        return edits
+
+    @staticmethod
+    def _label_setters(
+        edits: list[tuple[dict[str, Any], set[tuple[str, str]]]],
+    ) -> dict[tuple[str, str], list[dict]]:
+        """Each current ``(key, value)`` label, with every event that set or kept it since it
+        last appeared. Edits replace the whole label list, so a later edit that merely keeps a
+        label is listed too. ``approved`` is trusted if any of those events is trusted, since
+        the Reviewer may re-assert it; owner sign-offs only by the event that introduced them.
+        """
+        setters: dict[tuple[str, str], list[dict]] = {}
+        for event, state in edits:
+            setters = {pair: [*setters.get(pair, []), event] for pair in state}
         return setters
+
+    async def _approval_source(
+        self, project: Any, edits: list[tuple[dict[str, Any], set[tuple[str, str]]]]
+    ) -> str | None:
+        """The SHA the Reviewer or owner last approved and didn't withdraw.
+
+        A worker's new head clears the label without withdrawing it, so an identical patch
+        can carry it. The Reviewer or owner withdraws it by removing ``approved``, and the
+        Reviewer also by any label edit without it. The queue's own carries are skipped.
+        """
+        source: str | None = None
+        previous: str | None = None
+        for event, state in edits:
+            value = next((v for key, v in state if key == APPROVED_LABEL and v), None)
+            if event.get("agent_id") == LANDING_AGENT_ID:
+                previous = value
+                continue
+            trusted, by_reviewer = await self._trust(project, event)
+            if trusted and value is not None:
+                source = value
+            elif trusted and value is None and (previous is not None or by_reviewer):
+                source = None
+            previous = value
+        return source
 
     @staticmethod
     def _is_owner(project: Any, event: dict[str, Any] | None) -> bool:
@@ -315,12 +530,13 @@ class LandingQueue:
             and event.get("user_id") in product_approvers(project)
         )
 
-    async def _is_reviewer_or_owner(self, project: Any, event: dict[str, Any]) -> bool:
+    async def _trust(self, project: Any, event: dict[str, Any]) -> tuple[bool, bool]:
+        """Whether *event* is the owner's or the Reviewer's, and whether it is the Reviewer's."""
         if self._is_owner(project, event):
-            return True
+            return True, False
         session_id = event.get("session_id")
         if not session_id:
-            return False
+            return False, False
         identities = await asyncio.to_thread(
             self._notifications.projects.list_identities, project.id, user_id=project.user_id
         )
@@ -328,23 +544,32 @@ class LandingQueue:
         conv = await asyncio.to_thread(
             self._notifications.inputs.conversations.get_conversation, session_id
         )
-        return conv is not None and conv.labels.get(PROJECT_IDENTITY_LABEL_KEY) in reviewer
+        is_reviewer = conv is not None and conv.labels.get(PROJECT_IDENTITY_LABEL_KEY) in reviewer
+        return is_reviewer, is_reviewer
 
-    async def _check(self, project: Any, ticket: dict[str, Any], sha: str, target: Target) -> str:
-        """Raise a refusal unless *sha* may land now; return the current tip."""
+    async def _check(self, project: Any, ticket: dict[str, Any], sha: str, target: Target) -> Plan:
+        """Raise a refusal unless *sha* may land now; return how it lands.
+
+        The approval is the Reviewer's (or owner's) last approved SHA. Another SHA, or the
+        approved one once the tip moved on, lands only as an identical patch on the tip,
+        cherry-picked by the queue if needed. Outside pull requests never carry.
+        """
         labels = {
             label.get("key"): (label.get("value") or "").strip()
             for label in ticket.get("labels") or []
         }
-        if labels.get(APPROVED_LABEL) != sha:
+        edits = await self._label_events(project, ticket["id"])
+        setters = self._label_setters(edits)
+        source = await self._approval_source(project, edits)
+        if source is None:
+            if labels.get(APPROVED_LABEL) == sha:
+                raise refuse(
+                    "The `approved` label wasn't set by the Reviewer's session or the owner"
+                )
             raise refuse(
                 f"`{sha[:12]}` isn't approved: the ticket's `approved` label must be exactly "
                 "this SHA, set by the Reviewer"
             )
-        setters = await self._label_setters(project, ticket["id"])
-        approvers = setters.get((APPROVED_LABEL, sha), [])
-        if not any([await self._is_reviewer_or_owner(project, event) for event in approvers]):
-            raise refuse("The `approved` label wasn't set by the Reviewer's session or the owner")
         if RISK_LABEL in labels:
             risk_ok = setters.get((RISK_OK_LABEL, labels.get(RISK_OK_LABEL, "")), [])
             if RISK_OK_LABEL not in labels or not self._is_owner(
@@ -376,22 +601,49 @@ class LandingQueue:
                     f"(`{ticket['requested_by']}`): the owner must set `{OWNER_OK_LABEL}` = "
                     f"`{sha}` before it lands"
                 )
-        return await asyncio.to_thread(self._fast_forward_check, target, sha)
+        outside = is_outside_requester(ticket.get("requested_by"))
+        try:
+            return await asyncio.to_thread(self._plan, target, sha, source, not outside)
+        except (GitError, subprocess.SubprocessError) as exc:
+            raise refuse(f"Couldn't compare `{sha[:12]}` with the approved commit: {exc}") from exc
 
     @staticmethod
-    def _fast_forward_check(target: Target, sha: str) -> str:
-        if _git(target.checkout, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode:
+    def _plan(target: Target, sha: str, source: str, may_carry: bool) -> Plan:
+        checkout = target.checkout
+        if _git(checkout, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode:
             raise refuse(f"`{sha[:12]}` isn't a commit in this repository")
-        tip = _git(target.checkout, "rev-parse", f"refs/heads/{target.branch}").stdout.strip()
+        tip = _git(checkout, "rev-parse", f"refs/heads/{target.branch}").stdout.strip()
         if tip == sha:
             raise refuse(f"`{sha[:12]}` is already the tip of `{target.branch}`")
-        ancestor = _git(target.checkout, "merge-base", "--is-ancestor", tip, sha, check=False)
-        if ancestor.returncode != 0:
+        fast_forward = _is_ancestor(checkout, tip, sha)
+        if fast_forward and sha == source:
+            return Plan(tip=tip, land_sha=sha)
+        if not may_carry:
+            if sha != source:
+                raise refuse(
+                    f"`{sha[:12]}` isn't approved: the ticket's `approved` label must be "
+                    "exactly this SHA, set by the Reviewer"
+                )
             raise refuse(
-                f"`{sha[:12]}` doesn't fast-forward `{target.branch}` (tip `{tip[:12]}`): rebase "
-                "onto the tip, then get the rebased SHA re-approved"
+                f"`{sha[:12]}` doesn't fast-forward `{target.branch}` (tip `{tip[:12]}`): "
+                "rebase onto the tip, then get the rebased SHA re-approved"
             )
-        return tip
+        if _git(checkout, "cat-file", "-e", f"{source}^{{commit}}", check=False).returncode:
+            raise refuse(f"The approved `{source[:12]}` isn't a commit in this repository")
+        candidate = sha if fast_forward else rebase_onto_tip(checkout, sha, tip)
+        if candidate is None:
+            raise refuse(
+                f"`{sha[:12]}` doesn't fast-forward `{target.branch}` (tip `{tip[:12]}`) and "
+                "doesn't cherry-pick cleanly onto it: rebase onto the tip, resolve the "
+                "conflict, then get the rebased SHA re-approved"
+            )
+        problem = patch_identity_problem(checkout, source, candidate, tip)
+        if problem is not None:
+            raise refuse(
+                f"`{sha[:12]}` isn't the approved `{source[:12]}` re-applied ({problem}), so "
+                "the approval doesn't carry: get the Reviewer to re-approve it"
+            )
+        return Plan(tip=tip, land_sha=candidate, carried_from=source, rebased=not fast_forward)
 
     # -- submit ----------------------------------------------------------------
 
@@ -424,10 +676,11 @@ class LandingQueue:
             raise refuse("The ticket is already complete")
         target = await asyncio.to_thread(resolve_target, project.config)
         try:
-            tip = await self._check(project, ticket, sha, target)
+            plan = await self._check(project, ticket, sha, target)
         except OmnigentError as exc:
             await self._note(project, ticket["id"], f"refused `{sha[:12]}`: {exc}.")
             raise
+        tip = plan.tip
         if any(item.ticket["id"] == ticket["id"] for item in self.pending):
             raise refuse("This ticket already has a landing queued")
         self.pending.append(Item(project, ticket, sha, who.session_id))
@@ -435,11 +688,12 @@ class LandingQueue:
         await self._note(
             project,
             ticket["id"],
-            f"queued `{sha[:12]}` to fast-forward `{target.branch}` from `{tip[:12]}`.",
+            f"queued `{sha[:12]}` to fast-forward `{target.branch}` from `{tip[:12]}`"
+            f"{_describe(plan)}.",
         )
         if self._batch is None or self._batch.done():
             self._batch = self._spawn(self._run_batch_later())
-        return {"queued": True, "sha": sha, "branch": target.branch, "tip": tip}
+        return {"queued": True, "sha": sha, "branch": target.branch, "tip": tip, **_carry(plan)}
 
     async def check_only(self, project: Any, ticket_id: str, sha: str) -> dict:
         """Run every landing gate for a hand-land, without queueing; refusals raise 409."""
@@ -449,8 +703,15 @@ class LandingQueue:
         )
         ticket = ticket.get("ticket", ticket)
         target = await asyncio.to_thread(resolve_target, project.config)
-        tip = await self._check(project, ticket, sha, target)
-        return {"ok": True, "dry_run": True, "sha": sha, "branch": target.branch, "tip": tip}
+        plan = await self._check(project, ticket, sha, target)
+        return {
+            "ok": True,
+            "dry_run": True,
+            "sha": sha,
+            "branch": target.branch,
+            "tip": plan.tip,
+            **_carry(plan),
+        }
 
     def _spawn(self, coro: Any) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro)
@@ -505,13 +766,16 @@ class LandingQueue:
             )
             item.ticket = fresh.get("ticket", fresh)
             try:
-                await self._check(project, item.ticket, item.sha, target)
+                plan = await self._check(project, item.ticket, item.sha, target)
+                if plan.carried_from is not None:
+                    await self._carry(project, item, plan, target)
             except OmnigentError as exc:
                 await self._note(project, item.ticket["id"], f"refused `{item.sha[:12]}`: {exc}.")
                 await self._send(
                     project, item.submitter, f"[{NOTE_PREFIX}] Ticket {item.ticket['id']}: {exc}."
                 )
                 continue
+            item.sha = plan.land_sha
             try:
                 await asyncio.to_thread(_git, target.checkout, "merge", "--ff-only", item.sha)
             except (GitError, subprocess.SubprocessError) as exc:
@@ -538,6 +802,50 @@ class LandingQueue:
                 await self._note(project, item.ticket["id"], "rebuilt the web app.")
         await self._finish(project, landed, target)
         return landed, target.restart
+
+    async def _carry(self, project: Any, item: Item, plan: Plan, target: Target) -> None:
+        """Run the safety net, then record the carried approval on the SHA that lands."""
+        assert plan.carried_from is not None
+        tests = targeted_tests(item.ticket)
+        if tests is None:
+            raise refuse(
+                f"the `{TARGETED_TESTS_LABEL}` label must list test paths under `tests/`, so the "
+                "carried approval can't be checked: get the Reviewer to re-approve"
+            )
+        try:
+            failure = await asyncio.to_thread(
+                safety_net, target.checkout, plan.land_sha, plan.tip, tests
+            )
+        except (GitError, OSError, subprocess.SubprocessError) as exc:
+            failure = str(exc)[:300]
+        if failure:
+            raise refuse(
+                f"the identical patch `{plan.land_sha[:12]}` fails on the new tip ({failure}); "
+                "fix it, then get the Reviewer to re-approve"
+            )
+        labels = [
+            TicketLabel(key=label["key"], value=label.get("value"))
+            for label in item.ticket.get("labels") or []
+            if label.get("key") != APPROVED_LABEL
+        ]
+        labels.append(TicketLabel(key=APPROVED_LABEL, value=plan.land_sha))
+        checks = [
+            *(["`tsc` and `oxlint`"] if _touches_web(target, plan) else []),
+            *([f"{len(tests)} targeted test(s)"] if tests else []),
+        ]
+        comment = (
+            f"{NOTE_PREFIX}: approval carried from `{plan.carried_from}` to `{plan.land_sha}`: "
+            "identical patch"
+            f"{', cherry-picked onto the tip by the queue' if plan.rebased else ''}. "
+            + (f"Passed {' and '.join(checks)}." if checks else "No checks apply.")
+        )
+        await asyncio.to_thread(
+            self._notifications.tickets.update,
+            project.id,
+            item.ticket["id"],
+            UpdateTicket(labels=labels, comment=comment, audience="agents"),
+            self._actor(project),
+        )
 
     @staticmethod
     def _require_clean(target: Target) -> None:
@@ -686,8 +994,49 @@ class LandingQueue:
                 )
 
 
+def _touches_web(target: Target, plan: Plan) -> bool:
+    diff = _git(target.checkout, "diff", "--name-only", plan.tip, plan.land_sha, "--", "web/")
+    return bool(diff.stdout.strip())
+
+
+def _describe(plan: Plan) -> str:
+    if plan.carried_from is None:
+        return ""
+    if plan.rebased:
+        return (
+            f", carrying the approval of `{plan.carried_from[:12]}` as `{plan.land_sha[:12]}` "
+            "(cherry-picked onto the tip, identical patch)"
+        )
+    return f", carrying the approval of `{plan.carried_from[:12]}` (identical patch)"
+
+
+def _carry(plan: Plan) -> dict[str, Any]:
+    if plan.carried_from is None:
+        return {}
+    return {
+        "carried_from": plan.carried_from,
+        "land_sha": plan.land_sha,
+        "rebased": plan.rebased,
+    }
+
+
 def start(app: Any) -> LandingQueue:
     queue = LandingQueue(app)
     app.state.project_landing = queue
     queue.start()
     return queue
+
+
+def is_pure_rebase(config: dict[str, Any], approved: str, newer: str) -> bool:
+    """Whether *newer* is the approved commit re-applied onto the landing branch unchanged."""
+    try:
+        target = resolve_target(config)
+        tip = _git(target.checkout, "rev-parse", f"refs/heads/{target.branch}").stdout.strip()
+        for sha in (approved, newer):
+            if _git(
+                target.checkout, "cat-file", "-e", f"{sha}^{{commit}}", check=False
+            ).returncode:
+                return False
+        return patch_identity_problem(target.checkout, approved, newer, tip) is None
+    except (GitError, OmnigentError, OSError, subprocess.SubprocessError):
+        return False

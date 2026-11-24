@@ -73,7 +73,21 @@ class FakeTickets:
         return self.ticket
 
     def update(self, project_id: str, ticket_id: str, body: Any, actor: Any) -> dict:
-        self.ticket["stage_id"] = body.stage_id
+        if body.stage_id is not None:
+            self.ticket["stage_id"] = body.stage_id
+        if body.comment:
+            self.notes.append(body.comment)
+        if body.labels is not None:
+            self.ticket["labels"] = [label.model_dump() for label in body.labels]
+            self.history.append(
+                {
+                    "kind": "updated",
+                    "session_id": actor.session_id,
+                    "agent_id": actor.agent_id,
+                    "user_id": actor.user_id,
+                    "payload": {"changes": {"labels": list(self.ticket["labels"])}},
+                }
+            )
         return self.ticket
 
 
@@ -232,12 +246,13 @@ async def test_an_approved_sha_lands_moves_the_ticket_and_restarts(world) -> Non
     assert (world.tmp / "restarted").exists()
 
 
-async def test_a_stale_sha_is_refused_with_rebase_advice(world) -> None:
+async def test_a_stale_sha_that_conflicts_is_refused_with_rebase_advice(world) -> None:
     stale = feature(world, "f3")
-    commit(world.repo, "moved-tip")  # the branch moved on without the change
-    world.tickets.label("approved", stale)
-    with pytest.raises(OmnigentError, match="rebase onto the tip"):
+    write_commit(world.repo, "f3", "the tip's own f3")  # the tip changed the same file
+    world.tickets.label("approved", stale, session_id="rs")
+    with pytest.raises(OmnigentError, match="doesn't cherry-pick cleanly"):
         await submit(world, stale)
+    assert git(world.repo, "rev-parse", BRANCH) != stale
 
 
 async def test_off_by_default_and_agent_config_writes_refused(world) -> None:
@@ -274,3 +289,158 @@ async def test_a_restart_inside_the_batch_window_keeps_the_queued_land(world) ->
     resumed = landing.LandingQueue(world.queue.app)
     await resumed._resume_pending(delay=0)
     assert git(world.repo, "rev-parse", BRANCH) == sha
+
+
+# -- approval carry ----------------------------------------------------------------------
+
+TRAILER = "Co-authored-by: Example <bot@example.com>"
+
+
+def write_commit(repo: Path, name: str, content: str, *, trailer: str | None = TRAILER) -> str:
+    (repo / name).parent.mkdir(parents=True, exist_ok=True)
+    (repo / name).write_text(content)
+    git(repo, "add", name)
+    message = f"{name}\n\n{trailer}" if trailer else name
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", message)
+    return git(repo, "rev-parse", "HEAD")
+
+
+def branch(world: SimpleNamespace, name: str, files: dict[str, str], start: str) -> str:
+    """A feature branch from *start* with one commit per file; returns its head."""
+    git(world.repo, "checkout", "-q", "-B", name, start)
+    head = start
+    for path, content in files.items():
+        head = write_commit(world.repo, path, content)
+    git(world.repo, "checkout", "-q", BRANCH)
+    return head
+
+
+def approve_then_rebase(world: SimpleNamespace, files: dict[str, str]) -> tuple[str, str]:
+    """Approve a branch, move the tip, rebase onto it and let the worker's new SHA clear it."""
+    approved = branch(world, "feat", files, world.base)
+    world.tickets.label("approved", approved, session_id="rs")
+    commit(world.repo, "unrelated")  # the integration tip moves on
+    git(world.repo, "checkout", "-q", "-B", "rebased", approved)
+    git(
+        world.repo,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "rebase",
+        "-q",
+        BRANCH,
+    )
+    rebased = git(world.repo, "rev-parse", "HEAD")
+    git(world.repo, "checkout", "-q", BRANCH)
+    world.tickets.unlabel("approved", user_id=None)  # the worker's new head cleared it
+    world.tickets.history[-1]["session_id"] = "worker"
+    return approved, rebased
+
+
+async def test_an_identical_patch_carries_the_approval_and_lands(world) -> None:
+    approved, rebased = approve_then_rebase(world, {"a.txt": "a", "b.txt": "b"})
+    queued = await submit(world, rebased)
+    assert queued["carried_from"] == approved and not queued["rebased"]
+    await world.queue.run_batch()
+    assert git(world.repo, "rev-parse", BRANCH) == rebased
+    assert {"key": "approved", "value": rebased} in world.tickets.ticket["labels"]
+    carry = [note for note in world.tickets.notes if "approval carried" in note]
+    assert carry and approved in carry[0] and rebased in carry[0]
+    assert world.tickets.ticket["stage_id"] == "review"
+
+
+async def test_the_queue_rebases_a_stale_approved_sha_itself(world) -> None:
+    approved = branch(world, "feat", {"a.txt": "a"}, world.base)
+    world.tickets.label("approved", approved, session_id="rs")
+    commit(world.repo, "unrelated")
+    dry = await world.queue.submit(world.project, "t1", approved, None, dry_run=True)
+    assert dry["rebased"] and dry["carried_from"] == approved
+    await submit(world, approved)
+    await world.queue.run_batch()
+    tip = git(world.repo, "rev-parse", BRANCH)
+    assert tip != approved and git(world.repo, "show", f"{tip}:a.txt") == "a"
+    assert TRAILER in git(world.repo, "log", "-1", "--format=%B", tip)
+    assert any("cherry-picked onto the tip" in note for note in world.tickets.notes)
+    assert ("worker", f"[Landing queue] Ticket t1: `{tip}` landed on `{BRANCH}`.") in [
+        (sid, text.split(" The server")[0]) for sid, text in world.sent
+    ]
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"a.txt": "a, changed", "b.txt": "b"}, "different patch"),
+        ({"a.txt": "a", "b.txt": "b", "c.txt": "c"}, "3 commit"),  # an added commit
+        ({"b.txt": "b"}, "1 commit"),  # a dropped commit
+    ],
+)
+async def test_a_changed_patch_needs_re_approval(world, change, reason) -> None:
+    approved, _ = approve_then_rebase(world, {"a.txt": "a", "b.txt": "b"})
+    changed = branch(world, "changed", change, git(world.repo, "rev-parse", BRANCH))
+    with pytest.raises(OmnigentError, match=f"{reason}.*re-approve"):
+        await submit(world, changed)
+    assert approved != changed
+
+
+async def test_different_trailers_or_a_withdrawn_approval_or_an_outside_pr_dont_carry(
+    world,
+) -> None:
+    approved, rebased = approve_then_rebase(world, {"a.txt": "a"})
+    git(world.repo, "checkout", "-q", "-B", "untrailed", BRANCH)
+    untrailed = write_commit(world.repo, "a.txt", "a", trailer=None)
+    git(world.repo, "checkout", "-q", BRANCH)
+    with pytest.raises(OmnigentError, match="trailers"):
+        await submit(world, untrailed)
+    world.tickets.ticket["requested_by"] = "github:octocat"
+    world.tickets.ticket["labels"].append({"key": "kind", "value": "fix"})
+    world.tickets.label("owner-ok", rebased)  # even the owner's OK doesn't carry a PR
+    with pytest.raises(OmnigentError, match="isn't approved"):
+        await submit(world, rebased)
+    world.tickets.ticket.pop("requested_by")
+    world.tickets.label("kind", "fix", session_id="rs")  # the Reviewer edits without approving
+    with pytest.raises(OmnigentError, match="isn't approved"):
+        await submit(world, rebased)
+    assert approved
+
+
+async def test_a_carried_approval_that_fails_its_targeted_tests_falls_back(world) -> None:
+    files = {
+        "tests/test_carry.py": "import pathlib\n\ndef test_tip():\n"
+        "    assert not pathlib.Path('broken').exists()\n"
+    }
+    approved, rebased = approve_then_rebase(world, files)
+    world.tickets.label("targeted-tests", "tests/test_carry.py", session_id="worker")
+    before = git(world.repo, "rev-parse", BRANCH)
+    assert landing.safety_net(world.repo, rebased, before, ["tests/test_carry.py"]) is None
+    commit(world.repo, "broken")  # the new tip breaks the identical patch's test
+    git(world.repo, "checkout", "-q", "-B", "rebased2", rebased)
+    git(world.repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "rebase", "-q", BRANCH)
+    again = git(world.repo, "rev-parse", "HEAD")
+    git(world.repo, "checkout", "-q", BRANCH)
+    tip = git(world.repo, "rev-parse", BRANCH)
+    await submit(world, again)
+    await world.queue.run_batch()
+    assert git(world.repo, "rev-parse", BRANCH) == tip
+    assert any("fails on the new tip" in text for _, text in world.sent)
+    assert not any(label["key"] == "approved" for label in world.tickets.ticket["labels"])
+    world.tickets.label("targeted-tests", "--co; rm -rf /", session_id="worker")
+    assert landing.targeted_tests(world.tickets.ticket) is None
+    assert approved
+
+
+def test_pure_rebase_detection_and_uncounted_review_rounds(world) -> None:
+    from omnigent.server.routes import project_tickets as routes
+
+    approved, rebased = approve_then_rebase(world, {"a.txt": "a"})
+    changed = branch(world, "changed", {"a.txt": "other"}, git(world.repo, "rev-parse", BRANCH))
+    config = world.project.config
+    assert landing.is_pure_rebase(config, approved, rebased)
+    assert not landing.is_pure_rebase(config, approved, changed)
+    assert not landing.is_pure_rebase(config, approved, "f" * 40)
+    routes._review_rounds.pop("t-rounds", None)
+    routes._rebase_only_rounds.add("t-rounds")
+    routes._count_review_round("t-rounds")  # the re-approval of a pure rebase
+    assert routes._review_rounds.get("t-rounds", 0) == 0
+    routes._count_review_round("t-rounds")
+    assert routes._review_rounds["t-rounds"] == 1
