@@ -303,6 +303,26 @@ class SessionJournalStore:
         ).scalar_one_or_none()
 
     @staticmethod
+    def _oldest_kind_row(
+        session: Session, conversation_id: str, kind: int, *, after_position: int | None = None
+    ) -> SqlSessionJournalEntry | None:
+        statement = (
+            select(SqlSessionJournalEntry)
+            .where(
+                SqlSessionJournalEntry.workspace_id == current_workspace_id(),
+                SqlSessionJournalEntry.conversation_id == conversation_id,
+                SqlSessionJournalEntry.kind == kind,
+            )
+            .order_by(SqlSessionJournalEntry.position)
+            .limit(1)
+        )
+        if after_position is not None:
+            statement = statement.where(SqlSessionJournalEntry.position > after_position)
+        return session.execute(
+            _using(statement, "ix_session_journal_entries_kind")
+        ).scalar_one_or_none()
+
+    @staticmethod
     def _default_step(steps: list[dict[str, Any]] | None) -> str:
         """The step a status names when it names none: the only step of a one-step plan.
 
@@ -901,6 +921,77 @@ class SessionJournalStore:
         return WorkflowRunPage(
             plans=plans, next_cursor=_run_cursor(plans[-1]) if len(rows) > limit else None
         )
+
+    def get_entry(self, conversation_id: str, entry_id: str) -> JournalEntry | None:
+        """One of a session's entries by its ID, e.g. the plan that started a run."""
+        with self._session("read_journal_entry") as session:
+            row = session.execute(
+                _using(
+                    select(SqlSessionJournalEntry)
+                    .where(
+                        SqlSessionJournalEntry.workspace_id == current_workspace_id(),
+                        SqlSessionJournalEntry.conversation_id == conversation_id,
+                        SqlSessionJournalEntry.id == entry_id,
+                    )
+                    .limit(1),
+                    "ix_session_journal_entries_id",
+                )
+            ).scalar_one_or_none()
+        return None if row is None else self._entries([row])[0]
+
+    def next_run_starts(self, plans: Sequence[JournalEntry]) -> list[int | None]:
+        """When each plan's session began its next run, if it has.
+
+        One single-row index read per plan, e.g. for a page of workflow runs.
+
+        :param plans: Plans that started runs.
+        :returns: Unix epoch seconds of the first run boundary after each plan,
+            in order, or ``None`` while the plan's run is its session's latest.
+        """
+        with self._session("read_next_run_starts") as session:
+            boundaries = [
+                self._oldest_kind_row(
+                    session, plan.conversation_id, _PLAN_STATUS_KIND, after_position=plan.position
+                )
+                for plan in plans
+            ]
+        return [None if boundary is None else boundary.created_at for boundary in boundaries]
+
+    def first_workflow_runs(self, conversation_ids: Sequence[str]) -> dict[str, JournalEntry]:
+        """The workflow run each session began with: its first plan, if that named a workflow.
+
+        One single-row index read per session.
+
+        :param conversation_ids: The sessions, e.g. those a run's session started.
+        :returns: Each such session's first plan, by session ID.
+        """
+        with self._session("read_first_workflow_runs") as session:
+            rows = [
+                row
+                for conversation_id in dict.fromkeys(conversation_ids)
+                if (row := self._oldest_kind_row(session, conversation_id, _PLAN_KIND)) is not None
+                and row.workflow_id is not None
+            ]
+        return {entry.conversation_id: entry for entry in self._entries(rows)}
+
+    def current_workflow_run(self, conversation_id: str) -> JournalEntry | None:
+        """The plan that began the session's current run, if that run follows a saved workflow.
+
+        Reads the newest run boundary, then the first plan after it.
+
+        :param conversation_id: The session, e.g. one whose Tasks tab is open.
+        """
+        with self._session("read_current_workflow_run") as session:
+            boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+            row = self._oldest_kind_row(
+                session,
+                conversation_id,
+                _PLAN_KIND,
+                after_position=None if boundary is None else boundary.position,
+            )
+        if row is None or row.workflow_id is None:
+            return None
+        return self._entries([row])[0]
 
     def run_start_plans(self, runs: Sequence[tuple[str, str]]) -> list[JournalEntry | None]:
         """Each automation run's first plan: the one it started with.

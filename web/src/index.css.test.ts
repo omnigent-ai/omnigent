@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 // lightningcss is the minifier @tailwindcss/vite runs during `vite build`
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
+import { compile } from "tailwindcss";
 import { type ComponentProps, createElement } from "react";
 import { createPortal } from "react-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -12,6 +13,7 @@ import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "./components/ui/tooltip";
+import { MOBILE_BREAKPOINT_PX } from "./hooks/useIsMobileViewport";
 import type * as UseTerminalsModule from "./hooks/useTerminals";
 import {
   UI_FONT_SIZE_DEFAULT,
@@ -46,6 +48,23 @@ const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 // Innermost `selector { ... }` blocks with their match indices, shared by
 // every rule-extraction below so the block grammar lives in one place.
 const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
+
+// The layout variants and native-shell `@media` rules repeat Tailwind's md breakpoint in rem.
+const BREAKPOINT_MD = `${MOBILE_BREAKPOINT_PX / 16}rem`;
+/** `BREAKPOINT_MD` as regex source. */
+const BREAKPOINT_MD_SOURCE = BREAKPOINT_MD.replace(/[\\.]/g, "\\$&");
+
+/** Regex source for a `selector { @variant md|max-md {` opener: a raw rule on one side of the layout split. */
+function layoutVariantRule(selector: string, variant: "md" | "max-md"): string {
+  return String.raw`${selector} \{\s*@variant ${variant} \{`;
+}
+
+/** Top-level `@media` blocks in index.css that test the md breakpoint directly. */
+const rawMdMediaBlocks = [
+  ...indexCssSource.matchAll(
+    new RegExp(String.raw`^@media [^{]*${BREAKPOINT_MD_SOURCE}[^{]*\{\n[\s\S]*?\n\}\n`, "gm"),
+  ),
+].map(([block]) => block);
 
 describe("shared glass fallback", () => {
   it("uses the solid theme surface only when both backdrop filters are unsupported", () => {
@@ -355,6 +374,42 @@ describe("workspace panel content border", () => {
   });
 });
 
+describe("workspace rail open motion", () => {
+  // The rule that shows an open rail; the classic rail names its state data-state, the tabs
+  // rail data-rail-state, so a toggle there doesn't restyle everything Radix styles by data-state.
+  const openRule = indexCssSource.match(/([^{}]*\[data-rail-state="open"\][^{}]*)\{/)?.[1] ?? "";
+
+  it.each([
+    ["data-state", "the classic rail"],
+    ["data-rail-state", "the tabs rail"],
+  ])("shows an open rail that names its state %s (%s)", (attribute) => {
+    const rail = document.createElement("aside");
+    rail.className = "workspace-panel-motion";
+    rail.setAttribute(attribute, "open");
+    expect(rail.matches(openRule.trim())).toBe(true);
+    rail.setAttribute(attribute, "closed");
+    expect(rail.matches(openRule.trim())).toBe(false);
+  });
+
+  // Where an animated open starts from; the selector list inside @starting-style.
+  const startingRule =
+    indexCssSource.match(/@starting-style\s*\{([^{}]*\.workspace-panel-motion[^{}]*)\{/)?.[1] ?? "";
+
+  it.each([
+    ["data-state", "the classic rail"],
+    ["data-rail-state", "the tabs rail"],
+  ])("animates an open rail that names its state %s (%s) from its start", (attribute) => {
+    const rail = document.createElement("aside");
+    rail.className = "workspace-panel-motion";
+    rail.setAttribute(attribute, "open");
+    expect(rail.matches(startingRule.trim())).toBe(false);
+    rail.setAttribute("data-animate-visibility", "");
+    expect(rail.matches(startingRule.trim())).toBe(true);
+    rail.setAttribute(attribute, "closed");
+    expect(rail.matches(startingRule.trim())).toBe(false);
+  });
+});
+
 describe("index.css app-shell viewport lock", () => {
   const rule = cssBlocks
     .map(([block]) => block)
@@ -538,7 +593,7 @@ describe("index.css native safe-area layout", () => {
 
   it("keeps the unified rule at stylesheet top level, outside any at-rule", () => {
     // cssBlocks matches innermost blocks, so re-wrapping the rule in
-    // e.g. @media (width < 48rem) would leave every other assertion here
+    // e.g. a below-md @media query would leave every other assertion here
     // green while silently dropping the md+ coverage this change exists
     // for. Brace depth must be 0 where each matching block starts.
     expect(nativePanelBlocks.length).toBeGreaterThan(0);
@@ -676,6 +731,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           openTerminals: [],
           selectedTerminalKey: null,
           onCloseTerminal: () => {},
+          onCloseTerminals: () => {},
           maximized: false,
           onToggleMaximized: () => {},
           permissionLevel: null,
@@ -866,6 +922,150 @@ describe("index.css sidebar canvas", () => {
   });
 });
 
+/** Each top-level rule in `css`: its selector and its whole body, nested rules included. */
+function topLevelRules(css: string): { selector: string; body: string }[] {
+  // A comment's ";" or braces aren't the stylesheet's.
+  const source = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const rules: { selector: string; body: string }[] = [];
+  let depth = 0;
+  let start = 0;
+  let open = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") {
+      if (depth === 0) open = index;
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const selector = source.slice(start, open).replace(/\s+/g, " ").trim();
+        rules.push({ selector, body: source.slice(open + 1, index) });
+        start = index + 1;
+      }
+    } else if (char === ";" && depth === 0) {
+      start = index + 1;
+    }
+  }
+  return rules;
+}
+
+describe("index.css floating panes", () => {
+  const FLOATING_GATE = "@media (width >= 48rem)";
+  const topLevel = topLevelRules(indexCssSource);
+  const gates = topLevel.filter((rule) => rule.selector === FLOATING_GATE);
+  // The floating rules, read from inside their one width gate.
+  const rules = gates.flatMap((gate) => topLevelRules(gate.body));
+  // Every rule for exactly this selector, as one body.
+  const ruleFor = (selector: string) =>
+    rules
+      .filter((rule) => rule.selector === selector)
+      .map((rule) => rule.body.replace(/\s+/g, " "))
+      .join(" ");
+
+  it("gates every floating rule at 48rem alone, in a browser and the desktop app alike", () => {
+    expect(gates).toHaveLength(1);
+    for (const rule of rules) {
+      expect(rule.selector).toContain(".app-shell[data-floating-panes]");
+      // `md` is 73.8125rem in a browser and every width in the desktop app: not this gate.
+      expect(rule.body).not.toMatch(/@variant|@media/);
+    }
+    const outside = topLevel.filter(
+      (rule) => rule.selector !== FLOATING_GATE && rule.selector.includes("[data-floating-panes]"),
+    );
+    expect(outside).toEqual([]);
+  });
+
+  it("styles a standalone session's panes, not a grid's", () => {
+    // A grid portals its workspace sidebar and renders its cells outside the session column.
+    const paneRules = rules.filter((rule) =>
+      /aside\[aria-label="Workspace"\]|main-terminal-view|chat-conversation-content|> main\[/.test(
+        rule.selector,
+      ),
+    );
+    for (const rule of paneRules) {
+      for (const selector of rule.selector.split(/,\s*/)) {
+        if (selector.includes(".omnigent-sidebar-panel")) continue;
+        expect(selector).toContain("[data-main-view");
+      }
+    }
+    // The chat itself is the pane's card.
+    const card = ruleFor(
+      '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id]',
+    );
+    expect(card).toContain("border-radius: var(--radius-lg, 0.5rem)");
+    expect(card).toContain("border: 1px solid var(--pane-card-border)");
+  });
+
+  it("keeps every control the edge-to-edge layout shows", () => {
+    const floating = rules.filter((each) => each.selector.includes("[data-floating-panes]"));
+    for (const rule of floating) {
+      // Only decoration goes: the header's glass layer, never a control.
+      if (!rule.selector.endsWith("::before")) expect(rule.body).not.toMatch(/display:\s*none/);
+      expect(rule.selector).not.toMatch(/data-workspace-history|data-right-panel-toggle/);
+    }
+  });
+
+  it("makes the dark backdrop one surface, measured from the window corner in the sidebar's colors", () => {
+    const backdrop = ruleFor(".dark .app-shell[data-floating-panes]");
+    expect(backdrop).toContain("background: var(--floating-backdrop-image) !important");
+    expect(backdrop).toContain("background-color: var(--sidebar) !important");
+    const overBackdrop = ruleFor(
+      ".dark .app-shell[data-floating-panes] .omnigent-sidebar-panel:not(.is-peek), .dark .app-shell[data-floating-panes] [data-main-view] .main-terminal-view",
+    );
+    expect(overBackdrop).toContain("background: none");
+    const token = (name: string) =>
+      indexCssSource
+        .match(new RegExp(`${name}:([^;]*);`))?.[1]
+        .replace(/\s+/g, " ")
+        .trim();
+    // The same layers and colors; only the diagonal's fade is an absolute length: 60% along the
+    // sidebar's own diagonal, which a sidebar-sized box puts at 60%.
+    expect(token("--sidebar-surface-image")).toBe(
+      "linear-gradient(transparent 35%, rgb(255 255 255 / 6%)), linear-gradient(135deg, rgb(255 255 255 / 4%), transparent 60%)",
+    );
+    expect(token("--floating-backdrop-image")).toBe(
+      "linear-gradient(transparent 35%, rgb(255 255 255 / 6%)), linear-gradient( 135deg, rgb(255 255 255 / 4%), transparent calc(0.6 * (var(--app-sidebar-width, 0px) + 100dvh) * 0.7071) )",
+    );
+  });
+
+  it("sets the cards' canvas on the shell, where the sidebar width it is placed by is known", () => {
+    // A token declared on :root would read the width there, where it is never set.
+    expect(indexCssSource.match(/--floating-card-canvas:/g)).toHaveLength(1);
+    expect(ruleFor(".app-shell[data-floating-panes]")).toContain(
+      '--floating-card-canvas: url("./assets/omnigent-center-glow.svg") right center / calc(100% - var(--app-sidebar-width, 0px)) 100% no-repeat fixed, var(--app-shell-bg);',
+    );
+  });
+
+  it("sits a full-screen workspace on the backdrop, opaque over the chat it covers", () => {
+    const maximized =
+      '.app-shell[data-floating-panes] [data-main-view] aside[aria-label="Workspace"][data-maximized]';
+    expect(ruleFor(maximized)).toContain("border-left-width: 0");
+    expect(ruleFor(`:root:not(.dark) ${maximized}`)).toContain(
+      "background: var(--sidebar-background, var(--sidebar)) !important",
+    );
+    const dark = ruleFor(`.dark ${maximized}`);
+    expect(dark).toMatch(
+      /background-image: var\(--floating-backdrop-image\), linear-gradient\(var\(--sidebar\), var\(--sidebar\)\) !important/,
+    );
+    expect(dark).toContain("background-attachment: fixed !important");
+    expect(dark).toContain("background-color: var(--background) !important");
+  });
+
+  it("sizes the top row as the macOS title bar, which keeps window pixels at any zoom", () => {
+    expect(ruleFor("html[data-electron-mac] .app-shell[data-floating-panes]")).toContain(
+      "--shell-top-row: var(--mac-titlebar-height)",
+    );
+    expect(ruleFor(".app-shell[data-floating-panes]")).toContain("--shell-top-row: 48px");
+  });
+
+  it("keeps the gap above the chat's card when an extension owns the header", () => {
+    const hidden = ruleFor(
+      '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id][data-shell-header="hidden"]',
+    );
+    expect(hidden).toContain("margin-top: var(--pane-gap)");
+  });
+});
+
 describe("index.css composer and menu surfaces", () => {
   const darkTokens = cssSource.match(/\.dark \{\s*--app-shell-bg:[\s\S]*?\n\}/)?.[0];
   const queuedSurface = cssSource.match(/\.composer-queued-surface \{[^}]*\}/)?.[0];
@@ -884,6 +1084,67 @@ describe("index.css composer and menu surfaces", () => {
   });
 });
 
+describe("index.css md breakpoint", () => {
+  it("keeps Tailwind's md breakpoint on the JS mobile breakpoint", () => {
+    expect(cssSource).toContain(`--breakpoint-md: ${BREAKPOINT_MD};`);
+  });
+});
+
+describe("index.css layout variants", () => {
+  const variantBlock = (name: string) =>
+    indexCssSource.match(new RegExp(String.raw`@custom-variant ${name} \{[\s\S]*?\n\}`))?.[0];
+
+  it("compiles the variants to the desktop-app split, alone and stacked", async () => {
+    const dark = indexCssSource.match(/@custom-variant dark [^\n]*/)?.[0];
+    const compiler = await compile(
+      `${variantBlock("md")}\n${variantBlock("max-md")}\n${dark}\n@tailwind utilities;`,
+    );
+    const classes = ["dark:hidden", "md:flex", "max-md:hidden", "dark:max-md:block"];
+    const css = compiler.build([...classes, "hover:max-md:grid"]).replace(/\s+/g, " ");
+    const desktopApp = "[data-desktop-app], [data-desktop-app] *";
+    const mobileOnly = (declaration: string) =>
+      `@media (width < ${BREAKPOINT_MD}) { &:where(:not(${desktopApp})) { ${declaration} } }`;
+
+    expect(css).toContain(
+      String.raw`.md\:flex { @media (width >= ${BREAKPOINT_MD}) { display: flex; } ` +
+        `&:where(${desktopApp}) { display: flex; } }`,
+    );
+    expect(css).toContain(String.raw`.max-md\:hidden { ${mobileOnly("display: none;")} }`);
+    expect(css).toContain(
+      String.raw`.dark\:max-md\:block { &:is(.dark *) { ${mobileOnly("display: block;")} } }`,
+    );
+    expect(css).toContain(
+      String.raw`.hover\:max-md\:grid { &:hover { @media (hover: hover) { ${mobileOnly("display: grid;")} } } }`,
+    );
+    // Pins the emitted order, which decides ties between equally specific utilities.
+    const positions = classes.map((name) =>
+      css.indexOf(`.${name.replaceAll(":", String.raw`\:`)} {`),
+    );
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    expect(positions[0]).toBeGreaterThanOrEqual(0);
+  });
+
+  it("routes the touch variant and the touch-target floor through max-md", () => {
+    expect(variantBlock("mobile-app")).toMatch(/@variant max-md \{\s*@slot;/);
+    expect(indexCssSource).toMatch(/@utility mobile-touch-target \{[^@]*@variant max-md \{/);
+  });
+
+  it("keeps raw md media rules for native mobile shells only", () => {
+    // A raw width rule skips the desktop-app split, so only rules the desktop app
+    // can never match may use one; every other rule goes through the variants.
+    expect(rawMdMediaBlocks.length).toBeGreaterThan(0);
+    for (const block of rawMdMediaBlocks) {
+      const selectors = [
+        ...block.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/^ {2}(\S[^{}]*)\{/gm),
+      ].flatMap(([, selectorList]) => selectorList.split(/,\n/));
+      expect(selectors.length).toBeGreaterThan(0);
+      for (const selector of selectors) {
+        expect(selector).toMatch(/\[data-(?:ios|android)-native\]/);
+      }
+    }
+  });
+});
+
 /* Regression test for the "inline <code> renders at 9.75px" bug.
  *
  * code/kbd/samp/pre carry preflight's `font-size: 1em`, so they inherit their
@@ -891,7 +1152,9 @@ describe("index.css composer and menu surfaces", () => {
  * a 16px-equivalent shrinks every step, including nested code.
  */
 describe("index.css desktop typography ramp", () => {
-  const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
+  const desktopMap = cssSource.match(
+    new RegExp(String.raw`${layoutVariantRule(":root", "md")}[^}]*\}`),
+  )?.[0];
 
   const anchorDivisor = Number(
     desktopMap?.match(
@@ -931,12 +1194,14 @@ describe("index.css desktop typography ramp", () => {
 /* Captions derive from the raw body preference so they stay 1px smaller
  * at every size the Appearance setting allows. */
 describe("index.css body text tokens", () => {
-  const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
-  const mobileMap = cssSource.match(
-    /@media \(width < 48rem\) \{\s*(?:\/\*[\s\S]*?\*\/\s*)?:root \{[^}]*\}/,
+  const desktopMap = cssSource.match(
+    new RegExp(String.raw`${layoutVariantRule(":root", "md")}[^}]*\}`),
   )?.[0];
-  const BODY_LINE_HEIGHT_RATIO = 1.8;
-  const CAPTION_LINE_HEIGHT_RATIO = 1.4;
+  const mobileMap = cssSource.match(
+    new RegExp(String.raw`${layoutVariantRule(":root", "max-md")}[^}]*\}`),
+  )?.[0];
+  const BODY_LINE_HEIGHT_RATIO = 1.6;
+  const CAPTION_LINE_HEIGHT_RATIO = 1.3;
 
   it("derives the caption step from the body step on desktop", () => {
     expect(desktopMap).toContain("--text-sm: calc(var(--desktop-ui-font-size) - 1px)");
@@ -1007,7 +1272,7 @@ describe("index.css body text tokens", () => {
     // vendor markup (streamdown) this app does not control.
     expect(cssSource).toContain("--text-xs: var(--text-sm)");
     expect(cssSource).toContain("--text-xs--line-height: var(--text-sm--line-height)");
-    // And it must NOT be remapped in the media queries, or the alias is moot.
+    // And it must NOT be remapped in the layout variants, or the alias is moot.
     expect(desktopMap).not.toContain("--text-xs:");
     expect(mobileMap).not.toContain("--text-xs:");
   });
@@ -1022,6 +1287,7 @@ describe("index.css body text tokens", () => {
     // Unitless line heights scale with the selected font size.
     const themeBlock = cssSource.match(/@theme \{[^}]*--text-ui:[^}]*\}/)?.[0];
     expect(themeBlock).toContain(`--text-ui--line-height: ${BODY_LINE_HEIGHT_RATIO}`);
+    expect(themeBlock).toContain("--text-message--line-height: var(--text-ui--line-height)");
     expect(themeBlock).toContain(`--text-sm--line-height: ${CAPTION_LINE_HEIGHT_RATIO}`);
   });
 
@@ -1036,16 +1302,17 @@ describe("index.css shadow tokens", () => {
   const themeBlock = cssSource.match(/@theme inline \{[^}]*\}/)?.[0].replace(/\s+/g, " ");
 
   it.each([
-    "--shadow-composer: 0 0 12px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
-    "--shadow-composer-focus: 0 0 20px -4px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
-    "--shadow-xs: 0 2px 8px rgb(var(--ui-shadow-neutral-rgb) / 0.04)",
-    "--shadow-sm: 0 4px 10px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.09)",
-    "--shadow-md: 0 6px 12px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
-    "--shadow-lg: 0 6px 20px -4px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
-    "--shadow-menu: 0 8px 28px rgb(var(--ui-shadow-warm-rgb) / 0.12)",
-    "--shadow-xl: 0 12px 44px rgb(var(--ui-shadow-warm-rgb) / 0.16)",
-    "--shadow-card: 0 4px 16px -2px rgb(var(--ui-shadow-warm-rgb) / 0.1), 0 1px 0 rgb(var(--ui-shadow-neutral-rgb) / 0.02)",
-    "--shadow-tooltip: 0 3px 6px rgb(var(--ui-shadow-neutral-rgb) / 0.05)",
+    "--shadow-xs: 0 2px 8px -3px rgb(var(--ui-shadow-neutral-rgb) / 0.08)",
+    "--shadow-sm: 0 4px 12px -5px rgb(var(--ui-shadow-neutral-rgb) / 0.1)",
+    "--shadow-md: 0 5px 16px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
+    "--shadow-lg: 0 6px 20px -8px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
+    "--shadow-xl: 0 10px 32px -13px rgb(var(--ui-shadow-neutral-rgb) / 0.16)",
+    "--shadow-dialog: 0 14px 48px -19px rgb(var(--ui-shadow-neutral-rgb) / 0.2)",
+    // Aliases repeat their step: tooltip = xs, card and composer = lg, menu = xl.
+    "--shadow-tooltip: 0 2px 8px -3px rgb(var(--ui-shadow-neutral-rgb) / 0.08)",
+    "--shadow-card: 0 6px 20px -8px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
+    "--shadow-composer: 0 6px 20px -8px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
+    "--shadow-menu: 0 10px 32px -13px rgb(var(--ui-shadow-neutral-rgb) / 0.16)",
   ])("defines %s", (token) => {
     expect(themeBlock).toContain(token);
   });
@@ -1062,7 +1329,9 @@ describe("index.css shadow tokens", () => {
 
 describe("index.css mobile sidebar transparency", () => {
   const mobileRule = cssSource.match(
-    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background:\s*transparent[^}]*\}/,
+    new RegExp(
+      String.raw`${layoutVariantRule(String.raw`\n\.conversations-sidebar`, "max-md")}[^}]*background:\s*transparent[^}]*\}`,
+    ),
   )?.[0];
 
   it("keeps the drawer canvas transparent over its shared glass layer", () => {
@@ -1100,19 +1369,19 @@ describe("index.css text selection colors", () => {
   });
 });
 
-describe("index.css mobile settings title", () => {
-  const titleRule = cssSource.match(/\.settings-page-title \{[^}]*\}/)?.[0];
-  const headerFadeRule = cssSource.match(/\.settings-mobile-header::before \{[^}]*\}/)?.[0];
+describe("index.css mobile settings header", () => {
+  const headerFadeRule = cssSource.match(
+    new RegExp(
+      String.raw`${layoutVariantRule(String.raw`\.settings-mobile-header`, "max-md")}\s*&::before \{[^}]*\}`,
+    ),
+  )?.[0];
 
-  it("centers the settings title in the fixed mobile header row", () => {
-    expect(headerFadeRule, "the mobile settings header rule is gone").toBeDefined();
-    expect(titleRule, "the mobile settings title rule is gone").toBeDefined();
-    expect(titleRule).toContain("position: fixed");
-    expect(titleRule).toContain("height: var(--omnigent-header-height)");
-    expect(titleRule).toContain("text-align: center");
+  it("keeps settings page titles in the page instead of the header row", () => {
+    expect(cssSource).not.toContain(".settings-page-title");
   });
 
   it("fades the settings header into the page like the session header", () => {
+    expect(headerFadeRule, "the mobile settings header rule is gone").toBeDefined();
     expect(headerFadeRule).toContain("height: 80px");
     expect(headerFadeRule).toContain(
       "background: linear-gradient(to bottom, var(--background) 0 48px, transparent 80px)",
@@ -1402,17 +1671,21 @@ describe("index.css electron-mac sidebar header", () => {
     expect(settingsHeaderRule).toContain("padding-top: calc(var(--mac-titlebar-height) + 0.5rem)");
   });
 
-  it("hands the phone layout's headers the lights' corner below md", () => {
-    // Electron's 720px minimum is below md, where the drawer and chat header
-    // carry their own controls; a fixed rem pad would drift with zoom.
-    const narrowBlock = cssSource.match(
-      /@media \(width < 48rem\) \{(?=\s*html\[data-electron-mac\] \.electron-sidebar-header-actions \{)(?:[^{}]|\{[^{}]*\})*\}/,
-    )?.[0];
-    expect(narrowBlock, "expected the macOS sub-md header block").toBeDefined();
-    expect(narrowBlock).toMatch(/\.electron-sidebar-header-actions \{\s*display: none;/);
-    expect(narrowBlock).toMatch(
-      /\.traffic-light-clearance,\s*html\[data-electron-mac\] \.sidebar-header-row \{\s*padding-left: var\(--mac-traffic-light-width\);/,
+  it("keeps the title-bar cluster and header rows at every window width", () => {
+    // Electron's 720px minimum is below md, but the desktop app keeps the desktop
+    // layout there, so no mac shell rule may depend on the window width.
+    expect(indexCssSource).not.toMatch(
+      /html\[data-electron-mac\][^{}]*\{\s*@(?:variant (?:max-)?md\b|media [^{]*width)/,
     );
+    for (const block of rawMdMediaBlocks) expect(block).not.toContain("[data-electron-mac]");
+    // The cluster steps aside only while a full-window view covers the app.
+    const clusterHidingSelectors = cssBlocks
+      .map(([block]) => block.replace(/\/\*[\s\S]*?\*\//g, ""))
+      .filter((block) => /\.electron-sidebar-header-actions \{\s*display: none;/.test(block))
+      .map((block) => block.slice(0, block.indexOf("{")).trim());
+    expect(clusterHidingSelectors).toEqual([
+      "html[data-electron-mac]:has([data-fullscreen-overlay]) .electron-sidebar-header-actions",
+    ]);
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {
@@ -1594,3 +1867,31 @@ function extractInsetRule(css: string): { selectors: string; body: string } | nu
   if (bodyStart === -1 || bodyEnd === -1) return null;
   return { selectors, body: css.slice(bodyStart + 1, bodyEnd) };
 }
+
+// The lights are painted outside the page, so the corner pane row's room for them is pinned here.
+describe("index.css pane strip window-corner inset", () => {
+  const blocks = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).map((block) =>
+    block.replace(/\/\*[\s\S]*?\*\//g, "").trim(),
+  );
+  const ruleFor = (selector: string) =>
+    blocks.find((block) => block.slice(0, block.indexOf("{")).trim().endsWith(selector));
+
+  it("is hidden by default and shown on the Mac with the sidebar closed, clearing the header's room", () => {
+    expect(ruleFor(".pane-strip-window-inset")).toContain("display: none");
+    const shown = ruleFor(
+      "html[data-electron-mac] .app-shell:not([data-sidebar-open]) .pane-strip-window-inset",
+    );
+    expect(shown).toContain("display: block");
+    expect(shown).toContain("width: var(--mac-header-actions-clearance)");
+  });
+
+  it("makes a row under the title bar as tall as the title bar, as the chat body's offset reads it", () => {
+    const macRoot = blocks.filter(
+      (block) => block.slice(0, block.indexOf("{")).trim() === "html[data-electron-mac]",
+    );
+    expect(macRoot.join("\n")).toContain("--pane-window-top-row: var(--mac-titlebar-height)");
+    expect(
+      ruleFor("html[data-electron-mac] [data-pane-strip][data-pane-strip-title-bar-row]"),
+    ).toContain("height: var(--pane-window-top-row)");
+  });
+});

@@ -21,6 +21,7 @@ from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, local_single_user_enabled
+from omnigent.server.proactive_agent import reject_proactive_agent_id
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.conversation_store import is_internal_label_key
@@ -165,6 +166,10 @@ async def resolve_project_session_create(
 
     if getattr(resolved, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
         raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
+    if "agent_id" in updates:
+        # The request's own agent_id was checked by its route; a project's saved
+        # agent is the caller's to edit, so it must not name the hidden agent either.
+        reject_proactive_agent_id(resolved.agent_id)
     if getattr(resolved, "git", None) is not None and getattr(resolved, "host_id", None) is None:
         raise OmnigentError(
             "git worktree creation requires host_id",
@@ -477,6 +482,7 @@ async def validate_existing_host_workspace(
                 agent_cache.load,
                 agent.id,
                 agent.bundle_location,
+                expand_env=agent.operator_authored,
             )
             os_env = getattr(loaded.spec, "os_env", None)
             spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None

@@ -25,6 +25,7 @@ from omnigent.server.scheduled.schedule import (
     occurrence_host_id,
     sandbox_host_id,
     scheduled_trigger_key,
+    timer_rule,
 )
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests._helpers.polling import poll_until_async
@@ -2141,11 +2142,12 @@ async def test_run_now_records_a_manual_run_that_the_next_poll_starts(store) -> 
     scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now, poll_seconds=3600)
     await scheduler.start()
     try:
-        # The request only records the run, even on the replica that owns its host.
-        run = await scheduler.run_now(task)
-        assert run.status == "scheduled"
-        assert scheduler._startups == {}
-        assert fired == []
+        # Keep the background poll from consuming the run before these assertions.
+        async with scheduler._poll_lock:
+            run = await scheduler.run_now(task)
+            assert run.status == "scheduled"
+            assert scheduler._startups == {}
+            assert fired == []
         await scheduler.poll_once()
         await _drain(scheduler)
     finally:
@@ -2740,3 +2742,59 @@ async def test_without_a_busy_check_a_trigger_keeps_its_saved_schedule(store) ->
     await _drain(scheduler)
     fire.assert_awaited_once()
     assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+
+def _timer_task(
+    store: SqlAlchemyScheduledTaskStore,
+    seed: str,
+    *,
+    repeat: bool,
+    interval: int,
+    first_run_at: int,
+):
+    """Save a ``sys_timer_set`` timer as its route does: first firing at *first_run_at*."""
+    return _task(
+        store,
+        seed,
+        timer_rule(interval, repeat=repeat),
+        "[System: timer fired]",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        first_run_at=first_run_at,
+        kind="timer",
+        schedule_anchor=first_run_at - interval,
+    )
+
+
+async def test_a_timer_ticks_on_its_own_interval_below_the_automation_minimum(store) -> None:
+    task = _timer_task(store, "fast_timer", repeat=True, interval=5, first_run_at=1_800_000_000)
+    # The poll comes 12 seconds late, so two ticks were missed meanwhile.
+    clock = FakeClock(task.next_run_at + 12)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(return_value=None), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at
+    saved = store.get(task.id)
+    # Not paused for its five-second interval; missed ticks are skipped, the phase kept.
+    assert (saved.state, saved.next_run_at) == ("active", task.next_run_at + 15)
+
+
+@pytest.mark.parametrize("repeat", [True, False], ids=["repeating", "one_shot"])
+async def test_a_busy_session_never_holds_back_a_timer(store, repeat: bool) -> None:
+    """A tick that lands mid-turn joins it, as a message would; only triggers wait."""
+    task = _timer_task(
+        store, f"busy_timer_{repeat}", repeat=repeat, interval=120, first_run_at=1_800_000_000
+    )
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    busy = AsyncMock(return_value=task.next_run_at + 120)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    busy.assert_not_awaited()
+    fire.assert_awaited_once()

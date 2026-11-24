@@ -8,13 +8,16 @@ The observer steps live in :mod:`omnigent.runner.git_providers.github_observer`.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from typing import Any
+import functools
+import inspect
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, TypeVar
 
 from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
+    PullRequestStatus,
     ReviewerRef,
     ShellPrOp,
     ShellSegment,
@@ -67,8 +70,44 @@ def _with_provider_fields(info: dict[str, Any]) -> dict[str, Any]:
     return info
 
 
+_Facet = TypeVar("_Facet", bound=type)
+
+
+def _for_reference_host(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Run *method* with its ``reference``'s host as the target of its ``gh`` calls."""
+    parameters = list(inspect.signature(method).parameters)
+    position = parameters.index("reference")
+
+    @functools.wraps(method)
+    def step(*args: Any, **kwargs: Any) -> Any:
+        from omnigent.runner import github_resource
+
+        reference = kwargs["reference"] if "reference" in kwargs else args[position]
+        host = reference.host if isinstance(reference, PullRequestRef) else None
+        with github_resource.gh_target_host_scope(host):
+            return method(*args, **kwargs)
+
+    return step
+
+
+def _scoped_to_reference_hosts(facet: _Facet) -> _Facet:
+    """Wrap each public step that takes a ``reference`` with :func:`_for_reference_host`."""
+    for name, value in list(vars(facet).items()):
+        if (
+            not name.startswith("_")
+            and inspect.isfunction(value)
+            and "reference" in inspect.signature(value).parameters
+        ):
+            setattr(facet, name, _for_reference_host(value))
+    return facet
+
+
+@_scoped_to_reference_hosts
 class GitHubPullRequests:
-    """GitHub's pull request steps for the session panel."""
+    """GitHub's pull request steps for the session panel.
+
+    A step that takes a ``reference`` runs its ``gh`` calls for the reference's host.
+    """
 
     capabilities = _CAPABILITIES
 
@@ -153,6 +192,14 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._pr_title_before(root, reference, deadline)
+
+    def pr_status(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[PullRequestStatus | None, bool]:
+        """Look up one PR's title, state and draft flag before ``deadline``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_status_before(root, reference, deadline)
 
     def verify_accessible(self, root: str, reference: PullRequestRef) -> None:
         """Raise unless ``gh`` on the host can read the PR."""

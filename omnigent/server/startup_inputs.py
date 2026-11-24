@@ -60,6 +60,15 @@ _WITHDRAWN_INPUT_NOTE = (
 _FAILED_INPUT_NOTE = (
     "The message could not be delivered: the sandbox it was waiting for failed to launch."
 )
+# How long a submitted native input waits for its transcript echo before it stops
+# holding back the messages behind it. The CLI can take a message without ever
+# recording it (e.g. a slash command Claude Code answers only in its TUI), and then
+# no echo comes. Matches the in-memory pending-input TTL.
+_RECEIPT_TIMEOUT_S = 600.0
+_UNCONFIRMED_INPUT_NOTE = (
+    "The agent never confirmed it received this message. Check the terminal; "
+    "if the agent didn't act on it, send it again."
+)
 
 
 def _settled_startup(conv: Conversation) -> str | None:
@@ -176,6 +185,7 @@ class ManagedStartupInputs:
             tuple[int, str], tuple[HostConnection, asyncio.Task[None], asyncio.Event]
         ] = {}
         self._deliveries: dict[tuple[int, str], asyncio.Task[Any]] = {}
+        self._receipt_watches: set[asyncio.Task[None]] = set()
 
     async def enqueue(
         self,
@@ -609,6 +619,13 @@ class ManagedStartupInputs:
                         saved,
                         cleared_pending_id=pending_inputs.make_pending_id(session_id, item.id),
                     )
+                elif pending_id := response.get("pending_id"):
+                    watch = asyncio.create_task(
+                        self._expire_unconfirmed(session_id, item.id, str(pending_id)),
+                        name=f"startup-input-receipt-{session_id}",
+                    )
+                    self._receipt_watches.add(watch)
+                    watch.add_done_callback(self._receipt_watches.discard)
                 await asyncio.to_thread(
                     self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
                 )
@@ -684,6 +701,29 @@ class ManagedStartupInputs:
         _logger.info("Saved message for session %s waits for /clear to finish", session_id)
         return True
 
+    async def _expire_unconfirmed(self, session_id: str, item_id: str, pending_id: str) -> None:
+        """Fail a submitted input whose transcript echo never came, freeing the ones behind it."""
+        await asyncio.sleep(_RECEIPT_TIMEOUT_S)
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
+            return
+        # The echo replaces the row, so only an input still awaiting it changes here.
+        if not await asyncio.to_thread(
+            self.conversations.transition_pending_input,
+            session_id,
+            item_id,
+            expected="incomplete",
+            status="failed",
+        ):
+            return
+        # Its queued bubble now renders from the failed row instead.
+        pending_inputs.resolve(session_id, pending_id)
+        await self._report_failure(
+            session_id, f"unconfirmed_{item_id}", _UNCONFIRMED_INPUT_NOTE, publish_status=False
+        )
+        if conv.host_id is not None:
+            wake_startup_worker(conv.host_id)
+
     async def retry(self, session_id: str) -> bool:
         changed = False
         for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
@@ -754,7 +794,11 @@ class ManagedStartupInputs:
             _publish_status(session_id, "failed", failure_origin="startup_input_failed")
 
     async def shutdown(self) -> None:
-        tasks = [task for _, task, _ in self._workers.values()] + list(self._deliveries.values())
+        tasks = [
+            *(task for _, task, _ in self._workers.values()),
+            *self._deliveries.values(),
+            *self._receipt_watches,
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

@@ -9,7 +9,10 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
+import { HARNESS_DETAIL_ENTRIES } from "@/pages/settings/search/catalog/harnesses";
+import { SettingsOverlayOwner } from "@/pages/settings/search/settingsOwnership";
 import { HarnessCredentialForm } from "./HarnessCredentialForm";
+import { HarnessSubscriptionSignIn } from "./HarnessSubscriptionSignIn";
 
 const mutateMock = vi.fn();
 const { copyTextMock, showToastMock } = vi.hoisted(() => ({
@@ -40,7 +43,12 @@ afterEach(() => {
 describe("HarnessCredentialForm", () => {
   it("saves a pasted API key", () => {
     render(
-      <HarnessCredentialForm harness="codex" host={HOST} command="codex login" onDone={vi.fn()} />,
+      <HarnessCredentialForm
+        harness="codex"
+        host={HOST}
+        subscription={<HarnessSubscriptionSignIn command="codex login" hostName={HOST.name} />}
+        onDone={vi.fn()}
+      />,
     );
     fireEvent.change(screen.getByTestId("harness-credential-key"), {
       target: { value: "sk-ant-XYZ" },
@@ -53,14 +61,14 @@ describe("HarnessCredentialForm", () => {
   });
 
   it("does not submit an empty key (Save disabled)", () => {
-    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="codex" host={HOST} onDone={vi.fn()} />);
     expect((screen.getByTestId("harness-credential-save") as HTMLButtonElement).disabled).toBe(
       true,
     );
   });
 
   it("submits a gateway", () => {
-    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="codex" host={HOST} onDone={vi.fn()} />);
     // Gateway is an equally-weighted option, always shown (no toggle).
     const gateway = screen.getByTestId("harness-credential-gateway");
     const [urlInput, keyInput] = gateway.querySelectorAll("input");
@@ -80,7 +88,7 @@ describe("HarnessCredentialForm", () => {
 
   it("offers a detected credential for one-click adopt", () => {
     detected = [{ family: "openai", source: "$OPENAI_API_KEY", env_var: "OPENAI_API_KEY" }];
-    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="codex" host={HOST} onDone={vi.fn()} />);
     const adopt = screen.getByTestId("harness-credential-adopt");
     expect(adopt.textContent).toContain("$OPENAI_API_KEY");
     fireEvent.click(adopt.querySelector("button")!);
@@ -98,7 +106,7 @@ describe("HarnessCredentialForm", () => {
     detected = [
       { family: "anthropic", source: "$ANTHROPIC_API_KEY", env_var: "ANTHROPIC_API_KEY" },
     ];
-    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="codex" host={HOST} onDone={vi.fn()} />);
     expect(screen.queryByTestId("harness-credential-adopt")).toBeNull();
   });
 
@@ -107,7 +115,7 @@ describe("HarnessCredentialForm", () => {
       { family: "databricks", source: "isaac CLI", env_var: null },
       { family: "databricks", source: "Databricks profile DEFAULT", env_var: "DATABRICKS_TOKEN" },
     ];
-    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="codex" host={HOST} onDone={vi.fn()} />);
 
     expect(screen.queryByTestId("harness-credential-adopt")).toBeNull();
     expect(screen.queryByText(/isaac CLI|Databricks profile/)).toBeNull();
@@ -118,7 +126,7 @@ describe("HarnessCredentialForm", () => {
     detected = [
       { family: "anthropic", source: "$ANTHROPIC_API_KEY", env_var: "ANTHROPIC_API_KEY" },
     ];
-    render(<HarnessCredentialForm harness="pi" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="pi" host={HOST} onDone={vi.fn()} />);
     expect(screen.getByTestId("harness-credential-adopt").textContent).toContain(
       "$ANTHROPIC_API_KEY",
     );
@@ -129,7 +137,7 @@ describe("HarnessCredentialForm", () => {
     // adopts under the detected family, so a host with only $OPENAI_API_KEY can
     // still back Pi. The adopt filter must not narrow Pi to anthropic-only.
     detected = [{ family: "openai", source: "$OPENAI_API_KEY", env_var: "OPENAI_API_KEY" }];
-    render(<HarnessCredentialForm harness="pi" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="pi" host={HOST} onDone={vi.fn()} />);
     const adopt = screen.getByTestId("harness-credential-adopt");
     expect(adopt.textContent).toContain("$OPENAI_API_KEY");
     fireEvent.click(adopt.querySelector("button")!);
@@ -141,7 +149,7 @@ describe("HarnessCredentialForm", () => {
 
   it("shows no adopt row when nothing is detected", () => {
     detected = [];
-    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="codex" host={HOST} onDone={vi.fn()} />);
     expect(screen.queryByTestId("harness-credential-adopt")).toBeNull();
   });
 
@@ -150,7 +158,9 @@ describe("HarnessCredentialForm", () => {
       <HarnessCredentialForm
         harness="claude"
         host={HOST}
-        command="claude auth login"
+        subscription={
+          <HarnessSubscriptionSignIn command="claude auth login" hostName={HOST.name} />
+        }
         onDone={vi.fn()}
       />,
     );
@@ -161,7 +171,7 @@ describe("HarnessCredentialForm", () => {
   });
 
   it("omits the subscription signpost when there is no login command (Pi)", () => {
-    render(<HarnessCredentialForm harness="pi" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="pi" host={HOST} onDone={vi.fn()} />);
     expect(screen.queryByTestId("harness-credential-login-copy")).toBeNull();
   });
 
@@ -171,7 +181,12 @@ describe("HarnessCredentialForm", () => {
     // (no field is the primary with the rest demoted).
     detected = [{ family: "openai", source: "$OPENAI_API_KEY", env_var: "OPENAI_API_KEY" }];
     const { container } = render(
-      <HarnessCredentialForm harness="codex" host={HOST} command="codex login" onDone={vi.fn()} />,
+      <HarnessCredentialForm
+        harness="codex"
+        host={HOST}
+        subscription={<HarnessSubscriptionSignIn command="codex login" hostName={HOST.name} />}
+        onDone={vi.fn()}
+      />,
     );
     // Each path carries its own equal-weight label.
     for (const label of [
@@ -190,7 +205,7 @@ describe("HarnessCredentialForm", () => {
     // Pi has no CLI login and nothing detected → just API key and gateway, so a
     // single "or" divides them; the subscription block is absent.
     const { container } = render(
-      <HarnessCredentialForm harness="pi" host={HOST} command={null} onDone={vi.fn()} />,
+      <HarnessCredentialForm harness="pi" host={HOST} onDone={vi.fn()} />,
     );
     expect(screen.getByText("Use an API key")).toBeTruthy();
     expect(screen.getByText("Connect a gateway")).toBeTruthy();
@@ -209,7 +224,7 @@ describe("HarnessCredentialForm", () => {
       }),
     );
     const onDone = vi.fn();
-    render(<HarnessCredentialForm harness="pi" host={HOST} command={null} onDone={onDone} />);
+    render(<HarnessCredentialForm harness="pi" host={HOST} onDone={onDone} />);
     fireEvent.change(screen.getByTestId("harness-credential-key"), { target: { value: "sk-x" } });
     fireEvent.click(screen.getByTestId("harness-credential-save"));
     expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("is ready on"));
@@ -228,7 +243,7 @@ describe("HarnessCredentialForm", () => {
       }),
     );
     const onDone = vi.fn();
-    render(<HarnessCredentialForm harness="pi" host={HOST} command={null} onDone={onDone} />);
+    render(<HarnessCredentialForm harness="pi" host={HOST} onDone={onDone} />);
     const keyInput = screen.getByTestId("harness-credential-key") as HTMLInputElement;
     fireEvent.change(keyInput, { target: { value: "sk-x" } });
     fireEvent.click(screen.getByTestId("harness-credential-save"));
@@ -254,9 +269,7 @@ describe("HarnessCredentialForm", () => {
       }),
     );
     const onDone = vi.fn();
-    render(
-      <HarnessCredentialForm harness="codex-native" host={HOST} command={null} onDone={onDone} />,
-    );
+    render(<HarnessCredentialForm harness="codex-native" host={HOST} onDone={onDone} />);
     fireEvent.change(screen.getByTestId("harness-credential-key"), { target: { value: "sk-x" } });
     fireEvent.click(screen.getByTestId("harness-credential-save"));
     expect(showToastMock).toHaveBeenCalledWith(
@@ -281,7 +294,7 @@ describe("HarnessCredentialForm", () => {
       ),
     );
     const onDone = vi.fn();
-    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={onDone} />);
+    render(<HarnessCredentialForm harness="codex" host={HOST} onDone={onDone} />);
     const gateway = screen.getByTestId("harness-credential-gateway");
     const [urlInput, keyInput] = gateway.querySelectorAll("input");
     fireEvent.change(urlInput, { target: { value: "ftp://nope" } });
@@ -301,7 +314,7 @@ describe("HarnessCredentialForm", () => {
     // send the secret twice. The onSubmit is gated on !busy, so a submit while
     // pending is a no-op.
     storePending = true;
-    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="codex" host={HOST} onDone={vi.fn()} />);
     const keyInput = screen.getByTestId("harness-credential-key");
     fireEvent.change(keyInput, { target: { value: "sk-x" } });
     fireEvent.submit(keyInput.closest("form")!);
@@ -321,13 +334,7 @@ describe("HarnessCredentialForm", () => {
       }),
     );
     render(
-      <HarnessCredentialForm
-        harness="codex-native"
-        label="Codex"
-        host={HOST}
-        command={null}
-        onDone={vi.fn()}
-      />,
+      <HarnessCredentialForm harness="codex-native" label="Codex" host={HOST} onDone={vi.fn()} />,
     );
     fireEvent.change(screen.getByTestId("harness-credential-key"), { target: { value: "sk-x" } });
     fireEvent.click(screen.getByTestId("harness-credential-save"));
@@ -339,7 +346,7 @@ describe("HarnessCredentialForm", () => {
     // A disabled Save must read as "waiting for input" (outline), not a heavy
     // dark fill that looks like an error/unavailable state. Typing a key flips
     // it to the solid primary.
-    render(<HarnessCredentialForm harness="pi" host={HOST} command={null} onDone={vi.fn()} />);
+    render(<HarnessCredentialForm harness="pi" host={HOST} onDone={vi.fn()} />);
     const save = screen.getByTestId("harness-credential-save") as HTMLButtonElement;
     expect(save.disabled).toBe(true);
     expect(save.getAttribute("data-variant")).toBe("outline");
@@ -358,3 +365,37 @@ describe("HarnessCredentialForm", () => {
 function countOrDividers(container: HTMLElement): number {
   return Array.from(container.querySelectorAll("div")).filter((d) => d.textContent === "or").length;
 }
+
+describe("HarnessCredentialForm as a Settings overlay", () => {
+  it("names its controls as parts of the fix dialog's opener, and keeps its names elsewhere", () => {
+    const { unmount } = render(
+      <SettingsOverlayOwner entry={HARNESS_DETAIL_ENTRIES.entry("codex-native")} opener="fixAction">
+        <HarnessCredentialForm harness="codex" host={HOST} onDone={vi.fn()} />
+      </SettingsOverlayOwner>,
+    );
+
+    expect(screen.getByLabelText("API key")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:apiKey",
+    );
+    expect(screen.getByLabelText("Gateway base URL")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:gatewayUrl",
+    );
+    expect(screen.getByLabelText("Gateway API key")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:gatewayKey",
+    );
+    const saves = screen.getAllByRole("button", { name: /^Save/ });
+    expect(saves.map((save) => save.getAttribute("data-settings-control"))).toEqual([
+      "harness-codex-native-detail:saveKey",
+      "harness-codex-native-detail:saveGateway",
+    ]);
+    unmount();
+
+    render(<HarnessCredentialForm harness="codex" host={HOST} onDone={vi.fn()} />);
+    const bare = document.querySelector('input[placeholder="Paste an API key"]');
+    expect(bare).not.toHaveAttribute("aria-label");
+    expect(bare).not.toHaveAttribute("data-settings-control");
+  });
+});

@@ -1,6 +1,12 @@
+import type { ComponentProps, ComponentType } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ChatComposer, ComposerSendButton } from "./ChatComposer";
+
+// The stories render today's textarea composer, which chooses no engine.
+const TextareaChatComposer = ChatComposer as ComponentType<
+  Extract<ComponentProps<typeof ChatComposer>, { engine?: undefined }>
+>;
 
 const KEYBOARD = { submitWithModEnter: false, preventsKeyboardSubmit: false } as const;
 
@@ -9,7 +15,7 @@ const file = (name: string, content = "x", type = "text/plain") =>
 
 const meta = {
   title: "Components/Composer/ChatComposer",
-  component: ChatComposer,
+  component: TextareaChatComposer,
   tags: ["visual-snapshot"],
   args: {
     keyboard: KEYBOARD,
@@ -22,7 +28,7 @@ const meta = {
       </div>
     ),
   ],
-} satisfies Meta<typeof ChatComposer>;
+} satisfies Meta<typeof TextareaChatComposer>;
 
 export default meta;
 type Story = StoryObj<typeof meta>;

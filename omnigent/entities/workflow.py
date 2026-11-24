@@ -11,16 +11,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from omnigent.entities.session_journal import (
+    PLAN_DESCRIPTION_MAX_CHARS,
     PLAN_NAME_MAX_CHARS,
     InvalidJournalEntryError,
     _line,
-    _text,
+    normalize_description,
     normalize_plan,
 )
 
 # A run's plan takes the workflow's name, so it follows the plan-name limit.
 WORKFLOW_NAME_MAX_CHARS = PLAN_NAME_MAX_CHARS
-WORKFLOW_DESCRIPTION_MAX_CHARS = 2000
+# Save plan stores the description a planning chat proposed with its plan.
+WORKFLOW_DESCRIPTION_MAX_CHARS = PLAN_DESCRIPTION_MAX_CHARS
 
 
 class InvalidWorkflowError(ValueError):
@@ -32,7 +34,7 @@ class Workflow:
     """
     A saved workflow.
 
-    :param id: Workflow ID, a bare 32-character hex UUID.
+    :param id: Workflow ID, bare 32-character hex; by default a UUID4.
     :param user_id: The owner, or the reserved ``local`` user in single-user mode.
     :param name: One line, e.g. ``"nightly-build"``; unique per owner.
     :param description: What the workflow is for; a run gives it to the agent
@@ -41,6 +43,9 @@ class Workflow:
     :param updated_at: Unix epoch seconds of the last write.
     :param steps: The saved steps in the journal plan's format; empty for a draft.
     :param planning_session_id: The owner's conversation for iterating on the plan.
+    :param description_source: The journal entry ID of the planning-chat proposal
+        Save plan took the description from or kept it over; ``None`` once it's
+        written otherwise.
     """
 
     id: str
@@ -51,6 +56,7 @@ class Workflow:
     updated_at: int
     steps: list[dict[str, Any]]
     planning_session_id: str | None = None
+    description_source: str | None = None
 
 
 def normalize_workflow(
@@ -75,13 +81,7 @@ def normalize_workflow(
             if steps == []
             else normalize_plan(steps, name=workflow_name, source="workflow")["steps"]
         )
-        text = _text("description", description).strip()
+        text = normalize_description(description)
     except InvalidJournalEntryError as exc:
         raise InvalidWorkflowError(str(exc)) from exc
-    if not text:
-        raise InvalidWorkflowError("description must not be empty")
-    if len(text) > WORKFLOW_DESCRIPTION_MAX_CHARS:
-        raise InvalidWorkflowError(
-            f"description must be at most {WORKFLOW_DESCRIPTION_MAX_CHARS} characters"
-        )
     return workflow_name, text, workflow_steps

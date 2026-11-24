@@ -966,13 +966,23 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
 
 
 @pytest.mark.parametrize(
-    ("overrides", "app_server_command", "probed"),
+    ("overrides", "app_server_command", "probed", "allow_discovery"),
     [
-        (['model_provider="openai"'], (), False),
-        (['model_provider="openai"'], ("/wrapped/codex",), True),
-        (['model="gpt-5.5"'], (), True),
+        pytest.param(overrides, command, probed, allow, id=f"{case}-{allow}")
+        for case, overrides, command, probed in [
+            ("omnigent-picked", ['model_provider="openai"'], (), False),
+            ("launcher-wrapper", ['model_provider="openai"'], ("/wrapped/codex",), True),
+            ("codex-picked", ['model="gpt-5.5"'], (), True),
+            (
+                "configured-provider",
+                ['model_provider="inactive_gateway"'],
+                ("/wrapped/codex",),
+                True,
+            ),
+        ]
+        for allow in (True, False)
+        if allow or probed
     ],
-    ids=["omnigent-picked", "launcher-wrapper", "codex-picked"],
 )
 async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider(
     tmp_path: Path,
@@ -980,6 +990,7 @@ async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider
     overrides: list[str],
     app_server_command: tuple[str, ...],
     probed: bool,
+    allow_discovery: bool,
 ) -> None:
     from omnigent.harnesses.codex_native import app_server
 
@@ -992,6 +1003,7 @@ async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider
     config_path.write_text(
         '[model_providers.inactive_gateway]\nname = ""\n'
         'base_url = "https://gateway.example.test/ai-gateway/codex/v1"\n'
+        'auth = {command = "provider-secret-helper"}\n'
     )
     started = AsyncMock(side_effect=OSError("probe started"))
     monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", started)
@@ -1002,10 +1014,11 @@ async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider
         cwd=tmp_path,
         env={},
         app_server_command=app_server_command,
+        allow_discovery=allow_discovery,
     )
     assert result == overrides
-    assert started.await_count == int(probed)
-    assert (
-        tomllib.loads(config_path.read_text())["model_providers"]["inactive_gateway"]["name"]
-        == "inactive_gateway"
-    )
+    assert started.await_count == int(probed and allow_discovery)
+    provider = tomllib.loads(config_path.read_text())["model_providers"]["inactive_gateway"]
+    assert provider["name"] == "inactive_gateway"
+    assert provider["base_url"] == "https://gateway.example.test/ai-gateway/codex/v1"
+    assert provider["auth"] == {"command": "provider-secret-helper"}

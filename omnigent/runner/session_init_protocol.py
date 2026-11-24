@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal, TypeAlias
 from uuid import uuid4
 
@@ -32,6 +33,27 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     parent_session_id: str | None = None
     root_session_id: str | None = None
     inference_config: dict[str, object] | None = None
+    # Recorded cost of this session alone, excluding sessions it spawned; a
+    # native harness resumes its running cost total from it.
+    own_cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+def _own_cost_usd(conversation: Conversation) -> float | None:
+    """
+    Return the session's own recorded cost for the init snapshot.
+
+    :param conversation: Session whose ``session_usage`` holds its own spend,
+        e.g. ``{"total_cost_usd": 1.25}``.
+    :returns: The positive cost in USD, or ``None`` when none is recorded.
+    """
+    cost = (conversation.session_usage or {}).get("total_cost_usd")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    try:
+        value = float(cost)
+    except OverflowError:  # an integer too large for a float
+        return None
+    return value if math.isfinite(value) and value > 0 else None
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -51,15 +73,21 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # message, so a recovery turn started from history would process it twice
     # (once from the recovery path, once from the buffered forward).
     suppress_recovery_turn: bool = False
-    # Resume an interrupted child task in its existing native session.
+    # Resume an interrupted task in its existing session.
     resume_interrupted_turn: bool = False
     recovery_id: str | None = None
+    recovery_prompt: str | None = None
+    # Admit host recovery against durable input after local setup finishes.
+    require_recovery_admission: bool = False
     # The relay lets a pane-inferred status only annotate a running turn; an older
     # server would let it reopen one a hook just closed.
     accepts_inferred_status: bool = False
     # The relay records an ``input_only`` failure under its own response id and
     # keeps the tracked turn; an older server would end that turn instead.
     accepts_input_only_failures: bool = False
+    # Whether the server can route. The runner holds no routing backends of
+    # its own, so this is how it learns to advertise ``sys_advise_models``.
+    smart_routing_available: bool = False
 
 
 def build_runner_session_init_payload(
@@ -69,12 +97,24 @@ def build_runner_session_init_payload(
     suppress_recovery_turn: bool = False,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
+    recovery_prompt: str | None = None,
+    require_recovery_admission: bool = False,
+    smart_routing_available: bool | None = None,
 ) -> dict[str, object]:
-    """Build the versioned initialization fields appended to the legacy body."""
+    """Build the versioned initialization fields appended to the legacy body.
+
+    :param smart_routing_available: The routing answer to stamp. ``None`` stamps
+        this process's own answer: the builder runs on the server, the only
+        process that can route, so no call site has to remember to pass it.
+    """
     from omnigent.inference_config import snapshot_runtime_config
 
     if conversation.agent_id is None:
         raise ValueError("runner session initialization requires an agent_id")
+    if smart_routing_available is None:
+        from omnigent.runtime import routing_stamp
+
+        smart_routing_available = routing_stamp()
     envelope = RunnerSessionInitEnvelope(
         protocol_version=SESSION_INIT_PROTOCOL_VERSION,
         server_version=server_version,
@@ -84,8 +124,11 @@ def build_runner_session_init_payload(
         suppress_recovery_turn=suppress_recovery_turn,
         resume_interrupted_turn=resume_interrupted_turn,
         recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
+        recovery_prompt=recovery_prompt,
+        require_recovery_admission=require_recovery_admission,
         accepts_inferred_status=True,
         accepts_input_only_failures=True,
+        smart_routing_available=smart_routing_available,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
@@ -100,6 +143,7 @@ def build_runner_session_init_payload(
             parent_session_id=conversation.parent_conversation_id,
             root_session_id=conversation.root_conversation_id,
             inference_config=snapshot_runtime_config(conversation.inference_snapshot),
+            own_cost_usd=_own_cost_usd(conversation),
         ),
     )
     return {

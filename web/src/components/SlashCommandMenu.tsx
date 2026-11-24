@@ -12,7 +12,7 @@ import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 
 /**
@@ -237,6 +237,8 @@ interface SlashCommandMenuProps {
   query: string;
   /** Index of the currently highlighted suggestion (-1 = none). */
   activeIndex: number;
+  /** Opens below the prompt's first line when the composer sits at the window top. */
+  placement?: "above" | "below";
   /** Called when the user selects a command (click or keyboard). */
   onSelect: (cmd: string) => void;
   /**
@@ -611,12 +613,12 @@ function MenuRowButton({
   const { name, isBuiltin } = row;
   const descriptionRef = useRef<HTMLSpanElement>(null);
   const hoverTimerRef = useRef<number | undefined>(undefined);
-  const coarsePointer = useIsCoarsePointer();
-  // A highlight resting on a cut-off row opens its tooltip, except on touch screens where most
+  const mobileViewport = useIsMobileViewport();
+  // A highlight resting on a cut-off row opens its tooltip, except in the mobile layout where most
   // rows are cut off; a highlight move or new description closes it and drops a pending hover.
   useEffect(() => {
     const timer =
-      active && !coarsePointer
+      active && !mobileViewport
         ? window.setTimeout(
             () => onTooltipOpenChange(name, isCutOff(descriptionRef.current)),
             DESCRIPTION_TOOLTIP_DELAY_MS,
@@ -628,7 +630,7 @@ function MenuRowButton({
       hoverTimerRef.current = undefined;
       onTooltipOpenChange(name, false);
     };
-  }, [active, activeIndex, coarsePointer, name, onTooltipOpenChange, row.description]);
+  }, [active, activeIndex, mobileViewport, name, onTooltipOpenChange, row.description]);
   const tooltipRef = useRef<HTMLDivElement>(null);
   // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
   useEffect(() => {
@@ -736,11 +738,13 @@ function MenuRowButton({
  * Only commands whose name (sans ``/``) contains the current query as a
  * case-insensitive substring are shown.
  * Positioned via ``absolute bottom-full`` relative to the rounded
- * composer container. Exported for direct unit testing.
+ * composer container, or below its first line when ``placement`` is
+ * ``below``. Exported for direct unit testing.
  */
 export function SlashCommandMenu({
   query,
   activeIndex,
+  placement = "above",
   onSelect,
   commands,
   builtinNames = DEFAULT_BUILTIN_NAMES,
@@ -815,10 +819,16 @@ export function SlashCommandMenu({
     <TooltipProvider>
       <div
         data-testid="slash-command-menu"
-        className="menu-surface mobile-menu-glass absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
+        className={cn(
+          "menu-surface mobile-menu-glass absolute right-0 left-0 z-30 w-full rounded-[16px] border border-border bg-popover p-2 shadow-menu",
+          placement === "above"
+            ? "bottom-full mb-2 overflow-hidden"
+            : "top-11 flex max-h-[calc(100%-2.75rem)] flex-col overflow-hidden",
+        )}
       >
         <MobileMenuGlassSurface />
-        <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
+        {/* The list is the only scroller, also when the menu is capped below the prompt. */}
+        <div ref={listRef} className="max-h-[22rem] min-h-0 overflow-y-auto">
           {builtinRows.length > 0 && sectionHeader("Commands")}
           {builtinRows.map((row) => (
             <MenuRowButton

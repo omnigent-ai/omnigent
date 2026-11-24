@@ -11,7 +11,7 @@ import builtins
 import json
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -152,6 +152,7 @@ class ScheduledTaskStore(ABC):
         session_mode: str = "new",
         session_id: str | None = None,
         source_session_id: str | None = None,
+        workflow_id: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
         host_id: str | None = None,
@@ -161,6 +162,7 @@ class ScheduledTaskStore(ABC):
         delegation_ref: str | None = None,
         first_run_at: int | None = None,
         kind: str = "automation",
+        schedule_anchor: int | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -187,6 +189,8 @@ class ScheduledTaskStore(ABC):
             its prompt to; ``None`` lets its first firing create one.
         :param source_session_id: The session each firing's new session starts
             as a copy of, or ``None`` for runs that start empty.
+        :param workflow_id: The saved workflow every run starts as a run of, or
+            ``None`` for a task saved without one.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
         :param project_id: First-class project each fired session is filed
@@ -200,14 +204,22 @@ class ScheduledTaskStore(ABC):
             act as the owner when the task fires; never a credential.
         :param first_run_at: Epoch seconds the first run must fall at, checked
             against the schedule computed from the task's recorded creation timestamp, in
-            the same write. ``None`` skips the check.
-        :param kind: ``"automation"`` (default), or ``"reminder"`` for a one-time
-            (``COUNT=1``) task that continues ``session_id``.
+            the same write. ``None`` skips the check. A timer requires it and saves it as
+            its next run as given.
+        :param kind: ``"automation"`` (default), ``"reminder"`` for a one-time
+            (``COUNT=1``) task that continues ``session_id``, or ``"timer"`` for a
+            ``sys_timer_set`` wake into ``session_id`` (see
+            :func:`omnigent.server.scheduled.schedule.timer_rule`).
+        :param schedule_anchor: Epoch seconds recorded as the task's creation
+            timestamp, which anchors its interval phase and ``COUNT``; ``None`` uses
+            now. A copy passes its original's so it runs on the same occurrences.
+            The first run is still the next occurrence after now.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and
             the first run differs; nothing is saved.
         :raises ValueError: If ``state`` or ``kind`` is not a recognized value, or a
-            reminder's rule, session mode or session doesn't fit one.
+            reminder's rule, session mode or session doesn't fit one, or a timer has no
+            session or first run time.
         """
         ...
 
@@ -221,12 +233,33 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
+    def get_many(self, scheduled_task_ids: builtins.list[str]) -> dict[str, ScheduledTask]:
+        """
+        Return the scheduled tasks with these ids, deleted ones included.
+
+        The default reads each id; stores override it with one bounded read.
+
+        :param scheduled_task_ids: Task ids, e.g. one page of a list.
+        :returns: The tasks found, by id; missing ids are absent.
+        """
+        found = (self.get(task_id) for task_id in dict.fromkeys(scheduled_task_ids))
+        return {task.id: task for task in found if task is not None}
+
     @abstractmethod
-    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
+    def list(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        exclude_agent_ids: frozenset[str] = frozenset(),
+        kinds: Collection[str] | None = None,
+    ) -> list[ScheduledTask]:
         """
         List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         :param owner_user_id: When given, return only tasks owned by this user.
+        :param exclude_agent_ids: Leave out tasks bound to these agents.
+        :param kinds: When given, return only tasks of these kinds, e.g.
+            ``("automation",)``; ``None`` returns every kind.
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
@@ -239,13 +272,30 @@ class ScheduledTaskStore(ABC):
         check_generation: bool = False,
         after: tuple[int, str] | None = None,
         limit: int = 50,
+        exclude_agent_ids: frozenset[str] = frozenset(),
     ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
         """Page owned tasks and return their latest failures without a session.
 
         The cursor advances over examined tasks, including healthy/deleted tasks,
         so an empty page can still have a continuation. Legacy stores return empty.
+        Tasks bound to ``exclude_agent_ids`` are left out.
         """
-        del owner_user_id, generation, check_generation, after, limit
+        del owner_user_id, generation, check_generation, after, limit, exclude_agent_ids
+        return [], None
+
+    def list_for_agent(
+        self, agent_id: str, *, after: str | None = None, limit: int = 100
+    ) -> tuple[builtins.list[ScheduledTask], str | None]:
+        """Page the non-deleted tasks bound to *agent_id*, across owners, by id.
+
+        :param agent_id: The agent, e.g. a built-in agent's fixed id.
+        :param after: Continue after this task id, from a previous page.
+        :param limit: Most tasks to examine, 1 to 500.
+        :returns: The page and the id to continue after, or ``None`` at the end.
+            The cursor advances over examined deleted tasks too, so a page can be
+            empty and still continue. Stores without an agent index return empty.
+        """
+        del agent_id, after, limit
         return [], None
 
     @abstractmethod
@@ -288,6 +338,7 @@ class ScheduledTaskStore(ABC):
         max_cost_usd: float | None = _UNSET,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
+        workflow_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
         base_branch: str | None = _UNSET,
         host_id: str | None = _UNSET,
@@ -302,14 +353,13 @@ class ScheduledTaskStore(ABC):
         """
         Update mutable fields of a task.
 
-        Most parameters use ``None`` to mean "leave unchanged". For the per-task
-        overrides (``model_override``, ``reasoning_effort``,
-        ``permission_mode``), ``base_branch``, ``host_id``, ``project_id``, ``max_cost_usd``,
-        ``session_id``, and ``last_run_conversation_id``, the sentinel default means
-        "not provided / leave unchanged"; passing ``None`` explicitly sets the column to NULL —
-        so resetting an override to the agent default actually clears it (e.g.
-        turning a set ``bypassPermissions`` back off), and clearing a host
-        binding or nulling out a deleted last-run conversation.
+        Most parameters use ``None`` to mean "leave unchanged". For the per-task overrides
+        (``model_override``, ``reasoning_effort``, ``permission_mode``), ``base_branch``,
+        ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, ``workflow_id``, and
+        ``last_run_conversation_id``, the sentinel default means "not provided / leave unchanged";
+        passing ``None`` explicitly sets the column to NULL — so resetting an override to the agent
+        default actually clears it (e.g. turning a set ``bypassPermissions`` back off), and
+        clearing a host binding or nulling out a deleted last-run conversation.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged. ``mcp_services`` replaces the task's MCP services
@@ -392,6 +442,26 @@ class ScheduledTaskStore(ABC):
         :returns: ``True`` if newly deleted; ``False`` if missing or already deleted.
         """
         ...
+
+    def get_default_timezone(self, user_id: str | None) -> str | None:
+        """
+        Return the IANA timezone a user's clients last reported.
+
+        :param user_id: The owner; ``None`` in single-user mode.
+        :returns: The recorded zone, or ``None`` when unsupported, unset, or invalid.
+        """
+        del user_id
+        return None
+
+    def set_default_timezone(self, user_id: str | None, timezone: str) -> None:
+        """
+        Record the IANA timezone used when a new task explicitly requests the default.
+
+        :param user_id: The owner; ``None`` in single-user mode.
+        :param timezone: A validated IANA timezone name.
+        :raises NotImplementedError: If this store does not persist timezone preferences.
+        """
+        raise NotImplementedError("this store does not persist timezone preferences")
 
     # ── Runs ─────────────────────────────────────────────────────
 
@@ -585,7 +655,7 @@ class ScheduledTaskStore(ABC):
         scheduled_task_ids: builtins.list[str],
     ) -> dict[str, str]:
         """
-        Return each task's MOST RECENT run status in one windowed query.
+        Return each task's MOST RECENT run status in one query, reading one run per task.
 
         Powers the Tasks-list completion badge: the route resolves the owner's
         tasks, then this returns ``{task_id: status}`` for the single latest run

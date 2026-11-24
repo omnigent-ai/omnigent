@@ -13,6 +13,7 @@ import { DisabledActionTooltip } from "./DisabledActionTooltip";
 import { SessionActionMenuItem } from "./SessionActionMenuItem";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
 import { cn } from "@/lib/utils";
+import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
 import {
   ComposerConfigTooltipRows,
   ComposerHostTrigger,
@@ -101,6 +102,7 @@ export function HostBadge({
   starting = false,
   appearance = "status",
   readOnly = false,
+  launch: sessionLaunch,
 }: {
   sessionId: string;
   onReconnect?: () => void;
@@ -108,20 +110,22 @@ export function HostBadge({
   starting?: boolean;
   appearance?: "status" | "composer" | "header";
   readOnly?: boolean;
+  /** A grid cell passes its own session's launch; defaults to the open session's. */
+  launch?: SandboxStatus | null;
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const { session } = useSession(sessionId);
   const hostId = session?.hostId ?? null;
   // Keep sandbox hosts so managed sessions resolve to a provider label.
-  // Skip the fetch (and its 10s refetch loop) when there's no host to
-  // resolve — the badge renders nothing in that case anyway.
+  // Skip the fetch when there's no current host; the picker loads available hosts when opened.
   const { data: hosts } = useHosts({ includeSandbox: true, enabled: Boolean(hostId) });
   const liveOnline = useSessionHostOnline(sessionId);
 
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
   // The open session's sandbox launch, which its chat progress banners also show.
-  const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  const openLaunch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  const launch = sessionLaunch === undefined ? openLaunch : sessionLaunch;
 
   // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
   // poll. A host switch repoints `hostId` as soon as the session snapshot
@@ -158,7 +162,10 @@ export function HostBadge({
 
   const badge = resolveHostBadge({ hostId, host, online });
   const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
-  const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
+  const canSwitch =
+    (host !== undefined || (session !== null && hostId === null && launch === null)) &&
+    !switchHostDisabledReason &&
+    !readOnly;
   useEffect(() => {
     if (!canSwitch) setSwitchOpen(false);
   }, [canSwitch]);
@@ -200,61 +207,98 @@ export function HostBadge({
         { label: "Status", value: launchStatus },
       ];
     }
+    // The composer trigger is icon-only, so a disconnected host the user can
+    // reconnect also gets a visible label and a one-click Reconnect beside it.
+    const showReconnect = reconnectable && !asleep && !hostStarting && !readOnly;
+    const hostMenu = (
+      <DropdownMenu modal={appearance !== "header"} onOpenChange={setMenuOpen}>
+        <ComposerMenuTooltip
+          menuOpen={menuOpen}
+          content={<ComposerConfigTooltipRows rows={tooltipRows} />}
+          testId="composer-host-tooltip"
+          className="shrink-0"
+        >
+          <DropdownMenuTrigger asChild>
+            <ComposerHostTrigger
+              label={label}
+              appearance={appearance}
+              status={launchStatus && !hostStarting ? undefined : dotStatus}
+              cloud={!!launchStatus || !!host?.sandbox_provider}
+              data-testid="composer-host-select"
+            />
+          </DropdownMenuTrigger>
+        </ComposerMenuTooltip>
+        <DropdownMenuContent
+          align={appearance === "header" ? "end" : "start"}
+          side={appearance === "header" ? "bottom" : "top"}
+          sideOffset={8}
+          className="composer-host-menu w-max min-w-[220px]"
+          data-testid="composer-host-menu"
+        >
+          <div className="px-2 py-1 text-xs text-muted-foreground">
+            {launchStatus || host?.sandbox_provider ? "Cloud" : "My machines"}
+          </div>
+          <DropdownMenuItem disabled className="gap-2" data-selected="true">
+            {(!launchStatus || hostStarting) && (
+              <HostStatusDot status={dotStatus} testId="composer-host-menu-status" />
+            )}
+            <span>{launchStatus ? launchHost : (badge?.label ?? "No host bound")}</span>
+          </DropdownMenuItem>
+          {reconnectable && (
+            <DropdownMenuItem disabled={readOnly} onSelect={onReconnect}>
+              Reconnect host
+            </DropdownMenuItem>
+          )}
+          {!readOnly && (canSwitch || switchHostDisabledReason) && (
+            <SessionActionMenuItem
+              disabledReason={switchHostDisabledReason}
+              onSelect={() => setSwitchOpen(true)}
+            >
+              Switch host…
+            </SessionActionMenuItem>
+          )}
+          {(launchStatus || !badge) && (
+            <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
+              {launchStatus ?? "This session has no host binding."}
+            </p>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    );
     return (
       <>
-        <DropdownMenu modal={appearance !== "header"} onOpenChange={setMenuOpen}>
-          <ComposerMenuTooltip
-            menuOpen={menuOpen}
-            content={<ComposerConfigTooltipRows rows={tooltipRows} />}
-            testId="composer-host-tooltip"
-            className="shrink-0"
+        {appearance === "composer" ? (
+          // One stable wrapper, so the menu and its trigger stay mounted as the label toggles.
+          <div
+            className={cn("flex shrink-0 items-center rounded-lg", showReconnect && "bg-muted")}
+            data-testid={showReconnect ? "composer-host-offline" : undefined}
           >
-            <DropdownMenuTrigger asChild>
-              <ComposerHostTrigger
-                label={label}
-                appearance={appearance}
-                status={launchStatus && !hostStarting ? undefined : dotStatus}
-                cloud={!!launchStatus || !!host?.sandbox_provider}
-                data-testid="composer-host-select"
-              />
-            </DropdownMenuTrigger>
-          </ComposerMenuTooltip>
-          <DropdownMenuContent
-            align={appearance === "header" ? "end" : "start"}
-            side={appearance === "header" ? "bottom" : "top"}
-            sideOffset={8}
-            className="composer-host-menu w-max min-w-[220px]"
-            data-testid="composer-host-menu"
-          >
-            <div className="px-2 py-1 text-xs text-muted-foreground">
-              {launchStatus || host?.sandbox_provider ? "Cloud" : "My machines"}
-            </div>
-            <DropdownMenuItem disabled className="gap-2" data-selected="true">
-              {(!launchStatus || hostStarting) && (
-                <HostStatusDot status={dotStatus} testId="composer-host-menu-status" />
-              )}
-              <span>{launchStatus ? launchHost : (badge?.label ?? "No host bound")}</span>
-            </DropdownMenuItem>
-            {reconnectable && (
-              <DropdownMenuItem disabled={readOnly} onSelect={onReconnect}>
-                Reconnect host
-              </DropdownMenuItem>
+            {hostMenu}
+            {showReconnect && (
+              <>
+                <span
+                  className={cn(
+                    "text-ui leading-5 text-muted-foreground",
+                    COMPOSER_COLLAPSED_LABEL_CLASS,
+                  )}
+                >
+                  Offline<span aria-hidden> ·</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={onReconnect}
+                  aria-label="Reconnect host"
+                  className="flex h-8 mobile-touch-target cursor-pointer items-center rounded-lg px-1.5 text-ui leading-5 font-medium text-foreground transition-colors hover:bg-muted md:h-7"
+                  data-testid="composer-host-reconnect"
+                >
+                  Reconnect
+                </button>
+              </>
             )}
-            {!readOnly && (canSwitch || switchHostDisabledReason) && (
-              <SessionActionMenuItem
-                disabledReason={switchHostDisabledReason}
-                onSelect={() => setSwitchOpen(true)}
-              >
-                Switch host…
-              </SessionActionMenuItem>
-            )}
-            {(launchStatus || !badge) && (
-              <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
-                {launchStatus ?? "This session has no host binding."}
-              </p>
-            )}
-          </DropdownMenuContent>
-        </DropdownMenu>
+          </div>
+        ) : (
+          hostMenu
+        )}
         {switchOpen && canSwitch && (
           <SwitchHostDialog
             open

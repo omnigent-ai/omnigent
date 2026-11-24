@@ -15,8 +15,15 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { WorkflowPicker } from "@/components/composer/WorkflowPicker";
+import { offersSavedWorkflows, WorkflowPicker } from "@/components/composer/WorkflowPicker";
 import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
+import { isCommandAvailable } from "@/store/paletteCommands";
+import {
+  type ComposerAddActionId,
+  composerAddAction,
+  composerAddActions,
+} from "./composerAddActions";
+import { useComposerAddPaletteCommands } from "./useComposerAddPaletteCommands";
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
 const EMPTY_WORKFLOWS: readonly SavedWorkflow[] = [];
@@ -56,6 +63,7 @@ export function ComposerAddMenu({
   onOpen,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
+  paletteSource,
 }: {
   disabled: boolean;
   onAttach: () => void;
@@ -78,7 +86,7 @@ export function ComposerAddMenu({
   /** Open the "Run a workflow" dialog, once the menu has closed, with an optional
    *  description to start from. Absent when the agent has no `workflow` skill. */
   onWorkflow?: (description?: string) => void;
-  /** The user's saved workflows; when there are some, Run a workflow lists them. */
+  /** The user's saved workflows; when any can run, Run a workflow lists them. */
   savedWorkflows?: readonly SavedWorkflow[];
   workflowPagination?: WorkflowPagination;
   /** Open the dialog that runs a saved workflow, once the menu has closed. */
@@ -87,18 +95,53 @@ export function ComposerAddMenu({
   onOpen?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
+  /** Where ⌘K offers these actions too, with quick_pick_palette on; one composer sets it. */
+  paletteSource?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
   const [showWorkflows, setShowWorkflows] = useState(false);
-  const listsSavedWorkflows = savedWorkflows.length > 0 && onRunSavedWorkflow !== undefined;
+  const listsSavedWorkflows =
+    onRunSavedWorkflow !== undefined && offersSavedWorkflows(savedWorkflows, workflowPagination);
+  // The items' availability, shared with ⌘K's composer commands.
+  const actions = composerAddActions({
+    attachDisabled,
+    sideChat: onSideChat !== undefined,
+    showGoal,
+    goal: onGoal !== undefined,
+    goalDisabled,
+    goalActive,
+    goalDescription,
+    showPlan,
+    plan: onPlan !== undefined,
+    planDisabled,
+    planActive,
+    planUnavailableReason,
+  });
+  const unavailable = (id: ComposerAddActionId) =>
+    !isCommandAvailable(composerAddAction(actions, id).availability);
+  useComposerAddPaletteCommands(paletteSource, actions, {
+    attach: onAttach,
+    "side-chat": onSideChat,
+    goal: onGoal,
+    plan: onPlan,
+  });
   const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
+  const [geometry, setGeometry] = useState<{
+    width?: number;
+    alignOffset: number;
+    sideOffset: number;
+  }>({ width: 456, alignOffset: 0, sideOffset: 6 });
   const measure = useCallback(() => {
     const trigger = triggerRef.current;
-    const composer = trigger?.closest("[data-composer-card]");
+    const composer = trigger?.closest<HTMLElement>("[data-composer-card]");
     if (!trigger || !composer) return;
+    // A panel's card is its whole window, so the menu opens from the trigger at its own width.
+    if (composer.dataset.composerAppearance === "panel") {
+      setGeometry({ alignOffset: 0, sideOffset: 6 });
+      return;
+    }
     const triggerRect = trigger.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
     setGeometry({
@@ -214,7 +257,7 @@ export function ComposerAddMenu({
               <DropdownMenuItem
                 className="mobile-touch-target"
                 onSelect={onAttach}
-                disabled={attachDisabled}
+                disabled={unavailable("attach")}
               >
                 <span className="flex size-4 shrink-0 items-center justify-center">
                   <PaperclipIcon className="size-3.5" />
@@ -272,7 +315,7 @@ export function ComposerAddMenu({
                   {showGoal && (
                     <DropdownMenuItem
                       className="mobile-touch-target"
-                      disabled={!onGoal || goalDisabled}
+                      disabled={unavailable("goal")}
                       title={!onGoal ? goalDescription : undefined}
                       data-testid="composer-goal-action"
                       data-active={goalActive || undefined}
@@ -292,7 +335,7 @@ export function ComposerAddMenu({
                       data-testid="composer-plan-action"
                       data-active={planActive || undefined}
                       aria-label={planLabel}
-                      disabled={!onPlan || planDisabled}
+                      disabled={unavailable("plan")}
                       onSelect={onPlan}
                       title={onPlan ? undefined : planUnavailableReason}
                     >

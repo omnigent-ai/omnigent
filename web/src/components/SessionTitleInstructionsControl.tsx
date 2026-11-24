@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { SettingsLabel } from "@/components/SettingsLabel";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -9,6 +8,12 @@ import {
   saveSessionTitleInstructions,
 } from "@/lib/sessionTitleInstructionsApi";
 import { cn } from "@/lib/utils";
+import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { SESSION_TITLE_INSTRUCTIONS_ENTRY } from "@/pages/settings/search/catalog/general";
+import {
+  settingsControlProps,
+  settingsDescriptionId,
+} from "@/pages/settings/search/settingsControl";
 
 // Matches the server limit until the first read reports it.
 const DEFAULT_MAX_CHARS = 4000;
@@ -22,8 +27,6 @@ export function SessionTitleInstructionsControl() {
   const [draft, setDraft] = useState("");
   const [maxChars, setMaxChars] = useState(DEFAULT_MAX_CHARS);
   const [saving, setSaving] = useState(false);
-  const labelId = useId();
-  const descriptionId = useId();
   const counterId = useId();
   // Guards every async state update, from the initial load, Retry and Save.
   const mountedRef = useRef(false);
@@ -80,16 +83,15 @@ export function SessionTitleInstructionsControl() {
   const dirty = ready && trimmed !== saved;
 
   return (
-    <div className="flex flex-col gap-3" data-testid="session-title-instructions-control">
-      <SettingsLabel
-        label="Title instructions"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        description="Guidance for automatic session titles, such as a format, language or prefix. Leave blank to use the server's title instructions, or the default prompt."
-      />
+    <SettingsItem
+      entry={SESSION_TITLE_INSTRUCTIONS_ENTRY}
+      className="flex flex-col gap-3"
+      data-testid="session-title-instructions-control"
+    >
+      <SettingsEntryLabel entry={SESSION_TITLE_INSTRUCTIONS_ENTRY} />
       <Textarea
-        aria-labelledby={labelId}
-        aria-describedby={`${descriptionId} ${counterId}`}
+        {...settingsControlProps(SESSION_TITLE_INSTRUCTIONS_ENTRY)}
+        aria-describedby={`${settingsDescriptionId(SESSION_TITLE_INSTRUCTIONS_ENTRY)} ${counterId}`}
         aria-invalid={tooLong || undefined}
         data-testid="session-title-instructions-input"
         placeholder="e.g. Start every title with the ticket id, like OMNI-123."
@@ -119,6 +121,7 @@ export function SessionTitleInstructionsControl() {
               variant="outline"
               size="sm"
               onClick={() => void load()}
+              {...settingsControlProps(SESSION_TITLE_INSTRUCTIONS_ENTRY, "retry")}
               data-testid="session-title-instructions-retry"
               componentId="settings.general.session_title_instructions.retry"
             >
@@ -132,6 +135,7 @@ export function SessionTitleInstructionsControl() {
               // Clearing would also discard the unsaved draft.
               disabled={saving || dirty}
               onClick={() => void persist(null)}
+              {...settingsControlProps(SESSION_TITLE_INSTRUCTIONS_ENTRY, "clear")}
               data-testid="session-title-instructions-clear"
               componentId="settings.general.session_title_instructions.clear"
             >
@@ -143,6 +147,7 @@ export function SessionTitleInstructionsControl() {
               size="sm"
               disabled={!dirty || tooLong || saving}
               onClick={() => void persist(trimmed || null)}
+              {...settingsControlProps(SESSION_TITLE_INSTRUCTIONS_ENTRY, "save")}
               data-testid="session-title-instructions-save"
               componentId="settings.general.session_title_instructions.save"
             >
@@ -151,6 +156,6 @@ export function SessionTitleInstructionsControl() {
           )}
         </div>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
