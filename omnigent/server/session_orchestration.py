@@ -63,7 +63,8 @@ def require_owned_session(
     session_id = normalize_uuid(identifier)
     session = conversations.get_conversation(session_id) if session_id else None
     current, seen = session, set()
-    # Named only once ownership is established, so other callers learn nothing new.
+    # Named only where the chain would otherwise be accepted, so every other refusal
+    # wins and callers who don't own the chain learn nothing new.
     unusable: Conversation | None = None
     while current is not None:
         if current.id in seen or len(seen) >= 32:
@@ -79,9 +80,6 @@ def require_owned_session(
         grant = permissions.get(user_id, current.id)
         if grant is None or grant.level != LEVEL_OWNER:
             break
-        if unusable is not None:
-            assert session is not None
-            raise _unusable_session_error(identifier, session, unusable)
         if private:
             # Child access comes from the root. Read-only viewers, including the
             # public grant, cannot add input, so they cannot steer other sessions.
@@ -97,6 +95,8 @@ def require_owned_session(
                 current = conversations.get_conversation(source_id) if source_id else None
                 continue
         assert session is not None
+        if unusable is not None:
+            raise _unusable_session_error(identifier, session, unusable)
         return session
     raise OmnigentError("Session is not owned or available", code=ErrorCode.FORBIDDEN)
 

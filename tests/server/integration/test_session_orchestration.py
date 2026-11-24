@@ -308,18 +308,14 @@ async def test_archived_or_closed_session_refusal_says_why(
         archived = source if state == "archived_sender" else receiver
         store.update_conversation(archived["id"], archived=True)
     captured.clear()
-    refusal = await _send(auth_client, source, receiver)
-    assert expected.format(sender=source["id"], receiver=receiver["id"]) in refusal["detail"]
-    assert not captured.get("posts")
-    info = json.loads(
-        await execute_tool(
-            tool_name="sys_session_get_info",
-            arguments=json.dumps({"session_id": receiver["id"]}),
-            server_client=auth_client,
-            conversation_id=source["id"],
-        )
+    response = await auth_client.post(
+        f"/v1/sessions/{receiver['id']}/events",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"type": "session_message", "data": {"message": "DO_NOT_DELIVER"}},
     )
-    assert info["archived"] is (state in {"archived", "archived_other_owner"})
+    assert response.status_code == 403, response.text
+    assert expected.format(sender=source["id"], receiver=receiver["id"]) in response.text
+    assert not captured.get("posts")
 
 
 @pytest.mark.parametrize("manager_kind", ["root", "child", "side_chat"])
@@ -478,8 +474,11 @@ async def test_side_chat_inherits_sharing_for_new_controls(
     assert (await _send(auth_client, manager, target)).get("queued") is True
 
 
-@pytest.mark.parametrize("source_link", ["missing", "cycle", "absent"])
-async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, source_link):
+@pytest.mark.parametrize("side_state", ["live", "archived", "closed"])
+@pytest.mark.parametrize("source_link", ["missing", "cycle", "absent", "foreign"])
+async def test_side_chat_requires_resolvable_source(
+    auth_client, peers, db_uri, source_link, side_state
+):
     source, target, captured = peers
     response = await auth_client.post(
         f"/v1/sessions/{source['id']}/fork", json={"side_chat": True}
@@ -491,10 +490,16 @@ async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, 
     if source_link == "absent":
         store.delete_label(side["id"], SIDE_CHAT_SOURCE_LABEL_KEY)
     else:
-        store.set_labels(
-            side["id"],
-            {SIDE_CHAT_SOURCE_LABEL_KEY: side["id"] if source_link == "cycle" else uuid4().hex},
-        )
+        if source_link == "foreign":
+            linked = (await _create_session_as(auth_client, "", "bob"))["id"]
+        else:
+            linked = side["id"] if source_link == "cycle" else uuid4().hex
+        store.set_labels(side["id"], {SIDE_CHAT_SOURCE_LABEL_KEY: linked})
+    # Unarchiving wouldn't make the side chat usable, so its state isn't reported.
+    if side_state == "archived":
+        store.update_conversation(side["id"], archived=True)
+    elif side_state == "closed":
+        store.set_labels(side["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
     captured.clear()
     assert (
         "Session is not owned or available" in (await _send(auth_client, side, target))["detail"]

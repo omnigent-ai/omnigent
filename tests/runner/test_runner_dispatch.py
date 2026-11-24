@@ -10411,7 +10411,10 @@ async def test_sys_session_share_public_allows_public_grant(level: str, number: 
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
+@pytest.mark.parametrize("archived", [False, True])
+async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(
+    archived: bool,
+) -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
@@ -10442,6 +10445,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "agent_id": "ag_xyz",
                     "agent_name": "researcher",
                     "status": "running",
+                    "archived": archived,
                     "created_at": 1,
                     "updated_at": 84,
                     "title": "auth flow",
@@ -10486,6 +10490,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     info = json.loads(output)
     assert info["session_id"] == "conv_target"
     assert info["status"] == "running"
+    assert info["archived"] is archived
     assert info["last_activity_at"] == 84
     assert info["title"] == "auth flow"
     assert info["agent_id"] == "ag_xyz"
