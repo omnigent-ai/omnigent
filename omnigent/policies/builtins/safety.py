@@ -529,8 +529,12 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     )
 
 
-def _reminder_review(args: dict[str, object]) -> PolicyResponse:
-    """ASK to set a reminder, showing when it fires and its full message."""
+def _reminder_review(args: dict[str, object], *, ask: bool) -> PolicyResponse:
+    """ASK to set a reminder, showing when it fires and its full message.
+
+    With *ask* false, a valid reminder is allowed without asking; an invalid one is
+    still refused.
+    """
     message = args.get("message")
     if not isinstance(message, str) or not message.strip():
         return {
@@ -546,6 +550,8 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
     resolved = resolve_reminder_time(args, datetime.now(UTC))
     if isinstance(resolved, str):
         return {"result": "DENY", "reason": f"Cannot set a reminder. {resolved}"}
+    if not ask:
+        return _ALLOW
     if args.get("at") is not None:
         when = f"at {resolved:%Y-%m-%d %H:%M} UTC"
     else:
@@ -577,6 +583,29 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     :returns: ASK if a scheduled task is being created or updated, ALLOW
         otherwise.
     """
+    return _scheduled_task_change_verdict(event, ask=True)
+
+
+def check_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
+    """Refuse a malformed scheduled-task change or reminder, and allow a valid one.
+
+    The policy builder uses it instead of :func:`ask_on_scheduled_task_change` in a
+    session whose own mode doesn't ask a person, so the same requests are refused
+    there without asking about the rest.
+
+    :param event: Policy event dict.
+    :returns: DENY for a malformed create, update or reminder, ALLOW otherwise.
+    """
+    return _scheduled_task_change_verdict(event, ask=False)
+
+
+def _scheduled_task_change_verdict(event: PolicyEvent, *, ask: bool) -> PolicyResponse:
+    """The verdict on a scheduled-task change or reminder; *ask* false allows a valid one.
+
+    :param event: Policy event dict.
+    :param ask: Whether a valid change asks for approval (``True``) or is allowed.
+    :returns: DENY for a malformed change, ASK or ALLOW for a valid one, ALLOW otherwise.
+    """
     if event.get("type") != "tool_call":
         return _ALLOW
     tool = event.get("target")
@@ -587,13 +616,15 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     if not isinstance(args, dict):
         args = {}
     if tool == "sys_reminder_set":
-        return _reminder_review(args)
+        return _reminder_review(args, ask=ask)
     action = "create" if tool == "sys_scheduled_task_create" else "update"
     # Older runners expose optional review fields. Current runners enforce the
     # complete contract before dispatch, including when paired with an old server.
     error = scheduled_task_review_error(args, action=action, require_complete=False)
     if error:
         return {"result": "DENY", "reason": f"Cannot {action} a scheduled task. {error}"}
+    if not ask:
+        return _ALLOW
     if action == "create":
         name = _clip(str(args.get("name") or "(unnamed)"))
         review = _scheduled_task_review(

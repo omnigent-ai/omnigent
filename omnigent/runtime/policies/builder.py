@@ -91,8 +91,8 @@ _ASK_ON_ADD_POLICY_SPEC = FunctionPolicySpec(
     ),
 )
 
-# Same posture for the scheduled-task tools in SCHEDULED_TASK_APPROVAL_TOOLS:
-# an agent cannot create or update unattended work without user approval.
+# Same posture for the scheduled-task tools in SCHEDULED_TASK_APPROVAL_TOOLS, except in a
+# session whose own mode doesn't ask a person (see _required_approval_specs).
 # Listing and deleting tasks stay ungated.
 _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC = FunctionPolicySpec(
     name="__ask_on_scheduled_task_change",
@@ -103,11 +103,41 @@ _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC = FunctionPolicySpec(
     ),
 )
 
-# Appended to every engine after the session, agent, and admin policies.
+# Where the session's own mode doesn't ask a person: the same malformed changes
+# are refused, and the rest run without the review.
+_CHECK_SCHEDULED_TASK_CHANGE_SPEC = FunctionPolicySpec(
+    name="__check_scheduled_task_change",
+    on=None,
+    function=FunctionRef(
+        path="omnigent.policies.builtins.safety.check_scheduled_task_change",
+        arguments=None,
+    ),
+)
+
+# Appended after the session, agent, and admin policies (see _required_approval_specs).
 _REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
     _ASK_ON_ADD_POLICY_SPEC,
     _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC,
 )
+
+
+def _required_approval_specs(conversation: Conversation | None) -> tuple[FunctionPolicySpec, ...]:
+    """
+    The approval guards appended to *conversation*'s engine.
+
+    Adding a policy always asks. A session whose own mode doesn't ask a person, one
+    that skips approval or runs in Claude Code's auto mode, gets the scheduled-task
+    check instead of the review, so malformed changes are still refused.
+
+    :param conversation: The refreshed conversation row, or ``None`` when there is none.
+    :returns: The guard specs, in evaluation order.
+    """
+    from omnigent.server.scheduled.fire import session_skips_scheduled_task_review
+
+    if conversation is not None and session_skips_scheduled_task_review(conversation):
+        return (_ASK_ON_ADD_POLICY_SPEC, _CHECK_SCHEDULED_TASK_CHANGE_SPEC)
+    return _REQUIRED_APPROVAL_SPECS
+
 
 # The policy caches below are pure caches over the DB and are reached from
 # ``asyncio.to_thread`` workers, so they reset themselves if the backing
@@ -454,7 +484,7 @@ def any_policies_apply(
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
-    # The engine unconditionally injects _REQUIRED_APPROVAL_SPECS, so their
+    # The engine appends the approval guards (_required_approval_specs), so their
     # TOOL_CALL events must always reach it: never fast-path sys_add_policy
     # or the scheduled-task mutation tools.
     if phase == Phase.TOOL_CALL and (
@@ -654,11 +684,6 @@ def build_policy_engine(
     admin_policy_specs: list[PolicySpec] = db_default_policy_specs + list(default_policies or [])
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
 
-    # Mandatory approval guards: appended unconditionally so sys_add_policy
-    # and scheduled-task create/update always ask the user, even when no
-    # other guardrails are declared.
-    all_policy_specs.extend(_REQUIRED_APPROVAL_SPECS)
-
     label_defs = dict((guardrails.labels or {}) if guardrails else {})
     # One conversation read (``conv``, resolved above for policy
     # inheritance) and ONE spawn-tree load feed everything below: labels,
@@ -731,6 +756,10 @@ def build_policy_engine(
                 code=ErrorCode.CONFLICT,
             )
         conv = confirmed
+    # Mandatory approval guards, appended even when no guardrails are declared.
+    # Chosen from the refreshed row: the scheduled-task review follows its mode.
+    required_specs = _required_approval_specs(conv)
+    all_policy_specs.extend(required_specs)
     # A sub-agent conversation runs the CHILD agent's spec, but every
     # engine-build site resolves the session's agent binding to the ROOT
     # bundle spec. Resolve ``conv.sub_agent_name`` to the child spec so the
@@ -749,10 +778,7 @@ def build_policy_engine(
     if child_guardrails is not None and child_guardrails.policies:
         agent_policy_specs = agent_policy_specs + list(child_guardrails.policies)
         all_policy_specs = (
-            session_policy_specs
-            + agent_policy_specs
-            + admin_policy_specs
-            + list(_REQUIRED_APPROVAL_SPECS)
+            session_policy_specs + agent_policy_specs + admin_policy_specs + list(required_specs)
         )
         if child_guardrails.labels:
             # Child label schemas ADD keys; the parent's schema wins on a
@@ -771,10 +797,7 @@ def build_policy_engine(
         child_policy_specs = [p for p in session_policy_specs if p not in root_policy_specs]
         session_policy_specs = root_policy_specs + child_policy_specs
         all_policy_specs = (
-            session_policy_specs
-            + agent_policy_specs
-            + admin_policy_specs
-            + list(_REQUIRED_APPROVAL_SPECS)
+            session_policy_specs + agent_policy_specs + admin_policy_specs + list(required_specs)
         )
     root_conv = (
         conv

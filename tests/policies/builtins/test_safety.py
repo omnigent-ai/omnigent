@@ -1008,6 +1008,7 @@ def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
     assert "scheduled_task_id" in result["reason"]
 
 
+@pytest.mark.parametrize("policy", ["ask_on_scheduled_task_change", "check_scheduled_task_change"])
 @pytest.mark.parametrize("action", ["create", "update"])
 @pytest.mark.parametrize(
     ("field", "value"),
@@ -1015,12 +1016,16 @@ def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
     + [("permission_mode", value) for value in ["", " \n\t", 1, ["auto"], "null", " NULL "]],
 )
 def test_scheduled_task_approval_denies_invalid_review_values(
-    action: str, field: str, value: object
+    policy: str, action: str, field: str, value: object
 ) -> None:
-    """The string "null" is refused before approval, with the hint the runner gives."""
-    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+    """The string "null" is refused before approval, with the hint the runner gives.
 
-    result = ask_on_scheduled_task_change(
+    The check that replaces the review where the session's mode doesn't ask refuses
+    the same values.
+    """
+    from omnigent.policies.builtins import safety
+
+    result = getattr(safety, policy)(
         {
             "type": "tool_call",
             "target": f"sys_scheduled_task_{action}",
@@ -1043,6 +1048,54 @@ def test_scheduled_task_approval_denies_invalid_review_values(
         ),
     }[field]
     assert expected in result["reason"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        (
+            "sys_scheduled_task_create",
+            {"name": "nightly triage", "prompt": "Triage new issues.", "permission_mode": None},
+        ),
+        (
+            "sys_scheduled_task_update",
+            {
+                "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+                "prompt": "Triage new issues.",
+                "permission_mode": None,
+            },
+        ),
+        ("sys_reminder_set", {"message": "Check the deploy.", "delay_seconds": 1800}),
+    ],
+)
+def test_check_scheduled_task_change_allows_a_valid_change_without_asking(
+    tool: str, arguments: dict[str, object]
+) -> None:
+    from omnigent.policies.builtins.safety import check_scheduled_task_change
+
+    result = check_scheduled_task_change(
+        {"type": "tool_call", "target": tool, "data": {"arguments": arguments}}
+    )
+    assert result["result"] == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "reason"),
+    [
+        ({"message": " ", "delay_seconds": 1800}, "message must be a non-empty string"),
+        ({"message": "ping", "at": "tomorrow"}, "Cannot set a reminder."),
+    ],
+)
+def test_check_scheduled_task_change_still_refuses_a_bad_reminder(
+    arguments: dict[str, object], reason: str
+) -> None:
+    from omnigent.policies.builtins.safety import check_scheduled_task_change
+
+    result = check_scheduled_task_change(
+        {"type": "tool_call", "target": "sys_reminder_set", "data": {"arguments": arguments}}
+    )
+    assert result["result"] == "DENY"
+    assert reason in result["reason"]
 
 
 @pytest.mark.parametrize(

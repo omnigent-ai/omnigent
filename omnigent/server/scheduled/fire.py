@@ -1426,6 +1426,22 @@ def session_approval_skipping_mode(conv: Conversation) -> str | None:
     return None
 
 
+def session_skips_scheduled_task_review(conv: Conversation) -> bool:
+    """Whether *conv* creates and changes scheduled tasks without Omnigent's review.
+
+    A session in a mode that skips approval, or in Claude Code's auto mode, does: it
+    runs its other tools without asking a person either. As in
+    :func:`session_approval_skipping_mode`, the live Claude label wins over launch flags.
+    """
+    if session_approval_skipping_mode(conv) is not None:
+        return True
+    claude_mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    if claude_mode:
+        return claude_mode == "auto"
+    launch_args = list(getattr(conv, "terminal_launch_args", None) or [])
+    return launch_args_contain(launch_args, PERMISSION_LAUNCH_ARGS["claude-native"]["auto"])
+
+
 def _asks_for_approval(task: ScheduledTask) -> bool:
     """Whether *task* selects a permission mode that keeps approval."""
     return (

@@ -33,6 +33,7 @@ import pytest
 
 from omnigent.entities import Conversation
 from omnigent.entities.pagination import PagedList, paginate_in_memory
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runtime.policies.builder import build_policy_engine, load_verified_session_tree
 from omnigent.spec.parser import parse
 from omnigent.spec.types import (
@@ -42,7 +43,10 @@ from omnigent.spec.types import (
     Phase,
     PhaseSelector,
 )
-from omnigent.stores.conversation_store import SPAWN_TREE_READ_CAP
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    SPAWN_TREE_READ_CAP,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -117,6 +121,53 @@ name: no-guardrails
     ]
     assert engine.label_defs == {}
     assert engine.labels == {}
+
+
+_CLAUDE_MODE_LABEL = "omnigent.claude_native.permission_mode"
+
+
+@pytest.mark.parametrize(
+    ("labels", "launch_args", "reviewed"),
+    [
+        ({}, [], True),
+        ({_CLAUDE_MODE_LABEL: "default"}, [], True),
+        ({_CLAUDE_MODE_LABEL: "auto"}, [], False),
+        ({_CLAUDE_MODE_LABEL: "bypassPermissions"}, [], False),
+        ({_CLAUDE_MODE_LABEL: "dontAsk"}, [], False),
+        ({}, PERMISSION_LAUNCH_ARGS["claude-native"]["auto"], False),
+        # The live mode wins over the launch flags it replaced.
+        ({_CLAUDE_MODE_LABEL: "default"}, PERMISSION_LAUNCH_ARGS["claude-native"]["auto"], True),
+        ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, [], False),
+        ({}, PERMISSION_LAUNCH_ARGS["codex-native"]["full-access"], False),
+        ({}, PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"], True),
+    ],
+)
+def test_scheduled_task_review_follows_the_session_mode(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+    labels: dict[str, str],
+    launch_args: list[str],
+    reviewed: bool,
+) -> None:
+    """The scheduled-task review gives way to its check when the session's mode doesn't ask.
+
+    That is a mode that skips approval, or Claude Code's auto mode; any other mode,
+    including Codex's approve-for-me reviewer, keeps the review. Adding a policy
+    always asks.
+    """
+    agent_dir = _write_spec(tmp_path, "spec_version: 1\nname: no-guardrails\n")
+    conv = conversation_store.create_conversation()
+    if labels:
+        conversation_store.set_labels(conv.id, labels)
+    if launch_args:
+        conversation_store.update_conversation(conv.id, terminal_launch_args=launch_args)
+    engine = build_policy_engine(
+        spec=parse(agent_dir),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+    scheduled = "__ask_on_scheduled_task_change" if reviewed else "__check_scheduled_task_change"
+    assert [p.spec.name for p in engine.policies] == ["__ask_on_add_policy", scheduled]
 
 
 def test_build_with_empty_guardrails_block(
