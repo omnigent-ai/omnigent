@@ -64,6 +64,8 @@ import { buildOmnigentSdkBootstrapScript } from "../sdk/omnigentSdkRuntimeSource
 /**
  * Policy for the uploaded document. Inline script and style only (the gadget is one
  * self-contained HTML file); no network requests, nested frames, forms, plugins, or workers.
+ * No `webrtc` directive: browsers that don't know it log a warning on every load, and the
+ * ones that do still leave peer connections open in places (designs/GADGETS.md).
  * It can't stop the document navigating itself, so gadget code can still send out what it
  * reads (designs/GADGETS.md, "What gadget code can send out").
  */
@@ -82,7 +84,6 @@ export const GADGET_CONTENT_SECURITY_POLICY = [
   "form-action 'none'",
   "manifest-src 'none'",
   "base-uri 'none'",
-  "webrtc 'none'",
 ].join("; ");
 
 /** Scripts only: an opaque origin, no forms, pop-ups, top navigation, or same-origin access. */

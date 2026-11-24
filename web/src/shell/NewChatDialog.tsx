@@ -5010,6 +5010,20 @@ function NewChatLandingContent({
     selectedAgent?.harness,
     harnessWarningHost,
   );
+  // New session only warns about a harness the host can't run (the host re-checks at launch),
+  // but a full screen gadget's menu hides that warning: there Create session waits for one the
+  // host can run, and says why.
+  const gadgetCreateHarnessBlocker =
+    selectedAgentUnconfigured &&
+    harnessWarningHost != null &&
+    !harnessReadinessOnHost(selectedAgent?.harness, harnessWarningHost).selectable
+      ? harnessWarningMessage(
+          selectedAgent?.display_name,
+          harnessWarningHost.name,
+          harnessUnavailableReasonOnHost(selectedAgent?.harness, harnessWarningHost),
+          selectedAgent?.harness,
+        )
+      : null;
   // Smart Routing routes between native Claude Code and Codex, so both wrapper
   // agents must be registered and both CLIs ready on the target host — a router
   // with one arm is just that arm. The Claude wrapper is the placeholder the
@@ -8198,11 +8212,25 @@ function NewChatLandingContent({
                         {submitDisabledReason !== null && !creating && (
                           <p className="text-xs text-muted-foreground">{submitDisabledReason}</p>
                         )}
+                        {submitDisabledReason === null &&
+                          gadgetCreateHarnessBlocker !== null &&
+                          !creating && (
+                            <p
+                              className="text-xs text-muted-foreground"
+                              data-testid="gadget-create-session-harness"
+                            >
+                              {gadgetCreateHarnessBlocker} Pick another harness to start here.
+                            </p>
+                          )}
                         <Button
                           type="button"
                           size="sm"
                           className="w-full"
-                          disabled={creating || submitDisabledReason !== null}
+                          disabled={
+                            creating ||
+                            submitDisabledReason !== null ||
+                            gadgetCreateHarnessBlocker !== null
+                          }
                           loading={creating}
                           data-testid="gadget-create-session"
                           onClick={() => void handleCreate()}

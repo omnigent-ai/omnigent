@@ -98,7 +98,8 @@ describe("buildGadgetFrameDocument", () => {
   it("sets a content security policy that lists no network sources", () => {
     expect(GADGET_CONTENT_SECURITY_POLICY).toContain("connect-src 'none'");
     expect(GADGET_CONTENT_SECURITY_POLICY).toContain("default-src 'none'");
-    expect(GADGET_CONTENT_SECURITY_POLICY).toContain("webrtc 'none'");
+    // Not a directive every browser knows: it would only add a console warning on each load.
+    expect(GADGET_CONTENT_SECURITY_POLICY).not.toContain("webrtc");
   });
 });
 

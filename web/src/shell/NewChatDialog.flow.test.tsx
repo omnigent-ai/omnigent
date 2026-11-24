@@ -661,6 +661,34 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(onOpenSession).not.toHaveBeenCalled();
   });
 
+  it("keeps a full screen gadget's Create session off while the host can't run the harness", async () => {
+    // The host reports the selected agent's harness as not set up there.
+    setHosts([host({ configured_harnesses: { "claude-sdk": false } })]);
+    const panel = floatingPanel();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    act(() => {
+      requestGadgetCreateSessionMenu();
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    // New session only warns under its composer, which full screen hides: the menu says why
+    // and doesn't start a session that can't run.
+    expect(await screen.findByTestId("gadget-create-session-harness")).toHaveTextContent(
+      "Pick another harness",
+    );
+    expect(create).toBeDisabled();
+    fireEvent.click(create);
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(panel.launch).not.toHaveBeenCalled();
+  });
+
   it("shows a message the gadget wrote in its Create session menu before Create session sends it", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,

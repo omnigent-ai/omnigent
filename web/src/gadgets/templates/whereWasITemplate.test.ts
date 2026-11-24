@@ -944,14 +944,13 @@ describe("where was I tasks", () => {
     // Commit, open PR, request review, address review, approval done; CI now; the rest to do.
     expect(dots.slice(0, 7)).toEqual(["done", "done", "done", "done", "done", "current", "todo"]);
     expect(byId("card-client").querySelector(".task-now")?.textContent).toBe("Post PR: Pass CI");
-    // Shipped work has every step done and comes last.
-    expect(
-      [...byId("card-docs").querySelectorAll(".track-dot")].every(
-        (dot) => dot.getAttribute("data-s") === "done",
-      ),
-    ).toBe(true);
     const order = [...document.querySelectorAll("#view .task")].map((card) => card.id);
-    expect(order).toEqual(["card-client", "card-cache-fix", "card-docs"]);
+    expect(order).toEqual(["card-client", "card-cache-fix"]);
+    // Shipped work leaves the rows for the kit's own Shipped recently list.
+    expect(byId("shipped").hidden).toBe(false);
+    expect(byId("shipped-list").textContent).toContain(
+      TRACKED.tasks.find((task) => task.id === "docs")!.title,
+    );
   });
 
   it("shows what waits on what, and jumps to the task it waits on", async () => {
@@ -1187,5 +1186,182 @@ describe("where was I revision", () => {
     expect(WHERE_WAS_I_GUIDE).toContain("Never add a pattern from general knowledge alone");
     expect(WHERE_WAS_I_GUIDE).toContain("never fill the list");
     expect(WHERE_WAS_I_GUIDE).toContain("without counts");
+  });
+});
+
+describe("where was I kit pieces in designs", () => {
+  // A board that puts the kit's pieces straight into each card, as the live session's design did.
+  const CARDS_VIEW = withView(
+    "",
+    `Radar.view({ name: 'Cards', render: function (root, model, kit) {
+      kit.keyed(root, model.open, function (task) { return task.id; }, function (task) {
+        var card = kit.el('article', { class: 'card', id: 'design-' + task.id });
+        card.replaceChildren(kit.el('h3', { text: task.title }), kit.track(task), kit.taskChips(task), kit.taskSessions(task));
+        return card;
+      });
+    } });`,
+  );
+
+  it("hands designs elements, so pieces go straight into a card even when a task has none", async () => {
+    const { emit, reports, ready } = startRadar({ html: CARDS_VIEW });
+    await waitFor(() => expect(ready()).toBe(true));
+    // A task with no links, dependencies or sessions, beside ones that have them.
+    const lone = {
+      id: "lone",
+      title: "Lone change",
+      state: "active",
+      stage: "pre_pr",
+      step: "commit",
+    };
+    const value = { ...TRACKED, tasks: [...TRACKED.tasks, lone] };
+    emit("radar", [{ id: "current", version: "v1", value }]);
+    emit("layout", [{ id: "current", version: "v1", value: LAYOUT }]);
+
+    await waitFor(() => expect(byId("design-lone")).toBeTruthy());
+    // Nothing reads as stray data, and the pieces that exist are drawn.
+    const text = byId("view").textContent ?? "";
+    expect(text).not.toContain("[object");
+    expect(text).not.toMatch(/\bnull\b/);
+    expect(byId("design-cache-fix").querySelector(".session-link")?.textContent).toContain(
+      "Cache warm-up",
+    );
+    await waitFor(() =>
+      expect(reports()).toEqual([
+        expect.objectContaining({ value: expect.objectContaining({ state: "ok" }) }),
+      ]),
+    );
+  });
+
+  it("fails a design that draws data where an element belongs, so its session notices", async () => {
+    const html = withView(
+      "",
+      `Radar.view({ name: 'Leaky', render: function (root, model, kit) {
+        var card = kit.el('article', { class: 'card' });
+        card.replaceChildren.apply(card, [kit.el('h3', { text: 'Board' })].concat(kit.sessionsOf(model.open[0])));
+        root.replaceChildren(card, null);
+      } });`,
+    );
+    const { emit, reports, ready } = startRadar({ html });
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: TRACKED }]);
+    emit("layout", [{ id: "current", version: "v1", value: LAYOUT }]);
+
+    // The plain view takes over, and render_reports tells the session what went wrong.
+    await waitFor(() => expect(byId("card-client")).toBeTruthy());
+    await waitFor(() =>
+      expect(reports()).toEqual([
+        expect.objectContaining({
+          value: expect.objectContaining({
+            state: "failed",
+            error: expect.stringContaining("[object Object]"),
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("keeps shipped work on the page when a design draws only what is in flight", async () => {
+    const { emit, ready } = startRadar({ html: CARDS_VIEW });
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: TRACKED }]);
+    emit("layout", [{ id: "current", version: "v1", value: LAYOUT }]);
+
+    await waitFor(() => expect(byId("design-client")).toBeTruthy());
+    expect(byId("design-docs")).toBeNull();
+    expect(byId("shipped").hidden).toBe(false);
+    expect(byId("shipped-list").textContent).toContain("Docs fix");
+  });
+
+  it("names what a task waits on as part of the sentence, briefly", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    const long =
+      "An acme-web source checkout for the PR branch before anyone can address the comments";
+    const value = {
+      ...TRACKED,
+      tasks: [
+        { ...TRACKED.tasks[1], waiting_on: long },
+        {
+          ...TRACKED.tasks[0],
+          id: "sdk",
+          depends_on: [],
+          waiting_on: "SDK review from the API team",
+        },
+      ],
+    };
+    emit("radar", [{ id: "current", version: "v1", value }]);
+
+    await waitFor(() => expect(byId("card-client")).toBeTruthy());
+    const chip = byId("card-client").querySelector(".chip[data-kind='waits']") as HTMLElement;
+    expect(chip.textContent?.startsWith("Waits on an acme-web source checkout")).toBe(true);
+    expect(chip.textContent!.length).toBeLessThan(60);
+    expect(chip.title).toBe(long);
+    // A name stays as written.
+    expect(byId("card-sdk").querySelector(".chip[data-kind='waits']")?.textContent).toBe(
+      "Waits on SDK review from the API team",
+    );
+  });
+});
+
+describe("where was I failed next steps", () => {
+  const failedRun = (updated: string) => ({
+    id: "rerun-ci",
+    version: "v1",
+    value: {
+      label: "Rerun the UI shard",
+      state: "failed",
+      outcome: "No checkout of the branch.",
+      updated,
+    },
+  });
+
+  it("holds a step that failed when a later scan offers it again without saying what changed", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    // The run failed, then a scan (scanned_at after the failure) offered the same step again.
+    emit("step_runs", [failedRun("2026-11-19T09:00:00Z")]);
+    emit("radar", [{ id: "current", version: "v1", value: TRACKED }]);
+
+    await waitFor(() => expect(byId("card-client")).toBeTruthy());
+    expect(byId("next-rerun-ci")).toBeNull();
+    expect(byId("card-client").querySelector(".held-note")?.textContent).toContain(
+      "didn’t work last time: No checkout of the branch",
+    );
+  });
+
+  it("offers it again once the scan says what changed", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("step_runs", [failedRun("2026-11-19T09:00:00Z")]);
+    const value = {
+      ...TRACKED,
+      tasks: TRACKED.tasks.map((task) =>
+        task.id === "client"
+          ? {
+              ...task,
+              next_steps: [
+                { ...task.next_steps![0], retry_because: "The branch is checked out now." },
+              ],
+            }
+          : task,
+      ),
+    };
+    emit("radar", [{ id: "current", version: "v1", value }]);
+
+    await waitFor(() => expect(byId("next-rerun-ci")).toBeTruthy());
+    expect(byId("card-client").querySelector(".held-note")).toBeNull();
+  });
+
+  it("still shows a failure that happened after the last scan as a retry", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("step_runs", [failedRun("2026-11-19T11:00:00Z")]);
+    emit("radar", [{ id: "current", version: "v1", value: TRACKED }]);
+
+    await waitFor(() =>
+      expect(byId("next-rerun-ci")?.querySelector(".next-chip")?.textContent).toContain(
+        "Try again",
+      ),
+    );
   });
 });

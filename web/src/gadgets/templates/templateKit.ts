@@ -203,6 +203,10 @@ export const GADGET_KIT_HELPERS = `
 
   // Keeps one element per key in parent, in the order of items, and moves an element that kept
   // its key from where it was (or fades a new one in), so a rescan animates instead of redrawing.
+  // A key drawn moments ago is not new even under a parent that was rebuilt since, so a page
+  // that redraws every second doesn't keep its rows faded out.
+  var keyedDrawnAt = dict();
+  var KEYED_FRESH_MS = 2000;
   function keyed(parent, items, keyOf, build) {
     var before = dict();
     if (!calm) {
@@ -211,16 +215,23 @@ export const GADGET_KIT_HELPERS = `
         if (key) before[key] = child.getBoundingClientRect();
       });
     }
+    var now = Date.now();
+    var recent = dict();
     var nodes = items.map(function (item, index) {
       var node = build(item, index);
-      node.setAttribute('data-key', String(keyOf(item, index)));
+      var key = String(keyOf(item, index));
+      node.setAttribute('data-key', key);
+      if (keyedDrawnAt[key] !== undefined && now - keyedDrawnAt[key] < KEYED_FRESH_MS) recent[key] = true;
+      keyedDrawnAt[key] = now;
       return node;
     });
     parent.replaceChildren.apply(parent, nodes);
     if (!calm) {
       nodes.forEach(function (node) {
         if (typeof node.animate !== 'function') return;
-        var from = before[node.getAttribute('data-key')];
+        var key = node.getAttribute('data-key');
+        var from = before[key];
+        if (!from && recent[key]) return;
         if (!from) {
           node.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: 360, easing: 'ease-out' });
           return;

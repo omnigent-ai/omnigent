@@ -107,3 +107,44 @@ describe("watchEveryPage", () => {
     expect(reads[kit.MAX_EXTRA_PAGES + 1]).toBe("c1");
   });
 });
+
+describe("keyed", () => {
+  const helpers = new Function(`${GADGET_KIT_HELPERS}; return { keyed, el };`)() as {
+    keyed: (
+      parent: HTMLElement,
+      items: string[],
+      keyOf: (item: string) => string,
+      build: (item: string) => HTMLElement,
+    ) => HTMLElement[];
+    el: (tag: string, props?: Record<string, unknown>) => HTMLElement;
+  };
+
+  it("fades a row in once, not again when its parent is rebuilt on the next draw", () => {
+    const fades: string[] = [];
+    const original = Element.prototype.animate;
+    Element.prototype.animate = function (this: Element, frames: Keyframe[]) {
+      if (frames[0] && "opacity" in frames[0]) fades.push(this.getAttribute("data-key") ?? "");
+      return {} as Animation;
+    } as typeof Element.prototype.animate;
+    try {
+      const draw = () => {
+        // A design that builds its lanes afresh on every draw, then its rows inside them.
+        const lane = helpers.el("div");
+        helpers.keyed(
+          lane,
+          ["row-a", "row-b"],
+          (item) => item,
+          (item) => helpers.el("p", { text: item }),
+        );
+      };
+      draw();
+      expect(fades).toEqual(["row-a", "row-b"]);
+      draw();
+      draw();
+      // Drawn moments ago: still the same rows, so they stay visible instead of fading again.
+      expect(fades).toEqual(["row-a", "row-b"]);
+    } finally {
+      Element.prototype.animate = original;
+    }
+  });
+});

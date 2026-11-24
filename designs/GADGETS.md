@@ -169,8 +169,8 @@ CSP and sandbox support. It cannot stop the
 gadget's document from navigating itself (setting `location`, for example), and browsers offer
 no policy that does: that navigation's request leaves the browser before the web app can react,
 and its URL can carry anything the gadget had read. Peer connections are another such channel:
-the CSP's `webrtc 'none'` is not enforced everywhere, and a nested `about:blank` frame does not
-always inherit it. So treat gadget code as able to send out anything it can read:
+the policy sets no `webrtc` directive, since browsers that support one don't enforce it
+everywhere and the rest only warn about it. So treat gadget code as able to send out anything it can read:
 
 - the gadget's own records and comments, which everyone the gadget is shared with can read
   anyway;

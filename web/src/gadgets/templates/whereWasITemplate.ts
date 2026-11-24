@@ -129,6 +129,7 @@ export const WHERE_WAS_I_SCHEMA = {
                 pattern: text(64),
                 pattern_step: text(64),
                 nudge: { type: "string", enum: NUDGES },
+                retry_because: text(200),
                 session_id: text(128),
                 evidence: {
                   type: "object",
@@ -364,6 +365,12 @@ button.chip:hover { background: var(--line); }
 .others summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .others-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; }
 .others-list li { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; font-size: 13px; }
+.shipped { margin-top: 16px; }
+.shipped h2 { font-size: 13px; color: var(--muted); margin: 0 0 6px; }
+.shipped-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.shipped-list li { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; font-size: 13px; }
+.shipped-list .mark { color: var(--done); font-weight: 700; }
+.held-note { margin: 8px 0 0; font-size: 12.5px; color: var(--muted); }
 .block-label { margin: 12px 0 6px; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
 .steps { display: grid; gap: 8px; }
 .step { position: relative; border: 1px solid var(--line); border-radius: 10px; padding: 8px 30px 8px 10px; background: var(--bg); }
@@ -583,6 +590,7 @@ ${GADGET_KIT_HELPERS}
     syncKit();
     try {
       view.render(root, viewModel(), kit);
+      if (view === customView) checkDrawn(root);
       if (view === customView && !value.example) report('ok', '');
       // A failure whose report didn't save is reported again on the next draw.
       else if (viewFailure && !value.example) report('failed', viewFailure.text);
@@ -595,10 +603,25 @@ ${GADGET_KIT_HELPERS}
     }
   }
 
+  // Text a design draws by passing data where elements belong ("[object Object]", or a null
+  // the browser turns into "null"): a failed draw, so the session sees it in render_reports.
+  var STRAY_TEXT = /\\[object [A-Za-z]+\\]|^(?:null|undefined|NaN)$/;
+  function checkDrawn(root) {
+    var walker = document.createTreeWalker(root, 4 /* NodeFilter.SHOW_TEXT */);
+    for (var node = walker.nextNode(); node; node = walker.nextNode()) {
+      var text = node.nodeValue.trim();
+      if (text && STRAY_TEXT.test(text)) {
+        throw new Error('The design drew "' + text.slice(0, 40) + '": pass elements to replaceChildren and el, not data or null.');
+      }
+    }
+  }
+
   function viewModel() {
     return {
       radar: radar(),
       tasks: tasks(),
+      open: openTasks(),
+      shipped: shippedTasks(),
       others: otherSessions(),
       stages: STAGES.slice(),
       sessions: sessionsById(),
@@ -623,6 +646,9 @@ ${GADGET_KIT_HELPERS}
   function radar() { return radarDoc && radarDoc.value && Array.isArray(radarDoc.value.tasks) ? radarDoc.value : null; }
   function layoutValue() { return layoutDoc && layoutDoc.value && layoutDoc.value.revision_id ? layoutDoc.value : null; }
   function tasks() { var value = radar(); return value ? value.tasks.filter(function (task) { return task && task.id && task.title; }) : []; }
+  function isShipped(task) { return task.state === 'done' || task.stage === 'done'; }
+  function openTasks() { return tasks().filter(function (task) { return !isShipped(task); }); }
+  function shippedTasks() { return tasks().filter(isShipped); }
   function taskById() {
     var out = dict();
     tasks().forEach(function (task) { out[task.id] = task; });
@@ -683,7 +709,28 @@ ${GADGET_KIT_HELPERS}
   // without an estimate is not shown: a wrong step costs the viewer more than a missing one.
   function sure(step) { return Boolean(step) && typeof step.confidence === 'number' && step.confidence >= barOf(step); }
   function openSteps(task) {
-    return (task.next_steps || []).filter(function (step) { return step && step.id && !dismissedDocs[step.id] && sure(step); });
+    return (task.next_steps || []).filter(function (step) { return step && step.id && !dismissedDocs[step.id] && sure(step) && !held(step); });
+  }
+  // A step whose last run failed, offered again by a scan after that failure without saying what
+  // changed (retry_because): what stopped it most likely still holds, so it waits instead of
+  // asking for the same click again. Until that scan, Next up shows the failure with Try again.
+  function held(step) {
+    var doc = step && runDocs[step.id];
+    var run = doc && doc.value;
+    if (!run || run.state !== 'failed' || step.retry_because) return false;
+    var value = radar();
+    var scanned = Date.parse((value && value.scanned_at) || '');
+    var failed = Date.parse(run.updated || doc.updatedAt || '');
+    return !isNaN(scanned) && !isNaN(failed) && scanned > failed;
+  }
+  function heldSteps(task) {
+    return (task.next_steps || []).filter(function (step) { return step && step.id && !dismissedDocs[step.id] && held(step); });
+  }
+  function heldNote(step) {
+    var run = runDocs[step.id].value;
+    return el('p', { class: 'held-note', 'data-omnigent-ref': ref('steps/' + step.id), 'data-omnigent-label': step.label }, [
+      '“' + plain(step.label) + '” didn’t work last time' + (run.outcome ? ': ' + clause(plain(run.outcome)) : '') + '. It comes back once what stopped it changes.',
+    ]);
   }
   // The steps Next up shows now, by ID: a view draws the others, so no step shows twice.
   var nextUpIds = dict();
@@ -1031,7 +1078,17 @@ ${GADGET_KIT_HELPERS}
     return el('div', { class: 'track', role: 'img', 'aria-label': description.join(', ') || 'No steps yet' }, columns);
   }
 
-  // Links, what the task waits on and what waits on it.
+  // What a task waits on, as the end of "Waits on …": lowercased unless it starts with a name
+  // (an acronym or a capital mid-word), and short, with the whole text as its tip.
+  var WAITS_MAX = 48;
+  function waitsOnText(value) {
+    var text = plain(value);
+    var first = text.split(' ')[0] || '';
+    if (/^[A-Z][a-z]*$/.test(first) && !/^[A-Z][a-z]+[A-Z]/.test(first)) text = text.charAt(0).toLowerCase() + text.slice(1);
+    return text.length > WAITS_MAX ? text.slice(0, WAITS_MAX - 1).replace(/\\s+\\S*$/, '') + '…' : text;
+  }
+  // Links, what the task waits on and what waits on it, as one element (empty when there are
+  // none), so a design can put it anywhere.
   function taskChips(task) {
     var known = taskById();
     var chips = [];
@@ -1039,7 +1096,7 @@ ${GADGET_KIT_HELPERS}
       if (!owns(known, other)) return;
       chips.push(el('button', { type: 'button', class: 'chip', 'data-kind': 'waits', title: 'Waits on this task', on: { click: function () { focusTask(other); } } }, ['Waits on ' + known[other].title]));
     });
-    if (task.waiting_on) chips.push(el('span', { class: 'chip', 'data-kind': 'waits', text: 'Waits on ' + plain(task.waiting_on) }));
+    if (task.waiting_on) chips.push(el('span', { class: 'chip', 'data-kind': 'waits', title: plain(task.waiting_on), text: 'Waits on ' + waitsOnText(task.waiting_on) }));
     dependents(task).forEach(function (other) {
       if (task.state === 'done') return;
       chips.push(el('button', { type: 'button', class: 'chip', 'data-kind': 'blocks', title: 'This task waits on it', on: { click: function () { focusTask(other.id); } } }, ['Blocks ' + other.title]));
@@ -1047,7 +1104,7 @@ ${GADGET_KIT_HELPERS}
     (task.links || []).forEach(function (link) {
       chips.push(el('span', { class: 'chip', 'data-kind': 'link', title: link.url || link.label, text: link.label }));
     });
-    return chips.length ? el('div', { class: 'chips' }, chips) : null;
+    return chips.length ? el('div', { class: 'chips' }, chips) : document.createDocumentFragment();
   }
   function focusTask(taskId) {
     var card = document.getElementById('card-' + taskId);
@@ -1159,8 +1216,9 @@ ${GADGET_KIT_HELPERS}
     ]);
   }
 
-  // The sessions that worked on a task: those the radar files under it, then any it only names.
-  function taskSessions(task) {
+  // The sessions that worked on a task, as data: those the radar files under it, then any it
+  // only names.
+  function sessionsOf(task) {
     var byId = sessionsById();
     var out = [];
     var listed = dict();
@@ -1173,6 +1231,20 @@ ${GADGET_KIT_HELPERS}
       out.push(owns(byId, sessionId) ? byId[sessionId] : { id: sessionId, title: 'Session' });
     });
     return out;
+  }
+  // The same sessions drawn, as one element (empty when there are none): short links, then the
+  // ones to keep an eye on as cards.
+  function taskSessions(task) {
+    var sessions = sessionsOf(task);
+    var watched = sessions.filter(function (session) { return session.why; });
+    var quiet = sessions.filter(function (session) { return !session.why; });
+    var box = document.createDocumentFragment();
+    if (quiet.length) box.appendChild(el('div', { class: 'task-sessions' }, quiet.map(sessionLink)));
+    if (watched.length) {
+      box.appendChild(el('div', { class: 'block-label', text: 'Keep an eye on' }));
+      box.appendChild(el('div', { class: 'watch' }, watched.map(sessionCard)));
+    }
+    return box;
   }
   // A session as a short link with its live status, for a task's row.
   function sessionLink(session) {
@@ -1188,7 +1260,7 @@ ${GADGET_KIT_HELPERS}
     el: el, svg: svg, keyed: keyed, ago: ago, hash: hash, wrap: wrap, plain: plain, cite: cite,
     stateColor: stateColor, stateSoft: stateSoft, stateLabel: stateLabel, stateOrder: STATE_ORDER,
     stages: STAGES.slice(), stageLabel: stageLabel, trackOf: trackOf, currentStep: currentStep, track: trackEl,
-    taskChips: taskChips, taskSessions: taskSessions, sessionLink: sessionLink, dependents: dependents,
+    taskChips: taskChips, taskSessions: taskSessions, sessionsOf: sessionsOf, sessionLink: sessionLink, dependents: dependents,
     openSteps: openSteps, laterSteps: laterSteps, sure: sure, patternOf: patternOf, hitRatio: hitRatio,
     ordered: ordered, stepState: stepState, requestStep: requestStep,
     stepButton: stepButton, stepCard: stepCard, sessionCard: sessionCard, sessionTitle: sessionTitle,
@@ -1205,9 +1277,7 @@ ${GADGET_KIT_HELPERS}
     var steps = laterSteps(task);
     var hidden = hiddenSteps(task);
     var now = currentStep(task);
-    var sessions = taskSessions(task);
-    var watched = sessions.filter(function (session) { return session.why; });
-    var quiet = sessions.filter(function (session) { return !session.why; });
+    var held = heldSteps(task);
     var where = task.state === 'done' || task.stage === 'done' ? 'Shipped' : now ? stageLabel(now.stage) + ': ' : stageLabel(task.stage);
     return el('article', { class: 'task', id: 'card-' + task.id, 'data-state': stateKey(task.state), 'data-stage': task.stage, 'data-omnigent-ref': ref('tasks/' + task.id), 'data-omnigent-label': task.title }, [
       el('div', { class: 'task-head' }, [
@@ -1219,9 +1289,8 @@ ${GADGET_KIT_HELPERS}
       task.summary ? el('p', { class: 'summary', text: plain(task.summary) }) : null,
       trackEl(task),
       taskChips(task),
-      quiet.length ? el('div', { class: 'task-sessions' }, quiet.map(sessionLink)) : null,
-      watched.length ? el('div', { class: 'block-label', text: 'Keep an eye on' }) : null,
-      watched.length ? el('div', { class: 'watch' }, watched.map(sessionCard)) : null,
+      taskSessions(task),
+      held.length ? el('div', { class: 'held' }, held.map(heldNote)) : null,
       steps.length ? el('div', { class: 'block-label', text: 'Next steps' }) : null,
       steps.length ? el('div', { class: 'steps' }, steps.map(function (step) { return stepCard(task, step); })) : null,
       hidden.length ? el('div', { class: 'dismissed-note' }, [
@@ -1238,7 +1307,7 @@ ${GADGET_KIT_HELPERS}
     render: function (root, model) {
       var grid = root.firstChild;
       if (!grid || grid.className !== 'tasks') { grid = el('div', { class: 'tasks' }); root.replaceChildren(grid); }
-      keyed(grid, ordered(model.tasks), function (task) { return task.id; }, function (task) { return taskRow(task); });
+      keyed(grid, ordered(model.open), function (task) { return task.id; }, function (task) { return taskRow(task); });
     },
   };
 
@@ -1272,12 +1341,29 @@ ${GADGET_KIT_HELPERS}
     viewDirty = false;
     renderLook(value);
     if (!value) { drawView(); return; }
-    $('nothing').hidden = tasks().length > 0;
+    $('nothing').hidden = openTasks().length > 0;
     renderNextUp(tasks(), value);
     drawView();
     renderDone();
+    renderShipped();
     renderOthers();
     renderLearned();
+  }
+
+  // Shipped work, kept by the kit so a design can't drop it: the viewer sees that a change they
+  // finished made it, with its sessions.
+  function renderShipped() {
+    var list = shippedTasks();
+    $('shipped').hidden = list.length === 0;
+    keyed($('shipped-list'), list, function (task) { return 'shipped-' + task.id; }, function (task) {
+      var sessions = sessionsOf(task);
+      return el('li', { id: 'card-' + task.id, 'data-omnigent-ref': ref('tasks/' + task.id), 'data-omnigent-label': task.title }, [
+        el('span', { class: 'mark', 'aria-hidden': 'true', text: '✓' }),
+        el('span', { text: task.title }),
+        task.project ? el('span', { class: 'session-meta', text: task.project }) : null,
+        sessions.length ? sessionLink(sessions[0]) : null,
+      ]);
+    });
   }
 
   // Active sessions that are not part of a delivery task, kept by the kit so a design can't drop
@@ -1756,6 +1842,10 @@ const KIT_BODY = `
       <p id="next-empty" class="next-empty" hidden>Nothing needs you right now. Next up shows a step only when your past work says it is due and you will want it.</p>
     </section>
     <div id="view" class="view"></div>
+    <section id="shipped" class="shipped" hidden>
+      <h2>Shipped recently</h2>
+      <ul id="shipped-list" class="shipped-list"></ul>
+    </section>
     <details id="others" class="others" hidden>
       <summary><span id="others-count"></span> that aren't changes in flight</summary>
       <ul id="others-list" class="others-list"></ul>
@@ -1815,8 +1905,8 @@ throws, the kit switches the design's styles off, shows its plain view and repor
 render_reports.
 
 model: radar (the radar record: headline, tasks, sessions, scanned_at, window_days), tasks (the
-tasks that have an id and a title), others (sessions that are not part of a task; the kit lists
-them itself), sessions (an object of the radar's sessions keyed by ID, not an array: use
+tasks that have an id and a title), open (those not shipped yet: draw these), shipped (the kit
+lists them itself), others (sessions that are not part of a task; the kit lists them too), sessions (an object of the radar's sessions keyed by ID, not an array: use
 Object.values(model.sessions) to list them), stages (pre_pr, post_pr, post_merge, post_rollout),
 layout (the layout record or null), patterns (how each project ships, from the patterns record),
 width (root's width in pixels), preview.
@@ -1826,8 +1916,9 @@ on: { click: fn }, and any attribute); keyed(parent, items, keyOf, build) keeps 
 key and animates moves; track(task) is the task's lifecycle track, four stage columns of step
 dots that line up across tasks; trackOf(task) is its steps ({id, label, stage, status} with
 status done, current, blocked, todo or na), currentStep(task) the step it is at, and
-stageLabel(stage) a stage's name; taskChips(task) are its links and what it waits on or blocks;
-taskSessions(task) are its sessions, and sessionLink(session) a short link with live status;
+stageLabel(stage) a stage's name; taskChips(task) is one element with its links and what it
+waits on or blocks; taskSessions(task) is one element with its sessions, sessionsOf(task) the
+same sessions as data, and sessionLink(session) a short link with live status;
 dependents(task) are the tasks waiting on it; stepButton(task, step) is a next step that runs
 and shows its progress; stepCard(task, step) adds its reason, evidence and a way to hide it;
 sessionCard(session) is a session with its live status and journal outcome; openSession(id);
@@ -1840,10 +1931,15 @@ ref('tasks/' + task.id); ago(iso); wrap(text, maxChars, maxLines) splits text in
 SVG; plain(text) drops Markdown marks; calm is true when the viewer prefers reduced motion;
 canAct, canWrite.
 
+Every kit function that draws returns an element (an empty one when there is nothing to show),
+so its result can go straight into el or replaceChildren; currentStep, trackOf, sessionsOf,
+dependents, openSteps and laterSteps return data. A draw whose text shows "[object Object]" or
+a stray null fails like a throw.
+
 Colors: var(name) with name one of text, muted, line, faint, surface, bg, accent, active,
 blocked, waiting, done, and the -soft form of the last four; the kit switches them for dark mode.
-Next up, the other sessions, Done recently, the scan status, Rescan, the look line and the guide
-are the kit's: do not draw them again.
+Next up, shipped work, the other sessions, Done recently, the scan status, Rescan, the look line
+and the guide are the kit's: do not draw them again.
 -->`;
 
 const PLAIN_VIEW = `${WHERE_WAS_I_VIEW_START}
@@ -1894,15 +1990,15 @@ export const WHERE_WAS_I_GUIDE = [
   "- `post_merge`: roll out the binary [binary_rollout], ramp the flag [flag_rollout], roll out dependencies [rollout_deps].",
   "- `post_rollout`: check metrics and errors [metrics], impact report [impact].",
   "",
-  "Not every change has every step: some have no flag, no dependencies or no metrics. Mark those `na` for that task rather than leaving them to do, and add a project's own steps (a canary, a backport, a docs update) where its history shows them.",
+  "Not every change has every step: some have no flag, no dependencies or no metrics. Keep those steps in the task's track marked `na`, never leave them out, and add a project's own steps (a canary, a backport, a docs update) where its history shows them.",
   "",
   "## The radar record",
   "",
   "- `scanned_at` (ISO 8601 UTC), `window_days`, `sessions_read`, `sessions_unchecked` (true when the page budget ended before every session was listed), and `headline`: one plain sentence on where the changes stand.",
   "- `tasks` (up to 12): `{id, title, summary, project, state, stage, step, track, links, depends_on, waiting_on, session_ids, evidence, next_steps}`. `id` is a stable lowercase slug (`[a-z0-9][a-z0-9_-]*`, at most 64). `state` is `active`, `blocked`, `waiting` (on someone or something else) or `done`. `stage` is one of the four stages, or `done` once its last applicable step is done; `step` is the ID of the track step it is at.",
-  "- `track` (up to 16): the task's steps in order, `{id, label, stage, status, note}`, with `status` `done`, `current`, `blocked`, `todo` or `na`. Exactly one step is `current` or `blocked` while the task is open.",
+  "- `track` (up to 16): every lifecycle step of the task in order, `{id, label, stage, status, note}`, with `status` `done`, `current`, `blocked`, `todo` or `na` (not needed for this task). Exactly one step is `current` or `blocked` while the task is open.",
   '- `links` (up to 6): `{kind, label, url}`, `kind` one of pr, flag, dashboard, issue, deploy, doc, other ("PR #1482", "search_ranking_v2"). `depends_on` lists IDs of tasks it waits on; `waiting_on` names something outside the radar it waits on. `evidence` (up to 4) is `{session_id, quote}` behind its stage.',
-  "- `next_steps` (up to 3 per task): `{id, label, kind, why_now, confidence, track_step, pattern, pattern_step, nudge, session_id, evidence: {session_id, quote}}`. `kind` is `act` or `monitor`. `id` is a stable slug, unique across the radar, which also names its `step_runs` and `dismissed` records. `track_step` is the track step it moves. `confidence` (0 to 1) is your estimate that the viewer clicks it: the page shows a step only at or above its pattern's `bar` (0.7 without one) and never one without `confidence`. `nudge` is `forgotten` (a step they usually skip or do late), `overdue` or `due`.",
+  "- `next_steps` (up to 3 per task): `{id, label, kind, why_now, confidence, track_step, pattern, pattern_step, nudge, retry_because, session_id, evidence: {session_id, quote}}`. `kind` is `act` or `monitor`. `id` is a stable slug, unique across the radar, which also names its `step_runs` and `dismissed` records. `track_step` is the track step it moves. `confidence` (0 to 1) is your estimate that the viewer clicks it: the page shows a step only at or above its pattern's `bar` (0.7 without one) and never one without `confidence`. `nudge` is `forgotten` (a step they usually skip or do late), `overdue` or `due`.",
   '- `sessions` (up to 40): `{id, title, task, other, why, status, outcome, last_active}` for every session the scan kept. Set `task` to the task it worked on, or `other` to one short phrase on what it is ("research", "a question about logs") when it is not part of a change. Set `why` only on sessions the viewer should watch. `outcome` is one sentence from its journal or last messages.',
   "",
   "## Patterns",
@@ -1920,10 +2016,11 @@ export const WHERE_WAS_I_GUIDE = [
   "",
   "1. Propose a step only when it is due: the task's previous step is done, its pattern's `after_days` has passed, and no later session shows it done or under way.",
   "2. Estimate `confidence`: how sure you are of the task's place and that the step is due, times the pattern's hit ratio (`clicked / (clicked + dismissed + ignored)`; about 0.8 with fewer than five resolved). Lower it after a `not_relevant` dismissal of a similar step.",
-  "3. Write only steps at or above the bar, at most one per task. No step is the right answer when nothing is due; never fill the list.",
+  '3. Offer every step that is due and at or above the bar, at most one per task, including steps due by a pattern: an impact report the usual days after the last ramp, or the pattern\'s next ramp after a clean metric check. Name the exact next value from the pattern ("Ramp to 50%", not "beyond 10%"). No step is the right answer when nothing is due; never fill the list.',
   '4. `why_now` is one sentence from the evidence ("Two quiet days at 5%; you ramp after two."). Cite the session and a short quote in `evidence`.',
   "5. Keep the ledger: mark each `open` entry `clicked` when a `do_next_step` action or `step_runs` record exists for it, `dismissed` with its reason when it is in `dismissed`, `ignored` once it is seven days old; add an `open` entry for each new step and update each pattern's `hits`.",
-  "6. Calibrate once a pattern has five resolved steps: raise its `bar` by 0.05 (to at most 0.9) while its hit ratio is under 0.6, lower it by 0.05 (to at least 0.6) while it is over 0.85. `already_done` means you missed evidence: read the task's later sessions before proposing its steps again.",
+  "6. Calibrate once a pattern has five resolved steps: raise its `bar` by 0.05 (to at most 0.9) while its hit ratio is under 0.6, lower it by 0.05 (to at least 0.6) while it is over 0.85. `already_done` means you missed evidence: read the task's later sessions before proposing its steps again, and move its track only on what those sessions show, not on the dismissal.",
+  "7. A step whose `step_runs` record says `failed` stays out until what stopped it changed (the branch is checked out, the reviewer answered). Then offer it again with `retry_because` saying what changed, and lower its `confidence` if the cause is unclear; the page holds a failed step without it.",
   "",
   "## Scan",
   "",
@@ -1950,7 +2047,7 @@ export const WHERE_WAS_I_GUIDE = [
   "- Make it glanceable in the docked side panel (about 400 px wide) and full screen. Use the kit's colors, respect `kit.calm`, and use inline SVG and CSS only: the frame's CSP blocks external requests. Keep the HTML well under 1 MiB.",
   "- Include at least one visual element that carries meaning, such as `kit.track(task)` or your own stage columns.",
   "- Animate changes in place with `kit.keyed` and stable IDs, and scope your CSS to your own classes.",
-  "- Next up, the other sessions, Done recently, what the session learned, the hit ratio, the scan status, Rescan, the look line and the guide are the kit's: do not draw them again. Next up owns its steps: draw only `kit.laterSteps(task)`, with `kit.stepButton` or `kit.stepCard`, and use `kit.sessionLink` or `kit.sessionCard` for sessions, so their actions and progress keep working.",
+  "- Draw `model.open`; shipped work, Next up, the other sessions, Done recently, what the session learned, the hit ratio, the scan status, Rescan, the look line and the guide are the kit's: do not draw them again. Kit pieces that draw return elements; pass data only to your own code. Next up owns its steps: draw only `kit.laterSteps(task)`, with `kit.stepButton` or `kit.stepCard`, and use `kit.sessionLink` or `kit.sessionCard` for sessions, so their actions and progress keep working.",
   "",
   "To publish a design:",
   "",
