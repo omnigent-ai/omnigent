@@ -51,3 +51,35 @@ describe("ProjectIdentityRoster", () => {
     expect(items[1]).toHaveTextContent("QA Lead");
   });
 });
+
+describe("ProjectIdentityRoster on phones", () => {
+  it("folds the Lead, every persona and Edit team into one Team menu", async () => {
+    const viewport = await import("@/hooks/useIsMobileViewport");
+    const mobile = vi.spyOn(viewport, "useIsMobileViewport").mockReturnValue(true);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <TooltipProvider>
+            <ProjectIdentityRoster
+              projectId="p1"
+              projectName="P"
+              leadPath="/projects/P/orchestrator"
+            />
+          </TooltipProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.queryAllByTestId("project-identity-button")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Edit team" })).toBeNull();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Team" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    const items = within(screen.getByRole("menu")).getAllByRole("menuitem");
+    // The Lead, every persona, then Edit team.
+    expect(items).toHaveLength(names.length + 2);
+    expect(items[0]).toHaveTextContent("Lead");
+    expect(items.at(-1)).toHaveTextContent("Edit team");
+    mobile.mockRestore();
+  });
+});

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { UsersIcon } from "lucide-react";
+import { MessageSquareIcon, UsersIcon } from "lucide-react";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { RunningDot } from "@/components/RunningDot";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -19,8 +20,6 @@ import { projectIdentitiesKey, useProjectIdentities } from "./useProjectIdentiti
 
 /** Personas shown in the header; the rest open from a "+N" menu so the bar never overflows. */
 export const VISIBLE_ROSTER_LIMIT = 4;
-/** Phones fit only the menu beside the other icon buttons. */
-export const MOBILE_VISIBLE_ROSTER_LIMIT = 0;
 
 /**
  * The project's owner-defined identities beside the Lead button. Each
@@ -29,9 +28,12 @@ export const MOBILE_VISIBLE_ROSTER_LIMIT = 0;
 export function ProjectIdentityRoster({
   projectId,
   projectName,
+  leadPath,
 }: {
   projectId: string | null;
   projectName: string;
+  /** On phones the Lead joins the Team menu; omit when the project has no Lead. */
+  leadPath?: string;
 }) {
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
@@ -54,7 +56,61 @@ export function ProjectIdentityRoster({
     ...roles.filter((identity) => identity.active_session_state === "busy"),
     ...roles.filter((identity) => identity.active_session_state !== "busy"),
   ];
-  const limit = isMobile ? MOBILE_VISIBLE_ROSTER_LIMIT : VISIBLE_ROSTER_LIMIT;
+  if (isMobile) {
+    return (
+      <>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Team"
+              data-testid="project-team-menu"
+              loading={open.isPending}
+            >
+              <UsersIcon />
+              {ordered.some((identity) => identity.active_session_state === "busy") && (
+                <RunningDot />
+              )}
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {leadPath !== undefined && (
+              <DropdownMenuItem className="gap-2" onSelect={() => navigate(leadPath)}>
+                <MessageSquareIcon className="size-4" />
+                Lead
+              </DropdownMenuItem>
+            )}
+            {ordered.map((identity) => (
+              <DropdownMenuItem
+                key={identity.id}
+                className="gap-2"
+                onSelect={() => open.mutate(identity)}
+              >
+                <PersonaAvatar name={identity.name} size="xs" />
+                <span className="max-w-48 truncate">{identity.name}</span>
+                {identity.active_session_state === "busy" && <RunningDot />}
+              </DropdownMenuItem>
+            ))}
+            {(leadPath !== undefined || ordered.length > 0) && <DropdownMenuSeparator />}
+            <DropdownMenuItem className="gap-2" onSelect={() => setEditing(true)}>
+              <UsersIcon className="size-4" />
+              Edit team
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        {editing && (
+          <ProjectTeamDialog
+            projectId={projectId}
+            projectName={projectName}
+            onClose={() => setEditing(false)}
+          />
+        )}
+      </>
+    );
+  }
+  const limit = VISIBLE_ROSTER_LIMIT;
   const visible = ordered.slice(0, limit);
   const hidden = ordered.slice(limit);
   return (

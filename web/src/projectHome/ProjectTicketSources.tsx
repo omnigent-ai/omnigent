@@ -177,7 +177,8 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
             {(loadError || failedCount > 0) && (
               <TriangleAlertIcon aria-hidden className="size-3.5 text-status-yellow" />
             )}
-            <ChevronDownIcon aria-hidden className="size-3.5 text-muted-foreground" />
+            {/* Phones drop the chevron so every header action fits on screen. */}
+            <ChevronDownIcon aria-hidden className="size-3.5 text-muted-foreground max-md:hidden" />
           </Button>
         </PopoverTrigger>
         <PopoverContent

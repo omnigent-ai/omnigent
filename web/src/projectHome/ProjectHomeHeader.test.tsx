@@ -220,7 +220,9 @@ describe("ProjectHomeTitle", () => {
     renderNavigation();
     const header = screen.getByRole("banner");
     expect(screen.queryByRole("tablist")).toBeNull();
-    expect(within(header).getByRole("link", { name: "Lead" })).toBeVisible();
+    // Phones reach the Lead and personas through one Team menu.
+    expect(within(header).queryByRole("link", { name: "Lead" })).toBeNull();
+    expect(within(header).getByRole("button", { name: "Team" })).toBeVisible();
     expect(within(header).queryByRole("button", { name: "New session" })).toBeNull();
     expect(within(header).getByRole("link", { name: "New ticket" })).toBeVisible();
     expect(
