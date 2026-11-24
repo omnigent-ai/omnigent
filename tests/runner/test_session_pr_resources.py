@@ -1159,6 +1159,50 @@ def test_a_read_after_a_pr_is_tracked_lists_it_while_an_earlier_read_runs(
         assert linked in {pr["url"] for pr in later.result(timeout=budget(5))["prs"]}
 
 
+async def test_a_poll_after_the_agent_links_a_pr_shows_it_not_an_earlier_setup_state(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll may answer with an earlier setup state, but never after the session tracks a PR."""
+    monkeypatch.setattr(github, "_git", lambda *_a, **_kw: (128, "", "not a git repository"))
+    monkeypatch.setattr(github, "_gh", _forge({"value": "OPEN"}))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/untracked/resources/github"
+    poll = {"allow_cached": "true"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        before = [await client.get(path, params=poll) for _ in range(2)]
+        SessionPrRegistry("untracked").record(
+            [PullRequestRef.from_url(A)], relationship="created", source="test"
+        )
+        linked = await client.get(path, params=poll)
+    assert [response.json()["reason"] for response in before] == ["not_a_git_repo"] * 2
+    assert linked.status_code == 200, linked.text
+    assert linked.json()["selected_pr_url"] == A
+    assert linked.json()["pr"]["state"] == "OPEN"
+
+
+def test_host_pr_reads_without_the_poll_flag_reflect_the_forge_now(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host serves an offline runner's panel; its one-shot reads stay fresh after a poll."""
+    from omnigent.host.connect import HostProcess
+
+    forge = {"value": "OPEN"}
+    monkeypatch.setattr(github, "_gh", _forge(forge))
+    reader = WorkspaceReader(Path(tracked))
+    polled = HostProcess._dispatch_fs_op(
+        reader, "github_info", "session", {"pr_url": B, "allow_cached": True}
+    )
+    forge["value"] = "MERGED"
+    fresh = HostProcess._dispatch_fs_op(reader, "github_info", "session", {"pr_url": B})
+    assert polled["pr"]["state"] == "OPEN"  # type: ignore[index]
+    assert fresh["pr"]["state"] == "MERGED"  # type: ignore[index]
+
+
 async def test_pr_panel_reads_answer_while_changed_file_listings_hold_the_slow_pool(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
