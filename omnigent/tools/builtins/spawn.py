@@ -704,7 +704,7 @@ class SysSessionGetInfoTool(Tool):
     A **global read**: resolves against any session the caller is
     permitted to access (bounded by the server's per-user permission
     model), not just the caller's spawn subtree. Reports lifecycle
-    status, title, agent binding (id + name), runner binding and live
+    status, archived state, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
     effective model, current permission mode, parent
     linkage, workspace / git branch, project, persisted last-activity time, and
@@ -733,7 +733,8 @@ class SysSessionGetInfoTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Return a session's metadata: lifecycle status, title, "
+            "Return a session's metadata: lifecycle status, whether it is "
+            "archived, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
             "permission_mode (the mode it is in now, named as "
