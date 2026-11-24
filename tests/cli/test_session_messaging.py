@@ -763,6 +763,51 @@ def test_wait_timeout_does_not_wait_out_a_refresh_stuck_on_the_lock(
     assert elapsed < 1
 
 
+class _SlowMintAuth(httpx.Auth):
+    """An auth flow whose token mint blocks, as an SDK credential helper can."""
+
+    def __init__(self, released: threading.Event, minting: threading.Event) -> None:
+        self._released = released
+        self._minting = minting
+
+    def auth_flow(self, request: httpx.Request) -> Iterator[httpx.Request]:
+        self._minting.set()
+        self._released.wait(timeout=10)
+        request.headers["Authorization"] = "Bearer minted"
+        yield request
+
+
+@pytest.mark.parametrize("slow_step", ["choosing-a-credential", "minting-a-token"])
+def test_wait_timeout_does_not_wait_out_slow_credentials(
+    router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, slow_step: str
+) -> None:
+    """Credential discovery and token minting block outside asyncio, but --timeout holds."""
+    released, blocked = threading.Event(), threading.Event()
+
+    def server_auth(server_url: str | None = None) -> httpx.Auth | None:
+        if slow_step == "choosing-a-credential":
+            blocked.set()
+            released.wait(timeout=10)
+            return None
+        return _SlowMintAuth(released, blocked)
+
+    monkeypatch.setattr("omnigent.chat._server_auth", server_auth)
+    session = _FakeSession()
+    session.install(router)
+    try:
+        started = time.monotonic()
+        result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.2"])
+        elapsed = time.monotonic() - started
+    finally:
+        released.set()
+
+    assert blocked.is_set()
+    assert result.exit_code == 1
+    assert "Timed out after 0.2s" in result.stderr
+    assert elapsed < 1
+    assert session.calls == []
+
+
 def test_wait_gives_each_login_renewal_only_the_time_left(
     router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:

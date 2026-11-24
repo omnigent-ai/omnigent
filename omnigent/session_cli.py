@@ -12,14 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import os
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import cast
+from typing import TypeVar, cast
 
 import click
 import httpx
@@ -32,6 +33,8 @@ from omnigent.session_create_cli import (
     server_error,
 )
 from omnigent.util.json_types import JsonObject
+
+_Result = TypeVar("_Result")
 
 #: A message can wait on an approval policy before the server answers.
 _SEND_TIMEOUT = httpx.Timeout(30.0, read=3660.0)
@@ -130,8 +133,9 @@ async def open_session_client(
     from omnigent.cli_auth import open_server_client
 
     # An already-expired login must be renewed before choosing how to authenticate.
-    await _renew_in_background(base_url, _remaining(deadline))
-    auth = _server_auth(server_url=base_url)
+    await _run_in_daemon(_renew_stored_login, base_url, _remaining(deadline))
+    # Choosing a credential can run a credential helper, so it stays off the loop too.
+    auth = await _run_in_daemon(functools.partial(_server_auth, server_url=base_url))
     async with open_server_client(
         base_url,
         auth=_RenewingAuth(auth, base_url, deadline) if auth is not None else None,
@@ -167,40 +171,66 @@ def _renew_stored_login(server_url: str, budget_s: float | None = None) -> None:
         refresh_stored_token(server_url, timeout=limit)
 
 
-async def _renew_in_background(server_url: str, budget_s: float | None) -> None:
+async def _run_in_daemon(function: Callable[..., _Result], *args: object) -> _Result:
     """
-    Renew the stored login in a daemon thread and wait for it.
+    Run a blocking credential call in a daemon thread and wait for its result.
 
-    The refresh can block on the token file's lock with no deadline, so a wait the
-    caller's deadline cancels leaves the thread behind rather than joining it at exit.
-    The token file is replaced atomically, so an abandoned refresh can't corrupt it.
+    A login refresh can block on the token file's lock, and a credential helper or
+    SDK token mint can block on a subprocess, none under the caller's deadline. A
+    wait the deadline cancels therefore leaves the thread behind, never joining it
+    at exit. The token file is replaced atomically, so an abandoned refresh can't
+    corrupt it.
+
+    :param function: The blocking call, e.g. :func:`_renew_stored_login`.
+    :param args: Its arguments.
+    :returns: What *function* returned.
+    :raises Exception: What *function* raised.
     """
     loop = asyncio.get_running_loop()
-    done: asyncio.Future[None] = loop.create_future()
+    done: asyncio.Future[_Result] = loop.create_future()
 
-    def _settle(error: BaseException | None) -> None:
+    def _settle(result: _Result | None, error: BaseException | None) -> None:
         if done.done():
             return
         if error is None:
-            done.set_result(None)
+            done.set_result(cast(_Result, result))
         else:
             done.set_exception(error)
 
-    def _renew() -> None:
+    def _run() -> None:
+        result: _Result | None = None
         error: BaseException | None = None
         try:
-            _renew_stored_login(server_url, budget_s)
+            result = function(*args)
         except Exception as exc:  # noqa: BLE001 - re-raised in the awaiting task
             error = exc
         with contextlib.suppress(RuntimeError):  # the loop closed after giving up
-            loop.call_soon_threadsafe(_settle, error)
+            loop.call_soon_threadsafe(_settle, result, error)
 
-    threading.Thread(target=_renew, name="omnigent-login-renewal", daemon=True).start()
-    await done
+    threading.Thread(target=_run, name="omnigent-session-credentials", daemon=True).start()
+    return await done
+
+
+def _auth_step(
+    flow: Generator[httpx.Request, httpx.Response, None], response: httpx.Response | None
+) -> httpx.Request | None:
+    """
+    Advance a synchronous auth flow one step, off the event loop.
+
+    :returns: The next request to send, or ``None`` once the flow is done.
+    """
+    try:
+        return next(flow) if response is None else flow.send(response)
+    except StopIteration:
+        return None
 
 
 class _RenewingAuth(httpx.Auth):
-    """The CLI's server auth, with the stored login renewed before each request."""
+    """
+    The CLI's server auth, with the stored login renewed before each request.
+
+    The inner flow can mint a token synchronously, so each step runs off the loop.
+    """
 
     def __init__(self, inner: httpx.Auth, server_url: str, deadline: float | None) -> None:
         self._inner = inner
@@ -210,16 +240,17 @@ class _RenewingAuth(httpx.Auth):
     async def async_auth_flow(
         self, request: httpx.Request
     ) -> AsyncGenerator[httpx.Request, httpx.Response]:
-        """Renew the login off the event loop, then authenticate as the CLI does."""
-        await _renew_in_background(self._server_url, _remaining(self._deadline))
-        flow = self._inner.async_auth_flow(request)
-        outgoing = await anext(flow)
-        while True:
+        """Renew the login, then authenticate as the CLI does, all off the event loop."""
+        await _run_in_daemon(_renew_stored_login, self._server_url, _remaining(self._deadline))
+        if self._inner.requires_request_body:
+            await request.aread()
+        flow = self._inner.auth_flow(request)
+        outgoing = await _run_in_daemon(_auth_step, flow, None)
+        while outgoing is not None:
             response = yield outgoing
-            try:
-                outgoing = await flow.asend(response)
-            except StopAsyncIteration:
-                return
+            if self._inner.requires_response_body:
+                await response.aread()
+            outgoing = await _run_in_daemon(_auth_step, flow, response)
 
 
 @dataclass(frozen=True)
