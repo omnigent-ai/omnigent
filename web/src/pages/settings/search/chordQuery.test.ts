@@ -281,6 +281,7 @@ const PAGE_CONTEXT: ShortcutPageContext = {
   splitTerminal: true,
   siblingSessions: true,
   desktopCommands: true,
+  quickPick: false,
 };
 
 const SHOWN: SettingsAvailability = {
@@ -298,6 +299,7 @@ const SHOWN: SettingsAvailability = {
   sessionTitleInstructions: true,
   floatingPanes: true,
   proactiveAgent: true,
+  quickPickPalette: true,
 };
 
 describe("chord results in Settings search", () => {

@@ -61,15 +61,20 @@ export function useShortcutPageGroups(): ShortcutPageGroup[] {
     splitTerminal: !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
     desktopCommands: supportsDesktopCommands(),
     siblingSessions: serverInfo !== "loading" && serverInfo.sibling_sessions === true,
+    quickPick: isFeatureEnabled(serverInfo, "quick_pick_palette"),
   });
 }
 
 export function KeyboardShortcutsList({
   variant = "compact",
+  groups: shownGroups,
 }: {
   variant?: "compact" | "settings";
+  /** The groups to list, such as the Settings page's filtered ones; every group otherwise. */
+  groups?: readonly ShortcutPageGroup[];
 }) {
-  const groups = useShortcutPageGroups();
+  const allGroups = useShortcutPageGroups();
+  const groups = shownGroups ?? allGroups;
   const settings = variant === "settings";
   return (
     <div className={settings ? "flex flex-col gap-10" : undefined}>
