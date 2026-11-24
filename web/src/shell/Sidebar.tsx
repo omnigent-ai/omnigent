@@ -480,15 +480,23 @@ const NestMoveContext = createContext<{
   destinations: Conversation[];
   move: (id: string, destination: Conversation | null) => void;
   canJoin: boolean;
+  /** Whether the server lets a standalone session lead a new nest. */
+  standalone: boolean;
   saving: boolean;
 } | null>(null);
 
 /**
  * Whether the viewer can nest sessions under `row`: an owned, active, top-level
  * session. A standalone one then leads a new nest; a nest member stands for its nest.
+ * `standalone` is false for servers that only move sessions into existing nests.
  */
-function isNestDestination(row: Conversation, viewerId: string | null): boolean {
+function isNestDestination(
+  row: Conversation,
+  viewerId: string | null,
+  standalone: boolean,
+): boolean {
   return (
+    (standalone || !!row.family) &&
     !row.archived &&
     !row.provisional &&
     !row.nested_draft_source_id &&
@@ -3033,17 +3041,30 @@ function ConversationList({
     moveToNest.mutate({ id, destination });
   });
   const canJoinNests = serverInfo !== "loading" && serverInfo.sibling_sessions === true;
+  const standaloneNests =
+    serverInfo !== "loading" && serverInfo.session_nest_standalone_destinations === true;
   const nestMoveValue = useMemo(
     () =>
       nestMovesSupported
         ? {
-            destinations: allConversations.filter((row) => isNestDestination(row, viewerId)),
+            destinations: allConversations.filter((row) =>
+              isNestDestination(row, viewerId, standaloneNests),
+            ),
             move: moveNest,
             canJoin: canJoinNests,
+            standalone: standaloneNests,
             saving: moveToNest.isPending,
           }
         : null,
-    [nestMovesSupported, allConversations, viewerId, moveNest, canJoinNests, moveToNest.isPending],
+    [
+      nestMovesSupported,
+      allConversations,
+      viewerId,
+      moveNest,
+      canJoinNests,
+      standaloneNests,
+      moveToNest.isPending,
+    ],
   );
   // The session currently being dragged (id + source project + pinned state), or
   // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
@@ -6335,7 +6356,8 @@ function ConversationRowImpl({
   const { setNodeRef: setNestNodeRef, isOver: isNestTarget } = useDroppable({
     id: `nest:${conversation.id}`,
     data: { type: "session-nest", destination: conversation },
-    disabled: !canMoveNest || !isNestDestination(conversation, viewerId),
+    disabled:
+      !canMoveNest || !isNestDestination(conversation, viewerId, nestMoves?.standalone === true),
   });
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -7817,7 +7839,7 @@ function NestPickerMenu({
         .filter(
           (row) =>
             nests.canJoin &&
-            isNestDestination(row, viewerId) &&
+            isNestDestination(row, viewerId, nests.standalone) &&
             row.id !== conversation.id &&
             (!row.family || row.family.id !== conversation.family?.id),
         )

@@ -376,6 +376,8 @@ class ServerInfoResponse(BaseModel):
     # Owner-private families and reuse of the source session's sandbox.
     sibling_sessions: bool = False
     session_nest_moves: bool = False
+    # A nest move may name a standalone session, which then leads the new nest.
+    session_nest_standalone_destinations: bool = False
     # Uploaded-agent sessions accept repository lists and worktree options.
     session_bundle_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
@@ -4194,6 +4196,7 @@ def create_app(
                 "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "session_nest_moves": True,
+                "session_nest_standalone_destinations": True,
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,

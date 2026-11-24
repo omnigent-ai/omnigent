@@ -139,10 +139,9 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
   const family = { id: "conv_d", representative_id: "conv_d", pinned: false };
   const otherFamily = { id: "conv_other", representative_id: "conv_other", pinned: false };
   const destination = conv("conv_d", { family });
-  const standalone = conv("conv_c");
   vi.mocked(useConversations).mockReturnValue(
     conversationPage([
-      standalone,
+      conv("conv_c"),
       destination,
       conv("conv_other", { family: otherFamily }),
       conv("conv_member", { family: otherFamily }),
@@ -180,12 +179,11 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
     expectTarget: false,
     offsetY: ROW_HEIGHT / 2 + 2,
   });
-  expect(mocks.moveNest).toHaveBeenCalledTimes(2);
+  // A server without standalone nest destinations treats a standalone row as list space.
+  await dropOnto("conv_member", "conv_c", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenCalledTimes(3);
   for (const [move] of mocks.moveNest.mock.calls)
     expect(move).toEqual({ id: "conv_member", destination: null });
-  // A standalone row's center nests the member under it, in a new nest.
-  await dropOnto("conv_member", "conv_c", { expectTarget: false });
-  expect(mocks.moveNest).toHaveBeenLastCalledWith({ id: "conv_member", destination: standalone });
   await dropOnto("conv_member", "conv_d", { expectTarget: false });
   expect(mocks.moveNest).toHaveBeenLastCalledWith({ id: "conv_member", destination });
   expect(mocks.moveProject).not.toHaveBeenCalled();
@@ -242,7 +240,12 @@ it("starts a nest at a standalone row's center, but not over the dragged row its
   const head = conv("conv_d");
   vi.mocked(useConversations).mockReturnValue(conversationPage([conv("conv_c"), head]));
   renderSidebar({
-    info: { ...FALLBACK_SERVER_INFO, sibling_sessions: true, session_nest_moves: true },
+    info: {
+      ...FALLBACK_SERVER_INFO,
+      sibling_sessions: true,
+      session_nest_moves: true,
+      session_nest_standalone_destinations: true,
+    },
   });
   await dropOnto("conv_c", "conv_c", { expectTarget: false });
   await dropOnto("conv_c", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 - 2 });

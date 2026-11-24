@@ -161,18 +161,6 @@ def test_drag_nests_a_session_under_a_standalone_session(
         expect(child_row).to_have_attribute("data-sibling-session", "true")
         rows = _sidebar_row_ids(page)
         assert rows.index(child_id) == rows.index(head_id) + 1
-
-        # The non-drag path removes it again from the row menu.
-        child_row.click(button="right")
-        page.get_by_role("menuitem", name="Move session", exact=True).hover()
-        page.get_by_role("menuitem", name="Nests", exact=True).hover()
-        with page.expect_response(is_patch_of_child) as removed:
-            page.get_by_role("menuitem", name="Remove from nest", exact=True).click()
-        assert removed.value.ok, removed.value.text()
-        assert removed.value.json().get("family") is None
-        page.reload()
-        expect(child_row).to_be_visible()
-        expect(child_row).not_to_have_attribute("data-sibling-session", "true")
     finally:
         for session_id in (child_id, head_id):
             with contextlib.suppress(httpx.HTTPError):

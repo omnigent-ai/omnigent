@@ -3187,9 +3187,13 @@ describe("useMoveToNest", () => {
     },
   );
 
-  it.each([false, true])(
-    "shows a standalone destination leading the new nest until the move settles (rejected=%s)",
-    async (rejected) => {
+  it.each([
+    { rejected: false, listed: true },
+    { rejected: true, listed: true },
+    { rejected: true, listed: false },
+  ])(
+    "shows a standalone destination leading the new nest until the move settles (rejected=$rejected, listed=$listed)",
+    async ({ rejected, listed }) => {
       const row = conversation({ id: "moved" });
       const head = conversation({ id: "head", title: "Head" });
       const family = {
@@ -3207,7 +3211,8 @@ describe("useMoveToNest", () => {
       );
       const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
       const key = ["conversations", "", false];
-      const original = infinitePage([head, row]);
+      // An unlisted head is shown only through the open-session backfill.
+      const original = infinitePage(listed ? [head, row] : [row]);
       queryClient.setQueryData(key, original);
       // The head is the open session, so its row also lives in the backfill cache.
       const headBackfillKey = ["conversation-backfill", head.id];
@@ -3219,13 +3224,17 @@ describe("useMoveToNest", () => {
       result.current.mutate({ id: row.id, destination: head });
       await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
       expect(queryClient.getQueryData<ConversationsInfiniteData>(key)?.pages[0].data).toMatchObject(
-        [
-          { id: "head", family },
-          { id: "moved", family },
-        ],
+        listed
+          ? [
+              { id: "head", family },
+              { id: "moved", family },
+            ]
+          : [{ id: "moved", family }],
       );
       expect(withMoveTombstone(head)).toMatchObject({ family });
       expect(queryClient.getQueryData(headBackfillKey)).toMatchObject({ family });
+      // A streamed frame for the open head re-applies its tombstone before the PATCH answers.
+      queryClient.setQueryData(headBackfillKey, withMoveTombstone({ ...head, updated_at: 200 }));
       respond(
         rejected
           ? mockResponse(

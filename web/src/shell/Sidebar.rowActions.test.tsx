@@ -1146,7 +1146,11 @@ describe("two-step move menu", () => {
     ]);
     const view = renderSidebar(
       undefined,
-      serverInfo({ sibling_sessions: true, session_nest_moves: true }),
+      serverInfo({
+        sibling_sessions: true,
+        session_nest_moves: true,
+        session_nest_standalone_destinations: true,
+      }),
     );
     const open = async (item: HTMLElement) => {
       if (mobile) fireEvent.click(item);
@@ -1196,6 +1200,8 @@ describe("two-step move menu", () => {
     fireEvent.click(remoteItem);
     expect(mocks.moveToNest.mutate).toHaveBeenCalledWith({ id: CONV.id, destination: remote });
     view.unmount();
+    // A server without standalone destinations still offers existing nests.
+    mocks.searchRows = [];
     renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
     fireEvent.pointerDown(
       within(
@@ -1205,6 +1211,8 @@ describe("two-step move menu", () => {
     );
     await open(screen.getByTestId("move-to-project"));
     await open(await screen.findByRole("menuitem", { name: "Nests" }));
+    expect(await screen.findByRole("menuitem", { name: "Destination nest" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Standalone session" })).toBeNull();
     fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from nest" }));
     expect(mocks.moveToNest.mutate).toHaveBeenLastCalledWith({ id: CONV.id, destination: null });
   });
