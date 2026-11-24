@@ -50,8 +50,8 @@ import {
   HARNESS_PLUGIN_ENTRIES,
   HARNESS_SKILL_ENTRIES,
   HARNESSES_GRID_ENTRY,
+  harnessInventoryPage,
   isInventoryPageHarness,
-  isSkillPageHarness,
   MCP_SERVER_LIST_ENTRIES,
   NATIVE_HARNESS_IDS,
   type NativeHarnessId,
@@ -108,9 +108,12 @@ const ARCHIVED_IN_PROJECT = {
 };
 const page = (data: unknown[]) => ({ data, has_more: false, last_id: null });
 const STARTUP = { resolved_path: "/usr/local/bin/agent", command_source: "default", arg_count: 0 };
-/** A harness's detail page asks the host for its startup command, MCP servers, plugins and skills. */
-const harnessDetailRoutes = (harness: string, command: string): SettingsRoute[] => [
-  { url: `/v1/hosts/host_1/harnesses/${harness}/startup`, body: { ...STARTUP, command } },
+/** A harness's startup command and skills use its native ID on the wire. */
+const harnessDetailRoutes = (harness: NativeHarnessId): SettingsRoute[] => [
+  {
+    url: `/v1/hosts/host_1/harnesses/${harness}/startup`,
+    body: { ...STARTUP, command: harness.replace(/-native$/, "") },
+  },
   {
     url: `/v1/skills?host_id=host_1&harness=${harness}&path=%7E`,
     body: { skills: [], warnings: [] },
@@ -254,9 +257,7 @@ const ROUTES: readonly SettingsRoute[] = [
     },
   },
   { url: "/v1/hosts/host_1/plugins", body: { plugins: [] } },
-  ...NATIVE_HARNESS_IDS.flatMap((harness) =>
-    harnessDetailRoutes(harness, harness.replace(/-native$/, "")),
-  ),
+  ...NATIVE_HARNESS_IDS.flatMap(harnessDetailRoutes),
   {
     url: "/v1/sessions?order=desc&sort_by=updated_at&limit=100&visibility=archived&include_archived=true",
     body: ARCHIVED_PAGE,
@@ -490,10 +491,10 @@ function integrationScenario({
 }
 
 /** A harness's plugin and skill pages' rows, where it has those pages. */
-const nestedPageIds = (harness: NativeHarnessId) => [
-  ...(isInventoryPageHarness(harness) ? [HARNESS_PLUGIN_ENTRIES.entry(harness).id] : []),
-  ...(isSkillPageHarness(harness) ? [HARNESS_SKILL_ENTRIES.entry(harness).id] : []),
-];
+function nestedPageIds(harness: NativeHarnessId) {
+  const page = harnessInventoryPage(harness);
+  return [page?.plugin, page?.skill].flatMap((entry) => (entry ? [entry.id] : []));
+}
 /** A harness page's rows: its own, its credential card's, its MCP list's and its nested pages'. */
 const pageRowIds = (harness: NativeHarnessId) => [
   HARNESS_DETAIL_ENTRIES.entry(harness).id,
@@ -501,6 +502,11 @@ const pageRowIds = (harness: NativeHarnessId) => [
   ...(isInventoryPageHarness(harness) ? [MCP_SERVER_LIST_ENTRIES.entry(harness).id] : []),
   ...nestedPageIds(harness),
 ];
+
+const OMP_PAGE = "/settings/harnesses/omp-native";
+const OMP_DETAIL = HARNESS_DETAIL_ENTRIES.entry("omp-native").id;
+const OMP_CREDENTIAL = HARNESS_CREDENTIAL_ENTRIES.entry("omp-native").id;
+const OMP_MCP_LIST = MCP_SERVER_LIST_ENTRIES.entry("omp-native").id;
 const ON_OTHER_PAGE = "It's on another harness's page.";
 const NESTED_PAGE_CLOSED = "Its page opens only from its row, and none is open.";
 const ON_GRID = "It's on the Harnesses grid.";
@@ -589,6 +595,30 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
   ...NATIVE_HARNESS_IDS.filter((harness) => !isInventoryPageHarness(harness)).map(
     harnessPageScenario,
   ),
+  {
+    ...harnessPageScenario("omp-native"),
+    scenario: "web › OMP MCP servers tab",
+    routes: [
+      hostsRoute([harnessHost({ configured_harnesses: { "omp-native": true } })]),
+      {
+        url: "/v1/hosts/host_1/mcp-servers",
+        body: {
+          mcp_servers: [{ name: "omp-docs", harness: "omp", transport: "stdio", scope: "user" }],
+        },
+      },
+    ],
+    ready: ["omp-docs"],
+    hides: { ...onHarnessPage("omp-native"), [OMP_CREDENTIAL]: "It's on the Settings tab." },
+    states: { [OMP_DETAIL]: ["lists its inventory"] },
+  },
+  {
+    ...harnessPageScenario("omp-native"),
+    scenario: "web › OMP Settings tab",
+    path: `${OMP_PAGE}?host=host_1&tab=settings`,
+    ready: [{ row: OMP_CREDENTIAL }, "Startup configuration"],
+    hides: { ...onHarnessPage("omp-native"), [OMP_MCP_LIST]: "It's on the MCP servers tab." },
+    states: { [OMP_DETAIL]: ["lists its inventory"] },
+  },
   { section: "custom-agents", scenario: "web", ready: ["my-reviewer"] },
   {
     section: "custom-agents",
@@ -1314,8 +1344,8 @@ const ALL_AUDITS: ScenarioAudits = {
 };
 
 /**
- * What this audit leaves out, and why. A section or entry here is neither audited nor checked
- * for coverage; putting one back is a deliberate change to this list.
+ * What this audit leaves out, and why. These entries aren't checked for coverage; putting one
+ * back is a deliberate change to this list.
  */
 const LEFT_OUT_SECTIONS: Partial<Record<SettingsSectionId, string>> = {
   sharing:
@@ -1365,10 +1395,13 @@ const LEFT_OUT_ENTRIES: Readonly<Record<string, string>> = {
   "admin-view": ADMIN_VIEW_NOT_LOADED,
   "project-kanban-board": PROJECT_KANBAN_OFF,
   "proactive-agent": PROACTIVE_AGENT_OFF,
-  // A page with tabs keeps its tab list above its rows, and its MCP list and Credential card in
-  // tabs, so none of its rows is audited yet.
+  // The other inventory pages aren't audited yet: their MCP list and credential card live in
+  // different tabs. OMP's MCP list is audited through its tab, not as a standalone row.
+  [OMP_MCP_LIST]: "Its MCP servers tab stands in for the list's row.",
   ...Object.fromEntries(
-    NATIVE_HARNESS_IDS.filter(isInventoryPageHarness)
+    NATIVE_HARNESS_IDS.filter(
+      (harness) => harness !== "omp-native" && isInventoryPageHarness(harness),
+    )
       .flatMap(pageRowIds)
       .map((id) => [id, "Its tab list sits above its rows, so its page isn't audited yet."]),
   ),
@@ -1385,7 +1418,7 @@ describe("every Settings section, rendered by the real page", () => {
     expect(own.problems).toEqual([]);
   }, 120_000);
 
-  it("answers to the catalog on the Harnesses grid and on the pages without tabs", async () => {
+  it("answers to the catalog on the Harnesses grid and audited detail pages", async () => {
     const own = { ...ALL_AUDITS, problems: [] as string[] };
     await auditScenarios(
       SCENARIOS.filter((scenario) => scenario.section === "harnesses"),

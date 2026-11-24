@@ -872,7 +872,7 @@ def _write_databricks_provider(config_home) -> None:
         yaml.safe_dump({"providers": {"databricks": {"kind": "databricks", "profile": "myws"}}}, f)
 
 
-def test_remove_databricks_cleans_ucode_wiring_without_asking(
+def test_remove_databricks_cleans_gateway_wiring_without_asking(
     harness_input, isolated_config
 ) -> None:
     """Remove on a databricks provider strips ucode's wiring as part of removal.
@@ -952,7 +952,7 @@ def test_remove_databricks_gemini_preserves_other_harness_wiring(
     assert wiring.read_text() == 'model_provider = "ucode-databricks"\n'
 
 
-def test_remove_databricks_without_ucode_wiring_still_removes(
+def test_remove_databricks_without_gateway_wiring_still_removes(
     harness_input, isolated_config
 ) -> None:
     """Remove works when no ucode wiring exists on the machine.
@@ -1453,25 +1453,28 @@ def _databricks_add_menu_index() -> int:
     return next(i for i, o in enumerate(opts) if o.kind == DATABRICKS_KIND) + 1
 
 
+@pytest.mark.parametrize(
+    ("harness", "family", "workspace_input", "configured_agent"),
+    [
+        ("Claude", ANTHROPIC_FAMILY, "workspace.example/", "claude"),
+        ("OMP", "omp", "workspace.example/browse", None),
+    ],
+)
 def test_configure_harnesses_add_databricks_normalizes_url_and_persists(
-    databricks_sdk_present, harness_input, isolated_config, monkeypatch
+    databricks_sdk_present,
+    harness_input,
+    isolated_config,
+    monkeypatch,
+    harness,
+    family,
+    workspace_input,
+    configured_agent,
 ) -> None:
-    """The Databricks add branch normalizes the workspace URL, logs in + runs
-    ucode against that same URL, and persists a default ``databricks`` provider.
+    """Normalize and sign into the workspace; only configure tools that need it."""
+    from omnigent.onboarding.provider_config import default_provider_for_harness
 
-    Drives the real ``_configure_harness_add`` databricks branch through the CLI
-    (numbered fallback), stubbing only the two boundary helpers that shell out
-    (``login_databricks_workspace`` → returns a profile; ``configure_ucode_for_workspace``)
-    and ``ucode_workspace_exists`` (→ True). Asserts the user-entered
-    ``"example.cloud.databricks.com/"`` (no scheme, trailing slash) is normalized to
-    ``"https://example.cloud.databricks.com"`` for BOTH the login and the ucode call,
-    and that ``providers.databricks`` is written as the default. Added under the
-    Claude harness, so ucode is scoped to ``--agents claude`` (NOT codex/pi) and
-    the provider defaults only the Claude (anthropic) family. A regression in URL
-    handling, the per-harness scoping, or persistence surfaces here.
-    """
     login_calls: list[str] = []
-    ucode_calls: list[tuple[str, list[str] | None]] = []
+    configure_calls: list[tuple[str, list[str] | None]] = []
     exists_calls: list[str] = []
 
     def _fake_login(url: str, *, console: object | None = None) -> str:
@@ -1479,7 +1482,7 @@ def test_configure_harnesses_add_databricks_normalizes_url_and_persists(
         return "my-ws"
 
     def _fake_configure_ucode(url: str, *, agents: list[str] | None = None) -> None:
-        ucode_calls.append((url, agents))
+        configure_calls.append((url, agents))
 
     def _fake_exists(url: str) -> bool:
         exists_calls.append(url)
@@ -1493,37 +1496,36 @@ def test_configure_harnesses_add_databricks_normalizes_url_and_persists(
     )
     monkeypatch.setattr("omnigent.onboarding.ucode_setup.ucode_workspace_exists", _fake_exists)
 
-    db = _databricks_add_menu_index()
-    # L1 Claude → L2 1=+Add → add menu <db>=Databricks → workspace URL (no
-    # scheme + trailing slash, to exercise normalization) → L2 q=back → L1 q=exit.
-    stdin = harness_input("Claude", "1", str(db), "example.cloud.databricks.com/", "q", "q")
+    db = next(
+        i
+        for i, option in enumerate(add_menu_options_for_family(family), start=1)
+        if option.kind == "databricks"
+    )
+    stdin = harness_input(harness, "1", str(db), workspace_input, "q", "q")
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
-    normalized = "https://example.cloud.databricks.com"
-    # Login + ucode each ran exactly once, against the normalized URL — if the
-    # branch dropped the scheme-prefixing or trailing-slash strip, these fail.
+    normalized = "https://workspace.example"
     assert login_calls == [normalized]
-    assert exists_calls == [normalized]
-    # ucode is scoped to the drilled-in harness only: added under Claude →
-    # `--agents claude`, NOT the legacy claude,codex,pi. A regression to the
-    # hardcoded agent set (configuring/installing harnesses the user didn't
-    # pick) changes this and fails here.
-    assert ucode_calls == [(normalized, ["claude"])]
+    if configured_agent is None:
+        assert not exists_calls
+        assert not configure_calls
+    else:
+        assert exists_calls == [normalized]
+        assert configure_calls == [(normalized, [configured_agent])]
 
     cfg = _config_yaml(isolated_config)
-    # Persisted as a kind=databricks provider keyed on the returned profile, and
-    # made the default for ONLY the Claude (anthropic) family it was added under
-    # — `default: "anthropic"`, not `True` (which would claim both families).
+    # Persist the returned workspace profile and default only the selected harness.
     assert cfg["providers"]["databricks"] == {
         "kind": "databricks",
         "profile": "my-ws",
-        "default": "anthropic",
+        "default": family,
     }
-    assert get_default_provider(cfg, "anthropic").name == "databricks"
-    # Codex was NOT configured in ucode, so it must NOT be defaulted to
-    # Databricks (that would route Codex through a workspace ucode never set up
-    # for it). It stays unset here — add Databricks under Codex to wire it.
+    assert get_default_provider(cfg, family).name == "databricks"
+    if family == "omp":
+        assert default_provider_for_harness(cfg, "omp").name == "databricks"
+        assert default_provider_for_harness(cfg, "pi") is None
+        assert get_default_provider(cfg, ANTHROPIC_FAMILY) is None
     assert get_default_provider(cfg, "openai") is None
 
 
@@ -1551,7 +1553,7 @@ def test_configure_harnesses_add_databricks_fails_loud_when_ucode_records_no_sta
     )
 
     db = _databricks_add_menu_index()
-    stdin = harness_input("Claude", "1", str(db), "https://example.cloud.databricks.com", "q", "q")
+    stdin = harness_input("Claude", "1", str(db), "https://workspace.example", "q", "q")
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     # The branch raised ClickException → non-zero exit with an explanatory message.
@@ -1575,14 +1577,14 @@ def test_configure_harnesses_add_databricks_under_codex_scopes_to_codex(
     from omnigent.onboarding.configure_models import add_menu_options_for_family
     from omnigent.onboarding.provider_config import DATABRICKS_KIND, OPENAI_FAMILY
 
-    ucode_calls: list[tuple[str, list[str] | None]] = []
+    configure_calls: list[tuple[str, list[str] | None]] = []
     monkeypatch.setattr(
         "omnigent.onboarding.setup.login_databricks_workspace",
         lambda url, *, console=None: "my-ws",
     )
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_setup.configure_ucode_for_workspace",
-        lambda url, *, agents=None: ucode_calls.append((url, agents)),
+        lambda url, *, agents=None: configure_calls.append((url, agents)),
     )
     monkeypatch.setattr("omnigent.onboarding.ucode_setup.ucode_workspace_exists", lambda url: True)
 
@@ -1590,11 +1592,11 @@ def test_configure_harnesses_add_databricks_under_codex_scopes_to_codex(
     codex_opts = add_menu_options_for_family(OPENAI_FAMILY)
     db = next(i for i, o in enumerate(codex_opts) if o.kind == DATABRICKS_KIND) + 1
     # L1 Codex → L2 1=+Add → add menu <db>=Databricks → URL → q → q.
-    stdin = harness_input("Codex", "1", str(db), "https://example.cloud.databricks.com", "q", "q")
+    stdin = harness_input("Codex", "1", str(db), "https://workspace.example", "q", "q")
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
-    assert ucode_calls == [("https://example.cloud.databricks.com", ["codex"])]
+    assert configure_calls == [("https://workspace.example", ["codex"])]
     cfg = _config_yaml(isolated_config)
     assert get_default_provider(cfg, "openai").name == "databricks"
     assert get_default_provider(cfg, "anthropic") is None
@@ -2002,9 +2004,7 @@ def test_missing_cursor_cli_drillin_shows_install_and_login(
         lambda key: key != "cursor",
     )
 
-    result = CliRunner().invoke(
-        cli, ["setup", "--no-internal-beta"], input=harness_input("Cursor", "1", "q", "q")
-    )
+    result = CliRunner().invoke(cli, ["setup"], input=harness_input("Cursor", "1", "q", "q"))
 
     assert result.exit_code == 0, result.output
     assert "curl https://cursor.com/install -fsS | bash" in result.output
@@ -2363,7 +2363,7 @@ def test_omp_original_auth_runs_login_before_persisting(
     )
     result = CliRunner().invoke(
         cli,
-        ["setup", "--no-internal-beta"],
+        ["setup"],
         input=harness_input("OMP", "1", str(original_auth), "q", "q"),
     )
     assert result.exit_code == 0, result.output
@@ -2399,7 +2399,7 @@ def test_omp_add_key_stores_secret_without_changing_pi_original_auth(
     )
     result = CliRunner().invoke(
         cli,
-        ["setup", "--no-internal-beta"],
+        ["setup"],
         input=harness_input("OMP", "1", str(key_option), "omp-secret-key", "", "q", "q"),
     )
     assert result.exit_code == 0, result.output
@@ -2413,44 +2413,6 @@ def test_omp_add_key_stores_secret_without_changing_pi_original_auth(
     assert secrets.load_secret("openai") == "omp-secret-key"
     assert "omp-secret-key" not in (isolated_config / "config.yaml").read_text()
     assert "omp-secret-key" not in result.output
-
-
-def test_omp_add_databricks_defaults_only_omp_without_configuring_other_clis(
-    harness_input, isolated_config, monkeypatch, databricks_sdk_present
-) -> None:
-    from omnigent.onboarding.provider_config import default_provider_for_harness
-
-    login = Mock(return_value="omp-workspace")
-    ucode = Mock(side_effect=AssertionError("OMP must not configure another CLI"))
-    exists = Mock(side_effect=AssertionError("OMP does not depend on ucode state"))
-    monkeypatch.setattr("omnigent.onboarding.setup.login_databricks_workspace", login)
-    monkeypatch.setattr("omnigent.onboarding.ucode_setup.configure_ucode_for_workspace", ucode)
-    monkeypatch.setattr("omnigent.onboarding.ucode_setup.ucode_workspace_exists", exists)
-    db = next(
-        i
-        for i, option in enumerate(add_menu_options_for_family("omp"), start=1)
-        if option.kind == "databricks"
-    )
-    result = CliRunner().invoke(
-        cli,
-        ["setup", "--no-internal-beta"],
-        input=harness_input("OMP", "1", str(db), "workspace.example/browse", "q", "q"),
-    )
-    assert result.exit_code == 0, result.output
-    assert login.call_args.args == ("https://workspace.example",)
-    assert login.call_count == 1
-    ucode.assert_not_called()
-    exists.assert_not_called()
-    config = _config_yaml(isolated_config)
-    assert config["providers"]["databricks"] == {
-        "kind": "databricks",
-        "profile": "omp-workspace",
-        "default": "omp",
-    }
-    assert default_provider_for_harness(config, "omp").name == "databricks"
-    assert default_provider_for_harness(config, "pi") is None
-    assert get_default_provider(config, OPENAI_FAMILY) is None
-    assert get_default_provider(config, ANTHROPIC_FAMILY) is None
 
 
 def test_configure_harnesses_pi_page_excludes_subscription_rows(
@@ -2521,14 +2483,14 @@ def test_configure_harnesses_add_databricks_under_pi_scopes_to_pi(
         default_provider_for_harness,
     )
 
-    ucode_calls: list[tuple[str, list[str] | None]] = []
+    configure_calls: list[tuple[str, list[str] | None]] = []
     monkeypatch.setattr(
         "omnigent.onboarding.setup.login_databricks_workspace",
         lambda url, *, console=None: "my-ws",
     )
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_setup.configure_ucode_for_workspace",
-        lambda url, *, agents=None: ucode_calls.append((url, agents)),
+        lambda url, *, agents=None: configure_calls.append((url, agents)),
     )
     monkeypatch.setattr("omnigent.onboarding.ucode_setup.ucode_workspace_exists", lambda url: True)
 
@@ -2536,12 +2498,12 @@ def test_configure_harnesses_add_databricks_under_pi_scopes_to_pi(
     pi_opts = add_menu_options_for_family(PI_SURFACE)
     db = next(i for i, o in enumerate(pi_opts) if o.kind == DATABRICKS_KIND) + 1
     # L1 Pi → L2 1=+Add → add menu <db>=Databricks → URL → q → q.
-    stdin = harness_input("Pi", "1", str(db), "https://example.cloud.databricks.com", "q", "q")
+    stdin = harness_input("Pi", "1", str(db), "https://workspace.example", "q", "q")
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
     # ucode ran once, for the pi agent only — not the legacy claude,codex,pi.
-    assert ucode_calls == [("https://example.cloud.databricks.com", ["pi"])]
+    assert configure_calls == [("https://workspace.example", ["pi"])]
     cfg = _config_yaml(isolated_config)
     # The provider claims only the explicit pi scope it was added under.
     assert cfg["providers"]["databricks"] == {
@@ -3263,7 +3225,7 @@ def test_soft_sdk_install_prompt_abort_returns_to_overview(
 
     result = CliRunner().invoke(
         cli,
-        ["setup", "--no-internal-beta"],
+        ["setup"],
         input=harness_input(harness, *submenu, "q", "q", "q"),
     )
 
@@ -3756,9 +3718,7 @@ def test_gemini_gateway_setup_recovers_from_invalid_url(
     else:
         inputs += [""]
     inputs += ["q", "q", "q"]
-    result = CliRunner().invoke(
-        cli, ["setup", "--no-internal-beta"], input=harness_input("Antigravity", *inputs)
-    )
+    result = CliRunner().invoke(cli, ["setup"], input=harness_input("Antigravity", *inputs))
     assert result.exit_code == 0, result.output
     assert "OpenAI Responses and Chat Completions" in " ".join(result.output.split())
     assert "Databricks — profile" in result.output

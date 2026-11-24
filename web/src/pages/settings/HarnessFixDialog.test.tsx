@@ -1296,7 +1296,11 @@ describe("HarnessFixDialog", () => {
   it("offers OMP's own login alongside managed credentials without claiming a subscription", async () => {
     renderDialog({ harness: "omp-native", harnessLabel: "OMP" });
     const user = userEvent.setup();
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toBeVisible();
+    expect(
+      screen.getByRole("radio", {
+        description: "Databricks-managed credential via the Unity Gateway",
+      }),
+    ).toBeVisible();
     expect(screen.queryByRole("radio", { name: /Personal subscription/ })).toBeNull();
     expect(
       screen.getByRole("button", { name: "Use an API key or gateway URL instead" }),

@@ -102,7 +102,9 @@ from omnigent.runner.resource_registry import (
     KIMI_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
+    OMP_NATIVE_TERMINAL_ROLE,
     OPENCODE_NATIVE_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     redacted_terminal_output,
@@ -3176,7 +3178,9 @@ async def _auto_create_pi_terminal(
         session_id=session_id,
         terminal_name="omp" if harness == "omp-native" else "pi",
         session_key="main",
-        resource_role=harness,
+        resource_role=(
+            OMP_NATIVE_TERMINAL_ROLE if harness == "omp-native" else PI_NATIVE_TERMINAL_ROLE
+        ),
         parent_os_env=agent_os_env,
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(

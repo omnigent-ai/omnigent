@@ -429,11 +429,12 @@ def test_databricks_provider_uses_omp_gateway_attribution(
 ) -> None:
     from omnigent import databricks_ai_gateway
 
+    monkeypatch.setattr(databricks_ai_gateway, "DATABRICKS_TRUSTED_HOST_SUFFIXES", (".example",))
     monkeypatch.setattr(databricks_ai_gateway, "is_ug_route", lambda _: False)
     path = creds.write_omp_models_config(
         tmp_path,
         _provider(
-            base_url="https://workspace.cloud.databricks.com/ai-gateway/anthropic",
+            base_url="https://workspace.example/ai-gateway/anthropic",
             api="anthropic-messages",
             model="claude-sonnet-4-6",
         ),

@@ -860,6 +860,32 @@ describe("Harness details", () => {
     expect(mcpLookups).toEqual([]);
   });
 
+  it("lists OMP skills and MCP servers without a Plugins tab", async () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "omp-native": true } }];
+    inventory = {
+      ...INVENTORY,
+      context: {
+        ...INVENTORY.context,
+        mcps: [...INVENTORY.context.mcps, { id: "omp:wiki", name: "wiki", harness: "omp" }],
+        skills: [...INVENTORY.context.skills, { id: "omp:check", name: "check", harness: "omp" }],
+      },
+    };
+    renderHarnesses("omp-native");
+
+    expect(inventoryFamilies).toEqual(["omp"]);
+    expect(screen.queryByRole("tab", { name: /^Plugins/ })).toBeNull();
+    selectTab("Skills · 1");
+    expect(screen.getByTestId("catalog-row-check")).toBeVisible();
+    expect(screen.queryByTestId("catalog-row-review")).toBeNull();
+
+    act(() => navigateTo(settingsItemPath(MCP_SERVER_LIST_ENTRIES.entry("omp-native"))));
+    const tab = screen.getByRole("tab", { name: "MCP servers · 1" });
+    await waitFor(() => expect(tab).toHaveFocus());
+    expect(screen.getByTestId("catalog-row-wiki")).toBeVisible();
+    expect(screen.queryByTestId("catalog-row-github")).toBeNull();
+    expect(mcpLookups).toEqual([]);
+  });
+
   it("lists Pi's skills without opening their contents", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": true } }];
     inventory = {
