@@ -13,6 +13,7 @@ from contextlib import suppress
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -996,6 +997,72 @@ def test_a_failed_panel_read_is_read_again_on_refresh(
     assert read()["warnings"] == ["Could not load this pull request. Refresh to retry."]
     assert read()["pr"]["title"] == "Recovered"
     assert len(views) == 2
+
+
+def _forge(state: dict[str, str]) -> object:
+    """A ``gh`` stub whose PR views report ``state["value"]``, as the forge holds it now."""
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        return 0, json.dumps({"number": 42, "title": "Selected", "state": state["value"]}), ""
+
+    return gh
+
+
+async def test_a_panel_merge_shows_on_the_next_panel_read(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The panel refetches after its own merge; that read must show the merge."""
+    forge = {"value": "OPEN"}
+    monkeypatch.setattr(github, "_gh", _forge(forge))
+    monkeypatch.setattr(github, "_run_pr_merge", lambda *_a, **_kw: forge.update(value="MERGED"))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/session/resources/github"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        before = await client.get(path, params={"pr_url": B})
+        merged = await client.post(
+            f"{path}/merge",
+            json={"pr_url": B, "merge_method": "squash", "expected_head": "a" * 40},
+        )
+        after = await client.get(path, params={"pr_url": B})
+    assert before.json()["pr"]["state"] == "OPEN"
+    assert merged.status_code == 200, merged.text
+    assert after.json()["pr"]["state"] == "MERGED"
+
+
+async def test_panel_reads_answer_for_their_own_session_and_selected_pr(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sessions sharing a workspace, and PRs within one session, never answer for each other."""
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        repository = args[args.index("-R") + 1] if "-R" in args else "workspace"
+        return 0, json.dumps({"number": 42, "title": repository.rsplit("/", 1)[-1]}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    other = "https://github.com/example/three/pull/42"
+    SessionPrRegistry("other").record(
+        [PullRequestRef.from_url(other)], relationship="created", source="test"
+    )
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        reads = [
+            await client.get(f"/v1/sessions/{session}/resources/github", params={"pr_url": url})
+            for session, url in [("session", A), ("session", B), ("other", other), ("session", A)]
+        ]
+    assert [read.status_code for read in reads] == [200] * 4
+    assert [read.json()["pr"]["title"] for read in reads] == ["one", "two", "three", "one"]
+    assert {pr["url"] for pr in reads[2].json()["prs"]} == {other}
+    assert {pr["url"] for pr in reads[3].json()["prs"]} == {A, B}
 
 
 async def test_pr_panel_reads_answer_while_changed_file_listings_hold_the_slow_pool(
