@@ -373,6 +373,13 @@ def test_summary_reports_ticket_creation_for_new_ticket_badges(board, monkeypatc
     assert (
         tickets.summary(project.id, user_id="alice", created_after=300)["created_after_count"] == 0
     )
+    assert tickets.summary(
+        project.id, user_id="alice", created_after=100, include_responses=False
+    ) == {"latest_created_at": 300, "created_after_count": 2}
+    empty = projects.create(uuid4().hex, "Empty", "alice")
+    assert tickets.summary(empty.id, user_id="alice", include_responses=False) == {
+        "latest_created_at": None
+    }
 
 
 def test_activity_sessions_are_scoped_bounded_indexed_reads(board, db_uri, monkeypatch):

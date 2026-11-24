@@ -175,9 +175,17 @@ export function getTicket(projectId: string, ticketId: string) {
   return request<ProjectTicket>(path(projectId, ticketId)).then(normalizeTicket);
 }
 
-export function getTicketSummary(projectId: string, createdAfter?: number) {
-  const query = createdAfter === undefined ? "" : `?created_after=${createdAfter}`;
-  return request<TicketSummary>(`${path(projectId)}/summary${query}`);
+export function getTicketSummary(projectId: string) {
+  return request<TicketSummary>(`${path(projectId)}/summary`);
+}
+
+/** Ticket creation for new-ticket badges, skipping the human-request scan. */
+export function getTicketCreationSummary(projectId: string, createdAfter?: number) {
+  const query = new URLSearchParams({ responses: "false" });
+  if (createdAfter !== undefined) query.set("created_after", String(createdAfter));
+  return request<Pick<TicketSummary, "latest_created_at" | "created_after_count">>(
+    `${path(projectId)}/summary?${query}`,
+  );
 }
 
 function normalizeTicket(ticket: ProjectTicket & { status?: string }): ProjectTicket {

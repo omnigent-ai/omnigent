@@ -731,10 +731,15 @@ def create_project_tickets_router(
         request: Request,
         project_id: str,
         created_after: int | None = Query(None, ge=0),
+        responses: bool = Query(True, description="False omits the human-request counts."),
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
         return await asyncio.to_thread(
-            store.summary, project_id, user_id=who.user_id, created_after=created_after
+            store.summary,
+            project_id,
+            user_id=who.user_id,
+            created_after=created_after,
+            include_responses=responses,
         )
 
     @router.get("/cost")

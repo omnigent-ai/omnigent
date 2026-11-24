@@ -1,7 +1,7 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { getTicketSummary } from "@/lib/projectTicketsApi";
+import { getTicketCreationSummary } from "@/lib/projectTicketsApi";
 
 // Per-device marker of the newest ticket creation time (epoch seconds) the
 // viewer has seen on each project's board, keyed by project id.
@@ -76,7 +76,7 @@ export function useNewTicketCount(projectId: string | null, enabled = true): num
   const seen = useProjectTicketsSeen(projectId);
   const query = useQuery({
     queryKey: ["project-tickets", projectId, "summary", "created-after", seen ?? null],
-    queryFn: () => getTicketSummary(projectId!, seen),
+    queryFn: () => getTicketCreationSummary(projectId!, seen),
     enabled: projectId !== null && supported && enabled,
     refetchInterval: SIDEBAR_POLL_MS,
   });
@@ -95,8 +95,8 @@ export function useNewTicketCount(projectId: string | null, enabled = true): num
 export function useMarkProjectTicketsSeen(projectId: string | null, active: boolean): void {
   const supported = useSummarySupported();
   const query = useQuery({
-    queryKey: ["project-tickets", projectId, "summary"],
-    queryFn: () => getTicketSummary(projectId!),
+    queryKey: ["project-tickets", projectId, "summary", "created-after", "board"],
+    queryFn: () => getTicketCreationSummary(projectId!),
     enabled: projectId !== null && supported && active,
     refetchInterval: BOARD_POLL_MS,
   });

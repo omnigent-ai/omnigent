@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
-import { getTicketSummary } from "@/lib/projectTicketsApi";
+import { getTicketCreationSummary } from "@/lib/projectTicketsApi";
 import {
   markProjectTicketsSeen,
   readProjectTicketsSeen,
@@ -13,9 +13,9 @@ import {
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ project_ticket_summary: true }),
 }));
-vi.mock("@/lib/projectTicketsApi", () => ({ getTicketSummary: vi.fn() }));
+vi.mock("@/lib/projectTicketsApi", () => ({ getTicketCreationSummary: vi.fn() }));
 
-const summary = vi.mocked(getTicketSummary);
+const summary = vi.mocked(getTicketCreationSummary);
 
 function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -28,7 +28,7 @@ beforeEach(() => {
 });
 
 it("treats existing tickets as seen the first time a project is listed", async () => {
-  summary.mockResolvedValue({ needs_response_count: 0, is_complete: true, latest_created_at: 500 });
+  summary.mockResolvedValue({ latest_created_at: 500 });
   const { result } = renderHook(() => useNewTicketCount("p1"), { wrapper });
   await waitFor(() => expect(readProjectTicketsSeen("p1")).toBe(500));
   expect(result.current).toBe(0);
@@ -38,8 +38,6 @@ it("treats existing tickets as seen the first time a project is listed", async (
 it("counts tickets created after the seen marker until the board is opened", async () => {
   markProjectTicketsSeen("p1", 500);
   summary.mockImplementation(async (_projectId, createdAfter) => ({
-    needs_response_count: 0,
-    is_complete: true,
     latest_created_at: 700,
     ...(createdAfter === undefined ? {} : { created_after_count: createdAfter < 700 ? 2 : 0 }),
   }));
@@ -56,7 +54,7 @@ it("never moves the marker backwards and ignores servers without the field", asy
   markProjectTicketsSeen("p1", 900);
   markProjectTicketsSeen("p1", 100);
   expect(readProjectTicketsSeen("p1")).toBe(900);
-  summary.mockResolvedValue({ needs_response_count: 0, is_complete: true });
+  summary.mockResolvedValue({});
   const { result } = renderHook(() => useNewTicketCount("p2"), { wrapper });
   await waitFor(() => expect(summary).toHaveBeenCalled());
   expect(result.current).toBe(0);

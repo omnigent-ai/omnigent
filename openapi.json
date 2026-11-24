@@ -23219,6 +23219,18 @@
               ],
               "title": "Created After"
             }
+          },
+          {
+            "description": "False omits the human-request counts.",
+            "in": "query",
+            "name": "responses",
+            "required": false,
+            "schema": {
+              "default": true,
+              "description": "False omits the human-request counts.",
+              "title": "Responses",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

@@ -4,6 +4,7 @@ import {
   createTicket,
   getTicket,
   getTicketSummary,
+  getTicketCreationSummary,
   getTicketStages,
   listTickets,
   setTicketSessionInvolvement,
@@ -44,9 +45,9 @@ it("reads the project-wide response summary without fetching board pages", async
 it("asks the summary to count tickets created after the viewer's seen marker", async () => {
   const fetchMock = vi.fn(async () => new Response(JSON.stringify({ created_after_count: 2 })));
   vi.stubGlobal("fetch", fetchMock);
-  expect((await getTicketSummary("p", 1700)).created_after_count).toBe(2);
+  expect((await getTicketCreationSummary("p", 1700)).created_after_count).toBe(2);
   expect(fetchMock).toHaveBeenCalledWith(
-    "/v1/projects/p/tickets/summary?created_after=1700",
+    "/v1/projects/p/tickets/summary?responses=false&created_after=1700",
     expect.objectContaining({ method: "GET" }),
   );
 });
