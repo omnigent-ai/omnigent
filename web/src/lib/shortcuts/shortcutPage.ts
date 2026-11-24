@@ -49,7 +49,7 @@ export interface ShortcutPageContext {
   desktopCommands: boolean;
 }
 
-/** Keys with the last one replaced by a range label such as "1…0". */
+/** Keys with the last one replaced by a range label such as "1…9". */
 function withRangeLabel(keys: string[], range: string): string[] {
   return [...keys.slice(0, -1), range];
 }
@@ -151,7 +151,7 @@ export function shortcutPageGroups(
         ]),
         {
           label: shortcutBinding("session.number").label,
-          keys: withRangeLabel(shortcutKeys("session.number", environment), "1…0"),
+          keys: withRangeLabel(shortcutKeys("session.number", environment), "1…9"),
         },
       ],
     },

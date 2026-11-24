@@ -1,8 +1,8 @@
 """Desktop-only pinned-session hotkeys: Cmd/Ctrl+digit jumps to a pinned row.
 
-The sidebar binds ``Cmd+1..9/0`` (``Ctrl`` on Win/Linux) to the first ten
-sessions it lists, in render order, so pinned rows take the first slots —
-1–9 to the first nine, 0 to the tenth (``useSessionNumberHotkeys``). It is
+The sidebar binds ``Cmd+1..9`` (``Ctrl`` on Win/Linux) to the first nine
+sessions it lists, in render order, so pinned rows take the first slots;
+``Cmd+0`` stays the app's Actual Size (``useSessionNumberHotkeys``). It is
 **desktop-only**: a browser tab reserves ``Cmd/Ctrl+digit`` for native
 tab-switching, so the hook is inert outside the Electron shell (gated on ``isNativeShell()`` ->
 ``window.omnigentDesktop.kind === "electron"`` — see

@@ -51,8 +51,8 @@ interface ShortcutBindingDefinition {
   chords: (environment: ShortcutEnvironment) => Chord[];
 }
 
-/** Sidebar slots in order: ⌘1–⌘9 pick the first nine and ⌘0 the tenth, as browser tabs do. */
-export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
+/** Sidebar slots in order: ⌘1–⌘9 pick the first nine. ⌘0 stays the app's Actual Size. */
+export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 
 /** Workspace rail tabs ⌃1–⌃9, by position. */
 const WORKSPACE_TAB_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
@@ -112,7 +112,7 @@ const BINDINGS = {
     ],
   },
   "session.number": {
-    label: "Jump to a sidebar session (1–10)",
+    label: "Jump to a sidebar session (1–9)",
     // A browser keeps ⌘-digit for its tabs, so there Alt joins it, matched by the
     // physical key because Alt rewrites the digit on macOS.
     chords: (environment) =>

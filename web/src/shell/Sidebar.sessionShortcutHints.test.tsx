@@ -145,13 +145,14 @@ describe("Sidebar numbered-row shortcut hints", () => {
     expect(hintKeys(rowOf(renderedRowIds()[3]!))).toEqual([MOD_KEY, "4"]);
   });
 
-  it("labels the tenth row 0 and gives no hint past it", async () => {
+  it("labels the ninth row 9 and gives no hint past it", async () => {
     mocks.pinned = pinnedFixtures(ELEVEN_PINNED_IDS);
     renderSidebar();
 
     pressCommand();
-    await waitForHints(10);
-    expect(hintKeys(rowOf("conv_10"))).toEqual([MOD_KEY, ALT_KEY, "0"]);
+    await waitForHints(9);
+    expect(hintKeys(rowOf("conv_9"))).toEqual([MOD_KEY, ALT_KEY, "9"]);
+    expect(rowOf("conv_10").querySelector("[data-session-shortcut-hint]")).toBeNull();
     expect(rowOf("conv_11").querySelector("[data-session-shortcut-hint]")).toBeNull();
     expect(rowOf("conv_x").querySelector("[data-session-shortcut-hint]")).toBeNull();
   });
