@@ -76,6 +76,8 @@ def _read_request_config(descriptor: int) -> _RequestConfig:
 def _protect_init() -> None:
     if not sys.platform.startswith("linux") or os.getpid() != 1:
         raise OSError("Request init requires its own Linux PID namespace")
+    # Keep PID1's default protection without inheriting SIG_IGN into the command.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
     library = ctypes.CDLL(None, use_errno=True)
     prctl = library.prctl
     prctl.argtypes = [ctypes.c_int, *([ctypes.c_ulong] * 4)]

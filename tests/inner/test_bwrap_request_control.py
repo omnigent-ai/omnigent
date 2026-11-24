@@ -8,6 +8,8 @@ import select
 import socket
 import subprocess
 import sys
+import threading
+from concurrent.futures import Future
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -180,30 +182,67 @@ def request_case(monkeypatch: pytest.MonkeyPatch) -> _RequestCase:
     return _RequestCase(owner, control, process, exited, events)
 
 
-def test_outer_exit_and_output_cannot_substitute_for_init_completion(
-    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase
+@pytest.mark.parametrize("last_gate", ["init", "launcher", "output"])
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_completion_waits_for_each_pinned_lifetime_and_output(
+    monkeypatch: pytest.MonkeyPatch,
+    request_case: _RequestCase,
+    last_gate: str,
+    timed_out: bool,
 ) -> None:
     case = request_case
+    clock = iter([0.0])
+    monkeypatch.setattr(
+        request_control, "monotonic", lambda: next(clock, 2.0 if timed_out else 0.0)
+    )
+    kills: list[int] = []
+    monkeypatch.setattr(request_control, "_kill_pinned", kills.append)
+    last_descriptor = {"init": _INIT_FD, "launcher": _LAUNCHER_FD}.get(last_gate)
+    waited: list[int] = []
+    output_calls = 0
+    output_collected = False
+
+    def assert_still_owned() -> None:
+        assert not case.owner.done.is_set()
+        assert not any(event[0] == "close" for event in case.events)
+        case.control.close.assert_not_called()
 
     def communicate(**_kwargs: object) -> tuple[bytes, bytes]:
-        case.exited[_LAUNCHER_FD] = True
+        nonlocal output_calls, output_collected
+        output_calls += 1
+        if output_calls == 1:
+            if timed_out:
+                assert set(kills) == {_INIT_FD, _LAUNCHER_FD}
+            case.exited.update(
+                {descriptor: descriptor != last_descriptor for descriptor in case.exited}
+            )
+            assert_still_owned()
+            if last_gate == "output":
+                raise subprocess.TimeoutExpired("request-launcher", 0.05)
+        if not output_collected:
+            assert_still_owned()
+            output_collected = True
         return b"exact stdout\n", b"exact stderr\n"
 
     def exited(descriptor: int, timeout_ms: int = 0) -> bool:
-        if descriptor == _INIT_FD and timeout_ms:
-            assert ("close", _INIT_FD) not in case.events
-            assert not case.owner.done.is_set()
-            case.events.append(("init-complete", descriptor))
-            case.exited[descriptor] = True
+        if timeout_ms and output_collected and not all(case.exited.values()):
+            if not waited:
+                waited.append(descriptor)
+                assert descriptor == last_descriptor
+                assert_still_owned()
+                assert case.exited[(_LAUNCHER_FD if descriptor == _INIT_FD else _INIT_FD)]
+            if descriptor == last_descriptor:
+                case.exited[descriptor] = True
         return case.exited[descriptor]
 
     case.process.communicate.side_effect = communicate
     monkeypatch.setattr(request_control, "_pidfd_exited", exited)
     result = case.owner.run(deadline=1.0)
     assert result == request_control.BwrapRequestResult(
-        b"exact stdout\n", b"exact stderr\n", 7, False
+        b"exact stdout\n", b"exact stderr\n", None if timed_out else 7, timed_out
     )
-    assert case.events.index(("init-complete", _INIT_FD)) < case.events.index(("close", _INIT_FD))
+    assert waited == ([] if last_descriptor is None else [last_descriptor])
+    assert set(kills) == ({_INIT_FD, _LAUNCHER_FD} if timed_out else set())
     case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
     assert case.owner.admitted and case.owner.done.is_set()
 
@@ -243,25 +282,12 @@ def test_descriptor_close_failure_cannot_make_later_cancellation_signal_a_reused
     assert case.events == events
 
 
-def test_timeout_preserves_partial_output_and_waits_for_both_pinned_lifetimes(
-    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase
-) -> None:
-    case = request_case
-    clock = iter([0.0, 2.0])
-    monkeypatch.setattr(request_control, "monotonic", lambda: next(clock))
-    result = case.owner.run(deadline=1.0)
-    assert result.timed_out and result.exit_code is None
-    assert (result.stdout, result.stderr) == (b"exact stdout\n", b"exact stderr\n")
-    assert ("kill", _INIT_FD) in case.events and ("kill", _LAUNCHER_FD) in case.events
-    assert case.owner.admitted and case.owner.done.is_set()
-    case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
-
-
-def test_output_polling_can_wait_without_replaying_or_finishing_the_request(
+def test_output_and_result_polling_can_wait_without_replaying_or_finishing_the_request(
     request_case: _RequestCase,
 ) -> None:
     case = request_case
     polls = 0
+    case.control.recv.side_effect = [BlockingIOError(), b"exit:" + _TOKEN + b":7"]
 
     def communicate(**_kwargs: object) -> tuple[bytes, bytes]:
         nonlocal polls
@@ -275,22 +301,78 @@ def test_output_polling_can_wait_without_replaying_or_finishing_the_request(
     case.process.communicate.side_effect = communicate
     result = case.owner.run(deadline=1.0)
     assert result.stdout == b"delayed stdout\n" and result.exit_code == 7
+    assert case.control.recv.call_count == 2
     case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
     assert case.owner.done.is_set() and not result.timed_out
 
 
-def test_caller_cancellation_during_output_wait_retains_cleanup_without_replay(
-    request_case: _RequestCase,
+def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay(
+    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase
 ) -> None:
     case = request_case
+    sending = threading.Event()
+    release_send = threading.Event()
+    contention = threading.Event()
+    cancelled = threading.Event()
+    lock = threading.Lock()
+
+    class ContendedLock:
+        def __enter__(self) -> None:
+            if not lock.acquire(blocking=False):
+                contention.set()
+                lock.acquire()
+
+        def __exit__(self, *_args: object) -> None:
+            lock.release()
+
+    monkeypatch.setattr(case.owner, "_lock", ContendedLock())
+
+    def send(payload: bytes) -> int:
+        sending.set()
+        assert release_send.wait(5)
+        return len(payload)
+
+    case.control.send.side_effect = send
 
     def communicate(**_kwargs: object) -> tuple[bytes, bytes]:
-        case.owner.cancel()
+        assert cancelled.wait(5)
         return b"partial stdout\n", b""
 
     case.process.communicate.side_effect = communicate
+    result: Future[request_control.BwrapRequestResult] = Future()
+
+    def run() -> None:
+        try:
+            result.set_result(case.owner.run(deadline=1.0))
+        except Exception as error:
+            result.set_exception(error)
+
+    def cancel() -> None:
+        case.owner.cancel()
+        cancelled.set()
+
+    workers: list[threading.Thread] = []
+    try:
+        worker = threading.Thread(target=run)
+        worker.start()
+        workers.append(worker)
+        assert sending.wait(5)
+        canceller = threading.Thread(target=cancel)
+        canceller.start()
+        workers.append(canceller)
+        assert contention.wait(5)
+        assert not cancelled.is_set()
+        release_send.set()
+        assert cancelled.wait(5)
+    finally:
+        release_send.set()
+        cancelled.set()
+        case.exited.update({_INIT_FD: True, _LAUNCHER_FD: True})
+        for worker in workers:
+            worker.join(timeout=5)
+    assert all(not worker.is_alive() for worker in workers)
     with pytest.raises(request_control.RequestCancelled, match="must not be replayed"):
-        case.owner.run(deadline=1.0)
+        result.result(timeout=1)
     assert case.owner.admitted and case.owner.done.is_set()
     assert ("kill", _INIT_FD) in case.events and ("kill", _LAUNCHER_FD) in case.events
     case.control.send.assert_called_once_with(b"admit:" + _TOKEN)

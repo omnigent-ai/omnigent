@@ -73,7 +73,6 @@ from pathlib import Path
 
 from ._cwd_scan import MaskedEntry, MaskKind, merge_scan_roots, scan_cwd_mask_entries
 from ._seccomp import (
-    BASELINE_DENYLIST_SYSCALLS,
     SCMP_CMP_EQ,
     SCMP_CMP_GE,
     SCMP_CMP_MASKED_EQ,
@@ -81,6 +80,7 @@ from ._seccomp import (
     SeccompRule,
     apply_baseline_denylist,
     apply_seccomp_filter,
+    baseline_denylist_rules,
     export_seccomp_filter,
     scmp_act_errno,
 )
@@ -522,11 +522,7 @@ class BwrapSandboxBackend(SandboxBackend):
                 for descriptor, file in zip(program_fds, program_files, strict=True)
             ):
                 raise ValueError("Request filters require empty, rewound regular files")
-            deny = scmp_act_errno(errno.EPERM)
-            baseline = [
-                SeccompRule(syscall=name, action=deny) for name in BASELINE_DENYLIST_SYSCALLS
-            ]
-            export_seccomp_filter(baseline, _request_fds.baseline_fd)
+            export_seccomp_filter(baseline_denylist_rules(), _request_fds.baseline_fd)
             os.lseek(_request_fds.baseline_fd, 0, os.SEEK_SET)
             export_seccomp_filter(_bwrap_extra_seccomp_rules(), _request_fds.hardening_fd)
             os.lseek(_request_fds.hardening_fd, 0, os.SEEK_SET)

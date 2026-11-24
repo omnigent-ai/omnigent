@@ -93,6 +93,51 @@ def test_init_exports_its_handle_before_admission_and_reports_the_exact_child_re
     assert launch.return_value.returncode == expected_exit
 
 
+@pytest.mark.parametrize("status", [7 << 8, signal.SIGTERM])
+def test_child_interrupt_cannot_replace_the_commands_exact_result(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    handlers: dict[int, object] = {signal.SIGINT: signal.default_int_handler}
+
+    def install_handler(signum: int, handler: object) -> object:
+        previous = handlers[signum]
+        handlers[signum] = handler
+        return previous
+
+    monkeypatch.setattr(request_init.sys, "platform", "linux")
+    monkeypatch.setattr(request_init.os, "getpid", lambda: 1)
+    library = MagicMock()
+    library.prctl.return_value = 0
+    monkeypatch.setattr(request_init.ctypes, "CDLL", lambda *_a, **_k: library)
+    monkeypatch.setattr(request_init.signal, "signal", install_handler)
+    monkeypatch.setattr(request_init.os, "pidfd_open", lambda *_: 41, raising=False)
+    monkeypatch.setattr(request_init.os, "close", MagicMock())
+    process = MagicMock(spec=subprocess.Popen)
+    process.pid = 73
+    monkeypatch.setattr(request_init.subprocess, "Popen", MagicMock(return_value=process))
+    control = MagicMock(spec=socket.socket)
+    control.sendmsg.return_value = len(b"ready:" + _TOKEN)
+    control.recv.return_value = b"admit:" + _TOKEN
+    exit_code = 7 if status == 7 << 8 else -signal.SIGTERM
+    result = b"exit:" + _TOKEN + b":" + str(exit_code).encode()
+    control.send.return_value = len(result)
+
+    def command_interrupt(*_args: object) -> tuple[int, int]:
+        handler = handlers[signal.SIGINT]
+        if callable(handler):
+            try:
+                handler(signal.SIGINT, None)
+            except KeyboardInterrupt:
+                pytest.fail("Command-originated SIGINT would interrupt init")
+        assert handler == signal.SIG_DFL, "Ignoring SIGINT would change the exec'd command"
+        return 73, status
+
+    monkeypatch.setattr(request_init.os, "waitpid", command_interrupt)
+    request_init._run_request(control, _CONFIG)
+    control.send.assert_called_once_with(result)
+    assert process.returncode == exit_code
+
+
 @pytest.mark.parametrize("failure", ["protection", "handle", "ready", "timeout"])
 def test_setup_failure_cannot_admit_a_command(
     monkeypatch: pytest.MonkeyPatch,
@@ -163,13 +208,67 @@ def test_config_preserves_exact_command_and_environment(monkeypatch: pytest.Monk
     assert result.cwd == config["cwd"] and result.env == config["env"]
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "missing",
+        "aliased",
+        "stdio",
+        "overflow",
+        "not-integer",
+        "config-failure",
+        "command-failure",
+        "success",
+    ],
+)
+def test_entry_point_rejects_invalid_descriptors_and_always_exits_its_socket_context(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    invalid = {
+        "missing": ["41"],
+        "aliased": ["41", "41"],
+        "stdio": ["0", "42"],
+        "overflow": ["41", "2147483648"],
+        "not-integer": ["invalid", "42"],
+    }
+    control = MagicMock(spec=socket.socket)
+    control.__enter__.return_value = control
+    open_control = MagicMock(return_value=control)
+    read_config = MagicMock(return_value=_CONFIG)
+    run = MagicMock()
+    if mode == "config-failure":
+        read_config.side_effect = ValueError("Invalid configuration")
+    elif mode == "command-failure":
+        run.side_effect = OSError("Request failed")
+    monkeypatch.setattr(request_init.socket, "socket", open_control)
+    monkeypatch.setattr(request_init, "_read_request_config", read_config)
+    monkeypatch.setattr(request_init, "_run_request", run)
+    assert request_init.main(invalid.get(mode, ["41", "42"])) == (0 if mode == "success" else 125)
+    if mode in invalid:
+        open_control.assert_not_called()
+        read_config.assert_not_called()
+        run.assert_not_called()
+        return
+    open_control.assert_called_once_with(fileno=41)
+    control.__enter__.assert_called_once()
+    control.__exit__.assert_called_once()
+    read_config.assert_called_once_with(42)
+    if mode == "config-failure":
+        run.assert_not_called()
+    else:
+        run.assert_called_once_with(control, _CONFIG)
+
+
 def test_init_cannot_run_outside_namespace_pid_one(monkeypatch: pytest.MonkeyPatch) -> None:
     library = MagicMock()
+    configure_signal = MagicMock()
+    monkeypatch.setattr(request_init.signal, "signal", configure_signal)
     monkeypatch.setattr(request_init.os, "getpid", lambda: 73)
     monkeypatch.setattr(request_init.ctypes, "CDLL", library)
     with pytest.raises(OSError, match="own Linux PID namespace"):
         request_init._protect_init()
     library.assert_not_called()
+    configure_signal.assert_not_called()
 
 
 @pytest.mark.parametrize("failed_option", [None, 1, 4])
@@ -177,7 +276,14 @@ def test_parent_death_and_control_protection_precede_readiness(
     monkeypatch: pytest.MonkeyPatch, failed_option: int | None
 ) -> None:
     library = MagicMock()
-    library.prctl.side_effect = lambda option, *_: -1 if option == failed_option else 0
+    configure_signal = MagicMock()
+
+    def protect(option: int, *_args: object) -> int:
+        configure_signal.assert_called_once_with(signal.SIGINT, signal.SIG_DFL)
+        return -1 if option == failed_option else 0
+
+    library.prctl.side_effect = protect
+    monkeypatch.setattr(request_init.signal, "signal", configure_signal)
     monkeypatch.setattr(request_init.sys, "platform", "linux")
     monkeypatch.setattr(request_init.os, "getpid", lambda: 1)
     monkeypatch.setattr(request_init.ctypes, "CDLL", lambda *_a, **_k: library)

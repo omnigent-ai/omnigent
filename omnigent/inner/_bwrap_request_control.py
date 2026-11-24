@@ -230,7 +230,8 @@ class BwrapRequestControl:
                 if init_exited and launcher_exited and outputs is not None:
                     break
                 if outputs is not None:
-                    _pidfd_exited(self._init_pidfd, round(_POLL_S * 1000))
+                    pending = self._launcher_pidfd if init_exited else self._init_pidfd
+                    _pidfd_exited(pending, round(_POLL_S * 1000))
             if self._stop_reason == "cancelled":
                 raise RequestCancelled("Request was cancelled; it must not be replayed")
             timed_out = self._stop_reason == "timeout"

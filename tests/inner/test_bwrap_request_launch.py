@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import tempfile
@@ -78,6 +79,11 @@ def test_request_launch_preserves_existing_mounts_and_the_exact_active_filter_ru
     )
     backend.activate(request_policy)
     assert len(active_filters) == 2
+    assert tuple(rule.syscall for rule in active_filters[0]) == _seccomp.BASELINE_DENYLIST_SYSCALLS
+    assert all(
+        rule.action == _seccomp.scmp_act_errno(errno.EPERM) and not rule.arg_filters
+        for rule in active_filters[0]
+    )
 
     mounted: list[list[str]] = []
 
