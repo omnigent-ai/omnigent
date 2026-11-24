@@ -17,10 +17,8 @@ export function sessionWindowPath(sessionId: string): string {
 }
 
 /**
- * The session this page was popped out for, or null when it isn't a session window.
- * It must carry the query and be a real pop-out (the desktop shell's, or a browser
- * popup with an opener). A copied pop-out link opened elsewhere, such as on a phone,
- * keeps its usual layout.
+ * Identify marked Electron windows and browser pop-ups with an opener.
+ * Copied links keep the usual layout.
  */
 export function startingSessionWindowId(): string | null {
   if (typeof window === "undefined") return null;

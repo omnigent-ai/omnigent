@@ -5,6 +5,7 @@
 import { toast } from "sonner";
 
 import { isNativeShell } from "./nativeBridge";
+import { isSessionWindow } from "./sessionWindow";
 
 /** Loopback ports the desktop app may listen on, tried in order. Mirrors the app's own list. */
 export const DESKTOP_OPEN_PORTS = [28417, 28418, 28419];
@@ -257,7 +258,7 @@ export async function handOffToDesktopApp(conversationId: string): Promise<void>
 
 async function decideHandOff(conversationId: string): Promise<void> {
   const preference = storedPreference();
-  if (!desktopAppHandoffSupported() || preference === false) return;
+  if (!desktopAppHandoffSupported() || isSessionWindow() || preference === false) return;
   if (flagged(() => window.sessionStorage, HANDED_OVER_KEY)) return;
   const permission = await desktopAppPermission();
   if (permission !== "granted" && permission !== "prompt") return;

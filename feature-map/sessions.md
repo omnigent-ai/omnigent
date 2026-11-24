@@ -349,7 +349,8 @@ the header menu), and each place is a separate entry point.
 sidebar row's menu or right-click menu, and choose **Open in new window**. A
 browser opens a 960×820 popup on that session; it keeps the desktop layout and
 starts with the sidebar collapsed (the sidebar toggle reopens it). A blocked
-popup shows a toast asking to allow pop-ups. The desktop app opens another app
+popup shows a toast asking to allow pop-ups. Browser pop-outs stay in the browser
+even when automatic desktop handoff is enabled. The desktop app opens another app
 window on the same server instead of the system browser; that window doesn't
 replace the main window's saved size and position. Choosing it again for a
 session that's already popped out brings its window forward. Mobile viewports,

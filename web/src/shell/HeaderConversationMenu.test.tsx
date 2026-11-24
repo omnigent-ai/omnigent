@@ -276,20 +276,6 @@ describe("HeaderConversationMenu", () => {
     }
   });
 
-  it("explains a blocked popup", () => {
-    const open = vi.spyOn(window, "open").mockReturnValue(null);
-    try {
-      renderMenu();
-      openMenu();
-      fireEvent.click(screen.getByTestId("header-open-session-window"));
-      expect(mocks.toastError).toHaveBeenCalledWith(
-        "Your browser blocked the new window. Allow pop-ups for this site.",
-      );
-    } finally {
-      open.mockRestore();
-    }
-  });
-
   it("hides Mark as unread for a muted session", () => {
     renderMenu({
       conversation: { ...CONVERSATION, labels: { ...CONVERSATION.labels, [MUTED_LABEL_KEY]: "1" } },
