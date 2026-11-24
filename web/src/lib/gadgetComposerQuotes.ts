@@ -68,6 +68,15 @@ export function useGadgetComposerQuotes(
   });
 }
 
+/**
+ * Tries the queued quotes again. The composer calls this when it becomes able to take one (a
+ * restored draft, an overlay closing), since that change needn't re-render the page that
+ * applies them.
+ */
+export function retryGadgetComposerQuotes(): void {
+  if (queue.length > 0) notify();
+}
+
 /** Clears the queue; for tests. */
 export function resetGadgetComposerQuotes(): void {
   queue = [];

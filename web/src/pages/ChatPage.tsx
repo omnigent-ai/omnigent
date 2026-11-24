@@ -293,7 +293,11 @@ import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWa
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { type GadgetComposerQuote, useGadgetComposerQuotes } from "@/lib/gadgetComposerQuotes";
+import {
+  type GadgetComposerQuote,
+  retryGadgetComposerQuotes,
+  useGadgetComposerQuotes,
+} from "@/lib/gadgetComposerQuotes";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { modelPickerKindForConv, type NativeModelPickerKind } from "@/lib/composerCapabilities";
 
@@ -3885,6 +3889,14 @@ function ComposerImpl(
   });
 
   const replyQuoteInsertedRef = useRef(false);
+  // A quote a gadget queued while this composer couldn't take one (its draft still
+  // restoring, a Quick Answer open, the host unreachable) is tried again once it can.
+  const quoteBlocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
+  const canTakeQuoteNow =
+    settledConversationId === conversationId && !composerLockedByBtw && !quoteBlocked;
+  useEffect(() => {
+    if (canTakeQuoteNow) retryGadgetComposerQuotes();
+  }, [canTakeQuoteNow]);
   useImperativeHandle(ref, () => ({
     focus() {
       if (isMobileRef.current || composerLockedByBtw) return;

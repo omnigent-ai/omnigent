@@ -8042,6 +8042,18 @@ describe("gadget quotes in the composer", () => {
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted from a gadget");
   });
 
+  it("takes a quote once a Quick Answer closes, without the page re-rendering", () => {
+    useChatStore.setState({ btwSidechat: { question: "q", answer: "a", truncated: false } });
+    render(<GadgetQuoteHarness composer={composerProps()} permissionPending={false} />);
+    act(() => queueGadgetComposerQuote("conv_test", "reply", "Quoted from a gadget"));
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+
+    // Only the composer sees the overlay close; the harness is not re-rendered by the test.
+    act(() => useChatStore.setState({ btwSidechat: null }));
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted from a gadget");
+  });
+
   it("keeps a side-chat quote while offline and opens one side chat once reachable", () => {
     const offline = composerProps({ unreachable: true });
     const view = render(<GadgetQuoteHarness composer={offline} permissionPending={false} />);
