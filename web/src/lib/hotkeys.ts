@@ -31,6 +31,19 @@ export function hasCommandModifier(
   return isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
 }
 
+/** The transcript step ⌘⌥↑/↓ (Ctrl+Alt+↑/↓ off macOS) asks for, or null for any other key. */
+export function messageStepDirection(
+  e: Pick<globalThis.KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "altKey" | "getModifierState">,
+  isMac: boolean = isMacPlatform(),
+): "previous" | "next" | null {
+  if (!hasCommandModifier(e, isMac) || !e.altKey) return null;
+  // AltGr reports as Ctrl+Alt on some layouts; its arrows aren't this chord.
+  if (e.getModifierState?.("AltGraph")) return null;
+  if (e.key === "ArrowUp") return "previous";
+  if (e.key === "ArrowDown") return "next";
+  return null;
+}
+
 /** True while keyboard focus is in a dialog or menu, which keeps its own keys. */
 export function isFocusInDialogOrMenu(): boolean {
   return !!document.activeElement?.closest('[role="dialog"], [role="alertdialog"], [role="menu"]');

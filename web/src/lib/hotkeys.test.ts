@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { hasCommandModifier, isEscapeOwnerOpen, isKeyOwningOverlayOpen } from "./hotkeys";
+import {
+  hasCommandModifier,
+  isEscapeOwnerOpen,
+  isKeyOwningOverlayOpen,
+  messageStepDirection,
+} from "./hotkeys";
 
 describe("hasCommandModifier", () => {
   it("requires Meta exclusively on macOS", () => {
@@ -13,6 +18,36 @@ describe("hasCommandModifier", () => {
     expect(hasCommandModifier({ metaKey: false, ctrlKey: true }, false)).toBe(true);
     expect(hasCommandModifier({ metaKey: true, ctrlKey: false }, false)).toBe(false);
     expect(hasCommandModifier({ metaKey: true, ctrlKey: true }, false)).toBe(false);
+  });
+});
+
+describe("messageStepDirection", () => {
+  const press = (key: string, init: KeyboardEventInit, altGraph = false) => {
+    const event = new KeyboardEvent("keydown", { key, ...init });
+    if (altGraph) {
+      Object.defineProperty(event, "getModifierState", {
+        value: (modifier: string) => modifier === "AltGraph",
+      });
+    }
+    return event;
+  };
+
+  it("steps with ⌘⌥↑/↓ on macOS and Ctrl+Alt+↑/↓ elsewhere", () => {
+    expect(messageStepDirection(press("ArrowUp", { metaKey: true, altKey: true }), true)).toBe(
+      "previous",
+    );
+    expect(messageStepDirection(press("ArrowDown", { ctrlKey: true, altKey: true }), false)).toBe(
+      "next",
+    );
+    expect(messageStepDirection(press("ArrowDown", { ctrlKey: true }), false)).toBeNull();
+    expect(messageStepDirection(press("ArrowLeft", { ctrlKey: true, altKey: true }), false)).toBe(
+      null,
+    );
+  });
+
+  it("leaves AltGr arrows alone, which some layouts report as Ctrl+Alt", () => {
+    const altGraphDown = press("ArrowDown", { ctrlKey: true, altKey: true }, true);
+    expect(messageStepDirection(altGraphDown, false)).toBeNull();
   });
 });
 
