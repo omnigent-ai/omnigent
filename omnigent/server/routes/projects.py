@@ -25,6 +25,7 @@ from typing import Any
 from fastapi import APIRouter, Query, Request
 from sqlalchemy.exc import IntegrityError
 
+from omnigent.entities.mandate_sections import proposal_is_stale, proposal_target
 from omnigent.entities import Project
 from omnigent.entities.project import (
     PROJECT_IDENTITY_LABEL_KEY,
@@ -108,7 +109,9 @@ def _to_response(project: Project) -> dict[str, Any]:
         "updated_at": project.updated_at,
         "config": project.config,
         "mandate": project.mandate,
-        "mandate_proposals": [_proposal_response(entry) for entry in project.mandate_proposals],
+        "mandate_proposals": [
+            _proposal_response(entry, project.mandate) for entry in project.mandate_proposals
+        ],
         "description": project.description,
         "main_session_id": project.main_session_id,
         "owner_user_id": project.user_id,
@@ -119,13 +122,17 @@ def _to_response(project: Project) -> dict[str, Any]:
     }
 
 
-def _proposal_response(proposal: MandateProposal) -> dict[str, Any]:
-    """Serialize a pending proposal as a ``MandateProposalObject``."""
+def _proposal_response(proposal: MandateProposal, mandate: str | None) -> dict[str, Any]:
+    """Serialize a pending proposal as a ``MandateProposalObject`` against the current mandate."""
     return {
         "id": proposal.id,
         "text": proposal.text,
         "created_at": proposal.created_at,
         "session_id": proposal.session_id,
+        "mode": proposal.mode,
+        "section": proposal.section,
+        "current_text": proposal_target(mandate, proposal),
+        "stale": proposal_is_stale(mandate, proposal),
     }
 
 
@@ -623,6 +630,8 @@ def create_projects_router(
             body.text,
             user_id=user_id,
             session_id=source_session,
+            mode=body.mode,
+            section=body.section,
         )
         if result is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
@@ -632,7 +641,7 @@ def create_projects_router(
             session_live_state.raise_attention(source_session)
         announce_projects_changed(user_id)
         return {
-            "proposal": _proposal_response(proposal),
+            "proposal": _proposal_response(proposal, project.mandate),
             "project": await response(project, user_id),
         }
 
@@ -661,11 +670,12 @@ def create_projects_router(
     async def accept_mandate_proposal(
         request: Request, project_id: str, proposal_id: str
     ) -> dict[str, Any]:
-        """Append a pending proposal to the mandate. Owner only, never an agent tool.
+        """Apply a pending proposal to the mandate. Owner only, never an agent tool.
 
         :returns: The updated project.
         :raises OmnigentError: 403 for an agent request, 404 for an unknown
-            project or proposal, 400 when the mandate would exceed its limit.
+            project or proposal, 400 when the mandate would exceed its limit,
+            409 when a replacement is stale.
         """
         return await resolve_proposal(request, project_id, proposal_id, accept=True)
 

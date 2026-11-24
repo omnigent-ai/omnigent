@@ -8074,8 +8074,31 @@
         "additionalProperties": false,
         "description": "Request body for `POST /v1/projects/{project_id}/mandate/proposals`.",
         "properties": {
+          "mode": {
+            "default": "append",
+            "description": "`append` (default), `replace_section` or `replace_all`.",
+            "enum": [
+              "append",
+              "replace_section",
+              "replace_all"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "section": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The existing heading title `replace_section` targets, e.g. `\"Stages\"`.",
+            "title": "Section"
+          },
           "text": {
-            "description": "The addition to propose. Trimmed; 1 to 2,000 UTF-8 bytes. It reaches no session's instructions until the owner accepts it.",
+            "description": "Trimmed. For `append`, the addition (1 to 2,000 UTF-8 bytes). For `replace_section`, the section's new text including its heading line, or blank to delete it. For `replace_all`, the full new mandate. It reaches no session's instructions until the owner accepts it.",
             "title": "Text",
             "type": "string"
           }
@@ -23623,7 +23646,7 @@
     },
     "/v1/projects/{project_id}/mandate/proposals/{proposal_id}/accept": {
       "post": {
-        "description": "Append a pending proposal to the mandate. Owner only, never an agent tool.\n\n**Returns:** The updated project.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent request, 404 for an unknown project or proposal, 400 when the mandate would exceed its limit.",
+        "description": "Apply a pending proposal to the mandate. Owner only, never an agent tool.\n\n**Returns:** The updated project.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent request, 404 for an unknown project or proposal, 400 when the mandate would exceed its limit, 409 when a replacement is stale.",
         "operationId": "accept_mandate_proposal_v1_projects__project_id__mandate_proposals__proposal_id__accept_post",
         "parameters": [
           {

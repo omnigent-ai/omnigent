@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from omnigent.entities.project import (
     MANDATE_PROPOSAL_MAX_BYTES,
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
+    PROJECT_MANDATE_MAX_BYTES,
 )
 from omnigent.entities.project_kpi import SetProjectKpis
 from omnigent.entities.project_ticket import (
@@ -106,12 +107,26 @@ class LinkTickets(LinkRelatedTicket):
 class ProposeMandateAddition(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(
-        min_length=1,
-        max_length=MANDATE_PROPOSAL_MAX_BYTES,
+        max_length=PROJECT_MANDATE_MAX_BYTES,
         description=(
-            "The addition in the user's terms, written as a standing rule for every agent in "
-            "the project, e.g. 'Run the UI tests before moving a ticket to review.'"
+            "append: the addition in the user's terms, written as a standing rule for every "
+            "agent, e.g. 'Run the UI tests before moving a ticket to review.' (at most "
+            f"{MANDATE_PROPOSAL_MAX_BYTES} bytes). replace_section: the section's complete new "
+            "text including its heading line, or empty to delete the section. replace_all: "
+            "the complete new mandate."
         ),
+    )
+    mode: Literal["append", "replace_section", "replace_all"] = Field(
+        default="append",
+        description=(
+            "append adds to the end. Use replace_section or replace_all to rewrite or remove "
+            "rules that conflict or are superseded, instead of appending a contradiction."
+        ),
+    )
+    section: str | None = Field(
+        default=None,
+        max_length=200,
+        description="For replace_section: the exact title of one existing heading, e.g. 'Stages'.",
     )
 
 
@@ -364,12 +379,15 @@ class SysTicketLinkTool(_TicketTool):
 class SysProjectMandateProposeTool(_TicketTool):
     tool_name = "sys_project_mandate_propose"
     help_text = (
-        "Propose an addition to this project's mandate, the owner's standing guidance loaded "
-        "into every agent session in the project. Use it when the user asks for durable "
-        "project-wide feedback to be remembered, such as 'always', 'every change' or 'from "
-        "now on'. The proposal changes nothing until the owner accepts it in the project's "
-        "Mandate dialog, so tell the user it is waiting for them. Never claim it is in "
-        "effect. Agents cannot edit the mandate directly. Scoped to this session's project."
+        "Propose a change to this project's mandate, the owner's standing guidance loaded "
+        "into every agent session in the project: an addition, a replacement or deletion of "
+        "one section (by its heading title), or a whole new mandate. Use it when the user "
+        "asks for durable project-wide feedback to be remembered, such as 'always', 'every "
+        "change' or 'from now on', or to clean up conflicting rules. The owner sees it as a "
+        "diff; it changes nothing until the owner accepts it in the project's Mandate dialog, "
+        "so tell the user it is waiting for them. Never claim it is in effect. A replacement "
+        "goes stale, and can't be accepted, if its text changes first. Agents cannot edit "
+        "the mandate directly. Scoped to this session's project."
     )
     arguments = ProposeMandateAddition
 

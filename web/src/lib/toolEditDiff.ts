@@ -42,7 +42,7 @@ interface EditPair {
   replaceAll: boolean;
 }
 
-interface DiffLine {
+export interface DiffLine {
   /** `gap` stands for unchanged lines left out between two changes. */
   kind: "context" | "added" | "removed" | "gap";
   text: string;
@@ -258,6 +258,14 @@ function pairLines(pair: EditPair): [string[], string[]] {
     (pair.oldText.endsWith("\n") ? oldLines : newLines).push("");
   }
   return [oldLines, newLines];
+}
+
+/** Line diff of two texts, trimmed to the changes and nearby context, e.g. for a mandate proposal. */
+export function textLineDiff(oldText: string, newText: string): DiffLine[] {
+  return lineDiff(splitLines(oldText), splitLines(newText), {
+    cells: MAX_LINE_DIFF_CELLS,
+    exceeded: false,
+  });
 }
 
 /** Comparison steps a call's remaining edits may still use, and whether one ran out. */

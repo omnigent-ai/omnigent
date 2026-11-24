@@ -452,7 +452,10 @@ async def test_mandate_proposal_goes_to_the_callers_project_and_reports_it_pendi
             return httpx.Response(200, json={"project_id": PROJECT})
         assert request.method == "POST"
         assert request.url.path == f"/v1/projects/{PROJECT}/mandate/proposals"
-        assert json.loads(request.content) == {"text": "Attach a video to every change."}
+        assert json.loads(request.content) == {
+            "text": "Attach a video to every change.",
+            "mode": "append",
+        }
         proposal = {"id": TICKET, "text": "Attach a video to every change.", "created_at": 1}
         return httpx.Response(200, json={"proposal": proposal, "project": {"id": PROJECT}})
 

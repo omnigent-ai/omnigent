@@ -70,21 +70,29 @@ class Project:
 @dataclass(frozen=True)
 class MandateProposal:
     """
-    An addition to a project's mandate that an agent or the owner proposed.
+    A change to a project's mandate that an agent or the owner proposed.
 
-    It reaches no session's instructions until the owner accepts it, which
-    appends its text to the mandate.
+    It reaches no session's instructions until the owner accepts it.
 
     :param id: Proposal id (bare 32-char hex).
-    :param text: The proposed addition, e.g. ``"Run the UI tests before review."``.
+    :param text: The proposed text, e.g. ``"Run the UI tests before review."``:
+        an addition, a section's replacement (blank deletes it) or a whole new mandate.
     :param created_at: Unix epoch seconds when it was proposed.
     :param session_id: The session that proposed it, or ``None`` for the owner.
+    :param mode: ``"append"`` adds *text* to the end, ``"replace_section"``
+        replaces the section headed *section*, ``"replace_all"`` replaces the mandate.
+    :param section: The heading title a ``replace_section`` proposal targets, e.g. ``"Stages"``.
+    :param base_hash: SHA-256 of the text a replacement was written against, so
+        accepting it after that text changed is refused as stale.
     """
 
     id: str
     text: str
     created_at: int
     session_id: str | None = None
+    mode: str = "append"
+    section: str | None = None
+    base_hash: str | None = None
 
 
 # Most UTF-8 bytes a project mandate may hold. It is added to every project
@@ -94,7 +102,11 @@ PROJECT_MANDATE_MAX_BYTES = 32_000
 # Most bytes of the mandate's stored (compressed, possibly encrypted) envelope.
 PROJECT_MANDATE_MAX_STORED_BYTES = 16_383
 # Most UTF-8 bytes in one proposed addition, and how many may wait for review.
+# Replacement proposals may carry up to PROJECT_MANDATE_MAX_BYTES instead.
 MANDATE_PROPOSAL_MAX_BYTES = 2_000
+MANDATE_PROPOSAL_MODES = ("append", "replace_section", "replace_all")
+# Most bytes of the stored (compressed, possibly encrypted) pending-proposals envelope.
+MANDATE_PROPOSALS_MAX_STORED_BYTES = 16_383
 MANDATE_PROPOSALS_MAX_PENDING = 5
 # Most UTF-8 bytes a project description (its charter for people) may hold.
 PROJECT_DESCRIPTION_MAX_BYTES = 8_000

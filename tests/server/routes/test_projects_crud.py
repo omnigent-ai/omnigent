@@ -413,6 +413,57 @@ async def test_agent_proposals_wait_for_the_owner_before_reaching_any_session(
     assert dismissed["mandate"] == accepted["mandate"]
 
 
+async def test_replacement_proposals_show_their_target_apply_on_accept_and_go_stale(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Agents propose section and whole-text replacements; only fresh ones can be accepted."""
+    mandate = "# Rules\n\n## Push\n\nAsk first.\n\n## Git\n\nTrailer."
+    created = (
+        await project_client.post("/v1/projects", json={"name": "P", "mandate": mandate})
+    ).json()
+    agent = {ORCHESTRATION_SOURCE_HEADER: created["main_session_id"]}
+    base = f"/v1/projects/{created['id']}/mandate/proposals"
+    section = await project_client.post(
+        base,
+        json={"mode": "replace_section", "section": "push", "text": "## Push\n\nPush Verified work."},
+        headers=agent,
+    )
+    assert section.status_code == 200, section.text
+    proposal = section.json()["proposal"]
+    assert proposal["mode"] == "replace_section" and proposal["section"] == "push"
+    assert proposal["current_text"] == "## Push\n\nAsk first." and proposal["stale"] is False
+    delete = (
+        await project_client.post(
+            base, json={"mode": "replace_section", "section": "Git", "text": ""}, headers=agent
+        )
+    ).json()["proposal"]
+    whole = (
+        await project_client.post(
+            base, json={"mode": "replace_all", "text": "# Rules\n\nAll new."}, headers=agent
+        )
+    ).json()["proposal"]
+    for bad in (
+        {"mode": "replace_section", "section": "Missing", "text": "x"},
+        {"mode": "replace_section", "text": "x"},
+        {"mode": "replace_all", "text": " "},
+        {"mode": "append", "section": "Git", "text": "x"},
+    ):
+        assert (await project_client.post(base, json=bad, headers=agent)).status_code == 400, bad
+    assert (await project_client.post(f"{base}/{proposal['id']}/accept", headers=agent)).status_code == 403
+    accepted = (await project_client.post(f"{base}/{proposal['id']}/accept")).json()
+    assert accepted["mandate"] == "# Rules\n\n## Push\n\nPush Verified work.\n\n## Git\n\nTrailer."
+    pending = {entry["id"]: entry for entry in accepted["mandate_proposals"]}
+    # Editing the Push section leaves the Git deletion fresh but the whole-text one stale.
+    assert pending[delete["id"]]["stale"] is False
+    assert pending[whole["id"]]["stale"] is True
+    stale = await project_client.post(f"{base}/{whole['id']}/accept")
+    assert stale.status_code == 409
+    assert "changed since this proposal" in stale.text
+    final = (await project_client.post(f"{base}/{delete['id']}/accept")).json()
+    assert final["mandate"] == "# Rules\n\n## Push\n\nPush Verified work."
+    assert [entry["id"] for entry in final["mandate_proposals"]] == [whole["id"]]
+
+
 async def test_mandate_proposals_are_bounded(project_client: httpx.AsyncClient) -> None:
     """Blank, oversized and excess proposals are refused; so is an overflowing accept."""
     created = (await project_client.post("/v1/projects", json={"name": "P"})).json()

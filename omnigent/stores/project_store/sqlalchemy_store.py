@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import dataclasses
 import json
 import re
 import uuid
@@ -27,7 +28,7 @@ from omnigent.db.db_models import (
     SqlProjectTicketSession,
     current_workspace_id,
 )
-from omnigent.db.envelope import seal_text
+from omnigent.db.envelope import seal, seal_text
 from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -36,8 +37,17 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Project
+from omnigent.entities.mandate_sections import (
+    apply_proposal,
+    proposal_is_stale,
+    proposal_target,
+    section_spans,
+    text_hash,
+)
 from omnigent.entities.project import (
     MANDATE_PROPOSAL_MAX_BYTES,
+    MANDATE_PROPOSAL_MODES,
+    MANDATE_PROPOSALS_MAX_STORED_BYTES,
     MANDATE_PROPOSALS_MAX_PENDING,
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
     PROJECT_IDENTITY_MAX_COUNT,
@@ -206,12 +216,18 @@ def _decode_proposals(raw: object) -> list[MandateProposal]:
             and isinstance(entry.get("created_at"), int)
         ):
             session_id = entry.get("session_id")
+            mode = entry.get("mode", "append")
+            section = entry.get("section")
+            base_hash = entry.get("base_hash")
             proposals.append(
                 MandateProposal(
                     id=entry["id"],
                     text=entry["text"],
                     created_at=entry["created_at"],
                     session_id=session_id if isinstance(session_id, str) else None,
+                    mode=mode if mode in MANDATE_PROPOSAL_MODES else "append",
+                    section=section if isinstance(section, str) else None,
+                    base_hash=base_hash if isinstance(base_hash, str) else None,
                 )
             )
     return proposals
@@ -225,9 +241,52 @@ def _encode_proposals(proposals: list[MandateProposal]) -> list[dict[str, Any]] 
             "text": proposal.text,
             "created_at": proposal.created_at,
             "session_id": proposal.session_id,
+            # Append-only readers ignore these; an append omits them entirely.
+            **(
+                {}
+                if proposal.mode == "append"
+                else {
+                    "mode": proposal.mode,
+                    "section": proposal.section,
+                    "base_hash": proposal.base_hash,
+                }
+            ),
         }
         for proposal in proposals
     ] or None
+
+
+def _validate_proposal_shape(text: str, mode: str, section: str | None) -> str:
+    """Return the trimmed text, or raise ``INVALID_INPUT`` for a malformed proposal."""
+    if mode not in MANDATE_PROPOSAL_MODES:
+        raise OmnigentError(
+            f"mode must be one of {', '.join(MANDATE_PROPOSAL_MODES)}", code=ErrorCode.INVALID_INPUT
+        )
+    trimmed = text.strip()
+    size = len(trimmed.encode("utf-8"))
+    if mode == "append":
+        if section is not None or not trimmed or size > MANDATE_PROPOSAL_MAX_BYTES:
+            raise OmnigentError(
+                f"a mandate addition must be 1 to {MANDATE_PROPOSAL_MAX_BYTES} bytes, "
+                f"with no section (got {size})",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return trimmed
+    if size > PROJECT_MANDATE_MAX_BYTES:
+        raise OmnigentError(
+            f"a replacement must be at most {PROJECT_MANDATE_MAX_BYTES} bytes (got {size})",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if mode == "replace_section" and not (section or "").strip():
+        raise OmnigentError(
+            "replace_section needs the section's heading title", code=ErrorCode.INVALID_INPUT
+        )
+    if mode == "replace_all" and not trimmed:
+        raise OmnigentError(
+            "replace_all needs the full new mandate; a blank mandate is set by the owner",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return trimmed
 
 
 _IDENTITY_NAME_MAX_CHARS = 60
@@ -663,18 +722,12 @@ class SqlAlchemyProjectStore(ProjectStore):
         *,
         user_id: str | None,
         session_id: str | None = None,
+        mode: str = "append",
+        section: str | None = None,
     ) -> tuple[Project, MandateProposal] | None:
-        """Queue an addition for the owner to accept; it changes no instructions until then."""
-        trimmed = text.strip()
-        size = len(trimmed.encode("utf-8"))
-        if not trimmed or size > MANDATE_PROPOSAL_MAX_BYTES:
-            raise OmnigentError(
-                f"a mandate proposal must be 1 to {MANDATE_PROPOSAL_MAX_BYTES} bytes (got {size})",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        proposal = MandateProposal(
-            id=uuid.uuid4().hex, text=trimmed, created_at=now_epoch(), session_id=session_id
-        )
+        """Queue a change for the owner to accept; it changes no instructions until then."""
+        trimmed = _validate_proposal_shape(text, mode, section)
+        section_title = section.strip() if mode == "replace_section" and section else None
 
         def write(session: Session) -> tuple[Project, MandateProposal] | None:
             require_active_account(session, user_id)
@@ -690,7 +743,34 @@ class SqlAlchemyProjectStore(ProjectStore):
                     "ask them to accept or dismiss one first",
                     code=ErrorCode.CONFLICT,
                 )
-            row.mandate_proposals = _encode_proposals([*pending, proposal])
+            proposal = MandateProposal(
+                id=uuid.uuid4().hex,
+                text=trimmed,
+                created_at=now_epoch(),
+                session_id=session_id,
+                mode=mode,
+                section=section_title,
+            )
+            if mode != "append":
+                matches = len(section_spans(row.mandate or "", section_title or ""))
+                if mode == "replace_section" and matches != 1:
+                    raise OmnigentError(
+                        f"the mandate has {matches} sections titled {section_title!r}; "
+                        "name exactly one existing heading",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                target = proposal_target(row.mandate, proposal) or ""
+                proposal = dataclasses.replace(proposal, base_hash=text_hash(target))
+                # Refuse now what accepting would refuse: an oversized result.
+                _normalize_mandate(apply_proposal(row.mandate, proposal))
+            encoded = _encode_proposals([*pending, proposal])
+            if len(seal(encoded)) > MANDATE_PROPOSALS_MAX_STORED_BYTES:
+                raise OmnigentError(
+                    "pending mandate proposals are too large to store together; "
+                    "ask the owner to accept or dismiss one first",
+                    code=ErrorCode.CONFLICT,
+                )
+            row.mandate_proposals = encoded
             session.flush()
             return _to_entity(row), proposal
 
@@ -713,8 +793,13 @@ class SqlAlchemyProjectStore(ProjectStore):
             if proposal is None:
                 raise OmnigentError("Mandate proposal not found", code=ErrorCode.NOT_FOUND)
             if accept:
-                combined = "\n\n".join(part for part in (row.mandate, proposal.text) if part)
-                row.mandate = _normalize_mandate(combined)
+                if proposal_is_stale(row.mandate, proposal):
+                    raise OmnigentError(
+                        "the mandate changed since this proposal was written; "
+                        "dismiss it and propose the change again",
+                        code=ErrorCode.CONFLICT,
+                    )
+                row.mandate = _normalize_mandate(apply_proposal(row.mandate, proposal))
                 row.updated_at = now_epoch()
             row.mandate_proposals = _encode_proposals(
                 [entry for entry in pending if entry.id != proposal_id]

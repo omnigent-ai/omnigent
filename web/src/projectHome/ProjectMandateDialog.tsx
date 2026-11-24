@@ -12,6 +12,8 @@ import {
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { textLineDiff } from "@/lib/toolEditDiff";
+import { cn } from "@/lib/utils";
 import { Textarea } from "@/components/ui/textarea";
 import {
   acceptMandateProposal,
@@ -35,6 +37,51 @@ const MANDATE_PREVIEW_CLASS =
 /** Bytes the server counts against the limit: it stores the trimmed text. */
 function mandateBytes(text: string): number {
   return encoder.encode(text.trim()).length;
+}
+
+/** What a proposal does, in the owner's terms. */
+function proposalLabel(proposal: MandateProposal): string | null {
+  if (proposal.mode === "replace_all") return "Replace the whole mandate";
+  if (proposal.mode === "replace_section") {
+    return `${proposal.text.trim() ? "Replace" : "Delete"} section “${proposal.section ?? ""}”`;
+  }
+  return null;
+}
+
+/** Removed and added lines of a replacement proposal against the current mandate. */
+function ProposalDiff({ proposal }: { proposal: MandateProposal }) {
+  // Kind and text plus a running repeat count keep keys unique and stable.
+  const seen = new Map<string, number>();
+  const lines = textLineDiff(proposal.current_text ?? "", proposal.text).map((line) => {
+    const base = `${line.kind}:${line.text}`;
+    const repeat = seen.get(base) ?? 0;
+    seen.set(base, repeat + 1);
+    return { ...line, key: `${base}#${repeat}` };
+  });
+  return (
+    <pre
+      className="max-h-64 overflow-auto rounded-md border border-border bg-muted/40 py-1 font-mono text-xs leading-relaxed"
+      data-testid="project-mandate-proposal-diff"
+    >
+      {lines.map((line) => (
+        <div
+          key={line.key}
+          data-kind={line.kind}
+          className={cn(
+            "whitespace-pre-wrap px-2",
+            line.kind === "added" && "bg-emerald-500/15 text-emerald-800 dark:text-emerald-300",
+            line.kind === "removed" &&
+              "bg-red-500/15 text-red-800 line-through decoration-red-500/40 dark:text-red-300",
+            line.kind === "gap" && "text-muted-foreground",
+          )}
+        >
+          {line.kind === "gap"
+            ? "⋯"
+            : `${line.kind === "added" ? "+" : line.kind === "removed" ? "−" : " "} ${line.text}`}
+        </div>
+      ))}
+    </pre>
+  );
 }
 
 /** The project's mandate and pending proposals; agents' proposals refresh it live. */
@@ -94,6 +141,12 @@ export function ProjectMandateDialog({
       remember(project);
       if (!accept || draft === null) return;
       const accepted = project.mandate ?? "";
+      if ((proposal.mode ?? "append") !== "append") {
+        // Replacements are only accepted without unsaved edits, so the draft follows the server.
+        setLoaded(accepted);
+        setDraft(accepted);
+        return;
+      }
       // Keep unsaved edits, adding the accepted text so saving them doesn't drop it.
       const next =
         draft === loaded ? accepted : [draft.trim(), proposal.text].filter(Boolean).join("\n\n");
@@ -125,52 +178,80 @@ export function ProjectMandateDialog({
           <DialogTitle>Mandate</DialogTitle>
           <DialogDescription>
             Bounds every agent in <span className="font-medium">{projectName}</span> follows,
-            including the Lead and its workers. It overrides conflicting repo instructions
-            such as CLAUDE.md, but never safety rules or approval prompts. Running sessions may keep
-            the previous mandate until they restart.
+            including the Lead and its workers. It overrides conflicting repo instructions such as
+            CLAUDE.md, but never safety rules or approval prompts. Running sessions may keep the
+            previous mandate until they restart.
           </DialogDescription>
         </DialogHeader>
         {draft !== null ? (
           <form onSubmit={onSubmit} className="flex flex-col gap-2">
             {proposals.length > 0 && (
               <section
-                aria-label="Proposed additions"
+                aria-label="Proposed changes"
                 className="flex flex-col gap-2"
                 data-testid="project-mandate-proposals"
               >
-                <h3 className="font-medium text-ui">Proposed additions</h3>
+                <h3 className="font-medium text-ui">Proposed changes</h3>
                 <p className="text-sm text-muted-foreground">
                   Agents suggested these from your feedback. They apply only once you accept them.
                 </p>
-                {proposals.map((proposal) => (
-                  <div
-                    key={proposal.id}
-                    className="flex flex-col gap-2 rounded-lg border border-border p-2.5 sm:flex-row sm:items-start"
-                    data-testid="project-mandate-proposal"
-                  >
-                    <ProseMarkdown className="min-w-0 flex-1 text-sm">{proposal.text}</ProseMarkdown>
-                    <div className="flex shrink-0 gap-1">
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        disabled={busy}
-                        onClick={() => resolve.mutate({ proposal, accept: false })}
-                      >
-                        Dismiss
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() => resolve.mutate({ proposal, accept: true })}
-                      >
-                        Accept
-                      </Button>
+                {proposals.map((proposal) => {
+                  const label = proposalLabel(proposal);
+                  const blockedByEdits = label !== null && draft !== loaded;
+                  return (
+                    <div
+                      key={proposal.id}
+                      className="flex flex-col gap-2 rounded-lg border border-border p-2.5 sm:flex-row sm:items-start"
+                      data-testid="project-mandate-proposal"
+                      data-stale={proposal.stale || undefined}
+                    >
+                      {label === null ? (
+                        <ProseMarkdown className="min-w-0 flex-1 text-sm">
+                          {proposal.text}
+                        </ProseMarkdown>
+                      ) : (
+                        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                          <p className="text-sm font-medium">{label}</p>
+                          {proposal.stale && (
+                            <p
+                              className="text-sm text-amber-700 dark:text-amber-400"
+                              data-testid="project-mandate-proposal-stale"
+                            >
+                              Out of date: the mandate changed since this was proposed. Dismiss it
+                              and ask for a new one.
+                            </p>
+                          )}
+                          {blockedByEdits && !proposal.stale && (
+                            <p className="text-sm text-muted-foreground">
+                              Save or cancel your edits before accepting a replacement.
+                            </p>
+                          )}
+                          <ProposalDiff proposal={proposal} />
+                        </div>
+                      )}
+                      <div className="flex shrink-0 gap-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          onClick={() => resolve.mutate({ proposal, accept: false })}
+                        >
+                          Dismiss
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={busy || proposal.stale || blockedByEdits}
+                          onClick={() => resolve.mutate({ proposal, accept: true })}
+                        >
+                          Accept
+                        </Button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
                 <TicketError error={resolve.error} />
               </section>
             )}
@@ -211,7 +292,9 @@ export function ProjectMandateDialog({
                     {draft}
                   </FilePathAwareMessageResponse>
                 ) : (
-                  <p className="text-sm text-muted-foreground">No mandate yet. Choose Edit to write one.</p>
+                  <p className="text-sm text-muted-foreground">
+                    No mandate yet. Choose Edit to write one.
+                  </p>
                 )}
               </div>
             )}

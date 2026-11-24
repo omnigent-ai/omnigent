@@ -155,6 +155,14 @@ export interface MandateProposal {
   created_at: number;
   /** The proposing session, or `null` when the owner proposed it. */
   session_id?: string | null;
+  /** `append` adds `text`; the others replace a section (blank `text` deletes it) or everything. */
+  mode?: "append" | "replace_section" | "replace_all";
+  /** The heading title a `replace_section` proposal targets. */
+  section?: string | null;
+  /** The mandate text accepting it would remove; `null` when its section is gone. */
+  current_text?: string | null;
+  /** The text it replaces changed since it was proposed, so it can't be accepted. */
+  stale?: boolean;
 }
 
 /** Most UTF-8 bytes a mandate may hold; mirrors `PROJECT_MANDATE_MAX_BYTES` on the server. */

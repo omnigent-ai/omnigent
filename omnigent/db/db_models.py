@@ -36,7 +36,11 @@ from omnigent.db.bounded_binary import BoundedBinary
 from omnigent.db.compression import CompressedText
 from omnigent.db.envelope import EnvelopedJSON, EnvelopedText
 from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
-from omnigent.entities.project import PROJECT_MANDATE_MAX_BYTES, PROJECT_MANDATE_MAX_STORED_BYTES
+from omnigent.entities.project import (
+    MANDATE_PROPOSALS_MAX_STORED_BYTES,
+    PROJECT_MANDATE_MAX_BYTES,
+    PROJECT_MANDATE_MAX_STORED_BYTES,
+)
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
@@ -954,7 +958,7 @@ class SqlProject(OmnigentBase):
     )
     # Proposed mandate additions awaiting the owner; never part of any instructions.
     mandate_proposals: Mapped[list[dict[str, Any]] | None] = mapped_column(
-        EnvelopedJSON(16383), nullable=True
+        EnvelopedJSON(MANDATE_PROPOSALS_MAX_STORED_BYTES), nullable=True
     )
 
     __table_args__ = (

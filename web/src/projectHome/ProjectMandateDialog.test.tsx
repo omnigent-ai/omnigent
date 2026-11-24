@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -70,7 +70,8 @@ describe("Project mandate editor", () => {
     vi.mocked(api.getProject).mockResolvedValue({
       id: "project",
       name: "Shipping",
-      mandate: "## Scope\n\n- Only edit **docs/**.\n- Run `tsc` before [review](https://example.com).",
+      mandate:
+        "## Scope\n\n- Only edit **docs/**.\n- Run `tsc` before [review](https://example.com).",
       mandate_proposals: [{ ...PROPOSAL, text: "Attach a **video** to every change." }],
     });
     renderDialog();
@@ -80,7 +81,10 @@ describe("Project mandate editor", () => {
     expect(preview.querySelectorAll("[data-streamdown=list-item]")).toHaveLength(2);
     expect(preview.querySelector("[data-streamdown=strong]")).toHaveTextContent("docs/");
     expect(preview.querySelector("[data-streamdown=inline-code]")).toHaveTextContent("tsc");
-    expect(preview.querySelector("[data-streamdown=link]")).toHaveAttribute("href", "https://example.com/");
+    expect(preview.querySelector("[data-streamdown=link]")).toHaveAttribute(
+      "href",
+      "https://example.com/",
+    );
     const proposal = screen.getByTestId("project-mandate-proposal");
     expect(proposal.querySelector("[data-streamdown=strong]")).toHaveTextContent("video");
     const input = await openEditor();
@@ -91,7 +95,6 @@ describe("Project mandate editor", () => {
     await userEvent.click(screen.getByTestId("project-mandate-preview-tab"));
     expect(screen.getByTestId("project-mandate-preview")).toHaveTextContent("Never push.");
   });
-
 
   it("edits the stored mandate and saves only that field", async () => {
     const { onClose } = renderDialog();
@@ -219,6 +222,78 @@ describe("Project mandate editor", () => {
     await waitFor(() => expect(screen.queryByTestId("project-mandate-proposals")).toBeNull());
     expect(api.dismissMandateProposal).toHaveBeenCalledWith("project", "proposal");
     expect(input).toHaveValue("Only edit docs/.");
+  });
+
+  it("shows a section replacement as a diff and applies it on accept", async () => {
+    const replacement = {
+      id: "replace",
+      text: "## Push\n\nPush Verified work.",
+      created_at: 1,
+      mode: "replace_section" as const,
+      section: "Push",
+      current_text: "## Push\n\nAsk first.",
+      stale: false,
+    };
+    vi.mocked(api.getProject).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "## Push\n\nAsk first.",
+      mandate_proposals: [replacement],
+    });
+    vi.mocked(api.acceptMandateProposal).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "## Push\n\nPush Verified work.",
+      mandate_proposals: [],
+    });
+    renderDialog();
+    const proposal = await screen.findByTestId("project-mandate-proposal");
+    expect(proposal).toHaveTextContent("Replace section “Push”");
+    const diff = screen.getByTestId("project-mandate-proposal-diff");
+    expect(diff.querySelector("[data-kind=removed]")).toHaveTextContent("Ask first.");
+    expect(diff.querySelector("[data-kind=added]")).toHaveTextContent("Push Verified work.");
+    await userEvent.click(screen.getByRole("button", { name: "Accept" }));
+    expect(api.acceptMandateProposal).toHaveBeenCalledWith("project", "replace");
+    const input = await openEditor();
+    expect(input).toHaveValue("## Push\n\nPush Verified work.");
+  });
+
+  it("blocks accepting a stale replacement, or any replacement over unsaved edits", async () => {
+    vi.mocked(api.getProject).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      mandate: "Only edit docs/.",
+      mandate_proposals: [
+        {
+          id: "stale",
+          text: "Everything new.",
+          created_at: 1,
+          mode: "replace_all",
+          current_text: "Only edit docs/.",
+          stale: true,
+        },
+        {
+          id: "fresh",
+          text: "",
+          created_at: 2,
+          mode: "replace_section",
+          section: "Git",
+          current_text: "## Git",
+          stale: false,
+        },
+      ],
+    });
+    renderDialog();
+    const [stale, fresh] = await screen.findAllByTestId("project-mandate-proposal");
+    expect(stale).toHaveTextContent("Replace the whole mandate");
+    expect(screen.getByTestId("project-mandate-proposal-stale")).toHaveTextContent("Out of date");
+    const accept = (card: HTMLElement) => within(card).getByRole("button", { name: "Accept" });
+    expect(accept(stale!)).toBeDisabled();
+    expect(fresh).toHaveTextContent("Delete section “Git”");
+    expect(accept(fresh!)).toBeEnabled();
+    await userEvent.type(await openEditor(), " More.");
+    expect(accept(fresh!)).toBeDisabled();
+    expect(fresh).toHaveTextContent("Save or cancel your edits");
   });
 
   it("does not offer a blank editor when the mandate fails to load", async () => {

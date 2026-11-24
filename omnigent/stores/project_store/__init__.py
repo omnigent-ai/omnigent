@@ -214,12 +214,17 @@ class ProjectStore(ABC):
         *,
         user_id: str | None,
         session_id: str | None = None,
+        mode: str = "append",
+        section: str | None = None,
     ) -> tuple[Project, MandateProposal] | None:
         """
-        Queue an addition to the mandate; it reaches no instructions until accepted.
+        Queue a mandate change; it reaches no instructions until accepted.
 
         :param project_id: The owned project.
-        :param text: The addition, trimmed; at most 2,000 UTF-8 bytes.
+        :param text: The addition (at most 2,000 UTF-8 bytes), the section's
+            replacement (blank deletes it) or the full new mandate.
+        :param mode: ``"append"``, ``"replace_section"`` or ``"replace_all"``.
+        :param section: The heading title ``replace_section`` targets.
         :param user_id: The requesting owner.
         :param session_id: The proposing session, or ``None`` for the owner.
         :returns: The project and new proposal, or ``None`` if not found / not owned.

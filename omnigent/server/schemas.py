@@ -6430,31 +6430,48 @@ class ProjectOrderResponse(BaseModel):
 
 class MandateProposalObject(BaseModel):
     """
-    A proposed addition to a project's mandate, awaiting the owner.
+    A proposed change to a project's mandate, awaiting the owner.
 
     :param id: Proposal id (bare 32-char hex).
-    :param text: The proposed addition.
+    :param text: The proposed addition, section replacement (blank deletes the
+        section) or full new mandate.
     :param created_at: Unix epoch seconds when it was proposed.
     :param session_id: The proposing session, or ``None`` when the owner proposed it.
+    :param mode: ``append``, ``replace_section`` or ``replace_all``.
+    :param section: The heading title a ``replace_section`` proposal targets.
+    :param current_text: The mandate text accepting it would remove, for a
+        removed/added diff: empty for an append, ``None`` when its section is gone.
+    :param stale: Whether that text changed since the proposal was written;
+        a stale proposal can't be accepted.
     """
 
     id: str
     text: str
     created_at: int
     session_id: str | None = None
+    mode: Literal["append", "replace_section", "replace_all"] = "append"
+    section: str | None = None
+    current_text: str | None = ""
+    stale: bool = False
 
 
 class ProposeMandateRequest(BaseModel):
     """
     Request body for ``POST /v1/projects/{project_id}/mandate/proposals``.
 
-    :param text: The addition to propose. Trimmed; 1 to 2,000 UTF-8 bytes. It
-        reaches no session's instructions until the owner accepts it.
+    :param text: Trimmed. For ``append``, the addition (1 to 2,000 UTF-8 bytes).
+        For ``replace_section``, the section's new text including its heading line,
+        or blank to delete it. For ``replace_all``, the full new mandate. It reaches
+        no session's instructions until the owner accepts it.
+    :param mode: ``append`` (default), ``replace_section`` or ``replace_all``.
+    :param section: The existing heading title ``replace_section`` targets, e.g. ``"Stages"``.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     text: str
+    mode: Literal["append", "replace_section", "replace_all"] = "append"
+    section: str | None = None
 
 
 class ProjectRouterObject(BaseModel):
