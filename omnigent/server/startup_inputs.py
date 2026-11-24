@@ -859,7 +859,9 @@ class ManagedStartupInputs:
             return
         current = await asyncio.to_thread(self.conversations.get_item, session_id, item_id)
         if current is not None and automatic_kind(current, session_id) is not None:
-            if await self._expire_automatic(session_id, current, expected="incomplete"):
+            if await self._expire_automatic(
+                session_id, current, expected="incomplete", counted=False
+            ):
                 pending_inputs.resolve(session_id, pending_id)
                 if conv.host_id is not None:
                     wake_startup_worker(conv.host_id)
@@ -897,9 +899,14 @@ class ManagedStartupInputs:
         )
 
     async def _expire_automatic(
-        self, session_id: str, item: ConversationItem, *, expected: str
+        self, session_id: str, item: ConversationItem, *, expected: str, counted: bool = True
     ) -> bool:
-        """Drop an automatic input and count it toward the session's catch-up note."""
+        """
+        Drop an automatic input and count it toward the session's catch-up note.
+
+        :param counted: ``False`` for one already submitted, which the agent may
+            have received, so the note doesn't report it as missed.
+        """
         if not await asyncio.to_thread(
             self.conversations.transition_pending_input,
             session_id,
@@ -915,7 +922,7 @@ class ManagedStartupInputs:
             item.id,
             session_id,
         )
-        if automatic_kind(item, session_id) == CATCH_UP:
+        if not counted or automatic_kind(item, session_id) == CATCH_UP:
             return True
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         since, count = _expired_ledger(conv) or (item.created_at, 0)

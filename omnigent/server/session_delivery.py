@@ -20,13 +20,15 @@ async def deliver_to_session(
     user_id: str | None,
     stable_id: str,
     first: bool = False,
-    automatic: str = "ticket_update",
+    automatic: str | None = None,
 ) -> bool:
     """
     Queue ``text`` as a durable user turn and wake the session if it is idle.
 
-    :param automatic: What sent the turn; an automatic turn that can't be
-        delivered expires instead of showing as undelivered.
+    :param automatic: Set only for turns whose content the board already
+        holds, e.g. ``"ticket_update"``; such a turn that can't be delivered
+        expires instead of showing as undelivered. Leave it unset for turns
+        carrying a person's or another session's words.
     :param stable_id: 32 lowercase hex characters; a retry with the same ID
         dedupes, so a crash after enqueue cannot duplicate the turn.
     :returns: ``True`` when a drain was scheduled or the session is host-backed

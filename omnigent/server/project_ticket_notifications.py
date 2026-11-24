@@ -131,7 +131,14 @@ class ProjectTicketNotifications:
                     )
 
     async def deliver_to_session(
-        self, app: Any, project: Project, session_id: str, *, stable_id: str, text: str
+        self,
+        app: Any,
+        project: Project,
+        session_id: str,
+        *,
+        stable_id: str,
+        text: str,
+        automatic: str | None = None,
     ) -> bool:
         """
         Queue one user turn on a session in ``project`` and wake it if idle.
@@ -145,7 +152,13 @@ class ProjectTicketNotifications:
         if conversation is None or conversation.archived or conversation.project_id != project.id:
             return False
         return await deliver_to_session(
-            app, self.inputs, session_id, text, user_id=project.user_id, stable_id=stable_id
+            app,
+            self.inputs,
+            session_id,
+            text,
+            user_id=project.user_id,
+            stable_id=stable_id,
+            automatic=automatic,
         )
 
     async def _route_to_workers(self, app: Any, project: Project, event: dict[str, Any]) -> bool:
@@ -203,6 +216,8 @@ class ProjectTicketNotifications:
             text=ticket_batch_message(
                 project.id, remaining, worker_reply_seconds=self.worker_reply_seconds
             ),
+            # The board holds everything in this turn, so it may expire.
+            automatic="ticket_update",
         ):
             await asyncio.to_thread(
                 self.tickets.mark_notified_many,

@@ -32,6 +32,7 @@ from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
 from omnigent.server.scheduled.telemetry import scheduled_run_scope
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.session_delivery import deliver_to_session
 from omnigent.server.startup_inputs import (
     AUTOMATIC_TTL_ENV,
     EXPIRED_AUTOMATIC_LABEL,
@@ -1378,7 +1379,7 @@ async def test_undeliverable_automatic_input_expires_into_one_catch_up_note(
             automatic=automatic,
         )
 
-    denied_texts = {_TEXT, "Digest A", "Typed by owner"}
+    denied_texts = {_TEXT, "Digest A", "Typed by owner", "Routed comment"}
 
     async def evaluate(_request: Any, _session_id: str, _conv: Any, body: Any, *_: Any, **__: Any):
         text = body.data["content"][-1]["text"]
@@ -1403,10 +1404,18 @@ async def test_undeliverable_automatic_input_expires_into_one_catch_up_note(
     try:
         await enqueue("Digest A", automatic="ticket_update")
         await enqueue("Typed by owner")
+        # The shared delivery helper leaves a turn carrying someone's words unmarked.
+        await deliver_to_session(
+            env.app, startup, session_id, "Routed comment", user_id=None, stable_id=uuid4().hex
+        )
         await recover_until_idle()
         assert sent() == []
         _, failed = await startup.snapshot(session_id)
-        assert [entry["content"][-1]["text"] for entry in failed] == [_TEXT, "Typed by owner"]
+        assert [entry["content"][-1]["text"] for entry in failed] == [
+            _TEXT,
+            "Typed by owner",
+            "Routed comment",
+        ]
         errors = [
             item.data.message
             for item in env.conv_store.list_items(session_id).data
@@ -1424,7 +1433,7 @@ async def test_undeliverable_automatic_input_expires_into_one_catch_up_note(
         assert note.startswith("Catch-up:") and "1 automatic update " in note
         assert "Re-read the board" not in note
         assert EXPIRED_AUTOMATIC_LABEL not in env.conv_store.get_conversation(session_id).labels
-        assert len((await startup.snapshot(session_id))[1]) == 2
+        assert len((await startup.snapshot(session_id))[1]) == 3
 
         monkeypatch.setenv(AUTOMATIC_TTL_ENV, "0")
         await enqueue("Old digest", automatic="ticket_update")

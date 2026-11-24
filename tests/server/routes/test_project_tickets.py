@@ -1477,6 +1477,8 @@ async def test_person_comments_go_to_the_tickets_worker_and_fall_back_to_the_orc
     await service.flush_page(project_app)
     [handed] = store.list_pending_inputs(worker)
     assert "Can you also cover B?" in handed.data.content[0]["text"]
+    # A person's words must fail visibly, not expire like an orchestrator digest.
+    assert handed.data.startup_options.automatic is None
     assert len(store.list_pending_inputs(orchestrator)) == orchestrator_turns
     await service.flush_page(project_app)
     assert len(store.list_pending_inputs(worker)) == 1
@@ -1485,7 +1487,9 @@ async def test_person_comments_go_to_the_tickets_worker_and_fall_back_to_the_orc
     events = (await project_client.get(f"{path}/events")).json()["data"]
     assert events[-1]["payload"]["audience"] == "human"
     await service.flush_page(project_app, force_digest=True)
-    digest = store.list_pending_inputs(orchestrator)[-1].data.content[0]["text"]
+    digest_input = store.list_pending_inputs(orchestrator)[-1]
+    assert digest_input.data.startup_options.automatic == "ticket_update"
+    digest = digest_input.data.content[0]["text"]
     assert digest.startswith("Ticket update digest")
     assert "person's comment, answered by its worker, agent note" in digest
 
