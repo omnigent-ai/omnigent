@@ -4,6 +4,7 @@ import {
   shortTimeLimit,
   splitTimeLimit,
   stepTimeLimit,
+  withTimeLimitLength,
   timeLimitLength,
   timeLimitMinutes,
   withSavedTimeLimits,
@@ -115,6 +116,19 @@ describe("withStepTimeLimit", () => {
     expect(withStepTimeLimit("Fix it.\n\n**Time limit:** 1 hour", null)).toBe("Fix it.");
     expect(withStepTimeLimit("**Time limit:** 1 hour", null)).toBeNull();
     expect(withStepTimeLimit(GOAL, null)).toBe(GOAL);
+  });
+});
+
+describe("withTimeLimitLength", () => {
+  it("changes only the length, keeping the words after it", () => {
+    const noted = "Fix it.\n\n**Time limit:** 4 hours. Tell me if it runs longer.";
+    expect(withTimeLimitLength(noted, "8 hours")).toBe(
+      "Fix it.\n\n**Time limit:** 8 hours. Tell me if it runs longer.",
+    );
+    expect(withTimeLimitLength("**Time limit:** an afternoon", "1 hour")).toBe(
+      "**Time limit:** 1 hour",
+    );
+    expect(withTimeLimitLength("Fix it.", "2 hours")).toBe("Fix it.\n\n**Time limit:** 2 hours");
   });
 });
 

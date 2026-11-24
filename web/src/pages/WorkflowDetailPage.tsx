@@ -60,7 +60,12 @@ import { UNSHAREABLE_WORKFLOW_MESSAGE, workflowSharingAvailable } from "@/lib/pe
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { currentPlan, planDescription, planSteps } from "@/lib/sessionJournal";
-import { splitTimeLimit, withSavedTimeLimits, withStepTimeLimit } from "@/lib/stepTimeLimit";
+import {
+  splitTimeLimit,
+  withSavedTimeLimits,
+  withStepTimeLimit,
+  withTimeLimitLength,
+} from "@/lib/stepTimeLimit";
 import { ApiError } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 
@@ -220,7 +225,15 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     saveTimeLimit.mutate(
       {
         steps: workflow.steps.map((step) =>
-          step.id === stepId ? { ...step, goal: withStepTimeLimit(step.goal, limit) } : step,
+          step.id === stepId
+            ? {
+                ...step,
+                goal:
+                  limit === null
+                    ? withStepTimeLimit(step.goal, null)
+                    : withTimeLimitLength(step.goal, limit),
+              }
+            : step,
         ),
       },
       { onError: (saveError) => showToast(`Couldn’t save the time limit. ${saveError.message}`) },

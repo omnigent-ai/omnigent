@@ -513,6 +513,19 @@ describe("WorkflowDetailPage", () => {
     ]);
   });
 
+  it("changes only a limit's length from the menu, keeping the words after it", async () => {
+    const noted = "The suite passes\n\n**Time limit:** 2 hours. Tell me if it runs longer.";
+    const saved = [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: noted }];
+    const patches = await workflowWithProposal(saved, plan(5, saved));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]!.steps[1]!.goal).toBe(
+      "The suite passes\n\n**Time limit:** 4 hours. Tell me if it runs longer.",
+    );
+  });
+
   it("says when a time limit couldn't be saved, and keeps the saved one", async () => {
     const twoHours = "The suite passes\n\n**Time limit:** 2 hours";
     const saved = [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: twoHours }];

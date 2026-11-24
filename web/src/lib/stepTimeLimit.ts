@@ -103,6 +103,16 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
 }
 
 /**
+ * The step's description with its time limit's length set to *length*, keeping any words
+ * after the old length, e.g. "8 hours. Tell me after." from "4 hours. Tell me after.".
+ */
+export function withTimeLimitLength(goal: string | null, length: string): string | null {
+  const limit = stepTimeLimit(goal);
+  const old = limit ? timeLimitLength(limit) : null;
+  return withStepTimeLimit(goal, limit && old ? `${length}${limit.slice(old.length)}` : length);
+}
+
+/**
  * A proposed plan's steps with the saved workflow's time limits. A saved step's limit is set
  * from its menu, so a proposal leaves it alone; a step the proposal adds keeps its own.
  */
