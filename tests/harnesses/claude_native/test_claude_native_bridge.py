@@ -13776,8 +13776,16 @@ def test_model_command_rechecks_an_owned_draft_before_clearing_it(
     assert composer.text == replacement
 
 
-@pytest.mark.parametrize("claimed_capture", ["raw", "joined"])
-@pytest.mark.parametrize("replace_after_first_observation", [False, True])
+@pytest.mark.parametrize(
+    ("claimed_capture", "replace_after_first_observation"),
+    [
+        pytest.param("raw", False, id="False-raw"),
+        pytest.param("joined", False, id="False-joined"),
+        pytest.param("raw", True, id="True-raw"),
+        pytest.param("joined", True, id="True-joined"),
+        pytest.param("input", False, id="original-logical-input"),
+    ],
+)
 def test_model_command_keeps_the_captured_application_wrapped_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -13787,8 +13795,16 @@ def test_model_command_keeps_the_captured_application_wrapped_replacement(
     captured = json.loads(
         (Path(__file__).parent / "fixtures" / "claude-composer-application-wrap.json").read_text()
     )
-    claimed = claude_model_switch._draft(captured[claimed_capture])
-    assert isinstance(claimed, str) and claimed != captured["input"]
+    claimed = (
+        captured["input"]
+        if claimed_capture == "input"
+        else claude_model_switch._draft(captured[claimed_capture])
+    )
+    assert isinstance(claimed, str)
+    if claimed_capture == "input":
+        assert claude_model_switch._draft(captured["joined"]) != claimed
+    else:
+        assert claimed != captured["input"]
     composer = _SessionModelComposer(
         draft=claimed if replace_after_first_observation else captured["input"]
     )

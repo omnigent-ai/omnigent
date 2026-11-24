@@ -26,17 +26,18 @@ def _trust_test_bridge_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.parametrize(
-    ("version", "session_only"),
+    ("version", "session_only", "legacy_dialog_delay_s"),
     [
-        ("2.1.302", False),
-        ("2.1.311", False),
-        ("2.1.322", False),
-        ("2.1.323", True),
-        ("2.1.324", True),
-        ("2.2.0", True),
-        ("3.0.0", True),
-        ("2.1.323-preview", False),
-        (None, False),
+        pytest.param("2.1.302", False, None, id="2.1.302-False"),
+        pytest.param("2.1.311", False, None, id="2.1.311-False"),
+        pytest.param("2.1.322", False, None, id="2.1.322-False"),
+        pytest.param("2.1.323", True, None, id="2.1.323-True"),
+        pytest.param("2.1.324", True, None, id="2.1.324-True"),
+        pytest.param("2.2.0", True, None, id="2.2.0-True"),
+        pytest.param("3.0.0", True, None, id="3.0.0-True"),
+        pytest.param("2.1.323-preview", False, None, id="2.1.323-preview-False"),
+        pytest.param(None, False, None, id="None-False"),
+        pytest.param("2.1.311", False, 0, id="legacy-immediate-confirmation"),
     ],
 )
 def test_model_changes_preserve_the_version_appropriate_behavior(
@@ -44,8 +45,9 @@ def test_model_changes_preserve_the_version_appropriate_behavior(
     monkeypatch: pytest.MonkeyPatch,
     version: str | None,
     session_only: bool,
+    legacy_dialog_delay_s: float | None,
 ) -> None:
-    composer = _SessionModelComposer()
+    composer = _SessionModelComposer(legacy_dialog_delay_s=legacy_dialog_delay_s)
     composer.version = version or "unknown"
     bridge_dir = _session_model_bridge(tmp_path, composer)
     if version is None:
@@ -74,6 +76,9 @@ def test_model_changes_preserve_the_version_appropriate_behavior(
         assert composer.status_queries == 0
         assert [command for command in composer.submitted if command] == ["/model private-glm[1m]"]
         assert "s" not in [args[-1] for args in composer.sends]
+        assert composer.confirmations == int(legacy_dialog_delay_s is not None)
+        assert composer._legacy_pending is None
+        assert composer.overlay is None
 
 
 @pytest.mark.parametrize(

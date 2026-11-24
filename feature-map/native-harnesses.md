@@ -108,8 +108,10 @@ implements them separately, so a fix for one harness does not reach the others.
   drops rows that cannot launch.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
-- `smart-routing`: Pi applies the chosen route before inference from the
-  composer or native terminal; a tool turn and follow-up retain history.
+- `smart-routing`: Claude Code and Pi apply the chosen route before inference
+  from Chat or the native terminal. The first message is delivered once; a
+  tool turn and follow-up retain history. A refused Claude selection keeps
+  the first message saved but unsent for explicit resubmission.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
   the answer reaches the harness. Shared relay calls exclude their own human
   approval waits from the five-minute execution budget. A pending approval
@@ -300,9 +302,15 @@ card within about a second. A dialog the user opens during a turn, such as
 shows "May need input" in Needs attention until the dialog closes. Claude
 reports done after the turn, so a dialog opened then leaves the row unchanged.
 
-**Pi Smart Routing:** enable Smart Routing for the session, then send a task
-from Chat or type it into the native Pi terminal. Follow a completed tool call
-with a question about its result; verify the routed model and retained history.
+**Claude Code and Pi Smart Routing:** enable Smart Routing for the session,
+then submit its first task from Chat. Repeat in a fresh session by typing the
+first task into Terminal and pressing Enter. Verify the routed model before
+inference and exactly one delivered turn for each submission. With Claude Code
+2.1.323+, record the saved default first and confirm it remains unchanged in
+a fresh independent Claude terminal. If a long wrapped first message cannot
+be safely replayed, use the saved-text notice for copying and explicit
+resubmission. With Pi, follow a completed tool call with a question about its
+result and verify retained history.
 
 **Pi model and effort changes:** in an existing session, select Medium, switch
 to a non-reasoning model, then to a reasoning model from another family. Send
@@ -790,7 +798,7 @@ Cross-harness journeys:
   and the "did not respond" cases in
   `web/src/pages/settings/SettingsHarnessesSection.test.tsx` and
   `web/src/shell/NewChatDialog.test.tsx`.
-- **`model-and-effort`, Claude Smart Routing (own environment):**
+- **`smart-routing`, `model-and-effort`, Claude (own environment):**
   `tests/e2e_ui/chat/test_claude_native_routing_preserves_default.py::test_claude_routing_preserves_default_and_delivers_once`
   drives a first Chat message and a first message typed into the embedded
   Terminal. It starts an isolated server and host, with a

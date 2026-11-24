@@ -1,0 +1,201 @@
+"""Real Claude draft preservation against an owned loopback provider, without a browser."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import uuid
+from pathlib import Path
+
+import pytest
+
+from omnigent.harnesses.claude_native import bridge, model_switch
+from tests._helpers.native_claude import (
+    _PINNED_CLAUDE_MODELS,
+    _assert_mock_claude_turn,
+    _assert_native_claude_turn,
+    _live_claude_snapshot,
+    _require_session_only_claude,
+    isolated_claude_mock_routing_stack,
+)
+from tests._helpers.polling import poll_until
+from tests._helpers.session import message_item_text, ordered_message_items
+from tests.e2e.conftest import get_mock_message_requests, set_fallback_mock_llm
+from tests.e2e.routing._helpers import claude_settings_snapshot
+from tests.harnesses.claude_native._model_status_oracle import native_claude_wire_model
+
+pytestmark = [
+    pytest.mark.mock_only,
+    pytest.mark.skipif(
+        shutil.which("claude") is None or shutil.which("tmux") is None,
+        reason="requires Claude Code and tmux",
+    ),
+    pytest.mark.timeout(300),
+]
+
+
+def test_claude_model_switch_preserves_application_wrapped_drafts(
+    tmp_path: Path,
+    isolated_mock_llm_server_url: str,
+    claude_managed_settings: None,
+) -> None:
+    mock_url = isolated_mock_llm_server_url
+    with isolated_claude_mock_routing_stack(
+        tmp_path,
+        mock_url,
+        models=_PINNED_CLAUDE_MODELS,
+        judge_model="mock-claude-draft-judge",
+    ) as (base_url, client, host_id, workspace, settings_path):
+        saved_settings = claude_settings_snapshot(settings_path)
+        agents = client.get("/v1/agents")
+        agents.raise_for_status()
+        agent_id = next(
+            row["id"] for row in agents.json()["data"] if row["name"] == "claude-native-ui"
+        )
+        created = client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "host_id": host_id,
+                "workspace": str(workspace),
+                "cost_control_mode_override": "off",
+            },
+            timeout=120,
+        )
+        created.raise_for_status()
+        session_id = str(created.json()["id"])
+        try:
+            _require_session_only_claude(base_url, session_id)
+            selected = client.patch(
+                f"/v1/sessions/{session_id}", json={"model_override": "sonnet"}
+            )
+            assert selected.status_code == 200, selected.text
+            model = _PINNED_CLAUDE_MODELS["sonnet"]
+            poll_until(
+                lambda: (
+                    _live_claude_snapshot(base_url, session_id)["llm_model"]
+                    == native_claude_wire_model(model)
+                ),
+                timeout_s=30,
+            )
+            assert claude_settings_snapshot(settings_path) == saved_settings
+            snapshot = _live_claude_snapshot(base_url, session_id)
+            bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
+            bridge_dir = bridge.bridge_dir_for_bridge_id(bridge_id)
+            advert = bridge.read_tmux_target(bridge_dir)
+            assert advert is not None, "The owned Claude terminal advertised no tmux pane"
+            tmux = ["tmux", "-S", advert["socket_path"]]
+            target = advert["tmux_target"]
+            columns = int(
+                subprocess.check_output(
+                    [*tmux, "display-message", "-p", "-t", target, "#{pane_width}"],
+                    text=True,
+                    timeout=5,
+                )
+            )
+            evidence = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
+            evidence.mkdir(parents=True, exist_ok=True)
+            for kind in ("soft-wrap", "hard-newline"):
+                nonce = uuid.uuid4().hex[:8]
+                marker, reply = f"draft-{kind}-{nonce}", f"preserved-draft-{nonce}"
+                draft = marker + " " + "0123456789 " * (columns // 8 + 1) + "draft-end"
+                if kind == "hard-newline":
+                    split_at = draft.index(" ", columns // 2)
+                    draft = draft[:split_at] + "\n" + draft[split_at:]
+                set_fallback_mock_llm(mock_url, "default", reply)
+                set_fallback_mock_llm(mock_url, native_claude_wire_model(model), reply)
+                buffer_name = f"owned-renderer-{uuid.uuid4().hex}"
+                subprocess.run(
+                    [*tmux, "load-buffer", "-b", buffer_name, "-"],
+                    input=draft,
+                    text=True,
+                    check=True,
+                    timeout=5,
+                )
+                subprocess.run(
+                    [*tmux, "paste-buffer", "-d", "-p", "-b", buffer_name, "-t", target],
+                    check=True,
+                    timeout=5,
+                )
+                raw = ""
+
+                def draft_rendered(expected_marker: str = marker) -> bool:
+                    nonlocal raw
+                    raw = bridge._capture_pane(advert["socket_path"], target)
+                    box = bridge._composer_box(raw)
+                    return bool(
+                        box is not None
+                        and box.framed
+                        and len(box.rows) > 1
+                        and expected_marker in box.rows[0]
+                        and "draft-end" in "\n".join(box.rows)
+                    )
+
+                poll_until(draft_rendered, timeout_s=10)
+                joined = bridge._capture_pane(advert["socket_path"], target, join_wrapped=True)
+                (evidence / f"{kind}-renderer.json").write_text(
+                    json.dumps(
+                        {"columns": columns, "input": draft, "raw": raw, "joined": joined},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                box = bridge._composer_box(raw)
+                assert box is not None and box.framed and len(box.rows) > 1
+                refused = client.patch(
+                    f"/v1/sessions/{session_id}", json={"model_override": "opus"}
+                )
+                assert refused.status_code == 503, refused.text
+                preserved = bridge._composer_box(
+                    bridge._capture_pane(advert["socket_path"], target)
+                )
+                assert preserved is not None and preserved.framed
+                assert preserved.rows == box.rows
+                assert claude_settings_snapshot(settings_path) == saved_settings
+                assert all(
+                    marker not in json.dumps(request)
+                    for request in get_mock_message_requests(mock_url)
+                )
+                assert _live_claude_snapshot(base_url, session_id)["llm_model"] == (
+                    native_claude_wire_model(model)
+                )
+
+                # Submit explicitly to observe logical newlines independently of wrapping.
+                subprocess.run([*tmux, "send-keys", "-t", target, "Enter"], check=True, timeout=5)
+                poll_until(
+                    lambda reply=reply: any(
+                        item.get("role") == "assistant" and message_item_text(item) == reply
+                        for item in ordered_message_items(base_url, session_id)
+                    ),
+                    timeout_s=30,
+                )
+                native_session, user_text = _assert_native_claude_turn(
+                    base_url, session_id, marker, reply, model
+                )
+                assert user_text == draft, {"expected": draft, "native_user_text": user_text}
+                _assert_mock_claude_turn(
+                    mock_url,
+                    marker,
+                    model,
+                    native_session=native_session,
+                    user_text=draft,
+                )
+                (evidence / f"{kind}-delivered.json").write_text(
+                    json.dumps(
+                        {"native_session": native_session, "user_text": user_text, "reply": reply},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                poll_until(
+                    lambda: (
+                        model_switch._draft(bridge._capture_pane(advert["socket_path"], target))
+                        == ""
+                    ),
+                    timeout_s=10,
+                )
+                assert claude_settings_snapshot(settings_path) == saved_settings
+        finally:
+            client.delete(f"/v1/sessions/{session_id}").raise_for_status()

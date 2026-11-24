@@ -73,6 +73,8 @@ def _isolate_provider_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep provider defaults independent of ambient CI context and catalog access."""
     monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
     monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    for alias in ("OPUS", "SONNET", "HAIKU", "FABLE"):
+        monkeypatch.delenv(f"ANTHROPIC_DEFAULT_{alias}_MODEL", raising=False)
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(

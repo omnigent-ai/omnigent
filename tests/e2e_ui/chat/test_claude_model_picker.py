@@ -6,7 +6,6 @@ import json
 import os
 import re
 import signal
-import subprocess
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,7 +15,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from omnigent.harnesses.claude_native import bridge, model_switch
+from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     CONTEXT_RAW_FILE,
@@ -39,7 +38,6 @@ from tests._helpers.native_claude import (
 )
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
-from tests.e2e.conftest import get_mock_message_requests
 from tests.e2e.routing._helpers import claude_settings_snapshot, claude_user_settings_path
 from tests.e2e_ui.conftest import (
     configure_mock_llm,
@@ -1169,7 +1167,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
         native_session, user_text = _assert_native_claude_turn(
             base_url, session_id, marker, reply, model
         )
-        _assert_mock_claude_turn(
+        prior_request = _assert_mock_claude_turn(
             mock_llm_server_url, marker, model, native_session=native_session, user_text=user_text
         )
         expect(page.get_by_test_id("error-headline")).to_have_count(0)
@@ -1188,109 +1186,9 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     )
     assert isinstance(bridge_id, str)
     bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-    tmux = ["tmux", "-S", advert["socket_path"]]
     target = advert["tmux_target"]
-    columns = int(
-        subprocess.check_output(
-            [*tmux, "display-message", "-p", "-t", target, "#{pane_width}"],
-            text=True,
-            timeout=5,
-        )
-    )
     evidence = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
     evidence.mkdir(parents=True, exist_ok=True)
-    with httpx.Client(base_url=base_url, timeout=40) as client:
-        for kind in ("soft-wrap", "hard-newline"):
-            nonce = uuid.uuid4().hex[:8]
-            marker, reply = f"draft-{kind}-{nonce}", f"preserved-draft-{nonce}"
-            draft = marker + " " + "0123456789 " * (columns // 8 + 1) + "draft-end"
-            if kind == "hard-newline":
-                split_at = draft.index(" ", columns // 2)
-                draft = draft[:split_at] + "\n" + draft[split_at:]
-            model = _PINNED_CLAUDE_MODELS["sonnet"]
-            set_fallback_mock_llm(mock_llm_server_url, "default", reply)
-            set_fallback_mock_llm(mock_llm_server_url, _native_claude_wire_model(model), reply)
-            buffer_name = f"owned-renderer-{uuid.uuid4().hex}"
-            subprocess.run(
-                [*tmux, "load-buffer", "-b", buffer_name, "-"],
-                input=draft,
-                text=True,
-                check=True,
-                timeout=5,
-            )
-            subprocess.run(
-                [*tmux, "paste-buffer", "-d", "-p", "-b", buffer_name, "-t", target],
-                check=True,
-                timeout=5,
-            )
-            raw = ""
-
-            def draft_rendered(expected_marker: str = marker) -> bool:
-                nonlocal raw
-                raw = bridge._capture_pane(advert["socket_path"], target)
-                box = bridge._composer_box(raw)
-                return bool(
-                    box is not None
-                    and box.framed
-                    and len(box.rows) > 1
-                    and expected_marker in box.rows[0]
-                    and "draft-end" in "\n".join(box.rows)
-                )
-
-            poll_until(draft_rendered, timeout_s=10)
-            joined = bridge._capture_pane(advert["socket_path"], target, join_wrapped=True)
-            (evidence / f"{kind}-renderer.json").write_text(
-                json.dumps(
-                    {"columns": columns, "input": draft, "raw": raw, "joined": joined},
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            box = bridge._composer_box(raw)
-            assert box is not None and box.framed and len(box.rows) > 1
-            refused = client.patch(f"/v1/sessions/{session_id}", json={"model_override": "opus"})
-            assert refused.status_code == 503, refused.text
-            preserved = bridge._composer_box(bridge._capture_pane(advert["socket_path"], target))
-            assert preserved is not None and preserved.framed
-            assert preserved.rows == box.rows
-            assert claude_settings_snapshot(saved_settings_path) == saved_settings
-            assert all(
-                marker not in json.dumps(request)
-                for request in get_mock_message_requests(mock_llm_server_url)
-            )
-            assert _live_claude_snapshot(base_url, session_id)["llm_model"] == (
-                _native_claude_wire_model(model)
-            )
-            _screenshot(page, f"real-native-{kind}-draft-refused")
-
-            # Explicit submission exposes logical newlines independently of screen wrapping.
-            subprocess.run([*tmux, "send-keys", "-t", target, "Enter"], check=True, timeout=5)
-            _wait_for_transcript_message(page, base_url, session_id, reply, role="assistant")
-            native_session, user_text = _assert_native_claude_turn(
-                base_url, session_id, marker, reply, model
-            )
-            assert user_text == draft, {"expected": draft, "native_user_text": user_text}
-            prior_request = _assert_mock_claude_turn(
-                mock_llm_server_url,
-                marker,
-                model,
-                native_session=native_session,
-                user_text=draft,
-            )
-            (evidence / f"{kind}-delivered.json").write_text(
-                json.dumps(
-                    {"native_session": native_session, "user_text": user_text, "reply": reply},
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            _screenshot(page, f"real-native-{kind}-draft-delivered")
-            poll_until(
-                lambda: (
-                    model_switch._draft(bridge._capture_pane(advert["socket_path"], target)) == ""
-                ),
-                timeout_s=10,
-            )
 
     _ensure_chat_view(page)
     nonce = uuid.uuid4().hex[:8]
@@ -1392,10 +1290,10 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
         mock_llm_server_url,
         base_url=base_url,
         session_id=session_id,
-        index=7,
+        index=5,
         user_marker=marker,
         assistant_token=reply,
-        expected_assistant_bubbles=7,
+        expected_assistant_bubbles=5,
     )
     _wait_for_transcript_message(page, base_url, session_id, reply, role="assistant")
     native_session, user_text = _assert_native_claude_turn(

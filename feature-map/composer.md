@@ -77,6 +77,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   the saved default through session-only picks. Older or unverified versions
   keep an already selected model when status matches the same native session;
   actual legacy model changes may also change the saved default.
+  A long first message wrapped by Claude can remain saved but unsent if a
+  required model change cannot confirm its original text exactly. Copy the
+  saved text from the informational notice and resubmit it explicitly; the
+  notice does not automatically retry selection or send the message.
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
@@ -743,6 +747,20 @@ composer with its prompt`).
   success journey. Requires Claude Code and tmux. Use a clean container when
   machine-managed settings override the mock endpoint; short synthetic replies
   do not establish live gateway compatibility or inference beyond 200K tokens.
+  A held Sonnet turn also checks that the browser stays visibly working while
+  a model control completes; that turn finishes once and the following turn
+  uses Opus.
+- **`model-picker`, terminal draft preservation (own environment):**
+  `tests/e2e/test_claude_native_model_drafts.py::test_claude_model_switch_preserves_application_wrapped_drafts`
+  uses a real Claude CLI and an owned loopback provider without a browser.
+  Soft-wrapped and hard-newline drafts cause a refused switch while their
+  rendered text and saved settings stay unchanged. Explicit Enter then
+  delivers the complete original text once, checked against public history,
+  the native transcript and the provider request. The captured original-input
+  case in
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_model_command_keeps_the_captured_application_wrapped_replacement`
+  separately checks that ambiguous application wrapping sends no control keys.
+  These checks do not establish automatic replay of long first messages.
 - **`model-picker`, paused Pi after server restart (own environment):**
   Start a Pi session on a host with a configured local catalog, pause the
   session, restart only the server, and reload the session. Open the model
@@ -1226,7 +1244,11 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   chords. All of them yield to a focused terminal or code editor, so press them
   with the transcript or composer focused.
 - A refused model or effort change rolls the pill back to the applied setting.
-  There is no separate error control to inspect.
+  Read any actionable error card or saved-text notice that accompanies it.
+- Claude's own line wrapping can prevent automatic replay of a long first
+  message. A refused required selection keeps that message saved but unsent;
+  copying and explicit resubmission remain necessary. Notice delivery can
+  retry once, but it does not retry model selection or send the saved prompt.
 - Codex effort can change from the terminal as well as the composer. Confirm the
   terminal command actually landed before blaming the mirror.
 - The mock environment configures Claude and Codex only. Other harnesses'
