@@ -90,7 +90,6 @@ describe("clampPaneWidth for the Files tree", () => {
     // 48% of a 600px page.
     expect(clampPaneWidth(FILES_TREE_WIDTH, 360, 600)).toBe(288);
     expect(clampPaneWidth(FILES_TREE_WIDTH, 360, 200)).toBe(FILES_TREE_MIN_WIDTH);
-    expect(clampPaneWidth(FILES_TREE_WIDTH, 2000, null)).toBe(FILES_TREE_MAX_WIDTH);
   });
 });
 

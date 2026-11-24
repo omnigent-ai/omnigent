@@ -19,6 +19,10 @@ export interface FilesPageTreeProps {
   showHidden: boolean;
   /** Shows hidden files, for a workspace whose every file is hidden. */
   onShowHidden?: () => void;
+  /** List what Git ignores, marked as ignored; otherwise leave it out. */
+  showIgnored: boolean;
+  /** Shows ignored files, for a workspace where Git ignores every file. */
+  onShowIgnored?: () => void;
   /** `newTab` for a ⌘-click (Ctrl-click off macOS) or a middle click, which want the file in its own tab. */
   onFileSelect: (path: string, options?: { newTab: true }) => void;
 }
@@ -36,15 +40,25 @@ function TreeMessage({ children, alert = false }: { children: string; alert?: bo
   );
 }
 
+/** Why a listing shows nothing: everything left is hidden, or Git ignores the rest. */
+function hiddenListingMessage(listed: number, ignoredHidden: boolean): string {
+  if (listed === 0) return "No files here, apart from any that Git ignores.";
+  return ignoredHidden
+    ? "Every file here is hidden or ignored by Git."
+    : "Every file here is hidden.";
+}
+
 export function FilesPageTree({
   conversationId,
   activePath,
   sort,
   showHidden,
   onShowHidden,
+  showIgnored,
+  onShowIgnored,
   onFileSelect,
 }: FilesPageTreeProps) {
-  const files = useWorkspaceAllFiles(conversationId);
+  const files = useWorkspaceAllFiles(conversationId, { hideIgnored: !showIgnored });
   const changes = useWorkspaceChangedFiles(conversationId);
   if (files.isPending) return <TreeMessage>Loading files…</TreeMessage>;
   if (files.isError) {
@@ -56,16 +70,28 @@ export function FilesPageTree({
   }
   if (!files.data.available) return <TreeMessage>This session has no workspace files.</TreeMessage>;
   const entries = files.data.data;
-  if (entries.length === 0) return <TreeMessage>No files in the workspace.</TreeMessage>;
-  if (visibleEntries(entries, showHidden).length === 0) {
+  // Only a host that left out what Git ignores can be hiding more than this listing shows.
+  const ignoredHidden = files.data.ignoredHidden === true;
+  const hidden = visibleEntries(entries, showHidden).length === 0;
+  if (entries.length === 0 && !ignoredHidden) {
+    return <TreeMessage>No files in the workspace.</TreeMessage>;
+  }
+  if (hidden) {
     return (
       <div className="flex flex-col items-start gap-2 pb-2">
-        <TreeMessage>Every file here is hidden.</TreeMessage>
-        {onShowHidden ? (
-          <Button type="button" variant="outline" size="sm" className="mx-3" onClick={onShowHidden}>
-            Show hidden files
-          </Button>
-        ) : null}
+        <TreeMessage>{hiddenListingMessage(entries.length, ignoredHidden)}</TreeMessage>
+        <div className="mx-3 flex flex-wrap gap-2">
+          {entries.length > 0 && onShowHidden ? (
+            <Button type="button" variant="outline" size="sm" onClick={onShowHidden}>
+              Show hidden files
+            </Button>
+          ) : null}
+          {ignoredHidden && onShowIgnored ? (
+            <Button type="button" variant="outline" size="sm" onClick={onShowIgnored}>
+              Show git-ignored files
+            </Button>
+          ) : null}
+        </div>
       </div>
     );
   }
@@ -78,6 +104,7 @@ export function FilesPageTree({
       changedFiles={changes.data?.available ? changes.data.data : []}
       sort={sort}
       showHidden={showHidden}
+      showIgnored={showIgnored}
       refreshToken={0}
       onFileSelect={onFileSelect}
       reveal={null}

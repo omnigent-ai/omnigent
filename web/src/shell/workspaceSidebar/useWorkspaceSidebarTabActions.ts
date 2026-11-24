@@ -12,6 +12,7 @@ import {
   tabActionCommandFor,
   type WorkspaceTabAction,
   type WorkspaceTabActionCommand,
+  type WorkspaceTabGroupCloseAction,
   type WorkspaceTabListFacts,
   workspaceTabActionCommands,
 } from "../workspaceCommands/model";
@@ -25,11 +26,16 @@ import {
 } from "../workspaceTabs/keepSidebarFocus";
 import type { TabStripWidth } from "../workspaceTabs/useTabStripWidth";
 import { isPinnedTab } from "../workspaceTabs/pinnedTabs";
+import { groupClosesOf, type TabGroupId } from "../workspaceTabs/tabGroups";
 import { useWorkspaceTabStepping } from "../workspaceTabs/useWorkspaceTabStepping";
 import type { StripTabMenuItem } from "../workspaceTabs/WorkspaceStripTab";
 import type { TabId } from "../workspaceTabs/workspacePlace";
-import type { WorkspaceTab } from "../workspaceTabs/workspaceTab";
-import { isOnlyEmptyNewTab, type WorkspaceTabsStore } from "../workspaceTabs/workspaceTabsStore";
+import { isUnknownTab, type WorkspaceTab } from "../workspaceTabs/workspaceTab";
+import {
+  isBatchClosable,
+  isOnlyEmptyNewTab,
+  type WorkspaceTabsStore,
+} from "../workspaceTabs/workspaceTabsStore";
 
 /** Chords only the focused strip handles, so their ⌘K rows carry none; the menu still shows them. */
 const STRIP_TAB_SHORTCUTS: Partial<Record<WorkspaceTabAction, ShortcutId>> = {
@@ -61,10 +67,29 @@ export interface WorkspaceSidebarTabActionsOptions {
   closeStepsFor?: (tab: WorkspaceTab) => TabCloseSteps;
   /** Releases what closing others leaves behind, such as a browser view. */
   releaseFor?: (tab: WorkspaceTab) => (() => Promise<boolean>) | undefined;
+  /**
+   * Closes the strip entry `tabId` stands for when the host shows several tabs as one, such as
+   * a split, returning the close; null to close it as a tab. Used by Close tab and its chord.
+   */
+  closeEntry?: (tabId: TabId, source?: "pointer") => Promise<{ ok: boolean }> | null;
+  /**
+   * Moves the strip entry `tabId` is in one entry over, with every tab it stands for, where the
+   * host shows several tabs as one; true once handled, even with no entry to move past, and
+   * false to move it as a tab. Used by Move Tab Left and Right, their chords and the menu.
+   */
+  moveEntry?: (tabId: TabId, delta: -1 | 1) => boolean;
   /** The actions only some hosts offer. */
   offers?: { newTab?: () => void; searchTabs?: () => void };
   /** Offers Pin and Unpin, for a strip that shows pinned tabs; `refusalFor` says why a tab can't. */
   pinning?: { refusalFor?: (tabId: TabId) => string | undefined };
+  /**
+   * Offers closing a group of tabs at once, for a tab list that groups them: the group each
+   * tab is listed under, and whether a pull request tab's PR has merged.
+   */
+  tabGroups?: {
+    groupOf: (tab: WorkspaceTab) => TabGroupId;
+    merged: (tab: WorkspaceTab) => boolean;
+  };
   /** Puts the sidebar on screen, as reopening a tab does. */
   onReveal?: () => void;
 }
@@ -86,8 +111,11 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     canClose = () => true,
     closeStepsFor,
     releaseFor,
+    closeEntry,
+    moveEntry,
     offers = {},
     pinning,
+    tabGroups,
     onReveal,
   } = options;
   const { tabs, selectedTabId, canReopen } = store.snapshot();
@@ -100,20 +128,34 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     const tab = store.findTab(tabId);
     if (tab && !canClose(tab)) return;
     const closing = store.close(tabId, tab && closeStepsFor ? closeStepsFor(tab) : {});
-    // A pointer close keeps the strip still under the pointer, so only a keyboard close moves focus.
-    if (source !== "pointer") {
-      void keepSidebarFocusAfterClose(
-        closing,
-        () => store.snapshot().selectedTabId,
-        fromSidebar ?? isFocusInWorkspaceSidebar(),
-      );
-    }
+    keepFocusAfterKeyboardClose(closing, source, fromSidebar);
+  };
+  // A pointer close keeps the strip still under the pointer, so only a keyboard close moves focus.
+  const keepFocusAfterKeyboardClose = (
+    closing: Promise<{ ok: boolean }>,
+    source: "pointer" | undefined,
+    fromSidebar: boolean | undefined,
+  ) => {
+    if (source === "pointer") return;
+    void keepSidebarFocusAfterClose(
+      closing,
+      () => store.snapshot().selectedTabId,
+      fromSidebar ?? isFocusInWorkspaceSidebar(),
+    );
+  };
+  // The tab the strip shows for `tabId`: a split closes as one, keeping focus as a tab's close does.
+  const closeVisibleTab = (tabId: TabId, source?: "pointer", fromSidebar?: boolean) => {
+    const inSidebar = fromSidebar ?? isFocusInWorkspaceSidebar();
+    const closing = closeEntry?.(tabId, source) ?? null;
+    if (closing === null) closeTab(tabId, source, inSidebar);
+    else keepFocusAfterKeyboardClose(closing, source, inSidebar);
   };
   // Shells stay: closing others shouldn't end every shell with a dialog each.
   const closeOtherTabs = (keepTabId: TabId) => {
     void store.closeOthers(keepTabId, releaseFor ?? (() => undefined));
   };
   const moveTab = (tabId: TabId, delta: -1 | 1) => {
+    if (moveEntry?.(tabId, delta)) return;
     const index = store.tabs().findIndex((tab) => tab.id === tabId);
     if (index !== -1) store.move(tabId, index + delta);
   };
@@ -132,9 +174,32 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
   const reopenClosedTab = () => {
     if (store.reopenClosed() !== null) onReveal?.();
   };
+  // What each group close takes: the tabs shown here that this user may close and that close
+  // as a group, so pinned tabs and shells stay.
+  const groupCloseTargets = (() => {
+    if (!tabGroups) return undefined;
+    const targets: Record<WorkspaceTabGroupCloseAction, TabId[]> = {
+      "close-merged-pull-requests": [],
+      "close-pull-request-tabs": [],
+      "close-file-tabs": [],
+      "close-page-tabs": [],
+    };
+    for (const tab of tabs) {
+      if (isUnknownTab(tab) || !isBatchClosable(tab) || !canClose(tab)) continue;
+      for (const action of groupClosesOf(tabGroups.groupOf(tab), tabGroups.merged(tab))) {
+        targets[action].push(tab.id);
+      }
+    }
+    return targets;
+  })();
+  const closeGroup = (action: WorkspaceTabGroupCloseAction) => {
+    const targetIds = groupCloseTargets?.[action];
+    if (!targetIds?.length) return;
+    void store.closeMany(targetIds, releaseFor ?? (() => undefined));
+  };
 
-  const selectedIndex =
-    selectedTabId === null ? -1 : tabs.findIndex((tab) => tab.id === selectedTabId);
+  // Moves and Close Others go by the strip's entries, a split being one.
+  const selectedIndex = selectedEntryId === null ? -1 : entryIds.indexOf(selectedEntryId);
   const selectedTab = selectedTabId === null ? undefined : store.findTab(selectedTabId);
   const facts: WorkspaceTabListFacts = {
     canReopen,
@@ -142,11 +207,18 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     selectedPinned: selectedTab !== undefined && isPinnedTab(selectedTab),
     selectedPinRefusal: selectedTabId === null ? undefined : pinning?.refusalFor?.(selectedTabId),
     selectedIndex,
-    tabCount: tabs.length,
+    tabCount: entryIds.length,
     sidebarOpen,
     selectedCloseRefusal: selectedTabId === null ? undefined : closeRefusalFor?.(selectedTabId),
     selectedIsOnlyEmptyNewTab: selectedTabId !== null && isOnlyEmptyNewTab(tabs, selectedTabId),
     selectedLabel,
+    ...(groupCloseTargets
+      ? {
+          groupCloseCounts: Object.fromEntries(
+            Object.entries(groupCloseTargets).map(([action, ids]) => [action, ids.length]),
+          ) as Record<WorkspaceTabGroupCloseAction, number>,
+        }
+      : {}),
   };
   const commands = workspaceTabActionCommands(facts).filter(
     (command) =>
@@ -166,7 +238,7 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
         return;
       case "close-tab":
         if (selectedTabId !== null) {
-          closeTab(selectedTabId, undefined, origin?.fromWorkspaceSidebar);
+          closeVisibleTab(selectedTabId, undefined, origin?.fromWorkspaceSidebar);
         }
         return;
       case "reopen":
@@ -186,6 +258,12 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
         return;
       case "search-tabs":
         offers.searchTabs?.();
+        return;
+      case "close-merged-pull-requests":
+      case "close-pull-request-tabs":
+      case "close-file-tabs":
+      case "close-page-tabs":
+        closeGroup(command.action);
         return;
     }
   };
@@ -214,18 +292,14 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
   };
 
   /** The menu every ordinary tab shows: close it or the others, move it, reopen one. */
-  const menuItemsFor = (
-    tabId: TabId,
-    index: number,
-    label: string,
-    closable: boolean,
-  ): StripTabMenuItem[] => {
+  const menuItemsFor = (tabId: TabId, label: string, closable: boolean): StripTabMenuItem[] => {
     // This tab's own commands, so its rows read as the menus and ⌘K do, and Close names it
     // even while another tab is selected.
     const rowTab = store.findTab(tabId);
     const rowCommands = workspaceTabActionCommands({
       ...facts,
-      selectedIndex: index,
+      // Its place among the strip's entries, which Move Left and Right go by, a split being one.
+      selectedIndex: entryIds.indexOf(tabId),
       selectedLabel: label,
       selectedPinned: rowTab !== undefined && isPinnedTab(rowTab),
       selectedPinRefusal: pinning?.refusalFor?.(tabId),
@@ -296,6 +370,7 @@ export function useWorkspaceSidebarTabActions(options: WorkspaceSidebarTabAction
     facts,
     run,
     closeTab,
+    closeVisibleTab,
     closeOtherTabs,
     moveTab,
     togglePin,

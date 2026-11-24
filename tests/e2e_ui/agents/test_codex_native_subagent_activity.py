@@ -78,19 +78,26 @@ async def _forward_events(
 ) -> None:
     """Drive Codex events through the real forwarder into the live server."""
     tracker = codex_native_forwarder._CodexElicitationTaskTracker()
-    async with httpx.AsyncClient(base_url=base_url) as client:
-        for event in events:
-            await codex_native_forwarder._handle_event(
-                client,
-                session_id=session_id,
-                bridge_dir=Path(),
-                event=event,
-                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(client, session_id),
-                elicitation_tracker=tracker,
-                expected_thread_id=_PARENT_THREAD,
-                forwarder_state=state,
-            )
-    await tracker.close()
+    try:
+        async with httpx.AsyncClient(base_url=base_url) as client:
+            try:
+                for event in events:
+                    await codex_native_forwarder._handle_event(
+                        client,
+                        session_id=session_id,
+                        bridge_dir=Path(),
+                        event=event,
+                        usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
+                            client, session_id
+                        ),
+                        elicitation_tracker=tracker,
+                        expected_thread_id=_PARENT_THREAD,
+                        forwarder_state=state,
+                    )
+            finally:
+                await state.close_child_streams()
+    finally:
+        await tracker.close()
 
 
 def _forward_events_sync(
@@ -140,3 +147,27 @@ def test_codex_child_stays_done_in_agents_rail_after_stale_running_snapshot(
     _forward_events_sync(base_url, session_id, [_stale_running_snapshot_event()], state)
     _assert_child_completed(base_url, session_id)
     _expect_child_row_done(page, base_url, session_id)
+
+    _forward_events_sync(
+        base_url,
+        session_id,
+        [
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": _CHILD_THREAD,
+                    "turn": {"id": "turn_child_2", "status": "inProgress"},
+                },
+            }
+        ],
+        state,
+    )
+    children = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/child_sessions", timeout=10.0
+    ).json()["data"]
+    assert children[0]["busy"] is True
+    assert children[0]["current_task_status"] == "in_progress"
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_test_id("subagent-status-avatar")).to_have_attribute(
+        "aria-label", "Working", timeout=10_000
+    )

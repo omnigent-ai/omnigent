@@ -1,9 +1,11 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
+import { PaneLoading } from "@/components/PageLoading";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
   LazyFileActionHost,
+  LazyShowAllPullRequestsCommand,
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
   showAgentBrowserTab,
@@ -27,6 +29,8 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
+import { ChatPaneStrip } from "./ChatPaneStrip";
+import { useFloatingPanes, useFloatingPanesShown } from "./useFloatingPanes";
 import {
   Outlet,
   useLocation,
@@ -39,7 +43,12 @@ import { useDesktopCommand } from "@/lib/desktopCommands";
 import { CANVAS_CONVERSATION_MIN_WIDTH } from "@/canvas/CanvasWorkspace";
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
-import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
+import {
+  PROJECT_LABEL_KEY,
+  type Conversation,
+  useProjects,
+  useSyncMutedProjects,
+} from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
@@ -58,7 +67,10 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
+import { DesktopAppHandoffPage } from "@/components/DesktopAppHandoffPage";
+import { useDesktopAppHandoff } from "@/hooks/useDesktopAppHandoff";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isSessionWindow } from "@/lib/sessionWindow";
 import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
 import { useReportLocalTimezone } from "@/hooks/useReportLocalTimezone";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -71,6 +83,8 @@ import {
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
+  reportRightSidebarVisibility,
+  resetRightSidebarWindowTracking,
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
@@ -115,6 +129,7 @@ import { browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
 import { agentBrowserTabId } from "@/components/BrowserPane/agentTools/agentTabs";
 import { useRevealBrowserOnAgentTabs } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
+import { startSavingBrowserPages } from "@/lib/browserTabPages";
 import {
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
@@ -154,7 +169,6 @@ import { ChatHeader } from "./ChatHeader";
 import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/ProjectHomeHeader";
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
-import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import type { FilePosition, OpenFileOptions, FileNavigationGuard } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
@@ -184,7 +198,7 @@ import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { resolveDefaultShell } from "./preferredShell";
-import { WorkspacePanel } from "./WorkspacePanel";
+import { type ShellCloseCallbacks, WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import { TasksTabOnOpen } from "./TasksTabOnOpen";
 import {
@@ -406,9 +420,16 @@ function AppShellImpl() {
   // create window (or on a stale temp reload, before ChatPage redirects).
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
   const pendingConversation = conversationId != null && serverConversationId == null;
+  const handedOverConversation = useDesktopAppHandoff(
+    serverConversationId,
+    !isCanvasPathname(location.pathname, rebasePath("/canvas")) &&
+      !new URLSearchParams(location.search).has("file"),
+  );
   // With tabs enabled, links, pages and shells open there. The session ref stays null
   // until a new session has its real id: there are no tabs to open in before that.
   const tabsSidebar = useTabsSidebar();
+  const floatingPanes = useFloatingPanes();
+  const floatingPanesShown = useFloatingPanesShown();
   const tabsModeRef = useRef(false);
   tabsModeRef.current = tabsSidebar;
   const tabsSessionRef = useRef<string | null>(null);
@@ -701,9 +722,17 @@ function AppShellImpl() {
     },
     [cancelRightPanelVisibilityMotion],
   );
+  // Whether the rail can show here and how far it widens the window, for the shell's setting.
+  const rightSidebarWindowRef = useRef({ canShow: false, width: (): number => 0 });
+  useEffect(() => {
+    resetRightSidebarWindowTracking();
+  }, [conversationId]);
   const setRightPanelOpenAnimated = useCallback((open: boolean) => {
     if (rightPanelOpenRef.current === open) return;
     rightPanelOpenRef.current = open;
+    // Only in-session opens and closes resize the window; a session switch restores its rail.
+    const rail = rightSidebarWindowRef.current;
+    if (rail.canShow) reportRightSidebarVisibility(open, open ? rail.width() : 0);
     if (rightPanelMotionTimerRef.current !== null) {
       window.clearTimeout(rightPanelMotionTimerRef.current);
     }
@@ -758,6 +787,8 @@ function AppShellImpl() {
   // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
   const { data: conversationsData, isLoading: conversationsLoading } = useLoadedConversations();
   const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
+  // Mirror muted projects into the store that notifications and rows read.
+  useSyncMutedProjects();
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
   // the active conversation id, which suppresses the notification/badge for
@@ -1055,14 +1086,25 @@ function AppShellImpl() {
   const deleteTerminalMutation = useDeleteTerminal(conversationId ?? "");
   // Tab key awaiting a close confirmation, or null. Closing a tab kills the
   // terminal, so a user-initiated close routes through a confirm modal first.
-  const [terminalPendingClose, setTerminalPendingClose] = useState<string | null>(null);
-  // While a close is in flight, grey the tab being killed so the delay between
-  // confirming and the tab disappearing (the DELETE round-trip + its
-  // ``resource.deleted``) reads as "closing", not frozen.
-  const closingTerminalKey =
-    deleteTerminalMutation.isPending && deleteTerminalMutation.variables
-      ? `terminal:${deleteTerminalMutation.variables}`
-      : null;
+  const [terminalPendingClose, setTerminalPendingClose] = useState<{
+    keys: string[];
+    callbacks?: ShellCloseCallbacks;
+  } | null>(null);
+  // While a close is in flight, grey the tabs being killed so the delay between
+  // confirming and a tab disappearing (the DELETE round-trip + its
+  // ``resource.deleted``) reads as "closing", not frozen. A bulk close kills
+  // several shells at once, and the mutation's ``variables`` holds only the last.
+  const [killingTerminalIds, setKillingTerminalIds] = useState<readonly string[]>([]);
+  const deletingTerminalId = deleteTerminalMutation.isPending
+    ? deleteTerminalMutation.variables
+    : undefined;
+  const closingTerminalKeys = useMemo(
+    () =>
+      [
+        ...new Set([...killingTerminalIds, ...(deletingTerminalId ? [deletingTerminalId] : [])]),
+      ].map((id) => `terminal:${id}`),
+    [killingTerminalIds, deletingTerminalId],
+  );
   // A user-initiated "+"→Shell create: snapshot the shell tabs present when it
   // starts so the effect below can focus the newly-created shell the instant
   // its tab lands in the list. That's decoupled from the create POST, which on
@@ -1188,6 +1230,7 @@ function AppShellImpl() {
   }, [rootSessionId, rootSessionResolved]);
   const {
     panelWidth: inlinePanelWidth,
+    widthInWiderWindow: inlinePanelWidthInWiderWindow,
     preferredContentWidth: preferredConversationWidth,
     handleProps: inlinePanelHandleProps,
     isDragging: inlinePanelResizing,
@@ -1247,6 +1290,10 @@ function AppShellImpl() {
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
+  rightSidebarWindowRef.current = {
+    canShow: Boolean(conversationId) && hasRailContent,
+    width: inlinePanelWidthInWiderWindow,
+  };
   const initialWorkspaceTab = readInitialWorkspaceTab();
   const fallbackWorkspaceTab =
     initialWorkspaceTab !== null && railTabsAvailable[initialWorkspaceTab]
@@ -1264,6 +1311,9 @@ function AppShellImpl() {
   useEffect(() => {
     resyncBrowserSuppression();
   }, []);
+
+  // Keep each browser tab's address and title after the shell destroys its view.
+  useEffect(() => startSavingBrowserPages(), []);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
@@ -2363,15 +2413,18 @@ function AppShellImpl() {
   );
   const closeWorkspacePanel = useCallback(
     (tab: DefaultWorkspaceTab) => {
-      const remaining = openPanels.filter((panel) => panel !== tab);
-      setOpenPanels(remaining);
-      if (rightRailTab === tab) {
-        setRightRailTab(
-          remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab,
+      // Functional updates, so closing several panels in one pass drops them all.
+      setOpenPanels((previous) => {
+        const remaining = previous.filter((panel) => panel !== tab);
+        setRightRailTab((current) =>
+          current === tab
+            ? (remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab)
+            : current,
         );
-      }
+        return remaining;
+      });
     },
-    [openPanels, rightRailTab, fallbackWorkspaceTab, railTabsAvailable],
+    [fallbackWorkspaceTab, railTabsAvailable],
   );
 
   // Auto-open a Browser soft tab on a `navigate` action — agent-issued
@@ -2464,24 +2517,25 @@ function AppShellImpl() {
     setRightPanelOpenAnimated,
     revealTabsSidebar,
   ]);
-  // The chat's task preview, a task's marker, or the agent's first plan asks
-  // for this session's Tasks tab: open the rail on it, or its drawer on a phone
-  // unless the agent asked, then clear the one-shot request.
+  // A click on the task preview or a task's marker, the agent's first plan, or opening a
+  // session with tasks asks for its Tasks tab; clear the one-shot request, then show it.
   const tasksTabToOpen = useSessionTasksActions((state) => state.tasksTabToOpen);
   useEffect(() => {
     if (tasksTabToOpen === null || tasksTabToOpen !== conversationId) return;
-    const automatic = useSessionTasksActions.getState().tasksTabAutoOpen;
-    useSessionTasksActions.setState({ tasksTabToOpen: null, tasksTabAutoOpen: false });
+    const requestedBy = useSessionTasksActions.getState().tasksTabRequestedBy;
+    useSessionTasksActions.setState({ tasksTabToOpen: null, tasksTabRequestedBy: "click" });
     if (!railTabsAvailable.tasks) return;
     if (isMobileViewport()) {
-      // A drawer the agent opened would cover the chat it's working in.
-      if (automatic) return;
+      // Only a click opens the phone drawer; automatic requests would cover the chat.
+      if (requestedBy !== "click") return;
       if (!tabsModeRef.current) {
         openTasksPanel();
         return;
       }
     }
     selectRightRailTab("tasks");
+    // The rail keeps the session's saved open state, else the Workspace panel default.
+    if (requestedBy === "session-open") return;
     if (tabsModeRef.current) revealTabsSidebar();
     else setRightPanelOpenAnimated(true);
   });
@@ -2696,8 +2750,12 @@ function AppShellImpl() {
 
   // User clicked a tab's "x". Closing a tab kills the underlying terminal, so
   // confirm first rather than acting immediately.
-  const requestCloseTerminal = useCallback((key: string) => {
-    setTerminalPendingClose(key);
+  const requestCloseTerminal = useCallback((key: string, callbacks?: ShellCloseCallbacks) => {
+    setTerminalPendingClose({ keys: [key], callbacks });
+  }, []);
+  // A bulk tab close asks once for all of its shells.
+  const requestCloseTerminals = useCallback((keys: string[], callbacks?: ShellCloseCallbacks) => {
+    if (keys.length > 0) setTerminalPendingClose({ keys, callbacks });
   }, []);
   // Confirmed close: kill the terminal (DELETE). The `session.resource.deleted`
   // delta + the mutation's cache prune drop it from the list, so its tab
@@ -2705,18 +2763,31 @@ function AppShellImpl() {
   // previous, else the next) so the rail doesn't snap back to Files; when none
   // remain the selection clears.
   const confirmCloseTerminal = useCallback(() => {
-    const key = terminalPendingClose;
-    if (key === null) return;
+    if (terminalPendingClose === null) return;
+    const { keys, callbacks } = terminalPendingClose;
     setTerminalPendingClose(null);
     setSelectedTerminalKey((active) => {
-      if (active !== key) return active;
-      const idx = openTerminals.indexOf(key);
-      const remaining = openTerminals.filter((k) => k !== key);
-      if (remaining.length === 0) return null;
-      return remaining[idx - 1] ?? remaining[idx] ?? remaining[0];
+      if (active === null || !keys.includes(active)) return active;
+      const idx = openTerminals.indexOf(active);
+      const kept = (key: string) => !keys.includes(key);
+      return (
+        openTerminals.slice(0, Math.max(idx, 0)).findLast(kept) ??
+        openTerminals.slice(idx + 1).find(kept) ??
+        null
+      );
     });
-    const info = terminals.find((t) => terminalTabKey(t) === key);
-    if (info && conversationId) deleteTerminalMutation.mutate(info.id);
+    if (!conversationId) return;
+    callbacks?.onConfirmed?.();
+    for (const key of keys) {
+      const info = terminals.find((t) => terminalTabKey(t) === key);
+      if (!info) continue;
+      setKillingTerminalIds((ids) => [...ids, info.id]);
+      // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
+      deleteTerminalMutation
+        .mutateAsync(info.id)
+        .catch(() => callbacks?.onFailed?.(key))
+        .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== info.id)));
+    }
   }, [terminalPendingClose, openTerminals, terminals, conversationId, deleteTerminalMutation]);
 
   // The active shell selection is sticky: it changes only on explicit user
@@ -3100,6 +3171,10 @@ function AppShellImpl() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" keeps the switcher.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  // A terminal-first chat's card has a row of its own, over its Chat and Terminal views, which
+  // takes the Chat/Terminal switch. A sidebar shell in the main view has no switch to hold.
+  // It shows wherever the cards float, below the desktop layout's width too.
+  const chatPaneStrip = floatingPanesShown && !!conversationId && terminalFirst && !isShellView;
   const shellViewTargetAvailable =
     isShellView && terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey);
 
@@ -3235,6 +3310,8 @@ function AppShellImpl() {
       }}
       fileViewer={fileViewerContextValue}
     >
+      {/* Covers the page until the user chooses to stay in the browser. */}
+      {handedOverConversation && <DesktopAppHandoffPage conversationId={handedOverConversation} />}
       {/* One for the whole window, so a grid of sidebars runs each request once. */}
       {/* A host that breaks only disables the file actions. */}
       {tabsSidebar && (
@@ -3243,6 +3320,16 @@ function AppShellImpl() {
             <LazyFileActionHost />
           </Suspense>
         </RenderErrorBoundary>
+      )}
+      {/* Mounted only for a tabs sidebar session, so without the flag nothing runs. */}
+      {tabsSidebar && serverConversationId && (
+        <Suspense fallback={null}>
+          <LazyShowAllPullRequestsCommand
+            sessionId={serverConversationId}
+            pullRequestsAvailable={railTabsAvailable.github}
+            showAll={() => openGithubTab()}
+          />
+        </Suspense>
       )}
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
@@ -3266,6 +3353,7 @@ function AppShellImpl() {
             // maximized workspace rail's tab strip in index.css): with the
             // sidebar open over the window corner there are no lights to clear.
             data-sidebar-open={sidebarOpen ? "true" : undefined}
+            data-floating-panes={floatingPanes ? "" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
           >
@@ -3357,15 +3445,17 @@ function AppShellImpl() {
               <div
                 data-workspace-panel-resizing={inlinePanelResizing || undefined}
                 data-workspace-panel-animate={rightPanelVisibilityAnimating || undefined}
+                // A session's column, whose chat page (its terminal view included) floats as one pane.
+                data-main-view={conversationId ? "chat" : undefined}
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
                 )}
                 style={
                   {
-                    "--workspace-panel-offset": workspacePanelVisible
-                      ? `${inlinePanelWidth}px`
-                      : "0px",
+                    // Only an inline rail takes room beside the header; below md it's a drawer.
+                    "--workspace-panel-offset":
+                      workspacePanelVisible && !mobileViewport ? `${inlinePanelWidth}px` : "0px",
                     "--omnigent-header-height": headerClearanceHidden ? "0px" : undefined,
                   } as CSSProperties
                 }
@@ -3398,7 +3488,6 @@ function AppShellImpl() {
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
                     workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
-                    createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}
@@ -3486,11 +3575,18 @@ function AppShellImpl() {
                   data-flyout-boundary=""
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
+                  data-chat-pane-strip={chatPaneStrip ? "" : undefined}
                 >
+                  {chatPaneStrip && conversationId && (
+                    <ChatPaneStrip conversationId={conversationId} />
+                  )}
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
                       <ShellCommandContext.Provider value={shellCommandAction}>
-                        <Outlet />
+                        {/* A lazy page loading its chunk must not suspend the whole shell. */}
+                        <Suspense fallback={<PaneLoading />}>
+                          <Outlet />
+                        </Suspense>
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
@@ -3636,8 +3732,9 @@ function AppShellImpl() {
                       autoFocusTerminalRef.current.conversationId === conversationId &&
                       autoFocusTerminalRef.current.key === selectedTerminalKey
                     }
-                    closingTerminalKey={closingTerminalKey}
+                    closingTerminalKeys={closingTerminalKeys}
                     onCloseTerminal={requestCloseTerminal}
+                    onCloseTerminals={requestCloseTerminals}
                     maximized={rightPanelMaximized}
                     onToggleMaximized={toggleRightPanelMaximized}
                     permissionLevel={permissionLevel}
@@ -3753,9 +3850,12 @@ function AppShellImpl() {
           )}
           <CloseShellDialog
             open={terminalPendingClose !== null}
+            shellCount={terminalPendingClose?.keys.length}
             shellLabel={(() => {
-              if (terminalPendingClose === null) return null;
-              const info = terminals.find((t) => terminalTabKey(t) === terminalPendingClose);
+              if (terminalPendingClose?.keys.length !== 1) return null;
+              const info = terminals.find(
+                (t) => terminalTabKey(t) === terminalPendingClose.keys[0],
+              );
               if (!info) return null;
               return terminalDisplayLabel(info);
             })()}
@@ -3818,11 +3918,12 @@ function AppShellImpl() {
 }
 
 /**
- * Initial sidebar open state — open on desktop, closed on mobile. SSR-
- * safe (returns false when window is undefined). The threshold is
- * Tailwind's `md` breakpoint, used in the Sidebar's responsive classes.
+ * Initial sidebar open state — open on desktop, closed on mobile and in a
+ * popped-out session window, which shows just its session. SSR-safe (returns
+ * false when window is undefined). The threshold is Tailwind's `md` breakpoint,
+ * used in the Sidebar's responsive classes.
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return isDesktopLayout();
+  return isDesktopLayout() && !isSessionWindow();
 }

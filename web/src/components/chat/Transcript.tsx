@@ -28,7 +28,6 @@ import { sendableQueuedHead, useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
-import { DbcertBanner } from "@/components/DbcertBanner";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
@@ -66,11 +65,11 @@ import {
   userMessageOrigin,
   withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
+import { TranscriptPaletteCommands } from "@/components/chat/TranscriptPaletteCommands";
 import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
 export interface TranscriptProps {
-  hostId: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -162,7 +161,6 @@ export function isNativeFindShortcut(
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
-  hostId,
   setConversationEl,
   containerEl,
   scroller,
@@ -178,6 +176,7 @@ function TranscriptImpl({
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
+  const failedUploads = useChatStore((s) => s.failedUploads);
   const failedInputs = useChatStore((s) => s.failedInputs);
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
@@ -224,12 +223,14 @@ function TranscriptImpl({
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
+      failedUploads,
     );
   }, [
     blocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -439,6 +440,8 @@ function TranscriptImpl({
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
               hasPinnedBanner ? "pt-4" : "pt-20",
+              // In a chat pane, the panes view and the pane's strip already clear the header.
+              "in-data-chat-pane-body-host:pt-4",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -528,6 +531,10 @@ function TranscriptImpl({
           </ConversationContent>
           {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
           <ConversationScrollRefBridge onScroller={setScroller} />
+          <TranscriptPaletteCommands
+            conversationId={display.conversationId}
+            bubbles={display.streamBubbles}
+          />
           <ConversationScrollButton
             className={
               isMobileViewport
@@ -545,10 +552,9 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+        {/* Too-many-tabs and sandbox-launch warnings, siblings of Conversation. */}
         <FloatingBannerStack>
           <StreamBudgetBanner />
-          <DbcertBanner conversationId={conversationId} hostId={hostId} />
           <SandboxActionBanner />
         </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}

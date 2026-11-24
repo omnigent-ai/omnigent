@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { planOpen, type OpenState } from "../planOpen";
 import {
+  allPullRequestsChosen,
   changesComparisonShown,
   changesFileInNewTab,
   changesOverview,
@@ -132,6 +133,14 @@ describe("pull request tab", () => {
       replace: false,
     });
     expect(pullRequestSectionChosen(page, "summary")).toEqual({ type: "none" });
+  });
+
+  it("shows the session's list of pull requests in its own tab, not this one", () => {
+    expect(allPullRequestsChosen()).toEqual({
+      type: "open",
+      link: { place: { kind: "pulls" } },
+      options: { opener: "user", disposition: "focus" },
+    });
   });
 });
 

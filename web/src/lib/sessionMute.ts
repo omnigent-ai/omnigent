@@ -1,6 +1,9 @@
 // The viewer's mute preferences. Once this tab saves one, its entry here outranks
 // row labels, which rollbacks and lagging reads can leave stale.
 
+import { useSyncExternalStore } from "react";
+import { sessionBelongsToProject } from "@/shell/sidebarNav";
+
 /**
  * The reserved `conversation_labels` key recording that the viewer muted a
  * session. Per-viewer on the server like the pin; absent when unmuted.
@@ -26,11 +29,79 @@ interface MuteEntry {
 interface LabeledRow {
   id: string;
   labels?: Record<string, string> | null;
+  project_id?: string | null;
+  owner?: string | null;
+}
+
+interface MutedProject {
+  id: string;
+  name: string;
 }
 
 const entries = new Map<string, MuteEntry>();
 const recheckListeners = new Set<(id: string) => void>();
 const recheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+let mutedProjects: readonly MutedProject[] = [];
+// Only the viewer's own sessions are filed in their projects.
+let mutedProjectsViewerId: string | null = null;
+const mutedProjectListeners = new Set<() => void>();
+
+/**
+ * Replace the viewer's muted projects from their project list. A folder without
+ * a first-class id can't store a mute, so it never counts.
+ */
+export function setMutedProjects(
+  projects: readonly { id: string | null; name: string; muted?: boolean }[],
+  viewerId: string | null,
+): void {
+  const next = projects.flatMap((project) =>
+    project.muted === true && project.id !== null ? [{ id: project.id, name: project.name }] : [],
+  );
+  const unchanged =
+    viewerId === mutedProjectsViewerId &&
+    next.length === mutedProjects.length &&
+    next.every(
+      (project, index) =>
+        project.id === mutedProjects[index].id && project.name === mutedProjects[index].name,
+    );
+  if (unchanged) return;
+  mutedProjects = next;
+  mutedProjectsViewerId = viewerId;
+  for (const listener of mutedProjectListeners) listener();
+}
+
+function subscribeMutedProjects(listener: () => void): () => void {
+  mutedProjectListeners.add(listener);
+  return () => {
+    mutedProjectListeners.delete(listener);
+  };
+}
+
+function mutedProjectsSnapshot(): readonly MutedProject[] {
+  return mutedProjects;
+}
+
+/**
+ * Re-render when the viewer mutes or unmutes a project; rows whose own data
+ * didn't change otherwise keep a stale mute.
+ *
+ * @returns The current muted projects; a new array after each change.
+ */
+export function useMutedProjects(): readonly MutedProject[] {
+  return useSyncExternalStore(subscribeMutedProjects, mutedProjectsSnapshot);
+}
+
+/** Whether the viewer muted this session itself, regardless of its project. */
+export function isSessionMuted(row: LabeledRow): boolean {
+  return entries.get(row.id)?.muted ?? !!row.labels?.[MUTED_LABEL_KEY];
+}
+
+/** Whether the session sits in the folder of a project the viewer muted. */
+export function isInMutedProject(row: LabeledRow): boolean {
+  return mutedProjects.some((project) =>
+    sessionBelongsToProject(row, project, mutedProjectsViewerId),
+  );
+}
 
 /** Capture before a server read starts; pass the result to {@link reconcileMuteLabel}. */
 export function muteReadMarker(): number {
@@ -69,9 +140,9 @@ function scheduleRecheck(id: string, at: number): void {
   recheckTimers.set(id, timer);
 }
 
-/** Whether the viewer muted this session. */
+/** Whether the viewer muted this session, directly or through its project. */
 export function isConversationMuted(row: LabeledRow): boolean {
-  return entries.get(row.id)?.muted ?? !!row.labels?.[MUTED_LABEL_KEY];
+  return isSessionMuted(row) || isInMutedProject(row);
 }
 
 /** Whether unseen output surfaces as unread for this viewer; a muted session shows none. */
@@ -140,4 +211,6 @@ export function reconcileMuteLabel<T extends LabeledRow>(row: T, readMarker: num
 export function clearSessionMuteState(): void {
   for (const id of [...recheckTimers.keys()]) cancelRecheck(id);
   entries.clear();
+  mutedProjects = [];
+  mutedProjectsViewerId = null;
 }

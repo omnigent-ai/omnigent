@@ -17,6 +17,13 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { offersSavedWorkflows, WorkflowPicker } from "@/components/composer/WorkflowPicker";
 import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
+import { isCommandAvailable } from "@/store/paletteCommands";
+import {
+  type ComposerAddActionId,
+  composerAddAction,
+  composerAddActions,
+} from "./composerAddActions";
+import { useComposerAddPaletteCommands } from "./useComposerAddPaletteCommands";
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
 const EMPTY_WORKFLOWS: readonly SavedWorkflow[] = [];
@@ -56,6 +63,7 @@ export function ComposerAddMenu({
   onOpen,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
+  paletteSource,
 }: {
   disabled: boolean;
   onAttach: () => void;
@@ -87,12 +95,37 @@ export function ComposerAddMenu({
   onOpen?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
+  /** Where ⌘K offers these actions too, with quick_pick_palette on; one composer sets it. */
+  paletteSource?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
   const [showWorkflows, setShowWorkflows] = useState(false);
   const listsSavedWorkflows =
     onRunSavedWorkflow !== undefined && offersSavedWorkflows(savedWorkflows, workflowPagination);
+  // The items' availability, shared with ⌘K's composer commands.
+  const actions = composerAddActions({
+    attachDisabled,
+    sideChat: onSideChat !== undefined,
+    showGoal,
+    goal: onGoal !== undefined,
+    goalDisabled,
+    goalActive,
+    goalDescription,
+    showPlan,
+    plan: onPlan !== undefined,
+    planDisabled,
+    planActive,
+    planUnavailableReason,
+  });
+  const unavailable = (id: ComposerAddActionId) =>
+    !isCommandAvailable(composerAddAction(actions, id).availability);
+  useComposerAddPaletteCommands(paletteSource, actions, {
+    attach: onAttach,
+    "side-chat": onSideChat,
+    goal: onGoal,
+    plan: onPlan,
+  });
   const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState<{
@@ -224,7 +257,7 @@ export function ComposerAddMenu({
               <DropdownMenuItem
                 className="mobile-touch-target"
                 onSelect={onAttach}
-                disabled={attachDisabled}
+                disabled={unavailable("attach")}
               >
                 <span className="flex size-4 shrink-0 items-center justify-center">
                   <PaperclipIcon className="size-3.5" />
@@ -282,7 +315,7 @@ export function ComposerAddMenu({
                   {showGoal && (
                     <DropdownMenuItem
                       className="mobile-touch-target"
-                      disabled={!onGoal || goalDisabled}
+                      disabled={unavailable("goal")}
                       title={!onGoal ? goalDescription : undefined}
                       data-testid="composer-goal-action"
                       data-active={goalActive || undefined}
@@ -302,7 +335,7 @@ export function ComposerAddMenu({
                       data-testid="composer-plan-action"
                       data-active={planActive || undefined}
                       aria-label={planLabel}
-                      disabled={!onPlan || planDisabled}
+                      disabled={unavailable("plan")}
                       onSelect={onPlan}
                       title={onPlan ? undefined : planUnavailableReason}
                     >

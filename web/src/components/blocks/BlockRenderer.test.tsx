@@ -1669,7 +1669,13 @@ describe("BlockRenderer dispatch", () => {
     });
 
     describe("task markers", () => {
-      const marker = (entryId: string, status: string, name: string): RenderItem => ({
+      const marker = (
+        entryId: string,
+        status: string,
+        name: string,
+        turnElapsedS?: number,
+        native = false,
+      ): RenderItem => ({
         kind: "subagent_activity",
         itemId: `item_${entryId}`,
         data: {
@@ -1677,38 +1683,302 @@ describe("BlockRenderer dispatch", () => {
           event_type: "session.journal.task",
           resource_type: "journal",
           resource_id: "hello",
-          resource: { name, status, text: null, entry_id: entryId, native: false },
+          resource: { name, status, text: null, entry_id: native ? null : entryId, native },
         },
+        ...(turnElapsedS !== undefined ? { turnElapsedS } : {}),
+      });
+      const planLine = (entryId: string, added: string, turnElapsedS: number): RenderItem => ({
+        kind: "subagent_activity",
+        itemId: `item_${entryId}`,
+        data: {
+          type: "resource_event",
+          event_type: "session.journal.plan",
+          resource_type: "journal",
+          resource_id: entryId,
+          resource: {
+            change: "updated",
+            name: "Stage checks",
+            tasks: 32,
+            added: [added],
+            removed: [],
+            entry_id: entryId,
+          },
+        },
+        turnElapsedS,
+      });
+      const text = (itemId: string, value: string, phase?: "commentary" | "final_answer") =>
+        ({
+          kind: "text",
+          itemId,
+          text: value,
+          final: true,
+          ...(phase ? { phase } : {}),
+        }) satisfies RenderItem;
+      const turn = (
+        items: RenderItem[],
+        props: Partial<Parameters<typeof BlockRenderer>[0]> = {},
+        workflows = true,
+      ) => (
+        <MemoryRouter>
+          <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows } }}>
+            <BlockRenderer items={items} sessionStatus="idle" {...props} />
+          </CapabilitiesProvider>
+        </MemoryRouter>
+      );
+      // What a settled turn shows before anything is expanded, in order.
+      const outline = () =>
+        Array.from(
+          document.querySelectorAll(
+            '.turn-fold-row button, [data-testid="task-activity"], [data-testid="assistant-text-section"]',
+          ),
+          (node) => node.textContent?.trim(),
+        );
+
+      it("folds the work between a Codex turn's task markers, timing each fold by its markers", () => {
+        render(
+          turn(
+            [
+              text("m0", "I'll check what the coordinator reviews.", "commentary"),
+              tool(1, "Bash"),
+              tool(2, "Bash"),
+              text("m1", "I'm tracking this follow-up in the journal.", "commentary"),
+              planLine("p1", "Explain the stage", 36),
+              marker("e1", "started", "Explain the stage", 37),
+              tool(3, "Bash"),
+              tool(4, "Bash"),
+              text("m2", "The coordinator checked the ticket 29 times.", "commentary"),
+              tool(5, "Bash"),
+              marker("e2", "done", "Explain the stage", 142),
+              text("m3", "Because it checked progress, not the stage.", "final_answer"),
+            ],
+            { workedForS: 150 },
+          ),
+        );
+        expect(outline()).toEqual([
+          "Worked for 36s",
+          "Updated the plan: added Explain the stage",
+          "Started Explain the stage",
+          "Worked for 1m 45s",
+          "Completed Explain the stage",
+          "Because it checked progress, not the stage.",
+        ]);
+
+        fireEvent.click(screen.getByRole("button", { name: "Worked for 1m 45s" }));
+        expect(screen.getByText("The coordinator checked the ticket 29 times.")).toBeDefined();
+        expect(screen.getByText("Ran 2 shell commands")).toBeDefined();
+        expect(screen.getByText("Ran 1 shell command")).toBeDefined();
+        expect(screen.queryByText("I'll check what the coordinator reviews.")).toBeNull();
       });
 
-      it("keeps a settled turn's task markers in view instead of folding its work", () => {
+      it("keeps Claude Code's narration between the folds a task's markers bound", () => {
         render(
-          <MemoryRouter>
-            <CapabilitiesProvider
-              info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
-            >
-              <BlockRenderer
-                items={[
-                  tool(1, "Agent"),
-                  marker("e1", "started", "Say hello"),
-                  tool(2, "Agent"),
-                  marker("e2", "done", "Say hello"),
-                  { kind: "text", itemId: "m1", text: "Said hello.", final: true },
-                ]}
-                sessionStatus="idle"
-                workedForS={9}
-              />
-            </CapabilitiesProvider>
-          </MemoryRouter>,
+          turn(
+            [
+              text("m0", "I'll check what the coordinator reviews."),
+              tool(1, "Bash"),
+              text("m1", "I'm tracking this follow-up in the journal."),
+              marker("e1", "started", "Explain the stage", 20),
+              tool(2, "Bash"),
+              text("m2", "The coordinator checked the ticket 29 times."),
+              tool(3, "Bash"),
+              marker("e2", "done", "Explain the stage", 90),
+              text("m3", "Because it checked progress, not the stage."),
+            ],
+            { workedForS: 100 },
+          ),
         );
-        expect(screen.queryByRole("button", { name: "Worked for 9s" })).toBeNull();
-        expect(screen.getAllByTestId("task-activity").map((node) => node.textContent)).toEqual([
-          "Started Say hello",
-          "Completed Say hello",
+        // A stretch with more than one work run can't time each run, like a turn without markers.
+        expect(outline()).toEqual([
+          "I'll check what the coordinator reviews.",
+          "Worked for 20s",
+          "I'm tracking this follow-up in the journal.",
+          "Started Explain the stage",
+          "Worked",
+          "The coordinator checked the ticket 29 times.",
+          "Worked",
+          "Completed Explain the stage",
+          "Because it checked progress, not the stage.",
         ]);
-        // The tool calls on either side of a marker stay in their own group.
+      });
+
+      it("folds the tool calls on either side of a marker separately", () => {
+        render(
+          turn(
+            [
+              tool(1, "Agent"),
+              marker("e1", "started", "Say hello", 4),
+              tool(2, "Agent"),
+              marker("e2", "done", "Say hello", 7),
+              text("m1", "Said hello."),
+            ],
+            { workedForS: 9 },
+          ),
+        );
+        expect(outline()).toEqual([
+          "Worked for 4s",
+          "Started Say hello",
+          "Worked for 3s",
+          "Completed Say hello",
+          "Said hello.",
+        ]);
+        fireEvent.click(screen.getByRole("button", { name: "Worked for 4s" }));
+        fireEvent.click(screen.getByRole("button", { name: "Worked for 3s" }));
         expect(screen.getAllByText("Called 1 tool")).toHaveLength(2);
-        expect(screen.getByText("Said hello.")).toBeDefined();
+      });
+
+      it("reads Worked on both sides of a marker whose place in the turn is unknown", () => {
+        render(
+          turn(
+            [tool(1), marker("e1", "started", "Say hello"), tool(2), text("m1", "Said hello.")],
+            {
+              workedForS: 9,
+            },
+          ),
+        );
+        expect(outline()).toEqual(["Worked", "Started Say hello", "Worked", "Said hello."]);
+      });
+
+      it("leaves a turn with markers but no message unfolded unless it continues", () => {
+        const items = [tool(1), marker("e1", "started", "Say hello", 4), tool(2)];
+        const view = render(turn(items, { workedForS: 10 }));
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(screen.getAllByText("Called 1 tool")).toHaveLength(2);
+        view.unmount();
+
+        render(turn(items, { workedForS: 10, continued: true }));
+        expect(outline()).toEqual(["Worked for 4s", "Started Say hello", "Worked for 6s"]);
+      });
+
+      it("keeps a failure and a pending approval in view around markers", () => {
+        const failed: RenderItem[] = [
+          tool(1, "Bash"),
+          marker("e1", "started", "Say hello", 4),
+          tool(2, "Bash"),
+          { kind: "error", itemId: null, source: "", code: "server_error", message: "Failed." },
+        ];
+        const view = render(turn(failed, { workedForS: 9 }));
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(screen.getAllByText("Ran 1 shell command")).toHaveLength(2);
+        view.unmount();
+
+        render(
+          turn([
+            tool(1, "Bash"),
+            marker("e1", "started", "Say hello", 4),
+            elicitation("pending", null),
+            tool(2, "Bash"),
+            text("m1", "Waiting on you."),
+          ]),
+        );
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
+        expect(screen.getByTestId("approval-card").getAttribute("data-state")).toBe("pending");
+        expect(screen.getByTestId("task-activity").textContent).toBe("Started Say hello");
+      });
+
+      it("doesn't split a fold at a marker the chat hides", () => {
+        const items = (native: boolean) => [
+          tool(1),
+          marker("e1", "started", "Say hello", 4, native),
+          tool(2),
+          text("m1", "Said hello."),
+        ];
+        // Without workflows, a plan task's marker renders nothing, so its work folds as one.
+        const view = render(turn(items(false), { workedForS: 9 }, false));
+        expect(outline()).toEqual(["Worked for 9s", "Said hello."]);
+        view.unmount();
+
+        // The agent's own tasks show either way.
+        render(turn(items(true), { workedForS: 9 }, false));
+        expect(outline()).toEqual([
+          "Worked for 4s",
+          "Started Say hello",
+          "Worked for 5s",
+          "Said hello.",
+        ]);
+      });
+
+      it("folds a marker turn once it settles, keeping its markers mounted", async () => {
+        const items: RenderItem[] = [
+          tool(1, "Bash"),
+          marker("e1", "started", "Say hello", 4),
+          tool(2, "Bash"),
+          marker("e2", "done", "Say hello", 7),
+          text("m1", "Said hello."),
+        ];
+        const view = render(
+          turn(items, { sessionStatus: "running", turnLifecycle: "streaming", workedForS: 9 }),
+        );
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        const [started, done] = screen.getAllByTestId("task-activity");
+
+        view.rerender(
+          turn(items, { sessionStatus: "running", turnLifecycle: "completed", workedForS: 9 }),
+        );
+        // The fold waits out the settle debounce, then folds both runs.
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        await waitFor(() => expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2));
+        await waitFor(() =>
+          expect(screen.getByRole("button", { name: "Worked for 3s" })).toHaveAttribute(
+            "aria-expanded",
+            "false",
+          ),
+        );
+        const [startedAfter, doneAfter] = screen.getAllByTestId("task-activity");
+        expect(startedAfter).toBe(started);
+        expect(doneAfter).toBe(done);
+      });
+
+      it("keeps a sub-agent's notice between the markers it landed between", () => {
+        const returned: RenderItem = {
+          kind: "subagent_activity",
+          itemId: "notice_returned",
+          data: {
+            type: "resource_event",
+            event_type: "session.subagent.returned",
+            resource_type: "session",
+            resource_id: "conv_child",
+            resource: { title: "Peirce" },
+          },
+        };
+        const follows = (earlier: Node, later: Node) =>
+          (earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+        // No work between the markers: the notice stays in view instead of joining
+        // the fold before "Started".
+        const view = render(
+          turn(
+            [
+              tool(1, "Agent"),
+              marker("e1", "started", "Say hello", 4),
+              returned,
+              marker("e2", "done", "Say hello", 7),
+              text("m1", "Said hello."),
+            ],
+            { workedForS: 9 },
+          ),
+        );
+        const [started, done] = screen.getAllByTestId("task-activity");
+        const notice = screen.getByTestId("subagent-activity");
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(follows(started!, notice) && follows(notice, done!)).toBe(true);
+        view.unmount();
+
+        // Nor does it join the work after a marker when none came before it.
+        render(
+          turn(
+            [
+              text("m0", "Checking in with Peirce."),
+              returned,
+              marker("e1", "started", "Say hello", 4),
+              tool(1, "Agent"),
+              text("m1", "Said hello."),
+            ],
+            { workedForS: 9 },
+          ),
+        );
+        expect(
+          follows(screen.getByTestId("subagent-activity"), screen.getByTestId("task-activity")),
+        ).toBe(true);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
       });
     });
 

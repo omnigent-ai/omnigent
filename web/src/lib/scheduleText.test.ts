@@ -199,6 +199,10 @@ describe("validateSchedule — 1-hour floor + required selections", () => {
 });
 
 describe("describeSchedule", () => {
+  it("describes a withheld trigger rule as nothing", () => {
+    expect(describeSchedule(null)).toBe("");
+  });
+
   it("describes a one-time rule as once", () => {
     expect(
       describeSchedule(
@@ -353,6 +357,10 @@ describe("describeSchedule", () => {
 });
 
 describe("nextRunAtMs", () => {
+  it("has no next run without a rule", () => {
+    expect(nextRunAtMs(null, "UTC")).toBeNull();
+  });
+
   it("computes the next daily occurrence after now", () => {
     // 2026-01-01 06:00 UTC; a 9:00 UTC daily rule fires later the same day.
     const now = new Date("2026-01-01T06:00:00Z");

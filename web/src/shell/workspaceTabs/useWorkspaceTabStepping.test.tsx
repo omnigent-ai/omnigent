@@ -172,7 +172,7 @@ describe("useWorkspaceTabStepping", () => {
       });
     };
 
-    it("enables Previous and Next Tab, which step the strip even while a page has focus", async () => {
+    it("enables Previous and Next Tab, whose commands from the desktop menu step the strip", async () => {
       render(<Strip entryIds={["files", "terminal:zsh", "browser:1"]} />);
       await act(async () => {});
       expect(reported).toEqual(expect.arrayContaining(["next-tab", "previous-tab"]));
@@ -191,15 +191,21 @@ describe("useWorkspaceTabStepping", () => {
       expect(event.defaultPrevented).toBe(true);
     });
 
-    it("steps from the chord on an older shell whose menu never sends Previous or Next Tab", async () => {
+    it("steps from the chord on an older shell whose menu sends no commands, and enables neither", async () => {
+      const setDesktopCommandState = vi.fn<(state: { commands: string[] }) => void>();
+      Object.assign(window, { omnigentDesktop: { kind: "electron", setDesktopCommandState } });
       render(<Strip entryIds={["files", "terminal:zsh", "browser:1"]} />);
+      await act(async () => {});
+      const enabled = setDesktopCommandState.mock.calls.flatMap(([state]) => state.commands);
+      expect(enabled).not.toContain("next-tab");
+      expect(enabled).not.toContain("previous-tab");
       await pressChord("next");
       expect(pressed()).toBe("browser:1");
       await pressChord("next");
       expect(pressed()).toBe("files");
     });
 
-    it("leaves a code editor's key unhandled, so the editor folds and the page doesn't step", async () => {
+    it("neither steps nor handles the chord while a code editor has focus", async () => {
       render(
         <>
           <Strip entryIds={["files", "terminal:zsh", "browser:1"]} />
@@ -215,7 +221,7 @@ describe("useWorkspaceTabStepping", () => {
       expect(event.defaultPrevented).toBe(false);
     });
 
-    it("steps for every press in quick succession, from the chord with autorepeat and from the menu", async () => {
+    it("steps for every repeated press, from the chord with autorepeat and from the menu", async () => {
       render(<Strip entryIds={["files", "terminal:zsh", "browser:1"]} />);
       await pressChord("next");
       await pressChord("next", document.body, { repeat: true });

@@ -20,10 +20,13 @@ round-trip complements it by exercising the batch blocks end-to-end.
 from __future__ import annotations
 
 import ast
+import shutil
 import tempfile
+import textwrap
 import warnings
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
@@ -163,3 +166,71 @@ def test_full_migration_chain_round_trips_on_sqlite() -> None:
             )
         finally:
             engine.dispose()
+
+
+# Commits part way, as a migration must on CockroachDB, then keeps working.
+_PART_WAY_MIGRATION = """
+import sqlalchemy as sa
+from alembic import op
+
+revision = "a1"
+down_revision = None
+
+
+def upgrade():
+    op.create_table("progress", sa.Column("step", sa.String(16), primary_key=True))
+    op.execute("INSERT INTO progress (step) VALUES ('before')")
+    op.get_bind().commit()
+    op.execute("INSERT INTO progress (step) VALUES ('after')")
+"""
+# Commits part way, then fails before it finishes.
+_FAILING_MIGRATION = """
+from alembic import op
+
+revision = "b2"
+down_revision = "a1"
+
+
+def upgrade():
+    op.execute("INSERT INTO progress (step) VALUES ('committed')")
+    op.get_bind().commit()
+    op.execute("INSERT INTO progress (step) VALUES ('unfinished')")
+    raise RuntimeError("the migration failed part way")
+"""
+
+
+def test_work_after_a_part_way_commit_persists_under_alembics_own_connection(
+    tmp_path: Path,
+) -> None:
+    """The real env.py commits what a migration leaves open, but never unfinished work.
+
+    Each migration gets its own transaction where DDL isn't transactional (SQLite here,
+    CockroachDB in production), so a migration that commits part way leaves the rest of
+    its work, and its revision, in a transaction Alembic never commits.
+    """
+    scripts = tmp_path / "migrations"
+    (scripts / "versions").mkdir(parents=True)
+    shutil.copy(Path(omnigent.db.__file__).parent / "migrations" / "env.py", scripts)
+    (scripts / "versions" / "a1_part_way.py").write_text(textwrap.dedent(_PART_WAY_MIGRATION))
+    (scripts / "versions" / "b2_failing.py").write_text(textwrap.dedent(_FAILING_MIGRATION))
+    uri = f"sqlite:///{tmp_path / 'part_way.db'}"
+    config = Config()
+    config.set_main_option("script_location", str(scripts))
+    config.set_main_option("sqlalchemy.url", uri)
+    engine = sa.create_engine(uri)
+
+    def recorded() -> tuple[set[str], str]:
+        with engine.connect() as conn:
+            steps = set(conn.execute(sa.text("SELECT step FROM progress")).scalars())
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+        return steps, version
+
+    try:
+        command.upgrade(config, "a1")
+        assert recorded() == ({"before", "after"}, "a1")
+        with pytest.raises(RuntimeError, match="failed part way"):
+            command.upgrade(config, "b2")
+        # Work committed before the failure stays; the unfinished rest and the revision don't.
+        assert recorded() == ({"before", "after", "committed"}, "a1")
+    finally:
+        engine.dispose()

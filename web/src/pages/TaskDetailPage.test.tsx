@@ -46,6 +46,7 @@ import type {
   ScheduledTaskRunSteps,
 } from "@/lib/scheduledTasksApi";
 import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { usePlanStops } from "@/store/planStops";
 
 const navigate = vi.fn();
@@ -932,6 +933,21 @@ describe("header actions", () => {
       expect(navigate).toHaveBeenCalledWith("/tasks");
     },
   );
+
+  it("offers the header's actions in ⌘K with quick_pick_palette on, running the same handlers", () => {
+    setTask(task({ state: "active" }));
+    const info = { ...SERVER_INFO_OFFLINE_FALLBACK, features: { quick_pick_palette: true } };
+    render(<CapabilitiesProvider info={info}>{pageTree()}</CapabilitiesProvider>);
+    const command = (label: string) =>
+      Object.values(usePaletteCommandsStore.getState().groups)
+        .flatMap((group) => group.commands)
+        .find((candidate) => candidate.label === label)!;
+    act(() => command("Pause automation").run());
+    expect(updateMutate).toHaveBeenCalledWith({ id: "st_1", input: { state: "paused" } });
+    act(() => command("Edit automation…").run());
+    expect(screen.getByTestId("edit-dialog-open")).toHaveAttribute("data-editing-id", "st_1");
+    usePaletteCommandsStore.setState({ groups: {} });
+  });
 
   it("edit opens the reused create dialog in edit mode", () => {
     setTask(task());

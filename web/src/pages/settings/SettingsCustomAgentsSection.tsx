@@ -112,8 +112,6 @@ export function SettingsCustomAgentsSection() {
           {CUSTOM_AGENT_CREATE_ENTRY.label}
         </h1>
         <CreateAgentForm
-          settingsEntry={CUSTOM_AGENT_CREATE_ENTRY}
-          submitLabel={CUSTOM_AGENT_CREATE_ENTRY.parts.submit}
           notice="Reusing an installed agent's name replaces its configuration and updates its sessions. Use a new name to keep both agents."
           onCancel={() => navigate(BASE)}
           onCreate={async (input) => {

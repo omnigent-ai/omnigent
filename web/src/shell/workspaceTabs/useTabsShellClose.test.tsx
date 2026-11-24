@@ -11,7 +11,7 @@ const shell = (id: string, name: string): TerminalInfo => ({
   session: "s1",
   running: true,
 });
-const TERMINALS = [shell("t1", "zsh"), shell("t2", "bash")];
+const TERMINALS = [shell("t1", "zsh"), shell("t2", "bash"), shell("t3", "fish")];
 
 function closer(deleteTerminal = vi.fn(async () => undefined)) {
   const view = renderHook(() => useTabsShellClose({ terminals: TERMINALS, deleteTerminal }));
@@ -53,6 +53,40 @@ describe("useTabsShellClose", () => {
     expect(result.current.question?.label).toBe("bash · s1");
     act(() => result.current.answerQuestion(true));
     await expect(newer).resolves.toBe(true);
+  });
+
+  it("asks once for a split's shells, naming each, and skips one that's gone", async () => {
+    const { result } = closer();
+    let closing!: Promise<boolean>;
+    act(() => {
+      closing = result.current.confirmCloseShells([
+        "terminal:t1",
+        "terminal:gone",
+        "terminal:t2",
+        "terminal:t3",
+      ]);
+    });
+    expect(result.current.question).toMatchObject({
+      label: "zsh · s1, bash · s1 and fish · s1",
+      count: 3,
+    });
+    act(() => result.current.answerQuestion(true));
+    await expect(closing).resolves.toBe(true);
+
+    // Two shells read "a and b"; a newer single close keeps them.
+    act(() => {
+      closing = result.current.confirmCloseShells(["terminal:t1", "terminal:t2"]);
+    });
+    expect(result.current.question?.label).toBe("zsh · s1 and bash · s1");
+    act(() => void result.current.confirmCloseShell("terminal:t3"));
+    await expect(closing).resolves.toBe(false);
+    expect(result.current.question).toMatchObject({ label: "fish · s1", count: 1 });
+  });
+
+  it("lets a split whose shells are all gone close without asking", async () => {
+    const { result } = closer();
+    await expect(result.current.confirmCloseShells(["terminal:gone"])).resolves.toBe(true);
+    expect(result.current.question).toBeNull();
   });
 
   it("ends the shell, says when it couldn't, and lets a gone shell's tab close", async () => {

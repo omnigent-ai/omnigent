@@ -27,6 +27,7 @@ const {
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
+const { isDesktopOpenRequest } = require("./desktopOpenServer");
 const { createAgentNavigation } = require("./agentNavigation");
 const { hasHostLocalAccess } = require("./hostIdentity");
 const { agentInputInFlight } = require("./browserInput");
@@ -510,6 +511,8 @@ function createBrowserViewRegistry({
   // IP literals and exact loopback names need only the URL check; `*.localhost`
   // must also be on a direct route so a proxy never receives the request.
   async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
+    // A page in an embedded browser pane must not steer the user's main window.
+    if (isDesktopOpenRequest(url)) return true;
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);

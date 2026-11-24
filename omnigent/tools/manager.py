@@ -13,7 +13,6 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
-from omnigent.runtime import get_caps
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
@@ -397,10 +396,11 @@ class ToolManager:
                     "Unknown built-in tool %r — skipping. "
                     "Available: web_search, web_read, web_fetch, "
                     "search_conversations, export_agent. "
-                    "Note: list_comments, update_comment, sys_upload_file, "
-                    "sys_list_files and sys_download_file are "
-                    "framework-owned and auto-registered; they cannot "
-                    "be declared in the spec. "
+                    "Note: list_comments and update_comment are "
+                    "framework-owned and auto-registered, and "
+                    "sys_files_upload, sys_files_list and "
+                    "sys_files_download come from tool_groups.files: true; "
+                    "none of them can be declared in the spec. "
                     "(Interactive shells now go through the "
                     "spec-level `terminals:` block + sys_terminal_*; "
                     "one-shot shells use sys_os_shell.)",
@@ -555,9 +555,9 @@ class ToolManager:
         # Advise-models is capability-gated: expose it only when some router can
         # answer. Hiding the tool prevents agents from probing router_on via a
         # no-op call when routing is disabled.
-        from omnigent.server.routing_backend import routing_available
+        from omnigent.runtime import routing_stamp
 
-        if routing_available(get_caps()):
+        if routing_stamp():
             self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents
@@ -651,13 +651,13 @@ class ToolManager:
 
     def _register_file_tools(self) -> None:
         """
-        Auto-register ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``.
+        Register ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``.
 
-        Registered without spec opt-in so every agent can share workspace files
-        with the user and read the session's files; ``tool_groups.files: false``
-        drops all three. The runner dispatches them through the server's
-        session-scoped ``/v1/sessions/{id}/resources/files`` routes, and uploads
-        only read files inside the session workspace.
+        Off by default: an agent opts in with ``tool_groups.files: true`` to
+        share workspace files with the user and read the session's files. The
+        runner dispatches them through the server's session-scoped
+        ``/v1/sessions/{id}/resources/files`` routes, and uploads only read
+        files inside the session workspace.
         """
         if not self._spec.tool_groups.files:
             return

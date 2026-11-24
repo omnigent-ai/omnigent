@@ -77,6 +77,22 @@
             </intent-filter>
         </activity>
 
+        <!--
+          Opens `omnigent://<host>/c/<id>` links, the links the iOS and desktop apps open. Any
+          app can claim a custom scheme, so the link is treated as untrusted: see DeepLinkActivity.
+        -->
+        <activity
+            android:name=".DeepLinkActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Omnigent.Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="omnigent" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name=".ConnectActivity"
             android:exported="false"

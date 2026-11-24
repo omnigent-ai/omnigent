@@ -92,7 +92,7 @@ def test_unconditional_tools_always_advertised(monkeypatch: pytest.MonkeyPatch) 
         "upload_file",
         "list_files",
         "download_file",
-        "sys_upload_file",
-        "sys_list_files",
-        "sys_download_file",
+        "sys_files_upload",
+        "sys_files_list",
+        "sys_files_download",
     }

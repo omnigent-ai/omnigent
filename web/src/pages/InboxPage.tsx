@@ -101,6 +101,7 @@ import {
   type InboxSource,
   type UnreadInboxItem,
 } from "@/lib/inbox";
+import { useMutedProjects } from "@/lib/sessionMute";
 import {
   isInboxFilter,
   readInboxFilter,
@@ -338,6 +339,7 @@ export function InboxPage() {
   // Subscribed to the read-state mirror so "Mark as read" (here or in the
   // sidebar) drops the row immediately instead of on the next list poll.
   useUnseenTick();
+  useMutedProjects();
   const unreadItems = collectUnreadInboxItems(allRows, isConversationUnseen);
   const showApprovals = filter === "all" || filter === "awaiting";
   // Unread sessions, file comments, and automation results.

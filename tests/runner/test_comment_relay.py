@@ -489,9 +489,6 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_agent_download",
         "sys_add_policy",
         "sys_policy_registry",
-        "sys_upload_file",
-        "sys_list_files",
-        "sys_download_file",
     }
     # Parameters must be the real schemas from the tool classes — proving
     # get_schema() flowed through rather than an empty placeholder. "status"
@@ -1777,6 +1774,50 @@ async def test_native_relay_updates_workflow_tools_after_server_reconnect(
                     names = _relay_tool_names(relay_file)
                     assert names & JOURNAL_TOOL_NAMES == (JOURNAL_TOOL_NAMES if enabled else set())
                     assert "list_comments" in names
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_native_relay_follows_a_routing_flip_in_both_directions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A routing change from a session-init envelope reaches an existing relay.
+
+    The spec is unchanged, so the relay is reused unless its binding records the
+    routing answer it was built under. Each relaunch must advertise the advisor
+    exactly while the server routes, in both directions.
+    """
+    from omnigent.runtime import _globals, set_remote_routing_available
+    from omnigent.runtime.caps import RuntimeCaps
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps())
+    agent_id = "ag_routing_relay"
+    server_client = _SwitchableServerClient(agent_id)
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {agent_id: AgentSpec(spec_version=1, name="agent-routing", spawn=True)},
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                for routes in (False, True, False):
+                    # The envelope handler's only write to routing state; the
+                    # envelope round-trip is covered by the session-init tests.
+                    set_remote_routing_available(routes)
+                    await _launch_bridged(client, session_id)
+                    names = _relay_tool_names(relay_file)
+                    assert "list_comments" in names
+                    assert ("sys_advise_models" in names) is routes, sorted(names)
             finally:
                 await client.delete(f"/v1/sessions/{session_id}")
     finally:

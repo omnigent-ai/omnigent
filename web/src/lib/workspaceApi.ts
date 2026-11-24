@@ -10,6 +10,7 @@ import {
   ContentEncoding,
   EntryType,
   FileSearchMode,
+  SearchOrder,
   WorkspaceService,
   type ComparisonSchema,
   type Entry,
@@ -285,6 +286,41 @@ function routeCapabilities(
   return entry.pending;
 }
 
+const NO_CAPABILITIES: ReadonlySet<string> = new Set();
+// Failures of the route that carried GetCapabilities, not answers from its host.
+const ROUTE_FAILURE_CODES: ReadonlySet<Code> = new Set([
+  Code.Unavailable,
+  Code.Canceled,
+  Code.DeadlineExceeded,
+  Code.Unauthenticated,
+  Code.Unknown,
+]);
+
+/**
+ * A route's capabilities for a baseline method that only uses optional features: a host
+ * that answers GetCapabilities with an error still serves the method, just without them,
+ * for as long as an Unimplemented answer would be kept. A route that can't be reached
+ * fails, so the caller moves on to the next one.
+ */
+async function optionalCapabilities(
+  route: Route,
+  sessionId: string,
+  sshTarget: string | null | undefined,
+  signal: AbortSignal | undefined,
+): Promise<ReadonlySet<string>> {
+  try {
+    return await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (!(error instanceof ConnectError) || ROUTE_FAILURE_CODES.has(error.code)) throw error;
+    capabilities.set(routeKey(route, sessionId, sshTarget), {
+      pending: Promise.resolve(NO_CAPABILITIES),
+      expiresAtMs: Date.now() + ROUTE_RETRY_MS,
+    });
+    return NO_CAPABILITIES;
+  }
+}
+
 function concat(chunks: Uint8Array[]): Uint8Array {
   const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
   let offset = 0;
@@ -334,15 +370,30 @@ export interface ListedEntry {
   modified_at: number | null;
   /** The deepest directory of a single-child chain, when the host reports it. */
   leaf_directory_path?: string;
+  /** Git ignores the entry, as a host offering the "gitignore" feature reports. */
+  ignored?: true;
+}
+
+/** How a directory is listed. */
+export interface ListDirectoryOptions {
+  signal?: AbortSignal;
+  /** Leave out entries Git ignores, where the host can tell; others list them all. */
+  hideIgnored?: boolean;
+  /** Ask the host to report each single-folder chain's end, where it offers that. */
+  collapseSingleChildDirectories?: boolean;
 }
 
 const LIST_PAGE_SIZE = 1000;
+/** The ListDirectory feature that fills each entry's `leaf_directory_path`. */
+const DIRECTORY_CHAINS = "list_directory.collapse_single_child_directories";
+/** The ListDirectory feature that marks, and can leave out, what Git ignores. */
+const IGNORED_FEATURE = "gitignore";
 
 async function listDirectory(
   client: WorkspaceClient,
   path: string,
   maxEntries: number,
-  signal?: AbortSignal,
+  { signal, hideIgnored = false, collapseSingleChildDirectories = false }: ListDirectoryOptions,
 ): Promise<{ data: ListedEntry[]; hasMore: boolean }> {
   const data: ListedEntry[] = [];
   let pageToken = "";
@@ -350,7 +401,13 @@ async function listDirectory(
   /* oxlint-disable no-await-in-loop */
   do {
     const page = await client.listDirectory(
-      { path, pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length), pageToken },
+      {
+        path,
+        pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length),
+        pageToken,
+        collapseSingleChildDirectories,
+        hideIgnored,
+      },
       { signal },
     );
     // A host that hands back the token it was given is resending a page; stop before keeping it.
@@ -369,6 +426,8 @@ interface CallOptions {
   sshTarget?: string | null;
   /** Optional features of `method` the call relies on, e.g. "search_files.substring". */
   features?: readonly string[];
+  /** Optional features the call uses when the route's host lists them; `call` is told which. */
+  usesFeatures?: readonly string[];
   /** Codes that answer the request rather than fail the route. */
   answerCodes?: ReadonlySet<Code>;
   /** Throw an answer to the caller, for methods REST can't answer instead. */
@@ -390,11 +449,12 @@ interface CallOptions {
 async function viaWorkspaceApi<T>(
   sessionId: string,
   method: Method,
-  call: (client: WorkspaceClient) => Promise<T>,
+  call: (client: WorkspaceClient, served: ReadonlySet<string>) => Promise<T>,
   {
     signal,
     sshTarget,
     features = [],
+    usesFeatures = [],
     answerCodes = ANSWER_CODES,
     throwAnswers = false,
   }: CallOptions = {},
@@ -407,12 +467,22 @@ async function viaWorkspaceApi<T>(
     const unsupportedKey = `${key}:${method}`;
     if ((unsupportedUntil.get(unsupportedKey) ?? 0) > Date.now()) continue;
     try {
+      let served: ReadonlySet<string> = NO_CAPABILITIES;
       if (checked) {
-        const served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+        served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
         const required = [capabilityName(method), ...features];
         if (!required.every((name) => served.has(name))) continue;
+      } else if (usesFeatures.length > 0) {
+        served = await optionalCapabilities(route, sessionId, sshTarget, signal);
       }
-      return await callOn(route, sessionId, call, signal, sshTarget, answerCodes);
+      return await callOn(
+        route,
+        sessionId,
+        (client) => call(client, served),
+        signal,
+        sshTarget,
+        answerCodes,
+      );
     } catch (error) {
       signal?.throwIfAborted();
       if (error instanceof UnusableAnswerError) {
@@ -445,27 +515,40 @@ async function viaWorkspaceApi<T>(
 
 /**
  * List a workspace directory through the workspace API, in the REST listing's
- * shape and order (ascending by path), reading pages up to `maxEntries`.
+ * shape and order (ascending by path), reading pages up to `maxEntries`. Where the
+ * route's host offers it, each directory whose only entry is a directory carries the
+ * end of that chain as `leaf_directory_path`, so the tree shows "a/b/c" on one row.
  *
  * :param sessionId: The session whose workspace to list.
  * :param path: Workspace-relative directory, ``""`` for the root.
  * :param maxEntries: Stop after this many entries, e.g. ``1000``; must be positive.
- * :returns: The entries and whether more remain, or null when the caller
- *     should list through REST (see :func:`readFileViaWorkspaceApi`).
+ * :param options: ``hideIgnored`` leaves out what Git ignores, where the host can tell.
+ * :returns: The entries, whether more remain and whether Git-ignored ones were left
+ *     out, or null when the caller should list through REST (see :func:`readFileViaWorkspaceApi`).
  */
 export function listDirectoryViaWorkspaceApi(
   sessionId: string,
   path: string,
   maxEntries: number,
   signal?: AbortSignal,
-): Promise<{ data: ListedEntry[]; hasMore: boolean } | null> {
+  { hideIgnored = false }: Omit<ListDirectoryOptions, "signal"> = {},
+): Promise<{ data: ListedEntry[]; hasMore: boolean; ignoredHidden?: true } | null> {
   // The host reads a page size of 0 as its default, so a 0 limit would still return entries.
   if (!(maxEntries > 0)) return Promise.reject(new RangeError("maxEntries must be positive"));
   return viaWorkspaceApi(
     sessionId,
     "listDirectory",
-    (client) => listDirectory(client, path, maxEntries, signal),
-    { signal },
+    async (client, served) => {
+      // Only a host offering the feature leaves ignored entries out; others list them all.
+      const ignoredHidden = hideIgnored && served.has(IGNORED_FEATURE);
+      const listed = await listDirectory(client, path, maxEntries, {
+        signal,
+        hideIgnored: ignoredHidden,
+        collapseSingleChildDirectories: served.has(DIRECTORY_CHAINS),
+      });
+      return ignoredHidden ? { ...listed, ignoredHidden: true as const } : listed;
+    },
+    { signal, usesFeatures: [DIRECTORY_CHAINS, ...(hideIgnored ? [IGNORED_FEATURE] : [])] },
   );
 }
 
@@ -505,6 +588,7 @@ function listedEntry(entry: Entry): ListedEntry {
     bytes: entry.size === undefined ? null : Number(entry.size),
     modified_at: entry.modifyTime ? Number(entry.modifyTime.seconds) : null,
     ...(entry.leafDirectoryPath ? { leaf_directory_path: entry.leafDirectoryPath } : {}),
+    ...(entry.ignored ? { ignored: true as const } : {}),
   };
 }
 
@@ -573,6 +657,86 @@ export function searchFilesViaWorkspaceApi(
   );
 }
 
+export interface RankedWorkspaceFile {
+  /** Path relative to the searched directory. */
+  entry: ListedEntry;
+  /** Higher is better; zero when a blank query lists files in path order. */
+  score: number;
+  /** UTF-16 indices of the path's matched characters, ascending, for highlighting. */
+  matchedIndices: number[];
+}
+
+export interface RankedWorkspaceFiles {
+  files: RankedWorkspaceFile[];
+  /** More files matched than were returned. */
+  hasMore: boolean;
+  /** Some files weren't searched, so a missing file may still exist. */
+  truncated: boolean;
+}
+
+export interface RankedFileSearchOptions {
+  /** Workspace-relative directory to search under, ``""`` for the root. */
+  path: string;
+  /** Maximum files, 1 to 10,000. */
+  limit: number;
+  /** Also rank files Git ignores. */
+  includeGitIgnored: boolean;
+}
+
+/**
+ * Rank workspace files against a fuzzy query through the workspace API, best
+ * first. A blank query lists files in path order, for a picker's first view.
+ *
+ * :returns: The files, or null when the caller should use another route: see
+ *     :func:`viaWorkspaceApi`, or the host doesn't rank paths ("search_files.fuzzy",
+ *     plus "search_files.browse" for a blank query), or its file list is being built.
+ */
+export function rankFilesViaWorkspaceApi(
+  sessionId: string,
+  query: string,
+  { path, limit, includeGitIgnored }: RankedFileSearchOptions,
+  signal?: AbortSignal,
+): Promise<RankedWorkspaceFiles | null> {
+  const blank = query.trim() === "";
+  return viaWorkspaceApi(
+    sessionId,
+    "searchFiles",
+    async (client) => {
+      const response = await client.searchFiles(
+        { query, mode: FileSearchMode.FUZZY, maximumResults: limit, path, includeGitIgnored },
+        { signal },
+      );
+      if (response.refreshing) return null;
+      return {
+        files: response.results.flatMap((result) =>
+          result.entry
+            ? [
+                {
+                  entry: listedEntry(result.entry),
+                  score: result.score,
+                  matchedIndices: result.matchedIndices,
+                },
+              ]
+            : [],
+        ),
+        hasMore: response.truncated,
+        truncated: response.indexIncomplete || response.untrackedUnavailable,
+      };
+    },
+    {
+      signal,
+      features: blank ? ["search_files.fuzzy", "search_files.browse"] : ["search_files.fuzzy"],
+    },
+  );
+}
+
+export interface TextSearchPriority {
+  /** Workspace-relative files searched first, the most important first; 16 at most are used. */
+  focusedPaths: string[];
+  /** What changed folders are measured against; the last commit by default. */
+  changedAgainst?: ComparisonKind;
+}
+
 export interface TextSearchOptions {
   caseSensitive: boolean;
   /** Read the query as a ripgrep regular expression. */
@@ -580,6 +744,11 @@ export interface TextSearchOptions {
   /** Comma-separated globs; an include also searches files ignore rules skip. */
   include: string;
   exclude: string;
+  /**
+   * Search these first, then the folders with the most changes, then the rest.
+   * A host without "text_search_priority" ignores it and returns matches in walk order.
+   */
+  priority?: TextSearchPriority;
 }
 
 /**
@@ -594,7 +763,7 @@ export interface TextSearchOptions {
 export function searchTextViaWorkspaceApi(
   sessionId: string,
   query: string,
-  { caseSensitive, regex, include, exclude }: TextSearchOptions,
+  { caseSensitive, regex, include, exclude, priority }: TextSearchOptions,
   signal?: AbortSignal,
 ): Promise<ContentSearchResult | null> {
   const info = getCachedServerInfo() ?? "loading";
@@ -607,7 +776,18 @@ export function searchTextViaWorkspaceApi(
       const result: ContentSearchResult = { matches: [], truncated: false, warning: null };
       let done = false;
       const stream = client.searchText(
-        { query, caseSensitive, regularExpression: regex, include, exclude },
+        {
+          query,
+          caseSensitive,
+          regularExpression: regex,
+          include,
+          exclude,
+          ...(priority && {
+            order: SearchOrder.PRIORITY,
+            focusedPaths: priority.focusedPaths,
+            changedAgainst: priority.changedAgainst,
+          }),
+        },
         { signal },
       );
       for await (const message of stream) {

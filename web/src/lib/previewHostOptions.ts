@@ -4,6 +4,7 @@ import {
   getDesktopFeatures,
   navigationHostOptions,
   SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
   type BrowserHostOptions,
   type BrowserNavigationResult,
 } from "./nativeBridge";
@@ -32,7 +33,11 @@ export async function previewHostOptions(
   const options = navigationHostOptions(hostId);
   try {
     if (!hostId) return options;
-    if (!(await getDesktopFeatures())?.sshLocalhostPreview) return options;
+    const features = await getDesktopFeatures();
+    if (features?.trustedRemoteLocalhostPreview) {
+      options.trustedRemotePreviewProtocol = TRUSTED_REMOTE_PREVIEW_PROTOCOL;
+    }
+    if (!features?.sshLocalhostPreview) return options;
     options.sshPreviewProtocol = SSH_PREVIEW_PROTOCOL;
     if (!isLoopbackPreviewUrl(url)) return options;
     // Discovery only adds a hint; a stalled lookup must not hold up navigation.

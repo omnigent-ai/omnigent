@@ -84,6 +84,16 @@ export const OPEN_LINKS_IN_APP_ENTRY = settingsEntry({
   keywords: ["links", "browser", "in-app", "tabs", "click"],
 });
 
+export const OPEN_IN_DESKTOP_APP_ENTRY = settingsEntry({
+  id: "open-in-desktop-app",
+  available: (availability) => availability.desktopAppHandoff,
+  section: "general",
+  label: "Open conversations in the desktop app",
+  description:
+    "When a conversation link opens in this browser and the Omnigent desktop app is running, open it there. Your browser may ask once to let this site reach apps on this device.",
+  keywords: ["desktop", "app", "links", "browser", "open", "conversation", "hand off"],
+});
+
 export const ADMIN_VIEW_ENTRY = settingsEntry({
   id: "admin-view",
   available: (availability) => availability.adminView,
@@ -143,9 +153,15 @@ export const GLOBAL_SHORTCUT_ENTRY = settingsEntry({
     "bring to front",
     "window",
   ],
-  // Named by the chord it holds, or by the prompt while it records one.
-  parts: { recorder: "Shortcut" },
-  nameTemplates: { recorder: { before: "Shortcut: " } },
+  // Named by the chord it holds, or by the prompt while it records one. The suggestion names
+  // the free chord it proposes.
+  parts: { recorder: "Shortcut", suggestion: "Use suggested shortcut" },
+  nameTemplates: {
+    recorder: { before: "Shortcut: " },
+    suggestion: { before: "Use ", after: " instead" },
+  },
+  // Offered only after the shell couldn't register the chord.
+  presence: { suggestion: { states: ["shortcut taken by another app"] } },
 });
 
 /** The desktop app's shortcut that opens the New Agent panel; macOS, with `floating_composer`. */
@@ -167,9 +183,26 @@ export const FLOATING_COMPOSER_SHORTCUT_ENTRY = settingsEntry({
     "new agent",
     "panel",
   ],
-  // Named by the chord it holds, or by the prompt while it records one.
-  parts: { recorder: "New Agent shortcut" },
-  nameTemplates: { recorder: { before: "New Agent shortcut: " } },
+  // Named by the chord it holds, or by the prompt while it records one. The suggestion names
+  // the free chord it proposes.
+  parts: { recorder: "New Agent shortcut", suggestion: "Use suggested New Agent shortcut" },
+  nameTemplates: {
+    recorder: { before: "New Agent shortcut: " },
+    suggestion: { before: "Use ", after: " instead" },
+  },
+  // Offered only after the shell couldn't register the chord.
+  presence: { suggestion: { states: ["shortcut taken by another app"] } },
+});
+
+/** The desktop app's opt-in to make room for the right sidebar; a row only desktop builds show. */
+export const WIDEN_WINDOW_FOR_RIGHT_SIDEBAR_ENTRY = settingsEntry({
+  id: "widen-window-for-right-sidebar",
+  available: (availability) => availability.widenWindowForRightSidebar,
+  section: "general",
+  label: "Widen window when opening the right sidebar",
+  description:
+    "Opening the right sidebar makes the window wider, so the chat keeps its width. Closing it shrinks the window back. Maximized and full-screen windows keep their size.",
+  keywords: ["window", "resize", "wider", "width", "sidebar", "workspace", "panel", "desktop"],
 });
 
 /** Both system-wide shortcuts' rows, by the shell's shortcut id; one control renders either. */
@@ -188,6 +221,7 @@ export const GENERAL_SETTINGS = [
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
+  OPEN_IN_DESKTOP_APP_ENTRY,
   ADMIN_VIEW_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
   BROWSER_AGENT_TOOLS_ENTRY,
@@ -195,4 +229,5 @@ export const GENERAL_SETTINGS = [
 
   GLOBAL_SHORTCUT_ENTRY,
   FLOATING_COMPOSER_SHORTCUT_ENTRY,
+  WIDEN_WINDOW_FOR_RIGHT_SIDEBAR_ENTRY,
 ] as const;

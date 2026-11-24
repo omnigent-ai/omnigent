@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
@@ -29,6 +30,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
 from tests.server.integration.test_managed_startup_inputs import (
@@ -256,6 +258,74 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
     assert not captured.get("posts")
 
 
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        pytest.param(
+            "archived",
+            "Session {receiver} is archived; unarchive it or use another session",
+            id="archived",
+        ),
+        pytest.param("closed", "Session {receiver} is closed; use another session", id="closed"),
+        pytest.param(
+            "archived_parent",
+            "Session {receiver} belongs to an archived session; "
+            "unarchive that session or use another one",
+            id="archived_parent",
+        ),
+        pytest.param(
+            "closed_parent",
+            "Session {receiver} belongs to a closed session; use another session",
+            id="closed_parent",
+        ),
+        pytest.param(
+            "archived_sender",
+            "Session {sender} is archived; unarchive it or use another session",
+            id="archived_sender",
+        ),
+        pytest.param(
+            "archived_other_owner",
+            "Session is not owned or available",
+            id="archived_other_owner",
+        ),
+    ],
+)
+async def test_archived_or_closed_session_refusal_says_why(
+    state, expected, auth_client, peers, db_uri
+):
+    source, receiver, captured = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    if state in {"archived_parent", "closed_parent"}:
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={"agent_id": receiver["agent_id"], "parent_session_id": receiver["id"]},
+        )
+        assert response.status_code == 201, response.text
+        if state == "archived_parent":
+            store.update_conversation(receiver["id"], archived=True)
+        else:
+            store.set_labels(receiver["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+        receiver = response.json()
+    elif state == "archived_other_owner":
+        receiver = await _create_session_as(auth_client, "", "bob")
+        SqlAlchemyPermissionStore(db_uri).grant("alice", receiver["id"], LEVEL_EDIT)
+        store.update_conversation(receiver["id"], archived=True)
+    elif state == "closed":
+        store.set_labels(receiver["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    else:
+        archived = source if state == "archived_sender" else receiver
+        store.update_conversation(archived["id"], archived=True)
+    captured.clear()
+    response = await auth_client.post(
+        f"/v1/sessions/{receiver['id']}/events",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"type": "session_message", "data": {"message": "DO_NOT_DELIVER"}},
+    )
+    assert response.status_code == 403, response.text
+    assert expected.format(sender=source["id"], receiver=receiver["id"]) in response.text
+    assert not captured.get("posts")
+
+
 @pytest.mark.parametrize("manager_kind", ["root", "child", "side_chat"])
 async def test_view_only_sharing_keeps_new_controls(auth_client, peers, db_uri, manager_kind):
     source, target, captured = peers
@@ -412,8 +482,11 @@ async def test_side_chat_inherits_sharing_for_new_controls(
     assert (await _send(auth_client, manager, target)).get("queued") is True
 
 
-@pytest.mark.parametrize("source_link", ["missing", "cycle", "absent"])
-async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, source_link):
+@pytest.mark.parametrize("side_state", ["live", "archived", "closed"])
+@pytest.mark.parametrize("source_link", ["missing", "cycle", "absent", "foreign"])
+async def test_side_chat_requires_resolvable_source(
+    auth_client, peers, db_uri, source_link, side_state
+):
     source, target, captured = peers
     response = await auth_client.post(
         f"/v1/sessions/{source['id']}/fork", json={"side_chat": True}
@@ -425,10 +498,16 @@ async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, 
     if source_link == "absent":
         store.delete_label(side["id"], SIDE_CHAT_SOURCE_LABEL_KEY)
     else:
-        store.set_labels(
-            side["id"],
-            {SIDE_CHAT_SOURCE_LABEL_KEY: side["id"] if source_link == "cycle" else uuid4().hex},
-        )
+        if source_link == "foreign":
+            linked = (await _create_session_as(auth_client, "", "bob"))["id"]
+        else:
+            linked = side["id"] if source_link == "cycle" else uuid4().hex
+        store.set_labels(side["id"], {SIDE_CHAT_SOURCE_LABEL_KEY: linked})
+    # Unarchiving wouldn't make the side chat usable, so its state isn't reported.
+    if side_state == "archived":
+        store.update_conversation(side["id"], archived=True)
+    elif side_state == "closed":
+        store.set_labels(side["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
     captured.clear()
     assert (
         "Session is not owned or available" in (await _send(auth_client, side, target))["detail"]
@@ -643,7 +722,7 @@ async def test_scheduled_origin_workers_use_the_automation_permission_mode(
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
     source, _target, _captured = peers
-    worker_agent_id = await _upload_codex_worker(auth_client, **(worker_config or {}))
+    worker_agent_id = await _upload_native_worker(auth_client, **(worker_config or {}))
     schedules = SqlAlchemyScheduledTaskStore(db_uri)
     task = schedules.create(
         scheduled_task_id=uuid4().hex,
@@ -720,7 +799,7 @@ async def test_requested_permission_mode_wins_over_the_automation_mode(
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
     source, _target, _captured = peers
-    worker_agent_id = await _upload_codex_worker(auth_client)
+    worker_agent_id = await _upload_native_worker(auth_client)
     schedules = SqlAlchemyScheduledTaskStore(db_uri)
     task = schedules.create(
         scheduled_task_id=uuid4().hex,
@@ -776,7 +855,7 @@ async def test_worker_started_before_a_legacy_run_is_recorded_uses_the_automatio
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
     from tests._helpers.polling import poll_until_async
 
-    worker_agent_id = await _upload_codex_worker(auth_client)
+    worker_agent_id = await _upload_native_worker(auth_client)
     schedules = SqlAlchemyScheduledTaskStore(db_uri)
     task = schedules.create(
         scheduled_task_id=uuid4().hex,
@@ -1436,13 +1515,15 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     )
 
 
-async def _upload_codex_worker(auth_client, sub_agents=None, **config) -> str:
+async def _upload_native_worker(
+    auth_client, sub_agents=None, harness="codex-native", **config
+) -> str:
     from tests._helpers.session import post_session_bundle
     from tests.server.helpers import build_agent_bundle
 
     bundle = build_agent_bundle(
-        "codex-worker",
-        executor={"config": {"harness": "codex-native", **config}},
+        f"{harness}-worker",
+        executor={"config": {"harness": harness, **config}},
         sub_agents=sub_agents,
     )
     uploaded = await post_session_bundle(auth_client.post, "/v1/sessions", bundle)
@@ -1499,7 +1580,7 @@ async def test_created_session_launches_in_the_requested_permission_mode(
     from omnigent.server.routes.sessions import routes_core
 
     source, _, _ = peers
-    worker_agent_id = await _upload_codex_worker(auth_client, **spec_config)
+    worker_agent_id = await _upload_native_worker(auth_client, **spec_config)
 
     async def launch(**kwargs):
         pass
@@ -1635,7 +1716,7 @@ async def test_nested_agent_starts_in_its_creators_permission_mode(
     creator = await _codex_creator(creator_client, auth_app, db_uri, monkeypatch, creator_mode)
     agent_id = creator["agent_id"]
     if worker_config is not None:
-        agent_id = await _upload_codex_worker(creator_client, **worker_config)
+        agent_id = await _upload_native_worker(creator_client, **worker_config)
 
     async def launch(**kwargs):
         pass
@@ -1761,6 +1842,180 @@ async def test_a_worker_whose_spec_cannot_be_read_keeps_its_agent_default(
     assert worker.terminal_launch_args is None
 
 
+_CLAUDE_AUTO_PARENT = ("claude-native", {"omnigent.claude_native.permission_mode": "auto"}, None)
+
+
+def _set_native_parent(db_uri, session_id, parent) -> None:
+    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+
+    harness, labels, launch_args = parent
+    store = SqlAlchemyConversationStore(db_uri)
+    wrapper = native_coding_agent_for_harness(harness).wrapper_label
+    store.set_labels(session_id, {WRAPPER_LABEL_KEY: wrapper, **labels})
+    if launch_args is not None:
+        store.update_conversation(session_id, terminal_launch_args=launch_args)
+
+
+@pytest.mark.parametrize(
+    ("parent", "child_harness", "spec_config", "request_fields", "expected"),
+    [
+        pytest.param(
+            _CLAUDE_AUTO_PARENT,
+            "codex-native",
+            {},
+            {},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="claude-auto-to-codex",
+        ),
+        pytest.param(
+            _CLAUDE_AUTO_PARENT,
+            "claude-native",
+            {},
+            {},
+            ["--permission-mode", "auto"],
+            id="claude-auto-to-claude",
+        ),
+        pytest.param(
+            _CLAUDE_AUTO_PARENT,
+            "codex-native",
+            {},
+            {"permission_mode": "default"},
+            None,
+            id="request-over-parent",
+        ),
+        pytest.param(
+            _CLAUDE_AUTO_PARENT, "codex-native", {"yolo": False}, {}, None, id="spec-over-parent"
+        ),
+    ],
+)
+async def test_sub_agent_starts_in_its_parents_permission_mode(
+    auth_client, peers, db_uri, parent, child_harness, spec_config, request_fields, expected
+):
+    source, _, _ = peers
+    _set_native_parent(db_uri, source["id"], parent)
+    worker_agent_id = await _upload_native_worker(
+        auth_client, harness=child_harness, **spec_config
+    )
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": worker_agent_id, **request_fields}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    child = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert child.parent_conversation_id == source["id"]
+    assert child.terminal_launch_args == expected
+
+
+async def test_custom_native_parent_passes_on_its_mode(auth_client, peers, db_uri):
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    # A custom agent declaring a native harness runs chat-first, without a wrapper label.
+    bundle = build_agent_bundle(
+        "custom-claude-parent", executor={"config": {"harness": "claude-native"}}
+    )
+    uploaded = await post_session_bundle(auth_client.post, "/v1/sessions", bundle)
+    assert uploaded.status_code == 201, uploaded.text
+    parent_id = uploaded.json()["session_id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    assert WRAPPER_LABEL_KEY not in store.get_conversation(parent_id).labels
+    store.set_labels(parent_id, {"omnigent.claude_native.permission_mode": "auto"})
+    worker_agent_id = await _upload_native_worker(auth_client)
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": worker_agent_id}),
+            server_client=auth_client,
+            conversation_id=parent_id,
+        )
+    )
+    assert result.get("conversation_id"), result
+    child = store.get_conversation(result["conversation_id"])
+    assert child.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+
+
+@pytest.mark.parametrize(
+    ("child_harness", "spec_config", "expected"),
+    [
+        pytest.param("claude-native", {}, ["--permission-mode", "auto"], id="claude-auto"),
+        pytest.param(
+            "claude-native",
+            {"permission_mode": "plan"},
+            ["--permission-mode", "plan"],
+            id="spec-over-parent",
+        ),
+        # A bundled Codex or Cursor child keeps its headless default over the parent's mode.
+        pytest.param(
+            "codex-native",
+            {},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            id="codex-headless-default",
+        ),
+        pytest.param("cursor-native", {}, ["--yolo"], id="cursor-headless-default"),
+    ],
+)
+async def test_uploaded_child_starts_in_its_parents_permission_mode(
+    auth_client, peers, db_uri, child_harness, spec_config, expected
+):
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    source, _, _ = peers
+    _set_native_parent(db_uri, source["id"], _CLAUDE_AUTO_PARENT)
+    # sys_session_create(config_path=...) uploads the child's bundle under its parent.
+    bundle = build_agent_bundle(
+        f"uploaded-{child_harness}-child",
+        executor={"config": {"harness": child_harness, **spec_config}},
+    )
+    uploaded = await post_session_bundle(
+        auth_client.post, "/v1/sessions", bundle, metadata={"parent_session_id": source["id"]}
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    child = SqlAlchemyConversationStore(db_uri).get_conversation(uploaded.json()["session_id"])
+    assert child.parent_conversation_id == source["id"]
+    assert child.terminal_launch_args == expected
+
+
+async def test_added_agent_and_independent_worker_inheritance(
+    auth_client, peers, db_uri, monkeypatch
+):
+    from omnigent.server.routes.sessions import routes_core
+
+    source, _, _ = peers
+    _set_native_parent(db_uri, source["id"], _CLAUDE_AUTO_PARENT)
+    store = SqlAlchemyConversationStore(db_uri)
+    worker_agent_id = await _upload_native_worker(auth_client)
+    # A REST client creates the child with a plain POST /v1/sessions call.
+    response = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": worker_agent_id, "parent_session_id": source["id"]},
+    )
+    assert response.status_code == 201, response.text
+    added = store.get_conversation(response.json()["id"])
+    assert added.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+
+    async def launch(**kwargs):
+        pass
+
+    # An independent worker on another harness than its creator keeps its agent's default.
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": worker_agent_id, "placement": "managed"}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    worker = store.get_conversation(result["conversation_id"])
+    assert worker.parent_conversation_id is None
+    assert worker.terminal_launch_args is None
+
+
 @pytest.mark.parametrize(
     ("fields", "error"),
     [
@@ -1782,7 +2037,7 @@ async def test_created_session_refuses_an_unusable_permission_mode(
     auth_client, peers, db_uri, fields, error
 ):
     source, _, _ = peers
-    worker_agent_id = await _upload_codex_worker(auth_client, sub_agents=[{"name": "helper"}])
+    worker_agent_id = await _upload_native_worker(auth_client, sub_agents=[{"name": "helper"}])
     store = SqlAlchemyConversationStore(db_uri)
     before = {conversation.id for conversation in store.list_conversations().data}
     response = await auth_client.post(
@@ -1802,7 +2057,7 @@ async def test_created_session_starts_as_a_run_of_a_saved_workflow(
     from omnigent.server.routes.sessions import routes_core
 
     source, _, _ = peers
-    worker_agent_id = await _upload_codex_worker(auth_client)
+    worker_agent_id = await _upload_native_worker(auth_client)
 
     async def launch(**kwargs):
         pass

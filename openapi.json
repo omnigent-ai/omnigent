@@ -2591,8 +2591,15 @@
             "title": "Project Id"
           },
           "prompt": {
-            "title": "Prompt",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -2654,6 +2661,29 @@
             "default": "UTC",
             "title": "Timezone"
           },
+          "workflow_details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Details"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -2669,7 +2699,6 @@
         },
         "required": [
           "name",
-          "prompt",
           "rrule",
           "agent_id"
         ],
@@ -8133,6 +8162,11 @@
             "title": "Proactive Agent Available",
             "type": "boolean"
           },
+          "project_mute": {
+            "default": true,
+            "title": "Project Mute",
+            "type": "boolean"
+          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
@@ -8268,6 +8302,11 @@
             "title": "Scheduled Task Trigger Headers",
             "type": "boolean"
           },
+          "scheduled_task_workflow_id": {
+            "default": true,
+            "title": "Scheduled Task Workflow Id",
+            "type": "boolean"
+          },
           "scheduled_task_worktrees": {
             "default": true,
             "title": "Scheduled Task Worktrees",
@@ -8281,6 +8320,11 @@
           "server_version": {
             "title": "Server Version",
             "type": "string"
+          },
+          "session_archive_runner_checks": {
+            "default": false,
+            "title": "Session Archive Runner Checks",
+            "type": "boolean"
           },
           "session_bundle_model_override": {
             "default": true,
@@ -8369,6 +8413,11 @@
           "session_search_scope": {
             "default": true,
             "title": "Session Search Scope",
+            "type": "boolean"
+          },
+          "session_timers": {
+            "default": false,
+            "title": "Session Timers",
             "type": "boolean"
           },
           "session_title_instructions": {
@@ -12049,6 +12098,12 @@
             ],
             "description": "First-class project id when one exists, or `None` for a label-only project not yet promoted to the `projects` table.",
             "title": "Id"
+          },
+          "muted": {
+            "default": false,
+            "description": "Whether the owner muted notifications for every session in the project, read from its `config`; `False` for a label-only folder.",
+            "title": "Muted",
+            "type": "boolean"
           },
           "name": {
             "description": "Project name (the folder's display name and union key).",
@@ -15976,6 +16031,29 @@
             ],
             "title": "Timezone"
           },
+          "workflow_details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Details"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -16899,6 +16977,17 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "automation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunAutomation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation whose scheduled run started its session, when the caller owns that automation or it is shared with them."
+          },
           "background_work_running": {
             "default": false,
             "description": "Whether background work outlives the session's turn.",
@@ -17056,6 +17145,27 @@
           "progress"
         ],
         "title": "WorkflowRun",
+        "type": "object"
+      },
+      "WorkflowRunAutomation": {
+        "description": "The automation whose scheduled run started a workflow run.",
+        "properties": {
+          "id": {
+            "description": "The automation's ID, e.g. `\"0123456789abcdef0123456789abcdef\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "Its name, e.g. `\"Nightly triage\"`.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "WorkflowRunAutomation",
         "type": "object"
       },
       "WorkflowRunList": {
@@ -21281,7 +21391,7 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders and timers agents\nset for their own sessions stay off the Automations page. The kind filter runs\nin the query, so listing automations never reads an agent's timers. There is no\nreminders-only view; a selective view needs an indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
         "parameters": [
           {

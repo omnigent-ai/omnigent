@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
 from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
@@ -31,7 +32,6 @@ from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
     _claude_launch_metadata_from_envelope,
-    _claude_launch_permission_mode,
     _load_claude_launch_metadata,
     _load_legacy_claude_launch_metadata,
     _routed_spawn_launch_args,
@@ -744,12 +744,19 @@ def test_routed_spawn_launch_args_gate_is_off_without_auto_harness() -> None:
         (["--model", "opus"], None),
         (["--permission-mode", "auto", "--permission-mode="], "auto"),
         (["--dangerously-skip-permissions"], "bypassPermissions"),
+        # Claude applies the last mode it reads, in either spelling...
+        (["--permission-mode", "auto", "--permission-mode=plan"], "plan"),
+        # ...but the bypass flag wins over any mode.
+        (["--permission-mode", "auto", "--dangerously-skip-permissions"], "bypassPermissions"),
+        # Text after the ``--`` terminator is the prompt, not options.
+        (["--permission-mode", "plan", "--", "--permission-mode=auto"], "plan"),
+        (["--permission-mode", "plan", "--", "--dangerously-skip-permissions"], "plan"),
     ],
 )
 def test_claude_launch_permission_mode_logs_only_known_values(
     args: list[str], expected: str | None
 ) -> None:
-    assert _claude_launch_permission_mode(args) == expected
+    assert claude_launch_permission_mode(args) == expected
 
 
 async def test_claude_launch_metadata_log_includes_permission_mode(

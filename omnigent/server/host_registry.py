@@ -687,6 +687,51 @@ class HostRegistry:
         """Resolve launch activation; omit the wire field when no harness is active."""
         return active_harnesses(self._mcp_disabled_servers, self._feature_flags) or None
 
+    def live_newer_duplicate(
+        self,
+        host_id: str,
+        hello: HostHelloFrame,
+        owner: str | None,
+        *,
+        max_silence_s: float,
+        workspace_id: int | None = None,
+    ) -> HostConnection | None:
+        """Return the live connection an older duplicate host must not replace.
+
+        ``register`` lets the newest connection win so a reconnecting host can
+        retire its own stale socket. A second, older host process sharing the
+        id (a forgotten daemon from an earlier install) would win each
+        reconnect too, so launches would flap onto a build that cannot run
+        current sessions.
+
+        :param host_id: Host identifier from the tunnel path, in any accepted
+            spelling (see :func:`_canonical_host_id`).
+        :param hello: The connecting host's hello frame.
+        :param owner: Authenticated owner of the connecting tunnel.
+        :param max_silence_s: How recently the registered connection must have
+            sent a frame to count as live, e.g. ``90.0``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: The registered connection when it belongs to the same owner,
+            sent a frame within ``max_silence_s``, and reports a strictly newer
+            PEP 440 version than ``hello``; otherwise ``None``, including when
+            either version does not parse.
+        """
+        from packaging.version import InvalidVersion, Version
+
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        with self._lock:
+            current = self._hosts.get((ws_id, _canonical_host_id(host_id)))
+            if current is None or current.owner != owner:
+                return None
+            if time.monotonic() - current.last_frame_monotonic > max_silence_s:
+                return None
+            try:
+                is_newer = Version(current.hello.version) > Version(hello.version)
+            except InvalidVersion:
+                return None
+            return current if is_newer else None
+
     def register(
         self,
         host_id: str,

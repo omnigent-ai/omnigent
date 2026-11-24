@@ -41,6 +41,7 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
 from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatchFrame
 from omnigent.runtime import inflight_text
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
@@ -59,7 +60,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
 from tests.debug_log_helpers import capture_debug_rows
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
 
@@ -4744,6 +4745,90 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     store.set_pending_elicitation_count(session_id, 0)
 
 
+@pytest.mark.parametrize(
+    ("holds_runner", "child_runner", "child_read_fails", "expected_count"),
+    [
+        pytest.param(True, None, False, 0, id="repairs-on-runner-replica"),
+        pytest.param(False, None, False, 1, id="keeps-count-off-runner-replica"),
+        pytest.param(
+            True, "runner_child_replica", False, 1, id="keeps-child-prompt-from-another-replica"
+        ),
+        pytest.param(
+            True, "runner_stale_pending", False, 0, id="repairs-a-stale-child-on-the-same-runner"
+        ),
+        pytest.param(True, None, True, 1, id="serves-snapshot-when-repair-fails"),
+    ],
+)
+async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    holds_runner: bool,
+    child_runner: str | None,
+    child_read_fails: bool,
+    expected_count: int,
+) -> None:
+    """Detail reads repair stale pending counts without clearing prompts owned elsewhere.
+
+    :param app: The app behind ``client``; its tunnel registry gets the runner.
+    :param client: Test HTTP client backed by the real app.
+    :param db_uri: The app's DB, opened directly to seed the stored counts.
+    :param monkeypatch: Breaks the repair's child read in the failure case.
+    :param holds_runner: Whether this replica holds the session's runner.
+    :param child_runner: The runner of a child whose stored count is 1, if any.
+    :param child_read_fails: Whether the repair's child read raises.
+    :param expected_count: The listed count once the session has been opened.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server import session_live_state
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    pending_elicitations.reset_for_tests()
+    if holds_runner:
+        register_test_runner(app, "runner_stale_pending")
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner_stale_pending")
+    store.set_pending_elicitation_count(session_id, 1)
+    if child_runner is not None:
+        child = store.create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=session_id,
+            agent_id=agent["id"],
+            runner_id=child_runner,
+        )
+        store.set_pending_elicitation_count(child.id, 1)
+    if child_read_fails:
+
+        def _fail(*_args: object, **_kwargs: object) -> list[tuple[str, int]]:
+            raise RuntimeError("child read failed")
+
+        monkeypatch.setattr(
+            session_live_state.conversation_store(), "list_child_conversation_ids_page", _fail
+        )
+
+    async def listed_count() -> int:
+        resp = await client.get("/v1/sessions")
+        assert resp.status_code == 200
+        return next(r for r in resp.json()["data"] if r["id"] == session_id)[
+            "pending_elicitations_count"
+        ]
+
+    assert await listed_count() == 1
+
+    resp = await client.get(
+        f"/v1/sessions/{session_id}",
+        params={"include_items": "false", "include_live_status": "false"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["pending_elicitations"] == []
+    # One worker applies live-state writes in order, so this lands after any repair.
+    await asyncio.wrap_future(session_live_state.submit("test barrier", lambda: None))
+    assert await listed_count() == expected_count
+
+
 async def test_get_session_includes_runner_online(
     client: httpx.AsyncClient,
 ) -> None:
@@ -6070,6 +6155,69 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert [event["status"] for event in published] == ["failed", "idle"]
     assert cache_after == "idle"
     assert relay_bindings == [(sid, "runner_recovered")]
+
+
+@pytest.mark.parametrize("server_routes", [True, False])
+async def test_create_and_bind_notifies_carry_the_servers_routing_answer(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    server_routes: bool,
+) -> None:
+    """Both runner notifies must stamp the server's routing answer.
+
+    The runner learns whether ``sys_advise_models`` is answerable only from
+    ``smart_routing_available`` on the session-init envelope. An ID-only body
+    cannot update the runner's routing capability.
+    """
+    from omnigent.runtime import _globals
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routing_backend import RoutingBackends
+
+    # The server's own answer is what the envelope carries; a built-in judge is
+    # the simplest router that makes ``routing_available`` true.
+    server_caps = RuntimeCaps(routing_backends=RoutingBackends(local=Mock()))
+    monkeypatch.setattr(_globals, "_caps", server_caps if server_routes else RuntimeCaps())
+
+    inits: list[dict[str, Any]] = []
+
+    def record_init(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            inits.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    async def _ensure_runner_relay_ready(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _ensure_runner_relay_ready)
+    monkeypatch.setattr(
+        sessions_module, "_registered_runner_id", lambda _router, raw, *, user_id=None: raw
+    )
+
+    def _routing_answers() -> list[bool | None]:
+        envelopes = [parse_runner_session_init_envelope(body) for body in inits]
+        return [env.smart_routing_available if env is not None else None for env in envelopes]
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(record_init), base_url="http://runner"
+    ) as runner:
+        _route_to_runner(monkeypatch, runner)
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+
+        create_answers = _routing_answers()
+        assert create_answers, "session create never notified the runner"
+        assert all(answer is server_routes for answer in create_answers), create_answers
+
+        inits.clear()
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}", json={"runner_id": "runner_bound"}
+        )
+        assert resp.status_code == 200, resp.text
+
+        bind_answers = _routing_answers()
+        assert bind_answers, "runner bind never notified the runner"
+        assert all(answer is server_routes for answer in bind_answers), bind_answers
 
 
 @pytest.mark.parametrize("wire_output", [None, "HOOK_FINAL", ""])

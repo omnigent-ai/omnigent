@@ -82,6 +82,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_live_state
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -104,6 +105,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.failed_status_diagnostics import bound_runner_connection
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.openapi_request_bodies import SESSION_CREATE_OPENAPI_EXTRA
@@ -189,6 +191,7 @@ from omnigent.server.routes._sessions.helpers import (
     _native_coding_agent_for_session,
     _note_settings_write,
     _notify_runner_of_bundled_child,
+    _owns_host_runner,
     _parse_session_create_metadata,
     _permission_level_from_grants,
     _pin_claude_permission_launch_args,
@@ -461,8 +464,8 @@ async def _require_archive_teardown_replica(
     :param request: The PATCH request, for this replica's host registry/store.
     :param session_id: Session being archived, e.g. ``"conv_abc123"``.
     :param conversation_store: Store to read the session's host binding from.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the session's host is live
-        on another replica of a sharded deployment.
+    :raises WrongReplicaError: When the session's routing host is live on
+        another replica of a sharded deployment.
     """
     if not _deployment_is_sharded():
         return
@@ -471,16 +474,56 @@ async def _require_archive_teardown_replica(
     if host_registry is None or host_store is None:
         return
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    if conv is None or conv.host_id is None or conv.runner_id is None:
+    if conv is None or conv.runner_id is None:
         return
-    if host_registry.get(conv.host_id) is not None:
+    # A sub-agent or side chat on its ancestor's runner inherits that ancestor's host.
+    owner = await asyncio.to_thread(routing_host_session, conv, conversation_store)
+    if owner is None or owner.host_id is None or owner.runner_id != conv.runner_id:
         return
-    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+    host_id = owner.host_id
+    if host_registry.get(host_id) is not None:
+        return
+    host = await asyncio.to_thread(host_store.get_host, host_id)
     # An offline host has no runner to stop; archiving it here loses nothing.
     if host is not None and host_is_live(host):
+        raise WrongReplicaError(
+            "host is on another replica; retry with the host's slice key", host_id=host_id
+        )
+
+
+async def _require_archive_spares_source_runner(
+    request: Request,
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Refuse an agent-tool archive whose teardown would stop the caller's runner.
+
+    Archive stops a host runner the target owns. A caller on that runner, such
+    as a sibling left on it after their parent was rebound, would stop mid-turn.
+    A caller archiving itself is deferred until its turn ends, so it is allowed.
+
+    :param request: The PATCH request; its orchestration-source header names the caller.
+    :param session_id: Session being archived, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store to read both sessions' runner bindings from.
+    :raises OmnigentError: ``FORBIDDEN`` when the caller shares a runner the target owns.
+    """
+    raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+    if not raw_source:
+        return
+    source_id = normalize_uuid(raw_source)
+    if not source_id or source_id == normalize_uuid(session_id):
+        return
+    target = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+    if target is None or source is None or not source.runner_id:
+        return
+    if source.runner_id == target.runner_id and await _owns_host_runner(
+        target, conversation_store
+    ):
         raise OmnigentError(
-            "host is on another replica; retry with the host's slice key",
-            code=ErrorCode.WRONG_REPLICA,
+            "An agent cannot archive a session that owns the runner it runs on",
+            code=ErrorCode.FORBIDDEN,
         )
 
 
@@ -2188,6 +2231,7 @@ def register_core_routes(
                     git_branch=git_branch,
                     created_by=user_id,
                     agent_store=agent_store,
+                    parent=parent_conv,
                 )
             if parsed_metadata.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
@@ -2341,6 +2385,7 @@ def register_core_routes(
                         id=proj.id,
                         name=proj.name,
                         icon=icon if isinstance(icon, str) else None,
+                        muted=proj.config.get("muted") is True,
                     )
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in sorted(conversation_store.list_projects(owned_by=user_id)):
@@ -2491,6 +2536,15 @@ def register_core_routes(
             request=request,
         )
         snapshot.side_chat_allowed = side_chat_ok
+        # The session list also reads the stored pending count, which stays stale
+        # when a prompt is resolved on a replica that never recorded it.
+        tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+        if bound_runner_connection(tunnel_registry, conv.runner_id) is not None and (
+            pending_elicitations.count_for(conv.id) != (conv.pending_elicitation_count or 0)
+        ):
+            session_live_state.reconcile_pending_count(
+                conv.id, conv.pending_elicitation_count, runner_id=conv.runner_id
+            )
         return snapshot
 
     @router.get(
@@ -3716,6 +3770,7 @@ def register_core_routes(
                 require_archive_outside_source_lineage, request, session_id, conversation_store
             )
         if body.archived is True:
+            await _require_archive_spares_source_runner(request, session_id, conversation_store)
             await _require_archive_teardown_replica(request, session_id, conversation_store)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(

@@ -77,6 +77,19 @@ export function replaceCurrent(
 }
 
 /**
+ * Put `visit` at the cursor in place of whatever tab's visit is there, keeping Back and Forward:
+ * a move between tabs shown together (a split's shells) that isn't a step of its own.
+ */
+export function swapCurrent(state: WorkspaceHistoryState, visit: Visit): WorkspaceHistoryState {
+  const current = currentVisit(state);
+  if (!current) return historyStartingAt(visit);
+  if (visitsEqual(current, visit)) return state;
+  const visits = state.visits.slice();
+  visits[state.cursor] = visit;
+  return collapseRepeats({ visits, cursor: state.cursor });
+}
+
+/**
  * The new-tab page became an app: `oldTabId`'s visit is replaced by `visit`, in
  * the same tab (an unbound app) or a bound tab created in its slot. It is not a
  * step, so the new-tab page is never a place Back returns to.
@@ -303,6 +316,10 @@ export class WorkspaceHistory {
 
   replaceCurrent(visit: Visit): void {
     this.current = replaceCurrent(this.current, visit);
+  }
+
+  swapCurrent(visit: Visit): void {
+    this.current = swapCurrent(this.current, visit);
   }
 
   replaceNewTab(oldTabId: TabId, visit: Visit): void {
