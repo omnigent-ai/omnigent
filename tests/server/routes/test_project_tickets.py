@@ -44,6 +44,9 @@ from tests._helpers.polling import poll_until_async
 from tests._helpers.session import post_session_bundle
 from tests.server.helpers import build_agent_bundle, register_test_runner
 from tests.server.integration.test_sessions_attribution import _bind_runner
+from tests.server.integration.test_sessions_native_kickoff_duplicate import (
+    _simulate_transcript_forwarder_echo,
+)
 from tests.server.integration.test_sessions_permissions import _register_online_host
 from tests.server.integration.test_sessions_web_send_stable_id import _stub_runner
 from tests.server.routes.test_projects_crud import ALICE, BOB, PROJECT_AGENT_ID, _as_user
@@ -732,7 +735,9 @@ async def test_name_only_project_uses_owned_host_home_and_normal_launch(
     foreign_host, own_host = uuid4().hex, uuid4().hex
     _register_online_host(app, foreign_host, BOB)
     _register_online_host(app, own_host, ALICE)
-    app.state.host_registry.get(own_host).configured_harnesses = {
+    # Readiness arrives in the host's hello (and later readiness frames), where the
+    # server keeps it; claude-native is unconfigured unless the project names an agent.
+    app.state.host_registry.get(own_host).hello.configured_harnesses = {
         "claude-native": explicit_host,
         "codex-native": True,
     }
@@ -1663,6 +1668,23 @@ async def test_notifications_drain_through_normal_dispatch_after_reconnect(
             await service.flush_page(project_app)
 
     monkeypatch.setattr(inputs, "_finish", finish_with_update)
+
+    async def echo_native_receipts():
+        # The Lead runs a native CLI: the runner confirms each delivered turn by echoing
+        # it from the CLI's transcript, which frees the next queued input.
+        echoed = 0
+        while True:
+            turns = [event for event in forwarded if event.get("type") == "message"]
+            for turn in turns[echoed:]:
+                text = "".join(
+                    part.get("text", "")
+                    for part in turn["content"]
+                    if part.get("type") == "input_text"
+                )
+                await _simulate_transcript_forwarder_echo(project_client, session_id, text)
+                echoed += 1
+            await asyncio.sleep(0.05)
+
     register_test_runner(project_app, runner_id)
     try:
         if external_host:
@@ -1676,17 +1698,22 @@ async def test_notifications_drain_through_normal_dispatch_after_reconnect(
             inputs.host_changed(project_app, host_id)
         else:
             await service.flush_page(project_app)
-        await poll_until_async(
-            lambda: (
-                late_update
-                and sum(event.get("type") == "message" for event in forwarded) >= 2
-                and not store.list_pending_inputs(session_id)
-            ),
-            timeout_s=5,
-        )
+        echoes = asyncio.create_task(echo_native_receipts())
+        try:
+            await poll_until_async(
+                lambda: (
+                    late_update
+                    and sum(event.get("type") == "message" for event in forwarded) >= 2
+                    and not store.list_pending_inputs(session_id)
+                ),
+                timeout_s=5,
+            )
+        finally:
+            echoes.cancel()
         turns = [event for event in forwarded if event.get("type") == "message"]
         assert len(turns) == 2
-        assert len({turn["persisted_item_id"] for turn in turns}) == 2
+        # A native delivery names its saved input by `stable_id`.
+        assert len({turn["stable_id"] for turn in turns}) == 2
         assert "Persisted task" in json.dumps(turns[0])
         assert "First update" in json.dumps(turns[0])
         assert "Arrived while draining" in json.dumps(turns[1])
