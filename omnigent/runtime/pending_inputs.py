@@ -882,12 +882,9 @@ def resolve_matching_text(
             else _collapse_whitespace(_content_text(entry.content))
             for _pid, entry in ordered
         ]
-        # Two passes. An exact (whitespace-collapsed) match first, so two
-        # messages that differ only in a marker-like phrase the person typed
-        # at the front stay distinct. Then drop what the executor generated
-        # for an entry — one marker line per file block ahead of the text, and
-        # the line naming its sender — and compare with the entry's own text;
-        # typed marker-like text still counts.
+        # Exact match first, so typed marker-like text stays distinct. Then drop
+        # only what the executor generated for the entry (one marker per file
+        # block, the line naming its sender) and compare with the entry's text.
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
