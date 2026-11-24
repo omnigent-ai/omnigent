@@ -153,7 +153,7 @@ describe("createSearchDecorationExtension decorations", () => {
     expect(current).toHaveLength(1);
     // currentIndex 0 → the first "The".
     expect(current[0].textContent?.toLowerCase()).toBe("the");
-    // Only the current match asks a mermaid block showing its diagram to reveal it.
+    // Only the current match carries the reveal spec.
     const revealing = searchDecorationKey
       .getState(editor.state)!
       .find(undefined, undefined, (spec) => spec === REVEAL_DECORATION_SPEC);

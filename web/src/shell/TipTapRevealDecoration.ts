@@ -5,14 +5,17 @@ import type { DecorationSource } from "@tiptap/pm/view";
 
 export const REVEAL_DECORATION_SPEC = { revealHiddenContent: true } as const;
 
-/** True when `decorations` hold a decoration carrying REVEAL_DECORATION_SPEC. */
-export function hasRevealDecoration(decorations: DecorationSource): boolean {
-  let found = false;
+/**
+ * Positions of the decorations in `decorations` carrying REVEAL_DECORATION_SPEC,
+ * as a comparable key; "" when there are none.
+ */
+export function revealDecorationKey(decorations: DecorationSource): string {
+  const ranges: string[] = [];
   decorations.forEachSet((set) => {
-    found ||=
-      set.find(undefined, undefined, (spec: { revealHiddenContent?: boolean }) =>
-        Boolean(spec.revealHiddenContent),
-      ).length > 0;
+    const revealing = set.find(undefined, undefined, (spec: { revealHiddenContent?: boolean }) =>
+      Boolean(spec.revealHiddenContent),
+    );
+    for (const decoration of revealing) ranges.push(`${decoration.from}-${decoration.to}`);
   });
-  return found;
+  return ranges.join(",");
 }

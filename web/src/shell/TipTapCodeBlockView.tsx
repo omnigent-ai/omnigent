@@ -9,7 +9,7 @@ import { cn } from "@/lib/utils";
 import { MermaidPreview } from "./MermaidPreview";
 import { CODE_BLOCK_LANGUAGES } from "./codeBlockLanguages";
 import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
-import { hasRevealDecoration } from "./TipTapRevealDecoration";
+import { revealDecorationKey } from "./TipTapRevealDecoration";
 
 const MERMAID_VIEWS = [
   { value: "diagram", label: "Diagram" },
@@ -40,18 +40,24 @@ export function TipTapCodeBlockView({
 
   const [mermaidView, setMermaidView] = useState<MermaidView>("diagram");
   const canShowDiagram = isMermaid && source.trim() !== "";
+  // Choosing Diagram hides the current find match or active comment until it moves.
+  const revealKey = revealDecorationKey(innerDecorations);
+  const [dismissedRevealKey, setDismissedRevealKey] = useState("");
+  if (dismissedRevealKey && dismissedRevealKey !== revealKey) setDismissedRevealKey("");
   // Keep the source visible while the caret, the current find match, or the
   // active comment is in it, so nobody edits or navigates to hidden text.
   const showSource =
     !canShowDiagram ||
     mermaidView === "source" ||
     selectionInside === true ||
-    hasRevealDecoration(innerDecorations);
+    (revealKey !== "" && revealKey !== dismissedRevealKey);
 
   const selectMermaidView = useCallback(
     (view: MermaidView) => {
       setMermaidView(view);
-      if (view !== "diagram" || !selectionInside) return;
+      if (view !== "diagram") return;
+      setDismissedRevealKey(revealKey);
+      if (!selectionInside) return;
       // The caret would keep the source open; park it beside the block instead.
       const pos = getPos();
       if (typeof pos !== "number") return;
@@ -61,7 +67,7 @@ export function TipTapCodeBlockView({
         Selection.findFrom(state.doc.resolve(pos), -1, true);
       if (target) editor.view.dispatch(state.tr.setSelection(target));
     },
-    [editor, getPos, node.nodeSize, selectionInside],
+    [editor, getPos, node.nodeSize, revealKey, selectionInside],
   );
 
   // The editor is read-only for a file the user can't edit; the language

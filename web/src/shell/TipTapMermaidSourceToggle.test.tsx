@@ -1,8 +1,9 @@
 /**
  * A mermaid block in the real rich-text editor opens on its diagram and reveals
- * its source when the caret moves in or find lands on it. The mocked node-view
- * test can't reach these: they depend on TipTap's selection tracking and on the
- * node view's update hook re-rendering for decoration-only changes.
+ * its source when the caret moves in or find or the active comment lands on it.
+ * The mocked node-view test can't reach these: they depend on TipTap's selection
+ * tracking and on the node view's update hook re-rendering for decoration-only
+ * changes.
  */
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -10,7 +11,13 @@ import { afterEach, expect, it, vi } from "vitest";
 import { Editor, EditorContent } from "@tiptap/react";
 import { StarterKit } from "@tiptap/starter-kit";
 import { Markdown } from "@tiptap/markdown";
+import type { Comment } from "@/hooks/useComments";
 import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
+import {
+  commentDecorationKey,
+  createCommentDecorationExtension,
+  type CommentDecorationState,
+} from "./TipTapCommentExtension";
 import {
   createSearchDecorationExtension,
   searchDecorationKey,
@@ -34,12 +41,16 @@ afterEach(() => {
 
 const MARKDOWN = "Intro\n\n```mermaid\ngraph TD\nAlpha-->Beta\n```\n\nOutro";
 
-async function mount(searchState: { current: SearchDecorationState | null }) {
+async function mount(
+  searchState: { current: SearchDecorationState | null },
+  commentState: { current: CommentDecorationState | null } = { current: null },
+) {
   editor = new Editor({
     extensions: [
       StarterKit.configure({ codeBlock: false }),
       CodeBlockWithLanguage,
       createSearchDecorationExtension(searchState),
+      createCommentDecorationExtension(commentState),
       Markdown,
     ],
     content: MARKDOWN,
@@ -87,19 +98,82 @@ it("moves the caret out of the source when switching back to the diagram", async
   expect(instance.state.selection.$from.parent.textContent).toBe("Outro");
 });
 
+function rebuildSearch(instance: Editor) {
+  return act(async () => {
+    instance.view.dispatch(instance.state.tr.setMeta(searchDecorationKey, "rebuild"));
+  });
+}
+
 it("reveals the source while the current find match is inside it", async () => {
   const searchState = { current: null as SearchDecorationState | null };
   const instance = await mount(searchState);
-  const rebuild = () =>
-    act(async () => {
-      instance.view.dispatch(instance.state.tr.setMeta(searchDecorationKey, "rebuild"));
-    });
 
   searchState.current = { query: "beta", currentIndex: 0 };
-  await rebuild();
+  await rebuildSearch(instance);
   expect(mermaidSource()).toBeVisible();
 
   searchState.current = { query: "outro", currentIndex: 0 };
-  await rebuild();
+  await rebuildSearch(instance);
+  expect(mermaidSource()).not.toBeVisible();
+});
+
+it("hides a find match on Diagram until find moves to another match", async () => {
+  const searchState = { current: null as SearchDecorationState | null };
+  const instance = await mount(searchState);
+  searchState.current = { query: "beta", currentIndex: 0 };
+  await rebuildSearch(instance);
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Diagram" }));
+  });
+  expect(mermaidSource()).not.toBeVisible();
+
+  searchState.current = { query: "alpha", currentIndex: 0 };
+  await rebuildSearch(instance);
+  expect(mermaidSource()).toBeVisible();
+});
+
+it("reveals the source for the active comment inside it, beside other find highlights", async () => {
+  const start = MARKDOWN.indexOf("Alpha");
+  const comment: Comment = {
+    id: "c1",
+    conversation_id: "conv_1",
+    path: "diagram.md",
+    start_index: start,
+    end_index: start + "Alpha".length,
+    body: "rename this node",
+    status: "draft",
+    created_at: 0,
+    updated_at: 0,
+    anchor_content: "Alpha",
+    created_by: null,
+  };
+  const commentState = {
+    current: {
+      comments: [comment],
+      activeSelection: null,
+      rawContent: MARKDOWN,
+      pendingRange: null,
+      onClickComment: vi.fn(),
+    } as CommentDecorationState,
+  };
+  // A find highlight outside the block must not keep it open on its own.
+  const instance = await mount({ current: { query: "outro", currentIndex: 0 } }, commentState);
+  const rebuildComments = () =>
+    act(async () => {
+      instance.view.dispatch(instance.state.tr.setMeta(commentDecorationKey, "rebuild"));
+    });
+  expect(mermaidSource()).not.toBeVisible();
+
+  commentState.current.activeSelection = {
+    start_index: comment.start_index,
+    end_index: comment.end_index,
+    anchor_content: "Alpha",
+  };
+  await rebuildComments();
+  expect(mermaidSource()).toBeVisible();
+
+  commentState.current.activeSelection = null;
+  await rebuildComments();
   expect(mermaidSource()).not.toBeVisible();
 });

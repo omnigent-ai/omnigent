@@ -7,7 +7,7 @@ import { InputRule } from "@tiptap/core";
 import { CodeBlock } from "@tiptap/extension-code-block";
 import { ReactNodeViewRenderer } from "@tiptap/react";
 import { TipTapCodeBlockView } from "./TipTapCodeBlockView";
-import { hasRevealDecoration } from "./TipTapRevealDecoration";
+import { revealDecorationKey } from "./TipTapRevealDecoration";
 import { softBreaksToNewlines } from "./TipTapSoftBreak";
 import { fenceForBody } from "./markdownFence";
 
@@ -19,7 +19,7 @@ export const CodeBlockWithLanguage = CodeBlock.extend({
       update: ({ oldNode, newNode, oldInnerDecorations, innerDecorations, updateProps }) => {
         if (
           newNode !== oldNode ||
-          hasRevealDecoration(oldInnerDecorations) !== hasRevealDecoration(innerDecorations)
+          revealDecorationKey(oldInnerDecorations) !== revealDecorationKey(innerDecorations)
         ) {
           updateProps();
         }
