@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { PageScroll } from "@/components/PageScroll";
+import { ProactiveAgentAdminControls } from "@/components/ProactiveAgentAdminControls";
+import { ProactiveAgentSettingControl } from "@/components/ProactiveAgentSettingControl";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import {
   Select,
@@ -9,9 +11,15 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
+import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import { useSharing, useSetSharing } from "@/hooks/useSharing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode, type SiblingSessionDestinations } from "@/lib/capabilities";
+import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
+import { NESTED_AGENT_DESTINATIONS_ENTRY } from "@/pages/settings/search/catalog/admin";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
+import { settingsOverlayProps } from "@/pages/settings/search/settingsOwnership";
+import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
 
 const AGENT_DESTINATIONS: {
   id: SiblingSessionDestinations;
@@ -41,6 +49,7 @@ export function AdminGeneralPage() {
   const isAdmin = useIsAdmin();
   const canManage = isSingleUserMode(info) || isAdmin;
   const nestedAgentsEnabled = info !== "loading" && info.sibling_sessions === true;
+  const { available: advisorAvailable, settings: advisorSettings } = useProactiveAgentSettings();
   const {
     data: sharing,
     error: sharingError,
@@ -65,10 +74,10 @@ export function AdminGeneralPage() {
     );
   }
 
-  if (!nestedAgentsEnabled) return null;
+  if (!nestedAgentsEnabled && !advisorAvailable) return null;
   return (
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
-      <h1 className="settings-page-title text-2xl font-medium">Admin settings</h1>
+      <h1 className="text-2xl font-medium">Admin settings</h1>
       <p className="mt-1 mb-6 text-sm text-muted-foreground">Server-wide settings for all users.</p>
       {!canManage ? (
         <p className="text-ui text-muted-foreground">
@@ -77,12 +86,23 @@ export function AdminGeneralPage() {
       ) : (
         <>
           {isLoading && <p className="text-ui text-muted-foreground">Loading...</p>}
-          {sharing && (
+          {advisorAvailable && advisorSettings?.can_manage_workspace !== false && (
             <SettingsGroup
-              title="Nested agent destinations"
-              testId="settings-group-agent-destinations"
+              title={PROACTIVE_AGENT_DISPLAY_NAME}
+              testId="settings-group-admin-proactive-agent"
             >
-              <div className="flex flex-col gap-3 md:flex-row-reverse md:items-start md:gap-6">
+              <ProactiveAgentSettingControl scope="workspace" />
+              <div className="mt-4 border-t border-border pt-4">
+                <ProactiveAgentAdminControls />
+              </div>
+            </SettingsGroup>
+          )}
+          {nestedAgentsEnabled && sharing && (
+            <SettingsGroup title="Nested agents" testId="settings-group-agent-destinations">
+              <SettingsItem
+                entry={NESTED_AGENT_DESTINATIONS_ENTRY}
+                className="flex flex-col gap-3 md:flex-row-reverse md:items-start md:gap-6"
+              >
                 <Select
                   value={destinations}
                   onValueChange={(value) => chooseDestinations(value as SiblingSessionDestinations)}
@@ -91,13 +111,13 @@ export function AdminGeneralPage() {
                   valueHasNoPii
                 >
                   <SelectTrigger
+                    {...settingsControlProps(NESTED_AGENT_DESTINATIONS_ENTRY)}
                     className="w-full shrink-0 md:w-64"
-                    aria-label="Nested agent destinations"
-                    aria-describedby="agent-destinations-description"
                   >
                     <SelectValue>{destination?.label ?? destinations}</SelectValue>
                   </SelectTrigger>
                   <SelectContent
+                    {...settingsOverlayProps(NESTED_AGENT_DESTINATIONS_ENTRY)}
                     position="popper"
                     align="end"
                     className="w-[30rem] max-w-[calc(100vw-2rem)]"
@@ -117,13 +137,13 @@ export function AdminGeneralPage() {
                     ))}
                   </SelectContent>
                 </Select>
-                <p
-                  id="agent-destinations-description"
-                  className="min-w-0 flex-1 text-sm leading-normal text-muted-foreground md:pt-1"
-                >
-                  {destination?.description}
-                </p>
-              </div>
+                <div className="min-w-0 flex-1 md:pt-1">
+                  <SettingsEntryLabel
+                    entry={NESTED_AGENT_DESTINATIONS_ENTRY}
+                    description={destination?.description}
+                  />
+                </div>
+              </SettingsItem>
             </SettingsGroup>
           )}
           {(destinationError || sharingError) && (

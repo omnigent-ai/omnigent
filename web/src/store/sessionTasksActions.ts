@@ -1,10 +1,14 @@
 import { create } from "zustand";
 
+import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import type { TaskAction } from "@/lib/workflow";
+
+/** Opens the composer's workflow dialog, to describe one from `description` or to run `savedWorkflow`. */
+export type StartWorkflow = (description?: string, savedWorkflow?: SavedWorkflow | null) => void;
 
 interface SessionTasksActionsState {
   /** Per session: how its composer starts a workflow, when it offers one. */
-  startWorkflow: Readonly<Record<string, () => void>>;
+  startWorkflow: Readonly<Record<string, StartWorkflow>>;
   /** Per session: how its composer saves the plan as a workflow, given the plan's name. */
   saveWorkflow: Readonly<Partial<Record<string, (planName: string) => void>>>;
   /** Per session: how its composer asks the agent to continue the plan, given its name. */
@@ -17,8 +21,11 @@ interface SessionTasksActionsState {
   tasksTabToOpen: string | null;
   /** The task the Tasks tab should scroll to and highlight; the tab clears it once shown. */
   taskToShow: { conversationId: string; stepId: string } | null;
-  /** True when the agent, not a click, asked for the tab: a phone's drawer then stays shut. */
-  tasksTabAutoOpen: boolean;
+  /**
+   * Who asked for the tab: a click opens it; the agent's first plan keeps a phone's drawer
+   * shut; a session opening only selects it, leaving the rail as the session restored it.
+   */
+  tasksTabRequestedBy: "click" | "first-plan" | "session-open";
 }
 
 /**
@@ -36,7 +43,7 @@ export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
   stopWork: {},
   tasksTabToOpen: null,
   taskToShow: null,
-  tasksTabAutoOpen: false,
+  tasksTabRequestedBy: "click",
 }));
 
 /**
@@ -44,7 +51,7 @@ export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
  *
  * @returns A function that withdraws the action, unless another took its place.
  */
-export function registerStartWorkflow(conversationId: string, start: () => void): () => void {
+export function registerStartWorkflow(conversationId: string, start: StartWorkflow): () => void {
   return registerSessionAction("startWorkflow", conversationId, start);
 }
 
@@ -124,18 +131,22 @@ export function openTasksTab(conversationId: string, stepId?: string): void {
   useSessionTasksActions.setState({
     tasksTabToOpen: conversationId,
     taskToShow: stepId ? { conversationId, stepId } : null,
-    tasksTabAutoOpen: false,
+    tasksTabRequestedBy: "click",
   });
 }
 
 /**
- * Show a session's Tasks tab beside the chat, not over it on a phone: when the
- * agent makes the session's first plan, or a session with tasks opens.
+ * Show a session's Tasks tab beside the chat, not over it on a phone: open it for
+ * the agent's first plan, or select it when a session with tasks opens.
+ * A session opening keeps a request already waiting for it, e.g. a click that navigated there.
  */
-export function showTasksTabBesideChat(conversationId: string): void {
-  useSessionTasksActions.setState({
-    tasksTabToOpen: conversationId,
-    taskToShow: null,
-    tasksTabAutoOpen: true,
-  });
+export function showTasksTabBesideChat(
+  conversationId: string,
+  requestedBy: "first-plan" | "session-open",
+): void {
+  useSessionTasksActions.setState((state) =>
+    requestedBy === "session-open" && state.tasksTabToOpen === conversationId
+      ? state
+      : { tasksTabToOpen: conversationId, taskToShow: null, tasksTabRequestedBy: requestedBy },
+  );
 }

@@ -45,6 +45,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
@@ -1272,7 +1273,8 @@ async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input
     env = startup_env
     session_id = await _create(env)
 
-    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=5)
+    # The drain precedes the launch's five-second failure-recording window.
+    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=budget(10.0))
 
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and conv.labels[STARTUP_LABEL] == "failed"
@@ -1372,6 +1374,66 @@ async def test_native_receipt_wakes_the_host_worker(
     assert env.conv_store.list_pending_inputs(session_id) == []
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and woken == [conv.host_id]
+
+
+async def test_unconfirmed_native_submission_stops_holding_later_inputs(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A submitted input the CLI never echoes is failed, so later messages are not held."""
+    env = startup_env
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_TIMEOUT_S", 0)
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name)
+    entry = _bind(env, session_id)
+    startup = env.app.state.startup_inputs
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": _TEXT}], stable_id=entry.id
+    )
+
+    async def dispatch(context: StartupInputContext, session_id: str, _: SessionEventInput):
+        assert await context.claim(env.conv_store, session_id)
+        return {"queued": True, "pending_id": pending_id}
+
+    startup.dispatch = dispatch
+    woken: list[str] = []
+    monkeypatch.setattr("omnigent.server.startup_inputs.wake_startup_worker", woken.append)
+    await startup._deliver(env.app, session_id, entry)
+    await asyncio.gather(*startup._receipt_watches)
+
+    [failed] = env.conv_store.list_pending_inputs(session_id)
+    assert failed.id == entry.id and failed.status == "failed"
+    assert not await startup.has_undelivered(session_id)
+    assert pending_inputs.pending_id_for_stable_id(session_id, entry.id) is None
+    [notice] = env.conv_store.list_items(session_id).data
+    assert isinstance(notice.data, ErrorData) and notice.data.code == "startup_input_failed"
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and woken == [conv.host_id]
+
+
+async def test_confirmed_native_submission_is_not_failed_by_its_receipt_watch(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = startup_env
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name)
+    entry = _bind(env, session_id)
+    startup = env.app.state.startup_inputs
+
+    async def dispatch(context: StartupInputContext, session_id: str, _: SessionEventInput):
+        assert await context.claim(env.conv_store, session_id)
+        return {"queued": True, "pending_id": "pending"}
+
+    startup.dispatch = dispatch
+    await startup._deliver(env.app, session_id, entry)
+    pending_inputs.reset_for_tests()
+    await _simulate_transcript_forwarder_echo(env.client, session_id, _TEXT)
+    assert env.conv_store.list_pending_inputs(session_id) == []
+
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_TIMEOUT_S", 0)
+    await startup._expire_unconfirmed(session_id, entry.id, "pending")
+    assert not [
+        item
+        for item in env.conv_store.list_items(session_id).data
+        if isinstance(item.data, ErrorData)
+    ]
 
 
 async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:

@@ -18,11 +18,11 @@
     "start": "electron .",
     "dev": "electron .",
     "test": "node --test",
-    "build": "electron-builder -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
-    "build:mac": "electron-builder --mac -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
+    "build": "electron-builder -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev -c.electronFuses.enableNodeCliInspectArguments=true",
+    "build:mac": "electron-builder --mac -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev -c.electronFuses.enableNodeCliInspectArguments=true",
     "build:mac:release": "OMNIGENT_NOTARIZE_DMG=true electron-builder --mac -c.mac.notarize=true -c.dmg.sign=true",
-    "build:linux": "electron-builder --linux -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
-    "build:win": "electron-builder --win -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
+    "build:linux": "electron-builder --linux -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev -c.electronFuses.enableNodeCliInspectArguments=true",
+    "build:win": "electron-builder --win -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev -c.electronFuses.enableNodeCliInspectArguments=true",
     "build:overlay": "pnpm --filter web run build:overlay && pnpm --filter web run build:server-selector-v2",
     "predev": "pnpm run build:overlay",
     "prestart": "pnpm run build:overlay",
@@ -58,6 +58,14 @@
         "url": "https://omnigent.ai/_desktop/updates/"
       }
     ],
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true,
+      "resetAdHocDarwinSignature": true
+    },
     "afterPack": "build/afterPack.js",
     "afterAllArtifactBuild": "build/afterAllArtifactBuild.js",
     "files": [
@@ -177,6 +185,7 @@
     }
   },
   "dependencies": {
+    "@napi-rs/keyring": "2.1.2",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "electron-updater": "^6.3.9",

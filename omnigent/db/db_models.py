@@ -29,10 +29,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
+from sqlalchemy.dialects.postgresql import VARCHAR as PGVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.bounded_binary import BoundedBinary
 from omnigent.db.compression import CompressedText
+from omnigent.db.envelope import EnvelopedJSON, EnvelopedText
 from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
@@ -657,6 +659,97 @@ def _on_sqlite_family(
     """
     del ddl, target, bind, tables, state, compiler, checkfirst
     return dialect.name in ("sqlite", "cloudflare_d1")
+
+
+# Largest stored ``memories.content`` and ``memories.description`` envelopes,
+# framing included. Content stays under the 16 KB per-value limit for new columns;
+# a description is 512 characters of up to four bytes each, plus framing.
+MEMORY_CONTENT_MAX_STORED_BYTES = 16_383
+MEMORY_DESCRIPTION_MAX_STORED_BYTES = 2_100
+# The owner's id within its ``actor_type``: for a user, up to the 128 characters
+# other tables store for a user id.
+MEMORY_ACTOR_ID_MAX_LENGTH = 128
+# Exact comparison on MySQL, whose default collation ignores case and accents and
+# would let two owners share one memory.
+_MEMORY_ACTOR_ID = String(MEMORY_ACTOR_ID_MAX_LENGTH).with_variant(
+    MySQLVarchar(MEMORY_ACTOR_ID_MAX_LENGTH, charset="utf8mb4", collation="utf8mb4_0900_bin"),
+    "mysql",
+)
+# Byte-order comparison without trailing-space padding on every engine (SQLite and
+# CockroachDB compare bytes by default), so each distinct path is its own key and
+# the paths under a prefix form one contiguous primary-key range.
+_MEMORY_PATH = (
+    String(512)
+    .with_variant(MySQLVarchar(512, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql")
+    .with_variant(PGVarchar(512, collation="C"), "postgresql")
+)
+
+
+class SqlMemory(OmnigentBase):
+    """
+    Long-term memory entries, one row per ``(workspace, actor type, actor, path)``.
+
+    :param workspace_id: Tenant scope; stamped from :func:`current_workspace_id`.
+    :param actor_type: Kind of owner, as a ``MEMORY_ACTOR_TYPE`` code (``1`` for
+        a user).
+    :param actor_id: The owner's id within its type, e.g. ``"alice"``.
+    :param path: Absolute entry path, e.g. ``"/projects/api/gotchas"``, compared
+        byte for byte.
+    :param content: Entry body, in an opaque storage envelope.
+    :param description: One-line summary returned with listings, in an opaque
+        storage envelope.
+    :param created_at: Unix epoch seconds of the first write.
+    :param updated_at: Unix epoch seconds of the last write.
+    """
+
+    __tablename__ = "memories"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    actor_type: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False)
+    actor_id: Mapped[str] = mapped_column(_MEMORY_ACTOR_ID, primary_key=True)
+    path: Mapped[str] = mapped_column(_MEMORY_PATH, primary_key=True)
+    content: Mapped[str] = mapped_column(
+        EnvelopedText(MEMORY_CONTENT_MAX_STORED_BYTES), nullable=False
+    )
+    description: Mapped[str | None] = mapped_column(
+        EnvelopedText(MEMORY_DESCRIPTION_MAX_STORED_BYTES), nullable=True
+    )
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        # MEMORY_ACTOR_TYPE codes: user.
+        CheckConstraint("actor_type IN (1)", name="ck_memories_actor_type"),
+        # SQLite ignores declared lengths and types, so bound every column there:
+        # strings at up to four bytes per character, envelopes at their stored size.
+        CheckConstraint(
+            "typeof(workspace_id) = 'integer'", name="ck_memories_workspace_id_integer"
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            f"length(CAST(actor_id AS BLOB)) <= {4 * MEMORY_ACTOR_ID_MAX_LENGTH}",
+            name="ck_memories_actor_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(path AS BLOB)) <= 2048", name="ck_memories_path_bytes"
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            f"length(CAST(content AS BLOB)) <= {MEMORY_CONTENT_MAX_STORED_BYTES}",
+            name="ck_memories_content_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "description IS NULL OR "
+            f"length(CAST(description AS BLOB)) <= {MEMORY_DESCRIPTION_MAX_STORED_BYTES}",
+            name="ck_memories_description_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(created_at) = 'integer'", name="ck_memories_created_at_integer"
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(updated_at) = 'integer'", name="ck_memories_updated_at_integer"
+        ).ddl_if(callable_=_on_sqlite_family),
+    )
 
 
 class SqlConversationMetadata(OmnigentBase):
@@ -1572,10 +1665,13 @@ class SqlScheduledTask(OmnigentBase):
         continue (relates to ``conversations.id``; no DB foreign key, Rule R032).
         ``None`` until the first such firing creates it, unless a session was
         chosen.
-    :param kind: What the task is for — ``automation`` (1, the default) or
-        ``reminder`` (2), a one-time message an agent set for its own session.
-        Clients use it to list reminders apart from automations; scheduling
-        and firing do not depend on it.
+    :param kind: What the task is for — ``automation`` (1, the default),
+        ``reminder`` (2), a one-time message an agent set for its own session, or
+        ``timer`` (3), a hidden one-shot or repeating wake an agent set with
+        ``sys_timer_set``. Clients list only automations; timers also have their
+        own schedule arithmetic and delivery.
+    :param smart_routing: Whether the task's runs use Smart Routing instead of
+        a fixed model: on (1) or off (2). ``None`` until the owner chooses.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -1658,9 +1754,11 @@ class SqlScheduledTask(OmnigentBase):
     # The session each run's new session starts as a copy of. Relates to
     # conversations.id. No DB foreign key (Rule R032).
     source_session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    # Stable int code: automation=1, reminder=2. Defaults to automation so
+    # Stable int code: automation=1, reminder=2, timer=3. Defaults to automation so
     # existing tasks keep listing as automations.
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    # Stable int code: on=1, off=2. NULL keeps "never chosen" apart from off.
+    smart_routing: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
@@ -1668,11 +1766,22 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_lifecycle_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
-        CheckConstraint("kind IN (1, 2)", name="ck_scheduled_tasks_kind"),
+        CheckConstraint("kind IN (1, 2, 3)", name="ck_scheduled_tasks_task_kind"),
+        CheckConstraint("smart_routing IN (1, 2)", name="ck_scheduled_tasks_smart_routing"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.
         Index(
             "ix_scheduled_tasks_user_scope",
+            "workspace_id",
+            "user_id",
+            "created_at",
+            "id",
+        ),
+        # Lists one kind of a user's tasks without reading other kinds' rows, and finds
+        # any task of a kind in one lookup, as the timer-kind downgrade does.
+        Index(
+            "ix_scheduled_tasks_kind_scope",
+            "kind",
             "workspace_id",
             "user_id",
             "created_at",
@@ -1960,7 +2069,8 @@ class SqlWorkflow(OmnigentBase):
     ``session_journal_entries.workflow_id``. Workflows have no versions: an edit
     rewrites the row, and each run's journal keeps the plan it ran.
 
-    :param id: UUID of the workflow, in the session ID's format (bare hex).
+    :param id: The workflow's ID from the store's allocator, in the session ID's format
+        (bare hex); by default a UUID4.
     :param user_id: The owning user, or the reserved ``local`` user in single-user mode.
     :param name: One line, e.g. ``"nightly-build"``; a run's plan takes this name.
     :param description: What the workflow is for; a run gives it to the agent as
@@ -2001,6 +2111,65 @@ class SqlWorkflow(OmnigentBase):
     )
 
 
+class SqlWorkflowShare(OmnigentBase):
+    """
+    SQLAlchemy model for the ``workflow_shares`` table.
+
+    One row per user or group a saved workflow is shared with. They may view, run
+    and copy it, but not change it; a run is their own session, which stays theirs.
+    These rows are not session grants; those stay in ``session_permissions``. Public
+    shares (``__public__``) are never stored; the application enforces that.
+
+    :param workflow_id: The workflow this share belongs to (relates to
+        ``workflows.id``). Rows are deleted with their workflow by the application;
+        there is no DB foreign key (schema Rule R032).
+    :param user_id: The grantee, a user or group ID, e.g. ``"alice@example.com"``.
+        String(128) matches ``session_permissions.user_id``.
+    :param level: The permission level granted. No CHECK constraint: the permission
+        store owns the set of valid levels.
+    """
+
+    __tablename__ = "workflow_shares"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    # No database default; the ORM always supplies it.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    workflow_id: Mapped[str] = mapped_column(Uuid16, primary_key=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
+    # Permission level code, stored as a small integer like scheduled_task_shares.level.
+    level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    __table_args__ = (
+        # SQLite and D1 ignore VARCHAR lengths: 128 characters at up to four bytes each.
+        CheckConstraint(
+            "length(CAST(user_id AS BLOB)) <= 512",
+            name="ck_workflow_shares_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite and D1 store any value in an integer column.
+        CheckConstraint(
+            "typeof(workspace_id) = 'integer'",
+            name="ck_workflow_shares_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(level) = 'integer'",
+            name="ck_workflow_shares_level_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # Looks up the workflows shared with one user; the primary key already
+        # covers the remaining columns.
+        Index(
+            "ix_workflow_shares_user_id",
+            "workspace_id",
+            "user_id",
+            "workflow_id",
+        ),
+    )
+
+
 # Largest stored (compressed) value for a new column, per the database guide.
 _INBOX_MAX_STORED_BYTES = 16_383
 
@@ -2035,11 +2204,13 @@ class SqlInboxItem(OmnigentBase):
     # What the agent posted, which a deployment may encrypt, as one storage
     # envelope: {"kind", "title", "body_md", "links", "actions", "topic",
     # "primary_link", "media"}. Always read and written together.
-    content: Mapped[bytes] = mapped_column(BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=False)
+    content: Mapped[dict[str, Any]] = mapped_column(
+        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    )
     # How the owner answered, in its own envelope since it is written alone:
     # {"reason", "action", "text"}. NULL until the owner answers.
-    resolution: Mapped[bytes | None] = mapped_column(
-        BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=True
+    resolution: Mapped[dict[str, Any] | None] = mapped_column(
+        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
     )
     # Unix epoch seconds.
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

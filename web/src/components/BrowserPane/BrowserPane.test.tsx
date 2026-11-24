@@ -698,12 +698,7 @@ describe("BrowserPane Chrome cookie import", () => {
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getAllByText(HOST).length).toBeGreaterThan(0);
-    expect(within(dialog).getByText("Work")).toBeInTheDocument();
-    expect(
-      within(dialog).getByText(
-        `4 cookies for ${HOST} and its subdomains. Other sites' cookies stay out of Omnigent entirely.`,
-      ),
-    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Work (4)")).toBeInTheDocument();
     expect(bridge.browserChromeCookiePreview).toHaveBeenCalledWith("conv_cookie");
     // The preview alone must never write cookies.
     expect(bridge.browserChromeCookieImport).not.toHaveBeenCalled();
@@ -736,10 +731,7 @@ describe("BrowserPane Chrome cookie import", () => {
     fireEvent.click(scopePicker);
     fireEvent.click(await screen.findByRole("option", { name: `${PARENT} (6)` }));
 
-    expect(dialog).toHaveTextContent(`6 cookies for ${PARENT} and its subdomains`);
-    expect(
-      within(dialog).getByText(/Cookies from other subdomains stay bound to their own host/),
-    ).toBeInTheDocument();
+    expect(dialog).toHaveTextContent("Work (6)");
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
 
@@ -766,7 +758,7 @@ describe("BrowserPane Chrome cookie import", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).queryByRole("combobox", { name: "Site scope" })).toBeNull();
-    expect(dialog).toHaveTextContent("2 cookies for example.com");
+    expect(dialog).toHaveTextContent("Work (2)");
   });
 
   it("says so instead of opening a dialog when Chrome has nothing for the site", async () => {
@@ -807,7 +799,7 @@ describe("BrowserPane Chrome cookie import", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
     const dialog = await screen.findByRole("dialog");
     expect(
-      within(dialog).getByText(/tabs share one cookie jar, including any tab the agent controls/),
+      within(dialog).getByText(/Agent-controlled tabs share these cookies and can act as you/),
     ).toBeInTheDocument();
   });
 
@@ -866,7 +858,7 @@ describe("BrowserPane Chrome cookie import", () => {
 
     // The wider scope is gone from the picker, so the import targets the host.
     expect(within(dialog).queryByRole("combobox", { name: "Site scope" })).toBeNull();
-    expect(dialog).toHaveTextContent(`1 cookie for ${HOST}`);
+    expect(dialog).toHaveTextContent("Personal (1)");
     fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
     await waitFor(() =>
       expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_reset", {
@@ -875,6 +867,184 @@ describe("BrowserPane Chrome cookie import", () => {
         scope: HOST,
       }),
     );
+  });
+
+  describe("on a shell that offers every website", () => {
+    const ALL_SITES_PREVIEW = {
+      ...PREVIEW,
+      allSitesProfiles: [
+        { id: "Default", name: "Work", cookieCount: 40 },
+        // Holds nothing for this page's site, so only every website is on offer.
+        { id: "Profile 2", name: "Personal", cookieCount: 7 },
+      ],
+    };
+
+    it("imports every website's cookies by default", async () => {
+      const bridge = installCookieBridge({
+        preview: ALL_SITES_PREVIEW,
+        importResult: { ok: true, scope: "*", profileId: "Default", imported: 38, skipped: 2 },
+      });
+      render(<BrowserPane conversationId="conv_all" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+
+      expect(within(dialog).getByRole("combobox", { name: "Site scope" })).toHaveTextContent(
+        "All websites",
+      );
+      expect(within(dialog).getByRole("combobox", { name: "Chrome profile" })).toHaveTextContent(
+        "Work (40)",
+      );
+      // The consent text has to say the agent gets every imported site, not one.
+      expect(dialog).toHaveTextContent("can act as you on every imported site.");
+
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all", {
+          profileId: "Default",
+          expectedHost: HOST,
+          scope: "*",
+        }),
+      );
+      await waitFor(() => expect(bridge.browserReload).toHaveBeenCalledWith("conv_all"));
+      expect(toast.success).toHaveBeenCalledWith(
+        "Imported 38 cookies from Chrome (2 couldn't be used).",
+      );
+    });
+
+    it("still imports only the current site when the user picks it", async () => {
+      const bridge = installCookieBridge({ preview: ALL_SITES_PREVIEW });
+      render(<BrowserPane conversationId="conv_all_site" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+      expect(screen.getByRole("option", { name: "All websites (40)" })).toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("option", { name: `${HOST} (4)` }));
+
+      expect(within(dialog).getByRole("combobox", { name: "Chrome profile" })).toHaveTextContent(
+        "Work (4)",
+      );
+      expect(dialog).toHaveTextContent("can act as you on this site.");
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all_site", {
+          profileId: "Default",
+          expectedHost: HOST,
+          scope: HOST,
+        }),
+      );
+    });
+
+    it("narrows a picked site scope to the host, not to every website", async () => {
+      const bridge = installCookieBridge({
+        preview: {
+          ok: true,
+          host: HOST,
+          scopes: [HOST, PARENT],
+          profiles: [
+            {
+              id: "Default",
+              name: "Work",
+              cookieCount: 4,
+              scopes: [
+                { host: HOST, cookieCount: 4 },
+                { host: PARENT, cookieCount: 6 },
+              ],
+            },
+            {
+              id: "Profile 2",
+              name: "Personal",
+              cookieCount: 1,
+              scopes: [{ host: HOST, cookieCount: 1 }],
+            },
+          ],
+          allSitesProfiles: [
+            { id: "Default", name: "Work", cookieCount: 40 },
+            { id: "Profile 2", name: "Personal", cookieCount: 7 },
+          ],
+        },
+      });
+      render(<BrowserPane conversationId="conv_all_narrow" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+      fireEvent.click(await screen.findByRole("option", { name: `${PARENT} (6)` }));
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Chrome profile" }));
+      fireEvent.click(await screen.findByRole("option", { name: /^Personal/ }));
+
+      expect(within(dialog).getByRole("combobox", { name: "Site scope" })).toHaveTextContent(HOST);
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all_narrow", {
+          profileId: "Profile 2",
+          expectedHost: HOST,
+          scope: HOST,
+        }),
+      );
+    });
+
+    it("offers a profile that has no cookies for the current site", async () => {
+      const bridge = installCookieBridge({ preview: ALL_SITES_PREVIEW });
+      render(<BrowserPane conversationId="conv_all_profile" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      const dialog = await screen.findByRole("dialog");
+      // Pick the site first: the other profile can't cover it, so the scope
+      // must fall back to every website rather than import nothing.
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Site scope" }));
+      fireEvent.click(await screen.findByRole("option", { name: `${HOST} (4)` }));
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Chrome profile" }));
+      fireEvent.click(await screen.findByRole("option", { name: "Personal (7)" }));
+
+      expect(within(dialog).queryByRole("combobox", { name: "Site scope" })).toBeNull();
+      expect(within(dialog).getByRole("combobox", { name: "Chrome profile" })).toHaveTextContent(
+        "Personal (7)",
+      );
+      fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+      await waitFor(() =>
+        expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_all_profile", {
+          profileId: "Profile 2",
+          expectedHost: HOST,
+          scope: "*",
+        }),
+      );
+    });
+
+    it("opens for every website when Chrome has no cookies for the current site", async () => {
+      installCookieBridge({
+        preview: {
+          ok: true,
+          host: HOST,
+          scopes: [],
+          profiles: [],
+          allSitesProfiles: [{ id: "Default", name: "Work", cookieCount: 1 }],
+        },
+      });
+      render(<BrowserPane conversationId="conv_all_only" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+
+      const dialog = await screen.findByRole("dialog");
+      expect(dialog).toHaveTextContent("Work (1)");
+      expect(toast.info).not.toHaveBeenCalled();
+    });
+
+    it("says so when Chrome has no cookies at all", async () => {
+      installCookieBridge({
+        preview: { ok: true, host: HOST, scopes: [], profiles: [], allSitesProfiles: [] },
+      });
+      render(<BrowserPane conversationId="conv_all_none" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+
+      await waitFor(() => expect(toast.info).toHaveBeenCalledWith("No Chrome cookies found."));
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
   });
 
   it("explains a zero-cookie import that the session rejected", async () => {

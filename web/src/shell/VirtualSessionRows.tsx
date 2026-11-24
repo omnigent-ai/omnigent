@@ -89,6 +89,7 @@ export function VirtualSessionRows<Item extends { id: string }>({
   scrollElementRef,
   revealId,
   revealReady = true,
+  gap = ROW_GAP,
   className,
   renderRow,
 }: {
@@ -98,6 +99,8 @@ export function VirtualSessionRows<Item extends { id: string }>({
   revealId: string | null;
   /** False while rows are still arriving, so a reveal waits for the row's final position. */
   revealReady?: boolean;
+  /** Space between rows, in pixels. */
+  gap?: number;
   className?: string;
   renderRow: (item: Item, placement: VirtualRowPlacement) => ReactNode;
 }) {
@@ -122,9 +125,13 @@ export function VirtualSessionRows<Item extends { id: string }>({
   const estimateMeasured = useRef(false);
   const virtualizer = useVirtualizer({
     count: items.length,
+    // The virtualizer writes its starting offset to the scroller on attach, so it starts from
+    // the scroller's offset at that point; reading it earlier would undo a scroll restore.
+    enabled: scrollElement !== null,
+    initialOffset: () => scrollElement?.scrollTop ?? 0,
     getScrollElement: () => scrollElement,
     estimateSize: () => rowEstimate,
-    gap: ROW_GAP,
+    gap,
     overscan: OVERSCAN,
     scrollMargin,
     getItemKey,

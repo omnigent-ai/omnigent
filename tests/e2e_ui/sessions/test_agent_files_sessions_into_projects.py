@@ -224,7 +224,7 @@ def test_agent_files_existing_sessions_into_projects(
             0, timeout=_LIVE_UPDATE_TIMEOUT_MS
         )
     expect(folder_toggle).to_have_attribute("aria-expanded", "false")
-    folder_toggle.click()
+    folder_toggle.locator("[data-section-toggle]").first.click()
     existing_folder = _folder(page, journey.existing_project)
     for title in journey.unfiled.values():
         expect(existing_folder.get_by_text(title, exact=True)).to_be_visible(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import ntpath
@@ -21,6 +22,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.types import Message, Receive, Scope, Send
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
@@ -44,6 +46,12 @@ from omnigent.server.auth import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes._gzip_route import (
+    GZIP_COMPRESSLEVEL,
+    GZIP_MINIMUM_SIZE,
+    SKIP_GZIP_STATE_KEY,
+    _StateAwareGZipResponder,
+)
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -2772,7 +2780,7 @@ async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
     )
 
     assert resp.status_code == 415, resp.text
-    assert "Claude Code or Codex" in resp.text
+    assert "local file attachments" in resp.text
     listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
     assert listed.data == []
 
@@ -4686,10 +4694,12 @@ _DOWNLOAD_URL = (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scope", [None, "workspace"])
+@pytest.mark.parametrize("range_header", [None, "bytes=4096-8191", "bytes=16384-"])
 async def test_filesystem_download_streams_runner_attachment(
     client: httpx.AsyncClient,
     tmp_path: Path,
     scope: str | None,
+    range_header: str | None,
 ) -> None:
     """``?download=true`` forwards the runner's attachment and headers verbatim.
 
@@ -4719,15 +4729,27 @@ async def test_filesystem_download_streams_runner_attachment(
         )
 
     async with _runner_app_client(runner):
-        resp = await client.get(_DOWNLOAD_URL + (f"&scope={scope}" if scope else ""))
+        resp = await client.get(
+            _DOWNLOAD_URL + (f"&scope={scope}" if scope else ""),
+            headers={"Range": range_header} if range_header else {},
+        )
 
-    assert resp.status_code == 200
-    assert resp.content == payload
+    assert seen == [("data/big.bin", True, scope or "reach")]
+    if range_header == "bytes=16384-":
+        assert resp.status_code == 416
+        assert resp.headers["content-range"] == f"bytes */{len(payload)}"
+        return
+    assert resp.status_code == (206 if range_header else 200)
+    expected = payload[4096:8192] if range_header else payload
+    assert resp.content == expected
     assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
-    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.headers["content-length"] == str(len(expected))
+    assert resp.headers["accept-ranges"] == "bytes"
+    if range_header:
+        assert resp.headers["content-range"] == f"bytes 4096-8191/{len(payload)}"
+    assert "content-encoding" not in resp.headers
     assert resp.headers["cache-control"] == "no-store"
     assert resp.headers.get("X-Omnigent-File-Scope") == scope
-    assert seen == [("data/big.bin", True, scope or "reach")]
 
 
 @pytest.mark.asyncio
@@ -11220,6 +11242,54 @@ async def test_sibling_environment_routes_are_not_gzipped(
     assert "content-encoding" not in resp.headers
 
 
+@pytest.mark.asyncio
+async def test_skip_gzip_responder_forwards_start_before_bodies() -> None:
+    """An opted-out response is forwarded as soon as each message is sent.
+
+    Holding the start message ties the opt-out to when a Starlette version
+    flushes it; 1.8.0 drops it, so the server answers 500.
+
+    :returns: None.
+    """
+    start: Message = {
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"application/json")],
+    }
+    first_body: Message = {
+        "type": "http.response.body",
+        "body": b"x" * (GZIP_MINIMUM_SIZE * 2),
+        "more_body": True,
+    }
+    final_body: Message = {"type": "http.response.body", "body": b"", "more_body": False}
+    # Starlette's gzip path rewrites messages in place, so compare against copies.
+    expected = copy.deepcopy([start, first_body, final_body])
+    sent: list[Message] = []
+    sent_when_start_returned: list[Message] = []
+
+    async def handler(scope: Scope, receive: Receive, send: Send) -> None:
+        scope["state"][SKIP_GZIP_STATE_KEY] = True
+        await send(start)
+        sent_when_start_returned.extend(sent)
+        await send(first_body)
+        await send(final_body)
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def record(message: Message) -> None:
+        sent.append(message)
+
+    scope: Scope = {"type": "http", "headers": [(b"accept-encoding", b"gzip")], "state": {}}
+    responder = _StateAwareGZipResponder(
+        handler, GZIP_MINIMUM_SIZE, GZIP_COMPRESSLEVEL, scope["state"]
+    )
+    await responder(scope, receive, record)
+
+    assert sent == expected
+    assert sent_when_start_returned == expected[:1]
+
+
 @pytest.mark.parametrize(
     "resource,op",
     [
@@ -11587,6 +11657,7 @@ async def test_native_send_rechecks_runtime_after_upload(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("filename", ["trace.gz", "clip.mp4"])
 @pytest.mark.parametrize(
     ("retained_history", "host_has_attachments", "status"),
     [(False, True, 409), (True, True, 202), (True, False, 409)],
@@ -11595,11 +11666,12 @@ async def test_native_send_requires_delivery_support_for_new_types(
     file_client: httpx.AsyncClient,
     file_app: FastAPI,
     file_conv_store: _ConversationStore,
+    filename: str,
     retained_history: bool,
     host_has_attachments: bool,
     status: int,
 ) -> None:
-    """Only a file sent now needs the runtime to deliver types beyond the defaults.
+    """Only a file sent now needs the runtime to deliver types beyond the legacy extensions.
 
     A recorded file in retained history still needs filesystem attachment support.
     """
@@ -11613,12 +11685,13 @@ async def test_native_send_requires_delivery_support_for_new_types(
     runner = _FakeRunnerClient(payload={})
     set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
     set_runner_client(runner)  # type: ignore[arg-type]
-    file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
-        all_types=True
-    )
+    if filename.endswith(".gz"):
+        file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
+            all_types=True
+        )
     upload = await file_client.post(
         f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("trace.gz", b"\x1f\x8b", "application/gzip")},
+        files={"file": (filename, b"data", "application/octet-stream")},
     )
     assert upload.status_code == 201, upload.text
     content = [{"type": "input_file", "file_id": upload.json()["id"]}]

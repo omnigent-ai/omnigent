@@ -262,10 +262,10 @@ async def test_connected_host_cannot_launch_after_reset_until_it_reconnects(setu
     from asgiref.testing import ApplicationCommunicator
 
     from omnigent.errors import OmnigentError
+    from tests.server.helpers import wait_for_tunnel_registration
     from tests.server.integration.test_host_tunnel_route import (
         _make_hello,
         _managed_scope,
-        _wait_registered,
         _websocket_scope,
     )
 
@@ -300,7 +300,7 @@ async def test_connected_host_cannot_launch_after_reset_until_it_reconnects(setu
         response = await connection.receive_output(timeout=5)
         assert response["type"] == "websocket.accept", response
         await connection.send_input({"type": "websocket.receive", "text": _make_hello()})
-        await asyncio.wait_for(_wait_registered(registry, host_id), timeout=5)
+        await wait_for_tunnel_registration(connection, registry, host_id)
 
     async def disconnect(connection: ApplicationCommunicator) -> None:
         await connection.send_input({"type": "websocket.disconnect", "code": 1000})
@@ -554,9 +554,9 @@ async def test_accounts_host_handshake_revalidates_each_connection(setup_app):
 
     from asgiref.testing import ApplicationCommunicator
 
+    from tests.server.helpers import wait_for_tunnel_registration
     from tests.server.integration.test_host_tunnel_route import (
         _make_hello,
-        _wait_registered,
         _websocket_scope,
     )
 
@@ -583,7 +583,7 @@ async def test_accounts_host_handshake_revalidates_each_connection(setup_app):
         assert response["type"] == "websocket.accept", response
         await connection.send_input({"type": "websocket.receive", "text": _make_hello()})
         registry = admin.app.state.host_registry
-        await asyncio.wait_for(_wait_registered(registry, host_id), timeout=5)
+        await wait_for_tunnel_registration(connection, registry, host_id)
         assert registry.get(host_id).account_generation == generation
         assert checked == [generation]
     finally:
@@ -1554,7 +1554,7 @@ def test_automation_share_cannot_cross_registration(setup_app, monkeypatch, meth
 
 
 @pytest.mark.parametrize("setup_app", [True], indirect=True)
-@pytest.mark.parametrize("replaced_after", ["resolve_scheduled_task_access", "grant_delete"])
+@pytest.mark.parametrize("replaced_after", ["spelling_lookup", "grant_lookup", "grant_delete"])
 def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
     setup_app, monkeypatch, replaced_after
 ):
@@ -1574,10 +1574,13 @@ def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
 
     lookup = permissions.resolve_scheduled_task_access
     delete_grant = permissions.revoke_for_scheduled_task
+    lookups: list[object] = []
 
     def lookup_then_pause(*args, **kwargs):
         held = lookup(*args, **kwargs)
-        if replaced_after == "resolve_scheduled_task_access":
+        lookups.append(held)
+        # The DELETE's first lookup picks the spelling; its second finds the grant to delete.
+        if (replaced_after, len(lookups)) in {("spelling_lookup", 1), ("grant_lookup", 2)}:
             pause_once()
         return held
 
@@ -1593,7 +1596,10 @@ def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
     response = _replace_alice_during(
         admin, reached, resume, "DELETE", f"/v1/scheduled-tasks/{task_id}/permissions/alice"
     )
-    assert response.status_code == 500, response.text
+    # Replaced before the grant lookup, the new account holds nothing to remove.
+    assert response.status_code == (204 if replaced_after == "spelling_lookup" else 500), (
+        response.text
+    )
     # The grant being restored was the deleted account's, not the new one's.
     assert permissions.list_for_scheduled_task(task_id) == ([], None)
 

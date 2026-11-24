@@ -1,4 +1,4 @@
-"""Built-in tool: download a file to the workspace."""
+"""Built-in tool: read a stored session file by its ID."""
 
 from __future__ import annotations
 
@@ -13,19 +13,19 @@ from omnigent.tools.builtins.upload_file import safe_resolve
 
 class DownloadFileTool(Tool):
     """
-    Download a file from the file store to the workspace.
+    Read a stored session file by its file ID.
 
-    Retrieves the binary content by file ID from the artifact
-    store and writes it to the agent's workspace directory.
-    Returns the local path so the agent can read or process it.
+    Agent sessions run this tool through the runner, which returns the stored
+    content decoded as text and saves nothing. :meth:`invoke` is the in-process
+    variant: it writes the bytes into the workspace and returns the saved path.
     """
 
     @classmethod
     def name(cls) -> str:
         """
-        :returns: ``"download_file"``.
+        :returns: ``"sys_files_download"``.
         """
-        return "download_file"
+        return "sys_files_download"
 
     @classmethod
     def description(cls) -> str:
@@ -33,9 +33,9 @@ class DownloadFileTool(Tool):
         :returns: Human-readable description of the tool.
         """
         return (
-            "Download a file by its file_id to the workspace. "
-            "Returns the local file path. Use list_files to "
-            "find available file IDs."
+            "Read a stored session file by its file_id and return its content as "
+            "text. Use it for text files: binary content is not returned intact. "
+            "Use sys_files_list to find available file IDs."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -47,12 +47,8 @@ class DownloadFileTool(Tool):
         return {
             "type": "function",
             "function": {
-                "name": "download_file",
-                "description": (
-                    "Download a file by its file_id to the workspace. "
-                    "Returns the local file path. Use list_files to "
-                    "find available file IDs."
-                ),
+                "name": "sys_files_download",
+                "description": self.description(),
                 "parameters": {
                     "type": "object",
                     "properties": {

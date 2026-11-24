@@ -108,7 +108,7 @@ def test_harness_grouping_persists_across_reload(
         monkeypatch.setitem(row, "harness", harness)
     page.set_viewport_size({"width": width, "height": 900})
     page.reload()
-    if width < 768:
+    if width < 1181:
         page.get_by_role("button", name="Open sidebar", exact=True).click()
     _open_view_submenu(page, "session-grouping-menu")
     harness = page.get_by_role("menuitemradio", name="Harness", exact=True)
@@ -127,7 +127,7 @@ def test_harness_grouping_persists_across_reload(
     _section_header(page, "Codex").click()
 
     page.reload()
-    if width < 768:
+    if width < 1181:
         page.get_by_role("button", name="Open sidebar", exact=True).click()
     expect(codex.locator('a[href^="/c/"]')).to_have_text(["Running session", "Idle session"])
     _open_view_submenu(page, "session-grouping-menu")

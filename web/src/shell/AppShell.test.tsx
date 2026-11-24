@@ -17,7 +17,7 @@ import type * as UseWorkspaceModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { useCallback, useContext, useLayoutEffect, useState } from "react";
+import { lazy, useCallback, useContext, useLayoutEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -142,7 +142,7 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  isMobileViewport: () => !window.matchMedia("(min-width: 768px)").matches,
+  isMobileViewport: () => !window.matchMedia("(min-width: 1181px)").matches,
   // Reflect the open/peek props so tests can assert sidebar collapse/expand and
   // whether it is peeking (a floating hover card rather than a docked panel).
   // Rendered as aside.conversations-sidebar like the real one, so the
@@ -347,7 +347,12 @@ const getSessionSlimMock = vi.mocked(getSessionSlim);
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
-import { useChatStore } from "@/store/chatStore";
+import { bindConversationForTest, useChatStore } from "@/store/chatStore";
+import {
+  openTasksTab,
+  showTasksTabBesideChat,
+  useSessionTasksActions,
+} from "@/store/sessionTasksActions";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
 
@@ -834,6 +839,20 @@ describe("AppShell header", () => {
     expect(screen.getByRole("button", { name: /sidebar/i })).toBeInTheDocument();
   });
 
+  it("keeps the sidebar while a lazy page's chunk loads", () => {
+    mockConversations([]);
+    const PendingChunkPage = lazy(() => new Promise<never>(() => {}));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(shellTree(qc, "/inbox", <Route path="inbox" element={<PendingChunkPage />} />));
+
+    fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(
+      within(screen.getByRole("main")).getByRole("status", { name: "Loading" }),
+    ).toBeInTheDocument();
+  });
+
   it("does not fetch child sessions for a temp id in debug mode", () => {
     mockConversations([]);
     renderShell("/c/temp:12345678?debug=1");
@@ -876,6 +895,39 @@ describe("AppShell header", () => {
 
     expect(screen.queryByTestId("file-viewer")).toBeNull();
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+  });
+
+  it("leaves an agent-created session's creator out of the header", async () => {
+    mockConversations([]);
+    getSessionSlimMock.mockResolvedValue({ id: "conv_manager", title: "Manager" } as Session);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_worker",
+        agentId: "ag_owner",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: 1_700_000_000,
+        title: "Docs worker",
+        labels: { "omnigent.created_by_session_id": "conv_manager" },
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_worker");
+    // Let any creator lookup settle so a late label would have rendered.
+    await act(async () => {});
+
+    expect(screen.getByText("Docs worker")).toBeInTheDocument();
+    expect(screen.queryByText(/Created by/)).toBeNull();
+    expect(getSessionSlimMock).not.toHaveBeenCalledWith("conv_manager");
   });
 
   it.each([
@@ -2158,6 +2210,8 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
+    expect(screen.getByRole("main")).toHaveAttribute("data-flyout-boundary");
+    expect(screen.getByRole("main")).not.toContainElement(rail());
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
 
     // Maximize → the rail breaks out to cover the content region, and the left
@@ -2227,7 +2281,7 @@ describe("Workspace rail maximize", () => {
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: query === "(min-width: 768px)" ? viewport === "desktop" : false,
+      matches: query === "(min-width: 1181px)" ? viewport === "desktop" : false,
     }));
     onTestFinished(() => matchMedia.mockRestore());
     mockConversations([]);
@@ -2409,8 +2463,8 @@ describe("Sidebar across the md breakpoint", () => {
     let width = initialWidth;
     const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
     const matches = (query: string) => {
-      if (query === "(min-width: 768px)") return width >= 768;
-      if (query === "(max-width: 767.98px)") return width < 768;
+      if (query === "(min-width: 1181px)") return width >= 1181;
+      if (query === "(max-width: 1180.98px)") return width < 1181;
       return false;
     };
     const baseMatchMedia = window.matchMedia;
@@ -3122,57 +3176,103 @@ describe("Session overview", () => {
     if (workspace === "open") await waitFor(() => expect(railOpenState()).toBe("open"));
   }
 
-  const overview = () => screen.queryByRole("complementary", { name: "Session overview" });
+  const docked = () => screen.queryByRole("complementary", { name: "Session overview" });
+  const popover = () => screen.queryByRole("dialog", { name: "Session overview" });
 
   it("adds nothing with the flag off", async () => {
     setWideViewport(true);
     await renderOverviewShell(false, "collapsed");
 
     expect(screen.queryByTestId("header-session-cost")).toBeNull();
-    expect(overview()).toBeNull();
+    expect(docked()).toBeNull();
   });
 
-  it("docks beside chat in a wide window and keeps each placement's choice", async () => {
+  it("docks beside the right-panel toggle and keeps each placement's choice", async () => {
     setWideViewport(true);
     await renderOverviewShell(true, "collapsed");
     const chip = () => screen.getByTestId("header-session-cost");
+    const header = document.querySelector<HTMLElement>("header.chat-header")!;
 
-    expect(chip()).toHaveAttribute("aria-pressed", "true");
-    expect(overview()).toBeInTheDocument();
-    expect(screen.getByRole("main")).not.toContainElement(overview());
+    const headerButtons = within(header).getAllByRole("button");
+    expect(headerButtons.at(-2)).toBe(chip());
+    expect(headerButtons.at(-1)).toHaveAccessibleName("Expand right panel");
+    expect(chip()).toHaveAttribute("aria-expanded", "true");
+    expect(docked()).toBeInTheDocument();
+    expect(screen.getByRole("main")).not.toContainElement(docked());
     fireEvent.click(chip());
-    expect(chip()).toHaveAttribute("aria-pressed", "false");
-    expect(overview()).toBeNull();
+    expect(chip()).toHaveAttribute("aria-expanded", "false");
+    expect(docked()).toBeNull();
 
-    // The open workspace switches to the overlay, which starts hidden.
+    // The open workspace switches to the popover, which starts hidden.
     fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
     await waitFor(() => expect(railOpenState()).toBe("open"));
-    expect(overview()).toBeNull();
+    expect(popover()).toBeNull();
     fireEvent.click(chip());
-    expect(screen.getByRole("main")).toContainElement(overview());
+    expect(popover()).toBeInTheDocument();
+    expect(docked()).toBeNull();
 
     // Collapsing it docks again, keeping the docked card hidden.
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
     await waitFor(() => expect(railOpenState()).toBe("closed"));
-    expect(chip()).toHaveAttribute("aria-pressed", "false");
-    expect(overview()).toBeNull();
+    expect(chip()).toHaveAttribute("aria-expanded", "false");
+    expect(docked()).toBeNull();
+    expect(popover()).toBeNull();
+
+    // A reload keeps the hand-closed card closed, and reopening it is remembered too.
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeInTheDocument();
+  });
+
+  it("toggles the docked card when its choice can't be stored", async () => {
+    setWideViewport(true);
+    const key = "omnigent:session-overview-docked";
+    localStorage.setItem(key, "closed");
+    // Fail only this key's writes and removals; the shell stores other preferences too.
+    for (const method of ["setItem", "removeItem"] as const) {
+      const original = Storage.prototype[method];
+      const failing = vi.spyOn(Storage.prototype, method).mockImplementation(function (
+        this: Storage,
+        ...args: [string, string]
+      ) {
+        if (args[0] === key) throw new DOMException("Storage is full", "QuotaExceededError");
+        return original.apply(this, args);
+      });
+      onTestFinished(() => failing.mockRestore());
+    }
+    await renderOverviewShell(true, "collapsed");
+    const chip = () => screen.getByTestId("header-session-cost");
+
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    fireEvent.click(within(docked()!).getByRole("button", { name: "Hide session overview" }));
+    expect(docked()).toBeNull();
+    expect(localStorage.getItem(key)).toBe("closed");
   });
 
   it.each([
     ["a narrow window", false, "collapsed"],
     ["an open workspace", true, "open"],
-  ] as const)("starts hidden with %s and opens over chat", async (_, wide, workspace) => {
+  ] as const)("starts hidden with %s and opens as a popover", async (_, wide, workspace) => {
     setWideViewport(wide);
     await renderOverviewShell(true, workspace);
 
-    const toggle = screen.getByTestId("header-session-cost");
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
-    expect(overview()).toBeNull();
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("main")).toContainElement(overview());
-    fireEvent.click(screen.getByRole("button", { name: "Hide session overview" }));
-    expect(overview()).toBeNull();
+    const chip = screen.getByTestId("header-session-cost");
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+    expect(popover()).toBeNull();
+    fireEvent.click(chip);
+    expect(chip).toHaveAttribute("aria-expanded", "true");
+    expect(popover()).toBeInTheDocument();
+    expect(docked()).toBeNull();
+    fireEvent.click(within(popover()!).getByRole("button", { name: "Hide session overview" }));
+    expect(popover()).toBeNull();
+    expect(chip).toHaveAttribute("aria-expanded", "false");
   });
 });
 
@@ -3199,6 +3299,140 @@ describe("Right workspace card visibility", () => {
       expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
     },
   );
+
+  function bindSessionWithTasks({ phone = false } = {}) {
+    const viewport: Record<string, boolean> = {
+      "(min-width: 1181px)": !phone,
+      "(max-width: 1180.98px)": phone,
+    };
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: viewport[query] ?? baseMatchMedia(query).matches,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    mockConversations([
+      { id: "conv_tasks", permission_level: null },
+      { id: "conv_other", permission_level: null },
+    ]);
+    bindConversationForTest("conv_tasks", {
+      todos: [{ content: "Only item", status: "pending", activeForm: "" }],
+    });
+    onTestFinished(() => {
+      bindConversationForTest(null);
+    });
+  }
+  const workspaceRail = () => screen.queryByRole("complementary", { name: "Workspace" });
+  const tasksTabShown = () =>
+    waitFor(() => expect(readSessionWorkspaceState("conv_tasks").rightRailTab).toBe("tasks"));
+
+  it.each([
+    ["follows the collapsed default", "collapsed", undefined, false],
+    ["keeps the rail the user left open", "collapsed", true, true],
+    ["keeps the rail the user collapsed", "open", false, false],
+  ] as const)(
+    "opening a session with tasks %s, on the Tasks tab",
+    async (_, panelDefault, savedOpen, expectOpen) => {
+      writeWorkspacePanelDefault(panelDefault);
+      if (savedOpen !== undefined) writeSessionWorkspaceState("conv_tasks", { open: savedOpen });
+      bindSessionWithTasks();
+      renderShell("/c/conv_tasks", serverInfo());
+
+      await tasksTabShown();
+      if (expectOpen) {
+        expect(workspaceRail()).toBeInTheDocument();
+      } else {
+        expect(workspaceRail()).toBeNull();
+        fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+      }
+      expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+    },
+  );
+
+  it("keeps a session with tasks collapsed after the user collapses it and comes back", async () => {
+    writeWorkspacePanelDefault("open");
+    bindSessionWithTasks();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={serverInfo()}>
+        {sessionShellTree(
+          client,
+          "/c/conv_tasks",
+          <>
+            <Link to="/c/conv_other">Other chat</Link>
+            <Link to="/c/conv_tasks">Chat with tasks</Link>
+          </>,
+        )}
+      </CapabilitiesProvider>,
+    );
+    await tasksTabShown();
+    expect(workspaceRail()).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    fireEvent.click(screen.getByRole("link", { name: "Other chat" }));
+    const requests: string[] = [];
+    onTestFinished(
+      useSessionTasksActions.subscribe(({ tasksTabToOpen }) => {
+        if (tasksTabToOpen) requests.push(tasksTabToOpen);
+      }),
+    );
+    fireEvent.click(screen.getByRole("link", { name: "Chat with tasks" }));
+
+    await waitFor(() => {
+      expect(requests).toContain("conv_tasks");
+      expect(useSessionTasksActions.getState().tasksTabToOpen).toBeNull();
+    });
+    expect(workspaceRail()).toBeNull();
+  });
+
+  it.each([
+    ["the agent's first plan", () => showTasksTabBesideChat("conv_tasks", "first-plan")],
+    ["a click", () => openTasksTab("conv_tasks")],
+  ])("opens a collapsed rail on the Tasks tab for %s", async (_, requestTasksTab) => {
+    writeWorkspacePanelDefault("collapsed");
+    bindSessionWithTasks();
+    renderShell("/c/conv_tasks", serverInfo());
+    await tasksTabShown();
+    expect(workspaceRail()).toBeNull();
+
+    act(requestTasksTab);
+
+    expect(workspaceRail()).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("opens a collapsed rail on the Tasks tab for a click that navigates to its session", async () => {
+    writeWorkspacePanelDefault("collapsed");
+    bindSessionWithTasks();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={serverInfo()}>
+        {sessionShellTree(client, "/c/conv_other", <Link to="/c/conv_tasks">Chat with tasks</Link>)}
+      </CapabilitiesProvider>,
+    );
+    const link = await screen.findByRole("link", { name: "Chat with tasks" });
+
+    act(() => openTasksTab("conv_tasks"));
+    fireEvent.click(link);
+
+    await waitFor(() => expect(workspaceRail()).toBeInTheDocument());
+    expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it.each([
+    ["the session opening", "closed", () => showTasksTabBesideChat("conv_tasks", "session-open")],
+    ["the agent's first plan", "closed", () => showTasksTabBesideChat("conv_tasks", "first-plan")],
+    ["a click", "open", () => openTasksTab("conv_tasks")],
+  ] as const)("on a phone, %s leaves the Tasks drawer %s", async (_, state, requestTasksTab) => {
+    bindSessionWithTasks({ phone: true });
+    renderShell("/c/conv_tasks", serverInfo());
+    await screen.findByTestId("tasks-panel-drawer");
+
+    act(requestTasksTab);
+
+    expect(useSessionTasksActions.getState().tasksTabToOpen).toBeNull();
+    expect(screen.getByTestId("tasks-panel-drawer")).toHaveAttribute("data-state", state);
+  });
 
   it.each([true, false])(
     "waits for capabilities before validating restored search (enabled=%s)",
@@ -3352,8 +3586,72 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
   });
 
+  it.each([false, true])(
+    "resets desktop growth on session switches with the next rail open=%s",
+    async (nextOpen) => {
+      const rightSidebarWindow = {
+        getWidensWindow: vi.fn().mockResolvedValue(true),
+        setWidensWindow: vi.fn().mockResolvedValue(true),
+        opened: vi.fn(),
+        closed: vi.fn(),
+        reset: vi.fn(),
+      };
+      vi.stubGlobal("omnigentDesktop", { kind: "electron", rightSidebarWindow });
+      writeWorkspacePanelDefault("collapsed");
+      writeSessionWorkspaceState("conv_widen", { widthPx: 450 });
+      writeSessionWorkspaceState("conv_widen_other", { open: nextOpen, widthPx: 520 });
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null, home: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([
+        { id: "conv_widen", permission_level: null },
+        { id: "conv_widen_other", permission_level: null },
+      ]);
+
+      try {
+        renderShell("/c/conv_widen", undefined, { sessionNavTo: "/c/conv_widen_other" });
+        expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+        expect(rightSidebarWindow.reset).toHaveBeenCalledOnce();
+
+        fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+        // The shell gets the remembered width, not the width clamped to this narrow window.
+        expect(rightSidebarWindow.opened).toHaveBeenCalledExactlyOnceWith(450);
+        fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+        expect(rightSidebarWindow.closed).toHaveBeenCalledOnce();
+        fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+        expect(rightSidebarWindow.opened).toHaveBeenCalledTimes(2);
+        expect(rightSidebarWindow.reset).toHaveBeenCalledOnce();
+
+        // Leave while the first rail is open: restoring the next session only drops its growth.
+        fireEvent.click(screen.getByTestId("nav-session"));
+        await waitFor(() => expect(rightSidebarWindow.reset).toHaveBeenCalledTimes(2));
+        expect(Boolean(screen.queryByRole("complementary", { name: "Workspace" }))).toBe(nextOpen);
+        expect(rightSidebarWindow.opened).toHaveBeenCalledTimes(2);
+        expect(rightSidebarWindow.closed).toHaveBeenCalledOnce();
+
+        if (!nextOpen) {
+          fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+          expect(rightSidebarWindow.opened).toHaveBeenCalledTimes(3);
+          expect(rightSidebarWindow.opened).toHaveBeenLastCalledWith(520);
+        }
+        fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+        expect(rightSidebarWindow.closed).toHaveBeenCalledTimes(2);
+      } finally {
+        cleanup();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
   it("reveals a collapsed workspace when New Browser Tab opens a tab", async () => {
     writeWorkspacePanelDefault("collapsed");
+    const rightSidebarWindow = {
+      getWidensWindow: vi.fn().mockResolvedValue(true),
+      setWidensWindow: vi.fn().mockResolvedValue(true),
+      opened: vi.fn(),
+      closed: vi.fn(),
+    };
     let sendCommand: (event: {
       command: string;
       browserViewId: string | null;
@@ -3368,6 +3666,7 @@ describe("Right workspace card visibility", () => {
         return () => {};
       },
       setDesktopCommandState: () => {},
+      rightSidebarWindow,
     });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3388,6 +3687,8 @@ describe("Right workspace card visibility", () => {
         "true",
       );
       expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      // A reveal opens the sidebar too, so the desktop shell can widen the window for it.
+      expect(rightSidebarWindow.opened).toHaveBeenCalledOnce();
     } finally {
       cleanup();
       vi.unstubAllGlobals();
@@ -5896,7 +6197,7 @@ describe("AppShell clone/fork action", () => {
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: query === "(min-width: 768px)",
+      matches: query === "(min-width: 1181px)",
     }));
     onTestFinished(() => matchMedia.mockRestore());
     const parent = sessionSnapshot({ id: "conv_parent", title: "Parent title" });
@@ -6769,7 +7070,7 @@ describe("shell command drafts", () => {
       const matchMedia = window.matchMedia;
       const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...matchMedia(query),
-        matches: query === "(min-width: 768px)" ? !mobile : matchMedia(query).matches,
+        matches: query === "(min-width: 1181px)" ? !mobile : matchMedia(query).matches,
       }));
       onTestFinished(() => viewport.mockRestore());
       const terminals: TerminalInfo[] = [];
@@ -6932,7 +7233,8 @@ describe("AppShell desktop Close", () => {
       renderShell("/c/conv_shell_fail");
       expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
       if (layout === "fullscreen") {
-        fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+        // The desktop app starts with the sidebar docked open at any window width.
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
         fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
       } else if (layout === "collapsed") {
         fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));

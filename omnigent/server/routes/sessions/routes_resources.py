@@ -175,7 +175,7 @@ class _RunnerStreamResponse(StreamingResponse):
     """
 
     def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
-        super().__init__(upstream.aiter_raw(), headers=headers)
+        super().__init__(upstream.aiter_raw(), status_code=upstream.status_code, headers=headers)
         self._upstream = upstream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -244,11 +244,12 @@ def _unsupported_attachment_detail(content_type: str, policy: FilesystemAttachme
     )
     if policy == DEFAULT_FILESYSTEM_ATTACHMENT_POLICY:
         return (
-            f"{detail}, or use Claude Code or Codex for archives, Office documents, and databases."
+            f"{detail}, or use a supported native coding agent for archives, "
+            "Office documents, databases, and MP4 videos."
         )
     if policy.extensions:
         extensions = ", ".join(sorted(policy.extensions))
-        return f"{detail}, or use Claude Code or Codex for {extensions} files."
+        return f"{detail}, or use a supported native coding agent for {extensions} files."
     return f"{detail}."
 
 
@@ -470,7 +471,7 @@ def register_resources_routes(
         file is. There is no host fallback: the host tunnel's filesystem
         op answers in a single message, so it cannot stream a file.
 
-        :param request: The incoming request, for the gzip opt-out.
+        :param request: The incoming request, including any media byte range.
         :param session_id: Session/conversation identifier.
         :param conversation: Conversation loaded during authorization.
         :param runner_path: Runner-relative URL carrying ``download=true``.
@@ -512,7 +513,16 @@ def register_resources_routes(
             )
         try:
             resp = await runner_client.send(
-                runner_client.build_request("GET", runner_path, timeout=_download_timeout),
+                runner_client.build_request(
+                    "GET",
+                    runner_path,
+                    headers={
+                        name: request.headers[name]
+                        for name in ("range", "if-range")
+                        if name in request.headers
+                    },
+                    timeout=_download_timeout,
+                ),
                 stream=True,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
@@ -520,7 +530,9 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner download endpoint unavailable",
             ) from exc
-        if resp.status_code == 200 and "content-disposition" in resp.headers:
+        if (resp.status_code in (200, 206) and "content-disposition" in resp.headers) or (
+            resp.status_code == 416 and "content-range" in resp.headers
+        ):
             skip_gzip(request)
             forwarded = {
                 name: resp.headers[name]
@@ -529,6 +541,8 @@ def register_resources_routes(
                     "content-length",
                     "content-encoding",
                     "content-disposition",
+                    "accept-ranges",
+                    "content-range",
                     "cache-control",
                     "x-content-type-options",
                 )
@@ -2859,7 +2873,10 @@ def register_resources_routes(
             )
         else:
             target = HostTarget(host_registry, host, reach[2])
-        app = WorkspaceServiceASGIApplication(HostWorkspaceService(target))
+        forwarder = HostWorkspaceService(
+            target, content_search=flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH)
+        )
+        app = WorkspaceServiceASGIApplication(forwarder)
         # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
         return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
 
@@ -3328,7 +3345,7 @@ def register_resources_routes(
                 f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
                 + urllib.parse.urlencode({"download": "true", **scope_params}),
             )
-            if scope == "workspace" and download_response.status_code == 200:
+            if scope == "workspace" and download_response.status_code in (200, 206):
                 download_response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)
             return download_response
         path = (

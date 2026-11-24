@@ -6,6 +6,7 @@ import pytest
 
 from omnigent.entities.session_journal import (
     NOTE_BODY_MAX_BYTES,
+    PLAN_DESCRIPTION_MAX_CHARS,
     PLAN_MAX_RAW_BYTES,
     PLAN_MAX_STEPS,
     PLAN_NAME_MAX_CHARS,
@@ -140,6 +141,34 @@ def test_plan_needs_a_one_line_name(name: object, message: str) -> None:
 def test_plan_rejects_invalid_graphs(steps: object, message: str) -> None:
     with pytest.raises(InvalidJournalEntryError, match=message):
         normalize_plan(steps, name="The plan")
+
+
+def test_a_plan_carries_a_trimmed_proposed_description_only_when_given() -> None:
+    content = normalize_content(
+        "plan",
+        {
+            "name": "Triage",
+            "steps": [_step("a")],
+            "description": "\n Fix flaky tests.\nGive: suite ",
+        },
+    )
+    assert content["description"] == "Fix flaky tests.\nGive: suite"
+    assert "description" not in normalize_plan([_step("a")], name="Triage")
+
+
+@pytest.mark.parametrize(
+    ("description", "message"),
+    [
+        (" \n ", "description must not be empty"),
+        ("d" * (PLAN_DESCRIPTION_MAX_CHARS + 1), "description must be at most 2000 characters"),
+        (7, "description must be a string"),
+    ],
+)
+def test_a_plans_description_follows_the_workflow_description_rules(
+    description: object, message: str
+) -> None:
+    with pytest.raises(InvalidJournalEntryError, match=message):
+        normalize_plan([_step("a")], name="Triage", description=description)
 
 
 def test_plan_raw_size_is_capped() -> None:

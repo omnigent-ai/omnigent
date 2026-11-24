@@ -56,7 +56,24 @@
           animation: none;
         }
       }
+      /* The desktop's New Agent panel boots out of sight: only its background, no splash. */
+      html.quiet-boot #boot-loading {
+        color: transparent;
+      }
+      html.quiet-boot #boot-loading span {
+        display: none;
+      }
     </style>
+    <script>
+      // Only the desktop app's panel; the path must match FLOATING_COMPOSER_PATH in
+      // src/lib/floatingComposer/floatingComposerRoute.ts.
+      if (
+        window.omnigentDesktop?.kind === "electron" &&
+        /\/compose\/floating\/?$/.test(location.pathname)
+      ) {
+        document.documentElement.classList.add("quiet-boot");
+      }
+    </script>
   </head>
   <body>
     <div id="root">

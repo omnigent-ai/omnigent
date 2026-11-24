@@ -36,9 +36,9 @@ class ListFilesTool(Tool):
     @classmethod
     def name(cls) -> str:
         """
-        :returns: ``"list_files"``.
+        :returns: ``"sys_files_list"``.
         """
-        return "list_files"
+        return "sys_files_list"
 
     @classmethod
     def description(cls) -> str:
@@ -49,7 +49,7 @@ class ListFilesTool(Tool):
             "List files that have been uploaded or created. "
             "Returns file metadata: ID, filename, size, and "
             "creation time. Use the file_id to download content "
-            "with download_file."
+            "with sys_files_download."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -61,12 +61,12 @@ class ListFilesTool(Tool):
         return {
             "type": "function",
             "function": {
-                "name": "list_files",
+                "name": "sys_files_list",
                 "description": (
                     "List files that have been uploaded or created. "
                     "Returns file metadata: ID, filename, size, and "
                     "creation time. Use the file_id to download content "
-                    "with download_file."
+                    "with sys_files_download."
                 ),
                 "parameters": {
                     "type": "object",
@@ -114,7 +114,7 @@ class ListFilesTool(Tool):
 
         conversation_id = ctx.conversation_id
         if conversation_id is None:
-            return json.dumps({"error": "list_files requires a conversation_id"})
+            return json.dumps({"error": "sys_files_list requires a conversation_id"})
 
         from omnigent.runtime import get_file_store
 

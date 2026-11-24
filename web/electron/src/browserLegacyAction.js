@@ -1,6 +1,6 @@
 "use strict";
 
-const { buildBrowserActionScript } = require("./browserActionScript.mjs");
+const { buildBrowserActionScript, LEGACY_SNAPSHOT_JS } = require("./browserActionScript.mjs");
 
 // v0.18's relay embeds JSON literals in fixed templates. Remove this adapter in v0.21.
 const JSON_STRING = String.raw`"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[\da-fA-F]{4}))*"`;
@@ -38,7 +38,7 @@ const patterns = ["click", "type"].flatMap((action) =>
 
 function decodeLegacyBrowserAction(script) {
   if (typeof script === "string" && script.length <= 2_000_000) {
-    if (script === buildBrowserActionScript("snapshot")) {
+    if (script === LEGACY_SNAPSHOT_JS) {
       return { action: "snapshot", params: {} };
     }
     for (const { action, pattern } of patterns) {

@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
+import { MemoryRouter } from "react-router-dom";
 
 import { SessionTitleInstructionsControl } from "./SessionTitleInstructionsControl";
 import {
@@ -18,7 +19,10 @@ const getMock = vi.mocked(getSessionTitleInstructions);
 const saveMock = vi.mocked(saveSessionTitleInstructions);
 
 function renderControl() {
-  return render(<SessionTitleInstructionsControl />);
+  // The row reveals itself from the URL hash, so it renders under a router.
+  return render(<SessionTitleInstructionsControl />, {
+    wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter>,
+  });
 }
 
 async function loadedInput(): Promise<HTMLTextAreaElement> {

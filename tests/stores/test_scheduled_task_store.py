@@ -7,14 +7,17 @@ SQLite database.
 
 from __future__ import annotations
 
+import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.scheduled.schedule import next_scheduled_time
+from omnigent.server.scheduled.schedule import next_scheduled_time, timer_rule
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -416,6 +419,33 @@ def test_get_missing_returns_none(store: SqlAlchemyScheduledTaskStore) -> None:
     assert store.get(_uid("st_nope")) is None
 
 
+def test_get_many_reads_the_workspaces_tasks_by_id(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Deleted tasks come back with their state; unknown and other workspaces' ids don't."""
+
+    def create(seed: str) -> str:
+        return store.create(
+            scheduled_task_id=_uid(seed),
+            name=seed,
+            prompt="p",
+            rrule="FREQ=DAILY",
+            user_id="u",
+            agent_id=_uid("ag_1"),
+            timezone="UTC",
+        ).id
+
+    live, deleted = create("st_live"), create("st_deleted")
+    assert store.update(deleted, state="deleted")
+    with workspace_scope(7):
+        elsewhere = create("st_elsewhere")
+
+    found = store.get_many([live, deleted, live, elsewhere, _uid("st_nope")])
+    assert {task_id: task.state for task_id, task in found.items()} == {
+        live: "active",
+        deleted: "deleted",
+    }
+    assert store.get_many([]) == {}
+
+
 # ── list / list_active ────────────────────────────────────────────────────────
 
 
@@ -674,6 +704,92 @@ def test_delete_removes_task(store: SqlAlchemyScheduledTaskStore) -> None:
 def test_delete_missing_returns_false(store: SqlAlchemyScheduledTaskStore) -> None:
     """``delete`` is idempotent — returns ``False`` when nothing was removed."""
     assert store.delete(_uid("st_missing")) is False
+
+
+# ── default timezone ─────────────────────────────────────────────────────────
+
+
+def test_legacy_store_can_keep_implementing_only_its_existing_methods() -> None:
+    def unsupported(*args: object, **kwargs: object) -> None:
+        raise NotImplementedError
+
+    legacy_methods = {
+        name: unsupported
+        for name in ScheduledTaskStore.__abstractmethods__
+        if name not in {"get_default_timezone", "set_default_timezone"}
+    }
+    legacy_type = type("LegacyScheduledTaskStore", (ScheduledTaskStore,), legacy_methods)
+    legacy = legacy_type("memory")
+
+    assert legacy.get_default_timezone(None) is None
+    with pytest.raises(NotImplementedError):
+        legacy.set_default_timezone(None, "America/Chicago")
+
+
+def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorded zone round-trips per user; an unusable stored value reads as unset."""
+    from sqlalchemy import LargeBinary, literal, update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.compression import encode
+    from omnigent.db.db_models import SqlPreference
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    assert store.get_default_timezone(None) is None
+    store.set_default_timezone(None, "America/Chicago")
+    store.set_default_timezone("alice@example.com", "Asia/Tokyo")
+    store.set_default_timezone(None, "America/Los_Angeles")
+    assert store.get_default_timezone(None) == "America/Los_Angeles"
+    assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
+    assert store.get_default_timezone("bob@example.com") is None
+    with workspace_scope(7):
+        assert store.get_default_timezone(None) is None
+        assert store.get_default_timezone("alice@example.com") is None
+        store.set_default_timezone(None, "Asia/Kolkata")
+        store.set_default_timezone("alice@example.com", "Europe/Paris")
+        assert store.get_default_timezone(None) == "Asia/Kolkata"
+        assert store.get_default_timezone("alice@example.com") == "Europe/Paris"
+    assert store.get_default_timezone(None) == "America/Los_Angeles"
+    assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
+
+    for stored in ('"Not/A_Zone"', '"America"', "42", "not json"):
+        with Session(store._engine) as session:
+            session.execute(
+                update(SqlPreference)
+                .where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == "local",
+                    SqlPreference.key == "scheduled_task_default_timezone",
+                )
+                .values(value=stored)
+            )
+            session.commit()
+        assert store.get_default_timezone(None) is None, stored
+
+    def unexpected_zone_lookup(key: str) -> None:
+        pytest.fail(f"Invalid or oversized storage reached timezone lookup: {key[:40]}")
+
+    for raw in (b"not an envelope", b"\x00\x01bad", encode(json.dumps("x" * 1025))):
+        with store._session("seed_invalid_timezone_preference") as session:
+            session.execute(
+                update(SqlPreference)
+                .where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == "local",
+                    SqlPreference.key == "scheduled_task_default_timezone",
+                )
+                .values(value=literal(raw, type_=LargeBinary)),
+            )
+        with monkeypatch.context() as patch:
+            patch.setattr(sqlalchemy_store, "ZoneInfo", unexpected_zone_lookup)
+            assert store.get_default_timezone(None) is None
+    assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
+    with workspace_scope(7):
+        assert store.get_default_timezone(None) == "Asia/Kolkata"
+        assert store.get_default_timezone("alice@example.com") == "Europe/Paris"
 
 
 # ── runs ──────────────────────────────────────────────────────────────────────
@@ -1390,7 +1506,7 @@ def test_list_latest_run_status_for_tasks_returns_most_recent_status(
 ) -> None:
     """Returns each task's single most-recent run status by scheduled_at DESC.
 
-    Powers the Tasks-list completion badge in one windowed query. A task with a
+    Powers the Tasks-list completion badge in one query. A task with a
     terminal run followed by a newer run reports the NEWER run's status (so a
     run-now firing becomes the badge as soon as it is recorded).
     """
@@ -1517,6 +1633,82 @@ def test_list_latest_run_status_is_workspace_scoped(
         assert store.list_latest_run_status_for_tasks([_uid("lst_w11")]) == {
             _uid("lst_w11"): "succeeded"
         }
+
+
+def test_list_latest_run_status_work_stays_flat_as_run_history_grows(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Each task's lookup seeks its newest run on the history index, however many it has."""
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlScheduledTaskRun
+    from omnigent.db.enum_codecs import encode_scheduled_task_run_status
+
+    task = _session_task(store, "lst_history")
+    store.create_run(
+        run_id=_uid("lst_history_latest"),
+        scheduled_task_id=task.id,
+        status="failed",
+        scheduled_at=10_000,
+    )
+
+    def measure() -> tuple[int, str]:
+        """The lookup's SQLite VM steps and query plan; ``(0, "")`` on other databases."""
+        queries = []
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            if "scheduled_task_runs" in statement:
+                queries.append((statement, parameters))
+
+        event.listen(store._engine, "before_cursor_execute", capture)
+        try:
+            assert store.list_latest_run_status_for_tasks([task.id]) == {task.id: "failed"}
+        finally:
+            event.remove(store._engine, "before_cursor_execute", capture)
+        [(statement, parameters)] = queries
+        if store._engine.dialect.name != "sqlite":
+            return 0, ""
+        steps = 0
+
+        def count_step() -> int:
+            nonlocal steps
+            steps += 1
+            return 0
+
+        with store._engine.connect() as connection:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            # Warm up first, so loading the schema on a new connection is not counted.
+            connection.exec_driver_sql(statement, parameters).all()
+            driver = connection.connection.driver_connection
+            driver.set_progress_handler(count_step, 1)
+            try:
+                connection.exec_driver_sql(statement, parameters).all()
+            finally:
+                driver.set_progress_handler(None, 1)
+        return steps, plan
+
+    short_history_steps, _ = measure()
+    with store._engine.begin() as connection:
+        connection.execute(
+            insert(SqlScheduledTaskRun),
+            [
+                {
+                    "workspace_id": current_workspace_id(),
+                    "id": _uid(f"lst_history_{index}"),
+                    "scheduled_task_id": task.id,
+                    "status": encode_scheduled_task_run_status("succeeded"),
+                    "scheduled_at": index,
+                }
+                for index in range(500)
+            ],
+        )
+    long_history_steps, plan = measure()
+    assert long_history_steps == short_history_steps
+    if plan:
+        assert "ix_scheduled_task_runs_scheduled_task_id" in plan
+        assert "SCAN scheduled_task_runs" not in plan and "TEMP B-TREE" not in plan
 
 
 # ── has_active_run (workers of a live automation run) ─────────────────────────
@@ -2891,3 +3083,281 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
         float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
     ]
     assert examined and max(examined) <= 51, plans[0]
+
+
+@pytest.mark.parametrize(
+    ("days_later", "expected"),
+    [
+        (2, (int(datetime(2026, 11, 21, 9, tzinfo=UTC).timestamp()), "active")),
+        (3, (None, "completed")),
+    ],
+)
+def test_a_schedule_anchor_keeps_count_from_the_anchor(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+    days_later: int,
+    expected: tuple[int | None, str],
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    store.configure_dispatch(True)
+    anchor = int(datetime(2026, 11, 18, 12, tzinfo=UTC).timestamp())
+    # Runs on the 19th, 20th and 21st when anchored on the 18th.
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: anchor + days_later * 86400)
+    task = store.create(
+        scheduled_task_id=_uid(f"st_anchor_{days_later}"),
+        name="copy",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        schedule_anchor=anchor,
+    )
+    assert task.created_at == anchor
+    # Only the occurrences left after now remain; none, once COUNT is used up.
+    assert (task.next_run_at, task.state) == expected
+
+
+# ── Timers ──────────────────────────────────────────────────────────────────
+
+_TIMER_FIRST_RUN = 1_800_000_000
+
+
+def _timer(
+    store: SqlAlchemyScheduledTaskStore,
+    seed: str = "timer",
+    *,
+    repeat: bool = False,
+    interval: int = 60,
+    first_run_at: int = _TIMER_FIRST_RUN,
+):
+    """Save a ``sys_timer_set`` timer whose first firing is *first_run_at*, as its route does."""
+    store.configure_dispatch(True)
+    task = store.create(
+        scheduled_task_id=_uid(seed),
+        name="Timer",
+        prompt=f"[System: timer {_uid(seed)} fired]",
+        rrule=timer_rule(interval, repeat=repeat),
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        session_mode="continue",
+        session_id=_uid("conv"),
+        first_run_at=first_run_at,
+        kind="timer",
+        schedule_anchor=first_run_at - interval,
+    )
+    return store.get(task.id)
+
+
+def _claim_timer(store: SqlAlchemyScheduledTaskStore, task):
+    """Claim a timer's due firing as the scheduler's poll would."""
+    assert task.next_run_at is not None
+    return store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=next_scheduled_time(task, task.next_run_at),
+        host_id=None,
+        lease_seconds=120,
+    )
+
+
+@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
+def test_a_timer_keeps_the_first_run_its_route_chose(
+    store: SqlAlchemyScheduledTaskStore, repeat: bool
+) -> None:
+    """A firing already due when the row is written still fires, instead of being skipped."""
+    # A zero-second timer whose write lands after its first run time.
+    task = _timer(store, repeat=repeat, first_run_at=1)
+    assert (task.kind, task.state, task.next_run_at) == ("timer", "active", 1)
+    assert store.list_due_tasks(2) == [task]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"session_id": None}, {"session_mode": "new", "session_id": None}, {"first_run_at": None}],
+    ids=["no_session", "new_session", "no_first_run"],
+)
+def test_create_refuses_a_timer_without_its_session_or_first_run(
+    store: SqlAlchemyScheduledTaskStore, overrides: dict[str, Any]
+) -> None:
+    fields: dict[str, Any] = {
+        **_reminder_fields(kind="timer", rrule=timer_rule(60, repeat=True)),
+        "first_run_at": _TIMER_FIRST_RUN,
+        **overrides,
+    }
+    with pytest.raises(ValueError, match="a timer needs"):
+        store.create(scheduled_task_id=_uid("st_bad_timer"), **fields)
+    assert store.list() == []
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed", "skipped"])
+def test_a_spent_one_shot_timer_is_removed_once_its_run_finishes(
+    store: SqlAlchemyScheduledTaskStore, status: str
+) -> None:
+    """However its only firing ends, even before delivery commits, the timer leaves nothing."""
+    timer = _timer(store)
+    run = _claim_timer(store, timer)
+    store.transition_starting_run(
+        run,
+        now=lambda: _TIMER_FIRST_RUN,
+        status=status,
+        conversation_id=_uid("conv") if status == "succeeded" else None,
+    )
+    assert store.get(timer.id) is None
+    assert store.list_runs(timer.id)[0] == []
+
+
+def test_a_timer_firing_is_handed_back_only_under_its_live_lease(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _timer(store, "moved")
+    new_host = _uid("new-host")
+    run = _claim_timer(store, task)
+    assert run is not None and run.lease_expires_at is not None
+    claimed = store.get(task.id)
+    # Once the lease ran out, recovery owns the run, so a late hand-back changes nothing.
+    expired = run.lease_expires_at
+    assert store.hand_back_timer_firing(run, now=lambda: expired, host_id=new_host) is None
+    assert store.get(task.id) == claimed
+    assert [stored.status for stored in store.list_runs(task.id)[0]] == ["starting"]
+    handed = store.hand_back_timer_firing(run, now=lambda: _TIMER_FIRST_RUN, host_id=new_host)
+    assert handed is not None
+    assert (handed.status, handed.error_code) == ("skipped", "timer_host_moved")
+    # The one-shot is active again on the new host, due a second later than it was.
+    reopened = store.get(task.id)
+    assert (reopened.state, reopened.host_id, reopened.next_run_at) == (
+        "active",
+        new_host,
+        _TIMER_FIRST_RUN + 1,
+    )
+
+
+def test_a_timer_claims_one_firing_at_a_time(store: SqlAlchemyScheduledTaskStore) -> None:
+    timer = _timer(store, repeat=True, interval=5)
+    first = _claim_timer(store, timer)
+    due = store.get(timer.id)
+    # The next tick comes due while the first firing is still on its way.
+    assert _claim_timer(store, due) is None
+    assert store.get(timer.id) == due
+    assert [run.id for run in store.list_runs(timer.id)[0]] == [first.id]
+    store.transition_starting_run(first, now=lambda: first.fired_at, status="failed")
+    # A failed tick leaves a repeating timer active for the next one.
+    assert store.get(timer.id).state == "active"
+    second = _claim_timer(store, due)
+    assert second is not None
+    assert [run.id for run in store.list_runs(timer.id)[0]] == [second.id]
+
+
+def test_a_timer_claim_cleans_up_a_bounded_number_of_runs(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """However long a timer's history, one claim reads and deletes at most two of its runs."""
+    from sqlalchemy import event
+
+    timer = _timer(store, repeat=True, interval=5)
+    for index in range(4):
+        store.create_run(
+            run_id=_uid(f"old-run-{index}"),
+            scheduled_task_id=timer.id,
+            status="succeeded",
+            scheduled_at=index,
+            finished_at=index,
+        )
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT") and "LIMIT" in statement:
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        run = _claim_timer(store, timer)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert run is not None
+    # The two newest went; a later claim deletes the next ones.
+    assert {kept.id for kept in store.list_runs(timer.id)[0]} == {
+        _uid("old-run-0"),
+        _uid("old-run-1"),
+        run.id,
+    }
+    if store._engine.dialect.name != "sqlite":
+        return
+    [(statement, parameters)] = [query for query in queries if "scheduled_task_runs" in query[0]]
+    with store._engine.connect() as connection:
+        plan = str(connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+    # The read walks the task-history index in order, so its limit bounds what it examines.
+    assert "ix_scheduled_task_runs_scheduled_task_id" in plan and "SEARCH" in plan, plan
+    assert "TEMP B-TREE" not in plan, plan
+
+
+def test_listing_one_kind_reads_only_its_rows_through_the_kind_index(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """However many timers an owner has, the Automations list never examines them."""
+    from sqlalchemy import event
+
+    automation = store.create(
+        scheduled_task_id=_uid("st_plan_automation"),
+        **_reminder_fields(kind="automation", rrule="FREQ=DAILY"),
+    )
+    reminder = store.create(scheduled_task_id=_uid("st_kinds_reminder"), **_reminder_fields())
+    timer = _timer(store, "st_plan_timer", repeat=True)
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        listed = store.list(owner_user_id="u", kinds=("automation",))
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert [task.id for task in listed] == [automation.id]
+    assert {task.id for task in store.list(owner_user_id="u")} == {
+        automation.id,
+        reminder.id,
+        timer.id,
+    }
+    [(statement, parameters)] = queries
+    if store._engine.dialect.name != "sqlite":
+        return
+    with store._engine.connect() as connection:
+        plan = str(connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+    assert "ix_scheduled_tasks_kind_scope" in plan and "SEARCH" in plan, plan
+    assert "TEMP B-TREE" not in plan, plan
+
+
+def test_inbox_failures_never_list_timers(store: SqlAlchemyScheduledTaskStore) -> None:
+    automation = store.create(
+        scheduled_task_id=_uid("inbox-automation"),
+        name="nightly",
+        prompt="continue",
+        rrule="FREQ=DAILY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    # Set after the automation, so it is the newer task.
+    timer = _timer(store, repeat=True, first_run_at=int(datetime.now(UTC).timestamp()) + 3600)
+    for task in (automation, timer):
+        store.create_run(
+            run_id=_uid(f"{task.id}-failure"),
+            scheduled_task_id=task.id,
+            status="failed",
+            scheduled_at=100,
+            finished_at=101,
+            error_code="owner_identity_unavailable",
+        )
+    failures, no_cursor = store.list_inbox_failures(owner_user_id="u")
+    assert [failure.task_id for failure in failures] == [automation.id]
+    assert no_cursor is None
+    # The timer still takes its page slot, so a page never scans past its limit.
+    first, cursor = store.list_inbox_failures(owner_user_id="u", limit=1)
+    assert first == [] and cursor is not None
+    rest, last_cursor = store.list_inbox_failures(owner_user_id="u", after=cursor, limit=1)
+    assert [failure.task_id for failure in rest] == [automation.id]
+    assert last_cursor is None
