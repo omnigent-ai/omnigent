@@ -43,9 +43,10 @@ import os
 import re
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import httpx
 
@@ -504,8 +505,13 @@ class _MirrorItem:
     response_id: str
 
 
-def _read_blob_rows(store_path: Path, last_rowid: int) -> list[tuple[int, str, object]]:
-    """Return ``(rowid, id, data)`` for blobs with ``rowid > last_rowid``.
+_QueryResult = TypeVar("_QueryResult")
+
+
+def _query_store(
+    store_path: Path, query: Callable[[sqlite3.Connection], _QueryResult]
+) -> _QueryResult | None:
+    """Run *query* against *store_path*, returning ``None`` when it cannot be read.
 
     A *live* cursor chat keeps almost all of its data in the ``-wal`` sidecar
     (the main ``store.db`` is nearly empty until cursor checkpoints), so the
@@ -514,24 +520,30 @@ def _read_blob_rows(store_path: Path, last_rowid: int) -> list[tuple[int, str, o
     yielding an empty database (``no such table: blobs``). ``mode=ro`` reads the
     WAL via the live ``-shm``; a plain connection is the fallback for the rare
     window where ``-shm`` is momentarily absent. Both are read-only in practice
-    (only SELECTs are issued).
+    (*query* issues only SELECTs).
     """
-    sql = "SELECT rowid, id, data FROM blobs WHERE rowid > ? ORDER BY rowid"
     for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
         try:
             con = sqlite3.connect(uri, timeout=5.0, uri=use_uri)
         except sqlite3.Error:
             continue
         try:
-            return cast(
-                list[tuple[int, str, object]],
-                con.execute(sql, (last_rowid,)).fetchall(),
-            )
+            return query(con)
         except sqlite3.Error:
             continue
         finally:
             con.close()
-    return []
+    return None
+
+
+def _read_blob_rows(store_path: Path, last_rowid: int) -> list[tuple[int, str, object]]:
+    """Return ``(rowid, id, data)`` for blobs with ``rowid > last_rowid``.
+
+    Read through :func:`_query_store`; an unreadable store yields no rows.
+    """
+    sql = "SELECT rowid, id, data FROM blobs WHERE rowid > ? ORDER BY rowid"
+    rows = _query_store(store_path, lambda con: con.execute(sql, (last_rowid,)).fetchall())
+    return cast(list[tuple[int, str, object]], rows) if rows is not None else []
 
 
 def _read_last_used_model(store_path: Path) -> str | None:
@@ -547,7 +559,7 @@ def _read_last_used_model(store_path: Path) -> str | None:
     :func:`omnigent.harnesses.cursor_native.bridge.inject_model_command`).
 
     Opened ``mode=ro`` (with a plain-connection fallback) for the same
-    WAL-reading reason as :func:`_read_blob_rows`; only a SELECT is issued.
+    WAL-reading reason as :func:`_query_store`; only a SELECT is issued.
 
     :param store_path: The cursor chat store to read.
     :returns: The ``lastUsedModel`` id, or ``None`` when the meta row is absent,

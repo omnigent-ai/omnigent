@@ -38,7 +38,7 @@ def _count_transcript_scans(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     scans: list[Path] = []
     real_scan = forwarder._tool_use_ids_in_transcript
 
-    def counting_scan(path: Path, *, include_sidechains: bool) -> set[str] | None:
+    def counting_scan(path: Path, *, include_sidechains: bool) -> forwarder._SpawnIdScan | None:
         scans.append(path)
         return real_scan(path, include_sidechains=include_sidechains)
 
@@ -1050,6 +1050,35 @@ def test_spawn_id_memo_rescans_only_changed_files_and_stays_bounded(
     assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[0]}
 
 
+def test_spawn_id_memo_resumes_only_past_unchanged_complete_lines(tmp_path: Path) -> None:
+    """A record finished after a scan is read once complete; a grown rewrite and a
+    truncated file are rescanned from the start, dropping ids no longer present."""
+    path = tmp_path / "session.jsonl"
+    kept = json.dumps(_spawn_record("toolu_kept", "spawn", sidechain=False)) + "\n"
+    partial = json.dumps(_spawn_record("toolu_partial", "spawn", sidechain=False))
+    path.write_text(kept + partial[:40], encoding="utf-8")
+    assert forwarder._spawn_tool_use_ids_cached(path, include_sidechains=False) == {"toolu_kept"}
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(partial[40:] + "\n")
+    assert forwarder._spawn_tool_use_ids_cached(path, include_sidechains=False) == {
+        "toolu_kept",
+        "toolu_partial",
+    }
+
+    grown_size = path.stat().st_size
+    rewritten = "".join(json.dumps(_user_turn_record(index)) + "\n" for index in range(8))
+    rewritten += json.dumps(_spawn_record("toolu_rewritten", "spawn", sidechain=False)) + "\n"
+    path.write_text(rewritten, encoding="utf-8")
+    assert path.stat().st_size > grown_size
+    assert forwarder._spawn_tool_use_ids_cached(path, include_sidechains=False) == {
+        "toolu_rewritten"
+    }
+
+    path.write_text(kept, encoding="utf-8")
+    assert forwarder._spawn_tool_use_ids_cached(path, include_sidechains=False) == {"toolu_kept"}
+
+
 def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1066,19 +1095,230 @@ def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
         tool_use_id="toolu_child",
     )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
-    real_read_text = Path.read_text
+    real_open = Path.open
     failures_left = [1]
 
-    def flaky_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+    def flaky_open(self: Path, *args: Any, **kwargs: Any) -> Any:
         if self == transcript_path and failures_left[0]:
             failures_left[0] -= 1
             raise OSError(errno.EIO, "transient read failure")
-        return real_read_text(self, *args, **kwargs)
+        return real_open(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    monkeypatch.setattr(Path, "open", flaky_open)
 
     assert forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir) == {}
     assert transcript_path not in forwarder._SPAWN_TOOL_USE_ID_CACHE
     assert forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir) == {
         "toolu_child": None
     }
+
+
+_UNRESOLVABLE_META_POLLS = 20
+
+
+def _subagent_poll_kwargs(
+    client: httpx.AsyncClient, bridge_dir: Path, transcript_path: Path
+) -> dict[str, Any]:
+    return {
+        "client": client,
+        "parent_session_id": "conv_root",
+        "bridge_dir": bridge_dir,
+        "transcript_path": transcript_path,
+        "agent_name": "claude-native-ui",
+        "start_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+        "item_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+        "status_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+    }
+
+
+def _user_turn_record(index: int, padding: str = "") -> dict[str, Any]:
+    return {
+        "type": "user",
+        "uuid": f"turn-{index}",
+        "message": {"role": "user", "content": f"turn {index} {padding}"},
+    }
+
+
+def _append_user_turn(transcript_path: Path, index: int) -> None:
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_user_turn_record(index)) + "\n")
+
+
+@pytest.mark.parametrize(
+    "meta_text",
+    [
+        pytest.param(
+            json.dumps(
+                {
+                    "agentType": "general-purpose",
+                    "description": "spawn call never recorded",
+                    "toolUseId": "toolu_missing",
+                }
+            ),
+            id="spawn-id-in-no-transcript",
+        ),
+        pytest.param(
+            json.dumps({"agentType": "researcher", "description": "teammate without a spawn"}),
+            id="teammate-without-spawn-id",
+        ),
+        pytest.param('{"agentType": "general-purpose", "descr', id="unparseable"),
+    ],
+)
+async def test_unresolvable_subagent_meta_is_set_aside_with_one_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    meta_text: str,
+) -> None:
+    """A meta that can never resolve stops costing work each poll and is named once at WARNING."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True)
+    meta_path = subagents_dir / "agent-a-stuck.meta.json"
+    meta_path.write_text(meta_text, encoding="utf-8")
+    (subagents_dir / "agent-a-stuck.jsonl").write_text("", encoding="utf-8")
+
+    scans = _count_transcript_scans(monkeypatch)
+    meta_reads: list[Path] = []
+    real_read_meta = forwarder._read_subagent_meta
+
+    def counting_read_meta(path: Path) -> Any:
+        if path == meta_path:
+            meta_reads.append(path)
+        return real_read_meta(path)
+
+    monkeypatch.setattr(forwarder, "_read_subagent_meta", counting_read_meta)
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
+
+    work_per_poll: list[tuple[int, int]] = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://ap",
+    ) as client:
+        poll_kwargs = _subagent_poll_kwargs(client, bridge_dir, transcript_path)
+        state = forwarder.SubagentForwardState(subagents={})
+        for index in range(_UNRESOLVABLE_META_POLLS):
+            _append_user_turn(transcript_path, index)
+            meta_reads.clear()
+            scans.clear()
+            state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
+            work_per_poll.append((len(meta_reads), len(scans)))
+
+    levels_naming_the_subagent = [
+        record.levelname for record in caplog.records if "a-stuck" in record.getMessage()
+    ]
+    late_polls = work_per_poll[_UNRESOLVABLE_META_POLLS // 2 :]
+    observed = {
+        "warnings_naming_the_subagent": levels_naming_the_subagent.count("WARNING"),
+        "late_polls_still_reading": sum(1 for work in late_polls if work != (0, 0)),
+    }
+    assert observed == {"warnings_naming_the_subagent": 1, "late_polls_still_reading": 0}, (
+        f"observed {observed}; log levels naming the sub-agent: {levels_naming_the_subagent}; "
+        f"(meta reads, transcript scans) per poll: {work_per_poll}"
+    )
+
+
+def _process_bytes_read() -> int:
+    for line in Path("/proc/self/io").read_text(encoding="ascii").splitlines():
+        if line.startswith("rchar:"):
+            return int(line.split()[1])
+    raise AssertionError("/proc/self/io has no rchar counter")
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/io").is_file(), reason="needs Linux per-process read counters"
+)
+async def test_poll_after_a_small_append_reads_only_the_new_transcript_bytes(
+    tmp_path: Path,
+) -> None:
+    """While a meta is unresolved, a grown transcript is read from where the last poll stopped."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    padding = "x" * 4000
+    transcript_path.write_text(
+        "".join(json.dumps(_user_turn_record(index, padding)) + "\n" for index in range(1000)),
+        encoding="utf-8",
+    )
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True)
+    (subagents_dir / "agent-a-stuck.meta.json").write_text(
+        json.dumps(
+            {
+                "agentType": "general-purpose",
+                "description": "spawn call never recorded",
+                "toolUseId": "toolu_missing",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (subagents_dir / "agent-a-stuck.jsonl").write_text("", encoding="utf-8")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://ap",
+    ) as client:
+        poll_kwargs = _subagent_poll_kwargs(client, bridge_dir, transcript_path)
+        state = await forwarder._forward_available_subagents(
+            state=forwarder.SubagentForwardState(subagents={}), **poll_kwargs
+        )
+        size_before_append = transcript_path.stat().st_size
+        _append_user_turn(transcript_path, 1000)
+        appended = transcript_path.stat().st_size - size_before_append
+        before = _process_bytes_read()
+        state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
+        bytes_read = _process_bytes_read() - before
+
+    assert "a-stuck" not in state.subagents
+    assert bytes_read < 64 * 1024, (
+        f"the poll after a {appended}-byte append read {bytes_read} bytes "
+        f"of a {size_before_append + appended}-byte transcript"
+    )
+
+
+async def test_child_of_an_unregistrable_parent_is_set_aside_after_its_parent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A child spends no resolve budget until its parent's runs out, then is set aside once."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True)
+    (subagents_dir / "agent-a-parent.meta.json").write_text(
+        json.dumps(
+            {"agentType": "general-purpose", "description": "parent", "toolUseId": "toolu_missing"}
+        ),
+        encoding="utf-8",
+    )
+    (subagents_dir / "agent-a-child.meta.json").write_text(
+        json.dumps(
+            {
+                "agentType": "general-purpose",
+                "description": "child",
+                "toolUseId": "toolu_child",
+                "parentAgentId": "a-parent",
+            }
+        ),
+        encoding="utf-8",
+    )
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
+    max_attempts = forwarder._SUBAGENT_RESOLVE_MAX_ATTEMPTS
+    warning_polls: dict[str, list[int]] = {"a-parent": [], "a-child": []}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://ap",
+    ) as client:
+        poll_kwargs = _subagent_poll_kwargs(client, bridge_dir, transcript_path)
+        state = forwarder.SubagentForwardState(subagents={})
+        for index in range(3 * max_attempts):
+            caplog.clear()
+            state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
+            for subagent_id, polls in warning_polls.items():
+                if any(f"subagent_id={subagent_id} " in r.getMessage() for r in caplog.records):
+                    polls.append(index)
+
+    assert state.subagents == {}
+    assert warning_polls == {"a-parent": [max_attempts - 1], "a-child": [2 * max_attempts - 2]}
