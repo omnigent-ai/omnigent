@@ -17185,6 +17185,22 @@
       "UpdateTicket": {
         "additionalProperties": false,
         "properties": {
+          "add_labels": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TicketLabel"
+                },
+                "maxItems": 20,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Labels to add, replacing any with the same key, applied to the ticket's current labels in one write so concurrent label edits survive. Not with labels.",
+            "title": "Add Labels"
+          },
           "audience": {
             "anyOf": [
               {
@@ -17246,6 +17262,22 @@
               }
             ],
             "title": "Labels"
+          },
+          "remove_labels": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Label keys to remove, applied in the same write. Not with labels.",
+            "title": "Remove Labels"
           },
           "stage_id": {
             "anyOf": [

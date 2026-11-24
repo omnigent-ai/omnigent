@@ -1410,25 +1410,36 @@ class ProjectTicketStore:
     def update(
         self, project_id: str, ticket_id: str, body: UpdateTicket, actor: TicketActor
     ) -> dict[str, Any]:
-        changes = body.model_dump(exclude_none=True, exclude={"comment", "audience", "final"})
+        base_changes = body.model_dump(
+            exclude_none=True,
+            exclude={"comment", "audience", "final", "add_labels", "remove_labels"},
+        )
 
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
             row = self._row(session, project_id, ticket_id, write=True)
+            changes = dict(base_changes)
+            # Label adds and removes apply to the labels as they are now, inside this write.
+            if body.has_label_changes:
+                try:
+                    changes["labels"] = body.labels_after(row.labels)
+                except ValueError as exc:
+                    raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            touches_labels = "labels" in changes
             target = _stage(_stages(project), body.stage_id) if body.stage_id is not None else None
             adds_needs_human = (
-                body.labels is not None
+                touches_labels
                 and _has_needs_human(changes.get("labels"))
                 and not _has_needs_human(row.labels)
             )
-            needs_human_changed = body.labels is not None and _has_needs_human(
+            needs_human_changed = touches_labels and _has_needs_human(
                 changes.get("labels")
             ) != _has_needs_human(row.labels)
             # A person's sign-off label answers their ask; judged on the labels before it.
             person = actor.session_id is None and actor.agent_id is None
             gates_added = (
                 _gate_labels_added(row.labels, changes.get("labels"))
-                if body.labels is not None and person
+                if touches_labels and person
                 else []
             )
             label_answers_ask = bool(gates_added) and self._answers_open_ask(
@@ -1468,7 +1479,7 @@ class ProjectTicketStore:
                 if body.final:
                     audience = "human"
                 # An explicit label list is the person's own call on needs-human.
-                answers_ask = body.labels is None and self._answers_open_ask(
+                answers_ask = not touches_labels and self._answers_open_ask(
                     session, project, row, actor
                 )
                 self._append(

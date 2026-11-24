@@ -6,6 +6,7 @@ import {
   getTicketSummary,
   getTicketCreationSummary,
   getTicketStages,
+  labelChanges,
   listTickets,
   setTicketSessionInvolvement,
   ticketEventStage,
@@ -259,4 +260,22 @@ it("does not attribute a response from incomplete, failed-to-catch-up or mismatc
       page,
     ]),
   ).toBeNull();
+});
+
+it("turns a label editor's new list into adds and removes against the old one", () => {
+  const before = [
+    { key: "kind", value: "fix" },
+    { key: "needs-human" },
+    { key: "risk", value: "a" },
+  ];
+  const after = [{ key: "kind", value: "ux" }, { key: "risk", value: "a" }, { key: "risk-ok" }];
+  expect(labelChanges(before, after)).toEqual({
+    add_labels: [{ key: "kind", value: "ux" }, { key: "risk-ok" }],
+    remove_labels: ["needs-human"],
+  });
+  // A null and a missing value are the same label, so nothing is resent.
+  expect(labelChanges([{ key: "x", value: null }], [{ key: "x" }])).toEqual({
+    add_labels: [],
+    remove_labels: [],
+  });
 });

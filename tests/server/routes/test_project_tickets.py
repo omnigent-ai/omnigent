@@ -1945,3 +1945,29 @@ async def test_the_owner_sees_a_one_click_sign_off_and_taking_it_answers_the_ask
     after = (await project_client.get(path)).json()
     assert {label["key"] for label in after["labels"]} == {"risk", "risk-ok"}
     assert after["sign_offs"] == []
+
+
+async def test_adding_and_removing_one_label_keeps_the_permission_rules(project_client, db_uri):
+    project = (await project_client.post("/v1/projects", json={"name": "Label deltas"})).json()
+    store = SqlAlchemyConversationStore(db_uri)
+    worker = store.create_conversation(project_id=project["id"]).id
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Deltas"})).json()
+    path = f"{base}/{ticket['id']}"
+    as_worker = {ORCHESTRATION_SOURCE_HEADER: worker}
+
+    added = await project_client.patch(
+        path, json={"add_labels": [{"key": "risk", "value": "auth"}]}, headers=as_worker
+    )
+    assert added.status_code == 200, added.text
+    # An agent still can't add a sign-off or an approval, one label at a time either.
+    for label in ({"key": "risk-ok"}, {"key": "approved", "value": "a" * 40}):
+        refused = await project_client.patch(path, json={"add_labels": [label]}, headers=as_worker)
+        assert refused.status_code == 403, refused.text
+    # The owner can, and a removal leaves the rest.
+    signed = await project_client.patch(path, json={"add_labels": [{"key": "risk-ok"}]})
+    assert signed.status_code == 200, signed.text
+    trimmed = await project_client.patch(path, json={"remove_labels": ["risk"]})
+    assert [label["key"] for label in trimmed.json()["labels"]] == ["risk-ok"]
+    both = await project_client.patch(path, json={"labels": [], "remove_labels": ["risk-ok"]})
+    assert both.status_code in (400, 422)

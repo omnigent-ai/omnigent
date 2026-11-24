@@ -232,6 +232,19 @@ class UpdateTicket(BaseModel):
         description="A stage ID from this project's ticket list or stage definitions.",
     )
     labels: list[TicketLabel] | None = Field(default=None, max_length=20)
+    add_labels: list[TicketLabel] | None = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Labels to add, replacing any with the same key, applied to the ticket's current "
+            "labels in one write so concurrent label edits survive. Not with labels."
+        ),
+    )
+    remove_labels: list[str] | None = Field(
+        default=None,
+        max_length=20,
+        description="Label keys to remove, applied in the same write. Not with labels.",
+    )
     comment: str | None = Field(default=None, min_length=1, max_length=2000)
     audience: TicketCommentAudience | None = Field(default=None, description=AUDIENCE_DESCRIPTION)
     final: bool = Field(default=False, description=FINAL_DESCRIPTION)
@@ -242,6 +255,46 @@ class UpdateTicket(BaseModel):
             raise ValueError("final requires a comment")
         _require_human_final(self.final, self.audience)
         return self
+
+    @model_validator(mode="after")
+    def labels_or_label_changes(self) -> UpdateTicket:
+        if self.labels is not None and self.has_label_changes:
+            raise ValueError("send labels, or add_labels/remove_labels, not both")
+        added = {label.key for label in self.add_labels or []}
+        if len(added) != len(self.add_labels or []):
+            raise ValueError("add_labels keys must be unique")
+        if added & set(self.remove_labels or []):
+            raise ValueError("a label key can't be both added and removed")
+        return self
+
+    @property
+    def has_label_changes(self) -> bool:
+        return self.add_labels is not None or self.remove_labels is not None
+
+    def labels_after(self, current: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """The full label list this edit leaves on a ticket whose labels are *current*.
+
+        ``None`` when it doesn't touch labels. ``add_labels`` replace a same-key label in
+        place and otherwise append; ``remove_labels`` drop keys.
+
+        :raises ValueError: when the result has more than 20 labels.
+        """
+        if self.labels is not None:
+            return [label.model_dump(exclude_none=True) for label in self.labels]
+        if not self.has_label_changes:
+            return None
+        added = {label.key: label.model_dump(exclude_none=True) for label in self.add_labels or []}
+        removed = set(self.remove_labels or [])
+        result: list[dict[str, Any]] = []
+        for label in current or []:
+            key = label.get("key") if isinstance(label, dict) else None
+            if key in removed:
+                continue
+            result.append(added.pop(key) if key in added else label)
+        result.extend(added.values())
+        if len(result) > 20:
+            raise ValueError("a ticket can have at most 20 labels")
+        return result
 
     @field_validator("title", "comment")
     @classmethod

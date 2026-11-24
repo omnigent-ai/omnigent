@@ -163,8 +163,20 @@ beforeEach(() => {
   vi.mocked(api.createTicket).mockImplementation(async (_id, body) => ({ ...ticket, ...body }));
   vi.mocked(api.updateTicket).mockImplementation(
     async (_projectId, _id, changes: TicketChanges) => {
-      const { comment: _comment, ...fields } = changes;
+      const { comment: _comment, add_labels, remove_labels, ...fields } = changes;
       ticket = { ...ticket, ...fields };
+      if (add_labels || remove_labels) {
+        // Like the server: apply adds and removes to the labels as they are now.
+        const removed = new Set(remove_labels ?? []);
+        const added = new Map((add_labels ?? []).map((label) => [label.key, label]));
+        const kept = ticket.labels
+          .filter((label) => !removed.has(label.key))
+          .map((label) => added.get(label.key) ?? label);
+        const fresh = [...added.values()].filter(
+          (label) => !ticket.labels.some((existing) => existing.key === label.key),
+        );
+        ticket = { ...ticket, labels: [...kept, ...fresh] };
+      }
       return ticket;
     },
   );
@@ -1006,13 +1018,17 @@ describe("Project ticket board", () => {
     expect(screen.getByRole("heading", { name: "Labels" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Remove label needs-human" }));
     await waitFor(() => expect(screen.queryByText("Needs response")).toBeNull());
-    expect(api.updateTicket).toHaveBeenCalledWith("project", "ticket", { labels: [] });
+    expect(api.updateTicket).toHaveBeenCalledWith("project", "ticket", {
+      add_labels: [],
+      remove_labels: ["needs-human"],
+    });
     fireEvent.change(screen.getByLabelText("Label key"), { target: { value: "area" } });
     fireEvent.change(screen.getByLabelText("Label value"), { target: { value: "board" } });
     fireEvent.click(screen.getByRole("button", { name: "Save label" }));
     await waitFor(() =>
       expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
-        labels: [{ key: "area", value: "board" }],
+        add_labels: [{ key: "area", value: "board" }],
+        remove_labels: [],
       }),
     );
     expect(ticket.stage_id).toBe("open");

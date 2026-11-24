@@ -143,7 +143,30 @@ export interface TicketSession {
 }
 export type TicketChanges = Partial<
   Pick<ProjectTicket, "title" | "description" | "stage_id" | "labels">
-> & { comment?: string; final?: boolean };
+> & {
+  comment?: string;
+  final?: boolean;
+  /** Labels to add or replace by key, applied to the current labels in one server write. */
+  add_labels?: TicketLabel[];
+  /** Label keys to remove, applied in the same write. */
+  remove_labels?: string[];
+};
+
+/** The adds and removes that turn *before* into *after*, so concurrent label edits survive. */
+export function labelChanges(
+  before: TicketLabel[],
+  after: TicketLabel[],
+): Pick<TicketChanges, "add_labels" | "remove_labels"> {
+  const valueOf = (label: TicketLabel) => label.value ?? null;
+  const previous = new Map(before.map((label) => [label.key, valueOf(label)]));
+  const kept = new Set(after.map((label) => label.key));
+  return {
+    add_labels: after.filter(
+      (label) => !previous.has(label.key) || previous.get(label.key) !== valueOf(label),
+    ),
+    remove_labels: before.filter((label) => !kept.has(label.key)).map((label) => label.key),
+  };
+}
 export interface TicketComment {
   text: string;
   kind?: "comment" | "execution";

@@ -841,18 +841,21 @@ def create_project_tickets_router(
         who = await actor(request, project_id)
         before = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
         context = None
-        if body.labels is not None:
+        # The same permission checks for a full list or for adds/removes, on what they change.
+        try:
+            proposed = body.labels_after(before.get("labels"))
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if proposed is not None:
             await refuse_owner_label_change(
                 request,
                 project_id,
                 before.get("labels"),
-                [label.model_dump() for label in body.labels],
+                proposed,
                 who,
             )
-        if body.labels is not None:
-            approved_after = label_value(
-                [label.model_dump() for label in body.labels], APPROVED_LABEL
-            )
+        if proposed is not None:
+            approved_after = label_value(proposed, APPROVED_LABEL)
             approved_before = label_value(before.get("labels"), APPROVED_LABEL)
             if approved_after is not None and approved_after != approved_before:
                 context = await review_context(request, project_id, who)

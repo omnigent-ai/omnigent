@@ -1102,3 +1102,58 @@ def test_a_persons_sign_off_label_answers_the_ask_but_an_agents_does_not(board):
     context = tickets.person_comment_context(project.id, ticket["id"], event["position"])
     assert context["asker"] == worker.session_id
     assert tickets.human_requests(user_id="alice")["data"] == []
+
+
+def test_concurrent_single_label_changes_both_survive(board):
+    import threading
+
+    tickets, _, project = board
+    owner = TicketActor("alice")
+    ticket = tickets.create(
+        project.id, CreateTicket(title="Race", labels=[{"key": "kind", "value": "fix"}]), owner
+    )
+    start = threading.Barrier(2)
+
+    def add(key: str) -> None:
+        start.wait()
+        tickets.update(project.id, ticket["id"], UpdateTicket(add_labels=[{"key": key}]), owner)
+
+    threads = [threading.Thread(target=add, args=(key,)) for key in ("approved", "risk-ok")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    keys = {
+        label["key"] for label in tickets.get(project.id, ticket["id"], user_id="alice")["labels"]
+    }
+    assert keys == {"kind", "approved", "risk-ok"}
+
+    # Removing one key and replacing another by key leave every other label alone.
+    after = tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(add_labels=[{"key": "kind", "value": "ux"}], remove_labels=["approved"]),
+        owner,
+    )
+    assert after["labels"] == [{"key": "kind", "value": "ux"}, {"key": "risk-ok"}]
+    # A full stale list still replaces everything, which is why the board sends changes.
+    stale = tickets.update(
+        project.id, ticket["id"], UpdateTicket(labels=[{"key": "kind", "value": "ux"}]), owner
+    )
+    assert stale["labels"] == [{"key": "kind", "value": "ux"}]
+
+
+def test_label_changes_are_validated():
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="not both"):
+        UpdateTicket(labels=[], add_labels=[{"key": "a"}])
+    with pytest.raises(ValidationError, match="both added and removed"):
+        UpdateTicket(add_labels=[{"key": "a"}], remove_labels=["a"])
+    with pytest.raises(ValidationError, match="unique"):
+        UpdateTicket(add_labels=[{"key": "a"}, {"key": "a", "value": "b"}])
+    full = [{"key": f"k{index}"} for index in range(20)]
+    with pytest.raises(ValueError, match="at most 20"):
+        UpdateTicket(add_labels=[{"key": "one-more"}]).labels_after(full)
+    assert UpdateTicket(title="t").labels_after(full) is None

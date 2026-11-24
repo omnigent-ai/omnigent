@@ -42,6 +42,7 @@ import {
   createTicket,
   getProjectFile,
   getTicket,
+  labelChanges,
   openProjectFile,
   requesterLabel,
   ticketOutputs,
@@ -482,8 +483,8 @@ function TicketDetails({
                 pending={update.isPending || comment.isPending}
                 onApprove={(label) => {
                   update.reset();
-                  // Labels replace the whole list: build on a fresh read, and only while the
-                  // ticket still asks for this sign-off, so a newer edit isn't undone.
+                  // Add just this label, and only while a fresh read still asks for it, so a
+                  // withdrawn ask isn't answered and other label edits are left alone.
                   void getTicket(projectId, ticketId)
                     .then((fresh) => {
                       const stillOffered = (fresh.sign_offs ?? []).some(
@@ -494,7 +495,7 @@ function TicketDetails({
                       if (!stillOffered) return void query.refetch();
                       update.mutate({
                         id: ticketId,
-                        changes: { labels: [...fresh.labels, label] },
+                        changes: { add_labels: [label] },
                       });
                     })
                     .catch(() => void query.refetch());
@@ -538,7 +539,9 @@ function TicketDetails({
                   labels={ticket.labels}
                   disabled={update.isPending}
                   error={update.error}
-                  onChange={(labels) => update.mutate({ id: ticketId, changes: { labels } })}
+                  onChange={(labels) =>
+                    update.mutate({ id: ticketId, changes: labelChanges(ticket.labels, labels) })
+                  }
                 />
               </div>
               <TicketError error={configuration.error} />
