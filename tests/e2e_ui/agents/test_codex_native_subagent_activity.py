@@ -159,7 +159,7 @@ def test_codex_child_stays_done_in_agents_rail_after_stale_running_snapshot(
         f"{base_url}/v1/sessions/{session_id}/child_sessions", timeout=10.0
     ).json()["data"]
     assert children[0]["busy"] is True
-    assert children[0]["current_task_status"] == "running"
+    assert children[0]["current_task_status"] == "in_progress"
     rail = page.get_by_role("complementary", name="Workspace")
     expect(rail.get_by_test_id("subagent-status-avatar")).to_have_attribute(
         "aria-label", "Working", timeout=10_000
