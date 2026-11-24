@@ -1675,6 +1675,8 @@ class SqlScheduledTask(OmnigentBase):
         own schedule arithmetic and delivery.
     :param smart_routing: Whether the task's runs use Smart Routing instead of
         a fixed model: on (1) or off (2). ``None`` until the owner chooses.
+    :param notifications: Whether the sessions the task's runs start notify its
+        owner; ``False`` starts them muted. Defaults to ``True``.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -1765,6 +1767,10 @@ class SqlScheduledTask(OmnigentBase):
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     # Stable int code: on=1, off=2. NULL keeps "never chosen" apart from off.
     smart_routing: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # False starts run sessions muted for the task's owner.
+    notifications: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
+    )
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 

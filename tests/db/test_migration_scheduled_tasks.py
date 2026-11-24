@@ -57,6 +57,8 @@ _SMART_ROUTING_PREVIOUS = "d3bda6dbade3"
 _SMART_ROUTING_REVISION = "5ab01aaca219"
 _TIMER_KIND_REVISION = "bf30d7cbda61"
 _TIMER_KIND_MIGRATION = "omnigent.db.migrations.versions.bf30d7cbda61_allow_scheduled_task_timers"
+_WORKFLOW_ID_REVISION = "47d3e8fc3e25"
+_NOTIFICATIONS_REVISION = "8e1a06fad781"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -114,6 +116,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["mcp_services"]["nullable"] is True
     assert columns["kind"]["nullable"] is False
     assert columns["smart_routing"]["nullable"] is True
+    assert columns["notifications"]["nullable"] is False
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -148,6 +151,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "workflow_id",
         "kind",
         "smart_routing",
+        "notifications",
     }
 
 
@@ -1360,3 +1364,37 @@ def test_timer_kind_downgrade_finds_timers_through_the_kind_index(
             ).all()
         )
     assert "ix_scheduled_tasks_kind_scope" in plan and "SEARCH" in plan, plan
+
+
+@pytest.mark.parametrize("dispatch_migration_engine", [_WORKFLOW_ID_REVISION], indirect=True)
+def test_notifications_migration_keeps_existing_tasks_notifying_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, **values))
+    _migrate_on_one_connection(engine, _NOTIFICATIONS_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        # A task saved before the migration, and one written without the column, keep notifying.
+        conn.execute(tasks.insert().values(id=b"b" * 16, **values))
+        conn.execute(tasks.insert().values(id=b"c" * 16, notifications=False, **values))
+        choices = dict(conn.execute(sa.select(tasks.c.id, tasks.c.notifications)).tuples().all())
+    assert choices == {b"a" * 16: True, b"b" * 16: True, b"c" * 16: False}
+    _migrate_on_one_connection(engine, _WORKFLOW_ID_REVISION, downgrade=True)
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
+    assert "notifications" not in columns
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 3
+    _migrate_on_one_connection(engine, _NOTIFICATIONS_REVISION)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.notifications)).scalars().all() == [True] * 3
