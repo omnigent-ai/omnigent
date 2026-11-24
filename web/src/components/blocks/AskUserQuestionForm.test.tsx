@@ -29,13 +29,22 @@ import { AskUserQuestionForm } from "./AskUserQuestionForm";
 
 // Session rows the "@" menu lists from the sidebar; server title search is off.
 const sessionList = vi.hoisted(() => ({ loaded: [] as unknown[] }));
-vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
-  ...(await importOriginal<typeof UseSidebarDataModule>()),
-  useOptionalLoadedConversations: () => ({
-    pages: [{ data: sessionList.loaded }],
-    pageParams: [undefined],
-  }),
-}));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => {
+  // Like the app's context, the same value until the loaded list changes.
+  let cached: { list: unknown[]; value: object } | null = null;
+  return {
+    ...(await importOriginal<typeof UseSidebarDataModule>()),
+    useOptionalLoadedConversations: () => {
+      if (cached?.list !== sessionList.loaded) {
+        cached = {
+          list: sessionList.loaded,
+          value: { pages: [{ data: sessionList.loaded }], pageParams: [undefined] },
+        };
+      }
+      return cached.value;
+    },
+  };
+});
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useSessionSearch: () => ({ data: undefined }),
@@ -1032,6 +1041,51 @@ describe("AskUserQuestionForm — prompt editor", () => {
     const target = composerTargetOf(editor)!;
     expect([target.selectionStart, target.selectionEnd]).toEqual([0, 5]);
     expect(target.value).toBe("Ramen soup");
+  });
+
+  it("keeps a tagged session through a narrow viewport and back", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    // A live matchMedia: narrowing notifies the mobile query's listeners, as a resize does.
+    let narrow = false;
+    const listeners = new Set<() => void>();
+    const matchMedia = window.matchMedia;
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => {
+      const real = matchMedia(query);
+      const mobile = query.includes("max-width");
+      return {
+        ...real,
+        matches: mobile ? narrow : real.matches,
+        addEventListener: (type: string, listener: () => void) =>
+          mobile ? listeners.add(listener) : real.addEventListener(type, listener),
+        removeEventListener: (type: string, listener: () => void) =>
+          mobile ? listeners.delete(listener) : real.removeEventListener(type, listener),
+      } as MediaQueryList;
+    });
+    const resize = (nowNarrow: boolean) => {
+      narrow = nowNarrow;
+      act(() => listeners.forEach((listener) => listener()));
+    };
+    const { onSubmit } = renderForm([framework], { codeMirror: true });
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Use @Fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(composerTargetOf(editor)!.value).toBe("Use @Fix CI ");
+
+    resize(true);
+    const textarea = await waitFor(() => {
+      const field = screen.getByTestId("ask-user-question-custom-input");
+      expect(field.tagName).toBe("TEXTAREA");
+      return field as HTMLTextAreaElement;
+    });
+    expect(textarea.value).toBe("Use @Fix CI ");
+
+    resize(false);
+    const restored = await promptEditor();
+    expect(composerTargetOf(restored)!.value).toBe("Use @Fix CI ");
+    fireEvent.keyDown(restored, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+    });
   });
 
   it("keeps a tagged session when the card remounts with its draft", async () => {
