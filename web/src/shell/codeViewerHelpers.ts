@@ -820,18 +820,34 @@ interface SourcedHastNode {
   children?: SourcedHastNode[];
 }
 
+function nodeSource(node: SourcedHastNode): { start: number; end: number } | null {
+  const start = node.position?.start.offset;
+  const end = node.position?.end.offset;
+  return start === undefined || end === undefined ? null : { start, end };
+}
+
 /**
  * Rehype step that stamps each element with its `[start, end)` offsets in the
- * Markdown source as `data-md-start` / `data-md-end`, so a copy can map the
- * rendered selection back to the Markdown it came from. It runs after sanitize
- * and adds only numbers.
+ * Markdown source as `data-md-start` / `data-md-end`, and its text children's
+ * as `data-md-text` (`"2-9 12-20"`, `-` for text without a source, such as a
+ * code block's), so a copy can map the rendered selection back to the Markdown
+ * it came from. It runs after sanitize and adds only numbers.
  */
 export function rehypeSourceOffsets() {
   const stamp = (node: SourcedHastNode) => {
-    const start = node.position?.start.offset;
-    const end = node.position?.end.offset;
-    if (node.type === "element" && start !== undefined && end !== undefined) {
-      node.properties = { ...node.properties, dataMdStart: start, dataMdEnd: end };
+    const span = nodeSource(node);
+    if (node.type === "element" && span) {
+      const texts = (node.children ?? []).filter((child) => child.type === "text");
+      const textSources = texts.map((text) => {
+        const textSpan = nodeSource(text);
+        return textSpan ? `${textSpan.start}-${textSpan.end}` : "-";
+      });
+      node.properties = {
+        ...node.properties,
+        dataMdStart: span.start,
+        dataMdEnd: span.end,
+        ...(texts.length ? { dataMdText: textSources.join(" ") } : {}),
+      };
     }
     node.children?.forEach(stamp);
   };
@@ -911,32 +927,64 @@ function nextStampedStart(node: Node, end: number): number {
   return end;
 }
 
+const RECORDED_TEXT_SOURCE = /^(\d+)-(\d+)$/;
+
+/**
+ * The source `rehypeSourceOffsets` recorded for *node* on its stamped *parent*.
+ * Null for text without one, or when rendering dropped text nodes (whitespace
+ * in a table) so the record no longer lines up with the DOM.
+ */
+function recordedTextSource(node: Text, parent: Element): SourceSpan | null {
+  const recorded = parent.getAttribute("data-md-text")?.split(" ");
+  const texts = Array.from(parent.childNodes).filter((child) => child instanceof Text);
+  if (!recorded || recorded.length !== texts.length) return null;
+  const match = RECORDED_TEXT_SOURCE.exec(recorded[texts.indexOf(node)]);
+  return match ? { start: Number(match[1]), end: Number(match[2]) } : null;
+}
+
+/** Each character's source, or null for one without its own, like an emoji shortcode's glyph. */
+type CharacterSources = (SourceSpan | null)[];
+
+function isKnown(character: SourceSpan | null): character is SourceSpan {
+  return character !== null;
+}
+
 /**
  * The source a text node renders from (*stretch*) and each of its characters'
- * source. Its element's children are matched in order, so the text is found
- * after the text before it, even past an unstamped rendered formula.
+ * source. The stretch is the node's recorded source. Text without one (a code
+ * block's, or an emoji split out of its sentence) is matched in its element's
+ * source in order: after the text and stamped elements before it, even past an
+ * unstamped rendered formula, and before the next text's first character.
  */
 function textSource(
   node: Text,
+  parent: Element,
   owner: SourceSpan,
   source: string,
-): { stretch: SourceSpan; characters: SourceSpan[] | null } {
+): { stretch: SourceSpan; characters: CharacterSources } {
   let start = owner.start;
-  for (let child = node.parentNode?.firstChild ?? null; child; child = child.nextSibling) {
+  let found: { stretch: SourceSpan; characters: CharacterSources } | null = null;
+  for (let child = parent.firstChild; child; child = child.nextSibling) {
     const stamped = child instanceof Element ? stampedSpan(child) : null;
+    if (stamped && found) break;
     if (stamped) start = stamped.end;
     if (!(child instanceof Text)) continue;
-    const stretch = { start, end: nextStampedStart(child, owner.end) };
-    const aligned = alignText(child.data, source.slice(stretch.start, stretch.end));
-    const characters =
-      aligned?.map((span) => ({
-        start: stretch.start + span.start,
-        end: stretch.start + span.end,
-      })) ?? null;
-    if (child === node) return { stretch, characters };
-    if (characters?.length) start = characters[characters.length - 1].end;
+    const stretch = recordedTextSource(child, parent) ?? {
+      start,
+      end: nextStampedStart(child, owner.end),
+    };
+    const characters = alignText(child.data, source, stretch);
+    const next = found && characters.find(isKnown);
+    if (found && next) {
+      return {
+        stretch: { start: found.stretch.start, end: Math.min(found.stretch.end, next.start) },
+        characters: found.characters,
+      };
+    }
+    if (child === node) found = { stretch, characters };
+    start = characters.findLast(isKnown)?.end ?? start;
   }
-  return { stretch: owner, characters: null };
+  return found ?? { stretch: owner, characters: [] };
 }
 
 // A character reference such as `&amp;`, `&#42;` or `&#x2A;`, matched where it starts.
@@ -945,7 +993,7 @@ const CHARACTER_REFERENCE = /&(?:#\d{1,7}|#[xX][\dA-Fa-f]{1,6}|[A-Za-z][A-Za-z\d
 const ESCAPABLE = /[!-/:-@[-`{-~]/;
 
 /**
- * The first stretch of *source*, from *from* on, that renders as *text* at
+ * The first part of *source* within [*from*, *to*) that renders as *text* at
  * *index*: an escape (`\*`), a character reference (`&amp;`) or the character
  * itself. A reference can render as two code units, e.g. an emoji's pair.
  */
@@ -954,9 +1002,10 @@ function nextCharacterSource(
   index: number,
   source: string,
   from: number,
+  to: number,
 ): { span: SourceSpan; units: number } | null {
   const char = text[index];
-  for (let at = from; at < source.length; at++) {
+  for (let at = from; at < to; at++) {
     if (source[at] === "\\" && source[at + 1] === char && ESCAPABLE.test(char)) {
       return { span: { start: at, end: at + 2 }, units: 1 };
     }
@@ -974,29 +1023,54 @@ function nextCharacterSource(
 }
 
 /**
- * The stretch of *source*, the Markdown *text* renders from, behind each of its
- * characters. Verbatim text is found whole; otherwise characters match in
- * order, skipping syntax such as markers and quote prefixes. Null when a
- * character has no source of its own, like an emoji shortcode's glyph.
+ * The source behind each character of *text*, found in *stretch* of *source*.
+ * Verbatim text is found whole; otherwise characters match in order, skipping
+ * syntax such as quote prefixes and trimmed indentation.
  */
-function alignText(text: string, source: string): SourceSpan[] | null {
-  const verbatim = source.indexOf(text);
+function alignText(text: string, source: string, stretch: SourceSpan): CharacterSources {
+  const local = source.slice(stretch.start, stretch.end);
+  const verbatim = local.indexOf(text);
   // A match right after a backslash would drop that escape of its first character.
-  if (verbatim !== -1 && source[verbatim - 1] !== "\\") {
+  if (verbatim !== -1 && local[verbatim - 1] !== "\\") {
+    const first = stretch.start + verbatim;
     return Array.from({ length: text.length }, (_, i) => ({
-      start: verbatim + i,
-      end: verbatim + i + 1,
+      start: first + i,
+      end: first + i + 1,
     }));
   }
-  const spans: SourceSpan[] = [];
-  let at = 0;
-  while (spans.length < text.length) {
-    const next = nextCharacterSource(text, spans.length, source, at);
-    if (!next) return null;
-    for (let unit = 0; unit < next.units; unit++) spans.push(next.span);
+  const characters: CharacterSources = [];
+  let at = stretch.start;
+  while (characters.length < text.length) {
+    const next = nextCharacterSource(text, characters.length, source, at, stretch.end);
+    if (!next) {
+      characters.push(null);
+      continue;
+    }
+    for (let unit = 0; unit < next.units; unit++) characters.push(next.span);
     at = next.span.end;
   }
-  return spans;
+  return characters;
+}
+
+/**
+ * Where a selection's *side* edge at *offset* falls in the source. A start takes
+ * its first character's whole source, an end its last one's. A character with
+ * no source of its own covers the gap to its known neighbours.
+ */
+function edgeOffset(
+  characters: CharacterSources,
+  stretch: SourceSpan,
+  offset: number,
+  side: SelectionSide,
+): number {
+  if (side === "start") {
+    const own = characters[offset];
+    if (own) return own.start;
+    return characters.slice(0, offset).findLast(isKnown)?.end ?? stretch.start;
+  }
+  const own = characters[offset - 1];
+  if (own) return own.end;
+  return characters.slice(offset).find(isKnown)?.start ?? stretch.end;
 }
 
 /**
@@ -1010,10 +1084,37 @@ function sourceOffset(point: TextPoint, side: SelectionSide, source: string): nu
   const ownerSpan = owner ? stampedSpan(owner) : null;
   if (!parent || !ownerSpan) return null;
   if (owner !== parent) return side === "start" ? ownerSpan.start : ownerSpan.end;
-  const { stretch, characters } = textSource(point.node, ownerSpan, source);
-  if (!characters) return side === "start" ? stretch.start : stretch.end;
-  // A start takes its first character's whole source, an end its last one's.
-  return side === "start" ? characters[point.offset].start : characters[point.offset - 1].end;
+  const { stretch, characters } = textSource(point.node, parent, ownerSpan, source);
+  return edgeOffset(characters, stretch, point.offset, side);
+}
+
+/**
+ * The source of a selection inside one text node: each selected character's
+ * own source joined, so escapes and entities stay while syntax between them,
+ * such as a quote's `>` on the next line, stays out. Null when the text sits in
+ * an unstamped element, such as a rendered formula, whose source is unknown.
+ */
+function textNodeSelectionSource(start: TextPoint, end: TextPoint, source: string): string | null {
+  const parent = start.node.parentElement;
+  const owner = parent ? stampedSpan(parent) : null;
+  if (!parent || !owner) return null;
+  const { stretch, characters } = textSource(start.node, parent, owner, source);
+  let copied = "";
+  for (let index = start.offset; index < end.offset;) {
+    const character = characters[index];
+    if (character) {
+      copied += source.slice(character.start, character.end);
+      // An emoji's reference renders as two code units that share one source.
+      while (characters[index] === character) index++;
+      continue;
+    }
+    let unknownEnd = index;
+    while (unknownEnd < end.offset && !characters[unknownEnd]) unknownEnd++;
+    const from = edgeOffset(characters, stretch, index, "start");
+    copied += source.slice(from, edgeOffset(characters, stretch, unknownEnd, "end"));
+    index = unknownEnd;
+  }
+  return copied;
 }
 
 /** Whether *element* renders text before (start) or after (end) *point*. */
@@ -1052,12 +1153,13 @@ function widenOverLeftElements(
  * The Markdown source behind a selection in the rendered preview, mapped
  * through the offsets `rehypeSourceOffsets` stamped on its elements.
  *
- * Within one block the selection copies its slice of source, and a partially
- * selected bold, italic, link or code span widens to its whole source. Across
- * blocks, each block the selection covers from its edge copies whole, markers
- * included, while one entered mid-text starts or ends mid-line. A code block
- * copies whole when the selection leaves it, while text inside one copies
- * verbatim. A table copies whole once the selection spans its cells or leaves it.
+ * A selection inside one text node copies its characters' own source, so a
+ * code block's lines come without a quote's `>`. Otherwise it copies a slice of
+ * source: a partially selected bold, italic, link or code span widens to its
+ * whole source, each block the selection covers from its edge copies whole,
+ * markers included, and one entered mid-text starts or ends mid-line. A code
+ * block copies whole when the selection leaves it, and a table once the
+ * selection spans its cells or leaves it.
  *
  * :param range: The selection, e.g. `window.getSelection().getRangeAt(0)`.
  * :param root: The element holding the rendered document.
@@ -1073,6 +1175,10 @@ export function markdownPreviewSelectionSource(
   if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null;
   const bounds = selectedTextBounds(range);
   if (!bounds) return null;
+  if (bounds.start.node === bounds.end.node) {
+    const copied = textNodeSelectionSource(bounds.start, bounds.end, source);
+    return copied?.trim() ? copied : null;
+  }
   const start = sourceOffset(bounds.start, "start", source);
   const end = sourceOffset(bounds.end, "end", source);
   if (start === null || end === null) return null;
@@ -1119,6 +1225,7 @@ export function selectedPreviewHtml(range: Range, root: Element): string {
   for (const stamped of container.querySelectorAll("[data-md-start]")) {
     stamped.removeAttribute("data-md-start");
     stamped.removeAttribute("data-md-end");
+    stamped.removeAttribute("data-md-text");
   }
   return container.innerHTML;
 }

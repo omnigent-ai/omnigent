@@ -549,6 +549,10 @@ describe("CodeViewer markdown preview copy", () => {
       "*literal*",
       "\\*literal\\*",
     ],
+    ["an escaped star inside bold", "**\\* star**", "* star", "* star", "\\* star"],
+    ["heading text with an entity", "# #tags &amp; tips", "#tags", "#tags", "#tags"],
+    ["a word after an emoji shortcode", "Ship it :rocket: today", "today", "today", "today"],
+    ["an emoji shortcode's glyph", "Ship it :rocket: today", "🚀", "🚀", ":rocket:"],
     ["TeX delimiters", "Inline \\(x^2\\) math", "Inline", "math", "Inline \\(x^2\\) math"],
     [
       "whole list items",
@@ -580,6 +584,13 @@ describe("CodeViewer markdown preview copy", () => {
       "> Quoted line\n\nAfter",
     ],
     ["a code block's text", "```js\nconst answer = 42;\n```", "const", "42;", "const answer = 42;"],
+    [
+      "lines of code inside a quote",
+      "> ```\n> first\n> second\n> ```",
+      "first",
+      "second",
+      "first\nsecond",
+    ],
     [
       "a selection leaving a code block",
       "Intro line\n\n```js\nconst answer = 42;\n```",
@@ -650,7 +661,7 @@ describe("CodeViewer markdown preview copy", () => {
     range.setEnd(outside.firstChild as Text, 7);
     window.getSelection()?.addRange(range);
     try {
-      expect(fireCopyEvent(previewText("words").node)).not.toHaveBeenCalled();
+      expectBrowserCopy(previewText("words").node);
     } finally {
       outside.remove();
     }
@@ -663,8 +674,20 @@ describe("CodeViewer markdown preview copy", () => {
     range.setStart(node, 5);
     range.setEnd(node, 6);
     window.getSelection()?.addRange(range);
-    expect(fireCopyEvent(node)).not.toHaveBeenCalled();
+    expectBrowserCopy(node);
   });
+
+  /** Copies from *target* and checks the preview neither wrote nor cancelled the copy. */
+  function expectBrowserCopy(target: Node): void {
+    let defaultPrevented: boolean | undefined;
+    const listener = (event: Event) => {
+      defaultPrevented = event.defaultPrevented;
+    };
+    // Bubbles after React's handler at the root, so it sees whether that cancelled the copy.
+    document.addEventListener("copy", listener, { once: true });
+    expect(fireCopyEvent(target)).not.toHaveBeenCalled();
+    expect(defaultPrevented).toBe(false);
+  }
 });
 
 describe("CodeViewer editor routing", () => {
