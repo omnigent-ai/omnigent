@@ -370,6 +370,8 @@ async def test_invalid_arguments_never_reach_the_server() -> None:
             ("sys_gadget_get", {"gadget_id": "../sessions"}),
             ("sys_gadget_describe", {}),
             ("sys_gadget_comment_update", {"gadget_id": "a" * 32, "status": "addressed"}),
+            ("sys_gadget_records", {"gadget_id": "a" * 32, "op": ["list"]}),
+            ("sys_gadget_records", {"gadget_id": "a" * 32, "op": {"list": 1}}),
         ):
             assert "invalid_input" in (await _call(client, tool, **args))["error"]
         malformed = await execute_gadget_tool(

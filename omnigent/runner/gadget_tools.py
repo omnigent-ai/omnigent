@@ -123,7 +123,7 @@ async def _record(
     server: _Server, args: dict[str, Any], gadget_id: str, call_id: str | None
 ) -> Any:
     op = args.get("op")
-    if op not in GADGET_RECORD_OPS:
+    if not isinstance(op, str) or op not in GADGET_RECORD_OPS:
         raise _ToolError(f"invalid_input: op must be one of {', '.join(GADGET_RECORD_OPS)}")
     params = {
         key: value
