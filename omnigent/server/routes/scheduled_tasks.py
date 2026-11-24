@@ -2175,6 +2175,10 @@ def create_scheduled_tasks_router(
         derives_workflow_prompt = await _apply_workflow_update(request, existing, fields, owner)
         if await asyncio.to_thread(_align_stored_workflow, existing, fields):
             derives_workflow_prompt = True
+        # Whether a new agent needs the prompt's skill prefix rewritten was decided on the
+        # snapshot, so a workflow attached since then conflicts too.
+        if fields.get("agent_id") not in (None, existing.agent_id):
+            derives_workflow_prompt = True
         target_session_mode = fields.get("session_mode", existing.session_mode)
         # The caller's own changes, before the ones derived below.
         requested_session = {

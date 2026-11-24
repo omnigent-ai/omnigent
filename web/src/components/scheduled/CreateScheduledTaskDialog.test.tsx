@@ -7490,6 +7490,26 @@ describe("CreateScheduledTaskDialog workflow", () => {
     }
   });
 
+  it("saves a workflow run after a trigger header as the prompt it shows", async () => {
+    const editingTask = {
+      ...storedWorkflowTask(),
+      prompt: `<!-- omnigent-trigger v1 {} -->\n${run("The upload tests")}`,
+    };
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />, {
+      info: STORED_WORKFLOW_INFO,
+    });
+    fireEvent.change(screen.getByLabelText("Additional instructions (optional)"), {
+      target: { value: "The download tests" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    // The server can't rewrite a run below a header, so the prompt goes as the form shows it.
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited.prompt).toBe(run("The download tests"));
+  });
+
   it("saves a workflow run inside template text as the whole prompt", async () => {
     // Template text around the run that no trigger opening marks, so it saves as typed.
     const wrapped = renderTriggerPrompt(

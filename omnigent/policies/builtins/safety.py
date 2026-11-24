@@ -514,7 +514,7 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     supplied = args.get("prompt", "(unchanged; not supplied by legacy caller)")
     if action == "create" and "prompt" not in args and workflow_id is not None:
         prompt: object = f"Runs the saved workflow {workflow_id}"
-    elif action == "update" and workflow_id:
+    elif action == "update" and (workflow_id or "workflow_details" in args):
         # Read as the server reads the task's prompt: its specifics stay only if it runs a
         # saved workflow.
         from omnigent.server.scheduled.workflow_automations import (
@@ -522,6 +522,7 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
             saved_workflow_run,
         )
 
+        details_given = "workflow_details" in args
         if "prompt" not in args:
             effect = (
                 "keeping the specifics of the stored prompt if it already runs a saved "
@@ -531,6 +532,9 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
             effect = (
                 "in place of the current prompt below, whose instructions no longer run; "
                 "each run gets only the specifics in workflow_details"
+                if workflow_id
+                else "but the current prompt below runs no saved workflow, so the server "
+                "refuses the update"
             )
         elif not is_bare_saved_workflow_run(supplied):
             effect = (
@@ -538,14 +542,16 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
                 "server keeps it only if this is the workflow it runs and workflow_details "
                 "is left out, and otherwise refuses the update"
             )
-        else:
+        elif details_given:
             effect = (
-                "keeping the specifics of the current prompt below unless workflow_details "
-                "replaces them"
+                "with the specifics in workflow_details in place of those in the current "
+                "prompt below"
             )
+        else:
+            effect = "keeping the specifics of the current prompt below"
+        subject = f"the saved workflow {workflow_id}" if workflow_id else "its saved workflow"
         prompt = (
-            f"Runs the saved workflow {workflow_id}. The server writes the prompt that runs "
-            f"it, {effect}.\n{supplied}"
+            f"Runs {subject}. The server writes the prompt that runs it, {effect}.\n{supplied}"
         )
     else:
         prompt = supplied

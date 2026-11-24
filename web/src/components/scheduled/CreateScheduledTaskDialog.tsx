@@ -1116,32 +1116,6 @@ export function CreateScheduledTaskDialog({
       workflowChoice);
   const withoutWorkflow = (text: string) =>
     (workflowChoice && parseSavedWorkflowMessage(text)?.details) ?? text;
-  // A schedule's saved workflow, sent as itself to a server that stores it: the server
-  // writes the prompt, and only workflowId null stops running the workflow.
-  const scheduledWorkflowInput = () => {
-    if (!scheduledWorkflowSupported) return {};
-    const stopsStoredWorkflow = editingTask?.workflowId ? { workflowId: null } : {};
-    // A trigger runs its own prompt, so a schedule turned into one stops running the workflow.
-    if (trigger !== null || isTriggerPrompt(freeTextPrompt)) return stopsStoredWorkflow;
-    // A prompt edited as text, with the Workflow field off or a run inside template text,
-    // saves as typed: the server stores the workflow it runs, or stops one it no longer does.
-    if (!workflowsEnabled || systemPrompt !== null) {
-      return parseSavedWorkflowMessage(effectivePrompt) === null ? stopsStoredWorkflow : {};
-    }
-    // Cleared, the field leaves the prompt as typed, which may itself run a workflow.
-    if (workflowChoice === null) {
-      return parseSavedWorkflowMessage(effectivePrompt) === null ? stopsStoredWorkflow : {};
-    }
-    const workflowDetails = keepsWorkflowDetails ? prompt.trim() : "";
-    // Unchanged, so other edits save without the server loading the workflow, which may be gone.
-    if (
-      editingTask?.workflowId === workflowChoice.id &&
-      workflowDetails === (editingTask.workflowDetails ?? "")
-    ) {
-      return { prompt: undefined };
-    }
-    return { prompt: undefined, workflowId: workflowChoice.id, workflowDetails };
-  };
   const workflowField =
     workflowsEnabled && (savedWorkflows.workflows.length > 0 || workflowChoice) ? (
       <WorkflowField
@@ -1267,6 +1241,34 @@ export function CreateScheduledTaskDialog({
     renderedTriggerPrompt = renderTriggerConfigPrompt(renderedTriggerConfig, triggerPromptContext);
   }
   const effectivePrompt = trigger !== null ? renderedTriggerPrompt : freeTextPrompt;
+  // A schedule's saved workflow, sent as itself to a server that stores it: the server
+  // writes the prompt, and only workflowId null stops running the workflow.
+  const scheduledWorkflowInput = () => {
+    if (!scheduledWorkflowSupported) return {};
+    const stopsStoredWorkflow = editingTask?.workflowId ? { workflowId: null } : {};
+    // A trigger runs its own prompt, so a schedule turned into one stops running the workflow.
+    if (trigger !== null || isTriggerPrompt(freeTextPrompt)) return stopsStoredWorkflow;
+    // Saved as typed when the Workflow field is off or cleared, or the run sits inside a
+    // header or template text: the server stores the workflow it runs, or stops one it
+    // no longer does.
+    if (
+      !workflowsEnabled ||
+      workflowChoice === null ||
+      systemPrompt !== null ||
+      (editingTask !== null && hasTriggerHeader(editingTask.prompt))
+    ) {
+      return parseSavedWorkflowMessage(effectivePrompt) === null ? stopsStoredWorkflow : {};
+    }
+    const workflowDetails = keepsWorkflowDetails ? prompt.trim() : "";
+    // Unchanged, so other edits save without the server loading the workflow, which may be gone.
+    if (
+      editingTask?.workflowId === workflowChoice.id &&
+      workflowDetails === (editingTask.workflowDetails ?? "")
+    ) {
+      return { prompt: undefined };
+    }
+    return { prompt: undefined, workflowId: workflowChoice.id, workflowDetails };
+  };
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));

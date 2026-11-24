@@ -1003,6 +1003,43 @@ def test_an_update_says_what_the_server_keeps_of_the_prompt_it_sends(
     assert (saved_workflow_run(prompt) is not None) is keeps
 
 
+@pytest.mark.parametrize(
+    ("prompt", "effect"),
+    [
+        (
+            f"{_RUN}\n\nRead-only: make no changes",
+            "with the specifics in workflow_details in place of those in the current prompt",
+        ),
+        ("Summarize overnight activity.", "runs no saved workflow, so the server refuses"),
+    ],
+    ids=["workflow-prompt", "plain-prompt"],
+)
+def test_a_details_only_update_says_what_replaces_the_current_specifics(
+    prompt: str, effect: str
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "prompt": prompt,
+                    "permission_mode": None,
+                    "workflow_details": "Only the upload tests",
+                },
+            },
+        }
+    )
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert instructions.startswith("Runs its saved workflow.")
+    assert effect in instructions
+    assert "Only the upload tests" in instructions
+
+
 def test_an_update_that_leaves_the_prompt_out_claims_no_outcome() -> None:
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 

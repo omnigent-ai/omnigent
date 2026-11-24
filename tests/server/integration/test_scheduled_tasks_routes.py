@@ -4891,6 +4891,50 @@ async def test_a_resent_prompt_cant_undo_a_detach_that_lands_first(
     )
 
 
+async def test_an_agent_switch_read_before_a_concurrent_attach_conflicts(
+    workflows_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whether the new agent needs another skill prefix was decided without the workflow."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    assert created.status_code == 200, created.text
+    url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    codex = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    align = scheduled_tasks_routes._align_stored_workflow
+    read = threading.Event()
+    attached = threading.Event()
+
+    def align_after_attach(existing: Any, fields: dict[str, Any]) -> bool:
+        # Runs in a worker thread, so waiting here leaves the attach free to land.
+        if fields.get("agent_id") == codex:
+            read.set()
+            assert attached.wait(timeout=10)
+        return align(existing, fields)
+
+    async def attach() -> httpx.Response:
+        await asyncio.to_thread(read.wait, 10)
+        try:
+            return await client.patch(url, json={"workflow_id": workflow_id}, headers=_headers())
+        finally:
+            attached.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_align_stored_workflow", align_after_attach)
+    async with asyncio.timeout(15):
+        switched, attaching = await asyncio.gather(
+            client.patch(url, json={"agent_id": codex}, headers=_headers()), attach()
+        )
+    assert attaching.status_code == 200, attaching.text
+    assert switched.status_code == 409, switched.text
+    assert switched.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_CHANGED_MSG
+    saved = (await client.get(url, headers=_headers())).json()
+    # The run message still matches the agent the task runs.
+    assert (saved["agent_id"], saved["prompt"]) == (
+        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        _workflow_run_prompt(workflow_id),
+    )
+
+
 async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
