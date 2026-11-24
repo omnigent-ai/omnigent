@@ -277,6 +277,13 @@ _CHILD_DELIVERY_CONCURRENCY = 8
 _CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
 # Upper bound on draining queued child events at forwarder shutdown.
 _CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS = 10.0
+_ChildModelSource = Literal["requested", "snapshot", "started"]
+# Weakest first: a weaker source never replaces a child model from a stronger one.
+_CHILD_MODEL_SOURCE_RANK: dict[_ChildModelSource, int] = {
+    "requested": 0,
+    "snapshot": 1,
+    "started": 2,
+}
 # Bounds the inline Codex reads that link an unregistered thread to the parent.
 _CODEX_THREAD_LINEAGE_READ_TIMEOUT_SECONDS = 5.0
 _CODEX_THREAD_LINEAGE_MAX_DEPTH = 4
@@ -630,6 +637,8 @@ class _CodexForwarderState:
     :param child_models: Model each Codex child thread runs, keyed by child
         thread id, e.g. ``{"thread_child": "gpt-5.5"}``. A child absent here is
         assumed to run the parent's ``model``.
+    :param child_model_sources: Where each entry in ``child_models`` came from:
+        ``"requested"``, ``"snapshot"`` or ``"started"``.
     :param lineage_checked_threads: Unregistered Codex thread ids already
         checked for descent from the forwarder's thread this connection, so
         each costs at most one lineage lookup.
@@ -756,6 +765,7 @@ class _CodexForwarderState:
     subscribed_child_threads: set[str] = field(default_factory=set)
     child_turn_status_by_thread: dict[str, str] = field(default_factory=dict)
     child_models: dict[str, str] = field(default_factory=dict)
+    child_model_sources: dict[str, _ChildModelSource] = field(default_factory=dict)
     lineage_checked_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     child_delivery_slots: asyncio.Semaphore = field(
@@ -989,24 +999,34 @@ class _CodexForwarderState:
         self.subagents_by_thread[thread_id] = session_id
         self.pending_child_threads.pop(thread_id, None)
 
-    def note_child_model(self, thread_id: str, model: object, *, requested: bool = False) -> None:
+    def note_child_model(
+        self, thread_id: str, model: object, *, source: _ChildModelSource
+    ) -> None:
         """
         Record the model a Codex child thread runs.
 
         :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
-        :param model: Model the child's own thread reports, or the one its
-            spawn requested, e.g. ``"gpt-5.5"``. Non-string or empty values
-            are ignored.
-        :param requested: Whether ``model`` is only the spawn request, which
-            never replaces a model the child's thread reported.
+        :param model: Model from ``source``, e.g. ``"gpt-5.5"``. Non-string or
+            empty values are ignored.
+        :param source: ``"started"`` for the child's ``thread/started``,
+            ``"snapshot"`` for a ``thread/resume`` or ``thread/read`` result, or
+            ``"requested"`` for its spawn item. A weaker source never replaces
+            the model, and no source replaces one a live
+            ``thread/settings/updated`` set.
         :returns: None.
         """
         if not isinstance(model, str) or not model:
             return
-        if requested and thread_id in self.child_models:
+        recorded = self.child_model_sources.get(thread_id)
+        if recorded is not None and (
+            _CHILD_MODEL_SOURCE_RANK[source] < _CHILD_MODEL_SOURCE_RANK[recorded]
+        ):
+            return
+        stream = self.child_streams.get(thread_id)
+        if stream is not None and stream.state.settings_model:
             return
         self.child_models[thread_id] = model
-        stream = self.child_streams.get(thread_id)
+        self.child_model_sources[thread_id] = source
         if stream is not None:
             stream.state.model = model
 
@@ -4132,7 +4152,9 @@ async def _handle_event(
                 child_thread_id,
                 _parent_thread_id_from_started_event(event),
             )
-            forwarder_state.note_child_model(child_thread_id, params["thread"].get("model"))
+            forwarder_state.note_child_model(
+                child_thread_id, params["thread"].get("model"), source="started"
+            )
             _queue_child_model_sync(client, forwarder_state, child_thread_id)
         return
     if method == _CODEX_MCP_STARTUP_STATUS_METHOD:
@@ -7852,7 +7874,7 @@ async def _handle_collab_item(
         return
     parent_thread_id = _collab_parent_thread_id(params, item)
     for child_thread_id in _collab_receiver_thread_ids(item):
-        forwarder_state.note_child_model(child_thread_id, item.get("model"), requested=True)
+        forwarder_state.note_child_model(child_thread_id, item.get("model"), source="requested")
         await _ensure_child_session(
             client,
             parent_session_id=parent_session_id,
@@ -8116,7 +8138,7 @@ async def _reattach_descendant_thread(
     # mirrored any other thread's, and replaying it inline would stall the parent.
     announced = thread_id in forwarder_state.pending_child_threads
     forwarder_state.note_child_thread(thread_id, child_session_id)
-    forwarder_state.note_child_model(thread_id, thread.get("model"))
+    forwarder_state.note_child_model(thread_id, thread.get("model"), source="snapshot")
     _queue_child_model_sync(client, forwarder_state, thread_id)
     if not announced:
         forwarder_state.note_child_thread_subscribed(thread_id)
@@ -8358,7 +8380,9 @@ async def _apply_child_resume(
     if isinstance(result, dict):
         thread = result.get("thread")
         thread_model = thread.get("model") if isinstance(thread, dict) else None
-        forwarder_state.note_child_model(child_thread_id, thread_model or result.get("model"))
+        forwarder_state.note_child_model(
+            child_thread_id, thread_model or result.get("model"), source="snapshot"
+        )
     # Seed the child's model so replayed child token usage is priced into the
     # child's total_cost_usd — see _SessionUsageCoalescer.
     usage_coalescer = _SessionUsageCoalescer(
