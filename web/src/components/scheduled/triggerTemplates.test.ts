@@ -852,8 +852,13 @@ describe("Slack thread replies", () => {
     expect(prompt).toContain(
       `Drop a thread whose through is more than ${FOLLOWED_SLACK_THREAD_HOURS} hours before the time you noted, then keep at most the ${MAX_FOLLOWED_SLACK_THREADS} with the newest through.`,
     );
+    // A reply posted during a run waits for the next run instead of moving through past it.
     expect(prompt).toContain(
-      "conversations.replies with the channel ID, ts set to the thread ts, oldest set to its through, inclusive false",
+      "read the replies posted in it after its through and by the time you noted, for example with conversations.replies with the channel ID, ts set to the thread ts, oldest set to its through, latest set to the time you noted as a Unix timestamp, inclusive false",
+    );
+    expect(prompt).toContain("replies posted after the time you noted (the next run reads them)");
+    expect(prompt).toContain(
+      "If a read fails or you can't read every page of a thread, keep its through and send nothing for it in this run, so the next run reads it again.",
     );
     // A worker's own thread posts (bot replies, or the owner's account with the attribution
     // line) must not come back to it as new replies.
@@ -886,7 +891,7 @@ describe("Slack thread replies", () => {
     // Dedupe: an accepted or uncertain send, or a thread whose new replies were all left out,
     // moves the thread past those replies for good.
     expect(prompt).toContain(
-      "Once a send is accepted, or when you left out every new reply in a thread, set the thread's through to the ts of the newest reply you read in it, so no reply is read twice.",
+      "Once a send is accepted, or when you left out every new reply in a thread, set the thread's through to the ts of the newest reply you read in it that was posted by the time you noted, so no reply is read twice and none posted later is skipped.",
     );
     expect(prompt).toContain(
       "If a send times out or its result is unclear, don't retry it: set the thread's through as for an accepted send, so those replies are never sent twice, say in your reply that they may not have reached that session",
