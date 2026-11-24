@@ -427,6 +427,14 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
 
 ## Gotchas
 
+- `omnigent session send --wait` reads a native terminal session's reply from the
+  transcript the terminal mirrors, and the session gives no signal that a turn's
+  transcript is complete. The terminal can report idle before its last items
+  arrive, and it retries a failed transcript post for up to 30s. A mirror more than
+  the 2s settle behind can therefore end the wait on an earlier progress message, or
+  with no reply. `omnigent session read` shows the final reply once it's mirrored.
+  SDK sessions write their items before they report idle.
+
 - "Created by" records origin only: workers remain independent and have their own
   permissions and lifecycle. Sharing a worker does not share its creator; only
   the opaque creator ID remains in worker metadata, never the creator's title.

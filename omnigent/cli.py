@@ -8269,6 +8269,11 @@ def session_send(
     one prints nothing and says so on stderr. It stops early when the turn fails,
     exiting 1, or when the session waits for an approval or an answer.
 
+    A native terminal session (Claude Code, Codex) mirrors its transcript and
+    gives no sign that a turn's transcript is complete. If the mirror falls more
+    than a couple of seconds behind the turn's end, --wait can return before the
+    final reply arrives; `session read` shows it once mirrored.
+
     \b
     Examples:
       omnigent session send conv_abc123 -m "Now add a test"
