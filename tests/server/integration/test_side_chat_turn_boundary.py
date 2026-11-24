@@ -206,6 +206,24 @@ async def test_side_chat_leaves_out_a_request_mirrored_before_its_running_edge(
     assert await _side_chat_history(client, native_session) == [_CODENAME, _NOTED]
 
 
+async def test_side_chat_keeps_the_exchange_before_a_follow_up_that_starts_the_next_turn(
+    client: httpx.AsyncClient, native_session: str
+) -> None:
+    """A message sent during a turn that ended before the agent took it up starts the next turn."""
+    await _exchange(client, native_session)
+    await _send(client, native_session, "Run the long command")
+    await _status(client, native_session, "running")
+    await _mirror(client, native_session, "user", "Run the long command", "claude_turn_2")
+    await _mirror(client, native_session, "assistant", "Done running it", "claude_turn_2")
+    await _send(client, native_session, "Also check the parser")
+    await _status(client, native_session, "idle")
+    # Its running edge reaches the server before its transcript does.
+    await _status(client, native_session, "running")
+
+    history = await _side_chat_history(client, native_session)
+    assert history == [_CODENAME, _NOTED, "Run the long command", "Done running it"]
+
+
 @pytest.mark.parametrize("turn_end", ["idle", "waiting_on_background_agents"])
 async def test_side_chat_keeps_the_exchange_before_a_task_notification_turn(
     client: httpx.AsyncClient, native_session: str, turn_end: str
