@@ -844,8 +844,9 @@ describe("Slack thread replies", () => {
     expect(prompt).toContain(
       `The reply you read your check time from, when it has a "Slack threads:" line, lists those threads as one-line JSON: each key is "<channel ID> <thread ts>"`,
     );
+    // A session an earlier run started without recording it still gets its thread followed.
     expect(prompt).toContain(
-      "Add the thread of each message this run started a session for with its task delivered, with session set to that session's conversation_id and through set to the message's own ts",
+      "Add the thread of each message this run started a session for with its task delivered, or that you found an earlier run started one for without recording it in its reply, with session set to that session's conversation_id and through set to the message's own ts",
     );
     // Re-adding a followed thread mustn't rewind it and send its replies again.
     expect(prompt).toContain("a thread you already follow keeps its through.");
@@ -853,10 +854,14 @@ describe("Slack thread replies", () => {
     // before a thread would expire still reaches its session.
     const cap = `Follow at most the ${MAX_FOLLOWED_SLACK_THREADS} with the newest through.`;
     const read = "For each thread you follow, read the replies posted in it";
-    const expire = `Then stop following each thread you read in this run whose through is still more than ${FOLLOWED_SLACK_THREAD_HOURS} hours before the time you noted`;
+    const expire = `Then stop following each thread whose read in this run was complete and found nothing posted in it in the ${FOLLOWED_SLACK_THREAD_HOURS} hours before the time you noted, and whose through is older than that too`;
     for (const rule of [cap, read, expire]) expect(prompt).toContain(rule);
     expect(prompt.indexOf(cap)).toBeLessThan(prompt.indexOf(read));
     expect(prompt.indexOf(read)).toBeLessThan(prompt.indexOf(expire));
+    // A deferred lookup or refused send leaves through old, so expiry mustn't drop that thread.
+    expect(prompt).toContain(
+      "a thread with a reply you deferred or couldn't send keeps being followed.",
+    );
     // A reply posted during a run waits for the next run instead of moving through past it.
     expect(prompt).toContain(
       "read the replies posted in it after its through and by the time you noted, for example with conversations.replies with the channel ID, ts set to the thread ts, oldest set to its through, latest set to the time you noted as a Unix timestamp, inclusive false",
@@ -921,8 +926,9 @@ describe("Slack thread replies", () => {
 
   it("sends a task session's thread replies there with its instructions", () => {
     const prompt = renderTriggerPrompt("slack", channel(), { ...CTX, taskSessionMode: "continue" });
+    // A delivery an earlier run made without recording it still gets its thread followed.
     expect(prompt).toContain(
-      "Add the thread of each message this run sent to your task session, with session set to the task session it went to",
+      "Add the thread of each message this run sent to your task session, or that you found an earlier run sent there without recording it, with session set to the task session it went to",
     );
     expect(prompt).toContain(
       'a sentence saying that this is the task session of a Slack automation and that someone replied in the thread of a Slack message it was sent earlier, titled "Slack <channel> <thread ts>", then the instructions below',
