@@ -1164,11 +1164,7 @@ function SideChatComposer({
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
   const sendContext: ComposerSendContext = {
-    mentions: composerInlineMentions(
-      sharedTags?.files ?? [],
-      sharedTags?.sessions ?? [],
-      harness ?? null,
-    ),
+    mentions: composerInlineMentions(sharedTags ?? { files: [], sessions: [] }, harness ?? null),
     reviewComments,
   };
   const addFiles = (incoming: File[]) => {

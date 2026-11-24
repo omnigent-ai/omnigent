@@ -383,3 +383,14 @@ describe("useComposerAttachments", () => {
     expect(result.current.files.map((f) => f.name)).toEqual(["notes.txt"]);
   });
 });
+
+describe("pasting into a textarea that is still mounted during an engine handoff", () => {
+  it("attaches the file to the tray even when chips are requested", () => {
+    const onPasteChips = vi.fn(() => []);
+    const { result } = renderHook(() => useComposerAttachments({ onPasteChips }));
+    const shot = pngFile();
+    act(() => result.current.onPaste(pasteEvent({ files: [shot] }).event));
+    expect(onPasteChips).not.toHaveBeenCalled();
+    expect(result.current.files).toEqual([shot]);
+  });
+});
