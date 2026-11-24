@@ -1023,8 +1023,9 @@ async def test_review_conversation_reads_follow_file_sharing(
 )
 @pytest.mark.parametrize(
     "caller,expected",
-    [("owner@example.com", 200), ("viewer@example.com", 403)],
-    ids=["edit-allowed", "read-denied"],
+    # owner@example.com holds an edit grant; only the owner grant changes a pull request.
+    [("real-owner@example.com", 200), ("owner@example.com", 403), ("viewer@example.com", 403)],
+    ids=["owner-allowed", "edit-denied", "read-denied"],
 )
 async def test_pr_edit_routes_require_edit(
     client: httpx.AsyncClient,
@@ -1034,7 +1035,7 @@ async def test_pr_edit_routes_require_edit(
     path: str,
     added: object,
 ) -> None:
-    """PR label and reviewer routes act as the host's account, so viewers are refused."""
+    """PR label and reviewer routes act as the host's account, so only the owner reaches it."""
     headers = {"X-Forwarded-Email": caller}
     listed = await client.get(path, params={"pr_url": _LABELS_PR_URL}, headers=headers)
     edited = await client.post(
@@ -1069,8 +1070,9 @@ _ATTACHMENTS_PATH = "/v1/sessions/conv_share/resources/github/attachments"
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "caller,expected",
-    [("owner@example.com", 200), ("viewer@example.com", 403)],
-    ids=["edit-allowed", "read-denied"],
+    # owner@example.com holds an edit grant; only the owner grant changes a pull request.
+    [("real-owner@example.com", 200), ("owner@example.com", 403), ("viewer@example.com", 403)],
+    ids=["owner-allowed", "edit-denied", "read-denied"],
 )
 async def test_pr_merge_routes_require_edit(
     client: httpx.AsyncClient,
@@ -1078,7 +1080,7 @@ async def test_pr_merge_routes_require_edit(
     caller: str,
     expected: int,
 ) -> None:
-    """Merging acts with the host's account, so viewers are refused before the runner."""
+    """Merging acts with the host's account, so only the owner reaches the runner."""
     headers = {"X-Forwarded-Email": caller}
     options = await client.get(
         _MERGE_OPTIONS_PATH, params={"pr_url": _LABELS_PR_URL}, headers=headers
@@ -1109,8 +1111,9 @@ async def test_pr_merge_routes_require_edit(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "caller,expected",
-    [("owner@example.com", 200), ("viewer@example.com", 403)],
-    ids=["edit-allowed", "read-denied"],
+    # owner@example.com holds an edit grant; only the owner grant changes a pull request.
+    [("real-owner@example.com", 200), ("owner@example.com", 403), ("viewer@example.com", 403)],
+    ids=["owner-allowed", "edit-denied", "read-denied"],
 )
 @pytest.mark.parametrize("resource", ["details", "comment", "reply", "thread"])
 async def test_pr_details_route_requires_edit(
@@ -1120,7 +1123,7 @@ async def test_pr_details_route_requires_edit(
     expected: int,
     resource: str,
 ) -> None:
-    """Writing PR text acts as the host's account, so viewers are refused."""
+    """Writing PR text acts as the host's account, so only the owner may."""
     comment = resource != "details"
     path = {
         "details": _DETAILS_PATH,
@@ -1195,7 +1198,7 @@ async def test_pr_edit_requires_a_json_body(
     resp = await client.post(
         path,
         content=json.dumps(body),
-        headers={"X-Forwarded-Email": "owner@example.com", "Content-Type": "text/plain"},
+        headers={"X-Forwarded-Email": "real-owner@example.com", "Content-Type": "text/plain"},
     )
 
     assert resp.status_code == 415, resp.text
