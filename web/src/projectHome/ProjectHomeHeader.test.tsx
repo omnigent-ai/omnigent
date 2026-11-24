@@ -211,7 +211,7 @@ describe("ProjectHomeTitle", () => {
       "/projects/Billing%20%26%20Payments/orchestrator",
     );
     expect(within(actions).getByRole("button", { name: "Connect source" })).toBeVisible();
-    expect(within(actions).getByRole("button", { name: "New session" })).toBeVisible();
+    expect(within(actions).queryByRole("button", { name: "New session" })).toBeNull();
     expect(within(actions).getByRole("link", { name: "New ticket" })).toBeVisible();
   });
 
@@ -221,7 +221,7 @@ describe("ProjectHomeTitle", () => {
     const header = screen.getByRole("banner");
     expect(screen.queryByRole("tablist")).toBeNull();
     expect(within(header).getByRole("link", { name: "Lead" })).toBeVisible();
-    expect(within(header).getByRole("button", { name: "New session" })).toBeVisible();
+    expect(within(header).queryByRole("button", { name: "New session" })).toBeNull();
     expect(within(header).getByRole("link", { name: "New ticket" })).toBeVisible();
     expect(
       within(header).getByRole("button", { name: "Project actions for Billing & Payments" }),
@@ -266,7 +266,12 @@ describe("ProjectHomeTitle", () => {
     renderNavigation();
     const trigger = screen.getByRole("button", { name: "Project actions for Billing & Payments" });
     await user.click(trigger);
-    expect(screen.getAllByRole("menuitem")).toHaveLength(3);
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "New session",
+      "Edit stages",
+      "Rename project",
+      "Delete project",
+    ]);
     await user.click(screen.getByRole("menuitem", { name: "Edit stages" }));
     expect(
       screen.getByRole("dialog", { name: "Edit Billing & Payments stages" }),
@@ -354,28 +359,28 @@ describe("ProjectBoardSearch", () => {
 });
 
 describe("ProjectNewSessionButton", () => {
-  it("keeps ticket actions simple and sends New session to the full project composer", () => {
+  it("makes New ticket the board's primary action and moves New session to the project menu", () => {
     renderNavigation();
     expect(screen.getByRole("link", { name: "Lead" })).toHaveAttribute(
       "href",
       "/projects/Billing%20%26%20Payments/orchestrator",
     );
-    expect(screen.getByRole("link", { name: "New ticket" })).toHaveAttribute(
+    const newTicket = screen.getByRole("link", { name: "New ticket" });
+    expect(newTicket).toHaveAttribute(
       "href",
       "/projects/Billing%20%26%20Payments?view=board&ticket=new",
     );
     expect(screen.queryByRole("searchbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
-    const button = screen.getByRole("button", { name: "New session" });
+    expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
     const source = screen.getByRole("button", { name: "Connect source" });
     expect(source).toHaveAttribute("data-project-id", "project-2");
     expect(source).toHaveAttribute("data-project-name", "Billing & Payments");
-    expect(button.previousElementSibling).toContainElement(source);
-    expect(
+    fireEvent.pointerDown(
       screen.getByRole("button", { name: "Project actions for Billing & Payments" }),
-    ).toBeVisible();
-    expect(button).not.toHaveAttribute("aria-expanded");
-    fireEvent.click(button);
+      { button: 0 },
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "New session" }));
     expect(screen.getByTestId("location")).toHaveTextContent(
       /^\/\?project=Billing%20%26%20Payments$/,
     );
@@ -387,7 +392,7 @@ describe("ProjectNewSessionButton", () => {
     mocks.projectsError = state === "failed" ? new Error("Projects unavailable") : null;
     renderNavigation();
     expect(screen.queryByRole("button", { name: "Connect source" })).toBeNull();
-    expect(screen.getByRole("button", { name: "New session" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "New ticket" })).toBeInTheDocument();
   });
 
   it("gates stage editing on the server capability", () => {

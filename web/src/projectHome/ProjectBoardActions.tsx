@@ -1,4 +1,3 @@
-import type { ReactNode } from "react";
 import { MessageSquareIcon, PlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -10,13 +9,7 @@ import { projectOrchestratorPath, ticketPanelSearch } from "./projectHomeNavigat
 import { useProjectRecord } from "./useProjectAgentSession";
 import { useTicketProject } from "./useProjectTickets";
 
-export function ProjectBoardActions({
-  projectName,
-  children,
-}: {
-  projectName: string;
-  children: ReactNode;
-}) {
+export function ProjectBoardActions({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
   const [search] = useSearchParams();
   const { projectId, projects } = useTicketProject(projectName);
@@ -38,7 +31,6 @@ export function ProjectBoardActions({
         <ProjectTicketSources projectId={projectId} projectName={projectName} />
       )}
       {!projects.isLoading && !projects.isError && <ProjectFiles projectId={projectId} />}
-      {children}
       <Button asChild size={isMobile ? "icon" : "default"}>
         <Link to={ticketPanelSearch("new", search)} aria-label="New ticket">
           <PlusIcon />

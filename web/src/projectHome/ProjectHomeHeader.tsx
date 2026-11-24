@@ -101,9 +101,8 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
   return (
     <>
       {tickets ? (
-        <ProjectBoardActions projectName={projectName}>
-          <ProjectNewSessionButton projectName={projectName} />
-        </ProjectBoardActions>
+        // New ticket is the board's one primary action; New session lives in the project menu.
+        <ProjectBoardActions projectName={projectName} />
       ) : (
         <>
           <ProjectBoardSearch />
@@ -118,6 +117,7 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
 /** Project settings, plus an overflow menu to rename or delete the project. */
 function ProjectHomeActions({ projectName }: { projectName: string }) {
   const stagesEnabled = useTicketStagesEnabled();
+  const tickets = useProjectTicketsEnabled();
   const info = useServerInfo();
   const mandateEnabled = info !== "loading" && info.project_mandate === true;
   const [editingStages, setEditingStages] = useState(false);
@@ -198,6 +198,19 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
           }}
         >
           {isMobile && <SessionMenuHeader title={projectName} />}
+          {tickets && (
+            <>
+              <DropdownMenuItem
+                className={itemClass}
+                data-testid="project-menu-new-session"
+                onSelect={() => navigate(projectNewSessionPath(projectName))}
+              >
+                <MessageCirclePlusIcon className="size-3.5" />
+                New session
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
           {stagesEnabled && (
             <DropdownMenuItem className={itemClass} onSelect={() => setEditingStages(true)}>
               <Columns3Icon className="size-3.5" />
@@ -334,6 +347,10 @@ export function ProjectBoardSearch() {
   );
 }
 
+function projectNewSessionPath(projectName: string) {
+  return `/?project=${encodeURIComponent(projectName)}`;
+}
+
 /** Ticket boards and phones use the full project composer; desktop session boards keep it floating. */
 export function ProjectNewSessionButton({
   projectName,
@@ -345,7 +362,7 @@ export function ProjectNewSessionButton({
   const isMobile = useIsMobileViewport();
   const tickets = useProjectTicketsEnabled();
   const navigate = useNavigate();
-  const newSessionPath = `/?project=${encodeURIComponent(projectName)}`;
+  const newSessionPath = projectNewSessionPath(projectName);
   const open = useProjectComposerStore((state) => state.open);
   const setOpen = useProjectComposerStore((state) => state.setOpen);
   if (isMobile || compact) {
