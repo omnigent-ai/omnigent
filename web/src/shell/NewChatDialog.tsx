@@ -95,6 +95,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   GitBranchIcon,
+  ClipboardListIcon,
   FileTextIcon,
   FolderGit2Icon,
   FolderIcon,
@@ -7155,6 +7156,21 @@ function NewChatLandingContent({
     />
   );
 
+  const taskChip = workTask ? (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      className="h-6 min-w-0 max-w-[min(16rem,45%)] shrink gap-1.5 rounded-full border-border bg-background/70 px-2.5 text-xs text-muted-foreground hover:text-foreground"
+      aria-label={`Task: ${workTask.title}`}
+      title={`Task: ${workTask.title}`}
+      onClick={() => navigate(`/work-tasks/${workTask.id}`)}
+    >
+      <ClipboardListIcon className="size-3.5" aria-hidden="true" />
+      <span className="truncate">{workTask.title}</span>
+    </Button>
+  ) : null;
+
   const workspaceControls = (
     <NewChatWorkspaceControls>
       {/* Keep the tray mounted while the execution target changes. */}
@@ -7165,6 +7181,7 @@ function NewChatLandingContent({
           data-testid="new-chat-landing-workspace-controls"
           trailingContent={mcpRegistryPicker}
         >
+          {taskChip}
           {/* Sandbox repository chip — the sandbox counterpart of the
         working-directory chip. There is no filesystem to browse
         before the sandbox exists, so the workspace is specified as
@@ -7269,6 +7286,7 @@ function NewChatLandingContent({
           data-testid="new-chat-landing-workspace-controls"
           trailingContent={mcpRegistryPicker}
         >
+          {taskChip}
           {workspaceLoading && cachedWorkspace === null && (
             <NewChatPickerLoading
               label="Loading working directory"
@@ -7565,15 +7583,6 @@ function NewChatLandingContent({
           /* On phones the heading yields its height first, so a long draft cannot
             push Send below the keyboard. */
           <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 max-md:min-h-0 max-md:overflow-hidden md:flex-none">
-            {workTask && (
-              <Button
-                variant="outline"
-                className="max-w-full"
-                onClick={() => navigate(`/work-tasks/${workTask.id}`)}
-              >
-                <span className="truncate">Task: {workTask.title}</span>
-              </Button>
-            )}
             {siblingSourceId ? (
               <div aria-hidden="true" className="flex h-16 shrink-0 items-center">
                 <span className="flex size-14 items-center justify-center rounded-xl bg-tag-pink">

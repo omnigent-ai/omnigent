@@ -133,6 +133,7 @@ def test_personal_views_roundtrip_and_owner_workspace_isolation(db_uri: str) -> 
             lambda: store.save_view(definition, "bob", saved["id"]),
             lambda: store.delete_view(saved["id"], "bob"),
             lambda: store.get_task(task["id"], "bob"),
+            lambda: store.delete_task(task["id"], "bob"),
             lambda: store.save_task(SaveWorkTask(title="Changed"), "bob", task["id"]),
             lambda: store.query(ViewQuery(cursor=task["id"]), "bob"),
             lambda: store.list_views("bob", saved["id"]),
@@ -144,6 +145,34 @@ def test_personal_views_roundtrip_and_owner_workspace_isolation(db_uri: str) -> 
         assert store.list_views("alice")["data"] == []
         with pytest.raises(OmnigentError):
             store.get_task(task["id"], "alice")
+        with pytest.raises(OmnigentError):
+            store.delete_task(task["id"], "alice")
+    with workspace_scope(101):
+        assert store.get_task(task["id"], "alice")["title"] == "Private"
+
+
+@pytest.mark.parametrize("session_count", [0, 2])
+def test_delete_task_releases_only_its_session_links(db_uri: str, session_count: int) -> None:
+    store = WorkViewStore(db_uri)
+    task = store.save_task(SaveWorkTask(title="Delete me"), None)
+    retained = store.save_task(SaveWorkTask(title="Keep me"), None)
+    retained_link = LinkWorkSession(session_id=uuid.uuid4().hex)
+    store.link_session(retained["id"], retained_link, None)
+    links = [LinkWorkSession(session_id=uuid.uuid4().hex) for _ in range(session_count)]
+    for link in links:
+        store.link_session(task["id"], link, None)
+
+    store.delete_task(task["id"], None)
+
+    for operation in (store.get_task, store.delete_task):
+        with pytest.raises(OmnigentError) as exc:
+            operation(task["id"], None)
+        assert exc.value.code == ErrorCode.NOT_FOUND
+    assert [row["id"] for row in store.query(ViewQuery(), None)["data"]] == [retained["id"]]
+    assert store.get_task(retained["id"], None)["sessions"] == [retained_link.model_dump()]
+    for link in links:
+        store.link_session(retained["id"], link, None)
+    assert len(store.get_task(retained["id"], None)["sessions"]) == session_count + 1
 
 
 def test_task_session_one_to_many_and_explicit_reassignment(db_uri: str) -> None:

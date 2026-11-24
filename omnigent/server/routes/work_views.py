@@ -192,6 +192,11 @@ def create_work_views_router(
     ) -> dict[str, Any]:
         return await asyncio.to_thread(store.save_task, body, await writer(request), task_id)
 
+    @router.delete("/work-tasks/{task_id}")
+    async def delete_task(request: Request, task_id: RecordId) -> dict[str, bool]:
+        await asyncio.to_thread(store.delete_task, task_id, await writer(request))
+        return {"deleted": True}
+
     @router.post("/work-tasks/{task_id}/sessions")
     async def link_session(
         request: Request, task_id: RecordId, body: LinkWorkSession

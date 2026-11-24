@@ -150,6 +150,8 @@ export const saveWorkTask = (body: WorkTaskInput, id?: string) =>
     id ? "PUT" : "POST",
     body,
   );
+export const deleteWorkTask = (id: string) =>
+  request<{ deleted: boolean }>(`work-tasks/${encodeURIComponent(id)}`, "DELETE");
 export const linkWorkSession = (taskId: string, sessionId: string, involvement: string) =>
   request<{ linked: boolean }>(`work-tasks/${encodeURIComponent(taskId)}/sessions`, "POST", {
     session_id: sessionId,

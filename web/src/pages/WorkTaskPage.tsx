@@ -1,14 +1,21 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { ChevronRightIcon, PencilIcon } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronRightIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects } from "@/hooks/useConversations";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import { Link, useNavigate, useParams } from "@/lib/routing";
-import { getWorkTask } from "@/lib/workViewsApi";
+import { deleteWorkTask, getWorkTask } from "@/lib/workViewsApi";
 import { PRIORITIES, statusLabel } from "@/views/viewPresentation";
 import { StatusIcon } from "@/views/ViewResults";
 import { TaskSessions, WorkTaskForm } from "@/views/WorkTaskEditor";
@@ -31,7 +38,9 @@ export function WorkTaskPage() {
 
 function TaskDetail({ taskId }: { taskId: string }) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const projects = useProjects();
   const projectOptions = (projects.data ?? []).flatMap((project) =>
     project.id ? [{ id: project.id, name: project.name }] : [],
@@ -42,6 +51,14 @@ function TaskDetail({ taskId }: { taskId: string }) {
     refetchOnMount: "always",
   });
   const task = query.data;
+  const remove = useMutation({
+    mutationFn: () => deleteWorkTask(taskId),
+    onSuccess: () => {
+      queryClient.removeQueries({ queryKey: ["work-task", taskId], exact: true });
+      void queryClient.invalidateQueries({ queryKey: ["view-results", "tasks"] });
+      navigate("/work-tasks", { replace: true });
+    },
+  });
   return (
     <div className="space-y-8 pb-8">
       <nav aria-label="Task breadcrumb" className="flex items-center gap-2 text-sm">
@@ -66,13 +83,23 @@ function TaskDetail({ taskId }: { taskId: string }) {
           )}
           {task && (
             <>
-              <header className="flex items-start justify-between gap-4">
+              <header className="flex flex-col items-start justify-between gap-4 sm:flex-row">
                 <h1 className="min-w-0 break-words text-2xl font-semibold">{task.title}</h1>
                 {!editing && (
-                  <Button variant="outline" onClick={() => setEditing(true)}>
-                    <PencilIcon />
-                    Edit task
-                  </Button>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <Button variant="outline" onClick={() => setEditing(true)}>
+                      <PencilIcon />
+                      Edit task
+                    </Button>
+                    <Button
+                      variant="outline"
+                      className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                      onClick={() => setDeleting(true)}
+                    >
+                      <Trash2Icon />
+                      Delete task
+                    </Button>
+                  </div>
                 )}
               </header>
               {editing ? (
@@ -124,6 +151,48 @@ function TaskDetail({ taskId }: { taskId: string }) {
                   Couldn’t load projects. {projects.error.message}
                 </p>
               )}
+              <Dialog
+                open={deleting}
+                onOpenChange={(open) => {
+                  if (remove.isPending) return;
+                  setDeleting(open);
+                  if (!open) remove.reset();
+                }}
+              >
+                <DialogContent showCloseButton={!remove.isPending}>
+                  <DialogHeader>
+                    <DialogTitle>Delete task?</DialogTitle>
+                    <DialogDescription className="break-words">
+                      “{task.title}” will be permanently deleted. Linked sessions will be kept and
+                      unlinked from this task. This cannot be undone.
+                    </DialogDescription>
+                  </DialogHeader>
+                  {remove.error && (
+                    <p role="alert" className="text-sm text-destructive">
+                      Couldn’t delete this task. {remove.error.message}
+                    </p>
+                  )}
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      variant="ghost"
+                      disabled={remove.isPending}
+                      onClick={() => {
+                        setDeleting(false);
+                        remove.reset();
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      disabled={remove.isPending}
+                      onClick={() => remove.mutate()}
+                    >
+                      {remove.isPending ? "Deleting…" : "Delete task"}
+                    </Button>
+                  </div>
+                </DialogContent>
+              </Dialog>
             </>
           )}
         </>

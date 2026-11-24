@@ -27,6 +27,7 @@ vi.mock("@/lib/workViewsApi", async (original) => ({
   queryWorkView: vi.fn(),
   getWorkTask: vi.fn(),
   saveWorkTask: vi.fn(),
+  deleteWorkTask: vi.fn(),
   linkWorkSession: vi.fn(),
   unlinkWorkSession: vi.fn(),
 }));
@@ -132,6 +133,7 @@ beforeEach(() => {
     return { linked: false };
   });
   vi.mocked(api.deleteWorkView).mockResolvedValue({ deleted: true });
+  vi.mocked(api.deleteWorkTask).mockResolvedValue({ deleted: true });
 });
 afterEach(cleanup);
 
@@ -553,6 +555,73 @@ it.each(["/views/new?task=new", "/views/saved?task=new"])(
     );
   },
 );
+
+it.each(["/work-tasks", "/views/saved"])(
+  "confirms task deletion from %s and refreshes the Tasks list",
+  async (path) => {
+    let finishDelete!: (result: { deleted: boolean }) => void;
+    vi.mocked(api.deleteWorkTask).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishDelete = resolve;
+        }),
+    );
+    const user = userEvent.setup();
+    const { client } = renderPage(path);
+    await user.click(await screen.findByRole("button", { name: /Ship release/ }));
+    await user.click(await screen.findByRole("button", { name: "Delete task" }));
+    let confirmation = screen.getByRole("dialog", { name: "Delete task?" });
+    expect(confirmation).toHaveTextContent("Ship release");
+    expect(confirmation).toHaveTextContent("Linked sessions will be kept");
+    expect(api.deleteWorkTask).not.toHaveBeenCalled();
+    await user.click(within(confirmation).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(api.deleteWorkTask).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Delete task" }));
+    confirmation = screen.getByRole("dialog", { name: "Delete task?" });
+    await user.click(within(confirmation).getByRole("button", { name: "Delete task" }));
+    expect(api.deleteWorkTask).toHaveBeenCalledExactlyOnceWith(task.id);
+    expect(within(confirmation).getByRole("button", { name: "Deleting…" })).toBeDisabled();
+    expect(within(confirmation).getByRole("button", { name: "Cancel" })).toBeDisabled();
+    await user.keyboard("{Escape}");
+    expect(confirmation).toBeInTheDocument();
+    vi.mocked(api.queryWorkView).mockResolvedValue({
+      data: [],
+      has_more: false,
+      next_cursor: null,
+    });
+    await act(async () => finishDelete({ deleted: true }));
+    expect(await screen.findByRole("heading", { name: "Tasks" })).toBeInTheDocument();
+    expect(await screen.findByText("No matching tasks")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Ship release/ })).not.toBeInTheDocument();
+    expect(client.getQueryData(["work-task", task.id])).toBeUndefined();
+  },
+);
+
+it("keeps the task after a failed deletion and allows retrying", async () => {
+  vi.mocked(api.deleteWorkTask).mockRejectedValueOnce(new Error("Connection lost"));
+  const user = userEvent.setup();
+  renderPage(`/work-tasks/${task.id}`);
+  await user.click(await screen.findByRole("button", { name: "Delete task" }));
+  const confirmation = screen.getByRole("dialog", { name: "Delete task?" });
+  await user.click(within(confirmation).getByRole("button", { name: "Delete task" }));
+  expect(await within(confirmation).findByRole("alert")).toHaveTextContent(
+    "Couldn’t delete this task. Connection lost",
+  );
+  expect(within(confirmation).getByRole("button", { name: "Delete task" })).toBeEnabled();
+  await user.click(within(confirmation).getByRole("button", { name: "Cancel" }));
+  expect(screen.getByRole("heading", { name: "Ship release" })).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Delete task" }));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  await user.click(
+    within(screen.getByRole("dialog", { name: "Delete task?" })).getByRole("button", {
+      name: "Delete task",
+    }),
+  );
+  expect(await screen.findByRole("heading", { name: "Tasks" })).toBeInTheDocument();
+  expect(api.deleteWorkTask).toHaveBeenCalledTimes(2);
+});
 
 it.each([null, "Release"])("starts a session with task context and project %s", async (project) => {
   task = {

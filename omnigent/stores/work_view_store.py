@@ -191,6 +191,20 @@ class WorkViewStore:
             ]
             return result
 
+    def delete_task(self, record_id: str, user_id: str | None) -> None:
+        def write(session: Session) -> None:
+            require_active_account(session, user_id)
+            task = _owned(session, SqlWorkTask, record_id, user_id, lock=True)
+            session.execute(
+                delete(SqlWorkTaskSession).where(
+                    SqlWorkTaskSession.workspace_id == current_workspace_id(),
+                    SqlWorkTaskSession.task_id == record_id,
+                )
+            )
+            session.delete(task)
+
+        run_write_transaction(self._write, "delete_task", write)
+
     def link_session(self, record_id: str, body: LinkWorkSession, user_id: str | None) -> None:
         def write(session: Session) -> None:
             require_active_account(session, user_id)

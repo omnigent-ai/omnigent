@@ -100,6 +100,29 @@ async def test_work_views_and_tasks_crud(project_client: httpx.AsyncClient, db_u
     retained = WorkViewStore(db_uri).get_task(task["id"], None)
     assert retained["sessions"] == []
     assert retained["status"] == "review"
+    kept_session = conversations.create_conversation(
+        title="Keep this session", agent_id="a" * 32, project_id=project["id"]
+    )
+    assert (
+        await client.post(
+            f"/v1/work-tasks/{task['id']}/sessions", json={"session_id": kept_session.id}
+        )
+    ).status_code == 200
+    deleted = await client.delete(f"/v1/work-tasks/{task['id']}")
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"deleted": True}
+    assert (await client.get(f"/v1/work-tasks/{task['id']}")).status_code == 404
+    assert (await client.delete(f"/v1/work-tasks/{task['id']}")).status_code == 404
+    assert (await client.post("/v1/work-views/query", json={})).json()["data"] == []
+    assert conversations.get_conversation(kept_session.id) == kept_session
+    assert (await client.get(f"/v1/projects/{project['id']}")).status_code == 200
+    replacement = (await client.post("/v1/work-tasks", json={"title": "Next task"})).json()
+    assert (
+        await client.post(
+            f"/v1/work-tasks/{replacement['id']}/sessions",
+            json={"session_id": kept_session.id},
+        )
+    ).status_code == 200
 
 
 async def test_work_views_personal_access_and_session_permissions(
@@ -130,10 +153,17 @@ async def test_work_views_personal_access_and_session_permissions(
     assert (
         await client.post(endpoint, json={"session_id": session.id}, headers=alice)
     ).status_code == 200
+    assert (await client.delete(f"/v1/work-tasks/{task['id']}", headers=bob)).status_code == 404
+    assert (
+        len((await client.get(f"/v1/work-tasks/{task['id']}", headers=alice)).json()["sessions"])
+        == 1
+    )
     permissions.revoke(ALICE, session.id)
     assert (await client.get(f"/v1/work-tasks/{task['id']}", headers=alice)).json()[
         "sessions"
     ] == []
+    assert (await client.delete(f"/v1/work-tasks/{task['id']}", headers=alice)).status_code == 200
+    assert conversations.get_conversation(session.id) is not None
 
 
 async def test_session_view_filters_and_continuation(
