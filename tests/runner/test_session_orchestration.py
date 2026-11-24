@@ -659,6 +659,8 @@ async def test_message_routing_lookup_and_keyless_delivery(outcome):
         "dashed",
         "legacy",
         "managed",
+        "lead",
+        "orchestrator",
         "invalid",
         "query",
         "fragment",
@@ -678,6 +680,9 @@ async def test_message_destination_accepts_supported_session_ids(spelling):
         "dashed": str(destination),
         "legacy": f"conv_{destination.hex}",
         "managed": "1234567890123456",
+        # The project's router, by name; the server resolves it for the sender.
+        "lead": "lead",
+        "orchestrator": " Orchestrator ",
         "invalid": "not-a-session-id",
         "query": f"{destination.hex}?unexpected",
         "fragment": f"{destination.hex}#unexpected",
@@ -706,14 +711,18 @@ async def test_message_destination_accepts_supported_session_ids(spelling):
                 conversation_id="manager",
             )
         )
-    if spelling in ("hex", "dashed", "legacy", "managed"):
+    if spelling in ("hex", "dashed", "legacy", "managed", "lead", "orchestrator"):
         assert result == {"queued": True}
-        expected_id = supplied if spelling == "managed" else destination.hex
+        expected_id = {"managed": supplied, "lead": "lead", "orchestrator": "orchestrator"}.get(
+            spelling, destination.hex
+        )
         assert [str(r.url) for r in requests] == [
             f"http://server/v1/sessions/{expected_id}/events"
         ]
     else:
-        assert result == {"error": "Provide a valid session_id (UUID or numeric managed ID)"}
+        assert result == {
+            "error": "Provide a valid session_id (UUID, numeric managed ID or `lead`)"
+        }
         assert requests == []
 
 
