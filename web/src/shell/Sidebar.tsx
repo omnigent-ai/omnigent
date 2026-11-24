@@ -26,7 +26,6 @@ import {
 import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
 import { offersAnyHarness, useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { useInertRef } from "@/hooks/useInertRef";
-import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
@@ -194,7 +193,6 @@ import {
   useProjectSessions,
   useMoveToProject,
   useMoveToNest,
-  useSessionSearch,
   useDeleteProject,
   useRenameProject,
   useProjectConfig,
@@ -257,9 +255,10 @@ import {
   navigateAfterArchiving,
   newSessionPathFor,
 } from "./sessionCommands/archiveNavigation";
-import { nestDestinations, nestLabel } from "./nestDestinations";
+import { nestLabel } from "./nestDestinations";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
+import { useNestDestinationSearch } from "./useNestDestinationSearch";
 import { useSessionActions } from "./useSessionActions";
 import {
   useBulkSessionPaletteCommands,
@@ -7938,22 +7937,14 @@ function NestPickerMenu({
   const nests = useContext(NestMoveContext)!;
   const viewerId = useContext(ViewerIdContext);
   const [search, setSearch] = useState("");
-  const query = useDebouncedValue(search.trim(), 300);
-  const result = useSessionSearch(query, "title", {
+  const result = useNestDestinationSearch({
+    conversation,
+    loaded: nests.destinations,
+    search,
     enabled: nests.canJoin,
-    includeArchived: false,
-    limit: 20,
+    viewerId,
   });
-  const destinations = nests.canJoin
-    ? nestDestinations({
-        conversation,
-        loaded: nests.destinations,
-        searchHits:
-          query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : [],
-        search,
-        viewerId,
-      })
-    : [];
+  const { destinations } = result;
   const select = (destination: Conversation | null) => {
     nests.move(conversation.id, destination);
     close();
@@ -7983,18 +7974,19 @@ function NestPickerMenu({
             {nestLabel(row)}
           </C.Item>
         ))}
-        {!destinations.length && !result.isFetching && query === search.trim() && (
+        {!destinations.length && !result.searching && result.settled && (
           <p className="px-2 py-2 text-sm text-muted-foreground">No other nests</p>
         )}
-        {result.isFetching && <p className="px-2 py-2 text-sm text-muted-foreground">Searching…</p>}
-        {(result.hasNextPage || result.isError) && (
+        {result.searching && <p className="px-2 py-2 text-sm text-muted-foreground">Searching…</p>}
+        {(result.hasMore || result.failed) && (
           <C.Item
             onSelect={(event) => {
               event.preventDefault();
-              void (result.isError ? result.refetch() : result.fetchNextPage());
+              if (result.failed) result.retry();
+              else result.showMore();
             }}
           >
-            {result.isError ? "Retry" : "Show more"}
+            {result.failed ? "Retry" : "Show more"}
           </C.Item>
         )}
       </div>

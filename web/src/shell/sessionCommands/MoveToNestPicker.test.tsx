@@ -8,16 +8,39 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 
 import { MoveToNestPicker } from "./MoveToNestPicker";
 
+// The server's title search: its pages, how many have loaded, and whether it has failed.
 const rows = vi.hoisted(() => ({
   loaded: [] as Conversation[],
-  searchHits: [] as Conversation[],
+  searchPages: [] as Conversation[][],
+  pagesLoaded: 1,
+  failing: false,
 }));
-vi.mock("@/hooks/useConversations", async (importOriginal) => ({
-  ...(await importOriginal<typeof ConversationsModule>()),
-  useSessionSearch: (query: string) => ({
-    data: query ? { pages: [{ data: rows.searchHits }] } : undefined,
-  }),
-}));
+vi.mock("@/hooks/useConversations", async (importOriginal) => {
+  const { useReducer } = await import("react");
+  return {
+    ...(await importOriginal<typeof ConversationsModule>()),
+    useSessionSearch: (query: string) => {
+      const [, rerender] = useReducer((count: number) => count + 1, 0);
+      const answered = query !== "" && !rows.failing;
+      return {
+        data: answered
+          ? { pages: rows.searchPages.slice(0, rows.pagesLoaded).map((data) => ({ data })) }
+          : undefined,
+        isError: query !== "" && rows.failing,
+        isFetching: false,
+        hasNextPage: answered && rows.pagesLoaded < rows.searchPages.length,
+        fetchNextPage: () => {
+          rows.pagesLoaded += 1;
+          rerender();
+        },
+        refetch: () => {
+          rows.failing = false;
+          rerender();
+        },
+      };
+    },
+  };
+});
 vi.mock("@/hooks/useSidebarData", () => ({
   useOptionalLoadedConversations: () => ({ pages: [{ data: rows.loaded }] }),
 }));
@@ -60,13 +83,15 @@ function renderPicker(onPick = vi.fn()) {
 afterEach(() => {
   cleanup();
   rows.loaded = [];
-  rows.searchHits = [];
+  rows.searchPages = [];
+  rows.pagesLoaded = 1;
+  rows.failing = false;
 });
 
 describe("MoveToNestPicker", () => {
   it("keeps a search hit on a member's title, offered under its nest's name", async () => {
     const member = session("remote", "Member session", "Remote nest");
-    rows.searchHits = [member];
+    rows.searchPages = [[member]];
     const { onPick, input } = renderPicker();
 
     fireEvent.change(input, { target: { value: "Member" } });
@@ -74,6 +99,37 @@ describe("MoveToNestPicker", () => {
     fireEvent.keyDown(input, { key: "Enter" });
 
     expect(onPick).toHaveBeenCalledWith(member);
+  });
+
+  it("shows more search results when the first page holds no other nest", async () => {
+    const member = session("remote", "Member session", "Remote nest");
+    // Solo sessions and the session itself match the title but aren't nests to move into.
+    rows.searchPages = [[session("solo", "Member notes"), SESSION], [member]];
+    const { onPick, input } = renderPicker();
+
+    fireEvent.change(input, { target: { value: "Member" } });
+    expect(screen.queryByRole("option", { name: /Remote nest/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show more nests" }));
+
+    expect(await screen.findByRole("option", { name: /Remote nest/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show more nests" })).toBeNull();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onPick).toHaveBeenCalledWith(member);
+  });
+
+  it("says a failed search failed, and finds the nest on Retry", async () => {
+    const member = session("remote", "Member session", "Remote nest");
+    rows.searchPages = [[member]];
+    rows.failing = true;
+    const { input } = renderPicker();
+
+    fireEvent.change(input, { target: { value: "Member" } });
+    expect(screen.getByText("Couldn't search your nests.")).toHaveAttribute("role", "status");
+    expect(screen.queryByText("No other nests yet.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByRole("option", { name: /Remote nest/ })).toBeInTheDocument();
+    expect(screen.queryByText("Couldn't search your nests.")).toBeNull();
   });
 
   it("matches the sidebar's loaded nests by name", () => {

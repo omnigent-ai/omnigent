@@ -4,14 +4,15 @@
 import { GitBranchIcon, MinusIcon } from "lucide-react";
 import { useState } from "react";
 
+import { Button } from "@/components/ui/button";
 import { QuickPickDialog, type QuickPickItem } from "@/components/ui/quick-pick";
-import { type Conversation, useSessionSearch } from "@/hooks/useConversations";
-import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import type { Conversation } from "@/hooks/useConversations";
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 
-import { nestDestinations, nestLabel } from "../nestDestinations";
+import { nestLabel } from "../nestDestinations";
+import { useNestDestinationSearch } from "../useNestDestinationSearch";
 
 /** Moving the session under `destination`, or out of its nest when it's `null`. */
 interface NestChoice {
@@ -29,29 +30,48 @@ export function MoveToNestPicker({
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
-  const trimmed = query.trim();
-  const debouncedQuery = useDebouncedValue(trimmed, 300);
   const serverInfo = useServerInfo();
   const canJoin = serverInfo !== "loading" && serverInfo.sibling_sessions === true;
   const viewerId = useViewerId();
   const loadedPages = useOptionalLoadedConversations()?.pages ?? [];
-  const search = useSessionSearch(debouncedQuery, "title", {
+  const search = useNestDestinationSearch({
+    conversation,
+    loaded: loadedPages.flatMap((page) => page.data),
+    search: query,
     enabled: canJoin,
-    includeArchived: false,
-    limit: 20,
+    viewerId,
   });
-  // Search hits only count once they belong to the query on screen.
-  const searchHits =
-    debouncedQuery === trimmed ? (search.data?.pages.flatMap((page) => page.data) ?? []) : [];
-  const destinations = canJoin
-    ? nestDestinations({
-        conversation,
-        loaded: loadedPages.flatMap((page) => page.data),
-        searchHits,
-        search: query,
-        viewerId,
-      })
-    : [];
+  const { destinations } = search;
+  // A failed search says so and offers Retry, in place of an empty list's message.
+  const status = search.failed ? (
+    <p className="px-3 py-2 text-xs text-muted-foreground">
+      <span role="status">Couldn't search your nests.</span>
+      <button
+        type="button"
+        className="ml-2 underline"
+        disabled={search.searching}
+        onClick={search.retry}
+      >
+        Retry
+      </button>
+    </p>
+  ) : undefined;
+  // A later page can hold nests the first one's sessions didn't.
+  const showMore = search.hasMore && (
+    <Button
+      variant="ghost"
+      className="w-full"
+      disabled={search.searching}
+      onClick={search.showMore}
+    >
+      Show more nests
+    </Button>
+  );
+  const emptyMessage = search.failed
+    ? null
+    : search.searching || !search.settled
+      ? "Searching…"
+      : "No other nests yet.";
   const removal: QuickPickItem<NestChoice>[] = conversation.family
     ? [
         {
@@ -78,7 +98,9 @@ export function MoveToNestPicker({
       }}
       label={conversation.family ? "Move session to another nest" : "Move session to a nest"}
       placeholder="Find a nest…"
-      emptyMessage="No other nests yet."
+      emptyMessage={emptyMessage}
+      status={status}
+      listEnd={showMore || undefined}
       acceptLabel="Move"
       query={query}
       onQueryChange={setQuery}
