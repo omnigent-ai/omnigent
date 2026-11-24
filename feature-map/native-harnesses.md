@@ -115,6 +115,9 @@ implements them separately, so a fix for one harness does not reach the others.
   approval waits from the five-minute execution budget. A pending approval
   stays pending past five minutes; rejection or expiry does not run the tool.
   Cancellation or a disconnected caller releases that call's pending approval.
+  Claude runs Omnigent's timer and journal tools, and scheduled-task create and
+  update, without its own prompt or auto-mode check; Omnigent's policy
+  approvals, such as the scheduled-task review, still apply to them.
 - `questions`: Claude's questions show an answer form in chat. An answer
   submitted during a brief Omnigent outage still reaches Claude. If the web
   question can't be shown or its wait expires, Claude receives a request to
