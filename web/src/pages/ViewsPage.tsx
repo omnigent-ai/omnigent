@@ -370,7 +370,12 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
             </Button>
           </div>
         </div>
-        <ViewControls value={value} projects={projectOptions} onChange={setValue} />
+        <ViewControls
+          value={value}
+          projects={projectOptions}
+          onChange={setValue}
+          showEntityTabs={!saved}
+        />
         {save.error && (
           <p role="alert" className="px-5 py-3 text-sm text-destructive">
             {save.error.message}

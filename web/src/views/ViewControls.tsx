@@ -1,5 +1,6 @@
-import { Columns3Icon, ListFilterIcon, ListIcon, SlidersHorizontalIcon, XIcon } from "lucide-react";
+import { Columns3Icon, ListIcon, SlidersHorizontalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -13,13 +14,8 @@ import { Switch } from "@/components/ui/switch";
 import type { Project } from "@/lib/projectsApi";
 import type { ViewDisplay, ViewEntity, ViewInput, ViewProperty } from "@/lib/workViewsApi";
 import { newView } from "@/lib/workViewsApi";
-import {
-  ENTITY_NAMES,
-  PRIORITIES,
-  PROPERTY_NAMES,
-  SESSION_STATUSES,
-  TASK_STATUSES,
-} from "./viewPresentation";
+import { ENTITY_NAMES, PROPERTY_NAMES } from "./viewPresentation";
+import { ViewFilters } from "./ViewFilters";
 
 export function ViewSelect({
   label,
@@ -93,14 +89,6 @@ export function ViewControls({
     onChange({ ...value, filters: { ...filters, ...changes } });
   const setDisplay = (changes: Partial<ViewDisplay>) =>
     onChange({ ...value, display: { ...display, ...changes } });
-  const statuses = value.entity_type === "tasks" ? TASK_STATUSES : SESSION_STATUSES;
-  const filterCount =
-    filters.statuses.length +
-    filters.project_ids.length +
-    filters.priorities.length +
-    Number(filters.no_project) +
-    Number(filters.updated_after !== null) +
-    Number(filters.include_archived);
   const properties = Object.entries(PROPERTY_NAMES).filter(([key]) =>
     value.entity_type === "projects"
       ? key.endsWith("_at")
@@ -110,7 +98,7 @@ export function ViewControls({
   );
   return (
     <div className="flex flex-wrap items-center gap-3 border-b border-border/60 px-5 py-3">
-      {showEntityTabs && (
+      {showEntityTabs ? (
         <EntityTabs
           value={value.entity_type}
           onChange={(entity) => {
@@ -123,148 +111,21 @@ export function ViewControls({
             });
           }}
         />
+      ) : (
+        <Badge variant="secondary" className="h-8 px-3">
+          {ENTITY_NAMES[value.entity_type]}
+        </Badge>
       )}
+      <ViewFilters value={value} projects={projects} onChange={onChange} />
       <div className="ml-auto flex items-center gap-2">
         <Input
           aria-label="Filter by name"
+          maxLength={200}
           placeholder={`Search ${value.entity_type}…`}
           value={filters.search}
           onChange={(event) => setFilters({ search: event.target.value })}
           className="h-8 w-40 border-transparent bg-muted/40 sm:w-56"
         />
-        <Popover>
-          <PopoverTrigger asChild>
-            <Button
-              variant="outline"
-              size="icon"
-              className="rounded-full"
-              aria-label={`Filters${filterCount ? ` (${filterCount})` : ""}`}
-            >
-              <ListFilterIcon />
-              {filterCount > 0 && <span className="text-xs">{filterCount}</span>}
-            </Button>
-          </PopoverTrigger>
-          <PopoverContent align="end" className="max-h-[70vh] w-80 space-y-4 overflow-y-auto p-4">
-            <div className="flex items-center justify-between">
-              <span className="font-medium">Filters</span>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => onChange({ ...value, filters: newView(value.entity_type).filters })}
-              >
-                Clear all
-              </Button>
-            </div>
-            {value.entity_type !== "projects" && (
-              <fieldset className="space-y-2">
-                <legend className="mb-2 text-sm text-muted-foreground">Status</legend>
-                <div className="flex flex-wrap gap-1.5">
-                  {Object.entries(statuses).map(([key, label]) => (
-                    <Button
-                      key={key}
-                      size="sm"
-                      variant={filters.statuses.includes(key) ? "secondary" : "outline"}
-                      aria-pressed={filters.statuses.includes(key)}
-                      onClick={() =>
-                        setFilters({
-                          statuses: toggle(filters.statuses, key),
-                          ...(key === "archived" && !filters.statuses.includes(key)
-                            ? { include_archived: true }
-                            : {}),
-                        })
-                      }
-                    >
-                      {label}
-                    </Button>
-                  ))}
-                </div>
-              </fieldset>
-            )}
-            {value.entity_type !== "projects" && (
-              <fieldset className="space-y-2">
-                <legend className="mb-2 text-sm text-muted-foreground">Project</legend>
-                <div className="flex max-h-36 flex-wrap gap-1.5 overflow-y-auto">
-                  <Button
-                    size="sm"
-                    variant={filters.no_project ? "secondary" : "outline"}
-                    aria-pressed={filters.no_project}
-                    onClick={() => setFilters({ no_project: !filters.no_project })}
-                  >
-                    No project
-                  </Button>
-                  {projects.map((project) => (
-                    <Button
-                      key={project.id}
-                      size="sm"
-                      variant={filters.project_ids.includes(project.id) ? "secondary" : "outline"}
-                      aria-pressed={filters.project_ids.includes(project.id)}
-                      onClick={() =>
-                        setFilters({ project_ids: toggle(filters.project_ids, project.id) })
-                      }
-                    >
-                      {project.name}
-                    </Button>
-                  ))}
-                </div>
-              </fieldset>
-            )}
-            {value.entity_type === "tasks" && (
-              <fieldset>
-                <legend className="mb-2 text-sm text-muted-foreground">Priority</legend>
-                <div className="flex flex-wrap gap-1.5">
-                  {Object.entries(PRIORITIES).map(([key, label]) => (
-                    <Button
-                      key={key}
-                      size="sm"
-                      variant={filters.priorities.includes(Number(key)) ? "secondary" : "outline"}
-                      aria-pressed={filters.priorities.includes(Number(key))}
-                      onClick={() =>
-                        setFilters({ priorities: toggle(filters.priorities, Number(key)) })
-                      }
-                    >
-                      {label}
-                    </Button>
-                  ))}
-                </div>
-              </fieldset>
-            )}
-            <label className="grid gap-2 text-sm">
-              Updated since
-              <Input
-                type="date"
-                aria-label="Updated since"
-                value={
-                  filters.updated_after === null
-                    ? ""
-                    : new Date(filters.updated_after * 1000).toISOString().slice(0, 10)
-                }
-                onChange={(event) =>
-                  setFilters({
-                    updated_after: event.target.value
-                      ? Date.parse(`${event.target.value}T00:00:00Z`) / 1000
-                      : null,
-                  })
-                }
-              />
-            </label>
-            {value.entity_type === "sessions" && (
-              <label className="flex items-center justify-between text-sm">
-                Include archived
-                <Switch
-                  checked={filters.include_archived}
-                  onCheckedChange={(checked) =>
-                    setFilters({
-                      include_archived: checked,
-                      statuses: checked
-                        ? filters.statuses
-                        : filters.statuses.filter((status) => status !== "archived"),
-                    })
-                  }
-                />
-              </label>
-            )}
-          </PopoverContent>
-        </Popover>
         <Popover>
           <PopoverTrigger asChild>
             <Button
@@ -379,16 +240,6 @@ export function ViewControls({
             </fieldset>
           </PopoverContent>
         </Popover>
-        {filterCount > 0 && (
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="Clear filters"
-            onClick={() => onChange({ ...value, filters: newView(value.entity_type).filters })}
-          >
-            <XIcon />
-          </Button>
-        )}
       </div>
     </div>
   );

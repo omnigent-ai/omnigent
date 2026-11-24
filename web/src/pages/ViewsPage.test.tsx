@@ -116,10 +116,40 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+it("keeps views grouped by type in the library and carries that type into New view", async () => {
+  const views: api.SavedWorkView[] = [
+    saved,
+    { ...saved, ...api.newView("projects"), id: "projects", name: "Release overview" },
+    { ...saved, ...api.newView("sessions"), id: "sessions", name: "Needs attention" },
+  ];
+  vi.mocked(api.listWorkViews).mockResolvedValue({
+    data: views,
+    has_more: false,
+    next_cursor: null,
+  });
+  const user = userEvent.setup();
+  renderPage("/views");
+  expect(await screen.findByRole("link", { name: "My work" })).toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Release overview" })).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Projects" }));
+  expect(screen.getByRole("link", { name: "Release overview" })).toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "My work" })).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Sessions" }));
+  expect(screen.getByRole("link", { name: "Needs attention" })).toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Release overview" })).not.toBeInTheDocument();
+  await user.click(screen.getByRole("link", { name: "New view" }));
+  expect(await screen.findByRole("button", { name: "Sessions" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  expect(screen.getByLabelText("View name")).toHaveValue("All sessions");
+});
+
 it("saves and reopens filters and display independently of membership", async () => {
   const user = userEvent.setup();
   renderPage("/views/new");
   await screen.findByText("Ship release");
+  expect(screen.getByRole("group", { name: "View item type" })).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Review queue" } });
   await user.click(screen.getByRole("button", { name: "Filters" }));
   await user.click(screen.getByRole("button", { name: "In review" }));
@@ -139,19 +169,139 @@ it("saves and reopens filters and display independently of membership", async ()
   expect(api.queryWorkView).toHaveBeenCalledTimes(requestsBeforeLayout);
   await user.click(screen.getByRole("button", { name: "Create view" }));
   await waitFor(() => expect(saved.display.layout).toBe("board"));
+  await screen.findByRole("button", { name: "Save changes" });
+  expect(screen.queryByRole("group", { name: "View item type" })).not.toBeInTheDocument();
   expect(saved.filters.statuses).toEqual(["review"]);
   await user.click(screen.getByRole("link", { name: "Views" }));
   await user.click(await screen.findByRole("link", { name: "Review queue" }));
   expect(await screen.findByTestId("view-results")).toHaveAttribute("aria-label", "tasks board");
   expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  expect(screen.queryByRole("group", { name: "View item type" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Filters (1)" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Display options" })).toBeInTheDocument();
 });
 
-it("resets incompatible filters when selecting a different entity", async () => {
+it("edits grouped filter chips and removes only the selected field before saving", async () => {
+  saved.filters.statuses = ["todo", "in_progress", "review"];
+  saved.filters.priorities = [1, 2];
   const user = userEvent.setup();
-  saved.filters.priorities = [1];
-  saved.filters.statuses = ["todo"];
   renderPage("/views/saved");
+  const chips = await screen.findByRole("group", { name: "Applied filters" });
+  expect(
+    within(chips).getByRole("button", {
+      name: "Edit Status filter: Todo, In progress, In review",
+    }),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Filters (2)" })).toBeInTheDocument();
+  await user.click(
+    within(chips).getByRole("button", { name: "Edit Priority filter: Urgent, High" }),
+  );
+  const editor = screen.getByRole("dialog", { name: "Priority filter" });
+  expect(within(editor).queryByText("Status")).not.toBeInTheDocument();
+  await user.click(within(editor).getByRole("button", { name: "High" }));
+  await user.keyboard("{Escape}");
+  await user.click(screen.getByRole("button", { name: "Remove Status filter" }));
+  await waitFor(() =>
+    expect(api.queryWorkView).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        filters: expect.objectContaining({ statuses: [], priorities: [1] }),
+      }),
+      null,
+      expect.any(AbortSignal),
+    ),
+  );
+  expect(screen.queryByRole("button", { name: /Edit Status filter/ })).not.toBeInTheDocument();
+  expect(await screen.findByText("Unsaved changes")).toBeInTheDocument();
+  expect(api.saveWorkView).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled());
+  await user.click(screen.getByRole("link", { name: "Views" }));
+  await user.click(await screen.findByRole("link", { name: "My work" }));
+  expect(
+    await screen.findByRole("button", { name: "Edit Priority filter: Urgent" }),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Edit Status filter/ })).not.toBeInTheDocument();
+});
+
+it("shows and clears project, search and date filters without hiding unavailable projects", async () => {
+  saved.filters.project_ids = ["a".repeat(32), "e".repeat(32)];
+  saved.filters.no_project = true;
+  saved.filters.search = "release";
+  saved.filters.updated_after = 0;
+  const user = userEvent.setup();
+  renderPage("/views/saved");
+  await user.click(
+    await screen.findByRole("button", {
+      name: "Edit Project filter: Release, Unavailable project, No project",
+    }),
+  );
+  await user.click(
+    within(screen.getByRole("dialog", { name: "Project filter" })).getByRole("button", {
+      name: "No project",
+    }),
+  );
+  await user.keyboard("{Escape}");
+  expect(
+    screen.getByRole("button", { name: "Edit Project filter: Release, Unavailable project" }),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Remove Project filter" }));
+  expect(
+    screen.getByRole("button", { name: "Edit Updated since filter: 1970-01-01" }),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Remove Updated since filter" }));
+  await user.click(screen.getByRole("button", { name: "Edit Search filter: release" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Search filter" }), {
+    target: { value: "updated" },
+  });
+  await user.keyboard("{Escape}");
+  expect(screen.getByLabelText("Filter by name")).toHaveValue("updated");
+  await user.click(screen.getByRole("button", { name: "Remove Search filter" }));
+  await waitFor(() =>
+    expect(api.queryWorkView).toHaveBeenLastCalledWith(
+      expect.objectContaining({ filters: api.newView().filters }),
+      null,
+      expect.any(AbortSignal),
+    ),
+  );
+  expect(screen.getByText("No filters")).toBeInTheDocument();
+});
+
+it("keeps the archived-session scope visible and removes incompatible status selections", async () => {
+  saved = { ...saved, ...api.newView("sessions") };
+  saved.filters.statuses = ["failed", "archived"];
+  saved.filters.include_archived = true;
+  const user = userEvent.setup();
+  renderPage("/views/saved");
+  expect(
+    await screen.findByRole("button", { name: "Edit Archived filter: Included" }),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Remove Archived filter" }));
+  await waitFor(() =>
+    expect(api.queryWorkView).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        filters: expect.objectContaining({ statuses: ["failed"], include_archived: false }),
+      }),
+      null,
+      expect.any(AbortSignal),
+    ),
+  );
+  await user.click(screen.getByRole("button", { name: "Edit Archived filter: Excluded" }));
+  await user.click(screen.getByRole("switch", { name: "Include archived" }));
+  await user.keyboard("{Escape}");
+  expect(
+    screen.getByRole("button", { name: "Edit Archived filter: Included" }),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Edit Status filter: Failed" })).toBeInTheDocument();
+});
+
+it("resets incompatible filters when selecting a different entity for a new view", async () => {
+  const user = userEvent.setup();
+  renderPage("/views/new");
   await screen.findByLabelText("View name");
+  await user.click(screen.getByRole("button", { name: "Filters" }));
+  await user.click(screen.getByRole("button", { name: "Todo" }));
+  await user.click(screen.getByRole("button", { name: "Urgent" }));
+  await user.keyboard("{Escape}");
   await user.click(screen.getByRole("button", { name: "Sessions" }));
   await waitFor(() =>
     expect(api.queryWorkView).toHaveBeenLastCalledWith(
