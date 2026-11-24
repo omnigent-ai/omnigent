@@ -1756,7 +1756,7 @@ export function useBulkStopSessions() {
       }
       return { succeeded, failed };
     },
-    onSettled: () => {
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
     },
   });
@@ -1785,7 +1785,7 @@ export function useBulkMoveToProject() {
         .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
         .map((r) => r.value);
     },
-    onSettled: () => {
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
@@ -3260,7 +3260,8 @@ export function useRenameProject() {
       // the stale `null` and re-creating it (which 409s on the duplicate name).
       return projectId;
     },
-    onSuccess: () => {
+    // A failed re-file can follow a successful rename, so refetch either way.
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });

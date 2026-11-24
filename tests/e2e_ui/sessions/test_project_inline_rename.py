@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import uuid
 from collections.abc import Iterator
+from typing import NamedTuple
 
 import httpx
 import pytest
@@ -33,9 +34,16 @@ def _folder_header(page: Page, project: str) -> Locator:
     return page.locator('button[data-slot="context-menu-trigger"]').filter(has_text=project)
 
 
+class FiledProject(NamedTuple):
+    base_url: str
+    session_id: str
+    name: str
+    project_id: str
+
+
 @pytest.fixture
-def filed_project(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str, str]]:
-    """File the seeded session into a fresh project; yield its URL, session and name."""
+def filed_project(seeded_session: tuple[str, str]) -> Iterator[FiledProject]:
+    """File the seeded session into a fresh project."""
     base_url, session_id = seeded_session
     name = f"Roadmap {uuid.uuid4().hex[:6]}"
     project_id = _create_project(base_url, name)
@@ -44,7 +52,7 @@ def filed_project(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str, s
         json={"project_id": project_id, "title": "Plan the launch"},
         timeout=10.0,
     ).raise_for_status()
-    yield base_url, session_id, name
+    yield FiledProject(base_url, session_id, name, project_id)
     with contextlib.suppress(httpx.HTTPError):
         httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
 
@@ -57,6 +65,7 @@ def _start_inline_rename(page: Page, project: str) -> Locator:
     name_input = page.get_by_test_id("rename-project-inline-input")
     expect(name_input).to_be_focused()
     expect(name_input).to_have_value(project)
+    expect(name_input).to_have_js_property("selectionStart", 0)
     expect(name_input).to_have_js_property("selectionEnd", len(project))
     expect(page.get_by_role("dialog")).to_have_count(0)
     return name_input
@@ -64,10 +73,10 @@ def _start_inline_rename(page: Page, project: str) -> Locator:
 
 def test_double_click_renames_project_in_place(
     request: pytest.FixtureRequest,
-    filed_project: tuple[str, str, str],
+    filed_project: FiledProject,
 ) -> None:
     """Typing over the selected name and pressing Enter saves the new name."""
-    base_url, session_id, project = filed_project
+    base_url, session_id, project, _ = filed_project
     new_name = f"Launch {uuid.uuid4().hex[:6]}"
     page: Page = request.getfixturevalue("page")
     page.goto(f"{base_url}/c/{session_id}")
@@ -79,20 +88,21 @@ def test_double_click_renames_project_in_place(
     expect(name_input).to_have_count(0)
     expect(_folder_header(page, new_name)).to_be_visible()
     expect(_folder_header(page, project)).to_have_count(0)
-    assert new_name in _project_names(base_url)
-    session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
-    assert session["project_id"] is not None
-    # The double-click's first click opened the project home, which follows the rename.
+    # The double-click's first click opened the project home. It follows the
+    # rename only after the save lands, so the server reads below can't race it.
     expect(page.get_by_role("heading", name=new_name, level=1)).to_be_visible()
     expect(page.get_by_role("main").get_by_text("Plan the launch")).to_be_visible()
+    assert new_name in _project_names(base_url)
+    session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+    assert session["project_id"] == filed_project.project_id
 
 
 def test_escape_keeps_the_project_name(
     request: pytest.FixtureRequest,
-    filed_project: tuple[str, str, str],
+    filed_project: FiledProject,
 ) -> None:
     """Escape discards the typed name and sends no rename."""
-    base_url, session_id, project = filed_project
+    base_url, session_id, project, _ = filed_project
     page: Page = request.getfixturevalue("page")
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -108,10 +118,10 @@ def test_escape_keeps_the_project_name(
 
 def test_rejected_name_keeps_the_old_name(
     request: pytest.FixtureRequest,
-    filed_project: tuple[str, str, str],
+    filed_project: FiledProject,
 ) -> None:
     """A name another project already uses is refused with a toast."""
-    base_url, session_id, project = filed_project
+    base_url, session_id, project, _ = filed_project
     taken = f"Taken {uuid.uuid4().hex[:6]}"
     taken_id = _create_project(base_url, taken)
     try:

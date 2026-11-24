@@ -1,4 +1,5 @@
 import type * as ToastModule from "@/components/ui/toast";
+import { projectHomePath } from "@/projectHome/projectHomeNavigation";
 import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { conversationPage, setConversationMutedMock } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
@@ -6,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { useLocation } from "react-router-dom";
 
 const PROJECT_NAME = "Sprint 42";
 const PROJECT_ID = "p_sprint42";
@@ -551,6 +553,9 @@ describe("project folder inline rename", () => {
     });
     expect(screen.queryByTestId("rename-project-inline-input")).toBeNull();
     expect(screen.getByRole("button", { name: "Sprint 43" })).toBeInTheDocument();
+    // A second rename can't start until this one lands.
+    fireEvent.doubleClick(screen.getByRole("button", { name: "Sprint 43" }));
+    expect(screen.queryByTestId("rename-project-inline-input")).toBeNull();
     await act(async () => finishRename(PROJECT_ID));
   });
 
@@ -569,10 +574,15 @@ describe("project folder inline rename", () => {
     );
   });
 
-  it("moves an open project home to the new name", async () => {
+  it("moves an open project home to the new name and keeps its query", async () => {
+    function LocationProbe() {
+      const location = useLocation();
+      return <div data-testid="location">{location.pathname + location.search}</div>;
+    }
     renderSidebar({
-      route: `/projects/${encodeURIComponent(PROJECT_NAME)}`,
+      route: `/projects/${encodeURIComponent(PROJECT_NAME)}?session=conv_1`,
       features: { project_kanban: true },
+      children: <LocationProbe />,
     });
     expect(folderHeader()).toHaveAttribute("aria-current", "page");
 
@@ -580,8 +590,11 @@ describe("project folder inline rename", () => {
     fireEvent.change(inlineInput(), { target: { value: "Sprint 43" } });
     fireEvent.keyDown(inlineInput(), { key: "Enter" });
 
-    const renamedHeader = screen.getByRole("button", { name: "Sprint 43" });
-    await waitFor(() => expect(renamedHeader).not.toHaveAttribute("aria-current"));
+    await waitFor(() =>
+      expect(screen.getByTestId("location")).toHaveTextContent(
+        `${projectHomePath("Sprint 43")}?session=conv_1`,
+      ),
+    );
   });
 
   it("cancels on Escape without renaming", () => {

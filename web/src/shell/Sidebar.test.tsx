@@ -6059,6 +6059,8 @@ describe("sidebar_grouping_ui release flag", () => {
       screen.queryByRole("button", { name: "Project actions for Omnigent Automation" }),
     ).toBeNull();
     expect(screen.queryByRole("button", { name: "New session in Omnigent Automation" })).toBeNull();
+    fireEvent.doubleClick(screen.getByRole("button", { name: /^Omnigent Automation/ }));
+    expect(screen.queryByTestId("rename-project-inline-input")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /^Omnigent Automation/ }));
     expect(within(automationFolder()).getByText("conv_shared_run")).toBeInTheDocument();
 

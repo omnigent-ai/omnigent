@@ -1994,7 +1994,8 @@ function ProjectFolder({
       onProjectRenamed?.(name, newName);
     } catch (error) {
       setPendingName(null);
-      showToast(`Couldn't rename the project: ${(error as Error).message}`);
+      const message = error instanceof Error ? error.message : String(error);
+      showToast(`Couldn't rename the project: ${message}`);
     }
   };
 
@@ -2995,11 +2996,14 @@ function ConversationList({
       return next;
     });
   }, []);
-  // The project home is addressed by name, so follow its project to the new name.
+  // The project home is addressed by name, so follow its project to the new name,
+  // keeping the query (an open session panel).
   const navigate = useNavigate();
+  const location = useLocation();
   const handleProjectRenamed = useStableCallback((oldName: string, newName: string) => {
     renameExpandedProject(oldName, newName);
-    if (projectHomeName === oldName) navigate(projectHomePath(newName), { replace: true });
+    if (projectHomeName !== oldName) return;
+    navigate({ pathname: projectHomePath(newName), search: location.search }, { replace: true });
   });
 
   const revealedDrafts = useRef(new Set<string>());
