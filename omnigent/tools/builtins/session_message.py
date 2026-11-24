@@ -29,7 +29,8 @@ class SysSessionMessageTool(Tool):
             "use sys_session_send. The receiver sees it as a user message from your "
             "session ID, so make it self-contained. Replies are not forwarded; read them "
             "with sys_session_get_history. `queued` means accepted, not run. Never resend "
-            "an uncertain delivery automatically."
+            "an uncertain delivery automatically. Messages to a project's former "
+            "orchestrator reach its current one."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -41,7 +42,13 @@ class SysSessionMessageTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "session_id": {"type": "string", "description": "Destination session ID."},
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "Destination session ID, or `orchestrator` for your "
+                                "project's current orchestrator."
+                            ),
+                        },
                         "message": {
                             "type": "string",
                             "minLength": 1,

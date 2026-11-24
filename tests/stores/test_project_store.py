@@ -111,6 +111,30 @@ def test_main_session_assignment_is_owner_scoped_and_compares_effective_legacy_p
         assert row.main_session_id == first_id and row.legacy_orchestrator_session_id == old_id
 
 
+
+def test_replaced_main_sessions_are_retired_and_survive_config_replace(store):
+    project = store.create(_uid("rollover"), "Rollover", "alice@example.com", {"model": "m"})
+    first, second, third = (_uid(value) for value in ("main-1", "main-2", "main-3"))
+    store.set_main_session(project.id, first, user_id=project.user_id)
+    assert store.get(project.id, user_id=project.user_id).retired_main_session_ids == []
+    store.set_main_session(
+        project.id, second, user_id=project.user_id, expected_main_session_id=first
+    )
+    # A client replacing config can neither drop nor forge the retired list.
+    store.update(
+        project.id,
+        user_id=project.user_id,
+        config={"model": "n", "_omnigent_retired_main_sessions": ["forged"]},
+    )
+    store.set_main_session(
+        project.id, third, user_id=project.user_id, expected_main_session_id=second
+    )
+    current = store.get(project.id, user_id=project.user_id)
+    assert current.retired_main_session_ids == [first, second]
+    assert current.config == {"model": "n"}
+    assert (project.id, project.user_id, third) in store.list_main_sessions()
+
+
 # ── list ──────────────────────────────────────────────────────────────────
 
 

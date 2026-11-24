@@ -183,6 +183,7 @@ from omnigent.server.routes._sessions.common import (
     _MCP_ELICITATION_TYPE,
     _RELOAD_TOOLS_TYPE,
     _RETRY_SESSION_TYPE,
+    _ROLLOVER_ORCHESTRATOR_TYPE,
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
@@ -1257,12 +1258,24 @@ def register_events_routes(
                     )
                     acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
                 return acks
-            return await _post_event_impl(
+            redirected_from = None
+            if body.type == "session_message":
+                from omnigent.server.project_orchestrator_rollover import (
+                    resolve_message_target,
+                )
+
+                session_id, redirected_from = await resolve_message_target(
+                    request, session_id, _get_user_id(request, auth_provider)
+                )
+            ack = await _post_event_impl(
                 request,
                 session_id,
                 body,
                 in_flight=in_flight if body.type in _IN_FLIGHT_EVENT_TYPES else None,
             )
+            if redirected_from is not None:
+                ack = {**ack, "session_id": session_id, "redirected_from": redirected_from}
+            return ack
 
     router.include_router(event_router)
 
@@ -1527,6 +1540,24 @@ def register_events_routes(
                 permission_store=permission_store,
             )
             return {"queued": True, "reload": "scheduled"}
+        if body.type == _ROLLOVER_ORCHESTRATOR_TYPE:
+            from omnigent.server import project_orchestrator_rollover as rollover
+
+            await rollover.authorize_rollover(request, user_id, conv, permission_store)
+            notes = body.data.get("notes") if isinstance(body.data, dict) else None
+            reason = (
+                "requested by the orchestrator"
+                if request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+                else "requested by the owner"
+            )
+            scheduled = rollover.schedule_rollover(
+                request,
+                session_id,
+                user_id=user_id,
+                notes=notes if isinstance(notes, str) else None,
+                reason=reason,
+            )
+            return {"queued": True, "rollover": "scheduled" if scheduled else "already_pending"}
         native_harness = (
             await asyncio.to_thread(
                 _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
@@ -1721,6 +1752,7 @@ def register_events_routes(
             _STOP_SESSION_TYPE,
             _RETRY_SESSION_TYPE,
             _RELOAD_TOOLS_TYPE,
+            _ROLLOVER_ORCHESTRATOR_TYPE,
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,

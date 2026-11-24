@@ -90,6 +90,7 @@ from omnigent.tools.builtins.async_inbox import (
 from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
+from omnigent.tools.builtins.orchestrator_rollover import SysProjectOrchestratorRolloverTool
 from omnigent.tools.builtins.os_env import (
     OS_ENV_TOOL_TYPES,
     SysOsEditTool,
@@ -545,7 +546,11 @@ _BROWSER_TIMEOUT_ERROR = (
 # shell and file tools, and a relayed copy would be a second route to the
 # workspace that a same-uid caller holding the relay token could use.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
-    {SysSessionMessageTool.name(), SysSessionReloadToolsTool.name()}
+    {
+        SysSessionMessageTool.name(),
+        SysSessionReloadToolsTool.name(),
+        SysProjectOrchestratorRolloverTool.name(),
+    }
     | _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
@@ -695,6 +700,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionRenameTool,
             SysSessionMessageTool,
             SysSessionReloadToolsTool,
+            SysProjectOrchestratorRolloverTool,
             SysProjectListTool,
             SysSessionLinkPrTool,
             SysSessionUpdateTool,
@@ -1053,7 +1059,11 @@ async def _fitted_discovery_result(
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
-    {SysSessionMessageTool.name(), SysSessionReloadToolsTool.name()}
+    {
+        SysSessionMessageTool.name(),
+        SysSessionReloadToolsTool.name(),
+        SysProjectOrchestratorRolloverTool.name(),
+    }
     | _OS_ENV_TOOLS
     | _REST_TOOLS
     | _FILE_TOOLS
@@ -8285,6 +8295,10 @@ async def execute_tool(
             from omnigent.runner.session_reload import execute_reload_tools_tool
 
             output = await execute_reload_tools_tool(args, server_client, conversation_id)
+        elif tool_name == SysProjectOrchestratorRolloverTool.name():
+            from omnigent.runner.orchestrator_rollover import execute_orchestrator_rollover_tool
+
+            output = await execute_orchestrator_rollover_tool(args, server_client, conversation_id)
         elif tool_name == SysSessionLinkPrTool.name():
             from omnigent.runner.session_link_pr import execute_link_pr_tool
 

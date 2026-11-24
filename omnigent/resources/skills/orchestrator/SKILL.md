@@ -409,6 +409,15 @@ updates and worker reports promptly between checks.
   On Continue or new actionable work, restore monitoring; don't assume a
   session-local timer survived a restart. An empty new project needs no timer.
 
+## Roll over a long context
+
+When the owner asks, or your context is long, call
+`sys_project_orchestrator_rollover` with `notes` covering what the board can't
+show: branches awaiting landing, pending decisions, and promises to workers.
+Then finish your reply. A fresh orchestrator takes over with your notes and a
+board handoff. Messages to your session ID are forwarded to it. If you start
+with a handoff from a previous orchestrator, re-read the board before acting.
+
 ## Follow through
 
 - Verify the result against the ticket's outcome. A worker ending is not

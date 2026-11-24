@@ -1,11 +1,12 @@
 import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Maximize2Icon, XIcon } from "lucide-react";
+import { Maximize2Icon, RotateCcwIcon, XIcon } from "lucide-react";
 import { FullSessionChat } from "@/components/chat/FullSessionChat";
 import { useAgentChatPresentation } from "@/components/chat/useAgentChatPresentation";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { useSessionAgent } from "@/hooks/useAgents";
-import { getSessionSlim } from "@/lib/sessionsApi";
+import { getSessionSlim, rolloverOrchestrator } from "@/lib/sessionsApi";
+import { showToast } from "@/components/ui/toast";
 import { mergeTaggedDrafts } from "@/lib/composerMentions";
 import {
   appendReplyDraft,
@@ -112,6 +113,32 @@ export function ProjectOrchestrator({
     >
       <header className="flex h-11 shrink-0 items-center gap-1 border-b border-border/60 pr-1.5 pl-4">
         <h2 className="min-w-0 flex-1 truncate text-ui font-medium">Orchestrator</h2>
+        {sessionId && !canReplace && (
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Roll over orchestrator"
+            title="Roll over: continue in a fresh orchestrator with a handoff"
+            data-testid="rollover-orchestrator"
+            onClick={() => {
+              if (
+                !window.confirm(
+                  "Start a fresh orchestrator? It gets a handoff of the board and recent messages. This conversation is kept as read-only history, and messages to it are forwarded.",
+                )
+              )
+                return;
+              rolloverOrchestrator(sessionId).then(
+                () => showToast("The orchestrator will roll over when its current turn ends"),
+                (err: unknown) => {
+                  const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+                  showToast(`Couldn't roll over${detail}`);
+                },
+              );
+            }}
+          >
+            <RotateCcwIcon />
+          </Button>
+        )}
         {sessionId && (
           <Button variant="ghost" size="icon-sm" asChild>
             <Link

@@ -479,6 +479,8 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_info",
         "sys_session_rename",
         "sys_session_message",
+        "sys_session_reload_tools",
+        "sys_project_orchestrator_rollover",
         "sys_project_list",
         "sys_session_update",
         "sys_project_update",

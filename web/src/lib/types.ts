@@ -200,6 +200,7 @@ export type SessionEventInput =
   | { type: "stop_session"; data?: Record<string, unknown> }
   | { type: "retry_session"; data?: Record<string, unknown> }
   | { type: "reload_tools"; data?: Record<string, unknown> }
+  | { type: "rollover_orchestrator"; data?: { notes?: string } }
   | { type: "slash_command"; data: { kind: "skill"; name: string; arguments: string } }
   | { type: string; data: Record<string, unknown> };
 

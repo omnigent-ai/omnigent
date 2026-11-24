@@ -56,6 +56,28 @@ _PROJECT_ORDER_KEY = "project_order"
 _PREFERENCE_MAX_STORED_BYTES = 65535
 
 
+# Server-owned config key: former main sessions, so their messages reach the
+# current orchestrator. Hidden from ``Project.config`` and kept across replaces.
+RETIRED_MAIN_SESSIONS_CONFIG_KEY = "_omnigent_retired_main_sessions"
+_RETIRED_MAIN_SESSIONS_MAX = 50
+
+
+def _client_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop server-owned keys from a client-supplied config."""
+    return {k: v for k, v in (config or {}).items() if k != RETIRED_MAIN_SESSIONS_CONFIG_KEY}
+
+
+def _retired_ids(raw: str | None) -> list[str]:
+    value = _decode_config(raw).get(RETIRED_MAIN_SESSIONS_CONFIG_KEY)
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _with_retired(config: dict[str, Any], retired: list[str]) -> dict[str, Any]:
+    if not retired:
+        return config
+    return {**config, RETIRED_MAIN_SESSIONS_CONFIG_KEY: retired[-_RETIRED_MAIN_SESSIONS_MAX:]}
+
+
 def _encode_config(config: dict[str, Any] | None) -> str | None:
     """Pack a project's config dict into a compact JSON blob for storage.
 
@@ -210,10 +232,11 @@ def _to_entity(row: SqlProject) -> Project:
         user_id=row.user_id,
         created_at=row.created_at,
         updated_at=row.updated_at,
-        config=_decode_config(row.config),
+        config=_client_config(_decode_config(row.config)),
         main_session_id=row.main_session_id or row.legacy_orchestrator_session_id,
         mandate=row.mandate,
         mandate_proposals=_decode_proposals(row.mandate_proposals),
+        retired_main_session_ids=_retired_ids(row.config),
     )
 
 
@@ -339,7 +362,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         ``SqlProject.__table_args__`` for why that is acceptable.
         """
         created_at = now_epoch()
-        encoded_config = _encode_config(config)
+        encoded_config = _encode_config(_client_config(config))
         stored_mandate = _normalize_mandate(mandate) if mandate is not None else None
 
         def write(session: Session) -> Project:
@@ -429,7 +452,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         only uniqueness guard, so concurrent renames to the same name can both
         land.
         """
-        encoded_config = _encode_config(config) if config is not None else None
+        client_config = _client_config(config) if config is not None else None
         stored_mandate = _normalize_mandate(mandate) if mandate is not None else None
         updated_at = now_epoch()
 
@@ -449,6 +472,14 @@ class SqlAlchemyProjectStore(ProjectStore):
                         code=ErrorCode.CONFLICT,
                     )
                 row.main_session_id = main_session_id
+                if current_main is not None:
+                    # Keep the old orchestrator's address routable to its successor.
+                    retired = [r for r in _retired_ids(row.config) if r != main_session_id]
+                    if current_main not in retired:
+                        retired.append(current_main)
+                    row.config = _encode_config(
+                        _with_retired(_client_config(_decode_config(row.config)), retired)
+                    )
             if name is not None and row.name != name:
                 if self._name_taken(session, user_id=user_id, name=name, exclude_id=project_id):
                     raise OmnigentError(
@@ -457,7 +488,10 @@ class SqlAlchemyProjectStore(ProjectStore):
                     )
                 row.name = name
                 changed = True
-            if config is not None:
+            if client_config is not None:
+                encoded_config = _encode_config(
+                    _with_retired(client_config, _retired_ids(row.config))
+                )
                 if row.config != encoded_config:
                     row.config = encoded_config
                     changed = True
@@ -603,6 +637,16 @@ class SqlAlchemyProjectStore(ProjectStore):
 
         operation = "accept_mandate_proposal" if accept else "dismiss_mandate_proposal"
         return run_write_transaction(self._session_immediate, operation, write)
+
+    def list_main_sessions(self) -> builtins.list[tuple[str, str | None, str]]:
+        with self._session("list_project_main_sessions") as session:
+            rows = session.execute(
+                select(SqlProject.id, SqlProject.user_id, SqlProject.main_session_id).where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.main_session_id.is_not(None),
+                )
+            ).all()
+            return [(row[0], row[1], row[2]) for row in rows]
 
     def set_main_session(
         self,

@@ -16,10 +16,17 @@ from omnigent.tools.builtins.session_message import (
 async def execute_message_tool(
     args: dict[str, Any], client: httpx.AsyncClient | None, source_id: str | None
 ) -> str:
+    raw_target = args.get("session_id")
     try:
-        target = normalize_session_id(args.get("session_id"))
+        target = (
+            "orchestrator"
+            if isinstance(raw_target, str) and raw_target.strip().lower() == "orchestrator"
+            else normalize_session_id(raw_target)
+        )
     except ValueError:
-        return json.dumps({"error": "Provide a valid session_id (UUID or numeric managed ID)"})
+        return json.dumps(
+            {"error": "Provide a valid session_id (UUID, numeric managed ID or `orchestrator`)"}
+        )
     message = args.get("message")
     if (
         not isinstance(message, str)

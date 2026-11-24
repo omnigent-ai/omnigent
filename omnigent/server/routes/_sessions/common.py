@@ -96,6 +96,10 @@ _RETRY_SESSION_TYPE: str = "retry_session"
 _RELOAD_TOOLS_TYPE: str = "reload_tools"
 
 
+# Rolls a project orchestrator over to a fresh session; see project_orchestrator_rollover.
+_ROLLOVER_ORCHESTRATOR_TYPE: str = "rollover_orchestrator"
+
+
 _EXTERNAL_ASSISTANT_MESSAGE_TYPE: str = "external_assistant_message"
 
 
@@ -585,6 +589,7 @@ CLIENT_SESSION_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.key
     _STOP_SESSION_TYPE,
     _RETRY_SESSION_TYPE,
     _RELOAD_TOOLS_TYPE,
+    _ROLLOVER_ORCHESTRATOR_TYPE,
     # The web posts this when the user closes its /btw side chat.
     _EXTERNAL_BTW_DISMISS_TYPE,
 }
@@ -1252,6 +1257,7 @@ __all__ = [
     "_RACE_TASK_REAP_TIMEOUT_S",
     "_RELOAD_TOOLS_TYPE",
     "_RETRY_SESSION_TYPE",
+    "_ROLLOVER_ORCHESTRATOR_TYPE",
     "_RUNNER_CLIENT_RESOLVE_ATTEMPTS",
     "_RUNNER_CLIENT_RESOLVE_RETRY_S",
     "_RUNNER_CONVICTION_POLL_S",

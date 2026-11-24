@@ -36,6 +36,8 @@ class Project:
     :param mandate: Owner-written guidance (markdown) loaded into every agent
         session in the project to set its bounds, or ``None`` when unset.
     :param mandate_proposals: Proposed additions awaiting the owner, oldest first.
+    :param retired_main_session_ids: Former orchestrator sessions, oldest first.
+        Server-owned: messages addressed to one reach the current orchestrator.
     """
 
     id: str
@@ -47,6 +49,7 @@ class Project:
     main_session_id: str | None = None
     mandate: str | None = None
     mandate_proposals: list[MandateProposal] = field(default_factory=list)
+    retired_main_session_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

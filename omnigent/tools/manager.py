@@ -528,6 +528,13 @@ class ToolManager:
         from omnigent.tools.builtins.session_reload import SysSessionReloadToolsTool
 
         self._tools[SysSessionReloadToolsTool.name()] = SysSessionReloadToolsTool()
+        from omnigent.tools.builtins.orchestrator_rollover import (
+            SysProjectOrchestratorRolloverTool,
+        )
+
+        self._tools[SysProjectOrchestratorRolloverTool.name()] = (
+            SysProjectOrchestratorRolloverTool()
+        )
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()

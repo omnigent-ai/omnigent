@@ -161,6 +161,10 @@ class ProjectStore(ABC):
         """
         ...
 
+    def list_main_sessions(self) -> builtins.list[tuple[str, str | None, str]]:
+        """Every project in the workspace with a main session: ``(project, owner, session)``."""
+        raise NotImplementedError
+
     def set_main_session(
         self,
         project_id: str,

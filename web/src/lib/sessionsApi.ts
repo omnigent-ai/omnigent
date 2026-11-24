@@ -1930,6 +1930,14 @@ export function reloadSessionTools(sessionId: string): Promise<PostEventResponse
   return postEvent(sessionId, { type: "reload_tools", data: {} });
 }
 
+/**
+ * Hand a project orchestrator over to a fresh session once it is idle. The old
+ * session is archived as read-only history and messages to it are forwarded.
+ */
+export function rolloverOrchestrator(sessionId: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, { type: "rollover_orchestrator", data: {} });
+}
+
 /** Send *text* to a session as a plain user message, e.g. from a page other than its chat. */
 export function sendUserMessage(
   sessionId: string,

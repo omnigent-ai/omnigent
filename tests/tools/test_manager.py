@@ -70,6 +70,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # Peer messaging is advertised unless the runner disables
         # peer_session_messaging; the server enforces its own flags.
         "sys_session_message",
+        # Runner-replacing session lifecycle tools; the server checks who may call them.
+        "sys_session_reload_tools",
+        "sys_project_orchestrator_rollover",
         "ui_open_file",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
