@@ -1438,6 +1438,28 @@ def test_permission_request_hook_question_answer_survives_a_server_outage(
         assert len(client.calls) == cap + 1, "other prompts keep the hard-failure cap"
 
 
+@pytest.mark.parametrize("failure", ["5xx", "connect"])
+def test_permission_request_hook_never_approves_a_prompt_the_server_never_took(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    """
+    A tool approval raised while the server fails ends with no decision.
+
+    The hook must not fail open: once it stops retrying, Claude Code keeps its
+    own prompt rather than running the tool, and it stops at the cap.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    script = [(failure, 0.0)] * cap + [("ok", 0.0)]
+
+    client = _run_scripted_permission_hook(tmp_path, monkeypatch, tool_name="Bash", script=script)
+
+    assert capsys.readouterr().out == "", "a prompt the server never took must not get a verdict"
+    assert len(client.calls) == cap
+
+
 @pytest.mark.parametrize(
     ("last_retry", "max_retries"),
     [("5xx", None), ("5xx", 20), ("ok", None)],
