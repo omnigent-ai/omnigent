@@ -3317,6 +3317,16 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
+def _resumes_transcript(args: list[str]) -> bool:
+    """Whether Claude args resume a saved transcript (``--resume``), before any bare ``--``."""
+    for arg in args:
+        if arg == "--":
+            return False
+        if arg == "--resume" or arg.startswith("--resume="):
+            return True
+    return False
+
+
 def _merge_append_system_prompt(
     args: list[str], extra: str | None, *, bridge_dir: Path
 ) -> list[str]:
@@ -3326,6 +3336,8 @@ def _merge_append_system_prompt(
     value in place, or a new flag carries it. The scan stops at a bare ``--``.
     Caller prompt files stay in Claude's sandbox. With a file flag, deliver only
     ``extra`` through SessionStart so older CLIs do not receive a second flag.
+    A resumed transcript keeps its original system prompt, so ``extra`` also
+    goes through SessionStart then.
     A merged prompt too large for a tmux command moves to a private file flag.
 
     :param args: Claude CLI argument list to mutate-and-return.
@@ -3358,7 +3370,13 @@ def _merge_append_system_prompt(
     if has_prompt_file:
         _write_private_file(startup_context, extra)
         return args
-    startup_context.unlink(missing_ok=True)
+    if _resumes_transcript(args):
+        # `--resume` keeps the transcript's original system prompt and ignores a
+        # new flag, so a fork or cold resume also gets this launch's instructions
+        # through the SessionStart hook.
+        _write_private_file(startup_context, extra)
+    else:
+        startup_context.unlink(missing_ok=True)
     prompt_file = bridge_dir / CLAUDE_APPEND_SYSTEM_PROMPT_FILE
     existing = "" if location is None else args[location[0]][location[1] :]
     merged = f"{extra}\n\n{existing}" if existing else extra

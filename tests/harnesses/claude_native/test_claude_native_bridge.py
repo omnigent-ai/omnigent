@@ -4348,6 +4348,26 @@ def test_session_start_hook_preserves_generated_startup_context(
 
 
 @pytest.mark.parametrize(
+    "resume_args", (("--resume", "claude-session"), ("--resume=claude-session",))
+)
+def test_resumed_launch_also_delivers_its_prompt_through_session_start(
+    tmp_path: Path, resume_args: tuple[str, ...]
+) -> None:
+    """`--resume` keeps the transcript's first system prompt, so the hook carries this launch's."""
+    startup_context = tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    args = augment_claude_args(
+        resume_args, bridge_dir=tmp_path, append_system_prompt="## Side chat\nYou are a fork."
+    )
+    assert args[args.index("--append-system-prompt") + 1] == "## Side chat\nYou are a fork."
+    assert startup_context.read_text(encoding="utf-8") == "## Side chat\nYou are a fork."
+    # A bare `--` ends Claude's own args, and a fresh launch clears the stale context.
+    augment_claude_args(
+        ("--", "--resume", "x"), bridge_dir=tmp_path, append_system_prompt="Fresh."
+    )
+    assert not startup_context.exists()
+
+
+@pytest.mark.parametrize(
     "api_key_helper",
     (
         "printf %s sk-sentinel-do-not-use",
