@@ -3973,6 +3973,46 @@ def test_cascade_delete_removes_descendants(
     )
 
 
+def test_cascade_delete_survives_mysql_temp_tables_on_disk(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A subtree delete still succeeds when MySQL moves temp tables to disk mid-query.
+
+    A busy server moves internal temporary tables to disk once the TempTable
+    engine's shared memory is in use, and MySQL 8.0 then fails any recursive CTE
+    with 1146 ("Table '.../#sql…' doesn't exist"). A tiny tmp_table_size on new
+    connections forces that move deterministically.
+    """
+    engine = conversation_store._conv_engine
+    if engine.dialect.name != "mysql":
+        pytest.skip("MySQL internal temporary table regression")
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", title="coder:auth", parent_conversation_id=parent.id
+    )
+    grandchild = conversation_store.create_conversation(
+        kind="sub_agent", title="reviewer:nested", parent_conversation_id=child.id
+    )
+
+    def force_on_disk_temp_tables(dbapi_connection: Any, *_: object) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("SET SESSION tmp_table_size = 1024")
+        cursor.close()
+
+    # Only new connections: one that already held an in-memory temp table keeps
+    # serving small ones from memory whatever its tmp_table_size.
+    engine.dispose()
+    event.listen(engine, "connect", force_on_disk_temp_tables)
+    try:
+        assert asyncio.run(conversation_store.delete_conversation(parent.id)) is True
+    finally:
+        event.remove(engine, "connect", force_on_disk_temp_tables)
+        engine.dispose()
+
+    for conversation in (parent, child, grandchild):
+        assert conversation_store.get_conversation(conversation.id) is None
+
+
 # ── Runner pinning (designs/RUNNER.md §5) ─────────────
 
 

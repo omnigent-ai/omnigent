@@ -7699,36 +7699,33 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return None
-            cte = (
-                select(SqlConversation.id)
-                .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.id == conversation_id,
+            # One query per level, not a recursive CTE: MySQL 8.0 fails a recursive
+            # CTE with 1146 whenever its internal temporary table spills to disk.
+            subtree_ids = [conversation_id]
+            seen = {conversation_id}
+            frontier = [conversation_id]
+            while frontier:
+                children = ap_sess.scalars(
+                    select(SqlConversation.id).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.parent_conversation_id.in_(frontier),
+                    )
                 )
-                .cte(name="subtree", recursive=True)
+                # ``seen`` ends the walk even if corrupt parent links form a cycle.
+                frontier = [child for child in children if child not in seen]
+                seen.update(frontier)
+                subtree_ids.extend(frontier)
+            # Keep origin capture in the same transaction as the subtree deletion.
+            origin_task_ids = ap_sess.scalars(
+                select(SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(subtree_ids),
+                    SqlConversationLabel.key == SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+                )
             )
-            cte = cte.union_all(
-                select(SqlConversation.id).where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.parent_conversation_id == cte.c.id,
-                )
-            )
-            # Keep origin capture in the same snapshot as the existing subtree deletion.
-            entries = ap_sess.execute(
-                select(cte.c.id, SqlConversationLabel.value).outerjoin(
-                    SqlConversationLabel,
-                    and_(
-                        SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.conversation_id == cte.c.id,
-                        SqlConversationLabel.key == SCHEDULED_TASK_ORIGIN_LABEL_KEY,
-                    ),
-                )
-            ).all()
-            subtree_ids = [entry[0] for entry in entries]
             retained_tasks = {
                 continued_sandbox_host_id(task_id, current_workspace_id()): task_id
-                for _, task_id in entries
-                if task_id is not None
+                for task_id in origin_task_ids
             }
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
             ap_sess.execute(
