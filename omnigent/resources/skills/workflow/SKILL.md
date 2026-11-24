@@ -318,13 +318,11 @@ restarting.
   that one with `sys_timer_cancel` first, so the run keeps only one.
 - Each time it fires, a `[System: timer … fired]` message starts your turn.
   Read the journal, check the work you wait on, such as CI, jobs and nested
-  agents, and go on with any step that can proceed, writing each step's
-  status as in any other turn. If nothing changed, end your turn without a
-  reply. A firing during your turn needs nothing.
-- Once the journal shows every step done, failed or waiting for the user,
-  cancel it with `sys_timer_cancel`; cancel it too when the run is stopped.
-  The user's answer or Continue starts your next turn, and you set it again
-  then.
+  agents, and go on with any step that can proceed. If nothing changed, end
+  your turn without a reply. A firing during your turn needs nothing.
+- Cancel it with `sys_timer_cancel` when every step left is done, failed or
+  waiting for the user, and when the run is stopped. The user's answer or
+  Continue starts your next turn, and you set it again then.
 - `durable: false` in its result means the timer is kept only in this runner's
   memory, for example in a sub-agent or side chat, and is lost if the runner
   restarts. Keep it anyway: it still brings you back while the runner runs.
