@@ -51,6 +51,23 @@ async def test_lists_what_the_ignore_rules_cover_and_leaves_tracked_files(
     assert ignored == {"build", "node_modules"}
 
 
+async def test_paths_below_the_directory_answer_like_its_own_entries(tmp_path: Path) -> None:
+    """A folder chain's inner folders are asked as paths, with the tracked-file exception."""
+    root = _ignoring_repository(tmp_path / "repo")
+    (root / "src" / "gen" / "out").mkdir(parents=True)
+    (root / "src" / ".gitignore").write_text("generated.py\ngen/\n")
+    (root / "src" / "gen" / "kept" / "schema.json").parent.mkdir()
+    (root / "src" / "gen" / "kept" / "schema.json").write_text("x")
+    _git(root, "add", "-f", "src/gen/kept/schema.json")
+
+    ignored = await _ignored(
+        root, ["src/gen", "src/gen/out", "src/gen/kept", "src/main.py", "vendor"]
+    )
+
+    # src/gen holds a tracked file, so only its untracked folder is ignored.
+    assert ignored == {"src/gen/out"}
+
+
 async def test_escaped_and_negated_patterns_match_the_real_names(tmp_path: Path) -> None:
     """Rules that escape glob characters see the name as it is, unescaped."""
     root = _repository(tmp_path / "repo")

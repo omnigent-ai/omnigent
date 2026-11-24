@@ -18,6 +18,7 @@ an owner-only Unix socket, admitting calls that carry a server-issued token
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import shutil
@@ -229,13 +230,16 @@ class WorkspaceService(WorkspaceServiceMethods):
                 # Git stopped answering partway: end here rather than mix in unfiltered pages.
                 return ListDirectoryResponse(entries=entries, next_page_token=after or "")
             ignored = ignored or set()
+            leaves = await _leaves_short_of_ignored(ignores, page.data, ignored, deadline)
             for index, item in enumerate(page.data):
                 after = item["id"]
                 hidden = request.hide_ignored and item["name"] in ignored
                 if not hidden:
                     entries.append(
                         _entry(
-                            item,
+                            {**item, "leaf_directory_path": leaves[item["path"]]}
+                            if item["path"] in leaves
+                            else item,
                             is_symlink=item["path"] in links,
                             ignored=item["name"] in ignored,
                         )
@@ -387,6 +391,47 @@ async def _ignored(
     except GitError as exc:
         _logger.info("Listing without ignored files: %s", exc.problem.name)
         return None
+
+
+async def _leaves_short_of_ignored(
+    ignores: DirectoryIgnores | None,
+    items: list[ListedEntry],
+    ignored: set[str],
+    deadline: Deadline,
+) -> dict[str, str]:
+    """Folder chains cut before the first folder Git ignores, so a hint never shows one.
+
+    :returns: Each changed entry's path and its new ``leaf_directory_path``, ``""`` for none.
+    """
+    if ignores is None:
+        return {}
+    leaves: dict[str, str] = {}
+    # Each chain's inner folders, as paths below the listed directory.
+    inner: dict[str, list[str]] = {}
+    for item in items:
+        leaf = item.get("leaf_directory_path")
+        if not leaf:
+            continue
+        if item["name"] in ignored:
+            # Everything below an ignored folder is ignored too; it lists folder by folder.
+            leaves[item["path"]] = ""
+            continue
+        below = leaf.removeprefix(item["path"] + "/").split("/")
+        inner[item["path"]] = [
+            "/".join([item["name"], *below[: depth + 1]]) for depth in range(len(below))
+        ]
+    if not inner:
+        return leaves
+    hit = await _ignored(ignores, [path for paths in inner.values() for path in paths], deadline)
+    for path, folders in inner.items():
+        if hit is None:
+            # Git stopped answering: leave out the hint rather than risk an ignored folder.
+            leaves[path] = ""
+            continue
+        kept = len(list(itertools.takewhile(lambda folder: folder not in hit, folders)))
+        if kept < len(folders):
+            leaves[path] = "/".join([path, *folders[kept - 1].split("/")[1:]]) if kept else ""
+    return leaves
 
 
 def _entry(item: ListedEntry, *, is_symlink: bool, ignored: bool = False) -> Entry:

@@ -42,7 +42,7 @@ class DirectoryIgnores:
         return None if repository is None else cls(repository)
 
     async def ignored(self, names: Sequence[str], deadline: Deadline) -> set[str]:
-        """The ``names`` (entries of the directory) that Git ignores.
+        """The ``names`` Git ignores: entries of the directory, or paths below it.
 
         :raises GitError: When Git can't answer.
         """
@@ -82,4 +82,10 @@ class DirectoryIgnores:
             stdout_bytes=LISTING_OUTPUT_BYTES,
         )
         tracked = (os.fsdecode(record) for record in output.split(b"\0") if record)
-        return {path.split("/", 1)[0] for path in tracked} & names
+        return {folder for path in tracked for folder in _path_and_folders(path)} & names
+
+
+def _path_and_folders(path: str) -> list[str]:
+    """``"a/b/c"`` and the folders above it: ``["a", "a/b", "a/b/c"]``."""
+    parts = path.split("/")
+    return ["/".join(parts[: depth + 1]) for depth in range(len(parts))]

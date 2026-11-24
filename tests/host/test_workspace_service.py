@@ -418,6 +418,56 @@ async def test_list_directory_stops_where_git_stopped_answering(
     assert listed.next_page_token == "build"
 
 
+@pytest.mark.parametrize("hide_ignored", [True, False])
+async def test_list_directory_ends_a_folder_chain_before_an_ignored_folder(
+    tmp_path: Path, client_for: ClientFor, hide_ignored: bool
+) -> None:
+    root = _ignoring_workspace(tmp_path / "repo")
+    (root / ".gitignore").write_text("build/\n*.log\nsrc/generated/\napp/deep/out/\n")
+    (root / "src" / "generated" / "leaf").mkdir(parents=True)
+    (root / "src" / "generated" / "leaf" / "output.txt").write_text("x")
+    (root / "app" / "deep" / "out").mkdir(parents=True)
+    # An ignored folder holding a tracked file stays in the chain, as it lists too.
+    (root / "lib" / "vendor" / "pkg").mkdir(parents=True)
+    (root / "lib" / "vendor" / "pkg" / "kept.txt").write_text("x")
+    _git(root, "add", "-f", "lib/vendor/pkg/kept.txt")
+    client = client_for(root)
+
+    listed = await client.list_directory(
+        ListDirectoryRequest(collapse_single_child_directories=True, hide_ignored=hide_ignored)
+    )
+
+    leaves = {entry.path: entry.leaf_directory_path for entry in listed.entries}
+    assert leaves["src"] == ""
+    assert leaves["app"] == "app/deep"
+    assert leaves["lib"] == "lib/vendor/pkg"
+
+
+async def test_list_directory_drops_folder_chains_git_couldnt_check(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer = DirectoryIgnores.ignored
+
+    async def fail_on_inner_folders(self: DirectoryIgnores, names: Any, *args: Any) -> set[str]:
+        if any("/" in name for name in names):
+            raise GitError(GitProblem.TIMEOUT)
+        return await answer(self, names, *args)
+
+    monkeypatch.setattr(DirectoryIgnores, "ignored", fail_on_inner_folders)
+    root = _ignoring_workspace(tmp_path / "repo")
+    (root / "app" / "deep" / "out").mkdir(parents=True)
+    client = client_for(root)
+
+    listed = await client.list_directory(
+        ListDirectoryRequest(collapse_single_child_directories=True, hide_ignored=True)
+    )
+
+    # The entries still list; only the hint Git couldn't check is left out.
+    leaves = {entry.path: entry.leaf_directory_path for entry in listed.entries}
+    assert leaves["app"] == ""
+    assert "main.py" in leaves and "debug.log" not in leaves
+
+
 async def test_list_directory_marks_ignored_entries_of_a_subfolder(
     tmp_path: Path, client_for: ClientFor
 ) -> None:
