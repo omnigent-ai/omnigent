@@ -44,6 +44,7 @@ from omnigent.runtime.project_ticket_instructions import (
 )
 from omnigent.server import (
     github_pr_intake,
+    github_pr_status,
     product_approval,
     project_release,
     running_commit,
@@ -198,6 +199,8 @@ def intake_description(source_name: str, sender: str | None, description: str) -
 
 _mention_limiter = MentionRateLimiter()
 _mention_tasks: set[asyncio.Task[None]] = set()
+# A ticket rarely has more; it bounds GitHub reads per view.
+_PULL_REQUEST_STATUS_MAX = 20
 
 
 def _spawn_mention_delivery(
@@ -1306,6 +1309,42 @@ def create_project_tickets_router(
             limit=limit,
             kind=kind,
         )
+
+    @router.get("/{ticket_id}/pull-requests")
+    async def pull_requests(request: Request, project_id: str, ticket_id: str) -> dict[str, Any]:
+        """Live GitHub state and CI of the ticket's pull request outputs, read-only.
+
+        A PR GitHub won't show is left out, so the client keeps a plain link.
+        """
+        who = await actor(request, project_id)
+        urls: list[str] = []
+        after = -1
+        while True:
+            page = await asyncio.to_thread(
+                store.events,
+                project_id,
+                ticket_id,
+                user_id=who.user_id,
+                after=after,
+                limit=100,
+                kind="output",
+            )
+            for event in page["data"]:
+                payload = event.get("payload") or {}
+                url = payload.get("url")
+                if payload.get("type") == "pull_request" and isinstance(url, str):
+                    if url not in urls:
+                        urls.append(url)
+            if not page.get("has_more") or len(urls) >= _PULL_REQUEST_STATUS_MAX:
+                break
+            after = page["last_position"]
+        statuses = await asyncio.gather(
+            *(
+                asyncio.to_thread(github_pr_status.pull_request_status, url)
+                for url in urls[:_PULL_REQUEST_STATUS_MAX]
+            )
+        )
+        return {"data": [status for status in statuses if status is not None]}
 
     @router.get("/{ticket_id}/sessions")
     async def sessions(

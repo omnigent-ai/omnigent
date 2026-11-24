@@ -1975,3 +1975,34 @@ async def test_adding_and_removing_one_label_keeps_the_permission_rules(project_
     assert [label["key"] for label in trimmed.json()["labels"]] == ["risk-ok"]
     both = await project_client.patch(path, json={"labels": [], "remove_labels": ["risk-ok"]})
     assert both.status_code in (400, 422)
+
+
+async def test_pull_request_statuses_cover_readable_pr_outputs_only(project_client, monkeypatch):
+    from typing import Any
+
+    from omnigent.server import github_pr_status
+
+    readable = "https://github.com/example/repo/pull/1"
+    unreadable = "https://github.com/example/repo/pull/2"
+    asked: list[str] = []
+
+    def fake_status(url: str) -> dict[str, Any] | None:
+        asked.append(url)
+        return {"url": url, "state": "OPEN"} if url == readable else None
+
+    monkeypatch.setattr(github_pr_status, "pull_request_status", fake_status)
+    project = (await project_client.post("/v1/projects", json={"name": "Pills"})).json()
+    path = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(path, json={"title": "PRs"})).json()
+    path += f"/{ticket['id']}"
+    outputs = [
+        {"type": "pull_request", "url": readable},
+        {"type": "pull_request", "url": unreadable},
+        {"type": "link", "url": "https://example.com/docs"},
+    ]
+    await project_client.post(path + "/comments", json={"text": "PRs", "outputs": outputs})
+    await project_client.post(path + "/comments", json={"text": "Again", "outputs": outputs[:1]})
+    response = await project_client.get(path + "/pull-requests")
+    assert response.status_code == 200
+    assert response.json() == {"data": [{"url": readable, "state": "OPEN"}]}
+    assert asked == [readable, unreadable]

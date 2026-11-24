@@ -45,15 +45,17 @@ def is_outside_requester(requested_by: str | None) -> bool:
     return bool(requested_by) and str(requested_by).startswith(GITHUB_REQUESTER_PREFIX)
 
 
-def fetch_pr(owner: str, repo: str, number: int) -> dict[str, Any]:
-    """Read one PR from GitHub without writing anything."""
-    path = f"repos/{owner}/{repo}/pulls/{number}"
+def fetch_json(path: str, *, timeout_s: float = _FETCH_TIMEOUT_S) -> Any:
+    """GET one GitHub REST path read-only: ``gh api`` first, then the public API.
+
+    :raises OmnigentError: when neither can read it.
+    """
     try:
         result = subprocess.run(
             ["gh", "api", path],
             capture_output=True,
             text=True,
-            timeout=_FETCH_TIMEOUT_S,
+            timeout=timeout_s,
             check=False,
         )
         if result.returncode == 0:
@@ -65,11 +67,21 @@ def fetch_pr(owner: str, repo: str, number: int) -> dict[str, Any]:
         headers={"Accept": "application/vnd.github+json", "User-Agent": "omnigent-pr-intake"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_S) as response:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
             return json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         raise OmnigentError(
-            f"Couldn't read {owner}/{repo}#{number} from GitHub: {exc}",
+            f"Couldn't read {path} from GitHub: {exc}", code=ErrorCode.RUNNER_UNAVAILABLE
+        ) from exc
+
+
+def fetch_pr(owner: str, repo: str, number: int) -> dict[str, Any]:
+    """Read one PR from GitHub without writing anything."""
+    try:
+        return fetch_json(f"repos/{owner}/{repo}/pulls/{number}")
+    except OmnigentError as exc:
+        raise OmnigentError(
+            f"Couldn't read {owner}/{repo}#{number} from GitHub: {exc.__cause__ or exc}",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
 

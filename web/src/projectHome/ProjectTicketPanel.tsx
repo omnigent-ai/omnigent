@@ -51,6 +51,7 @@ import {
   createTicket,
   getProjectFile,
   getTicket,
+  getTicketPullRequests,
   labelChanges,
   openProjectFile,
   ticketOutputs,
@@ -59,6 +60,7 @@ import {
   type TicketEvent,
   type TicketFinalUpdate,
   type TicketOutput,
+  type TicketPullRequestStatus,
   type TicketLabel,
 } from "@/lib/projectTicketsApi";
 import { getCurrentUserId } from "@/lib/identity";
@@ -99,6 +101,7 @@ import {
 import { TicketFollowUps, TicketRelatedTickets } from "./TicketRelatedTickets";
 import { TicketShipBlocker } from "./TicketShipBlocker";
 import { SUMMARY_MIN_EVENTS, TicketHistorySummary } from "./TicketHistorySummary";
+import { TicketPullRequestPills } from "./TicketPullRequestPills";
 import { parseAskPosition, useTicketAsk } from "./useTicketAsk";
 import { useTicketSeen } from "./useTicketSeen";
 import {
@@ -1093,9 +1096,29 @@ function LabelEditor({
   );
 }
 
+// Live PR state is a glance, not a feed: refresh it at most once a minute.
+const PULL_REQUEST_STATUS_STALE_MS = 60_000;
+
+/** Each pull request's live status by URL; empty while loading or when GitHub can't be read. */
+function useTicketPullRequestStatuses(projectId: string, ticketId: string, enabled: boolean) {
+  const query = useQuery({
+    queryKey: ["project-tickets", projectId, ticketId, "pull-requests"],
+    queryFn: () => getTicketPullRequests(projectId, ticketId),
+    enabled,
+    staleTime: PULL_REQUEST_STATUS_STALE_MS,
+    retry: false,
+  });
+  return new Map((query.data?.data ?? []).map((status) => [status.url, status]));
+}
+
 function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: string }) {
   const query = useTicketEvents(projectId, ticketId, "output");
   const outputs = ticketOutputs(query.data?.pages.flatMap((page) => page.data) ?? []);
+  const pullRequestStatuses = useTicketPullRequestStatuses(
+    projectId,
+    ticketId,
+    outputs.some((output) => output.type === "pull_request"),
+  );
   if (outputs.length === 0 && !query.error && !query.hasNextPage) return null;
   return (
     <div className="space-y-4">
@@ -1115,7 +1138,10 @@ function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: s
             <ul className="divide-y divide-border/60 overflow-hidden rounded-lg border border-border/60">
               {group.map((output) => (
                 <li key={output.url}>
-                  <TicketOutputLink output={output} />
+                  <TicketOutputLink
+                    output={output}
+                    pullRequestStatus={pullRequestStatuses.get(output.url)}
+                  />
                   <TicketArtifactImage output={output} className="px-3 pb-3" />
                 </li>
               ))}
@@ -1231,7 +1257,16 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function TicketOutputLink({ output, inline = false }: { output: TicketOutput; inline?: boolean }) {
+function TicketOutputLink({
+  output,
+  inline = false,
+  pullRequestStatus,
+}: {
+  output: TicketOutput;
+  inline?: boolean;
+  /** Live GitHub status; without it a PR reads as a plain link. */
+  pullRequestStatus?: TicketPullRequestStatus;
+}) {
   if (output.type === "artifact") return <TicketArtifactLink output={output} inline={inline} />;
   const url = parseHttpUrl(output.url);
   if (!url) return null;
@@ -1261,12 +1296,17 @@ function TicketOutputLink({ output, inline = false }: { output: TicketOutput; in
         ))}
       <span className={inline ? undefined : "min-w-0 flex-1"}>
         <span className={inline ? undefined : "block truncate text-sm font-medium"}>{label}</span>
-        {!inline && (
-          <span className="block text-sm text-muted-foreground">
-            {output.type === "pull_request" ? "Pull request" : "Link"}
-            {pullRequest ? ` on ${url.host}` : ""}
-          </span>
-        )}
+        {!inline &&
+          (pullRequestStatus ? (
+            <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
+              <TicketPullRequestPills status={pullRequestStatus} />
+            </span>
+          ) : (
+            <span className="block text-sm text-muted-foreground">
+              {output.type === "pull_request" ? "Pull request" : "Link"}
+              {pullRequest ? ` on ${url.host}` : ""}
+            </span>
+          ))}
       </span>
       {!inline && (
         <ExternalLinkIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />

@@ -26701,6 +26701,60 @@
         ]
       }
     },
+    "/v1/projects/{project_id}/tickets/{ticket_id}/pull-requests": {
+      "get": {
+        "description": "Live GitHub state and CI of the ticket's pull request outputs, read-only.\n\nA PR GitHub won't show is left out, so the client keeps a plain link.",
+        "operationId": "pull_requests_v1_projects__project_id__tickets__ticket_id__pull_requests_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Pull Requests V1 Projects  Project Id  Tickets  Ticket Id  Pull Requests Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pull Requests",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
     "/v1/projects/{project_id}/tickets/{ticket_id}/read-state": {
       "put": {
         "operationId": "mark_seen_v1_projects__project_id__tickets__ticket_id__read_state_put",

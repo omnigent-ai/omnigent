@@ -276,6 +276,21 @@ export async function getPushPrefix(projectId: string): Promise<PushPrefix | nul
   return (await response.json()) as PushPrefix;
 }
 
+/** Live GitHub state and CI for one of a ticket's pull request outputs. */
+export interface TicketPullRequestStatus {
+  url: string;
+  state: "OPEN" | "MERGED" | "CLOSED";
+  is_draft: boolean;
+  merge_state_status?: string | null;
+  checks_supported?: boolean;
+  checks: { failing: number; pending: number; total: number; partial?: boolean };
+}
+
+/** The ticket's readable pull requests; one GitHub can't read is left out. */
+export function getTicketPullRequests(projectId: string, ticketId: string) {
+  return request<{ data: TicketPullRequestStatus[] }>(`${path(projectId, ticketId)}/pull-requests`);
+}
+
 export function getTicketSummary(projectId: string) {
   return request<TicketSummary>(`${path(projectId)}/summary`);
 }
