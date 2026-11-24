@@ -3654,7 +3654,9 @@ function ConversationList({
     }),
     [projectOrderNames, orderingFacts],
   );
-  usePublishProjectOrdering(publishedOrdering);
+  // Only ⌘K's QuickPick palette reads it.
+  const publishesProjectOrdering = useQuickPickPaletteEnabled();
+  usePublishProjectOrdering(publishedOrdering, publishesProjectOrdering);
 
   const sessionsBulkBar =
     sessionsSelecting && !unifiedSelection ? (

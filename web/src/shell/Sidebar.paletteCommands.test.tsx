@@ -2,7 +2,7 @@
 // itself from the same models its headers and menus render, running the same handlers.
 
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as ProjectsApiModule from "@/lib/projectsApi";
@@ -178,11 +178,17 @@ describe("the project list in ⌘K", () => {
     expect(await screen.findByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
   });
 
-  it("registers nothing with the flag off", async () => {
-    renderSidebar({ features: {} });
+  it("registers nothing with the flag off, and never writes the project order", async () => {
+    const writes = vi.fn();
+    const unsubscribe = projectOrderingStore.subscribe(writes);
+    onTestFinished(unsubscribe);
+    const view = renderSidebar({ features: {} });
     await screen.findByText("Alpha");
     expect(labels()).toEqual([]);
-    expect(projectOrderingStore.getState().ordering).not.toBeNull();
+    view.setOpen(true);
+    view.unmount();
+    expect(writes).not.toHaveBeenCalled();
+    expect(projectOrderingStore.getState().ordering).toBeNull();
   });
 });
 

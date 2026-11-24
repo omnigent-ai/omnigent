@@ -17,12 +17,16 @@ export const projectOrderingStore = create<{ ordering: ProjectOrdering | null }>
   ordering: null,
 }));
 
-/** Publish `ordering` while mounted; the project list owns it. */
-export function usePublishProjectOrdering(ordering: ProjectOrdering): void {
+/** Publish `ordering` while mounted and `enabled`; the project list owns it. */
+export function usePublishProjectOrdering(ordering: ProjectOrdering, enabled: boolean): void {
   useEffect(() => {
+    if (!enabled) return;
     projectOrderingStore.setState({ ordering });
-  }, [ordering]);
-  useEffect(() => () => projectOrderingStore.setState({ ordering: null }), []);
+  }, [enabled, ordering]);
+  useEffect(() => {
+    if (!enabled) return;
+    return () => projectOrderingStore.setState({ ordering: null });
+  }, [enabled]);
 }
 
 export function useProjectOrdering(): ProjectOrdering | null {
