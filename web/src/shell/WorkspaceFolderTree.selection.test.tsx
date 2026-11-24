@@ -27,9 +27,9 @@ vi.mock("@/lib/workspaceApi", async (importOriginal) => ({
 
 const SIBLINGS = ["a.ts", "b.ts", "c.ts"];
 
-function serveSiblings() {
+function serveSiblings(names: () => string[] = () => SIBLINGS) {
   vi.mocked(authenticatedFetch).mockImplementation(async () => {
-    const data = SIBLINGS.map((name) => ({
+    const data = names().map((name) => ({
       id: `src/${name}`,
       name,
       path: `src/${name}`,
@@ -98,6 +98,36 @@ describe("WorkspaceFolderTree selection", () => {
     fireEvent.keyDown(third, { key: "Enter" });
 
     expect(onOpenFile.mock.calls).toEqual([["b.ts"], ["c.ts"]]);
+  });
+
+  it("opens files that arrive after the folder first listed empty", async () => {
+    let names: string[] = [];
+    serveSiblings(() => names);
+    const onOpenFile = vi.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <WorkspaceFolderTree
+          conversationId="conv_picker"
+          folder="src"
+          revealPath="a.ts"
+          label="Files in src"
+          dark={false}
+          onOpenFile={onOpenFile}
+        />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("This folder is empty.");
+
+    names = SIBLINGS;
+    await client.refetchQueries();
+    fireEvent.click(await row("b.ts"));
+    const third = await row("c.ts");
+    third.focus();
+    fireEvent.keyDown(third, { key: "Enter" });
+
+    expect(onOpenFile.mock.calls).toEqual([["b.ts"], ["c.ts"]]);
+    expect(screen.queryByText("This folder is empty.")).toBeNull();
   });
 
   it("opens a sibling a person clicks in the breadcrumb popover, and closes it", async () => {

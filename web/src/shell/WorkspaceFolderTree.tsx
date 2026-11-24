@@ -209,14 +209,15 @@ function LoadedFolderTree({
     return () => cancelAnimationFrame(frame);
   }, [model, focusTarget]);
 
-  if (isEmpty) return <TreeMessage>This folder is empty.</TreeMessage>;
   return (
+    // The tree stays mounted while its folder is empty, so its listeners are there once files arrive.
     <div
       ref={treeContainer}
       className="flex min-h-0 flex-1 flex-col"
       onKeyDownCapture={() => (readerActed.current = true)}
       onPointerDownCapture={() => (readerActed.current = true)}
     >
+      {isEmpty && <TreeMessage>This folder is empty.</TreeMessage>}
       <FileTree
         model={model}
         aria-label={label}
@@ -226,9 +227,10 @@ function LoadedFolderTree({
           flex: 1,
           minHeight: 0,
           colorScheme: dark ? "dark" : "light",
+          ...(isEmpty ? { display: "none" } : {}),
         }}
       />
-      {(failedLoad ?? pendingLoad) && (
+      {!isEmpty && (failedLoad ?? pendingLoad) && (
         <div
           role="status"
           className="flex shrink-0 items-center justify-between gap-2 border-t border-border px-3 py-1.5 text-ui text-muted-foreground"
