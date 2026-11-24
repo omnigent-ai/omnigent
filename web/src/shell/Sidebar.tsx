@@ -334,6 +334,7 @@ import {
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
   isSharedAutomationRun,
+  sessionBelongsToProject,
   sessionInSidebarFolder,
   sessionsListAcceptsDrop,
   UNTITLED_CONVERSATION_LABEL,
@@ -455,8 +456,11 @@ const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // The filter menu's "Show" toggles: which optional metadata each row renders.
 const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
-// True for rows listed inside their project's folder, which already names the project.
-const InProjectFolderContext = createContext(false);
+// The project folder a row is listed in, if any. A row filed there sits under the
+// folder's name; another owner's run placed in the automation folder isn't filed there.
+const EnclosingProjectFolderContext = createContext<{ id: string | null; name: string } | null>(
+  null,
+);
 // Row-invariant values resolved once at the list owner and shared, so a row
 // doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
 // `useViewerId` (an identity-resolve effect) per instance.
@@ -2023,6 +2027,7 @@ function ProjectFolder({
   });
   const orderedMenuActions = { ...menuActions, ordering };
 
+  const enclosingFolder = useMemo(() => ({ id: projectId, name }), [projectId, name]);
   let footer: ReactNode = null;
   if (loadingFirstPage) {
     footer = (
@@ -2075,8 +2080,7 @@ function ProjectFolder({
           style={ordering.insertion === "before" ? { top: 0 } : { bottom: 0 }}
         />
       )}
-      {/* Rows here sit under the project's name, so they don't repeat it. */}
-      <InProjectFolderContext.Provider value={true}>
+      <EnclosingProjectFolderContext.Provider value={enclosingFolder}>
         <ConversationSection
           headerDrag={placeholder ? undefined : headerDrag}
           title={shownName}
@@ -2197,7 +2201,7 @@ function ProjectFolder({
           }
           footer={footer}
         />
-      </InProjectFolderContext.Provider>
+      </EnclosingProjectFolderContext.Provider>
       {menuDialogs}
     </div>
   );
@@ -6419,10 +6423,13 @@ function ConversationRowImpl({
   const trailingLayout =
     TRAILING_SLOT_LAYOUT[trailingSlotKind(sessionState, hasSessionIndicator, showUpdated)];
   const showHarness = show.includes("harness");
-  // Folder rows sit under their project's name; pins and other groupings don't.
-  const inProjectFolder = useContext(InProjectFolderContext);
+  // A row in its own project's folder already sits under that name; pins, other
+  // groupings and runs placed in the automation folder don't.
+  const enclosingFolder = useContext(EnclosingProjectFolderContext);
+  const inOwnProjectFolder =
+    enclosingFolder !== null && sessionBelongsToProject(conversation, enclosingFolder, viewerId);
   const metaProject =
-    show.includes("project") && !inProjectFolder && currentProject !== null
+    show.includes("project") && !inOwnProjectFolder && currentProject !== null
       ? { name: currentProject, icon: projectFlyoutIcon }
       : null;
   const metaEnvironment = show.includes("environment") ? (

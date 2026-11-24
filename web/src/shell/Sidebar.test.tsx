@@ -6154,6 +6154,28 @@ describe("sidebar_grouping_ui release flag", () => {
     for (const run of SHARED_RUNS) expect(screen.getByText(run.id)).toBeInTheDocument();
   });
 
+  it("names a shared run's own project in the automation folder when Project is shown", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["project"] }));
+    projectsMock.push("Alpha", "Omnigent Automation");
+    mockScopedConversations([
+      conv("conv_own_run", "Claude Code", {
+        labels: { ...RUN_LABELS, omni_project: "Omnigent Automation" },
+      }),
+      ...SHARED_RUNS,
+    ]);
+    renderGroupingSidebar();
+    selectSessionFilter("all");
+    fireEvent.click(screen.getByRole("button", { name: /^Omnigent Automation/ }));
+    const meta = (id: string) =>
+      within(within(automationFolder()).getByText(id).closest("li")!).queryByTestId(
+        "session-row-meta",
+      );
+    // Alice filed this run in her Alpha, not in this folder, so the row names Alpha.
+    expect(meta("conv_shared_run")).toHaveTextContent(/^Alpha$/);
+    // The viewer's own run is filed here, under the folder's name already.
+    expect(meta("conv_own_run")).toBeNull();
+  });
+
   it("shows the folder where the viewer's project will go until they have it", () => {
     projectsMock.push("Alpha", "Zeta");
     mockScopedConversations(SHARED_RUNS);
