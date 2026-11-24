@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import omnigent.stores.gadget_store.local as local_module
 from omnigent.gadgets.documents import ImmutableDocumentStore, StoreLimits
 from omnigent.stores.gadget_store import (
     CapacityExceeded,
@@ -272,6 +274,53 @@ def test_a_late_remover_never_deletes_the_record_created_again(env: Env) -> None
     env.docs._finish_purge(ref, marker)
     assert env.docs.get("cards", "a") == again
     assert env.docs.verify_record("cards", "a").revisions == 1  # type: ignore[union-attr]
+
+
+def test_a_remover_paused_just_before_deleting_never_deletes_the_record_created_again(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_module, "_EXCLUSIVE_WAIT_S", 0.2)
+    a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
+    env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
+    env.clock.advance(61)
+    ref = env.docs._ref("cards", "a")
+    head = env.docs._load_head(ref)
+    assert head is not None
+    original = env.docs._finish_purge
+    env.docs._finish_purge = lambda ref, marker: None  # type: ignore[method-assign]
+    env.docs._purge(ref, head)
+    env.docs._finish_purge = original  # type: ignore[method-assign]
+    marker = env.docs._load_head(ref).latest  # type: ignore[union-attr]
+
+    # The first remover passes its last check, then stalls right before deleting the record.
+    at_delete, resume = threading.Event(), threading.Event()
+    real_delete = env.files.delete_tree
+    stalled: list[str] = []
+
+    def delete_tree(path: str) -> None:
+        if path == ref.directory and not stalled:
+            stalled.append(path)
+            at_delete.set()
+            resume.wait(60)
+        real_delete(path)
+
+    env.files.delete_tree = delete_tree  # type: ignore[method-assign]
+    slow = threading.Thread(target=env.docs._finish_purge, args=(ref, marker))
+    slow.start()
+    assert at_delete.wait(10)
+    # Its ticket is old enough to take over, but it still holds the record: the next
+    # remover leaves the record alone, and nothing can create it again meanwhile.
+    env.clock.advance(31)
+    taker = ImmutableDocumentStore(env.files, "data", limits=SMALL, clock=env.clock)
+    taker._finish_purge(ref, marker)
+    assert taker._load_head(ref) is not None
+    with pytest.raises(Conflict):
+        taker.create("cards", "a", {"n": 2}, "op-a2", ACTOR)
+    resume.set()
+    slow.join(10)
+    again = env.docs.create("cards", "a", {"n": 2}, "op-a3", ACTOR)
+    env.docs._finish_purge(ref, marker)
+    assert env.docs.get("cards", "a") == again
 
 
 def test_only_the_ticket_holder_removes_a_record_until_it_stops(env: Env) -> None:

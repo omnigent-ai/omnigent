@@ -25,6 +25,7 @@ Paths given to :class:`GadgetFiles` are relative POSIX paths such as
 from __future__ import annotations
 
 import bisect
+import contextlib
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
@@ -181,9 +182,18 @@ class GadgetFiles(ABC):
     def delete_tree(self, path: str) -> None:
         """Delete a file, or a directory with everything under it; nothing if it is missing.
 
-        Readers see the whole tree disappear at once, never part of it.
+        Readers see the whole tree disappear at once, never part of it. A store that
+        deletes must also implement :meth:`exclusive`.
         """
         raise NotImplementedError
+
+    @contextlib.contextmanager
+    def exclusive(self, name: str) -> Iterator[bool]:  # noqa: ARG002
+        """Hold the lock *name* in this scope against every process using the same storage,
+        for a check and the deletion it allows; yields whether it is held. A store that
+        cannot delete has nothing to guard and yields ``True``.
+        """
+        yield True
 
     @abstractmethod
     def read_json(self, path: str) -> dict:

@@ -43,7 +43,7 @@ import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from omnigent.stores.gadget_store import (
     GADGET_ID_PATTERN,
@@ -64,6 +64,8 @@ from omnigent.stores.gadget_store import (
 _GADGET_ID = GADGET_ID_PATTERN
 _OWNER_SEGMENT = re.compile(r"s[0-9]{8}")
 _OWNER_SEGMENT_SIZE = 1000
+# How long a remover waits for another to finish with the same record before leaving it.
+_EXCLUSIVE_WAIT_S = 5
 # A page cursor: the segment, and the last gadget ID read in it (none: start of the segment).
 _OWNER_CURSOR = re.compile(rf"({_OWNER_SEGMENT.pattern})/((?:{GADGET_ID_PATTERN.pattern})?)")
 _METADATA_FILE = "gadget.json"
@@ -133,6 +135,23 @@ class LocalGadgetFiles(GadgetFiles):
         self._root = root
         self._tmp_dir = tmp_dir
         self._create_root = create_root
+
+    @contextlib.contextmanager
+    def exclusive(self, name: str) -> Iterator[bool]:
+        # Lock files sit beside the store's staging directory, named for the scope and *name*.
+        key = hashlib.sha256(f"{self._root}\n{name}".encode()).hexdigest()[:32]
+        locks = self._tmp_dir.parent / ".locks"
+        locks.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(str(locks / f"{key}.lock"), timeout=_EXCLUSIVE_WAIT_S)
+        try:
+            lock.acquire()
+        except Timeout:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            lock.release()
 
     def _missing_scope(self) -> NotFound:
         if self._create_root:

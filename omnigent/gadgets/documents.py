@@ -1263,22 +1263,30 @@ class ImmutableDocumentStore:
 
         Fenced by *marker*, the purge revision: only the holder of its newest removal
         ticket deletes, and only while *marker* is still the record's newest revision.
-        A remover that finds another holding the ticket, or the record already gone or
-        created again, leaves it alone.
+        The check and the deletions it allows run under the record's lock
+        (:meth:`GadgetFiles.exclusive`), which every remover takes, so a remover that
+        stalls after its check holds off the one that takes over: the record can't be
+        removed and created again in between, and its deletion never reaches a new one.
+        A remover that finds another holding the lock or the ticket, or the record already
+        gone or created again, leaves it alone.
         """
         tickets = f"{self._root}/.removals/{ref.collection}/{ref.doc_id}/{marker.digest[:32]}"
-        ticket = self._take_removal_ticket(tickets)
-        if ticket is None:
-            return
-        claim = self._claim_path(ref.collection, ref.doc_id)
-        creates = f"{self._root}/.creates/{ref.collection}/{ref.doc_id}"
-        for path in (claim, creates, ref.directory):
-            if path is None:
-                continue
+        with self._files.exclusive(
+            f"{self._root}/.removing/{ref.collection}/{ref.doc_id}"
+        ) as held:
+            if not held:
+                return
+            ticket = self._take_removal_ticket(tickets)
+            if ticket is None:
+                return
             if not self._still_removing(ref, marker, tickets, ticket):
-                break
-            self._files.delete_tree(path)
-        self._files.delete_tree(tickets)
+                return
+            claim = self._claim_path(ref.collection, ref.doc_id)
+            creates = f"{self._root}/.creates/{ref.collection}/{ref.doc_id}"
+            for path in (claim, creates, ref.directory):
+                if path is not None:
+                    self._files.delete_tree(path)
+            self._files.delete_tree(tickets)
 
     def _removal_tickets(self, tickets: str) -> _IntList:
         try:
