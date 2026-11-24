@@ -213,7 +213,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     !!proposedSteps?.length &&
     (stepSignature(proposedSteps) !== stepSignature(workflow.steps) || newDescription !== null);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
-  const canRun = !isDraft && !hasChanges;
+  // A run copies the saved steps, so it waits for a time limit being saved.
+  const canRun = !isDraft && !hasChanges && !saveTimeLimit.isPending;
   const canShare = !isViewer && workflowSharingAvailable(info);
   const shareDisabledReason = isSharingOff(info)
     ? SHARING_OFF_REASON
@@ -235,6 +236,15 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               }
             : step,
         ),
+        // The menu shows only while no proposal is offered, so the description stands over the
+        // current one; recording that keeps a later proposal's offer from going by this save's time.
+        ...(proposal
+          ? {
+              description: workflow.description,
+              expected_description: workflow.description,
+              description_source: proposal.id,
+            }
+          : {}),
       },
       { onError: (saveError) => showToast(`Couldn’t save the time limit. ${saveError.message}`) },
     );

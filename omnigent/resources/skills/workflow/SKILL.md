@@ -495,7 +495,9 @@ note. Whenever you resume or wake for anything else, also compare `date -u`
 with the time in each limited step's note. For a step past its limit:
 
 1. Read it with `sys_journal_read` (`step`: its ID). Stop here if it's done or
-   failed, or if you already told the user during this attempt.
+   failed, if the run is stopped, if the firing's `timer_id` isn't the one in
+   the step's latest time limit note, or if you already told the user during
+   this attempt.
 2. Check what it waits on, such as a nested agent's journal, CI or a job, and
    fix what you can, as for any stalled step.
 3. Tell the user. The limit is their explicit request to hear this, so it
@@ -514,10 +516,11 @@ with the time in each limited step's note. For a step past its limit:
      session (`{"type": "session", "ref": "<your session ID>"}`, from
      `sys_session_get_info`), and `topic: "time limit <step ID> <time from
      its note>"`, so a later attempt's overrun posts a new item.
-   - Without either tool, say it in the step's status text, such as "Over
-     its 2-hour limit; waiting on web-app's tests", and in your reply.
-4. Note on the step that you told the user, so a later check doesn't tell
-   them again.
+   - Without either tool, or when the post is refused (a session can post
+     only a few Inbox items), say it in the step's status text, such as
+     "Over its 2-hour limit; waiting on web-app's tests", and in your reply.
+4. Once the question, post or status went through, note on the step that you
+   told the user, so a later check doesn't tell them again.
 
 ## Measurable goals
 

@@ -29,8 +29,9 @@ function descriptionLines(goal: string | null): string[] {
 /** The step's time limit as its description words it, e.g. "2 hours"; null without one. */
 export function stepTimeLimit(goal: string | null): string | null {
   for (const line of descriptionLines(goal)) {
+    // An empty line names no limit; a later one may.
     const match = LIMIT_LINE.exec(line);
-    if (match) return match[1] || null;
+    if (match?.[1]) return match[1];
   }
   return null;
 }
