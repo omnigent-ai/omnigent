@@ -4166,6 +4166,7 @@ function projectMarkerState(
   let terminalReason: string | undefined;
   let running = false;
   let starting = false;
+  let background = false;
   let error = false;
   let disconnected = false;
   let unseen = false;
@@ -4177,10 +4178,12 @@ function projectMarkerState(
     if (state?.kind === "awaiting") {
       awaiting += state.count;
       terminalReason ??= state.terminalReason;
-    } else if (state?.kind === "running") {
+    } else if (state?.kind === "running" && !state.background) {
       running = true;
     } else if (c.id === startingConversationId) {
       starting = true;
+    } else if (state?.kind === "running") {
+      background = true;
     } else if (state?.kind === "error") {
       error = true;
     } else if (state?.kind === "disconnected") {
@@ -4193,6 +4196,7 @@ function projectMarkerState(
   if (terminalReason) return { kind: "awaiting", count: 0, terminalReason };
   if (running) return { kind: "running" };
   if (starting) return { kind: "starting" };
+  if (background) return { kind: "running", background: true };
   if (error) return { kind: "error" };
   if (disconnected) return { kind: "disconnected" };
   if (unseen) return { kind: "unseen" };
@@ -6336,8 +6340,9 @@ function ConversationRowImpl({
   const isStartingUp = useChatStore(
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
+  // A send waking the session shows its startup spinner over background work.
   const sessionState =
-    badgeState?.kind === "awaiting" || badgeState?.kind === "running"
+    badgeState?.kind === "awaiting" || (badgeState?.kind === "running" && !badgeState.background)
       ? badgeState
       : isStartingUp
         ? { kind: "starting" as const }
