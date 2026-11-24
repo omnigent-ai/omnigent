@@ -235,8 +235,14 @@ def build_session_history(
                 _skipped_types.append(str(item_type))
             if item_type == "message":
                 content = item.get("content", [])
-                if item.get("sender_in_context") is True and item.get("role", "user") == "user":
-                    content = with_message_sender(content, item.get("created_by"))
+                sender = item.get("created_by")
+                if (
+                    item.get("sender_in_context") is True
+                    and item.get("role", "user") == "user"
+                    and isinstance(content, list)
+                    and isinstance(sender, str)
+                ):
+                    content = with_message_sender(content, sender)
                 result.append(
                     {
                         "type": "message",
