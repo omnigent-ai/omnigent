@@ -436,6 +436,25 @@ def _owner_request(app: Any, key: str, template: Any | None = None) -> Request:
     return Request(scope)
 
 
+def carried_over_session_choices(previous: Any, config: dict[str, Any]) -> dict[str, Any]:
+    """The old Lead's model, effort and harness to keep, where the project sets none.
+
+    A default the project sets (for example the Lead's model chosen in Team) wins,
+    so the new Lead picks it up instead of inheriting its predecessor's.
+    """
+    if previous is None:
+        return {}
+    return {
+        field: value
+        for field, config_key, value in (
+            ("model_override", "model", previous.model_override),
+            ("reasoning_effort", "effort", previous.reasoning_effort),
+            ("harness_override", "harness", previous.harness_override),
+        )
+        if value and field not in config and config_key not in config
+    }
+
+
 async def start_fresh_main_session(
     app: Any,
     project: Project,
@@ -481,14 +500,7 @@ async def start_fresh_main_session(
         "project_main_session": True,
         "expected_main_session_id": expected_main_session_id,
     }
-    if previous is not None:
-        for field, value in (
-            ("model_override", previous.model_override),
-            ("reasoning_effort", previous.reasoning_effort),
-            ("harness_override", previous.harness_override),
-        ):
-            if value and field not in project.config:
-                base[field] = value
+    base.update(carried_over_session_choices(previous, project.config))
     payload = await project_session_payload(request, project, base)
     if not payload.get("agent_id"):
         payload["agent_id"] = await default_project_agent_id(

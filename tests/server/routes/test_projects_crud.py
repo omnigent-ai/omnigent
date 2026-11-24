@@ -501,6 +501,15 @@ async def test_only_the_owner_edits_the_leads_charter_and_only_the_lead_reads_it
     assert worker.json()["project_lead_charter"] is None
     cleared = await project_client.patch(lead_path, json={"instructions": " "})
     assert cleared.json()["instructions"] == ""
+    # Its agent, model and effort are the project's defaults; agents can't change them.
+    tuned = await project_client.patch(lead_path, json={"model": "m2", "effort": "high"})
+    assert (tuned.json()["model"], tuned.json()["effort"]) == ("m2", "high")
+    stored = (await project_client.get(f"/v1/projects/{created['id']}")).json()["config"]
+    assert (stored["model"], stored["effort"]) == ("m2", "high")
+    refused = await project_client.patch(lead_path, json={"model": "m3"}, headers=agent)
+    assert refused.status_code == 403
+    reset = await project_client.patch(lead_path, json={"effort": ""})
+    assert (reset.json()["model"], reset.json()["effort"]) == ("m2", None)
 
 
 async def test_the_owner_routes_events_to_a_persona_and_can_remove_the_lead(

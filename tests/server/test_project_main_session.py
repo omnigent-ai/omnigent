@@ -49,3 +49,23 @@ def test_orchestrator_access_does_not_replace_normal_launch_selection(scenario):
     seed_orchestrator_access(request, metadata, "claude-native")
     assert metadata.terminal_launch_args is None
     assert metadata.labels == {}
+
+
+def test_a_rolled_over_lead_takes_the_projects_defaults_over_its_predecessors() -> None:
+    """A model or effort set for the Lead in Team beats the old Lead's launch choice."""
+    from types import SimpleNamespace
+
+    from omnigent.server.project_orchestrator_rollover import carried_over_session_choices
+
+    previous = SimpleNamespace(
+        model_override="old-model", reasoning_effort="low", harness_override="codex"
+    )
+    assert carried_over_session_choices(previous, {}) == {
+        "model_override": "old-model",
+        "reasoning_effort": "low",
+        "harness_override": "codex",
+    }
+    assert carried_over_session_choices(previous, {"model": "m2", "effort": "high"}) == {
+        "harness_override": "codex"
+    }
+    assert carried_over_session_choices(None, {}) == {}

@@ -8,6 +8,10 @@ import {
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useLaunchModelOptions } from "@/hooks/useLaunchModelOptions";
+import { selectableSessionAgents } from "@/lib/agentGrouping";
+import { pickerCuration } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { harnessReadinessOnHost } from "@/lib/harnessSetup";
 import { normalizeEffortLabel, nativeModelLabel } from "@/lib/composerModelLabel";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
@@ -17,9 +21,15 @@ import { firstAvailableNativeAgent } from "./projectAgentDefaults";
 // Radix Select can't use an empty value, so "Project default" gets a sentinel.
 const DEFAULT_CHOICE = "__default__";
 
+export interface IdentitySessionChoice {
+  agentId: string;
+  model: string;
+  effort: string;
+}
+
 /**
- * Model and effort for an identity's sessions, chosen from what the project's
- * host and the identity's agent support. Empty values mean the project default.
+ * Agent, model and effort for an identity's sessions, chosen from what the
+ * project's host and that agent support. Empty values mean the default.
  */
 export function IdentityModelEffortFields({
   config,
@@ -27,22 +37,26 @@ export function IdentityModelEffortFields({
   model,
   effort,
   disabled,
+  defaultLabel = "Project default",
   onChange,
-}: {
+}: IdentitySessionChoice & {
   config: ProjectConfig | undefined;
-  agentId: string | null;
-  model: string;
-  effort: string;
   disabled: boolean;
-  onChange: (next: { model: string; effort: string }) => void;
+  /** Label for the empty choice, e.g. "Default" where these are the project defaults. */
+  defaultLabel?: string;
+  onChange: (next: IdentitySessionChoice) => void;
 }) {
+  const info = useServerInfo();
   const sandbox = config?.host_id === SANDBOX_HOST_CHOICE;
   const hosts = useHosts({ enabled: !!config?.host_id && !sandbox });
   const host = sandbox ? undefined : hosts.data?.find((entry) => entry.host_id === config?.host_id);
   const catalog = useAvailableAgents({ enabled: config !== undefined });
-  const agents = catalog.data ?? [];
+  const agents = selectableSessionAgents(
+    catalog.data ?? [],
+    pickerCuration(info).restrictToAgentNames,
+  ).filter((entry) => nativeCodingAgentForAvailableAgent(entry));
   // Sessions launch with the identity's agent, else the project's, else the first usable one.
-  const preferred = agentId ?? config?.agent_id ?? null;
+  const preferred = agentId || config?.agent_id || null;
   const agent =
     (preferred ? agents.find((entry) => entry.id === preferred) : undefined) ??
     firstAvailableNativeAgent(agents, host);
@@ -80,11 +94,45 @@ export function IdentityModelEffortFields({
   const selectModel = (value: string) => {
     const next = value === DEFAULT_CHOICE ? "" : value;
     const keepEffort = options.effortsForModel(next).some((option) => option.value === effort);
-    onChange({ model: next, effort: keepEffort ? effort : "" });
+    onChange({ agentId, model: next, effort: keepEffort ? effort : "" });
   };
+  // Another agent has its own catalog, so its model and effort start from the default.
+  const selectAgent = (value: string) =>
+    onChange({ agentId: value === DEFAULT_CHOICE ? "" : value, model: "", effort: "" });
+  // Keep a saved agent selectable even when this catalog doesn't list it.
+  const missingAgent = agentId && !agents.some((entry) => entry.id === agentId) ? agentId : null;
   return (
     <div className="flex flex-col gap-1">
-      <div className="flex gap-3">
+      <div className="flex flex-wrap gap-3">
+        <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm">
+          Agent
+          <Select
+            value={agentId || DEFAULT_CHOICE}
+            onValueChange={selectAgent}
+            disabled={disabled || catalog.isLoading}
+          >
+            <SelectTrigger data-testid="project-team-agent">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={DEFAULT_CHOICE}>{defaultLabel}</SelectItem>
+              {agents.map((entry) => {
+                const native = nativeCodingAgentForAvailableAgent(entry);
+                const blocked =
+                  !sandbox &&
+                  !!host &&
+                  !!native &&
+                  !harnessReadinessOnHost(native.harness, host).selectable;
+                return (
+                  <SelectItem key={entry.id} value={entry.id} disabled={blocked}>
+                    {entry.display_name}
+                  </SelectItem>
+                );
+              })}
+              {missingAgent && <SelectItem value={missingAgent}>{missingAgent}</SelectItem>}
+            </SelectContent>
+          </Select>
+        </label>
         <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm">
           Model
           <Select
@@ -96,7 +144,7 @@ export function IdentityModelEffortFields({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={DEFAULT_CHOICE}>Project default</SelectItem>
+              <SelectItem value={DEFAULT_CHOICE}>{defaultLabel}</SelectItem>
               {models.map((option) => (
                 <SelectItem key={option.id} value={option.id}>
                   {nativeModelLabel(option)}
@@ -110,7 +158,7 @@ export function IdentityModelEffortFields({
           <Select
             value={effort || DEFAULT_CHOICE}
             onValueChange={(value) =>
-              onChange({ model, effort: value === DEFAULT_CHOICE ? "" : value })
+              onChange({ agentId, model, effort: value === DEFAULT_CHOICE ? "" : value })
             }
             disabled={disabled || offline || effortChoices.length === 0}
           >
@@ -118,7 +166,7 @@ export function IdentityModelEffortFields({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={DEFAULT_CHOICE}>Project default</SelectItem>
+              <SelectItem value={DEFAULT_CHOICE}>{defaultLabel}</SelectItem>
               {effortChoices.map((option) => (
                 <SelectItem key={option.value} value={option.value}>
                   {option.label}

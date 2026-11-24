@@ -22,7 +22,7 @@ import {
   type ProjectIdentity,
   type ProjectIdentityInput,
 } from "@/lib/projectsApi";
-import { IdentityModelEffortFields } from "./IdentityModelEffortFields";
+import { IdentityModelEffortFields, type IdentitySessionChoice } from "./IdentityModelEffortFields";
 import { ProjectRoutingSection } from "./ProjectRoutingSection";
 import { TicketError } from "./TicketControls";
 import { useProjectRecord } from "./useProjectAgentSession";
@@ -30,33 +30,38 @@ import { projectIdentitiesKey, useProjectIdentities } from "./useProjectIdentiti
 
 const encoder = new TextEncoder();
 
-interface IdentityDraft {
+interface IdentityDraft extends IdentitySessionChoice {
   name: string;
   instructions: string;
-  model: string;
-  effort: string;
 }
 
-const EMPTY_DRAFT: IdentityDraft = { name: "", instructions: "", model: "", effort: "" };
+const EMPTY_DRAFT: IdentityDraft = {
+  name: "",
+  instructions: "",
+  agentId: "",
+  model: "",
+  effort: "",
+};
 
 function draftOf(identity: ProjectIdentity): IdentityDraft {
   return {
     name: identity.name,
     instructions: identity.instructions,
+    agentId: identity.agent_id ?? "",
     model: identity.model ?? "",
     effort: identity.effort ?? "",
   };
 }
 
 function inputOf(draft: IdentityDraft, builtin: boolean): ProjectIdentityInput {
-  // The Lead's name and session defaults are fixed here; Team edits only its charter.
-  if (builtin) return { instructions: draft.instructions };
-  return {
-    name: draft.name.trim(),
+  const session = {
     instructions: draft.instructions,
+    agent_id: draft.agentId.trim(),
     model: draft.model.trim(),
     effort: draft.effort.trim(),
   };
+  // The Lead keeps its name; its agent, model and effort are the project's defaults.
+  return builtin ? session : { name: draft.name.trim(), ...session };
 }
 
 /** Adds and edits the project's identities: named roles the user can talk to. */
@@ -101,8 +106,8 @@ export function ProjectTeamDialog({
   const lead = all.find((identity) => identity.builtin);
   const selectedIdentity = all.find((identity) => identity.id === selected);
   const isLead = selectedIdentity?.builtin === true;
-  // Only the owner edits the Lead's charter, as with the mandate.
-  const readOnly = isLead && shared;
+  // Only the owner edits the Lead's charter, as with the mandate; members still edit its model.
+  const charterReadOnly = isLead && shared;
   const bytes = encoder.encode(draft.instructions.trim()).length;
   const tooLarge = bytes > PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES;
   const busy = save.isPending || remove.isPending;
@@ -114,7 +119,7 @@ export function ProjectTeamDialog({
   };
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
-    if (draft.name.trim() && !tooLarge && !readOnly) save.mutate(inputOf(draft, isLead));
+    if (draft.name.trim() && !tooLarge) save.mutate(inputOf(draft, isLead));
   };
   return (
     <Dialog
@@ -206,7 +211,7 @@ export function ProjectTeamDialog({
                     className="min-h-36 max-h-[45dvh] text-sm"
                     aria-invalid={tooLarge || undefined}
                     onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
-                    disabled={busy || readOnly}
+                    disabled={busy || charterReadOnly}
                   />
                   <span
                     className={
@@ -217,22 +222,25 @@ export function ProjectTeamDialog({
                     {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES.toLocaleString()} bytes
                   </span>
                 </label>
-                {isLead ? (
+                <IdentityModelEffortFields
+                  config={project?.config}
+                  agentId={draft.agentId}
+                  model={draft.model}
+                  effort={draft.effort}
+                  disabled={busy}
+                  defaultLabel={isLead ? "Default" : "Project default"}
+                  onChange={(next) => setDraft({ ...draft, ...next })}
+                />
+                {isLead && (
                   <p className="text-xs text-muted-foreground" data-testid="project-team-lead-note">
-                    The Lead is the project's built-in coordinator. Your charter is added to its
-                    instructions beside the built-in orchestrator role and takes effect on its next
-                    turn or session start. Only you can edit it; agents can't. The Lead can't be
-                    renamed or deleted here, and its model comes from the project's settings.
+                    The Lead is the project's built-in coordinator and can't be renamed or deleted.
+                    {charterReadOnly
+                      ? " Only the project owner edits its charter."
+                      : " Only you can edit its charter; agents can't."}{" "}
+                    The charter applies on its next turn or session start. Its agent, model and
+                    effort are also the project's defaults for new sessions, and they apply from the
+                    Lead's next session or rollover.
                   </p>
-                ) : (
-                  <IdentityModelEffortFields
-                    config={project?.config}
-                    agentId={selectedIdentity?.agent_id ?? null}
-                    model={draft.model}
-                    effort={draft.effort}
-                    disabled={busy}
-                    onChange={(next) => setDraft({ ...draft, ...next })}
-                  />
                 )}
                 {selectedIdentity?.created_by_session_id && (
                   <p
@@ -265,7 +273,7 @@ export function ProjectTeamDialog({
                     type="submit"
                     data-testid="project-team-save"
                     loading={save.isPending}
-                    disabled={!draft.name.trim() || tooLarge || readOnly || remove.isPending}
+                    disabled={!draft.name.trim() || tooLarge || remove.isPending}
                   >
                     {selected === null ? "Add" : "Save"}
                   </Button>

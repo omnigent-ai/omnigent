@@ -68,6 +68,8 @@ _RETIRED_MAIN_SESSIONS_MAX = 50
 # built-in Lead was removed. Owner-set only, through ``set_routing``.
 ROUTER_IDENTITY_CONFIG_KEY = "_omnigent_router_identity"
 LEAD_REMOVED_CONFIG_KEY = "_omnigent_lead_removed"
+# Project config keys that hold the Lead's session defaults, edited from Team.
+LEAD_SESSION_DEFAULT_KEYS = ("agent_id", "model", "effort")
 # Server-owned: the owner's charter for the Lead, set only through ``set_lead_charter``.
 LEAD_CHARTER_CONFIG_KEY = "_omnigent_lead_charter"
 _SERVER_CONFIG_KEYS = frozenset(
@@ -760,6 +762,46 @@ class SqlAlchemyProjectStore(ProjectStore):
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "set_project_lead_charter", write)
+
+    def set_lead_session_defaults(
+        self, project_id: str, *, user_id: str | None, values: dict[str, str | None]
+    ) -> Project | None:
+        """Set the Lead's agent, model or effort: the project's session defaults.
+
+        Like other identities, any person with access (owner or member) may edit
+        them. A ``None`` or blank value clears that default.
+
+        :param values: Keys among ``agent_id``, ``model`` and ``effort``.
+        :returns: The project, or ``None`` if not found / no access.
+        """
+        unknown = set(values) - set(LEAD_SESSION_DEFAULT_KEYS)
+        if unknown:
+            raise ValueError(f"not a Lead session default: {sorted(unknown)}")
+        updated_at = now_epoch()
+
+        def write(session: Session) -> Project | None:
+            require_active_account(session, user_id)
+            row = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
+            if row is None or project_role(session, row, user_id) is None:
+                return None
+            config = _decode_config(row.config)
+            for key, value in values.items():
+                if value and value.strip():
+                    config[key] = value.strip()
+                else:
+                    config.pop(key, None)
+            encoded = _encode_config(config)
+            if row.config != encoded:
+                row.config = encoded
+                row.updated_at = updated_at
+            session.flush()
+            return _to_entity(row)
+
+        return run_write_transaction(
+            self._session_immediate, "set_project_lead_session_defaults", write
+        )
 
     def list_main_sessions(self) -> builtins.list[tuple[str, str | None, str]]:
         with self._session("list_project_main_sessions") as session:

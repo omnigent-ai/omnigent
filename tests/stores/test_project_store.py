@@ -111,7 +111,6 @@ def test_main_session_assignment_is_owner_scoped_and_compares_effective_legacy_p
         assert row.main_session_id == first_id and row.legacy_orchestrator_session_id == old_id
 
 
-
 def test_replaced_main_sessions_are_retired_and_survive_config_replace(store):
     project = store.create(_uid("rollover"), "Rollover", "alice@example.com", {"model": "m"})
     first, second, third = (_uid(value) for value in ("main-1", "main-2", "main-3"))
@@ -766,3 +765,31 @@ def test_share_grants_member_access_until_revoked(store: SqlAlchemyProjectStore)
     assert store.remove_share(_uid("shared"), "bob@example.com", user_id="alice@example.com")
     assert store.get(_uid("shared"), user_id="bob@example.com") is None
     assert store.list_shares(_uid("shared"), user_id="alice@example.com") == []
+
+
+def test_members_edit_the_leads_session_defaults_but_only_the_owner_its_charter(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """The Lead's agent, model and effort are project defaults any person with access edits."""
+    store.create(_uid("lead"), "Lead project", "alice@example.com", config={"model": "old"})
+    store.add_share(_uid("lead"), "bob@example.com", user_id="alice@example.com")
+    edited = store.set_lead_session_defaults(
+        _uid("lead"), user_id="bob@example.com", values={"model": " m2 ", "effort": "high"}
+    )
+    assert edited is not None and (edited.config["model"], edited.config["effort"]) == (
+        "m2",
+        "high",
+    )
+    cleared = store.set_lead_session_defaults(
+        _uid("lead"), user_id="alice@example.com", values={"effort": None, "agent_id": ""}
+    )
+    assert (
+        cleared is not None and "effort" not in cleared.config and cleared.config["model"] == "m2"
+    )
+    assert (
+        store.set_lead_session_defaults(_uid("lead"), user_id="carol@example.com", values={})
+        is None
+    )
+    with pytest.raises(OmnigentError) as denied:
+        store.set_lead_charter(_uid("lead"), user_id="bob@example.com", charter="Mine.")
+    assert denied.value.code == ErrorCode.FORBIDDEN

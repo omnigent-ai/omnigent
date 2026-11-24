@@ -642,31 +642,49 @@ def create_projects_router(
         [identity] = await heal_identity_sessions(request, project, [identity])
         return await _identity_payload(project, identity)
 
-    async def _update_lead_charter(
+    async def _update_lead(
         request: Request, project: Project, user_id: str | None, body: ProjectIdentityRequest
     ) -> dict[str, Any]:
-        """Edit the built-in Lead's charter, the only Lead field Team edits. Owner only.
+        """Edit the built-in Lead: its charter, agent, model and effort, never its name.
 
-        Like the mandate, agents never write it: it shapes the coordinator's behavior.
+        The Lead is owner-made, so as with other owner-made identities agents can't
+        edit it. People with access edit its agent, model and effort (the project's
+        session defaults); only the owner edits its charter, like the mandate.
         """
         if ORCHESTRATION_SOURCE_HEADER in request.headers:
             raise OmnigentError(
-                "Only the project owner can edit the Lead's charter", code=ErrorCode.FORBIDDEN
+                "Only the project's people can edit the Lead; agents can't",
+                code=ErrorCode.FORBIDDEN,
             )
         if body.name is not None and body.name.strip() != LEAD_NAME:
             raise OmnigentError("The Lead can't be renamed", code=ErrorCode.INVALID_INPUT)
-        if any(getattr(body, field) for field in ("agent_id", "model", "effort")):
-            raise OmnigentError(
-                "The Lead's agent, model and effort come from the project's settings",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if body.instructions is not None:
+        defaults = {
+            field: getattr(body, field) or None
+            for field in ("agent_id", "model", "effort")
+            if field in body.model_fields_set
+        }
+        # A member's save resends the charter unchanged; only a real change is owner-only.
+        charter_changed = body.instructions is not None and body.instructions.strip() != (
+            project.lead_charter or ""
+        )
+        if charter_changed:
             project = await asyncio.to_thread(
                 project_store.set_lead_charter,
                 project.id,
                 user_id=user_id,
-                charter=body.instructions,
+                charter=body.instructions or "",
             )
+        if defaults:
+            updated = await asyncio.to_thread(
+                project_store.set_lead_session_defaults,
+                project.id,
+                user_id=user_id,
+                values=defaults,
+            )
+            if updated is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            project = updated
+        if charter_changed or defaults:
             announce_projects_changed(user_id)
         return orchestrator_identity_response(
             project, await main_session_state(project, conversation_store, permission_store)
@@ -684,7 +702,7 @@ def create_projects_router(
         await _require_private_source(request, user_id)
         project = await _owned_project(project_id, user_id)
         if identity_id == LEAD_IDENTITY_ID:
-            return await _update_lead_charter(request, project, user_id, body)
+            return await _update_lead(request, project, user_id, body)
         clear = frozenset(
             field
             for field in ("agent_id", "model", "effort")

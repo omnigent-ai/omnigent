@@ -8,7 +8,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/hooks/useHosts", () => ({ useHosts: () => ({ data: mocks.hosts() }) }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: () => ({ data: [] }) }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: () => ({ data: [], isLoading: false }),
+}));
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => "loading" }));
 vi.mock("@/hooks/useLaunchModelOptions", () => ({
   useLaunchModelOptions: (args: { enabled: boolean }) => mocks.launch(args),
 }));
@@ -30,7 +33,7 @@ function renderFields(model = "", effort = "") {
   render(
     <IdentityModelEffortFields
       config={{ host_id: "h1", harness: "claude-native" }}
-      agentId={null}
+      agentId=""
       model={model}
       effort={effort}
       disabled={false}
@@ -71,7 +74,25 @@ describe("IdentityModelEffortFields", () => {
   it("shows the project default when nothing is chosen", () => {
     mocks.hosts.mockReturnValue([{ host_id: "h1", name: "laptop", status: "online" }]);
     renderFields();
+    expect(screen.getByTestId("project-team-agent")).toHaveTextContent("Project default");
     expect(screen.getByTestId("project-team-model")).toHaveTextContent("Project default");
     expect(screen.getByTestId("project-team-effort")).toHaveTextContent("Project default");
+  });
+
+  it("keeps a saved agent the catalog doesn't list", () => {
+    mocks.hosts.mockReturnValue([{ host_id: "h1", name: "laptop", status: "online" }]);
+    render(
+      <IdentityModelEffortFields
+        config={{ host_id: "h1" }}
+        agentId="ag_saved"
+        model=""
+        effort=""
+        disabled={false}
+        defaultLabel="Default"
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("project-team-agent")).toHaveTextContent("ag_saved");
+    expect(screen.getByTestId("project-team-model")).toHaveTextContent("Default");
   });
 });

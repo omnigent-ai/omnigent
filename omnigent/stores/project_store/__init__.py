@@ -192,6 +192,12 @@ class ProjectStore(ABC):
         """Set the owner's charter for the built-in Lead; blank clears it (owner-only)."""
         raise NotImplementedError
 
+    def set_lead_session_defaults(
+        self, project_id: str, *, user_id: str | None, values: dict[str, str | None]
+    ) -> Project | None:
+        """Set the Lead's agent, model or effort (project defaults); blank clears one."""
+        raise NotImplementedError
+
     def propose_mandate_addition(
         self,
         project_id: str,
