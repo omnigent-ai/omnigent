@@ -389,7 +389,7 @@ def _versioned_cache_cost_bridge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[_SessionModelComposer, Path]:
     composer = _SessionModelComposer(cache_cost_label="Sonnet 5.5")
-    picker_value = "system.ai.claude-sonnet-5-5[1m]"
+    picker_value = "system.ai.claude-sonnet-5-5"
     composer.options = ["private-initial-model", picker_value]
     composer.model = composer.options[0]
     composer.picker_labels[picker_value] = "Sonnet"

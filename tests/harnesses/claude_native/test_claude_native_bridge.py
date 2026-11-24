@@ -14029,6 +14029,9 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
         "unstructured-caption",
         "private-caption",
         "glyph-in-label",
+        "plain-public-caption",
+        "plain-public-family-caption",
+        "plain-public-explicit-extended",
     ],
 )
 def test_current_context_requires_a_unique_exact_active_picker_row(
@@ -14042,7 +14045,13 @@ def test_current_context_requires_a_unique_exact_active_picker_row(
     model = "system.ai.claude-opus-4-8[1m]"
     label = "Opus 4.8"
     pane = recorded["picker"]
-    if variation == "no-marker":
+    if variation.startswith("plain-public-"):
+        model = model.removesuffix("[1m]")
+        label = "Opus" if variation == "plain-public-family-caption" else "Opus 4.8"
+        row = next(line for line in pane.splitlines() if "❯ 2." in line)
+        if variation != "plain-public-explicit-extended":
+            pane = pane.replace(row, f"  ❯ 2. {label} ✔  Available model")
+    elif variation == "no-marker":
         pane = pane.replace(" ✔", "")
     elif variation == "marker-in-description":
         pane = pane.replace("Opus 4.8 ✔", "Opus 4.8").replace("Custom Opus", "✔ Custom Opus")
@@ -14079,7 +14088,14 @@ def test_current_context_requires_a_unique_exact_active_picker_row(
     )
 
     assert switch.current_picker_confirms_context(picker) is (
-        variation in {"exact", "exact-private", "public-caption"}
+        variation
+        in {
+            "exact",
+            "exact-private",
+            "public-caption",
+            "plain-public-caption",
+            "plain-public-family-caption",
+        }
     )
 
 
@@ -14305,7 +14321,10 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     requires_context_proof = (plain_request or initial_model != "different") and (
         initial_model != "different" or selection_applied
     )
-    assert composer.submitted == ["/status", "/model", "/status"] + (
+    commands = ["/model", "/status"]
+    if not plain_request or initial_model != "different":
+        commands.insert(0, "/status")
+    assert composer.submitted == commands + (
         ["/model"] if requires_context_proof and not context_was_active else []
     )
     assert [args[-1] for args in composer.sends].count("s") == 1
@@ -14624,7 +14643,9 @@ def test_model_command_accepts_equivalent_picker_descriptors(
     assert result.picker_value == ordinary
     assert result.resolved_model == result.status_model == composer.model == concrete
     assert result.already_selected is already_selected
-    assert composer.submitted == (["/status"] if already_selected else ["/model", "/status"])
+    assert composer.submitted == (
+        ["/status"] if already_selected else ["/model", "/status", "/model"]
+    )
     assert composer.confirmations == int(not already_selected)
 
 
@@ -14700,7 +14721,7 @@ def test_model_command_selects_the_exact_case_distinct_private_row(
 
     assert result.requested_model == result.picker_value == requested
     assert result.resolved_model == result.status_model == composer.model == requested
-    assert composer.submitted == ["/model", "/status"]
+    assert composer.submitted == ["/model", "/status", "/model"]
     assert composer.status_queries == 1
 
 
@@ -15150,7 +15171,7 @@ def test_model_command_confirms_cache_cost_at_most_once(
         pytest.param(
             _versioned_cache_cost_bridge,
             "system.ai.claude-sonnet-5-5",
-            "system.ai.claude-sonnet-5-5[1m]",
+            "system.ai.claude-sonnet-5-5",
             "system.ai.claude-sonnet-5-5",
             False,
             id="versioned",
@@ -15158,7 +15179,7 @@ def test_model_command_confirms_cache_cost_at_most_once(
         pytest.param(
             _versioned_cache_cost_bridge,
             "system.ai.claude-sonnet-5-5",
-            "system.ai.claude-sonnet-5-5[1m]",
+            "system.ai.claude-sonnet-5-5",
             "system.ai.claude-sonnet-5-5",
             True,
             id="disabled-catalog-version",
@@ -15211,6 +15232,9 @@ def test_model_command_confirms_versioned_cache_cost_for_managed_row(
         "s",
         "Enter",
         "/status",
+        "Enter",
+        "Escape",
+        "/model",
         "Enter",
         "Escape",
     ]
@@ -15580,9 +15604,10 @@ def test_model_command_tracks_the_highlight_through_a_scrolling_picker(
             marker = (
                 "❯" if index == composer.highlight else "↑" if index == start and start else " "
             )
+            current = " ✔" if composer.options[index] == composer.model else ""
             rows.append(
-                f"   {marker} {index + 1}. Choice {index}  Managed by your organization "
-                f"({composer.options[index]})"
+                f"   {marker} {index + 1}. Choice {index}{current}  "
+                f"Managed by your organization ({composer.options[index]})"
             )
         return (
             "Select model\n"
@@ -15595,7 +15620,7 @@ def test_model_command_tracks_the_highlight_through_a_scrolling_picker(
 
     assert result.resolved_model == composer.model == "private-model-12"
     assert [args[-1] for args in composer.sends].count("Down") == 12
-    assert composer.submitted == ["/model", "/status"]
+    assert composer.submitted == ["/model", "/status", "/model"]
 
 
 @pytest.mark.parametrize("wrap", ["description", "model-id"])

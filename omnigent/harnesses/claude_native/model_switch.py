@@ -741,7 +741,9 @@ class SessionOnlyModelSwitch:
         )
 
     def current_picker_confirms_context(self, picker: _Picker) -> bool:
-        """Require the active marker and an explicit matching context identity."""
+        """Require a unique active row with a context-consistent model identity."""
+        from omnigent.models.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
+
         if any(
             "✔" in text for text in (self.choice.model, self.choice.value, self.choice.label or "")
         ):
@@ -753,15 +755,28 @@ class SessionOnlyModelSwitch:
             or sum(self.row_matches(row) for row in picker.rows) != 1
         ):
             return False
-        identities = re.findall(r"\(([^()\r\n]+)\)", current[0].text)
-        if any(self.status_matches(identity, exact_context=True) for identity in identities):
-            return True
+        identities = [
+            identity
+            for identity in re.findall(r"\(([^()\r\n]+)\)", current[0].text)
+            if not any(char.isspace() for char in identity)
+            and identity.lower() not in (*CLAUDE_MODEL_ALIASES, "default", "opusplan")
+        ]
+        if identities:
+            return all(
+                self.status_matches(identity, exact_context=True) for identity in identities
+            )
         caption = _row_label(current[0])
+        public_label = _cache_cost_model_label(self.choice.model)
+        context = claude_picker_model_key(self.choice.model).endswith("[1m]")
         return bool(
             self.choice.structured
             and public_claude_model_id(self.choice.model)
             and self.choice.label == caption
-            and re.search(r"\(1M context\)$", caption, re.IGNORECASE)
+            and (
+                re.search(r"\(1M context\)$", caption, re.IGNORECASE)
+                if context
+                else public_label and caption in {public_label, public_label.split()[0]}
+            )
         )
 
     def observe_current_context(self) -> bool:
@@ -888,11 +903,15 @@ class SessionOnlyModelSwitch:
                     "An unrelated draft occupies Claude's input box. Finish it, then retry."
                 )
             self.clear_owned_draft(self.owned_draft)
-        before_selection = self.local_status()
+        before_selection: str | None = None
         plain_context = not claude_picker_model_key(self.choice.model).endswith("[1m]")
-        if hinted_current and self.status_matches(before_selection, exact_context=True):
-            if not plain_context or (self.choice.status_only and self.observe_current_context()):
-                return self.result(before_selection, already_selected=True)
+        if hinted_current or not plain_context:
+            before_selection = self.local_status()
+            if hinted_current and self.status_matches(before_selection, exact_context=True):
+                if not plain_context or (
+                    self.choice.status_only and self.observe_current_context()
+                ):
+                    return self.result(before_selection, already_selected=True)
         if self.choice.status_only:
             raise self.refuse(
                 f"Claude's fresh status did not confirm the current model {self.model}. "
@@ -957,7 +976,10 @@ class SessionOnlyModelSwitch:
             plain_context
             or (
                 not self.status_matches(current, exact_context=True)
-                and self.status_matches(before_selection, exact_context=False)
+                and (
+                    before_selection is None
+                    or self.status_matches(before_selection, exact_context=False)
+                )
             )
         )
         if ambiguous_context and self.status_matches(current, exact_context=False):
