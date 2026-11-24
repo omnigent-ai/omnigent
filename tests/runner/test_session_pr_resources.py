@@ -1065,6 +1065,61 @@ async def test_panel_reads_answer_for_their_own_session_and_selected_pr(
     assert {pr["url"] for pr in reads[3].json()["prs"]} == {A, B}
 
 
+async def test_a_panel_read_shows_a_forge_change_made_before_it(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refresh, the turn-end refetch and focus refetches are one-shot reads of the forge.
+
+    A PR merged outside the app before such a read must show as merged in it: a
+    merged PR stops the panel's poll, so no later poll would correct an older answer.
+    """
+    forge = {"value": "OPEN"}
+    monkeypatch.setattr(github, "_gh", _forge(forge))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/session/resources/github"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        before = await client.get(path, params={"pr_url": B})
+        forge["value"] = "MERGED"
+        refreshed = await client.get(path, params={"pr_url": B})
+    assert before.json()["pr"]["state"] == "OPEN"
+    assert refreshed.json()["pr"]["state"] == "MERGED"
+
+
+def test_a_read_after_a_pr_is_tracked_lists_it_while_an_earlier_read_runs(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that starts after the agent links a PR lists it, even if an older read is busy."""
+    monkeypatch.setattr(github, "_gh", _forge({"value": "OPEN"}))
+    listed = threading.Event()
+    release = threading.Event()
+    list_prs = pr_resource._session_prs_with_titles
+
+    def held_first_listing(*args: Any, **kwargs: Any) -> Any:
+        if not listed.is_set():
+            listed.set()
+            release.wait(budget(5))
+        return list_prs(*args, **kwargs)
+
+    monkeypatch.setattr(pr_resource, "_session_prs_with_titles", held_first_listing)
+    reader = WorkspaceReader(Path(tracked))
+    linked = "https://github.com/example/three/pull/7"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        earlier = pool.submit(reader.github_info, session_id="session", pr_url=B)
+        assert listed.wait(budget(5))
+        SessionPrRegistry("session").record(
+            [PullRequestRef.from_url(linked)], relationship="created", source="test"
+        )
+        later = pool.submit(reader.github_info, session_id="session", pr_url=B)
+        release.set()
+        assert {pr["url"] for pr in earlier.result(timeout=budget(5))["prs"]} == {A, B}
+        assert linked in {pr["url"] for pr in later.result(timeout=budget(5))["prs"]}
+
+
 async def test_pr_panel_reads_answer_while_changed_file_listings_hold_the_slow_pool(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
