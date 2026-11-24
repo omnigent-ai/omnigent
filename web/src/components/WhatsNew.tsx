@@ -66,20 +66,22 @@ export function WhatsNew({ entries = WHATS_NEW_ENTRIES }: { entries?: WhatsNewEn
       {badgeVisible && (
         <div
           role="status"
-          className="fixed left-1/2 top-[calc(4.25rem+var(--omnigent-safe-top,0px))] sm:top-[calc(0.5rem+var(--omnigent-safe-top,0px))] z-50 flex -translate-x-1/2 items-center gap-1 rounded-full bg-success py-1 pr-1 pl-3 text-sm text-white shadow-md"
+          // Phones: a one-line pill under the header. Desktop: a card at the bottom-left,
+          // above the sidebar footer, so it never sits over a page header.
+          className="fixed left-1/2 top-[calc(4.25rem+var(--omnigent-safe-top,0px))] z-50 flex -translate-x-1/2 items-center gap-1 rounded-full bg-success py-1 pr-1 pl-3 text-sm text-white shadow-md md:top-auto md:bottom-[calc(4.5rem+var(--omnigent-safe-bottom,0px))] md:left-3 md:w-72 md:translate-x-0 md:items-start md:rounded-lg md:py-2 md:pl-3"
         >
           <button
             type="button"
-            className="flex items-center gap-1.5 whitespace-nowrap rounded-full outline-none focus-visible:ring-2 focus-visible:ring-white/70"
+            className="flex min-w-0 flex-1 items-center gap-1.5 whitespace-nowrap rounded-full text-left outline-none focus-visible:ring-2 focus-visible:ring-white/70 md:flex-wrap md:items-baseline md:gap-x-1.5 md:gap-y-0.5 md:whitespace-normal md:rounded-md"
             onClick={() => {
               markSeen();
               setOpen(true);
             }}
           >
-            <SparklesIcon className="size-4" aria-hidden="true" />
+            <SparklesIcon className="size-4 shrink-0 md:self-center" aria-hidden="true" />
             <span className="font-semibold">What&apos;s New?</span>
-            {/* Narrow screens show just the label so the pill fits beside the header controls. */}
-            <span className="sr-only sm:not-sr-only">
+            {/* Phones show just the label so the pill fits between the header controls. */}
+            <span className="sr-only md:not-sr-only">
               See features released since your last visit.
             </span>
           </button>
