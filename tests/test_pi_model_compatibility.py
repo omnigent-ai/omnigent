@@ -14,6 +14,7 @@ from omnigent.models.model_metadata import (
 from omnigent.models.pi_model_compatibility import (
     enrich_databricks_model_catalog,
     pi_model_json_entry,
+    pi_model_with_level_map,
 )
 from omnigent.onboarding.providers import ModelInfo
 
@@ -369,10 +370,15 @@ def test_unknown_thinking_defaults_leave_entry_unchanged() -> None:
 
 @pytest.mark.parametrize(
     "model_id",
-    ["system.ai.gpt-6-2-astra", "databricks-gpt-6-astra", "system.ai.gpt-6-1-sol"],
+    [
+        "system.ai.gpt-6-2-astra",
+        "databricks-gpt-6-astra",
+        "system.ai.gpt-6-1-sol",
+        "openai/gpt-6.1-sol",
+    ],
 )
 def test_models_without_none_effort_map_unsupported_pi_levels(model_id: str) -> None:
-    """Pi must not offer ``off``/``minimal`` (sent as ``none``) where the endpoint rejects them."""
+    """Pi must not offer ``off`` or ``minimal`` where the endpoint rejects them."""
     entry = pi_model_json_entry(
         _entry(model_id, reasoning=None, wire=ModelWireAPI.OPENAI_RESPONSES)
     )
@@ -397,8 +403,6 @@ def test_other_gpt_models_keep_default_thinking_levels(model_id: str) -> None:
 
 
 def test_explicit_thinking_level_map_wins_over_gpt_level_map() -> None:
-    from omnigent.models.pi_model_compatibility import pi_model_with_level_map
-
     entry = {"id": "system.ai.gpt-6-2-astra", "thinkingLevelMap": {"off": "low"}}
 
     assert pi_model_with_level_map(entry) is entry

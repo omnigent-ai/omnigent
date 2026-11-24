@@ -367,7 +367,7 @@ class PiProviderConfig:
                 )
                 if self.api == "anthropic-messages":
                     base["reasoning"] = True
-                models.append(base)
+                models.append(pi_model_with_level_map(base))
             elif surface is DatabricksPiSurface.ANTHROPIC:
                 models.append({"id": self.model, "input": ["text", "image"], "reasoning": True})
             elif surface is not None:

@@ -7471,4 +7471,9 @@ def test_models_json_uncatalogued_gpt_without_none_effort_maps_levels() -> None:
 
     [entry] = models["providers"]["databricks-openai"]["models"]
     assert entry["reasoning"] is True
-    assert entry["thinkingLevelMap"]["off"] is None
+    assert entry["thinkingLevelMap"] == {
+        "off": None,
+        "minimal": None,
+        "xhigh": "xhigh",
+        "max": "max",
+    }

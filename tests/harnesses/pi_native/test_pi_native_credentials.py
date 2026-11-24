@@ -4630,3 +4630,20 @@ def test_uncataloged_gpt_without_none_effort_maps_levels(monkeypatch: pytest.Mon
         "xhigh": "xhigh",
         "max": "max",
     }
+
+
+def test_selected_gpt_without_none_effort_on_openai_primary_maps_levels() -> None:
+    """An unlisted model appended to a non-gateway primary still gets the level map."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://llm.example.com/v1",
+        api="openai-responses",
+        model="gpt-6-2-astra",
+        api_key="sk-test",
+        auth_header=False,
+    )
+
+    [entry] = provider.to_models_config()["providers"]["omnigent"]["models"]
+
+    assert entry["reasoning"] is True
+    assert entry["thinkingLevelMap"]["off"] is None

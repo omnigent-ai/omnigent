@@ -135,7 +135,8 @@ def pi_thinking_level_map(model_id: str) -> dict[str, str | None] | None:
     :param model_id: A model id, e.g. ``"system.ai.gpt-6-2-astra"``.
     :returns: The level map, or ``None`` when no known restriction applies.
     """
-    bare = model_id.lower().removeprefix("system.ai.").removeprefix("databricks-")
+    bare = model_id.lower().rsplit("/", 1)[-1].replace(".", "-")
+    bare = bare.removeprefix("system-ai-").removeprefix("databricks-")
     if bare not in PI_GPT_NO_NONE_EFFORT.model_ids:
         return None
     return {"off": None, "minimal": None, "xhigh": "xhigh", "max": "max"}
