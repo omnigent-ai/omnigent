@@ -1234,14 +1234,18 @@ def _deliver_parent_events(
             base_url="http://127.0.0.1:8000",
             transport=httpx.MockTransport(_make_omnigent_handler(posted)),
         ) as client:
-            for event in events:
-                await codex_native_forwarder._handle_event(
-                    client,
-                    **_forwarder_context(client, bridge_dir, session_id="conv_parent"),
-                    event=event,
-                    expected_thread_id="thread_parent",
-                    forwarder_state=state,
-                )
+            try:
+                for event in events:
+                    await codex_native_forwarder._handle_event(
+                        client,
+                        **_forwarder_context(client, bridge_dir, session_id="conv_parent"),
+                        event=event,
+                        expected_thread_id="thread_parent",
+                        forwarder_state=state,
+                    )
+                    await state.settle_child_lanes()
+            finally:
+                await state.close_child_streams()
 
     asyncio.run(run())
 
@@ -1402,7 +1406,8 @@ async def test_forwarder_in_flight_parent_snapshot_cannot_overwrite_the_child_st
 
     class ObservedLock(codex_native_forwarder._ReentrantAsyncLock):
         async def __aenter__(self) -> None:
-            if asyncio.current_task() is snapshot_task:
+            task = asyncio.current_task()
+            if task is not None and task.get_name() == "codex-native-child-delivery":
                 snapshot_started.set()
             await super().__aenter__()
 
@@ -1443,12 +1448,14 @@ async def test_forwarder_in_flight_parent_snapshot_cannot_overwrite_the_child_st
                         await child_started.wait()
                         release_snapshot.set()
                     await asyncio.gather(*tasks)
+                    await state.close_child_streams()
             finally:
                 release_snapshot.set()
                 for task in tasks:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                await state.close_child_streams()
     finally:
         codex_native_forwarder._conversation_item_locks.reset(token)
 

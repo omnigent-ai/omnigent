@@ -8361,18 +8361,43 @@ async def _post_collab_agent_statuses(
         ap_status = _omnigent_status_from_collab_state(state)
         if ap_status is None:
             continue
-        async with _conversation_item_delivery_scope(child_session_id):
-            own_status = forwarder_state.child_turn_status(thread_id)
-            if own_status is not None and ap_status != own_status:
-                _logger.info(
-                    "Codex forwarder ignored collab snapshot %s for child with own status %s: "
-                    "thread_id=%s",
-                    ap_status,
-                    own_status,
-                    thread_id,
-                )
-                continue
-            await _post_status(client, child_session_id, ap_status)
+        queued = _QueuedChildEvent(
+            deliver=functools.partial(
+                _post_collab_agent_status,
+                client,
+                child_session_id=child_session_id,
+                thread_id=thread_id,
+                ap_status=ap_status,
+                forwarder_state=forwarder_state,
+            ),
+            enqueued_at=asyncio.get_running_loop().time(),
+        )
+        forwarder_state.child_stream(client, thread_id, child_session_id).enqueue(
+            queued, forwarder_state.child_delivery_slots
+        )
+
+
+async def _post_collab_agent_status(
+    client: httpx.AsyncClient,
+    *,
+    child_session_id: str,
+    thread_id: str,
+    ap_status: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Recheck a queued snapshot while holding the child's publication lock."""
+    async with _conversation_item_delivery_scope(child_session_id):
+        own_status = forwarder_state.child_turn_status(thread_id)
+        if own_status is not None and ap_status != own_status:
+            _logger.info(
+                "Codex forwarder ignored collab snapshot %s for child with own status %s: "
+                "thread_id=%s",
+                ap_status,
+                own_status,
+                thread_id,
+            )
+            return
+        await _post_status(client, child_session_id, ap_status)
 
 
 def _omnigent_status_from_collab_state(state: _JsonObject) -> str | None:
