@@ -4815,6 +4815,9 @@ async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
         register_test_runner(app, "runner_stale_pending")
     store = SqlAlchemyConversationStore(db_uri)
     assert store.set_runner_id(session_id, "runner_stale_pending")
+    if not holds_runner:
+        # Another replica holds the runner, so it is live, just not here.
+        store.touch_runner_liveness(["runner_stale_pending"], int(time.time()))
     store.set_pending_elicitation_count(session_id, 1)
     if child_runner is not None:
         child = store.create_conversation(
