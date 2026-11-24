@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import time
 import uuid
 from typing import Any
 
@@ -23,7 +25,11 @@ from fastapi import APIRouter, Query, Request
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.entities import Project
-from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY, MandateProposal
+from omnigent.entities.project import (
+    PROJECT_IDENTITY_LABEL_KEY,
+    MandateProposal,
+    ProjectIdentity,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server import session_live_state
@@ -62,7 +68,11 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
 from omnigent.util.uuid import InvalidUuidError, normalize_uuid, uuid_to_bytes
 
+logger = logging.getLogger(__name__)
+
 _DEFAULT_PROJECT_PAGE = 50
+# Seconds before retrying a failed restore of an identity's session (e.g. no host online).
+_HEAL_RETRY_SECONDS = 60.0
 _MAX_PROJECT_PAGE = 200
 
 
@@ -465,6 +475,8 @@ def create_projects_router(
         identities = await asyncio.to_thread(
             project_store.list_identities, project.id, user_id=user_id
         )
+        # Every identity keeps one live session; this listing is what the board polls.
+        identities = await heal_identity_sessions(request, project, identities)
         orchestrator = orchestrator_identity_response(
             project, await main_session_state(project, conversation_store, permission_store)
         )
@@ -514,6 +526,8 @@ def create_projects_router(
             created_by_session_id=source_session,
         )
         announce_projects_changed(user_id)
+        # A new identity starts its one session right away; a failure retries on the next list.
+        [identity] = await heal_identity_sessions(request, project, [identity])
         return await _identity_payload(project, identity)
 
     @router.patch("/projects/{project_id}/identities/{identity_id}")
@@ -567,6 +581,112 @@ def create_projects_router(
         announce_projects_changed(user_id)
         return {"id": normalized, "object": "project.identity.deleted", "deleted": True}
 
+    # Single-flight per identity, so concurrent opens and heals never start two sessions.
+    identity_locks: dict[str, asyncio.Lock] = {}
+    # Earliest monotonic time a failed background heal may retry, per identity.
+    heal_not_before: dict[str, float] = {}
+
+    async def ensure_identity_session(
+        request: Request,
+        project: Project,
+        identity_id: str,
+    ) -> tuple[ProjectIdentity, bool]:
+        """Return the identity with a live session, starting one only when it has none.
+
+        A missing (deleted) or archived session is replaced, keeping the persona.
+        Replacements are single-flight per identity under a lock, so a stale caller
+        view can never start a second session; it simply gets the live one.
+
+        :returns: The (possibly updated) identity and whether a session was started.
+        """
+        user_id = project.user_id
+        lock = identity_locks.setdefault(identity_id, asyncio.Lock())
+        async with lock:
+            identity = await asyncio.to_thread(
+                project_store.get_identity, project.id, identity_id, user_id=user_id
+            )
+            if identity is None:
+                raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+            state = await identity_session_state(
+                project, identity.active_session_id, conversation_store, permission_store
+            )
+            if state in ("idle", "busy"):
+                return identity, False
+            if state == "unavailable":
+                raise OmnigentError(
+                    "The identity's session is unavailable", code=ErrorCode.CONFLICT
+                )
+            if create_session is None or conversation_store is None:
+                raise OmnigentError("Sessions are unavailable", code=ErrorCode.RUNNER_UNAVAILABLE)
+            payload = await project_session_payload(
+                request,
+                project,
+                {
+                    "project_id": project.id,
+                    "title": identity.name,
+                    "agent_id": identity.agent_id or project.config.get("agent_id"),
+                    "model_override": identity.model,
+                    "reasoning_effort": identity.effort,
+                },
+            )
+            if not payload.get("agent_id"):
+                payload["agent_id"] = await default_project_agent_id(
+                    request,
+                    getattr(request.app.state, "agent_store", None),
+                    payload.get("host_id"),
+                )
+            store = conversation_store
+
+            async def label_identity_session(session_id: str) -> None:
+                # Server-owned label, so it is written here rather than seeded by the
+                # client-validated payload; the runner reads it at launch for the persona.
+                await asyncio.to_thread(
+                    store.set_labels, session_id, {PROJECT_IDENTITY_LABEL_KEY: identity.id}
+                )
+
+            created = await create_session(request, user_id, payload, label_identity_session)
+            session_id = getattr(created, "id", None) or getattr(created, "session_id", None)
+            if not isinstance(session_id, str):
+                raise OmnigentError("Session creation failed", code=ErrorCode.INTERNAL_ERROR)
+            updated = await asyncio.to_thread(
+                project_store.set_identity_session,
+                project.id,
+                identity.id,
+                session_id,
+                user_id=user_id,
+                expected_session_id=identity.active_session_id,
+            )
+            heal_not_before.pop(identity.id, None)
+        announce_projects_changed(user_id)
+        return updated, True
+
+    async def heal_identity_sessions(
+        request: Request, project: Project, identities: list[ProjectIdentity]
+    ) -> list[ProjectIdentity]:
+        """Give every identity without a live session a new one; failures retry later."""
+        healed = []
+        for identity in identities:
+            state = await identity_session_state(
+                project, identity.active_session_id, conversation_store, permission_store
+            )
+            # An in-flight heal for the same identity is awaited inside
+            # ensure_identity_session, so this caller reports the new session too.
+            if state not in ("absent", "missing", "archived") or time.monotonic() < (
+                heal_not_before.get(identity.id, 0.0)
+            ):
+                healed.append(identity)
+                continue
+            try:
+                identity, _ = await ensure_identity_session(request, project, identity.id)
+            except Exception:
+                # Never fail the listing (the roster polls it); retry after a pause.
+                heal_not_before[identity.id] = time.monotonic() + _HEAL_RETRY_SECONDS
+                logger.warning(
+                    "Could not restore identity %s's session", identity.id, exc_info=True
+                )
+            healed.append(identity)
+        return healed
+
     @router.post("/projects/{project_id}/identities/{identity_id}/session")
     async def open_identity_session(
         request: Request,
@@ -588,65 +708,12 @@ def create_projects_router(
             raise OmnigentError(
                 "Open the Orchestrator from the project header", code=ErrorCode.INVALID_INPUT
             )
-        identity = await asyncio.to_thread(
-            project_store.get_identity, project.id, _identity_id(identity_id), user_id=user_id
+        # ``body.expected_session_id`` is accepted for older clients; the lock makes it moot.
+        del body
+        identity, created = await ensure_identity_session(
+            request, project, _identity_id(identity_id)
         )
-        if identity is None:
-            raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
-        state = await identity_session_state(
-            project, identity.active_session_id, conversation_store, permission_store
-        )
-        if state in ("idle", "busy"):
-            return {"session_id": identity.active_session_id, "created": False}
-        if state == "unavailable":
-            raise OmnigentError("The identity's session is unavailable", code=ErrorCode.CONFLICT)
-        expected = expected_main_id(body.expected_session_id)
-        if identity.active_session_id != expected:
-            raise OmnigentError(
-                "The identity's session changed; reload the project", code=ErrorCode.CONFLICT
-            )
-        if create_session is None:
-            raise OmnigentError("Sessions are unavailable", code=ErrorCode.RUNNER_UNAVAILABLE)
-        payload = await project_session_payload(
-            request,
-            project,
-            {
-                "project_id": project.id,
-                "title": identity.name,
-                "agent_id": identity.agent_id or project.config.get("agent_id"),
-                "model_override": identity.model,
-                "reasoning_effort": identity.effort,
-            },
-        )
-        if not payload.get("agent_id"):
-            payload["agent_id"] = await default_project_agent_id(
-                request, getattr(request.app.state, "agent_store", None), payload.get("host_id")
-            )
-
-        async def label_identity_session(session_id: str) -> None:
-            # Server-owned label, so it is written here rather than seeded by the
-            # client-validated payload; the runner reads it at launch for the persona.
-            assert conversation_store is not None
-            await asyncio.to_thread(
-                conversation_store.set_labels,
-                session_id,
-                {PROJECT_IDENTITY_LABEL_KEY: identity.id},
-            )
-
-        created = await create_session(request, user_id, payload, label_identity_session)
-        session_id = getattr(created, "id", None) or getattr(created, "session_id", None)
-        if not isinstance(session_id, str):
-            raise OmnigentError("Session creation failed", code=ErrorCode.INTERNAL_ERROR)
-        await asyncio.to_thread(
-            project_store.set_identity_session,
-            project.id,
-            identity.id,
-            session_id,
-            user_id=user_id,
-            expected_session_id=identity.active_session_id,
-        )
-        announce_projects_changed(user_id)
-        return {"session_id": session_id, "created": True}
+        return {"session_id": identity.active_session_id, "created": created}
 
     @router.delete("/projects/{project_id}")
     async def delete_project(

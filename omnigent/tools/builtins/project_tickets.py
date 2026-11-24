@@ -354,9 +354,11 @@ class SysProjectIdentityUpdateTool(_TicketTool):
 class SysProjectIdentitySessionTool(_TicketTool):
     tool_name = "sys_project_identity_session"
     help_text = (
-        "Open the session of one of this project's existing identities (owner-defined roles "
-        "such as 'PM') to delegate a workstream to it. Returns its one live session, starting "
-        "it with the identity's persona only when it has none; it never starts a second one. "
+        "Open the session of one of this project's existing identities (roles such as 'PM') "
+        "to delegate a workstream to it. Returns its one current session; the server recreates "
+        "it with the identity's persona if it was deleted or archived, and never starts a "
+        "second one. Call it again for the current session_id if a message to an old one "
+        "fails with 'Session not found'. "
         "With message, also delivers that message to it like sys_session_message (queued if "
         "it is busy). Keep talking to it later with sys_session_message on the returned "
         "session_id. The built-in Orchestrator is not an identity here. To add a role, use "

@@ -183,7 +183,9 @@ proposals.
 The project may define identities: persistent named roles such as `PM` or
 `Designer`, each with a persona. You are the built-in one. The
 user talks to an identity from the project header; its session gets the persona
-automatically. Each identity works in **one session at a time**.
+automatically. Each identity always has **exactly one session**: the server
+starts it when the identity is created and starts a fresh one, with the same
+persona, if that session is deleted or archived.
 
 - To assign a ticket to an identity, set the label `assignee: <name>` (preserve
   other labels). Keep it current when ownership changes; it is advisory and does
@@ -199,6 +201,10 @@ automatically. Each identity works in **one session at a time**.
   session for one that already has a live session. Keep talking to it with
   `sys_session_message` on the returned session ID. When it is busy, leave its
   next assigned ticket queued and message it once it is idle.
+- An identity's session ID can change when its session is recreated. If a
+  message to it fails with "Session not found", call
+  `sys_project_identity_session` again for the current session and resend once.
+  A recreated session starts with no history, so restate the workstream.
 - Create identities when useful, for example when the user asks you to set up
   roles ("give us a PM and a Designer") or a recurring workstream needs a
   standing owner. Use `sys_project_identity_create` with a clear, unique name

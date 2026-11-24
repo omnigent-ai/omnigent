@@ -463,27 +463,28 @@ async def test_agents_create_and_edit_their_own_identities_but_not_the_owners(
     deleted = await project_client.delete(f"{identities}/{pm.json()['id']}", headers=agent)
     assert deleted.status_code == 403
     names = [entry["name"] for entry in (await project_client.get(identities)).json()["data"]]
-    assert names == ["Orchestrator", "PM", "Lead"]
+    assert names[0] == "Orchestrator" and sorted(names[1:]) == ["Lead", "PM"]
 
 
 async def test_agents_open_an_identitys_one_session_but_cannot_edit_it(
     project_client: httpx.AsyncClient,
 ) -> None:
-    """Delegating to an owner-made identity starts its session once, then reuses it."""
+    """Delegating to an owner-made identity reuses the session it started with."""
     created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
     agent = {ORCHESTRATION_SOURCE_HEADER: created["main_session_id"]}
     identities = f"/v1/projects/{created['id']}/identities"
     pm = (
         await project_client.post(identities, json={"name": "PM", "instructions": "Plan."})
     ).json()
+    assert pm["active_session_state"] in ("idle", "busy")
     session = f"{identities}/{pm['id']}/session"
     first = await project_client.post(session, json={"expected_session_id": None}, headers=agent)
     assert first.status_code == 200, first.text
-    assert first.json()["created"] is True
+    assert first.json() == {"session_id": pm["active_session_id"], "created": False}
     again = (
         await project_client.post(session, json={"expected_session_id": None}, headers=agent)
     ).json()
-    assert again == {"session_id": first.json()["session_id"], "created": False}
+    assert again == {"session_id": pm["active_session_id"], "created": False}
     snapshot = await project_client.get(
         f"/v1/sessions/{again['session_id']}", params={"include_project_mandate": "true"}
     )
@@ -503,6 +504,56 @@ async def test_agents_open_an_identitys_one_session_but_cannot_edit_it(
     assert (
         await project_client.delete(f"{identities}/{pm['id']}", headers=agent)
     ).status_code == 403
+
+
+async def test_identity_sessions_come_back_after_delete_or_archive(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """A persona always has exactly one live session; listing restores a lost one."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    identities = f"/v1/projects/{created['id']}/identities"
+    pm = (
+        await project_client.post(identities, json={"name": "PM", "instructions": "Plan."})
+    ).json()
+    first = pm["active_session_id"]
+    assert first is not None
+
+    def persona(listing: dict) -> dict:
+        return next(entry for entry in listing["data"] if entry["id"] == pm["id"])
+
+    assert (await project_client.delete(f"/v1/sessions/{first}")).status_code == 200
+    racing = await asyncio.gather(
+        project_client.get(identities),
+        project_client.get(identities),
+        project_client.post(f"{identities}/{pm['id']}/session", json={}),
+    )
+    seen = {persona(racing[0].json())["active_session_id"]}
+    seen |= {persona(racing[1].json())["active_session_id"], racing[2].json()["session_id"]}
+    assert len(seen) == 1 and first not in seen
+    restored = persona((await project_client.get(identities)).json())
+    second = restored["active_session_id"]
+    assert second not in (None, first)
+    assert restored["active_session_state"] in ("idle", "busy")
+    assert persona((await project_client.get(identities)).json())["active_session_id"] == second
+
+    archived = await project_client.patch(f"/v1/sessions/{second}", json={"archived": True})
+    assert archived.status_code == 200
+    third = persona((await project_client.get(identities)).json())["active_session_id"]
+    assert third not in (None, first, second)
+    snapshot = (
+        await project_client.get(
+            f"/v1/sessions/{third}", params={"include_project_mandate": "true"}
+        )
+    ).json()
+    assert snapshot["project_identity"]["instructions"] == "Plan."
+    live = [
+        session
+        for session in (
+            await project_client.get("/v1/sessions", params={"project_id": created["id"]})
+        ).json()["data"]
+        if session.get("title") == "PM" and not session.get("archived")
+    ]
+    assert [session["id"] for session in live] == [third]
 
 
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:
