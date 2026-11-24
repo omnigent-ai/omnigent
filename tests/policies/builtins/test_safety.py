@@ -1056,58 +1056,52 @@ def test_scheduled_task_approval_denies_invalid_review_values(
     assert expected in result["reason"]
 
 
-@pytest.mark.parametrize(
-    ("tool", "arguments"),
-    [
-        (
-            "sys_scheduled_task_create",
-            {"name": "nightly triage", "prompt": "Triage new issues.", "permission_mode": None},
-        ),
-        (
-            "sys_scheduled_task_update",
-            {
-                "scheduled_task_id": "0123456789abcdef0123456789abcdef",
-                "prompt": "Triage new issues.",
-                "permission_mode": None,
-            },
-        ),
-        ("sys_reminder_set", {"message": "Check the deploy.", "delay_seconds": 1800}),
-    ],
-)
-def test_check_scheduled_task_change_allows_a_valid_change_without_asking(
-    tool: str, arguments: dict[str, object]
-) -> None:
+def test_check_scheduled_task_change_allows_a_valid_reminder_without_asking() -> None:
     from omnigent.policies.builtins.safety import check_scheduled_task_change
 
     result = check_scheduled_task_change(
-        {"type": "tool_call", "target": tool, "data": {"arguments": arguments}}
+        {
+            "type": "tool_call",
+            "target": "sys_reminder_set",
+            "data": {"arguments": {"message": "Check the deploy.", "delay_seconds": 1800}},
+        }
     )
     assert result["result"] == "ALLOW"
+
+
+_OMITTED = object()
 
 
 @pytest.mark.parametrize("action", ["create", "update"])
 @pytest.mark.parametrize(
     ("permission_mode", "result"),
-    [("bypassPermissions", "ASK"), ("full-access", "ASK"), ("auto", "ALLOW"), (None, "ALLOW")],
+    [
+        ("bypassPermissions", "ASK"),
+        ("full-access", "ASK"),
+        # An older runner's update may leave the mode out, which keeps the task's own.
+        (_OMITTED, "ASK"),
+        ("auto", "ALLOW"),
+        (None, "ALLOW"),
+    ],
 )
 def test_check_scheduled_task_change_still_asks_for_a_task_mode_that_skips_approval(
-    action: str, permission_mode: str | None, result: str
+    action: str, permission_mode: object, result: str
 ) -> None:
-    """A task that would run without any reviewer is shown to a person even so."""
+    """A task that may run without any reviewer is shown to a person even so."""
     from omnigent.policies.builtins.safety import check_scheduled_task_change
 
+    arguments: dict[str, object] = {
+        "name": "nightly triage",
+        "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+        "prompt": "Triage new issues.",
+    }
+    if permission_mode is not _OMITTED:
+        arguments["permission_mode"] = permission_mode
     verdict = check_scheduled_task_change(
         {
             "type": "tool_call",
             "target": f"sys_scheduled_task_{action}",
-            "data": {
-                "arguments": {
-                    "name": "nightly triage",
-                    "scheduled_task_id": "0123456789abcdef0123456789abcdef",
-                    "prompt": "Triage new issues.",
-                    "permission_mode": permission_mode,
-                }
-            },
+            "data": {"arguments": arguments},
         }
     )
     assert verdict["result"] == result

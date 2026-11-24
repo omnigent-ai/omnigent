@@ -591,11 +591,12 @@ def check_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
 
     The policy builder uses it instead of :func:`ask_on_scheduled_task_change` in a
     session whose own mode doesn't ask a person, so the same requests are refused
-    there. A create or update that selects a mode skipping approval still asks.
+    there. A create or update still asks when it selects a mode skipping approval,
+    or omits the mode, which an update keeps from the task.
 
     :param event: Policy event dict.
     :returns: DENY for a malformed create, update or reminder, ASK for a task mode
-        that skips approval, ALLOW otherwise.
+        that skips approval or is omitted, ALLOW otherwise.
     """
     return _scheduled_task_change_verdict(event, ask=False)
 
@@ -605,7 +606,7 @@ def _scheduled_task_change_verdict(event: PolicyEvent, *, ask: bool) -> PolicyRe
 
     :param event: Policy event dict.
     :param ask: Whether every valid change asks (``True``), or only a create or update
-        that selects a mode skipping approval (``False``).
+        that selects a mode skipping approval or omits it (``False``).
     :returns: DENY for a malformed change, ASK or ALLOW for a valid one, ALLOW otherwise.
     """
     if event.get("type") != "tool_call":
@@ -625,9 +626,13 @@ def _scheduled_task_change_verdict(event: PolicyEvent, *, ask: bool) -> PolicyRe
     error = scheduled_task_review_error(args, action=action, require_complete=False)
     if error:
         return {"result": "DENY", "reason": f"Cannot {action} a scheduled task. {error}"}
-    # A task mode that skips approval would run with no reviewer at all, so a person
-    # still sees it where the session's own mode doesn't ask.
-    if not ask and args.get("permission_mode") not in APPROVAL_SKIPPING_PERMISSION_MODES:
+    # A person still sees a task mode that skips approval, which would run with no
+    # reviewer, and an omitted one, which keeps a mode this call can't see.
+    if (
+        not ask
+        and "permission_mode" in args
+        and args["permission_mode"] not in APPROVAL_SKIPPING_PERMISSION_MODES
+    ):
         return _ALLOW
     if action == "create":
         name = _clip(str(args.get("name") or "(unnamed)"))
