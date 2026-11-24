@@ -6512,7 +6512,7 @@ async def _forward_pane_signals(
     subprocess, this reads the pane a single time (throttled to
     :data:`_PANE_POLL_INTERVAL_S`) and hands the one snapshot to each relay,
     so the always-on cost is one subprocess per window regardless of how many
-    signals are parsed. Rejected retries are recaptured before interruption.
+    signals are parsed. Rejected retries are recaptured before reporting and interruption.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -6562,14 +6562,14 @@ async def _stop_rejected_api_retry(
     after its last attempt, minutes later. The ``failed`` status is posted
     before the Escape so the interrupt's trailing idle cannot settle the turn
     first. A failed post or keystroke is retried on the next capture.
-    The pane and parent hooks are rechecked after reporting to avoid
-    interrupting a turn that replaced the rejected request during the post.
+    The pane and parent hooks are rechecked after earlier relays and after
+    reporting, before each side effect.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Claude bridge directory.
     :param retry: The retry row parsed from the pane, or ``None``.
-    :param observed_hooks: Complete hook position observed before the pane capture.
+    :param observed_hooks: Durable hook checkpoint observed before the pane capture.
     :param response_id: Active turn's response id, or ``None`` when unknown.
     :param dedupe: Shared per-session dedupe state; mutated in place.
     """
@@ -6586,6 +6586,13 @@ async def _stop_rejected_api_retry(
     if dedupe.api_retry_observed_hooks is None:
         dedupe.api_retry_observed_hooks = observed_hooks
     if not dedupe.api_retry_reported:
+        if not await asyncio.to_thread(
+            _api_retry_is_current,
+            bridge_dir,
+            retry=retry,
+            observed_hooks=dedupe.api_retry_observed_hooks,
+        ):
+            return
         detail = _display_text(
             f"API Error: {retry.error}\n\nOmnigent stopped Claude Code from retrying this "
             f"rejected request (attempt {retry.attempt} of {retry.max_retries}).",
@@ -6638,10 +6645,10 @@ async def _stop_rejected_api_retry(
         return
 
 
-def _interrupt_api_retry_if_current(
+def _api_retry_is_current(
     bridge_dir: Path, *, retry: ApiRetry, observed_hooks: HookForwardState
 ) -> bool:
-    """Recheck the pane and on-disk turn hooks immediately before sending Escape."""
+    """Recheck the pane and on-disk turn hooks before reporting or interrupting a retry."""
     if read_pane_signals(bridge_dir).api_retry != retry:
         return False
     if (
@@ -6651,7 +6658,14 @@ def _interrupt_api_retry_if_current(
     ):
         return False
     hooks = _read_hook_events_for_state(bridge_dir, observed_hooks)
-    if _has_parent_turn_transition(bridge_dir, hooks.records):
+    return not _has_parent_turn_transition(bridge_dir, hooks.records)
+
+
+def _interrupt_api_retry_if_current(
+    bridge_dir: Path, *, retry: ApiRetry, observed_hooks: HookForwardState
+) -> bool:
+    """Revalidate ownership immediately before sending Escape."""
+    if not _api_retry_is_current(bridge_dir, retry=retry, observed_hooks=observed_hooks):
         return False
     inject_interrupt(bridge_dir, timeout_s=1.0)
     return True

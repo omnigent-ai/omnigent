@@ -1248,6 +1248,7 @@ async def test_forward_pane_signals_leaves_other_api_retries_running(
         "restarted",
         "restarted-followup",
         "pending-followup",
+        "relay-followup",
     ],
 )
 @pytest.mark.asyncio
@@ -1258,6 +1259,7 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
 ) -> None:
     """Report before Escape, recover delivery failures, and protect replacement turns."""
     recover_failures = scenario == "unchanged"
+    suspended_operation = "relay" if scenario == "relay-followup" else "report"
     should_interrupt = scenario in {
         "unchanged",
         "compacted",
@@ -1274,21 +1276,26 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
     )
     panes.append(_claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 2s · attempt 3/10"))
     calls: list[dict[str, Any]] = []
-    report_started = asyncio.Event()
-    finish_report = asyncio.Event()
+    operation_started = asyncio.Event()
+    finish_operation = asyncio.Event()
 
     async def handler(request: httpx.Request) -> httpx.Response:
         """Suspend the successful report; inject delivery failure only in its recovery case."""
         body = json.loads(request.content.decode("utf-8"))
         calls.append(body)
-        if _failed_status_posts([body]):
+        is_failure = bool(_failed_status_posts([body]))
+        if is_failure:
             if recover_failures and len(_failed_status_posts(calls)) == 1:
                 timeline.append("report_failed")
                 return httpx.Response(503, json={})
-            timeline.append("report_started")
-            report_started.set()
-            await finish_report.wait()
-            timeline.append("report_completed")
+        if is_failure or (
+            scenario == "relay-followup" and body["type"] == "external_permission_mode_change"
+        ):
+            operation = "report" if is_failure else "relay"
+            timeline.append(f"{operation}_started")
+            operation_started.set()
+            await finish_operation.wait()
+            timeline.append(f"{operation}_completed")
         return httpx.Response(200, json={})
 
     dedupe = forwarder._ForwardDedupeState()
@@ -1344,12 +1351,12 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
                 bridge_dir,
                 {"hook_event_name": "UserPromptSubmit", "session_id": "parent-session"},
             )
-            finish_report.set()
+            finish_operation.set()
             await _poll()
             assert _failed_status_posts(calls) == []
             assert sent_keys == []
             assert dedupe.prompt_submit_cursor == 1
-            finish_report.clear()
+            finish_operation.clear()
             restored = forwarder._read_hook_state(bridge_dir)
             assert restored is not None
             await _forward_hooks(restored)
@@ -1365,11 +1372,16 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(_poll())
             try:
-                await asyncio.wait_for(report_started.wait(), timeout=5.0)
-                assert timeline == [*recovery_timeline, "report_started"]
-                if scenario in {"stopped", "followup"}:
-                    panes.append(_claude_pane("✻ Billowing…" if scenario == "followup" else ""))
-                if scenario in {"followup", "identical-retry", "restarted-followup"}:
+                await asyncio.wait_for(operation_started.wait(), timeout=5.0)
+                assert timeline == [*recovery_timeline, f"{suspended_operation}_started"]
+                if scenario in {"stopped", "followup", "relay-followup"}:
+                    panes.append(_claude_pane("" if scenario == "stopped" else "✻ Billowing…"))
+                if scenario in {
+                    "followup",
+                    "identical-retry",
+                    "restarted-followup",
+                    "relay-followup",
+                }:
                     record_hook_event(
                         bridge_dir,
                         {"hook_event_name": "UserPromptSubmit", "session_id": "parent-session"},
@@ -1387,8 +1399,8 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
                         },
                     )
             finally:
-                finish_report.set()
-        report_count = 2 if recover_failures else 1
+                finish_operation.set()
+        report_count = 0 if scenario == "relay-followup" else 2 if recover_failures else 1
         assert len(_failed_status_posts(calls)) == report_count
         assert len(sent_keys) == int(should_interrupt and not recover_failures)
 
@@ -1400,8 +1412,8 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
     escape_count = (2 if recover_failures else 1) if should_interrupt else 0
     assert timeline == [
         *recovery_timeline,
-        "report_started",
-        "report_completed",
+        f"{suspended_operation}_started",
+        f"{suspended_operation}_completed",
         *(["escape"] * escape_count),
     ]
     assert len(sent_keys) == int(should_interrupt)
