@@ -110,7 +110,7 @@ function startRadar({
   /** A design that is meant to throw while the page loads. */
   allowErrors?: boolean;
 } = {}) {
-  const { listeners, writes, pages, collection } = recordingCollections();
+  const { listeners, writes, pages, failing, collection } = recordingCollections();
   let actionListener: Listener | null = null;
   const requests: { action: string; params: unknown }[] = [];
   const automations: unknown[] = [];
@@ -156,6 +156,7 @@ function startRadar({
     emitSnapshot,
     emitActions,
     pages,
+    failing,
     writes,
     reports,
     requests,
@@ -875,6 +876,28 @@ describe("where was I designs", () => {
             error: expect.stringContaining("lanes exploded"),
           }),
         }),
+      ]),
+    );
+  });
+
+  it("reports a failed design again after a report that didn't save", async () => {
+    const html = withView(
+      "",
+      "Radar.view({ name: 'Broken', render: function () { throw new Error('lanes exploded'); } });",
+    );
+    const { emit, reports, failing, ready } = startRadar({ html });
+    await waitFor(() => expect(ready()).toBe(true));
+    failing.render_reports = 1;
+    emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
+    emit("layout", [{ id: "current", version: "v1", value: LAYOUT }]);
+    await waitFor(() => expect(byId("look").dataset.kind).toBe("failed"));
+    // The first report didn't save; a later draw reports it again, so the agent still learns
+    // the design failed.
+    await waitFor(() => expect(failing.render_reports).toBe(0));
+    emit("radar", [{ id: "current", version: "v2", value: RADAR }]);
+    await waitFor(() =>
+      expect(reports()).toEqual([
+        expect.objectContaining({ value: expect.objectContaining({ state: "failed" }) }),
       ]),
     );
   });

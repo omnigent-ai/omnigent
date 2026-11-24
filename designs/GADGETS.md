@@ -56,7 +56,8 @@ A deployment can replace three pieces without forking:
 `create_app(gadget_store=..., gadget_access=...)` takes custom implementations; the CLI passes
 the defaults. Grants live in the server's shared database, but the default store is a local
 directory: replicas that serve the same gadgets need one shared directory that supports its
-atomic file operations (create-only `link`, `rename`), or a shared custom store.
+atomic file operations (create-only `link`, `rename`) and file locks that hold across hosts
+(writers and removers of a record coordinate through them), or a shared custom store.
 
 ### Why a document store, not the relational stores
 

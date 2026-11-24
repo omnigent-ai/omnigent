@@ -62,6 +62,13 @@ export function recordingCollections() {
     string,
     Record<string, { items: TemplateDoc[]; nextCursor: string | null } | Error>
   > = {};
+  /** How many of the next writes to a collection fail, by collection. */
+  const failing: Record<string, number> = {};
+  const failWrite = (name: string) => {
+    if (!failing[name]) return false;
+    failing[name] -= 1;
+    return true;
+  };
   const collection = (name: string) => {
     const docs = (stored[name] ??= {});
     return {
@@ -75,12 +82,14 @@ export function recordingCollections() {
       },
       get: (id: string) => Promise.resolve(docs[id] ?? null),
       create: (value: unknown, options: { id?: string }) => {
+        if (failWrite(name)) return Promise.reject(new Error("write failed"));
         const doc = { id: options?.id ?? "x", version: "v1", value };
         writes.push({ collection: name, op: "create", id: doc.id, value });
         docs[doc.id] = doc;
         return Promise.resolve(doc);
       },
       replace: (id: string, value: unknown) => {
+        if (failWrite(name)) return Promise.reject(new Error("write failed"));
         const doc = { id, version: "v2", value };
         writes.push({ collection: name, op: "replace", id, value });
         docs[id] = doc;
@@ -89,7 +98,7 @@ export function recordingCollections() {
       delete: () => Promise.resolve({ deleted: true }),
     };
   };
-  return { listeners, writes, pages, collection };
+  return { listeners, writes, pages, failing, collection };
 }
 
 /**

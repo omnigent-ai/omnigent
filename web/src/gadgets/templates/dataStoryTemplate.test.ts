@@ -125,7 +125,7 @@ function startStory({
   /** Every action request fails, as when the gadget session can't be reached. */
   failRequests?: boolean;
 } = {}) {
-  const { listeners, writes, pages, collection } = recordingCollections();
+  const { listeners, writes, pages, failing, collection } = recordingCollections();
   let actionListener: Listener | null = null;
   const requests: { action: string; params: unknown }[] = [];
   const opened: string[] = [];
@@ -179,6 +179,7 @@ function startStory({
     emitActions,
     load,
     pages,
+    failing,
     writes,
     requests,
     opened,
@@ -501,6 +502,27 @@ describe("data story designs", () => {
     expect(byId("look").getAttribute("data-kind")).toBe("failed");
     expect(byId("look").textContent).toContain("This look could not be drawn");
     expect(button("Back to the previous look")).toBeDefined();
+    await waitFor(() =>
+      expect(reports()).toEqual([
+        expect.objectContaining({ value: expect.objectContaining({ state: "failed" }) }),
+      ]),
+    );
+  });
+
+  it("reports a failed design again after a report that didn't save", async () => {
+    const broken = withView(
+      "",
+      "Story.view({ name: 'Broken', render: function () { return undefined.length; } });",
+    );
+    const { load, emit, reports, failing, ready } = startStory({ html: broken });
+    await waitFor(() => expect(ready()).toBe(true));
+    failing.render_reports = 1;
+    load({ story: STORY, series: { weekly: WEEKLY }, layout: LAYOUT });
+    await waitFor(() => expect(byId("look").getAttribute("data-kind")).toBe("failed"));
+    // The first report didn't save; a later draw reports it again, so the agent still learns
+    // the design failed.
+    await waitFor(() => expect(failing.render_reports).toBe(0));
+    emit("story", [{ id: "current", version: "v2", value: STORY }]);
     await waitFor(() =>
       expect(reports()).toEqual([
         expect.objectContaining({ value: expect.objectContaining({ state: "failed" }) }),

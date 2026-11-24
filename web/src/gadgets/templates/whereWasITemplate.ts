@@ -484,7 +484,10 @@ ${GADGET_KIT_HELPERS}
       if (!doc) return reports.create(value, { id: revision });
       if (doc.value && doc.value.state === state) return null;
       return reports.replace(revision, value, { ifVersion: doc.version });
-    }).catch(function () { return undefined; });
+    }).catch(function () {
+      // Not saved: forget it, so the next draw reports it again and the agent still learns.
+      if (reported[revision] === state) delete reported[revision];
+    });
   }
 
   function drawView() {
@@ -497,6 +500,8 @@ ${GADGET_KIT_HELPERS}
     try {
       view.render(root, viewModel(), kit);
       if (view === customView && !value.example) report('ok', '');
+      // A failure whose report didn't save is reported again on the next draw.
+      else if (viewFailure && !value.example) report('failed', viewFailure.text);
     } catch (error) {
       if (view !== customView) throw error;
       failView(error);

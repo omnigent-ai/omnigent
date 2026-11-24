@@ -147,13 +147,7 @@ footer { margin-top: 26px; font-size: 12px; color: var(--muted); }
 .view:empty { display: none; }
 `;
 
-/**
- * DOM and text helpers: el and svg build elements, $ finds one by ID, keyed keeps one element
- * per key and animates moves (unless the viewer prefers reduced motion, `calm`), ago and elapsed
- * format times, hash gives a stable number for a string, wrap splits text for SVG, plain drops
- * Markdown marks, clause drops a closing period, message reads an error, and watchEveryPage
- * watches every page of a collection.
- */
+/** DOM, formatting and paginated-watch helpers embedded by both templates. */
 export const GADGET_KIT_HELPERS = `
   var SVG_NS = 'http://www.w3.org/2000/svg';
   var calm = Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
