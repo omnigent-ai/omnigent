@@ -1,12 +1,13 @@
-// Map raw-file comment offsets to and from ProseMirror positions, and apply
-// externally changed Markdown to a live editor.
+// Map raw-file comment offsets to and from ProseMirror positions, apply
+// externally changed Markdown to a live editor, and write copies as Markdown.
 
 import type { Editor } from "@tiptap/core";
-import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
+import type { Fragment, Node as ProseMirrorNode, Slice } from "@tiptap/pm/model";
 import { EditorState } from "@tiptap/pm/state";
 import { Mapping, StepMap } from "@tiptap/pm/transform";
 import type { MarkdownManager } from "@tiptap/markdown";
 import { exactIndex, markdownSourceMap, type SourceMap } from "./markdownSourceMap";
+import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import type { Comment } from "@/hooks/useComments";
 
 const SEP = "\n";
@@ -311,4 +312,51 @@ function changedRangeMapping(previous: ProseMirrorNode, next: ProseMirrorNode): 
     endB += overlap;
   }
   return new Mapping([new StepMap([start, endA - start, endB - start])]);
+}
+
+/** The textblock *content* holds alone, through single-child wrappers like a list item. */
+function soleTextblock(content: Fragment): ProseMirrorNode | null {
+  let node = content.childCount === 1 ? content.firstChild : null;
+  while (node && !node.isTextblock) node = node.childCount === 1 ? node.firstChild : null;
+  return node;
+}
+
+/** Whether *content* holds a raw HTML block, whose source the editor never shows. */
+function holdsRawHtml(content: Fragment): boolean {
+  let found = false;
+  content.descendants((node) => {
+    found ||= node.type.name === HtmlPassthrough.name;
+    return !found;
+  });
+  return found;
+}
+
+/**
+ * The Markdown a copy of *slice* puts on the clipboard as plain text, written by
+ * the editor's own serializer so unsaved edits come along. Text within one
+ * paragraph, heading or list item copies as inline Markdown, without the block's
+ * `#`s or list marker; text within a code block copies as the code itself. A
+ * whole selected block, such as a selected heading node, keeps its marker.
+ *
+ * :param editor: A TipTap editor with the Markdown extension.
+ * :param slice: What the copy takes, e.g. ``editor.state.selection.content()``,
+ *     whose content is cut from the top of the document.
+ * :returns: The Markdown, or null when *slice* can't stand as a document (a few
+ *     table cells' bare rows), holds a raw HTML block whose hidden source (a
+ *     comment or `<script>`) would ride along, or would copy only whitespace.
+ */
+export function selectionMarkdown(editor: Editor, slice: Slice): string | null {
+  const manager = editor.markdown;
+  if (!manager || !editor.schema.topNodeType.validContent(slice.content)) return null;
+  if (holdsRawHtml(slice.content)) return null;
+  // Only a slice open down to its textblock lies inside it.
+  const open = slice.openStart > 0 && slice.openEnd > 0;
+  const textblock = open ? soleTextblock(slice.content) : null;
+  if (textblock?.type.spec.code) return textblock.textContent.trim() ? textblock.textContent : null;
+  const content = textblock
+    ? [{ type: "paragraph", content: textblock.content.toJSON() }]
+    : slice.content.toJSON();
+  // A table serializes between blank lines, which a copy of it shouldn't carry.
+  const markdown = manager.serialize({ type: "doc", content }).replace(/^\n+|\n+$/g, "");
+  return markdown.trim() ? markdown : null;
 }

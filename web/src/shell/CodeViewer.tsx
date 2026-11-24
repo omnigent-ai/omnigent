@@ -25,6 +25,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent as ReactClipboardEvent,
   type ComponentPropsWithoutRef,
   type ReactNode,
   type RefObject,
@@ -65,6 +66,7 @@ import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceI
 import {
   type ActiveSelection,
   type SaveStatus,
+  type SourceSpan,
   detectLang,
   getSelectionOffsets,
   indexToLine,
@@ -75,6 +77,10 @@ import {
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
+  markdownPreviewSelectionSource,
+  rehypeSourceOffsets,
+  remarkRecordHiddenSource,
+  selectedPreviewHtml,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
 import { DataTablePreview } from "./DataTablePreview";
@@ -179,6 +185,8 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   // `language-math` code nodes as plain text; KaTeX then renders that trusted
   // output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
   MATH_PLUGIN.rehypePlugin,
+  // Last, so sanitize keeps the source offsets that copy maps a selection through.
+  rehypeSourceOffsets,
 ];
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
@@ -221,8 +229,9 @@ function MarkdownPreviewLink({
   }
   const target = filePath === null ? "" : resolveWorkspacePath(filePath, href);
   if (!openFile || !target) {
+    // Spread keeps the source-offset stamps that copy maps a selection through.
     return (
-      <span className={props.className} title={href}>
+      <span {...props} title={href}>
         {children}
       </span>
     );
@@ -293,19 +302,38 @@ function MarkdownPreview({
   tocOpen: boolean;
   onTocOpenChange: (open: boolean) => void;
 }) {
+  // Where source the preview hides sits in *content*, refilled each time it renders.
+  const [hiddenSource] = useState<SourceSpan[]>(() => []);
   // Rewrite `\(…\)`/`\[…\]` to `$$…$$` as chat does; remark-math only honours `$`.
   // Memoized so resizes and toolbar re-renders skip re-parsing the document.
   const markdown = useMemo(
     () => (
       <ReactMarkdown
-        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+        remarkPlugins={[[remarkRecordHiddenSource, hiddenSource], ...MARKDOWN_REMARK_PLUGINS]}
         rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
         components={MARKDOWN_COMPONENTS}
       >
         {normalizeExplicitMathDelimiters(content)}
       </ReactMarkdown>
     ),
-    [content],
+    [content, hiddenSource],
+  );
+  // Plain text gets the selection's Markdown source, and HTML its rendered form
+  // for rich paste. The math rewrite above keeps every offset, so they index
+  // *content* too. A selection that can't be mapped keeps the browser's copy.
+  const handleCopy = useCallback(
+    (event: ReactClipboardEvent<HTMLDivElement>) => {
+      const selection = window.getSelection();
+      if (selection?.rangeCount !== 1) return;
+      const range = selection.getRangeAt(0);
+      const root = event.currentTarget;
+      const source = markdownPreviewSelectionSource(range, root, content, hiddenSource);
+      if (source === null) return;
+      event.preventDefault();
+      event.clipboardData.setData("text/plain", source);
+      event.clipboardData.setData("text/html", selectedPreviewHtml(range, root));
+    },
+    [content, hiddenSource],
   );
   return (
     <div className="flex h-full">
@@ -313,6 +341,7 @@ function MarkdownPreview({
         ref={rootRef}
         data-preview-scroll
         onScroll={onScroll}
+        onCopy={handleCopy}
         className={cn(
           "markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none",
           deferOffscreen &&

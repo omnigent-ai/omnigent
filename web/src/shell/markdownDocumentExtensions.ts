@@ -1,4 +1,5 @@
-import type { AnyExtension } from "@tiptap/core";
+import { Extension, type AnyExtension } from "@tiptap/core";
+import { Plugin } from "@tiptap/pm/state";
 import { StarterKit } from "@tiptap/starter-kit";
 import { TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import { ListItem, TaskItem } from "@tiptap/extension-list";
@@ -11,10 +12,28 @@ import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import { SoftBreak } from "./TipTapSoftBreak";
 import { BoundedTable, BoundedTaskList } from "./tiptapBoundedTokenizers";
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
+import { selectionMarkdown } from "./TipTapEditorHelpers";
 
 // Parsed list items may start with a nested list, code block, quote, heading or
 // table; `block+` keeps that doc schema-valid so the first transaction doesn't throw.
 const SafeListItem = ListItem.extend({ content: "block+" });
+
+// Copies plain text as Markdown; the HTML stays ProseMirror's. Priority 101 runs
+// ahead of TipTap's core serializer (100), and an empty answer falls back to it.
+const MarkdownClipboardText = Extension.create({
+  name: "markdownClipboardText",
+  priority: 101,
+  addProseMirrorPlugins() {
+    const { editor } = this;
+    return [
+      new Plugin({
+        props: {
+          clipboardTextSerializer: (slice) => selectionMarkdown(editor, slice) ?? "",
+        },
+      }),
+    ];
+  },
+});
 
 /** Extensions that define how the Markdown viewer parses and renders a document. */
 export function createMarkdownDocumentExtensions(
@@ -51,6 +70,7 @@ export function createMarkdownDocumentExtensions(
     // reflows prose to the viewer width like Preview; see TipTapSoftBreak.ts.
     SoftBreak,
     Markdown,
+    MarkdownClipboardText,
     createWorkspaceImageExtension(conversationId, path),
   ];
 }

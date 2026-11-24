@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { NodeSelection } from "@tiptap/pm/state";
+import { CellSelection } from "@tiptap/pm/tables";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
-import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
+import {
+  installMarkdownParserPatch,
+  installMarkdownSerializerPatch,
+} from "./tiptapMarkdownPatches";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import {
   applyExternalMarkdown,
@@ -12,6 +16,8 @@ import {
 import type { Comment } from "@/hooks/useComments";
 
 installMarkdownParserPatch();
+// The viewer serializes copies through the patched serializer, as it does saves.
+installMarkdownSerializerPatch();
 
 describe("repeated words in Markdown", () => {
   let editor: Editor | undefined;
@@ -446,5 +452,178 @@ describe("applyExternalMarkdown", () => {
     ed.commands.setTextSelection(positionAfter(ed.state.doc, "Same"));
     applyExternalMarkdown(ed, "Same text.\n");
     expect(ed.state.selection.from).toBe(positionAfter(ed.state.doc, "Same"));
+  });
+});
+
+describe("selectionMarkdown on copy", () => {
+  let editor: Editor | undefined;
+  afterEach(() => {
+    editor?.destroy();
+    editor = undefined;
+  });
+
+  function openMarkdown(markdown: string): Editor {
+    editor = new Editor({
+      extensions: createMarkdownDocumentExtensions("conversation", "doc.md"),
+      content: markdown,
+      contentType: "markdown",
+    });
+    return editor;
+  }
+
+  /** Document position where *needle* starts (or, with *after*, ends) in a text node. */
+  function textPosition(ed: Editor, needle: string, after = false): number {
+    let found = -1;
+    ed.state.doc.descendants((node, pos) => {
+      if (found !== -1 || !node.isText || !node.text?.includes(needle)) return;
+      found = pos + node.text.indexOf(needle) + (after ? needle.length : 0);
+    });
+    if (found === -1) throw new Error(`no text holds ${JSON.stringify(needle)}`);
+    return found;
+  }
+
+  /** Selects from the start of *from* through the end of *to*, copies, and returns each flavor. */
+  function copySelection(ed: Editor, from: string, to: string): Map<string, string> {
+    ed.commands.setTextSelection({ from: textPosition(ed, from), to: textPosition(ed, to, true) });
+    return copyCurrentSelection(ed);
+  }
+
+  /** Copies the editor's current selection through ProseMirror and returns each flavor. */
+  function copyCurrentSelection(ed: Editor): Map<string, string> {
+    const flavors = new Map<string, string>();
+    const event = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        clearData: vi.fn(),
+        setData: (type: string, data: string) => flavors.set(type, data),
+      },
+    });
+    ed.view.dom.dispatchEvent(event);
+    return flavors;
+  }
+
+  it.each([
+    ["text inside one paragraph", "Plain words here.", "words", "words", "words"],
+    [
+      "text across a hard-wrapped line",
+      "First line words\nsecond line words.",
+      "words",
+      "second",
+      "words\nsecond",
+    ],
+    [
+      "a selection ending inside bold",
+      "Plain **bold text** after",
+      "Plain",
+      "bold",
+      "Plain **bold**",
+    ],
+    [
+      "a selection starting inside a link",
+      "See [the docs](https://example.com/docs) now",
+      "docs",
+      "now",
+      "[docs](https://example.com/docs) now",
+    ],
+    ["a selection crossing inline code", "Run `make test` today", "Run", "make", "Run `make`"],
+    ["text inside a heading", "# Release notes\n\nBody text.", "Release", "notes", "Release notes"],
+    [
+      "a heading and the paragraph after it",
+      "# Release notes\n\nBody text.",
+      "Release",
+      "Body",
+      "# Release notes\n\nBody",
+    ],
+    ["text inside a list item", "- first item\n- second item", "first", "item", "first item"],
+    [
+      "whole list items",
+      "- first item\n- second item\n- third item",
+      "first",
+      "second item",
+      "- first item\n- second item",
+    ],
+    ["a code block's text", "```js\nconst answer = 42;\n```", "const", "42;", "const answer = 42;"],
+    [
+      "a selection leaving a code block",
+      "Intro line\n\n```js\nconst answer = 42;\n```",
+      "Intro",
+      "answer",
+      "Intro line\n\n```js\nconst answer\n```",
+    ],
+    [
+      "table cells",
+      "| Name | Value |\n| --- | --- |\n| alpha | 1 |",
+      "Name",
+      "1",
+      // The editor's serializer pads columns, as it does when saving.
+      "| Name  | Value |\n| ----- | ----- |\n| alpha | 1     |",
+    ],
+  ])("copies %s as Markdown", (_shape, markdown, from, to, expected) => {
+    const flavors = copySelection(openMarkdown(markdown), from, to);
+    expect(flavors.get("text/plain")).toBe(expected);
+  });
+
+  it("copies unsaved edits and keeps ProseMirror's HTML", () => {
+    const ed = openMarkdown("Plain words here.");
+    ed.commands.setTextSelection({
+      from: textPosition(ed, "words"),
+      to: textPosition(ed, "words", true),
+    });
+    ed.commands.toggleBold();
+    const flavors = copySelection(ed, "Plain", "here.");
+    expect(flavors.get("text/plain")).toBe("Plain **words** here.");
+    expect(flavors.get("text/html")).toContain("<strong>words</strong>");
+  });
+
+  it("keeps the plain text of a whitespace-only selection", () => {
+    const ed = openMarkdown("Plain words here.");
+    const flavors = copySelection(ed, " ", " ");
+    expect(flavors.get("text/plain")).toBe(" ");
+  });
+
+  it("keeps TipTap's plain text across a raw HTML block, whose hidden source stays out", () => {
+    const ed = openMarkdown("First para\n\n<!-- INERT -->\n\nSecond para");
+    const flavors = copySelection(ed, "First", "Second para");
+    expect(flavors.get("text/plain")).toBe("First para\n\n\n\nSecond para");
+  });
+
+  it("copies a reference-style link inline alone, and as a reference with its definition", () => {
+    const ed = openMarkdown("See [docs][d] now.\n\n[d]: https://example.com/docs");
+    expect(copySelection(ed, "See", "now.").get("text/plain")).toBe(
+      "See [docs](https://example.com/docs) now.",
+    );
+    ed.commands.setTextSelection({ from: textPosition(ed, "See"), to: ed.state.doc.content.size });
+    expect(copyCurrentSelection(ed).get("text/plain")).toBe(
+      "See [docs][d] now.\n\n[d]: https://example.com/docs",
+    );
+  });
+
+  it.each([
+    ["heading", "# Release notes\n\nBody text.", "# Release notes"],
+    [
+      "code block",
+      "```js\nconst answer = 42;\n```\n\nBody text.",
+      "```js\nconst answer = 42;\n```",
+    ],
+  ])("copies a selected %s node whole, syntax included", (_shape, markdown, expected) => {
+    const ed = openMarkdown(markdown);
+    ed.commands.setNodeSelection(0);
+    expect(copyCurrentSelection(ed).get("text/plain")).toBe(expected);
+  });
+
+  it("leaves a few table cells' bare rows to TipTap's plain text", () => {
+    const ed = openMarkdown("| Name | Value |\n| --- | --- |\n| alpha | 1 |");
+    // Position before the cell holding *needle*: its text sits in the cell's paragraph.
+    const cell = (needle: string) => {
+      const $text = ed.state.doc.resolve(textPosition(ed, needle));
+      return $text.before($text.depth - 1);
+    };
+    ed.view.dispatch(
+      ed.state.tr.setSelection(CellSelection.create(ed.state.doc, cell("Name"), cell("alpha"))),
+    );
+    const flavors = copyCurrentSelection(ed);
+    expect(flavors.get("text/plain")).toBe("Name\n\nalpha");
+    // ProseMirror still writes the selected cells' HTML.
+    expect(flavors.get("text/html")).toMatch(/<table.*<p>Name<\/p>.*<p>alpha<\/p>/);
   });
 });

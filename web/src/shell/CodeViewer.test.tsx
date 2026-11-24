@@ -230,20 +230,21 @@ describe("video previews", () => {
 });
 
 /**
- * Dispatches a `copy` event to `document` with a mock clipboardData.
- * Returns the `setData` spy so the caller can assert on what was written.
+ * Dispatches a `copy` event to *target* (default `document`) with a mock
+ * clipboardData. Returns the `setData` spy so the caller can assert on what
+ * was written.
  *
  * Uses a plain `Event` rather than `new ClipboardEvent(...)` because jsdom
  * does not expose `ClipboardEvent` as a global constructor.
  */
-function fireCopyEvent(): ReturnType<typeof vi.fn> {
+function fireCopyEvent(target: EventTarget = document): ReturnType<typeof vi.fn> {
   const setData = vi.fn();
   const event = new Event("copy", { bubbles: true, cancelable: true });
   Object.defineProperty(event, "clipboardData", {
     value: { setData, getData: vi.fn() },
     writable: false,
   });
-  document.dispatchEvent(event);
+  target.dispatchEvent(event);
   return setData;
 }
 
@@ -469,6 +470,331 @@ describe("CodeViewer Cmd+A select-all and copy interception", () => {
 
     expect(setData).not.toHaveBeenCalled();
   });
+});
+
+describe("CodeViewer markdown preview copy", () => {
+  const TWO_ROW_TABLE = "| Name | Value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |";
+
+  /** The first rendered text node holding *needle*, and where it starts in it. */
+  function previewText(needle: string): { node: Text; offset: number } {
+    const root = document.querySelector(".markdown-preview");
+    if (!root) throw new Error("no Markdown preview rendered");
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const offset = (node as Text).data.indexOf(needle);
+      if (offset !== -1) return { node: node as Text, offset };
+    }
+    throw new Error(`no rendered text holds ${JSON.stringify(needle)}`);
+  }
+
+  /** Selects from the start of *from*'s text through the end of *to*'s, then copies. */
+  function copyPreviewSelection(from: string, to: string): ReturnType<typeof vi.fn> {
+    const start = previewText(from);
+    const end = previewText(to);
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset + to.length);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    return fireCopyEvent(start.node);
+  }
+
+  afterEach(() => window.getSelection()?.removeAllRanges());
+
+  it.each([
+    ["text inside one text node", "Plain words here.", "words", "words", "words"],
+    [
+      "a selection ending inside bold",
+      "Plain **bold text** after",
+      "Plain",
+      "bold",
+      "Plain **bold text**",
+    ],
+    [
+      "a selection starting inside italic",
+      "Some *italic text* after",
+      "text",
+      "after",
+      "*italic text* after",
+    ],
+    [
+      "a selection inside a link",
+      "See [the docs](https://example.com/docs) now",
+      "the",
+      "docs",
+      "the docs",
+    ],
+    [
+      "a selection leaving a link",
+      "See [the docs](https://example.com/docs) now",
+      "docs",
+      "now",
+      "[the docs](https://example.com/docs) now",
+    ],
+    [
+      "a selection leaving a workspace link",
+      "See [notes](notes.md) here",
+      "otes",
+      "here",
+      "[notes](notes.md) here",
+    ],
+    ["a selection crossing inline code", "Run `make test` today", "Run", "make", "Run `make test`"],
+    ["an escaped character", "Price is 5\\*3 today", "*3", "today", "\\*3 today"],
+    ["text after an entity", "AT&amp;T rocks", "T rocks", "rocks", "T rocks"],
+    ["an entity on its own", "a &amp; b", "&", "&", "&amp;"],
+    ["an entity filling its text node", "&amp;", "&", "&", "&amp;"],
+    ["a doubly encoded entity", "&amp;amp;", "&amp;", "&amp;", "&amp;amp;"],
+    ["part of an unknown entity name", "a &madeup; b", "made", "made", "made"],
+    ["escaped backslashes", "\\\\\\\\", "\\\\", "\\\\", "\\\\\\\\"],
+    [
+      "a selection starting at an escape",
+      "\\*literal\\* here",
+      "*literal*",
+      "*literal*",
+      "\\*literal\\*",
+    ],
+    ["an escaped star inside bold", "**\\* star**", "* star", "* star", "\\* star"],
+    ["heading text with an entity", "# #tags &amp; tips", "#tags", "#tags", "#tags"],
+    ["TeX delimiters", "Inline \\(x^2\\) math", "Inline", "math", "Inline \\(x^2\\) math"],
+    [
+      "whole list items",
+      "- first item\n- second item\n- third item",
+      "first",
+      "second item",
+      "- first item\n- second item",
+    ],
+    [
+      "list items entered mid-text",
+      "- first item\n- second item\n- third item",
+      "item",
+      "second",
+      "item\n- second",
+    ],
+    ["text inside a heading", "# Release notes\n\nBody text.", "Release", "notes", "Release notes"],
+    [
+      "a heading and the paragraph after it",
+      "# Release notes\n\nBody text.",
+      "Release",
+      "Body",
+      "# Release notes\n\nBody",
+    ],
+    [
+      "a quote and the paragraph after it",
+      "> Quoted line\n\nAfter it.",
+      "Quoted",
+      "After",
+      "> Quoted line\n\nAfter",
+    ],
+    ["an escape on a quote's next line", "> a\n> \\>b", "a", ">b", "a\n\\>b"],
+    ["an entity on a quote's next line", "> a\n> &gt;b", "a", ">b", "a\n&gt;b"],
+    ["a code block's text", "```js\nconst answer = 42;\n```", "const", "42;", "const answer = 42;"],
+    [
+      "lines of code inside a quote",
+      "> ```\n> first\n> second\n> ```",
+      "first",
+      "second",
+      "first\nsecond",
+    ],
+    [
+      "a selection leaving a code block",
+      "Intro line\n\n```js\nconst answer = 42;\n```",
+      "Intro",
+      "answer",
+      "Intro line\n\n```js\nconst answer = 42;\n```",
+    ],
+    [
+      "table cells",
+      "| Name | Value |\n| ---- | ----- |\n| alpha | 1 |",
+      "Name",
+      "1",
+      "| Name | Value |\n| ---- | ----- |\n| alpha | 1 |",
+    ],
+    [
+      "a selection leaving a table",
+      "Intro\n\n| Name | Value |\n| ---- | ----- |\n| alpha | 1 |",
+      "Intro",
+      "Name",
+      "Intro\n\n| Name | Value |\n| ---- | ----- |\n| alpha | 1 |",
+    ],
+    ["text inside a table cell", TWO_ROW_TABLE, "alpha", "alpha", "alpha"],
+    ["cells within one table row", TWO_ROW_TABLE, "alpha", "1", TWO_ROW_TABLE],
+    ["table body rows", TWO_ROW_TABLE, "alpha", "2", TWO_ROW_TABLE],
+  ])("copies %s as its Markdown source", (_shape, markdown, from, to, expected) => {
+    renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    const setData = copyPreviewSelection(from, to);
+    expect(setData).toHaveBeenCalledWith("text/plain", expected);
+  });
+
+  it.each([
+    ["before its caption", "![logo](logo.png) caption"],
+    ["after its caption", "caption ![logo](logo.png)"],
+  ])("copies a selected image %s", (_shape, markdown) => {
+    renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    const paragraph = document.querySelector(".markdown-preview p");
+    if (!paragraph) throw new Error("no rendered paragraph");
+    // Element boundaries, as a drag over the whole line makes, so the image is inside.
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    window.getSelection()?.addRange(range);
+    expect(fireCopyEvent(paragraph)).toHaveBeenCalledWith("text/plain", markdown);
+  });
+
+  it("keeps the browser's copy for a selection reaching a footnote's rendered definition", () => {
+    renderViewer("Text[^1] here\n\n[^1]: The note", true, "doc.md", { viewMode: "preview" });
+    const start = previewText("Text");
+    const end = previewText("The note");
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset + "The note".length);
+    window.getSelection()?.addRange(range);
+    expectBrowserCopy(start.node);
+  });
+
+  it("keeps the selected cells' HTML inside their table, without source stamps", () => {
+    renderViewer(TWO_ROW_TABLE, true, "doc.md", { viewMode: "preview" });
+    const setData = copyPreviewSelection("alpha", "1");
+    expect(setData).toHaveBeenCalledWith(
+      "text/html",
+      "<table><tbody><tr><td>alpha</td><td>1</td></tr></tbody></table>",
+    );
+  });
+
+  it("keeps the selection's rendered HTML, wrapped in its list, for rich paste", () => {
+    renderViewer("- first **item**\n- second item", true, "doc.md", { viewMode: "preview" });
+    const setData = copyPreviewSelection("first", "second");
+    expect(setData).toHaveBeenCalledWith(
+      "text/html",
+      "<ul><li>first <strong>item</strong></li>\n<li>second</li></ul>",
+    );
+  });
+
+  // A rendered construct copies its whole source, comments the render hides included.
+  it.each([
+    [
+      "diagram",
+      "```mermaid\ngraph TD\n%% a diagram comment\nA-->B\n```",
+      "[data-testid='mermaid-preview'] svg",
+    ],
+    ["formula", "$$\nx^2 % a TeX comment\n$$", ".katex"],
+  ])("copies a rendered %s's whole source across it", async (_shape, construct, rendered) => {
+    const markdown = `Before\n\n${construct}\n\nAfter`;
+    const { container } = renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    await waitFor(() => expect(container.querySelector(rendered)).not.toBeNull());
+    const start = previewText("Before");
+    const end = previewText("After");
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset + "After".length);
+    window.getSelection()?.addRange(range);
+    expect(fireCopyEvent(start.node)).toHaveBeenCalledWith("text/plain", markdown);
+  });
+
+  it("places text after a rendered formula past the same text before it", () => {
+    renderViewer("a b $$x$$ b\n\nNext line", true, "doc.md", { viewMode: "preview" });
+    // The paragraph ends with " b", after KaTeX's unstamped markup.
+    const afterFormula = document.querySelector(".markdown-preview p")?.lastChild as Text;
+    expect(afterFormula.data).toBe(" b");
+    const range = document.createRange();
+    range.setStart(afterFormula, 1);
+    range.setEnd(previewText("Next").node, 4);
+    window.getSelection()?.addRange(range);
+    expect(fireCopyEvent(afterFormula)).toHaveBeenCalledWith("text/plain", "b\n\nNext");
+  });
+
+  it("keeps the browser's copy for a selection between a formula's glyphs", () => {
+    renderViewer("Energy is $$E = mc^2$$ here.", true, "doc.md", { viewMode: "preview" });
+    const formula = document.querySelector(".markdown-preview .katex-html");
+    if (!formula) throw new Error("no rendered formula");
+    const walker = document.createTreeWalker(formula, NodeFilter.SHOW_TEXT);
+    const glyphs: Text[] = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if ((node as Text).data.trim()) glyphs.push(node as Text);
+    }
+    const range = document.createRange();
+    range.setStart(glyphs[0], 0);
+    range.setEnd(glyphs[glyphs.length - 1], 1);
+    window.getSelection()?.addRange(range);
+    expectBrowserCopy(glyphs[0]);
+  });
+
+  // Emoji shortcodes split their sentence into text with no recorded source, so
+  // no selection of it guesses which shortcode or glyph it came from.
+  it.each([
+    ["a word beside a shortcode", "Ship it :rocket: today", "today"],
+    ["a shortcode's glyph", "Ship it :rocket: today", "🚀"],
+    ["one of two adjacent shortcodes", ":rocket::smile:", "🚀"],
+    ["a shortcode before the same literal glyph", ":rocket: 🚀", "🚀"],
+  ])("keeps the browser's copy for %s", (_shape, markdown, selected) => {
+    renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    const { node, offset } = previewText(selected);
+    const range = document.createRange();
+    range.setStart(node, offset);
+    range.setEnd(node, offset + selected.length);
+    window.getSelection()?.addRange(range);
+    expectBrowserCopy(node);
+  });
+
+  // Raw HTML and link definitions can hold text the preview never shows; the
+  // copy must not carry it.
+  it.each([
+    ["a hidden comment", "a<!--INERT-->**b**", "a", "b"],
+    ["a stripped element", 'a<script type="text/plain">INERT</script>**b**', "a", "b"],
+    ["a link definition", "First para\n\n[//]: # (INERT)\n\nSecond para", "First", "Second para"],
+    [
+      "an unreferenced footnote definition",
+      "First para\n\n[^unused]: INERT\n\nSecond para",
+      "First",
+      "Second para",
+    ],
+  ])("keeps the browser's copy across %s", (_shape, markdown, from, to) => {
+    renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    expect(document.querySelector(".markdown-preview")?.textContent).not.toContain("INERT");
+    const start = previewText(from);
+    const end = previewText(to);
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset + to.length);
+    window.getSelection()?.addRange(range);
+    expectBrowserCopy(start.node);
+  });
+
+  it("keeps the browser's copy for a selection reaching outside the preview", () => {
+    renderViewer("Plain words here.", true, "doc.md", { viewMode: "preview" });
+    const outside = document.createElement("p");
+    outside.textContent = "Outside text";
+    document.body.appendChild(outside);
+    const range = document.createRange();
+    range.setStart(previewText("words").node, 0);
+    range.setEnd(outside.firstChild as Text, 7);
+    window.getSelection()?.addRange(range);
+    try {
+      expectBrowserCopy(previewText("words").node);
+    } finally {
+      outside.remove();
+    }
+  });
+
+  it("keeps the browser's copy when only whitespace is selected", () => {
+    renderViewer("Plain words here.", true, "doc.md", { viewMode: "preview" });
+    const { node } = previewText(" words");
+    const range = document.createRange();
+    range.setStart(node, 5);
+    range.setEnd(node, 6);
+    window.getSelection()?.addRange(range);
+    expectBrowserCopy(node);
+  });
+
+  /** Copies from *target* and checks the preview neither wrote nor cancelled the copy. */
+  function expectBrowserCopy(target: Node): void {
+    let defaultPrevented: boolean | undefined;
+    const listener = (event: Event) => {
+      defaultPrevented = event.defaultPrevented;
+    };
+    // Bubbles after React's handler at the root, so it sees whether that cancelled the copy.
+    document.addEventListener("copy", listener, { once: true });
+    expect(fireCopyEvent(target)).not.toHaveBeenCalled();
+    expect(defaultPrevented).toBe(false);
+  }
 });
 
 describe("CodeViewer editor routing", () => {
