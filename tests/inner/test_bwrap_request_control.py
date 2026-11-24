@@ -78,6 +78,7 @@ def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
         "uid",
         "not-pid-one",
         "dead-pidfd",
+        "foreign-pidfd",
         "extra-handle",
         "truncated",
         "unexpected-before-rights",
@@ -116,10 +117,15 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
                 os.getegid(),
             ),
         )
-    elif problem in {"not-pid-one", "dead-pidfd"}:
+    elif problem in {"not-pid-one", "dead-pidfd", "foreign-pidfd"}:
+        init_identity = {
+            "not-pid-one": (73, (73, 2)),
+            "dead-pidfd": (-1, ()),
+            "foreign-pidfd": (74, (74, 1)),
+        }[problem]
         identities = {
             _LAUNCHER_FD: (83, (83,)),
-            _INIT_FD: (73, (73, 2)) if problem == "not-pid-one" else (-1, ()),
+            _INIT_FD: init_identity,
         }
         monkeypatch.setattr(request_control, "_pidfd_identity", identities.__getitem__)
     elif problem == "extra-handle":

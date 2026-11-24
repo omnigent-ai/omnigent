@@ -2269,12 +2269,11 @@ async def test_move_cancelled_during_its_startup_write_leaves_nothing_held(
     release.set()
     await asyncio.gather(move, return_exceptions=True)
 
-    # Withdrawal precedes claim release; wait for the restored binding as well.
+    # The rollback finishes after the cancelled request.
     await poll_until_async(
         lambda: (
             (current := env.conv_store.get_conversation(session_id)) is not None
             and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
-            and (current.host_id, current.runner_id) == (_LAPTOP_HOST_ID, None)
         )
     )
     conv = env.conv_store.get_conversation(session_id)
