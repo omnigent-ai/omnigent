@@ -176,6 +176,19 @@ RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
         uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
     fi
 
+# Re-install omnigent and the sibling SDKs without -e, as the host stage does,
+# so the package bytes land in site-packages. With the editable finder, a
+# community sandbox provider installed into the image (a
+# site-packages/omnigent/community/sandbox/<name>/ directory) makes the
+# top-level `omnigent` a namespace package: omnigent/__init__.py never runs and
+# `from omnigent import ...` fails. A regular package in site-packages wins over
+# that namespace portion. The web-ui bundle overlaid above ships as package data.
+# --no-deps keeps the SDKs from being re-resolved as editable path sources; the
+# import check runs with -I because the working directory is /build.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} --no-deps . ./sdks/python-client ./sdks/ui \
+ && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages \
+ && python -I -c "import omnigent, os, sysconfig; f = os.path.realpath(omnigent.__file__); roots = [os.path.realpath(sysconfig.get_paths()[k]) for k in ('purelib', 'platlib')]; assert any(f.startswith(r + os.sep) for r in roots), f"
+
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
 # image; contributes no layers of its own.
@@ -440,9 +453,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Preserve /build/ in the runtime stage — the venv's editable install
-# .pth files reference /build/omnigent and /build/sdks/* by absolute
-# path. Copying these to /app/ would break the import paths silently.
+# Preserve /build/ in the runtime stage for the LICENSE/NOTICE files and the
+# source tree the troubleshooting notes inspect (deploy/docker/SKILL.md).
+# omnigent and the sibling SDKs import from site-packages, not from here.
 COPY --from=server-builder /opt/venv /opt/venv
 COPY --from=server-builder /build /build
 COPY deploy/docker/entrypoint.py /app/entrypoint.py
