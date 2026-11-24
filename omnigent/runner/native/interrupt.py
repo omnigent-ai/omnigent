@@ -845,6 +845,15 @@ class NativeInterruptRunner:
                         # can still leave its parent waiting; reconciled separately.
                         return Response(status_code=204)
         except Exception as exc:  # surface active-turn interrupt failures.
+            if state.active_turn_id is None:
+                # The MCP cancel already took effect locally; a held message is still the
+                # runner's to cancel even when the app-server cannot be reached yet.
+                self._logger.warning(
+                    "Codex-native MCP startup interrupt failed for session=%s",
+                    conv_id,
+                    exc_info=True,
+                )
+                return None
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
                 conv_id,
