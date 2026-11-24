@@ -422,6 +422,53 @@ describe("data story template", () => {
     expect(byId("view").textContent).not.toContain("No data for this chart yet");
   });
 
+  it("finds a chart past the first ten pages over the next polls", async () => {
+    const { emit, load, pages, ready } = startStory();
+    await waitFor(() => expect(ready()).toBe(true));
+    // Eleven accepted charts of 400 points each are near the 32 KiB record limit, so the
+    // server's 48 KiB page budget gives one per page: eleven pages in all.
+    const big = (n: number) => ({
+      id: `c${n}`,
+      version: "v1",
+      value: {
+        ...WEEKLY,
+        title: `Chart ${n}`,
+        annotations: [],
+        series: [
+          {
+            name: "Signups",
+            points: Array.from({ length: 400 }, (_, i) => ({ x: `Day ${i + 1}`, y: 400 + n + i })),
+          },
+        ],
+      },
+    });
+    const story = {
+      ...STORY,
+      sections: [
+        { ...STORY.sections[0], chart: "c0" },
+        { ...STORY.sections[1], chart: "c10" },
+      ],
+    };
+    load({ ideas: IDEAS, story });
+    pages.series = {};
+    for (let n = 1; n <= 10; n += 1) {
+      pages.series[`p${n}`] = { items: [big(n)], nextCursor: n < 10 ? `p${n + 1}` : null };
+    }
+    const chart = (section: string) => byId("view").querySelector(`#section-${section} svg.chart`);
+
+    // The first poll reads ten pages and stops before the last chart.
+    emit("series", [big(0)], "p1");
+    await waitFor(() => expect(byId("content").hidden).toBe(false));
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(chart("where")).toBeNull();
+    // The next poll goes on from there and finds it.
+    emit("series", [{ ...big(0), version: "v2" }], "p1");
+    await waitFor(() => expect(chart("where")).not.toBeNull());
+    expect(byId("view").textContent).not.toContain("No data for this chart yet");
+  });
+
   it("refreshes the data and shows the refresh running", async () => {
     const { load, emitActions, requests, ready } = startStory();
     await waitFor(() => expect(ready()).toBe(true));

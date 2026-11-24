@@ -323,12 +323,12 @@ ${GADGET_KIT_HELPERS}
   var ideasDoc = null;
   var storyDoc = null;
   var layoutDoc = null;
-  var seriesDocs = {};
+  var seriesDocs = dict();
   var loaded = { ideas: false, story: false };
   var actionItems = [];
   var seen = {};
-  var pending = {};
-  var openSince = {};
+  var pending = dict();
+  var openSince = dict();
   var renderQueued = false;
   var viewDirty = true;
   var previewSeeded = false;
@@ -341,7 +341,7 @@ ${GADGET_KIT_HELPERS}
   var shownView = null;
   var viewFailure = null;
   var started = false;
-  var reported = {};
+  var reported = dict();
 
   // A design that throws while it loads or draws is replaced by the plain view, its styles are
   // switched off, and the page reports it in render_reports for the gadget session.

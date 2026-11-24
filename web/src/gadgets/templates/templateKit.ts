@@ -204,7 +204,7 @@ export const GADGET_KIT_HELPERS = `
   // Keeps one element per key in parent, in the order of items, and moves an element that kept
   // its key from where it was (or fades a new one in), so a rescan animates instead of redrawing.
   function keyed(parent, items, keyOf, build) {
-    var before = {};
+    var before = dict();
     if (!calm) {
       Array.prototype.forEach.call(parent.children, function (child) {
         var key = child.getAttribute('data-key');
@@ -277,36 +277,55 @@ export const GADGET_KIT_HELPERS = `
     var rest = seconds % 60;
     return Math.floor(seconds / 60) + ':' + (rest < 10 ? '0' : '') + rest;
   }
+  // A map keyed by IDs that records or agents chose: no inherited keys, so an ID such as
+  // "constructor" is as ordinary as any other.
+  function dict() { return Object.create(null); }
+  // Whether a constant table has its own entry for key, which may come from a record.
+  function owns(table, key) { return typeof key === 'string' && Object.prototype.hasOwnProperty.call(table, key); }
   function byIdOf(items) {
-    var out = {};
+    var out = dict();
     (items || []).forEach(function (doc) { out[doc.id] = doc; });
     return out;
   }
   // A watch sees one page. For a collection the page looks records up in, watchEveryPage
   // follows its continuation pages before calling handler(items, complete), so a record on a
-  // later page never reads as deleted, and drops a page set a newer snapshot replaced; on a
-  // failed page it keeps what is known until the next poll. Past MAX_EXTRA_PAGES it stops with
-  // complete false, and mergeKnown keeps the records already known.
+  // later page never reads as deleted, and drops a page set a newer snapshot replaced. Each poll
+  // reads at most MAX_EXTRA_PAGES more pages; a longer collection is walked over several polls,
+  // each resuming where the last stopped (complete false until the walk reaches the end, and
+  // mergeKnown keeps the records already known meanwhile). A failed page keeps what is known.
   var MAX_EXTRA_PAGES = 9;
   function watchEveryPage(collection, handler, options) {
     var latest = 0;
+    // An unfinished walk: where it stopped and the later pages it has read so far.
+    var walk = null;
+    function combined(first, later) {
+      var out = first.slice();
+      var have = dict();
+      first.forEach(function (doc) { have[doc.id] = true; });
+      later.forEach(function (doc) { if (!have[doc.id]) { have[doc.id] = true; out.push(doc); } });
+      return out;
+    }
     return collection.watch(function (snapshot) {
       if (snapshot.status === 'loading') return;
       var mine = ++latest;
-      if (!snapshot.nextCursor) { handler(snapshot.items || [], true); return; }
-      var items = (snapshot.items || []).slice();
+      var first = snapshot.items || [];
+      if (!snapshot.nextCursor) { walk = null; handler(first, true); return; }
+      var carried = walk ? walk.items : [];
+      var gathered = [];
       var pages = 0;
       (function more(cursor) {
         collection.list({ limit: options.limit, cursor: cursor }).then(function (page) {
           if (mine !== latest) return;
-          items = items.concat(page.items || []);
+          gathered = gathered.concat(page.items || []);
           pages += 1;
           if (page.nextCursor && pages < MAX_EXTRA_PAGES) { more(page.nextCursor); return; }
-          handler(items, !page.nextCursor);
+          var later = carried.concat(gathered);
+          walk = page.nextCursor ? { cursor: page.nextCursor, items: later } : null;
+          handler(combined(first, later), !page.nextCursor);
         }, function () {
-          // Keep what is known; the next poll tries again.
+          // Keep what is known; the next poll goes on from the same place.
         });
-      })(snapshot.nextCursor);
+      })(walk ? walk.cursor : snapshot.nextCursor);
     }, options);
   }
   function mergeKnown(known, items, complete) {

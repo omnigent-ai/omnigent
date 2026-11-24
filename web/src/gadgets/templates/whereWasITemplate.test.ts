@@ -275,6 +275,50 @@ describe("where was I template", () => {
     expect(byId("next-list").textContent).toContain("Done");
   });
 
+  it("treats IDs and values such as constructor like any other", async () => {
+    const { emit, requests, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [
+      {
+        id: "current",
+        version: "v1",
+        value: {
+          ...RADAR,
+          areas: [
+            {
+              id: "constructor",
+              title: "Builder cleanup",
+              state: "constructor",
+              related: ["toString"],
+              next_steps: [
+                {
+                  id: "constructor",
+                  label: "Delete the old builder",
+                  kind: "act",
+                  confidence: 0.9,
+                  nudge: "constructor",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    ]);
+
+    await waitFor(() => expect(byId("content").hidden).toBe(false));
+    expect(byId("card-constructor").textContent).toContain("Builder cleanup");
+    const chip = byId("next-constructor").querySelector(".next-chip") as HTMLButtonElement;
+    expect(chip.textContent).toContain("Delete the old builder");
+    expect(byId("next-constructor").textContent).not.toContain("function");
+    chip.click();
+    expect(requests).toEqual([
+      {
+        action: "do_next_step",
+        params: { next_step: "constructor", label: "Delete the old builder", area: "constructor" },
+      },
+    ]);
+  });
+
   it("says when a scan's page budget ended before every session was listed", async () => {
     const { emit, ready } = startRadar();
     await waitFor(() => expect(ready()).toBe(true));

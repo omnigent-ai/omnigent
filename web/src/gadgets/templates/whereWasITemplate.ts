@@ -426,21 +426,21 @@ ${GADGET_KIT_HELPERS}
   var radarDoc = null;
   var radarLoaded = false;
   var layoutDoc = null;
-  var runDocs = {};
-  var dismissedDocs = {};
+  var runDocs = dict();
+  var dismissedDocs = dict();
   var actionItems = [];
   var seen = {};
   // Next steps that finished while this page watched, by step ID: they show as done for a moment
   // in Next up, then stay under Done recently.
   var FRESH_MS = 8000;
-  var freshDone = {};
-  var openStepActions = {};
+  var freshDone = dict();
+  var openStepActions = dict();
   var pendingScan = null;
-  var pendingSteps = {};
+  var pendingSteps = dict();
   var pendingRestore = null;
-  var dismissing = {};
+  var dismissing = dict();
   var scanOpenSince = 0;
-  var live = { on: false, timer: null, byId: {}, error: '' };
+  var live = { on: false, timer: null, byId: dict(), error: '' };
   var renderQueued = false;
   var viewDirty = true;
   var previewSeeded = false;
@@ -452,7 +452,7 @@ ${GADGET_KIT_HELPERS}
   var shownView = null;
   var viewFailure = null;
   var started = false;
-  var reported = {};
+  var reported = dict();
 
 
   // A design that throws while it loads or draws is replaced by the plain view, its styles are
@@ -526,7 +526,7 @@ ${GADGET_KIT_HELPERS}
 
   // ---- States
 
-  function stateKey(state) { return STATE_LABELS[state] ? state : 'active'; }
+  function stateKey(state) { return owns(STATE_LABELS, state) ? state : 'active'; }
   function stateColor(state) { return 'var(--' + stateKey(state) + ')'; }
   function stateSoft(state) { return 'var(--' + stateKey(state) + '-soft)'; }
   function stateLabel(state) { return STATE_LABELS[stateKey(state)]; }
@@ -538,7 +538,7 @@ ${GADGET_KIT_HELPERS}
   function layoutValue() { return layoutDoc && layoutDoc.value && layoutDoc.value.revision_id ? layoutDoc.value : null; }
   function areas() { var value = radar(); return value ? value.areas.filter(function (area) { return area && area.id && area.title; }) : []; }
   function sessionsById() {
-    var out = {};
+    var out = dict();
     var value = radar();
     ((value && value.sessions) || []).forEach(function (session) { if (session && session.id) out[session.id] = session; });
     return out;
@@ -560,7 +560,7 @@ ${GADGET_KIT_HELPERS}
     return (area.next_steps || []).filter(function (step) { return step && step.id && !dismissedDocs[step.id] && sure(step); });
   }
   // The steps Next up shows now, by ID: a view draws the others, so no step shows twice.
-  var nextUpIds = {};
+  var nextUpIds = dict();
   function laterSteps(area) { return openSteps(area).filter(function (step) { return !nextUpIds[step.id]; }); }
   function hiddenSteps(area) {
     return (area.next_steps || []).filter(function (step) { return step && step.id && dismissedDocs[step.id]; });
@@ -591,9 +591,9 @@ ${GADGET_KIT_HELPERS}
   }
   // Related areas next to each other, blocked work first.
   function ordered(list) {
-    var byId = {};
+    var byId = dict();
     list.forEach(function (area) { byId[area.id] = area; });
-    var visited = {};
+    var visited = dict();
     var out = [];
     function visit(area) {
       if (visited[area.id]) return;
@@ -774,7 +774,7 @@ ${GADGET_KIT_HELPERS}
   // Steps hidden in the last week without a reason, so the viewer can still say why once the
   // notice is gone (after a reload): newest first, a few at most. A step hidden on this page asks
   // in its notice instead.
-  var askedNow = {};
+  var askedNow = dict();
   function renderWhyHidden() {
     var box = $('why-hidden');
     var unanswered = canWrite ? Object.keys(dismissedDocs).filter(function (stepId) {
@@ -814,13 +814,13 @@ ${GADGET_KIT_HELPERS}
       pollLive();
       live.timer = setInterval(pollLive, 20000);
     } else {
-      live.byId = {};
+      live.byId = dict();
     }
     schedule();
   }
   function pollLive() {
     client.sessions.list({ limit: 100 }).then(function (page) {
-      var byId = {};
+      var byId = dict();
       ((page && page.items) || []).forEach(function (session) { byId[session.id] = session; });
       live.byId = byId;
       live.error = '';
@@ -924,7 +924,7 @@ ${GADGET_KIT_HELPERS}
   // from, and a way to hide it.
   function nextItem(area, step) {
     var why = [];
-    if (step.nudge && NUDGE_TEXT[step.nudge]) why.push(el('span', { class: 'nudge', text: NUDGE_TEXT[step.nudge] + ' ' }));
+    if (owns(NUDGE_TEXT, step.nudge)) why.push(el('span', { class: 'nudge', text: NUDGE_TEXT[step.nudge] + ' ' }));
     if (step.why_now || step.why) why.push(plain(step.why_now || step.why) + ' ');
     var cited = (step.evidence && step.evidence.session_id) || step.session_id;
     var from = [];
@@ -955,7 +955,7 @@ ${GADGET_KIT_HELPERS}
     var state = liveState(session.id, session.status);
     var steps = session.steps || [];
     var meta = [];
-    if (state) meta.push(LIVE_TEXT[state] || state);
+    if (state) meta.push(owns(LIVE_TEXT, state) ? LIVE_TEXT[state] : state);
     if (live.on && live.byId[session.id] && live.byId[session.id].unread) meta.push('new messages');
     if (session.why) meta.push(session.why);
     var finished = steps.filter(function (step) { return step.status === 'done'; }).length;
@@ -1162,7 +1162,7 @@ ${GADGET_KIT_HELPERS}
     });
     picks.sort(function (a, b) { return a.score - b.score; });
     picks = picks.slice(0, NEXT_UP_MAX);
-    nextUpIds = {};
+    nextUpIds = dict();
     picks.forEach(function (pick) { nextUpIds[pick.step.id] = true; });
     Object.keys(freshDone).filter(isFresh).forEach(function (stepId) { nextUpIds[stepId] = true; });
     var finished = Object.keys(freshDone).filter(isFresh).map(function (stepId) {
@@ -1210,7 +1210,7 @@ ${GADGET_KIT_HELPERS}
   // Finished next steps: the session's step_runs records, and finished do_next_step actions it
   // reported without one. Steps that finished while this page watched come first, highlighted.
   function renderDone() {
-    var rows = {};
+    var rows = dict();
     Object.keys(runDocs).forEach(function (key) {
       var doc = runDocs[key];
       var value = doc.value;
