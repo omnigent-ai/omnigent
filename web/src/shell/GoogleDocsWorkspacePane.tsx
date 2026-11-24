@@ -91,7 +91,11 @@ function PaneContent({ visible = true }: GoogleDocsWorkspacePaneProps) {
           <SelectTrigger size="sm" aria-label="Session document" className="min-w-0 flex-1">
             <SelectValue placeholder="Select a document" />
           </SelectTrigger>
-          <SelectContent>
+          <SelectContent
+            position="popper"
+            align="start"
+            className="w-(--radix-select-trigger-width) min-w-0 data-open:animate-none data-closed:animate-none"
+          >
             {displayed && !active && (
               <SelectItem value="unlinked" disabled>
                 {displayed.originalUrl} (not linked)
