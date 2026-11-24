@@ -4,7 +4,7 @@
 // review) derives each file's facts without a hook per file.
 
 import { useMemo } from "react";
-import { useHostSshTarget, useResolveHostSshTarget } from "@/hooks/useHostSshTarget";
+import { useHostSshTarget, useHostSshTargetDemand } from "@/hooks/useHostSshTarget";
 import { CODE_EDITORS, editorLink, type CodeEditor } from "@/lib/editorLinks";
 import { isAndroidShell, isIOSShell, supportsFileReveal } from "@/lib/nativeBridge";
 import { useDesktopHostId } from "@/lib/desktopHostId";
@@ -81,7 +81,7 @@ function useEditorHost(hostId: string | null): { local: boolean; sshHostId: stri
 /**
  * The environment for session `conversationId`'s files on `hostId`. Editors open this
  * machine's files directly and a remote host's over SSH; a phone opens neither. The remote
- * host's SSH name is known once a menu offering it has opened, see {@link useResolveFileSshTarget}.
+ * host's SSH name is known once a menu offering it has opened, see {@link useFileSshTargetDemand}.
  */
 export function useFileCommandEnvironment(
   hostId: string | null,
@@ -102,14 +102,15 @@ export function useFileCommandEnvironment(
 }
 
 /**
- * Read the SSH name of `hostId`, where `conversationId`'s files are, for a menu that offers
- * opening them in an editor over SSH to call as it opens. Does nothing for this machine's files.
+ * Read the SSH name of `hostId`, where `conversationId`'s files are, while `wanted`, as while a
+ * menu offering to open them in an editor over SSH is open. Does nothing for this machine's files.
  */
-export function useResolveFileSshTarget(
+export function useFileSshTargetDemand(
   hostId: string | null,
   conversationId: string | null,
-): () => void {
-  return useResolveHostSshTarget(useEditorHost(hostId).sshHostId, conversationId ?? undefined);
+  wanted: boolean,
+): void {
+  useHostSshTargetDemand(useEditorHost(hostId).sshHostId, conversationId ?? undefined, wanted);
 }
 
 /** The facts for `target`; the open facts are the surface's own answer, as only it knows what it shows. */

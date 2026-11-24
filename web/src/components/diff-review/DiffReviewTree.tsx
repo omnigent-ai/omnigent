@@ -114,7 +114,7 @@ export function DiffReviewTree({
   onOpenInNewTab,
   rowActions,
   folderActions,
-  onRowMenuOpen,
+  onRowMenuOpenChange,
   folderOwner,
   appearance = "default",
   onClose,
@@ -133,8 +133,8 @@ export function DiffReviewTree({
   rowActions?: (path: string) => readonly DiffReviewFileAction[];
   /** A folder row's actions after Collapse or Expand, such as copying its path. */
   folderActions?: (path: string) => readonly DiffReviewFileAction[];
-  /** Called as a row's menu opens, so the review can load what its actions need. */
-  onRowMenuOpen?: () => void;
+  /** Called as a row's menu opens and closes, so the review can load what its actions need. */
+  onRowMenuOpenChange?: (open: boolean) => void;
   /** The review a focused folder belongs to, so ⌘K offers its actions there. */
   folderOwner?: string;
   appearance?: DiffReviewTreeAppearance;
@@ -217,7 +217,7 @@ export function DiffReviewTree({
         onOpenInNewTab={onOpenInNewTab}
         rowActions={rowActions}
         folderActions={folderActions}
-        onRowMenuOpen={onRowMenuOpen}
+        onRowMenuOpenChange={onRowMenuOpenChange}
         folderOwner={folderOwner}
         appearance={appearance}
       />
@@ -244,7 +244,7 @@ function ChangedFileRows({
   onOpenInNewTab,
   rowActions,
   folderActions,
-  onRowMenuOpen,
+  onRowMenuOpenChange,
   folderOwner,
   appearance,
 }: {
@@ -254,7 +254,7 @@ function ChangedFileRows({
   onOpenInNewTab?: (path: string, options: { background: boolean }) => void;
   rowActions?: (path: string) => readonly DiffReviewFileAction[];
   folderActions?: (path: string) => readonly DiffReviewFileAction[];
-  onRowMenuOpen?: () => void;
+  onRowMenuOpenChange?: (open: boolean) => void;
   folderOwner?: string;
   appearance: DiffReviewTreeAppearance;
 }) {
@@ -266,8 +266,8 @@ function ChangedFileRows({
   pathSet.current = new Set(paths);
   const filesByPath = useRef(new Map(files.map((file) => [file.path, file])));
   filesByPath.current = new Map(files.map((file) => [file.path, file]));
-  const latest = useRef({ onOpenInNewTab, rowActions, folderActions, onRowMenuOpen });
-  latest.current = { onOpenInNewTab, rowActions, folderActions, onRowMenuOpen };
+  const latest = useRef({ onOpenInNewTab, rowActions, folderActions, onRowMenuOpenChange });
+  latest.current = { onOpenInNewTab, rowActions, folderActions, onRowMenuOpenChange };
   const [menu, setMenu] = useState<{
     directory: boolean;
     /** The row the menu is for, and the one focus goes back to when it closes. */
@@ -305,9 +305,19 @@ function ChangedFileRows({
   const openRowMenu = (row: FileTreeVisibleRow, anchor: DOMRect) => {
     const target = { directory: row.kind === "directory", path: row.path };
     if (rowMenuActions(target).length === 0) return;
-    latest.current.onRowMenuOpen?.();
+    latest.current.onRowMenuOpenChange?.(true);
     setMenu({ ...target, point: { x: anchor.left, y: anchor.bottom } });
   };
+  const closeRowMenu = () => {
+    latest.current.onRowMenuOpenChange?.(false);
+    setMenu(null);
+  };
+  // A row that leaves the list, or loses every action, closes its menu rather than hiding it.
+  const menuActions = menu ? rowMenuActions(menu) : [];
+  const menuEmptied = menu !== null && menuActions.length === 0;
+  useEffect(() => {
+    if (menuEmptied) closeRowMenu();
+  });
 
   // A row's full path follows the pointer, a name truncated in the middle included.
   const rowTooltip = useTreeRowTooltip(treeHolder, model, { hidden: menu !== null });
@@ -448,9 +458,9 @@ function ChangedFileRows({
       {rowTooltip}
       {menu && (
         <TreeRowMenu
-          actions={rowMenuActions(menu)}
+          actions={menuActions}
           point={menu.point}
-          onClose={() => setMenu(null)}
+          onClose={closeRowMenu}
           onRestoreFocus={() => focusRow(menu.path)}
         />
       )}

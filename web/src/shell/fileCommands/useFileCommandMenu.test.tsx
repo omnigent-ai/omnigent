@@ -3,6 +3,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FileCommandTarget } from "./target";
+
+const sshDemand = vi.hoisted(() => [] as [string | null, string | null, boolean][]);
+vi.mock("./useFileCommandFacts", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileCommandFactsModule>()),
+  useFileSshTargetDemand: (hostId: string | null, conversationId: string | null, wanted: boolean) =>
+    void sshDemand.push([hostId, conversationId, wanted]),
+}));
+import type * as FileCommandFactsModule from "./useFileCommandFacts";
 import { FileCommandMenuAt, type FileRowOpens } from "./useFileCommandMenu";
 
 const TARGET: FileCommandTarget = {
@@ -93,4 +101,16 @@ describe("FileCommandMenuAt focus", () => {
     expect(elsewhere).toHaveFocus();
     expect(onRestoreFocus).not.toHaveBeenCalled();
   });
+});
+
+it("wants the host's SSH name only while the row's menu is open", () => {
+  sshDemand.length = 0;
+  const { row } = openMenu();
+  expect(row).toBeInTheDocument();
+  expect(sshDemand.length).toBeGreaterThan(0);
+  expect(sshDemand.every(([, , wanted]) => wanted)).toBe(true);
+  sshDemand.length = 0;
+  fireEvent.keyDown(screen.getAllByRole("menuitem")[0]!, { key: "Escape" });
+  expect(screen.queryByRole("menu")).toBeNull();
+  expect(sshDemand).toEqual([]);
 });

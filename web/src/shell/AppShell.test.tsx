@@ -9,8 +9,13 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 const sshNamesAsked = vi.hoisted(() => [] as [string | null, string | null][]);
 vi.mock("./fileCommands/useFileCommandFacts", async (importOriginal) => ({
   ...(await importOriginal<typeof FileCommandFactsModule>()),
-  useResolveFileSshTarget: (hostId: string | null, conversationId: string | null) => () =>
-    sshNamesAsked.push([hostId, conversationId]),
+  useFileSshTargetDemand: (
+    hostId: string | null,
+    conversationId: string | null,
+    wanted: boolean,
+  ) => {
+    if (wanted) sshNamesAsked.push([hostId, conversationId]);
+  },
 }));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
@@ -7564,5 +7569,12 @@ describe("⌘K in a session grid", () => {
     });
     // The grid's first pane is selected until another is.
     expect(sshNamesAsked).toContainEqual(["host_a", "conv_a"]);
+    sshNamesAsked.length = 0;
+    await act(async () => {
+      // Clicking into a pane selects it.
+      fireEvent.click(document.querySelector('section[data-grid-session="conv_b"]')!);
+    });
+    expect(sshNamesAsked).toContainEqual(["host_b", "conv_b"]);
+    expect(sshNamesAsked).not.toContainEqual(["host_a", "conv_a"]);
   });
 });

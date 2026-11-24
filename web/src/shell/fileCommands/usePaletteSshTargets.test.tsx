@@ -7,8 +7,13 @@ const focused = vi.hoisted(() => ({
 }));
 
 vi.mock("./useFileCommandFacts", () => ({
-  useResolveFileSshTarget: (hostId: string | null, conversationId: string | null) => () =>
-    asked.push([hostId, conversationId]),
+  useFileSshTargetDemand: (
+    hostId: string | null,
+    conversationId: string | null,
+    wanted: boolean,
+  ) => {
+    if (wanted) asked.push([hostId, conversationId]);
+  },
 }));
 vi.mock("./focusedFile", () => ({ useFocusedFile: () => focused.target }));
 vi.mock("../RevealInFileManager", () => ({

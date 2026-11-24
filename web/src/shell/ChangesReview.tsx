@@ -59,7 +59,7 @@ import { reviewFileActions, reviewFolderActions } from "./fileCommands/reviewFil
 import { resolveFileCommandTarget, useSessionHostId } from "./fileCommands/target";
 import {
   useFileCommandEnvironment,
-  useResolveFileSshTarget,
+  useFileSshTargetDemand,
 } from "./fileCommands/useFileCommandFacts";
 import { type FilePosition, useWorkspacePaths } from "./FileViewerContext";
 import { useStopFilePositionOnInput } from "./useStopFilePositionOnInput";
@@ -576,8 +576,9 @@ export function ChangesReview({
   const { root } = useWorkspacePaths();
   const sessionHostId = useSessionHostId();
   const fileEnvironment = useFileCommandEnvironment(sessionHostId, conversationId);
-  // The host's SSH name, for opening a file in an editor, is read once a file's menu opens.
-  const resolveSshTarget = useResolveFileSshTarget(sessionHostId, conversationId);
+  // The host's SSH name, for opening a file in an editor, is read while a file's menu is open.
+  const [fileMenuOpen, setFileMenuOpen] = useState(false);
+  useFileSshTargetDemand(sessionHostId, conversationId, fileMenuOpen);
   const { preferences, update } = useReviewViewPreferences();
   const [pickerOpen, setPickerOpen] = useState(false);
   // Without access the picker goes, with its typed text; it reopens closed.
@@ -866,7 +867,7 @@ export function ChangesReview({
               onFindClose={() => setFindOpen(false)}
               fileActions={fileActions}
               folderActions={folderActions}
-              onFileMenuOpen={resolveSshTarget}
+              onFileMenuOpenChange={setFileMenuOpen}
               fileActionsInPalette={commitActive}
               onOpenFileInNewTab={onOpenFileInNewTab}
               active={commitActive}
@@ -1073,7 +1074,7 @@ export function ChangesReview({
         onFindClose={() => setFindOpen(false)}
         fileActions={fileActions}
         folderActions={folderActions}
-        onFileMenuOpen={resolveSshTarget}
+        onFileMenuOpenChange={setFileMenuOpen}
         fileActionsInPalette={changesActive}
         onOpenFileInNewTab={onOpenFileInNewTab}
         active={changesActive}

@@ -1,5 +1,4 @@
-import { useCallback, useMemo } from "react";
-import { queryOptions, useQuery, useQueryClient } from "@tanstack/react-query";
+import { queryOptions, useQuery } from "@tanstack/react-query";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { useHosts } from "@/hooks/useHosts";
 import { inferHostSshTarget, parseArcaTypeLabel } from "@/lib/editorLinks";
@@ -20,8 +19,10 @@ function hostSshTargetQuery(hostId: string | null, conversationId: string | unde
   return queryOptions({
     // Every session on a host gives the same answer, so one read serves them all.
     queryKey: ["hostSshTarget", hostId],
-    staleTime: Infinity,
-    gcTime: Infinity,
+    // Read again when wanted after this, so a host that changed shows its new name; an answer
+    // nothing shows is kept as long, so a session switched away and back reuses it.
+    staleTime: 5 * 60_000,
+    gcTime: 5 * 60_000,
     retry: false,
     queryFn: async () => {
       const labels = await readMetadataText(conversationId!, "/etc/metric_proxy/labels/default");
@@ -46,8 +47,8 @@ function useSshTargetSource(hostId: string | null, conversationId: string | unde
 
 /**
  * `hostId`'s SSH name for editor links. A provider's host is named by its alias; a
- * user-connected host's name is read from its metadata only once something asks, by passing
- * `resolve` or through {@link useResolveHostSshTarget}, and is null until then.
+ * user-connected host's name is read from its metadata only while something wants it, by
+ * passing `resolve` or through {@link useHostSshTargetDemand}, and is null until then.
  */
 export function useHostSshTarget(
   hostId: string | null,
@@ -64,20 +65,19 @@ export function useHostSshTarget(
 }
 
 /**
- * Read `hostId`'s SSH name unless it's known, for a menu that offers opening files over SSH to
- * call as it opens. Every {@link useHostSshTarget} for the host shows the name once it's read.
+ * Read `hostId`'s SSH name while `wanted`, as while a menu offering to open files over SSH is
+ * open. A read waits for the host to be known; every {@link useHostSshTarget} shows its answer.
  */
-export function useResolveHostSshTarget(
+export function useHostSshTargetDemand(
   hostId: string | null,
   conversationId: string | undefined,
-): () => void {
-  const queryClient = useQueryClient();
+  wanted: boolean,
+): void {
   const { discover } = useSshTargetSource(hostId, conversationId);
-  const query = useMemo(
-    () => (discover ? hostSshTargetQuery(hostId, conversationId) : null),
-    [discover, hostId, conversationId],
-  );
-  return useCallback(() => {
-    if (query) void queryClient.prefetchQuery(query);
-  }, [queryClient, query]);
+  // Subscribes only to whether a read runs, so the caller doesn't render again on its answer.
+  useQuery({
+    ...hostSshTargetQuery(hostId, conversationId),
+    enabled: discover && wanted,
+    notifyOnChangeProps: [],
+  });
 }

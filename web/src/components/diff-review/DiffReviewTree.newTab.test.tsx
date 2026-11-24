@@ -242,11 +242,17 @@ describe("a row menu without tabs, as Changes review has", () => {
   });
 });
 
-describe("a row menu whose actions load as it opens", () => {
-  it("asks the review to load them, and lists one that arrives while the menu is open", async () => {
-    const onRowMenuOpen = vi.fn();
-    const copyPath = { id: "copy-path", label: "Copy path", icon: CopyIcon, run: () => {} };
-    const tree = (actions: readonly DiffReviewFileAction[]) => (
+describe("a row menu whose actions load while it's open", () => {
+  const copyPath = { id: "copy-path", label: "Copy path", icon: CopyIcon, run: () => {} };
+  const openInEditor = {
+    id: "open-in-editor",
+    label: "Open in Editor",
+    icon: CopyIcon,
+    run: () => {},
+  };
+  function renderLoadingTree(actions: readonly DiffReviewFileAction[]) {
+    const onRowMenuOpenChange = vi.fn();
+    const tree = (rowActions: readonly DiffReviewFileAction[]) => (
       <DiffReviewTree
         files={[file(FIRST), file(SECOND)]}
         navigate={() => undefined}
@@ -254,24 +260,40 @@ describe("a row menu whose actions load as it opens", () => {
         setSearchQuery={() => undefined}
         searchFocusRequest={0}
         dark={false}
-        rowActions={() => actions}
-        onRowMenuOpen={onRowMenuOpen}
+        rowActions={() => rowActions}
+        onRowMenuOpenChange={onRowMenuOpenChange}
       />
     );
-    const view = render(tree([copyPath]));
+    const view = render(tree(actions));
+    return {
+      onRowMenuOpenChange,
+      setActions: (next: readonly DiffReviewFileAction[]) => view.rerender(tree(next)),
+    };
+  }
+
+  it("tells the review while it's open, and lists an action that arrives meanwhile", async () => {
+    const { onRowMenuOpenChange, setActions } = renderLoadingTree([copyPath]);
     fireEvent.contextMenu(await findTreeRow(SECOND));
     await screen.findByRole("menuitem", { name: "Copy path" });
-    expect(onRowMenuOpen).toHaveBeenCalledTimes(1);
+    expect(onRowMenuOpenChange.mock.calls).toEqual([[true]]);
 
-    const openInEditor = {
-      id: "open-in-editor",
-      label: "Open in Editor",
-      icon: CopyIcon,
-      run: () => {},
-    };
-    view.rerender(tree([copyPath, openInEditor]));
+    setActions([copyPath, openInEditor]);
     expect(await screen.findByRole("menuitem", { name: "Open in Editor" })).toBeInTheDocument();
-    expect(onRowMenuOpen).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(screen.getByRole("menuitem", { name: "Copy path" }), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    expect(onRowMenuOpenChange.mock.calls).toEqual([[true], [false]]);
+  });
+
+  it("closes when its row loses every action, and doesn't come back by itself", async () => {
+    const { onRowMenuOpenChange, setActions } = renderLoadingTree([copyPath]);
+    fireEvent.contextMenu(await findTreeRow(SECOND));
+    await screen.findByRole("menuitem", { name: "Copy path" });
+
+    setActions([]);
+    await waitFor(() => expect(onRowMenuOpenChange.mock.calls).toEqual([[true], [false]]));
+    setActions([copyPath]);
+    await act(async () => {});
+    expect(screen.queryByRole("menuitem", { name: "Copy path" })).toBeNull();
   });
 });
 

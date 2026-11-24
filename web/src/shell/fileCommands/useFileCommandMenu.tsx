@@ -1,7 +1,7 @@
 // A Files row's right-click menu and ⌘K target: the shared file actions for the
 // row's path. Spread `rowProps` on the row and render `menu` inside it.
 
-import { useEffect, useRef, useState, type MouseEvent } from "react";
+import { useRef, useState, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
 import {
   DropdownMenu,
@@ -13,7 +13,7 @@ import { FileCommandMenuItem } from "./FileCommandMenuItem";
 import { useFocusedFileSource } from "./focusedFile";
 import { type FileCommandTarget, useFileCommandTarget } from "./target";
 import { type FileCommandOptions, useFileCommandsForTarget } from "./useFileCommands";
-import { useResolveFileSshTarget } from "./useFileCommandFacts";
+import { useFileSshTargetDemand } from "./useFileCommandFacts";
 
 /** A tree's ways to open a row besides selecting it, offered as the shared file actions. */
 export type FileRowOpens = Pick<FileCommandOptions, "onOpenInNewTab" | "onOpenAsRoot">;
@@ -114,8 +114,7 @@ function FileRowMenuItems({ target, opens }: { target: FileCommandTarget; opens?
   // The row opens its file itself, so its menu doesn't repeat that.
   const { commands, run } = useFileCommandsForTarget(target, opens);
   // Opening the file in an editor over SSH shows up once the host's SSH name is read.
-  const resolveSshTarget = useResolveFileSshTarget(target.hostId, target.conversationId);
-  useEffect(() => resolveSshTarget(), [resolveSshTarget]);
+  useFileSshTargetDemand(target.hostId, target.conversationId, true);
   return commands.map((command) => (
     <FileCommandMenuItem key={command.id} command={command} onRun={run} Item={DropdownMenuItem} />
   ));

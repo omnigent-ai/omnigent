@@ -47,7 +47,7 @@ vi.mock("@/components/diff-review/DiffReview", () => ({
 }));
 vi.mock("./fileCommands/useFileCommandFacts", () => ({
   useFileCommandEnvironment: () => ({}),
-  useResolveFileSshTarget: () => () => {},
+  useFileSshTargetDemand: () => {},
 }));
 vi.mock("./fileCommands/target", () => ({
   useSessionHostId: () => null,

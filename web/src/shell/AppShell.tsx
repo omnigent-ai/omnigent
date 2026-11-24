@@ -355,6 +355,22 @@ function GridSessionMain(props: ComponentProps<"main">) {
   return <main {...props} data-grid-session={grids?.enabled ? grids.conversationId : undefined} />;
 }
 
+/** Reads ⌘K's SSH names while it's open; a leaf, so pane focus changes don't re-render the shell. */
+function PaletteSshTargets({
+  open,
+  gridRoute,
+  conversationId,
+}: {
+  open: boolean;
+  gridRoute: boolean;
+  conversationId: string | undefined;
+}) {
+  // ⌘K acts on the routed session, or in a grid on the selected pane's.
+  const grids = useGridSessions();
+  usePaletteSshTargets(open, (gridRoute ? grids?.selectedSessionId : conversationId) ?? null);
+  return null;
+}
+
 function AppShellImpl() {
   const shellDrafts = useContext(ShellCommandDraftContext);
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
@@ -2255,12 +2271,6 @@ function AppShellImpl() {
   useEffect(() => {
     if (commandPaletteOpen) replaceThemePicker();
   }, [commandPaletteOpen]);
-  // ⌘K acts on the routed session, or in a grid on the selected pane's.
-  const gridSessions = useGridSessions();
-  usePaletteSshTargets(
-    commandPaletteOpen,
-    (gridRoute ? gridSessions?.selectedSessionId : serverConversationId) ?? null,
-  );
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.
@@ -3889,6 +3899,11 @@ function AppShellImpl() {
               </DialogContent>
             </Dialog>
           )}
+          <PaletteSshTargets
+            open={commandPaletteOpen}
+            gridRoute={gridRoute}
+            conversationId={serverConversationId}
+          />
           <AppShellOverlays
             isEmbedded={isEmbedded}
             serverInfo={serverInfo}

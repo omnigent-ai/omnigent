@@ -310,8 +310,8 @@ export interface DiffReviewProps<A = undefined> {
   fileActions?: (file: DiffReviewFile) => readonly DiffReviewFileAction[];
   /** A changed-files tree folder's actions after its Collapse or Expand, such as copying its path. */
   folderActions?: (path: string) => readonly DiffReviewFileAction[];
-  /** Called as a file's or folder's menu opens, so the source can load what its actions need. */
-  onFileMenuOpen?: () => void;
+  /** Called as a file's or folder's menu opens and closes, so the source can load what it offers. */
+  onFileMenuOpenChange?: (open: boolean) => void;
   /** Whether ⌘K offers the current file's actions; false while another file, such as a focused row, has them. */
   fileActionsInPalette?: boolean;
   /**
@@ -413,7 +413,7 @@ export function DiffReview<A = undefined>({
   onScrollAnchorChange,
   fileActions,
   folderActions,
-  onFileMenuOpen,
+  onFileMenuOpenChange,
   fileActionsInPalette = true,
   onOpenFileInNewTab,
   onTreeFileChosen,
@@ -1914,7 +1914,7 @@ export function DiffReview<A = undefined>({
             path={path}
             actions={richAction ? [richAction, ...actions] : actions}
             titleShowsCopy={titleShowsCopy}
-            onOpen={onFileMenuOpen}
+            onOpenChange={onFileMenuOpenChange}
           />
         </span>
       );
@@ -1926,7 +1926,7 @@ export function DiffReview<A = undefined>({
       filesByPath,
       onRetry,
       menuActionsFor,
-      onFileMenuOpen,
+      onFileMenuOpenChange,
       ownedFiles,
       renderHeaderExtras,
       shownRich,
@@ -2344,7 +2344,7 @@ export function DiffReview<A = undefined>({
       onOpenInNewTab={onOpenFileInNewTab && openTreeFileInNewTab}
       rowActions={onOpenFileInNewTab || presentation?.treeRowActions ? treeRowActions : undefined}
       folderActions={folderActions}
-      onRowMenuOpen={onFileMenuOpen}
+      onRowMenuOpenChange={onFileMenuOpenChange}
       folderOwner={folderOwner}
       appearance={presentation?.tree?.appearance}
       searchQuery={treeSearch}
@@ -2790,12 +2790,12 @@ function FileActionsMenu({
   path,
   actions,
   titleShowsCopy,
-  onOpen,
+  onOpenChange,
 }: {
   path: string;
   actions: readonly DiffReviewFileAction[];
   titleShowsCopy: (path: string) => boolean;
-  onOpen?: () => void;
+  onOpenChange?: (open: boolean) => void;
 }) {
   // Read when the menu opens: the header's width decides whether the title shows the copy button.
   const [copyInTitle, setCopyInTitle] = useState(false);
@@ -2805,9 +2805,8 @@ function FileActionsMenu({
   return (
     <DropdownMenu
       onOpenChange={(open) => {
-        if (!open) return;
-        setCopyInTitle(titleShowsCopy(path));
-        onOpen?.();
+        if (open) setCopyInTitle(titleShowsCopy(path));
+        onOpenChange?.(open);
       }}
     >
       <DropdownMenuTrigger asChild>
