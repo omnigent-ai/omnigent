@@ -311,6 +311,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => () => void;
   /** Report which menu commands this page can run now (fire-and-forget). */
   setDesktopCommandState?: (state: DesktopCommandState) => void;
+  /** Report the conversation this page has loaded, or null for none (fire-and-forget). */
+  reportConversationShown?: (conversationId: string | null) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow?: () => Promise<boolean>;
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
@@ -917,6 +919,20 @@ export function onDesktopCommand(callback: (event: DesktopCommandEvent) => void)
   } catch (err) {
     console.warn("[nativeBridge] desktop command subscription failed:", err);
     return () => {};
+  }
+}
+
+/**
+ * Tell the shell which conversation this page has loaded for the signed-in
+ * user, or null when it shows none. A shell that predates this ignores it.
+ */
+export function reportConversationShown(conversationId: string | null): void {
+  const electron = electronApi();
+  if (!electron?.reportConversationShown) return;
+  try {
+    electron.reportConversationShown(conversationId);
+  } catch (err) {
+    console.warn("[nativeBridge] conversation report failed:", err);
   }
 }
 

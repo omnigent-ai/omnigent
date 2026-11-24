@@ -19,6 +19,8 @@ const HANDED_OVER_KEY = "omnigent:open-in-desktop-app-done";
 const AUTOMATIC_TIMEOUT_MS = 1500;
 /** The browser may be asking the user for permission while this request waits. */
 const REQUESTED_TIMEOUT_MS = 60_000;
+/** The app answers once a window shows the conversation, which can mean loading one first. */
+const OPEN_TIMEOUT_MS = 12_000;
 
 /** Set on every answer from the app's listener; another program on the port doesn't send it. */
 const LISTENER_HEADER = "X-Omnigent-Desktop";
@@ -77,37 +79,29 @@ export async function desktopAppPermission(): Promise<
 }
 
 /**
- * Ask the running desktop app to open a conversation on this page's server.
+ * The port the desktop app answers on for this page's server, or null when no
+ * app is running, it isn't connected to this server, or the browser blocked
+ * the request. Opens nothing.
  *
- * @param conversationId - The session to open, e.g. `"e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"`.
  * @param timeoutMs - How long each port gets to answer.
- * @returns Whether the app accepted it. False when no app is running, the app
- *   isn't connected to this server, or the browser blocked the request.
  */
-export async function openInDesktopApp(
-  conversationId: string,
-  timeoutMs: number = AUTOMATIC_TIMEOUT_MS,
-): Promise<boolean> {
+async function desktopAppPort(timeoutMs: number): Promise<number | null> {
   for (const port of DESKTOP_OPEN_PORTS) {
     try {
       // The request goes to the app on this machine, not to the server, so it bypasses the host transport.
       // oxlint-disable-next-line no-await-in-loop, no-restricted-globals -- ports are tried one after another
-      const response = await fetch(`http://127.0.0.1:${port}/open-conversation`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ conversationId }),
+      const response = await fetch(`http://127.0.0.1:${port}/status`, {
         credentials: "omit",
         signal: AbortSignal.timeout(timeoutMs),
       });
       // Another program holds this port; the app may be on the next.
       if (!response.headers.has(LISTENER_HEADER)) continue;
-      // Only 204 means the app took the conversation.
-      return response.status === 204;
+      return response.status === 204 ? port : null;
     } catch {
-      // Nothing is listening here, the browser blocked the request, or the app doesn't know this server.
+      // Nothing is listening here, or the app doesn't know this server.
     }
   }
-  return false;
+  return null;
 }
 
 /**
@@ -115,21 +109,38 @@ export async function openInDesktopApp(
  * Opens nothing; used to offer the hand-off only to someone who can use it.
  */
 export async function desktopAppRunning(): Promise<boolean> {
-  for (const port of DESKTOP_OPEN_PORTS) {
-    try {
-      // The request goes to the app on this machine, not to the server, so it bypasses the host transport.
-      // oxlint-disable-next-line no-await-in-loop, no-restricted-globals -- ports are tried one after another
-      const response = await fetch(`http://127.0.0.1:${port}/status`, {
-        credentials: "omit",
-        signal: AbortSignal.timeout(AUTOMATIC_TIMEOUT_MS),
-      });
-      if (!response.headers.has(LISTENER_HEADER)) continue;
-      return response.status === 204;
-    } catch {
-      // Nothing is listening here, or the app doesn't know this server.
-    }
+  return (await desktopAppPort(AUTOMATIC_TIMEOUT_MS)) !== null;
+}
+
+/**
+ * Ask the running desktop app to open a conversation on this page's server.
+ *
+ * @param conversationId - The session to open, e.g. `"e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"`.
+ * @param findTimeoutMs - How long each port gets to say the app is there.
+ * @returns Whether the app is showing it. False when no app is running, the
+ *   app isn't connected to this server, the browser blocked the request, or
+ *   the app accepted it but could not bring the conversation up.
+ */
+export async function openInDesktopApp(
+  conversationId: string,
+  findTimeoutMs: number = AUTOMATIC_TIMEOUT_MS,
+): Promise<boolean> {
+  const port = await desktopAppPort(findTimeoutMs);
+  if (port === null) return false;
+  try {
+    // oxlint-disable-next-line no-restricted-globals -- to the app on this machine, not the server
+    const response = await fetch(`http://127.0.0.1:${port}/open-conversation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId }),
+      credentials: "omit",
+      signal: AbortSignal.timeout(OPEN_TIMEOUT_MS),
+    });
+    // The app answers 204 only once one of its windows shows the conversation.
+    return response.headers.has(LISTENER_HEADER) && response.status === 204;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 function isMobileBrowser(): boolean {
@@ -221,7 +232,7 @@ function offerDesktopApp(conversationId: string, browserWillAsk: boolean): void 
         writeOpenInDesktopApp(true);
         void openInDesktopApp(conversationId, REQUESTED_TIMEOUT_MS).then((opened) => {
           if (opened) announceOpened(conversationId);
-          else toast("Couldn't reach the Omnigent desktop app. Check that it's running.");
+          else toast("Couldn't open this conversation in the Omnigent desktop app.");
         });
       },
     },

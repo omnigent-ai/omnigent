@@ -6,6 +6,7 @@ import {
   closeDesktopWindow,
   confirmDesktopQuit,
   onDesktopCommand,
+  reportConversationShown,
   setDesktopCommandState,
   startSystemDictation,
   supportsDesktopCommands,
@@ -839,6 +840,23 @@ describe("desktop command bridge", () => {
     ).not.toThrow();
     await expect(closeDesktopWindow()).resolves.toBe(false);
     await expect(confirmDesktopQuit(false)).resolves.toBe(false);
+  });
+
+  it("reports the conversation on screen to a shell that listens for it", () => {
+    // An older shell has no such method: the report is simply dropped.
+    installDesktop({});
+    expect(() => reportConversationShown("conv_a")).not.toThrow();
+
+    const report = vi.fn();
+    installDesktop({ reportConversationShown: report });
+    reportConversationShown("conv_a");
+    reportConversationShown(null);
+    expect(report.mock.calls).toEqual([["conv_a"], [null]]);
+
+    report.mockImplementationOnce(() => {
+      throw new Error("bridge down");
+    });
+    expect(() => reportConversationShown("conv_a")).not.toThrow();
   });
 
   it("confirms a quit with the Don't ask again choice", async () => {
