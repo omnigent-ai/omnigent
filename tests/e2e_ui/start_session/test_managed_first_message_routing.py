@@ -757,7 +757,11 @@ def _assert_opened_off_the_prompts_replica(
     snapshots = [
         json.loads(row["body"])
         for row in rows
-        if row["path"] == session_path and row["method"] == "GET" and row["replica"] == "b"
+        if row["path"] == session_path
+        and row["method"] == "GET"
+        and row["replica"] == "b"
+        and row["closed"]
+        and row["status"] == 200
     ]
     assert any(snapshot["pending_elicitations"] == [] for snapshot in snapshots), rows
     streams = [row for row in rows if row["path"] == f"{session_path}/stream"]

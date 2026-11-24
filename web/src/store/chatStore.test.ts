@@ -85,6 +85,7 @@ import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import {
   clearHostKeyless,
   getSessionHost,
+  markHostKeyless,
   setSessionHost,
   setSessionParent,
 } from "@/lib/sessionHost";
@@ -19144,51 +19145,99 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       setSessionHost(id, null);
     });
 
-    it("shows a prompt parked on the replica its keyless re-address reaches", async () => {
+    const KEYLESS_PROMPT_ID = "elicit_keyless_replica";
+
+    /**
+     * Bind *id* to host_b, whose tunnel dialed in without a key: only an unkeyed
+     * snapshot lists its prompt, so the keyed bind snapshot shows none.
+     */
+    function bindKeyedWithKeylessPrompt(id: string, opts: { refuseKeyedOpens: boolean }) {
       workspaceMode();
-      const id = "conv_rekey_keyless";
-      const before = userMessage("keyless_pre", "before the prompt");
+      const before = userMessage(`${id}_pre`, "before the prompt");
       seedSession(id, [before]);
       setSessionHost(id, "host_b");
       const prompt = {
         type: "response.elicitation_request",
-        elicitation_id: "elicit_keyless_replica",
+        elicitation_id: KEYLESS_PROMPT_ID,
         params: { mode: "form", message: "Approve the parked command?", requestedSchema: null },
       };
-      // host_b's tunnel dialed in keyless: only the default replica holds its prompt.
       const route = routeKeyedStreamOpens({
         snapshotExtras: new Map([[id, { host_id: "host_b" }]]),
         keylessSnapshotExtras: new Map([[id, { pending_elicitations: [prompt] }]]),
-        refuseKeyedOpensFor: id,
+        refuseKeyedOpensFor: opts.refuseKeyedOpens ? id : undefined,
       });
       const controller = new AbortController();
-      // Bound from the keyed replica's snapshot, which listed no prompt.
       useChatStore.setState({
         conversationId: id,
         abortController: controller,
         blocks: itemsToBlocks([before]),
       });
+      return { route, controller, loop: startStreamPump(id, controller, setState, getState) };
+    }
 
-      const loop = startStreamPump(id, controller, setState, getState);
-      await drainAsync(50);
-
-      // The refusal names the key already sent, so the open retries keyless.
-      expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
-        "open:host_b",
-        "open:none",
-      ]);
-      expect(route.log.indexOf(`snapshot:${id}`)).toBeGreaterThan(route.log.indexOf("open:none"));
-      const card = useChatStore
+    function keylessPromptCard(): ElicitationBlock | undefined {
+      return useChatStore
         .getState()
         .blocks.find(
           (b): b is ElicitationBlock =>
-            b.type === "elicitation" && b.elicitationId === "elicit_keyless_replica",
+            b.type === "elicitation" && b.elicitationId === KEYLESS_PROMPT_ID,
         );
-      expect(card?.status).toBe("pending");
+    }
 
+    // Always runs: a leaked keyless demotion would reroute later host_b tests.
+    async function releaseKeylessHost(
+      id: string,
+      controller: AbortController,
+      loop: Promise<void>,
+    ): Promise<void> {
       await teardown(controller, loop);
       setSessionHost(id, null);
       clearHostKeyless("host_b");
+    }
+
+    it("shows a prompt parked on the replica its keyless re-address reaches", async () => {
+      const id = "conv_rekey_keyless";
+      const { route, controller, loop } = bindKeyedWithKeylessPrompt(id, {
+        refuseKeyedOpens: true,
+      });
+      try {
+        await drainAsync(50);
+
+        // The refusal names the key already sent, so the open retries keyless.
+        expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
+          "open:host_b",
+          "open:none",
+        ]);
+        expect(route.log.indexOf(`snapshot:${id}`)).toBeGreaterThan(route.log.indexOf("open:none"));
+        expect(keylessPromptCard()?.status).toBe("pending");
+      } finally {
+        await releaseKeylessHost(id, controller, loop);
+      }
+    });
+
+    it("recycles an open stream when another request demotes its host to keyless", async () => {
+      const id = "conv_rekey_keyless_open";
+      const { route, controller, loop } = bindKeyedWithKeylessPrompt(id, {
+        refuseKeyedOpens: false,
+      });
+      try {
+        await drainAsync();
+        route.sinks[0]!.push(sse("session.heartbeat", {}));
+        await drainAsync();
+        expect(route.log).toEqual(["open:host_b"]);
+
+        // A sibling request's keyless retry proved the host's tunnel is unkeyed.
+        markHostKeyless("host_b");
+        await drainAsync(50);
+
+        expect(route.opens).toHaveLength(2);
+        expect(route.opens[0]!.aborted).toBe(true);
+        expect(route.opens[1]!.headers.get(SLICE_KEY)).toBeNull();
+        expect(route.log.indexOf(`snapshot:${id}`)).toBeGreaterThan(route.log.indexOf("open:none"));
+        expect(keylessPromptCard()?.status).toBe("pending");
+      } finally {
+        await releaseKeylessHost(id, controller, loop);
+      }
     });
 
     it("rebinds a hostless child's stream when its parent's host is learned", async () => {

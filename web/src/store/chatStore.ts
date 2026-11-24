@@ -6961,6 +6961,8 @@ export async function startStreamPump(
   let hasConnected = false;
   // The open currently live, so routing changes and missed events can recycle it.
   let liveAttempt: AbortController | null = null;
+  // Whether that open has connected, rather than still awaiting its response.
+  let liveAttemptConnected = false;
   let backfillRuns = 0;
   const missedEventRecovery: MissedEventRecovery = {
     recycleStream: () => {
@@ -7046,9 +7048,10 @@ export async function startStreamPump(
           liveAttempt?.abort();
         } else if (isHostKeyless(host) !== openedKeyless) {
           // Keyless requests reach another replica, whose parked prompts the
-          // keyed bind snapshot lacks. The open re-addresses itself.
+          // keyed bind snapshot lacks. A pending open re-addresses itself.
           openedKeyless = !openedKeyless;
           hostReaddressed = true;
+          if (liveAttemptConnected) liveAttempt?.abort();
         }
       })
     : undefined;
@@ -7085,6 +7088,7 @@ export async function startStreamPump(
       openedHost = getSessionHost(id);
       openedKeyless = openedHost !== null && isHostKeyless(openedHost);
       liveAttempt = attempt;
+      liveAttemptConnected = false;
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
       // Whether this attempt opened, so its close is signaled exactly once.
       let streamOpened = false;
@@ -7184,6 +7188,7 @@ export async function startStreamPump(
         if (!hasConnected) clearSseLog(id);
         hasConnected = true;
         streamOpened = true;
+        liveAttemptConnected = true;
         noteSessionStreamOpen(id, reconnecting);
         hostReaddressed = false;
         failedOpens = 0;
