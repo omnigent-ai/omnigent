@@ -3276,6 +3276,26 @@ describe("Sidebar project sections", () => {
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 
+  it("makes a ticket project's shortcut file a ticket and keeps New session in its menu", async () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar(true, "/", undefined, { ...FALLBACK_SERVER_INFO, project_tickets: true });
+
+    expect(screen.queryByRole("link", { name: "New session in Customer X" })).toBeNull();
+    const shortcut = screen.getByRole("link", { name: "New ticket in Customer X" });
+    expect(shortcut).toHaveAttribute("href", "/projects/Customer%20X?ticket=new");
+    expect(shortcut).toHaveClass("hidden", "md:flex");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    const menuItem = await screen.findByTestId("project-new-session-menu");
+    expect(menuItem).not.toHaveClass("md:hidden");
+    expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+  });
+
   it("reveals project actions on hover only in the desktop layout", () => {
     projectsMock.push("Customer X");
     mockConversations([

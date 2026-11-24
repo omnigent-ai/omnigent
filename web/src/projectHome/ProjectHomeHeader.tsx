@@ -103,8 +103,9 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
   return (
     <>
       {tickets ? (
-        // New ticket is the board's one primary action; New session lives in the project menu.
-        <ProjectBoardActions projectName={projectName} />
+        <ProjectBoardActions projectName={projectName}>
+          <ProjectNewSessionButton projectName={projectName} />
+        </ProjectBoardActions>
       ) : (
         <>
           <ProjectBoardSearch />
@@ -119,7 +120,6 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
 /** Project settings, plus an overflow menu to rename or delete the project. */
 function ProjectHomeActions({ projectName }: { projectName: string }) {
   const stagesEnabled = useTicketStagesEnabled();
-  const tickets = useProjectTicketsEnabled();
   const info = useServerInfo();
   const mandateEnabled = info !== "loading" && info.project_mandate === true;
   const descriptionEnabled = info !== "loading" && info.project_description === true;
@@ -202,19 +202,6 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
           }}
         >
           {isMobile && <SessionMenuHeader title={projectName} />}
-          {tickets && (
-            <>
-              <DropdownMenuItem
-                className={itemClass}
-                data-testid="project-menu-new-session"
-                onSelect={() => navigate(projectNewSessionPath(projectName))}
-              >
-                <MessageCirclePlusIcon className="size-3.5" />
-                New session
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-            </>
-          )}
           {stagesEnabled && (
             <DropdownMenuItem className={itemClass} onSelect={() => setEditingStages(true)}>
               <Columns3Icon className="size-3.5" />

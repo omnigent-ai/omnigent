@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { PlusIcon } from "lucide-react";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { Button } from "@/components/ui/button";
@@ -11,7 +12,13 @@ import { useProjectRecord } from "./useProjectAgentSession";
 import { useProjectIdentities } from "./useProjectIdentities";
 import { useTicketProject } from "./useProjectTickets";
 
-export function ProjectBoardActions({ projectName }: { projectName: string }) {
+export function ProjectBoardActions({
+  projectName,
+  children,
+}: {
+  projectName: string;
+  children?: ReactNode;
+}) {
   const isMobile = useIsMobileViewport();
   const [search] = useSearchParams();
   const { projectId, projects } = useTicketProject(projectName);
@@ -46,6 +53,7 @@ export function ProjectBoardActions({ projectName }: { projectName: string }) {
         <ProjectTicketSources projectId={projectId} projectName={projectName} />
       )}
       {!projects.isLoading && !projects.isError && <ProjectFiles projectId={projectId} />}
+      {children}
       <Button asChild size={isMobile ? "icon" : "default"}>
         <Link to={ticketPanelSearch("new", search)} aria-label="New ticket">
           <PlusIcon />

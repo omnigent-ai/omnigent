@@ -364,7 +364,11 @@ import {
 } from "./sidebarStyles";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
-import { projectHomePath, projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
+import {
+  projectHomePath,
+  projectNameFromHomePath,
+  ticketPanelSearch,
+} from "@/projectHome/projectHomeNavigation";
 import { useProjectTicketsEnabled } from "@/projectHome/useProjectTickets";
 import { useNewTicketCount } from "@/projectHome/projectTicketsSeen";
 import { getEmbedRoot } from "../lib/host";
@@ -7007,6 +7011,8 @@ function ProjectFolderActions({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
+  // With ticket boards, the row's quick action files a ticket; New session stays in its menu.
+  const tickets = useProjectTicketsEnabled();
   return (
     <div className="flex items-center gap-0.5">
       <Tooltip>
@@ -7015,24 +7021,39 @@ function ProjectFolderActions({
             asChild
             variant="ghost"
             size="icon-xs"
-            aria-label={`New session in ${projectName}`}
-            data-testid="project-new-session"
+            aria-label={tickets ? `New ticket in ${projectName}` : `New session in ${projectName}`}
+            data-testid={tickets ? "project-new-ticket" : "project-new-session"}
             className="hidden text-muted-foreground md:flex"
           >
             <Link
-              to={`/?project=${encodeURIComponent(projectName)}`}
+              to={
+                tickets
+                  ? `${projectHomePath(projectName)}${ticketPanelSearch("new")}`
+                  : `/?project=${encodeURIComponent(projectName)}`
+              }
               onClick={(e) => {
                 e.stopPropagation();
                 onNavigate(e);
               }}
             >
-              <MessageCirclePlusIcon className="size-3.5" data-icon-size="14" />
+              {tickets ? (
+                <PlusIcon className="size-3.5" data-icon-size="14" />
+              ) : (
+                <MessageCirclePlusIcon className="size-3.5" data-icon-size="14" />
+              )}
             </Link>
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom">New session in project</TooltipContent>
+        <TooltipContent side="bottom">
+          {tickets ? "New ticket in project" : "New session in project"}
+        </TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        onNavigate={onNavigate}
+        actions={actions}
+        showNewSessionOnDesktop={tickets}
+      />
     </div>
   );
 }
@@ -7488,10 +7509,13 @@ function ProjectFolderMenu({
   projectName,
   onNavigate,
   actions,
+  showNewSessionOnDesktop = false,
 }: {
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  /** The row's quick action no longer starts a session, so the menu offers it on desktop too. */
+  showNewSessionOnDesktop?: boolean;
 }) {
   return (
     <DropdownMenu>
@@ -7515,7 +7539,7 @@ function ProjectFolderMenu({
       >
         <ProjectFolderMenuItems
           components={dropdownBundle}
-          hideNewSessionOnDesktop
+          hideNewSessionOnDesktop={!showNewSessionOnDesktop}
           projectName={projectName}
           onNavigate={onNavigate}
           actions={actions}
