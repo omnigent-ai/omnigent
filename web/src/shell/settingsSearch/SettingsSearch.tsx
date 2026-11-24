@@ -91,8 +91,9 @@ export function SettingsSearch({ query, onQueryChange, onNavigate }: SettingsSea
     }
   };
 
+  // `contents` keeps the results in the sidebar's flex column, so a short window scrolls them.
   return (
-    <div onKeyDown={handleKeyDown}>
+    <div className="contents" onKeyDown={handleKeyDown}>
       <QuickPick<SettingsSearchTarget>
         label="Search settings"
         placeholder="Search settings"
