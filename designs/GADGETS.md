@@ -78,12 +78,17 @@ action ledger, rule state, and each viewer's shelf) is a revisioned JSON documen
   deployment that stores user content elsewhere (for example in a workspace file system,
   where gadgets inherit that system's permissions and quotas) implements `GadgetStore` without
   touching the server's database. A database-backed `GadgetFiles` is a table of
-  `(scope, path, value)` rows with a unique key.
+  `(scope, path, value)` rows with a unique key: `create_json` is an insert that fails on a
+  duplicate key, `list_page` an index range from `after`, `delete_tree` a delete of the rows
+  under a path, and a value over a payload column's size goes to artifact storage with the row
+  keeping its reference.
 - **Every read and write is bounded.** Documents are at most 32 KiB, HTML at most 1 MiB,
-  collections and records are capped, listings page with cursors and examine a fixed number
-  of entries per call, and a record's revisions roll into segments so finding its head reads
-  at most two directory listings. Deleted records give their capacity back after a
-  retention period (seven days by default) when the store can delete.
+  collections and records are capped, and a collection pages through a numbered order of its
+  records, reading a fixed number of entries per call however large it grows. A record's
+  revisions roll into segments; its newest is found by probing segment starts by number and
+  listing only the newest segment. Deleted records give their capacity back after a retention
+  period (seven days by default) when the store can delete, and removed files go a bounded
+  number per step.
 - **Lifecycle follows the data directory.** Backing up or moving `<data_dir>` carries gadgets
   with sessions; deleting a gadget or an account removes its scope in one rename.
 
@@ -188,10 +193,11 @@ the SDK at any time, so the web app (`gadgetGestureGate.ts`) reads only host-sid
   moves focus away, and a cross-origin frame cannot take focus by script without a gesture.
 - No gesture reached Omnigent's own document since the frame took focus, because some host
   controls keep focus where it was on mousedown.
-- The gesture is unused. The host can't see clicks inside the frame, so after each decision it
-  moves focus to the frame's container (Tab goes back in), and the next gesture inside focuses the
-  frame again. A frame that refocuses itself needs its own activation, and calls are spaced at
-  least a second apart, which bounds what one click can start.
+- The call falls in a rate-limited activation window, not a single-use gesture. The host can't see
+  clicks inside the frame, so after each decision it moves focus to the frame's container (Tab
+  goes back in), and the next gesture inside focuses the frame again. A frame that refocuses
+  itself needs its own activation, and calls are spaced at least a second apart, which bounds
+  what one click can start; a later call after the frame is activated again is allowed.
 
 ## Not in scope
 
