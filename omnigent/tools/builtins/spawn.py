@@ -977,7 +977,11 @@ class SysSessionCreateTool(Tool):
             "and a sending session that is private or shared read-only, including its "
             "side-chat source chain. "
             "project_name files an independent session in your project with that name, "
-            "or in a new one; the project's agent, workspace and git defaults don't apply. "
+            "or in a new one. An independent session filed in a project (yours by default) "
+            "takes the project's default agent when you give neither agent_id nor "
+            "config_path, and its default model and reasoning effort when you pass none and "
+            "it runs the project's agent; explicit arguments win. Its workspace, git and "
+            "permission defaults don't apply: placement and permission_mode decide those. "
             "A project_name other than this session's project makes a standalone "
             "session there, not a nested agent. "
             "An independent worker's optional "
@@ -1048,7 +1052,7 @@ class SysSessionCreateTool(Tool):
                             "description": (
                                 "Existing owned project ID for an independent session. "
                                 "Use project_id or project_name, not both. "
-                                "Project defaults do not apply."
+                                "Its default agent, model and effort apply as described above."
                             ),
                         },
                         "sandbox_provider": {
@@ -1075,7 +1079,9 @@ class SysSessionCreateTool(Tool):
                                 "sys_agent_list (both builtins and "
                                 "session_agents rows carry it) or "
                                 "sys_agent_get (a session's agent). "
-                                "Use instead of config_path."
+                                "Use instead of config_path; an independent "
+                                "session may omit both to use its project's "
+                                "default agent."
                             ),
                         },
                         "config_path": {
@@ -1125,7 +1131,8 @@ class SysSessionCreateTool(Tool):
                                 "the child session, e.g. 'provider/model-id' "
                                 "or 'provider-local-model-id'. Sets the harness "
                                 "model at session creation; omit to use the "
-                                "agent's default."
+                                "project's default for an independent session, "
+                                "else the agent's default."
                             ),
                         },
                         "reasoning_effort": {
@@ -1144,7 +1151,8 @@ class SysSessionCreateTool(Tool):
                                 "Optional reasoning level for the child "
                                 "session, e.g. 'high'. Only for harnesses "
                                 "with effort plumbing; omit to use the "
-                                "agent's default."
+                                "project's default for an independent session, "
+                                "else the agent's default."
                             ),
                         },
                         "permission_mode": {

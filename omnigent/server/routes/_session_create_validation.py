@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -506,3 +506,43 @@ async def validate_uploaded_bundle_host_workspace(
         spec_cwd=spec_cwd,
         host_name=host_name,
     )
+
+
+def project_model_defaults(
+    config: Mapping[str, Any],
+    requested_fields: Collection[str],
+    *,
+    agent_id: str,
+    harness: str | None,
+) -> dict[str, str]:
+    """
+    The project's default model and effort for a create that names neither.
+
+    Like New Chat's prefill, they apply only to the project's own agent and harness:
+    the session runs the project's agent, or the project names no agent but a
+    harness the session runs on. A model from one harness never reaches another,
+    and permission settings are never inherited here.
+
+    :param config: The project's saved config, e.g. ``{"model": "opus", "effort": "high"}``.
+    :param requested_fields: Fields the create request set; one it set, even to null,
+        keeps its value.
+    :param agent_id: The agent the session runs.
+    :param harness: The harness it runs on, canonical, or ``None`` when unknown.
+    :returns: ``model_override`` / ``reasoning_effort`` updates for *body*.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    project_agent = config.get("agent_id")
+    project_harness = config.get("harness")
+    if project_agent and project_agent != agent_id:
+        return {}
+    if project_harness and canonicalize_harness(project_harness) != harness:
+        return {}
+    if not project_agent and not project_harness:
+        return {}
+    updates: dict[str, str] = {}
+    for source, target in (("model", "model_override"), ("effort", "reasoning_effort")):
+        value = config.get(source)
+        if isinstance(value, str) and value and target not in requested_fields:
+            updates[target] = value
+    return updates

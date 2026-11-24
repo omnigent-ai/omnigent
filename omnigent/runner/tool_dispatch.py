@@ -3571,7 +3571,7 @@ def _session_create_fields(args: Mapping[str, object]) -> _JsonObject:
 
 
 def _build_session_create_body(
-    agent_id: str,
+    agent_id: str | None,
     conversation_id: str,
     title: object,
     model: object = None,
@@ -3593,7 +3593,8 @@ def _build_session_create_body(
     harness's capabilities here. The server validates both against their
     vocabularies at create.
 
-    :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
+    :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``, or ``None``
+        for an independent session that takes its project's default agent.
     :param conversation_id: The caller's session id — the forced parent.
     :param title: Optional session label; included only when a non-empty
         string.
@@ -3606,7 +3607,7 @@ def _build_session_create_body(
     :returns: The JSON request body.
     """
     return {
-        "agent_id": agent_id,
+        **({"agent_id": agent_id} if agent_id is not None else {}),
         "parent_session_id": conversation_id,
         **_session_create_fields(
             {
@@ -3854,9 +3855,12 @@ async def _execute_session_create(
     config_path = args.get("config_path")
     has_agent_id = isinstance(agent_id, str) and bool(agent_id)
     has_config_path = isinstance(config_path, str) and bool(config_path)
-    if has_agent_id == has_config_path:
-        # Fail loud on both-or-neither: the two modes create different
-        # agents, so silently preferring one would mislaunch.
+    placement = args.get("placement", "child")
+    # An independent session may omit both and take its project's default agent.
+    project_agent = not has_agent_id and not has_config_path and placement != "child"
+    if has_agent_id == has_config_path and not project_agent:
+        # Fail loud on both: the two modes create different agents, so
+        # silently preferring one would mislaunch.
         return json.dumps(
             {
                 "error": (
@@ -3866,7 +3870,6 @@ async def _execute_session_create(
                 )
             }
         )
-    placement = args.get("placement", "child")
     if placement not in ("child", "same_host", "host", "managed"):
         return json.dumps({"error": "placement must be child, same_host, host or managed"})
     if placement != "child" and has_config_path:
@@ -3943,7 +3946,7 @@ async def _execute_session_create(
             runner_workspace=runner_workspace,
         )
     body = _build_session_create_body(
-        str(agent_id),
+        str(agent_id) if has_agent_id else None,
         conversation_id,
         args.get("title"),
         model=args.get("model"),
@@ -4173,7 +4176,7 @@ async def _execute_session_create(
     return await _finalize_created_session(
         data,
         conversation_id=conversation_id,
-        agent_id=str(agent_id),
+        agent_id=str(data.get("agent_id") or agent_id),
         title=args.get("title"),
         message=message,
         server_client=server_client,

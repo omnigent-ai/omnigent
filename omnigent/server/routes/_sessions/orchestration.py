@@ -12793,6 +12793,25 @@ async def _create_session_from_existing_agent(
             conversation_store, body.workflow_id, user_id=user_id
         )
 
+    # A session an agent starts in a project takes the project's agent, model and
+    # effort where the request names none, like a session started from New Chat.
+    defaults_project_id = (
+        getattr(body, "project_id", None)
+        if "project_id" in body.model_fields_set
+        else created_by_project_id
+    )
+    # Project resolution re-validates the body, so remember what the caller set.
+    requested_fields = frozenset(body.model_fields_set)
+    project_defaults: dict[str, Any] = {}
+    if created_by is not None and defaults_project_id is not None and project_store is not None:
+        defaults_project = await asyncio.to_thread(
+            project_store.get, defaults_project_id, user_id=user_id
+        )
+        project_defaults = dict(defaults_project.config) if defaults_project is not None else {}
+    project_agent_id = project_defaults.get("agent_id")
+    if body.agent_id is None and isinstance(project_agent_id, str) and project_agent_id:
+        body = body.model_copy(update={"agent_id": project_agent_id})
+
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
@@ -12909,6 +12928,20 @@ async def _create_session_from_existing_agent(
             _fixed_routing_error,
         ) = await _resolve_fixed_native_model_routing(
             body, request, user_id, _fixed_native_harness
+        )
+
+    if project_defaults:
+        from omnigent.server.routes._session_create_validation import project_model_defaults
+
+        body = body.model_copy(
+            update=project_model_defaults(
+                project_defaults,
+                requested_fields,
+                agent_id=agent.id,
+                harness=await asyncio.to_thread(
+                    _create_resolved_harness, agent, body.harness_override, agent_cache
+                ),
+            )
         )
 
     # Authorize parent_session_id before inheriting anything.
