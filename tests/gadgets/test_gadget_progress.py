@@ -357,9 +357,23 @@ def test_a_later_action_waits_while_the_gadget_session_works_on_an_earlier_one(
     assert status(service, app, second) == ("queued", None)
 
 
-def test_asking_again_for_an_open_action_joins_it(gadgets: Fixture, clock: dict) -> None:
+@pytest.mark.parametrize("unrelated", [False, True], ids=["few", "long_history"])
+@pytest.mark.parametrize("settles", ["idle", "offline"])
+def test_asking_again_for_an_open_action_joins_it(
+    gadgets: Fixture,
+    clock: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    unrelated: bool,
+    settles: str,
+) -> None:
     conversations = FakeConversations()
     conversations.add("s_gadget", status="running", updated=NOW)
+    if unrelated:
+        # More unrelated sessions than the newest-session listing holds, all from before the
+        # delivery: they say nothing about this action, so it still settles.
+        monkeypatch.setattr(progress_module, "MAX_RECENT_SESSIONS", 2)
+        for n in range(4):
+            conversations.add(f"s_other{n}", created=NOW - 900 + n, updated=NOW - 900 + n)
     service = progress_service(gadgets, conversations)
     app = publish_actions_board(service)
     service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
@@ -374,7 +388,15 @@ def test_asking_again_for_an_open_action_joins_it(gadgets: Fixture, clock: dict)
     assert (again["id"], again["merged"]) == (first, True)
     assert other["merged"] is False and other["id"] != first
 
-    conversations.set("s_gadget", status="idle", updated=NOW + 60)
+    if settles == "idle":
+        conversations.set("s_gadget", status="idle", updated=NOW + 60)
+        assert status(service, app, first) == ("finished_unreported", None)
+    else:
+        # Its runner stopped reporting and stayed gone past the start grace.
+        conversations.set("s_gadget", seen=NOW - 3600)
+        conversations.bound.add("s_gadget")
+        clock["now"] = NOW + progress_module.RUNNER_START_GRACE_S + 1
+        assert status(service, app, first) == ("interrupted", "runner_offline")
     fresh = service.request_action(
         app["id"], {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "r4"}
     )

@@ -19,8 +19,10 @@ background task it left running is still going, the same rule the session's
 Tasks tab uses. A session bound to a runner or host that hasn't reported in counts
 as offline, not as running in-process. Sessions are matched by creation time, so
 attribution without a recorded session can include an unrelated child and keep the
-action running longer, never shorter, and when the listings of sessions reach their
-limits (so a worker may be missing) an action is not called finished.
+action running longer, never shorter, and when an action's own session tree or family
+is too large to read whole (so a worker may be missing) it is not called finished. An
+independent session that is in no family, wasn't recorded on the action and isn't among
+the workspace's newest sessions is not found; the skill asks the agent to record it.
 """
 
 from __future__ import annotations
@@ -410,11 +412,13 @@ class SessionStateReader:
                 pass
             except OmnigentError:
                 complete = False  # A family too large to read: some members are unknown.
+        # Best effort only: a just-started worker outside a family is usually among the
+        # newest sessions. A longer history is not evidence that one is missing, so it
+        # doesn't make the read incomplete; the agent records the session it hands work to
+        # on the action, which is read directly.
         recent = self._store.list_conversations(
             limit=MAX_RECENT_SESSIONS, kind=None, include_archived=True
         )
-        # Older sessions may have been started from these too; that can't be ruled out.
-        complete = complete and not recent.has_more
         for conversation in recent.data:
             candidates.setdefault(conversation.id, conversation)
         # A worker can start workers of its own: follow the labels until nothing new is found.
