@@ -20,7 +20,6 @@ import {
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects } from "@/hooks/useConversations";
-import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -29,7 +28,6 @@ import {
   getWorkView,
   listWorkViews,
   newView,
-  queryWorkView,
   saveWorkView,
   type SavedWorkView,
   type ViewEntity,
@@ -37,7 +35,7 @@ import {
   type ViewRecord,
 } from "@/lib/workViewsApi";
 import { EntityTabs, ViewControls } from "@/views/ViewControls";
-import { ResultsFooter, ViewResults } from "@/views/ViewResults";
+import { QueriedViewResults } from "@/views/QueriedViewResults";
 import { WorkTaskDialog } from "@/views/WorkTaskDialog";
 
 function viewInput(view: SavedWorkView): ViewInput {
@@ -304,21 +302,6 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
     return initial;
   });
   const [baseline, setBaseline] = useState(() => JSON.stringify(saved ? viewInput(saved) : null));
-  const settledSearch = useDebouncedValue(value.filters.search, 200);
-  const definition = { ...value, filters: { ...value.filters, search: settledSearch } };
-  const results = useInfiniteQuery({
-    queryKey: [
-      "view-results",
-      value.entity_type,
-      definition.filters,
-      value.display.order_by,
-      value.display.direction,
-    ],
-    queryFn: ({ pageParam, signal }) => queryWorkView(definition, pageParam, signal),
-    initialPageParam: null as string | null,
-    getNextPageParam: (page) => page.next_cursor ?? undefined,
-    refetchInterval: value.entity_type === "sessions" ? 15000 : false,
-  });
   const save = useMutation({
     mutationFn: () => saveWorkView(value, saved?.id),
     onSuccess: async (view) => {
@@ -329,11 +312,6 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
       if (!saved) navigate(`/views/${view.id}`, { replace: true });
     },
   });
-  const records = [
-    ...new Map(
-      (results.data?.pages.flatMap((page) => page.data) ?? []).map((record) => [record.id, record]),
-    ).values(),
-  ];
   const taskId = searchParams.get("task");
   const openTask = (id: string | null) => {
     const next = new URLSearchParams(searchParams);
@@ -400,69 +378,21 @@ function ViewEditor({ saved }: { saved?: SavedWorkView }) {
         )}
       </div>
       <div className="px-4 pb-4">
-        <div className="mb-3 flex min-h-8 items-center justify-between px-1">
-          <span className="text-xs text-muted-foreground">
-            {results.isFetching && !results.isPending
-              ? "Updating…"
-              : saved && baseline !== JSON.stringify(value)
-                ? "Unsaved changes"
-                : ""}
-          </span>
-          {value.entity_type === "tasks" && (
-            <Button size="sm" variant="ghost" onClick={() => openTask("new")}>
-              <PlusIcon />
-              New task
-            </Button>
-          )}
-        </div>
         {projects.error && (
           <p role="alert" className="mb-3 text-sm text-destructive">
             Couldn’t load projects. {projects.error.message}
           </p>
         )}
-        {results.isPending ? (
-          <div className="flex justify-center p-12">
-            <Spinner aria-label="Loading results" />
-          </div>
-        ) : results.error ? (
-          <div role="alert" className="p-8 text-sm text-destructive">
-            {results.error.message}
-            <Button variant="ghost" onClick={() => void results.refetch()}>
-              Retry
-            </Button>
-          </div>
-        ) : (
-          <>
-            {records.length === 0 && (
-              <div className="space-y-2 py-14 text-center">
-                <LayersIcon className="mx-auto size-7 text-muted-foreground/50" />
-                <p className="text-sm font-medium">No matching {value.entity_type}</p>
-                <p className="text-sm text-muted-foreground">
-                  {results.hasNextPage
-                    ? "More results are available to search. Load more to continue."
-                    : value.entity_type === "tasks"
-                      ? "Create a task or adjust your filters."
-                      : "Try adjusting your filters."}
-                </p>
-              </div>
-            )}
-            <ViewResults records={records} definition={value} onOpen={openRecord} />
-            <ResultsFooter
-              count={records.length}
-              hasMore={results.hasNextPage}
-              loading={results.isFetchingNextPage}
-              onMore={() => void results.fetchNextPage()}
-            />
-          </>
-        )}
+        <QueriedViewResults
+          definition={value}
+          onOpen={openRecord}
+          notice={saved && baseline !== JSON.stringify(value) ? "Unsaved changes" : undefined}
+        />
       </div>
-      {taskId && (
+      {taskId && taskId !== "new" && (
         <WorkTaskDialog
           taskId={taskId}
           projects={projectOptions}
-          initialProjectId={
-            value.filters.project_ids.length === 1 ? value.filters.project_ids[0] : undefined
-          }
           onClose={() => openTask(null)}
           onSaved={openTask}
         />

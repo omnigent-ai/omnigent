@@ -623,6 +623,7 @@ function useActiveNavItem(): {
   isInboxPage: boolean;
   isCanvasPage: boolean;
   isTasksPage: boolean;
+  isWorkTasksPage: boolean;
   isViewsPage: boolean;
   isWorkflowsPage: boolean;
   isUsagePage: boolean;
@@ -647,6 +648,7 @@ function useActiveNavItem(): {
   // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
   // match the "tasks" segment by position from the end, not an absolute path.
   const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
+  const isWorkTasksPage = !isExtensionRoute && leaf === "work-tasks";
   const isViewsPage = !isExtensionRoute && (leaf === "views" || segments.at(-2) === "views");
   // Likewise /workflows (list) and /workflows/:workflowId (a workflow's page).
   const isWorkflowsPage =
@@ -664,6 +666,7 @@ function useActiveNavItem(): {
     !isInboxPage &&
     !isCanvasPage &&
     !isTasksPage &&
+    !isWorkTasksPage &&
     !isViewsPage &&
     !isWorkflowsPage &&
     !isUsagePage &&
@@ -682,6 +685,7 @@ function useActiveNavItem(): {
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkTasksPage,
     isViewsPage,
     isWorkflowsPage,
     isUsagePage,
@@ -990,6 +994,7 @@ function SidebarImpl({
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkTasksPage,
     isViewsPage,
     isWorkflowsPage,
     isUsagePage,
@@ -1526,6 +1531,31 @@ function SidebarImpl({
                       )}
                     />
                     Automations
+                  </Link>
+                </Button>
+              )}
+              {serverInfo !== "loading" && serverInfo.work_views && (
+                <Button
+                  asChild
+                  variant="ghost"
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal mobile-touch-target",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isWorkTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  data-testid="work-tasks-nav"
+                >
+                  <Link to="/work-tasks" onClick={onNavClick} componentId="sidebar.work_tasks">
+                    <ListChecksIcon
+                      className={cn(
+                        "ui-icon",
+                        isWorkTasksPage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    Tasks
                   </Link>
                 </Button>
               )}

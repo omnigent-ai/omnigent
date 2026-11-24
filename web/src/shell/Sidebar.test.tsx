@@ -1485,6 +1485,30 @@ describe("Sidebar session list", () => {
     );
   });
 
+  it.each(["/work-tasks", "/embedded/work-tasks?task=new"])(
+    "marks Tasks active independently of Automations and New session on %s",
+    (path) => {
+      mockConversations([]);
+      renderSidebar(true, path, undefined, { ...AUTOMATIONS_INFO, work_views: true });
+      const tasks = screen.getByRole("link", { name: "Tasks" });
+      expect(tasks).toHaveAttribute("href", "/work-tasks");
+      expect(tasks).toHaveClass("bg-[var(--sidebar-active)]");
+      expect(screen.getByTestId("scheduled-tasks-nav")).not.toHaveClass(
+        "bg-[var(--sidebar-active)]",
+      );
+      expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+      expect(screen.getByTestId("views-nav")).not.toHaveClass("bg-[var(--sidebar-active)]");
+      expect(screen.queryByRole("button", { name: "New task" })).toBeNull();
+      expect(screen.queryByRole("link", { name: "New task" })).toBeNull();
+    },
+  );
+
+  it("hides Tasks when work views are unavailable", () => {
+    mockConversations([]);
+    renderSidebar(true, "/", undefined, { ...AUTOMATIONS_INFO, work_views: false });
+    expect(screen.queryByRole("link", { name: "Tasks" })).toBeNull();
+  });
+
   it("reveals the new-session shortcut within the row on hover or keyboard focus", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();

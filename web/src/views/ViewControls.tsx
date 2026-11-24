@@ -80,10 +80,12 @@ export function ViewControls({
   value,
   projects,
   onChange,
+  showEntityTabs = true,
 }: {
   value: ViewInput;
   projects: Pick<Project, "id" | "name">[];
   onChange: (view: ViewInput) => void;
+  showEntityTabs?: boolean;
 }) {
   const filters = value.filters;
   const display = value.display;
@@ -108,18 +110,20 @@ export function ViewControls({
   );
   return (
     <div className="flex flex-wrap items-center gap-3 border-b border-border/60 px-5 py-3">
-      <EntityTabs
-        value={value.entity_type}
-        onChange={(entity) => {
-          const next = newView(entity);
-          onChange({
-            ...next,
-            name: value.name === `All ${value.entity_type}` ? next.name : value.name,
-            description: value.description,
-            favorite: value.favorite,
-          });
-        }}
-      />
+      {showEntityTabs && (
+        <EntityTabs
+          value={value.entity_type}
+          onChange={(entity) => {
+            const next = newView(entity);
+            onChange({
+              ...next,
+              name: value.name === `All ${value.entity_type}` ? next.name : value.name,
+              description: value.description,
+              favorite: value.favorite,
+            });
+          }}
+        />
+      )}
       <div className="ml-auto flex items-center gap-2">
         <Input
           aria-label="Filter by name"
