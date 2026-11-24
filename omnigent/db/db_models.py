@@ -631,6 +631,9 @@ class SqlSessionPermission(OmnigentBase):
 # limit in docs/DATABASE_BEST_PRACTICES.md, which forbids exactly 16,384 bytes.
 MAX_STORED_VALUE_BYTES = 16 * 1024 - 1
 WORKFLOW_DESCRIPTION_MAX_STORED_BYTES = 2000
+# A session's plan progress: a few counts and one step name, encoded by the
+# journal store's codec, encryption overhead included.
+PLAN_PROGRESS_MAX_STORED_BYTES = 2048
 
 # MySQL stores these documents as BLOB (at most 65,535 bytes), so writes that
 # compress past that fail before reaching MySQL. Other dialects keep the uncapped codec.
@@ -2055,6 +2058,10 @@ class SqlSessionJournalHead(OmnigentBase):
     :param conversation_id: The session (relates to ``conversations.id``; no DB
         foreign key, Rule R032).
     :param next_position: The position the session's next entry gets.
+    :param plan_progress: Where the session's current plan stands, as the
+        journal store encodes it, so a session list reads it by primary key
+        instead of reading the journal. ``None`` until a plan or status write
+        records it.
     """
 
     __tablename__ = "session_journal_heads"
@@ -2064,6 +2071,9 @@ class SqlSessionJournalHead(OmnigentBase):
     )
     conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     next_position: Mapped[int] = mapped_column(Integer, nullable=False)
+    plan_progress: Mapped[bytes | None] = mapped_column(
+        BoundedBinary(PLAN_PROGRESS_MAX_STORED_BYTES), nullable=True
+    )
 
 
 class SqlWorkflow(OmnigentBase):

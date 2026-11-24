@@ -81,6 +81,27 @@ def test_mysql_payload_types_are_bounded_and_keep_the_codec(
         bind(value + b"x" * limit)
 
 
+def test_mysql_plan_progress_is_bounded_bytes_the_store_encodes() -> None:
+    migration = import_module(
+        "omnigent.db.migrations.versions.ce6afa56e9f7_add_session_journal_plan_progress"
+    )
+    dialect = mysql.dialect()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="mysql", opts={"as_sql": True, "output_buffer": output}
+    )
+    with Operations.context(context):
+        migration.upgrade()
+    column = SqlSessionJournalHead.__table__.c.plan_progress
+    assert str(column.type.compile(dialect=dialect)) == "VARBINARY(2048)"
+    assert "ADD COLUMN plan_progress VARBINARY(2048)" in output.getvalue()
+    bind = column.type.dialect_impl(dialect).bind_processor(dialect)
+    stored = b'\x00\x00{"total": 1}'
+    assert bind is not None and bind(stored) == stored
+    with pytest.raises(ValueError):
+        bind(stored + b"x" * 2048)
+
+
 def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) -> None:
     config = _build_alembic_config(uri)
     with engine.begin() as conn:
@@ -136,5 +157,34 @@ def test_upgrade_matches_models_and_downgrade_drops_tables(tmp_path: Path) -> No
         assert connection.execute(
             sa.text("SELECT version_num FROM alembic_version")
         ).scalars().all() == ["27d16059fab9"]
+    engine.dispose()
+    clear_engine_cache()
+
+
+def test_plan_progress_downgrade_keeps_heads_and_reupgrades(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'journal.db'}"
+    engine = sa.create_engine(uri)
+    _migrate(uri, engine, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                f"INSERT INTO {_HEADS} (workspace_id, conversation_id, next_position, "
+                "plan_progress) VALUES (0, :conversation, 3, :progress)"
+            ),
+            {"conversation": b"\x01" * 16, "progress": b'\x00\x00{"total": 1}'},
+        )
+
+    _migrate(uri, engine, "47d3e8fc3e25", down=True)
+    columns = [column["name"] for column in sa.inspect(engine).get_columns(_HEADS)]
+    assert columns == ["workspace_id", "conversation_id", "next_position"]
+    with engine.connect() as connection:
+        assert connection.execute(sa.text(f"SELECT next_position FROM {_HEADS}")).scalar() == 3
+
+    _migrate(uri, engine, "head")
+    with engine.connect() as connection:
+        # The column returns empty: the next plan or status write records it.
+        assert connection.execute(
+            sa.text(f"SELECT next_position, plan_progress FROM {_HEADS}")
+        ).one() == (3, None)
     engine.dispose()
     clear_engine_cache()
