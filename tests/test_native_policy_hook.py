@@ -681,8 +681,8 @@ def test_post_evaluate_with_retry_fails_closed_after_repeated_429(
     assert error is not None
     assert "retry budget exhausted" in error
     assert "server returned 429" in error
-    assert sleeps == [1.0, 2.0, 4.0, 8.0, 10.0]
-    assert len(request_bodies) == 6
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, *[10.0] * 16]
+    assert len(request_bodies) == 21
     assert len({body["_omnigent_elicitation_id"] for body in request_bodies}) == 1
 
 
@@ -1117,7 +1117,7 @@ def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(
 
     assert resp is None
     assert error is not None and "retry budget exhausted" in error
-    assert 2 <= len(posts) <= 8, "retried within the budget, then gave up"
+    assert 2 <= len(posts) <= 25, "retried within the budget, then gave up"
 
 
 def test_post_evaluate_with_retry_reauths_on_403_invalid_token(

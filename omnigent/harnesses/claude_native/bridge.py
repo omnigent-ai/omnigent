@@ -234,6 +234,10 @@ def _pinned_temp_parent() -> Path | None:
 # trusted parent (`/tmp`) is shared; everything under
 # `_BRIDGE_ROOT_PARENT` must be owned by the current uid and not be a
 # symlink — see :func:`_ensure_secure_dir`.
+# Claude Code timeout for the policy-evaluate hook: a day, like the hook's read
+# budget, so a parked ASK or a restart retry is never killed into "no opinion".
+_EVALUATE_POLICY_HOOK_TIMEOUT_S = 86400.0
+
 _TRUSTED_PARENT = Path(tempfile.gettempdir())
 _BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
@@ -2921,6 +2925,10 @@ def build_hook_settings(
             "command": policy_allow_cache.guarded_hook_command(
                 bridge_dir, evaluate_policy_command
             ),
+            # Claude's default hook timeout would kill a parked policy ASK, or
+            # a retry riding out a server restart, and run the tool unchecked.
+            # Match the hook's own day-long read budget instead.
+            "timeout": int(_EVALUATE_POLICY_HOOK_TIMEOUT_S),
         }
 
         # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
@@ -9061,7 +9069,15 @@ def _tool_relay_handler_factory(
                     continue
                 if resp.status_code != HTTPStatus.OK:
                     last_error = f"server returned HTTP {resp.status_code}"
-                    non_connect_failures += 1
+                    if resp.status_code == HTTPStatus.TOO_MANY_REQUESTS or resp.status_code >= 500:
+                        # A restarting or overloaded server: wait it out like a
+                        # connect error instead of asking the user.
+                        if time.monotonic() + backoff_s >= deadline:
+                            break
+                        retry_delay = backoff_s
+                        backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
+                    else:
+                        non_connect_failures += 1
                     continue
                 try:
                     verdict = json.loads(resp.content)

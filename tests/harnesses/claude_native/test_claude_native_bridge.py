@@ -5104,6 +5104,30 @@ def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
     )
 
 
+def test_policy_hook_timeout_outlasts_the_evaluate_retry_budget(tmp_path: Path) -> None:
+    """Claude must not kill the policy hook mid-retry and run the tool unchecked."""
+    from omnigent.native.native_policy_hook import _EVALUATE_POLICY_RETRY_BUDGET_S
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    hooks = _load_invocation_settings(args)["hooks"]
+    for event in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit"):
+        policy_hooks = [
+            hook
+            for entry in hooks[event]
+            for hook in entry["hooks"]
+            if "evaluate-policy" in hook["command"]
+        ]
+        assert policy_hooks, event
+        for hook in policy_hooks:
+            assert hook["timeout"] > _EVALUATE_POLICY_RETRY_BUDGET_S, (event, hook)
+
+
 def test_augment_claude_args_registers_policy_hook_for_failed_tool_calls(
     tmp_path: Path,
 ) -> None:
@@ -16052,13 +16076,14 @@ async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
             assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "ask"
         else:
             assert body == "", "PostToolUse must still fail open"
-        assert client.calls == 6
+        # Backoff doubles to 10s and stops before the 180s budget would be passed.
+        assert client.calls == 21
         assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
             1,
             2,
             4,
             8,
-            10,
+            *[10] * 16,
         ]
     finally:
         relay.close()
@@ -16067,7 +16092,7 @@ async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    [401, 504, httpx.RequestError("no auth token"), httpx.ReadError("torn poll")],
+    [401, httpx.RequestError("no auth token"), httpx.ReadError("torn poll")],
 )
 async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
     tmp_path: Path,
@@ -16075,7 +16100,7 @@ async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
     _policy_retry_clock: Mock,
     failure: int | Exception,
 ) -> None:
-    """HTTP, auth, and held-poll failures retain the existing three attempts."""
+    """Client-error, auth and held-poll failures retain the existing three attempts."""
     client = _ScriptedPolicyClient(failure)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -16089,6 +16114,34 @@ async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
         assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
         assert client.calls == 3
         assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [0.4, 0.4]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [502, 503, 504, 429])
+async def test_hook_evaluate_endpoint_waits_out_a_restarting_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock, status: int
+) -> None:
+    """A server answering 5xx/429 while it restarts gets a real verdict, not an "ask"."""
+    client = _ScriptedPolicyClient(*[status] * 8, {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/hook/claude/evaluate-policy", _PRE_TOOL_USE_PAYLOAD
+        )
+        assert body == "", f"an ALLOW after the restart must not prompt, got {body!r}"
+        assert client.calls == 9
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
+            1,
+            2,
+            4,
+            8,
+            10,
+            10,
+            10,
+            10,
+        ]
     finally:
         relay.close()
 

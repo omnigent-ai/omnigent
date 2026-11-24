@@ -36,11 +36,11 @@ import httpx
 from omnigent.util.http_retry import bounded_retry_after_seconds
 
 # How long to keep retrying transient 429 / 5xx / connect errors on the
-# policy evaluate POST before failing closed. Keeps the pre-execution
-# gate from blocking long on a sick server while still absorbing brief
-# hosted-deployment failures. A gateway-severed held poll resets
-# it — see :func:`post_evaluate_with_retry`.
-_EVALUATE_POLICY_RETRY_BUDGET_S = 30.0
+# policy evaluate POST before falling back to asking the user. Long enough
+# to ride out a hosted server restart: an approval card raised meanwhile
+# can't reach the web until the server is back anyway. A gateway-severed
+# held poll resets it — see :func:`post_evaluate_with_retry`.
+_EVALUATE_POLICY_RETRY_BUDGET_S = 180.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 _EVALUATE_POLICY_MAX_RETRY_AFTER_S = 10.0
