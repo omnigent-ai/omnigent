@@ -30,6 +30,7 @@ Resolution order for the config path:
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
@@ -242,6 +243,8 @@ def load_picker_curation(config: Mapping[str, Any]) -> PickerCuration:
 
 PULL_REQUEST_LINKS_KEY = "pull_request_links"
 _PULL_REQUEST_LINK_FIELD = re.compile(r"\{(?:host|owner|repo|number)\}")
+# Dot-separated hostname labels a browser accepts unescaped.
+_DESTINATION_HOSTNAME = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?")
 
 
 @dataclass(frozen=True)
@@ -275,9 +278,24 @@ class PullRequestLinks:
         }
 
 
+def _is_destination_hostname(hostname: str | None) -> bool:
+    """
+    Whether *hostname*, as ``urlsplit`` reports it, is a valid host name or IP literal.
+    """
+    if hostname is None:
+        return False
+    if _DESTINATION_HOSTNAME.fullmatch(hostname):
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return True
+
+
 def _is_http_destination(url: str) -> bool:
     """
-    Whether *url* is an absolute http(s) URL with a hostname and, if any, a usable port.
+    Whether *url* is an absolute http(s) URL with a valid hostname and, if any, a usable port.
     """
     parts = urlsplit(url)
     try:
@@ -285,7 +303,11 @@ def _is_http_destination(url: str) -> bool:
         has_usable_port = parts.port is None or parts.port > 0
     except ValueError:
         return False
-    return parts.scheme in ("http", "https") and bool(parts.hostname) and has_usable_port
+    return (
+        parts.scheme in ("http", "https")
+        and _is_destination_hostname(parts.hostname)
+        and has_usable_port
+    )
 
 
 def _pull_request_link_template(raw: object) -> str:

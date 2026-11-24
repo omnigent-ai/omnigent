@@ -812,6 +812,34 @@ def test_pull_request_links_normalize_the_configured_block() -> None:
 
 
 @pytest.mark.parametrize(
+    "url_template",
+    [
+        "https://review.example.com:8443/{owner}/{repo}/{number}",
+        "https://{host}.review.example.com/{number}",
+        "https://[::1]:8443/{number}",
+        "http://10.0.0.5/review/{number}",
+    ],
+    ids=["port", "host-field-subdomain", "ipv6-literal", "ipv4-literal"],
+)
+def test_pull_request_links_accept_destinations_with_ports_and_ip_literals(
+    url_template: str,
+) -> None:
+    """Validation rejects unusable destinations, not ordinary ports, subdomains or IP hosts."""
+    links = load_pull_request_links(
+        {
+            "pull_request_links": {
+                "url_template": url_template,
+                "name": "Review",
+                "applies_to": ["github.com"],
+            }
+        }
+    )
+
+    assert links is not None
+    assert links.url_template == url_template
+
+
+@pytest.mark.parametrize(
     ("block", "message"),
     [
         ("https://review.example.com/{number}", "must be a mapping"),
@@ -876,6 +904,22 @@ def test_pull_request_links_normalize_the_configured_block() -> None:
             },
             "url_template",
         ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://bad host/{number}",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://bad%20host/{number}",
+            },
+            "url_template",
+        ),
     ],
     ids=[
         "not-a-mapping",
@@ -895,6 +939,8 @@ def test_pull_request_links_normalize_the_configured_block() -> None:
         "template-relative",
         "template-invalid-port",
         "template-no-hostname",
+        "template-hostname-space",
+        "template-hostname-escaped-space",
     ],
 )
 def test_malformed_pull_request_links_stop_startup(block: object, message: str) -> None:
