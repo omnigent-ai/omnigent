@@ -757,20 +757,25 @@ class ConstraintGuard:
                 self.actor,
             )
 
-    def mark_stale(self) -> None:
-        """Mark the derived state stale after a write the rules didn't see.
+    def mark_stale(self, *, unguarded_write: bool = False) -> None:
+        """Mark the derived state stale, so the next guarded write rebuilds it.
 
-        A revision without rules writes records directly. Publishing rules again must recount
-        them, even when the rules match the digest the state last saw, so the state is marked
-        stale (after finishing any change left pending). A gadget that never had rules has no
-        state, and nothing is written.
+        For an *unguarded_write*, one the published rules don't cover (no rules, or rules
+        only for other collections) that went straight to the records: publishing earlier
+        rules again must recount it, even when those rules match the digest the state last
+        saw. State derived for this guard's own rules is left alone then, because they don't
+        cover the collection written and any other rules differ from it and rebuild anyway.
+        Any change left pending is finished first. A gadget that never had rules has no state,
+        and nothing is written.
         """
         if not self._epochs():
             return
         for attempt in range(GUARD_ATTEMPTS):
             epoch, state = self._current()
             current = state.value
-            if current.get("rules") == _STALE:
+            if current.get("rules") == _STALE or (
+                unguarded_write and current.get("rules") == self.digest
+            ):
                 return
             if current.get("pending") is not None:
                 self._finish(epoch, state)

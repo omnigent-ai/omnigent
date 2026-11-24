@@ -922,11 +922,19 @@ def _republish(service: GadgetService, app: dict, revision_id: str) -> dict:
     return service.publish(app["id"], {"revision_id": revision_id, "if_version": app["version"]})
 
 
-@pytest.mark.parametrize("case", ["count", "unique", "restrict", "cascade", "unset"])
+@pytest.mark.parametrize(
+    ("case", "between"),
+    [
+        *((case, "none") for case in ["count", "unique", "restrict", "cascade", "unset"]),
+        ("count", "other"),
+        ("unique", "other"),
+    ],
+)
 def test_rules_published_again_count_the_writes_made_without_them(
-    gadgets: Fixture, case: str
+    gadgets: Fixture, case: str, between: str
 ) -> None:
-    # Rules R, then a revision without rules, then R again: the state R left behind never saw
+    # Rules R, then a revision whose rules don't cover the collection written (none at all,
+    # or rules only for another collection), then R again: the state R left behind never saw
     # the writes in between, so R must recount them instead of reusing it.
     service = gadgets.service()
     if case == "count":
@@ -945,7 +953,12 @@ def test_rules_published_again_count_the_writes_made_without_them(
     app = publish_ruled_board(service, [rule])
     ruled = app["published_revision"]
     target = card(service, app, "a", "todo")
-    app = _republish(service, app, ruled_revision(service, app["id"], []))
+    other = (
+        [{"name": "few_runs", "kind": "max_records", "collection": "runs", "max": 100}]
+        if between == "other"
+        else []
+    )
+    app = _republish(service, app, ruled_revision(service, app["id"], other))
     if case == "count":
         card(service, app, "b", "todo")
     elif case == "unique":

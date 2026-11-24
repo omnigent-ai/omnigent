@@ -1477,8 +1477,9 @@ class GadgetService:
             )
         else:
             result = store.delete(collection, record_id, cast(str, version), operation_id, actor)
-        if guard is None:
-            # Rules published again later must count this write: the state they would reuse
-            # never saw it.
-            ConstraintGuard(files, "data/_guard", store, [], actor).mark_stale()
+        # Rules published again later must count this write: the state they would reuse
+        # never saw it.
+        (guard or ConstraintGuard(files, "data/_guard", store, [], actor)).mark_stale(
+            unguarded_write=True
+        )
         return result.to_dict()
