@@ -552,6 +552,22 @@ async def claude_memory_import_note(cwd: Path, env: Mapping[str, str]) -> str | 
     )
 
 
+def release_claude_memory_import_offer(cwd: Path, env: Mapping[str, str]) -> None:
+    """
+    Undo :func:`claude_memory_import_note`'s claim after the launch failed.
+
+    The offer never reached a running Claude, so a later launch should make it.
+    Never raises.
+
+    :param cwd: The working directory the offer was made for.
+    :param env: The launch environment the offer was made for.
+    """
+    try:
+        _import_offer_marker("claude", _claude_config_dir(cwd, env)).unlink(missing_ok=True)
+    except Exception:
+        _logger.debug("Claude Code memory import offer not released", exc_info=True)
+
+
 async def codex_memory_import_note(codex_home: Path) -> str | None:
     """
     The one-time offer to import Codex's own notes, for a native launch.

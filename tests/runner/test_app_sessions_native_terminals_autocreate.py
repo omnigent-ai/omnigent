@@ -2651,6 +2651,80 @@ async def test_auto_create_claude_terminal_offers_its_own_notes_on_the_first_lau
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_keeps_the_offer_for_a_retry_after_a_failed_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch refused before Claude starts leaves the offer for the next launch, once."""
+    from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    note = tmp_path / "claude-config" / "projects" / "-home-me-repo" / "memory" / "role.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nname: role\ntype: user\n---\nBody.\n")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration.resolve_cli_binary",
+        lambda _name: tmp_path / "claude",
+    )
+    refusals = [ClaudeNativeHookInterpreterMismatchError("Windows-native claude")]
+
+    def _validate(_binary: Path) -> None:
+        if refusals:
+            raise refusals.pop()
+
+    monkeypatch.setattr(
+        claude_native_bridge, "validate_claude_hook_interpreter_compatibility", _validate
+    )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": True})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        tool_groups=ToolGroupsConfig(memory=True),
+    )
+    offers = tmp_path / "omnigent-data" / "memory-import-offers"
+
+    async def _launch() -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+        await _auto_create_claude_terminal(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            agent_spec=agent_spec,
+        )
+        return captured
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError):
+        await _launch()
+    assert list(offers.iterdir()) == []
+
+    prompts = []
+    for _ in range(2):
+        args = (await _launch())["spec"].args
+        prompts.append(args[args.index("--append-system-prompt") + 1])
+    assert [("Claude Code's own memory" in prompt) for prompt in prompts] == [True, False]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["wrapper-config-dir", "wrapper-unsets-memory-off", "child"])
 async def test_auto_create_claude_terminal_offers_the_notes_of_the_launched_claude_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
@@ -2765,6 +2839,34 @@ async def test_codex_launch_turns_its_own_memory_off_and_offers_its_notes_once(
     assert [launch[0] for launch in launches] == [overrides, overrides]
     offers = ["Codex's own memory" in (launch[1] or "") for launch in launches]
     assert offers == ([True, False] if overrides else [False, False])
+
+
+@pytest.mark.asyncio
+async def test_a_codex_child_launch_leaves_the_offer_to_its_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child's memory still goes off, but the offer waits for a top-level launch."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    notes = tmp_path / "codex-home" / "memories" / "MEMORY.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("# Task Group: repo\n")
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={"memory": True})),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        tool_groups=ToolGroupsConfig(memory=True),
+    )
+
+    child = await _codex_own_memory_launch(agent_spec, fake_client, offer=False)
+    parent = await _codex_own_memory_launch(agent_spec, fake_client)
+
+    assert child == (["features.memories=false"], None)
+    assert "Codex's own memory" in (parent[1] or "")
 
 
 @pytest.mark.asyncio

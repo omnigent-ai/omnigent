@@ -93,6 +93,7 @@ from omnigent.runner.memory_guidance import (
     claude_memory_import_note,
     codex_memory_import_note,
     memory_startup_guidance,
+    release_claude_memory_import_offer,
 )
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
@@ -758,6 +759,9 @@ class _CodexNativeLaunchConfig:
     turn_routing: bool = False
     reasoning_effort: str | None = None
     bridge_id: str | None = None
+    #: The session is a child whose replies its parent receives, so one-time user
+    #: offers are left to top-level sessions.
+    has_parent: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1578,6 +1582,7 @@ async def _codex_native_launch_config(
         turn_routing=routing_class.turn_routing,
         reasoning_effort=reasoning_effort,
         bridge_id=bridge_id,
+        has_parent=bool(snapshot.get("parent_session_id")),
     )
 
 
@@ -5953,7 +5958,7 @@ async def _auto_create_codex_terminal(
         _codex_routing_note = smart_routing_spawn_note("codex-native")
     # Decided before the instructions are composed, since the offer goes into them.
     _codex_memory_overrides, _codex_memory_import = await _codex_own_memory_launch(
-        agent_spec, server_client
+        agent_spec, server_client, offer=not launch_config.has_parent
     )
     _codex_developer_instructions = await _native_startup_instructions(
         agent_spec,
@@ -8045,7 +8050,10 @@ async def _claude_auto_memory_env(
 
 
 async def _codex_own_memory_launch(
-    agent_spec: AgentSpec | ResolvedSpec | None, server_client: httpx.AsyncClient | None
+    agent_spec: AgentSpec | ResolvedSpec | None,
+    server_client: httpx.AsyncClient | None,
+    *,
+    offer: bool = True,
 ) -> tuple[list[str], str | None]:
     """
     Turn Codex's own memory off when the session has Omnigent memory, and offer its notes.
@@ -8055,6 +8063,8 @@ async def _codex_own_memory_launch(
 
     :param agent_spec: The session's agent spec, or ``None``.
     :param server_client: The runner's client for the Omnigent server.
+    :param offer: Whether this launch may make the import offer; ``False`` for a
+        child session, whose reply goes to its parent rather than the user.
     :returns: The launch's extra config overrides and the one-time import offer,
         e.g. ``(["features.memories=false"], None)``; ``([], None)`` without
         Omnigent memory.
@@ -8063,8 +8073,8 @@ async def _codex_own_memory_launch(
         return [], None
     from omnigent.inner.codex_executor import _codex_home_config_source_from_env
 
-    offer = await codex_memory_import_note(_codex_home_config_source_from_env())
-    return [_CODEX_OWN_MEMORY_OFF_OVERRIDE], offer
+    note = await codex_memory_import_note(_codex_home_config_source_from_env()) if offer else None
+    return [_CODEX_OWN_MEMORY_OFF_OVERRIDE], note
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -10204,6 +10214,7 @@ async def _auto_create_claude_terminal(
     # since the offer goes into them. Base args already give the wrapper's shape.
     # Only a top-level session is offered: a child's reply goes to its parent.
     claude_memory_import = None
+    offer_claim: tuple[Path, dict[str, str]] | None = None
     if _CLAUDE_AUTO_MEMORY_OFF_ENV in claude_auto_memory_env and not launch_metadata.has_parent:
         offer_spec = claude_terminal_spec(
             resolve_harness_args("claude-native", tuple(base_claude_args), cfg=_harness_cfg),
@@ -10218,6 +10229,14 @@ async def _auto_create_claude_terminal(
         # A wrapper can unset or change the variable, leaving auto memory on.
         if offer_cwd is not None and offer_env.get(_CLAUDE_AUTO_MEMORY_OFF_ENV) == "1":
             claude_memory_import = await claude_memory_import_note(offer_cwd, offer_env)
+            if claude_memory_import is not None:
+                offer_claim = (offer_cwd, offer_env)
+
+    def release_offer() -> None:
+        # A launch that fails never shows the offer, so a later launch makes it.
+        if offer_claim is not None:
+            release_claude_memory_import_offer(*offer_claim)
+
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
@@ -10255,7 +10274,11 @@ async def _auto_create_claude_terminal(
     # ``_preflight_local_tools`` on the local-CLI path.
     resolved_claude = resolve_cli_binary(launch_command)
     if resolved_claude is not None:
-        validate_claude_hook_interpreter_compatibility(resolved_claude)
+        try:
+            validate_claude_hook_interpreter_compatibility(resolved_claude)
+        except BaseException:
+            release_offer()
+            raise
 
     env_spec = claude_terminal_spec(
         launch_args,
@@ -10288,6 +10311,7 @@ async def _auto_create_claude_terminal(
             added_dirs=trusted_added_dirs,
         )
     except BaseException as seed_error:
+        release_offer()
         # No forwarder owns the routers yet, so release the ones this launch started.
         # A ``None`` handle would shut down whichever router is registered now.
         cleanups: list[Coroutine[Any, Any, None]] = []
@@ -10336,6 +10360,7 @@ async def _auto_create_claude_terminal(
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
         )
     except (Exception, asyncio.CancelledError) as launch_error:
+        release_offer()
         # Preserve the original failure even if diagnostic cleanup is cancelled.
         if not isinstance(launch_error, asyncio.CancelledError):
             _logger.exception(
