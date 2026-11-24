@@ -923,11 +923,8 @@ def register_core_routes(
         # URL is a synchronous 4xx, not a background failure.
         repos = [parse_repo_workspace(w) for w in workspaces]
         if requested_host_id is None and _deployment_is_sharded() and routed_slice_key(request):
-            # A keyed caller reaches the host through wrong_replica, which names the
-            # host's id, so key the host by an id minted here as if the caller chose
-            # it. Unkeyed, it would join every other unkeyed host on the default
-            # replica. An unkeyed caller keeps an unkeyed host: its requests reach
-            # only that replica.
+            # Keyed callers re-address via wrong_replica by host id, so mint one to key
+            # the host; keyless callers only reach the default replica, so stay unkeyed.
             requested_host_id = uuid.uuid4().hex
         managed_labels: dict[str, str] = {}
         if requested_host_id is not None:
