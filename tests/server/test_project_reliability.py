@@ -87,7 +87,8 @@ class FakeTickets:
 
 
 @pytest.fixture()
-def world(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> SimpleNamespace:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     conversations = FakeConversations()
     conversations.convs["lead"] = FakeConv("lead", updated_at=0)
     conversations.convs["worker"] = FakeConv("worker", updated_at=0)
@@ -112,7 +113,6 @@ def world(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             permission_store=None,
         )
     )
-    loop = reliability.ReliabilityLoop(app)
     restarts: list[str] = []
 
     async def restart(session_id: str, user_id: Any) -> bool:
@@ -122,10 +122,20 @@ def world(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     async def lead_ok(*_: Any) -> bool:
         return True
 
-    monkeypatch.setattr(loop, "_restart", restart)
-    monkeypatch.setattr(loop, "_check_lead", lead_ok)
+    def new_loop() -> reliability.ReliabilityLoop:
+        fresh = reliability.ReliabilityLoop(app)
+        monkeypatch.setattr(fresh, "_restart", restart)
+        monkeypatch.setattr(fresh, "_check_lead", lead_ok)
+        return fresh
+
     return SimpleNamespace(
-        loop=loop, inputs=inputs, tickets=tickets, conversations=conversations, restarts=restarts
+        loop=new_loop(),
+        new_loop=new_loop,
+        projects=projects,
+        inputs=inputs,
+        tickets=tickets,
+        conversations=conversations,
+        restarts=restarts,
     )
 
 
@@ -352,3 +362,37 @@ async def test_a_later_agent_note_clears_an_earlier_question(world) -> None:
     await world.loop.check_project("p1", None, now=11 * MINUTE)
     assert [sid for sid, _ in world.inputs.sent] == ["worker"]
     assert "needs-human" not in str(world.tickets.tickets[0].get("labels"))
+
+
+async def test_a_restart_mid_cycle_resumes_the_ladder(world) -> None:
+    await world.loop.check_project("p1", None, now=11 * MINUTE)
+    assert [sid for sid, _ in world.inputs.sent] == ["worker"]
+    restarted = world.new_loop()  # a new server process reads the saved ladders
+    await restarted.check_project("p1", None, now=13 * MINUTE)
+    await restarted.check_project("p1", None, now=17 * MINUTE)
+    nudges = [text for _, text in world.inputs.sent if "has had no activity" in text]
+    assert len(nudges) == 1  # no second nudge
+    assert world.restarts == ["worker"]
+    assert [text.split(",")[0] for _, text in world.tickets.notes] == [
+        "Reliability check: step 1/3",
+        "Reliability check: step 2/3",
+    ]
+
+
+async def test_saved_ladders_are_dropped_with_activity_or_the_project(world) -> None:
+    await world.loop.check_project("p1", None, now=11 * MINUTE)
+    world.tickets.tickets[0]["updated_at"] = 2**40
+    await world.loop.check_project("p1", None, now=12 * MINUTE)
+    assert "t1" not in world.new_loop().state.get("p1", reliability.ProjectState()).tickets
+    world.tickets.tickets[0]["updated_at"] = 1
+    await world.loop.check_project("p1", None, now=30 * MINUTE)
+    assert "t1" in world.new_loop().state["p1"].tickets
+    await world.loop.check_all(now=31 * MINUTE)  # the project no longer has a lead or was deleted
+    assert world.new_loop().state == {}
+
+
+def test_an_unreadable_ladder_file_is_ignored(world) -> None:
+    path = reliability._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"p1": {"tickets": {"t1": {"step": "x"}}}}')
+    assert world.new_loop().state == {}

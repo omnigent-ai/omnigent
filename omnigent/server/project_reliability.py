@@ -18,19 +18,22 @@ orchestrator and:
 - gives the lead a short periodic review turn every ``review_hours`` when the
   board changed since the last one.
 
-Settings live in project config ``reliability`` (see :func:`settings`).
+Settings live in project config ``reliability`` (see :func:`settings`). Ticket
+ladders are saved under the data directory so a server restart resumes them.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from omnigent.entities.project_ticket import (
@@ -239,12 +242,59 @@ class SessionView:
     oldest_pending_at: int | None
 
 
+def _state_path() -> Path:
+    base = Path(os.environ.get("OMNIGENT_DATA_DIR") or "~/.omnigent").expanduser()
+    return base / "reliability" / "ladders.json"
+
+
+def _dump_ladders(state: dict[str, ProjectState]) -> dict[str, Any]:
+    return {
+        project_id: {
+            "tickets": {
+                ticket_id: asdict(ladder) for ticket_id, ladder in project.tickets.items()
+            },
+            "escalated": sorted(project.escalated),
+        }
+        for project_id, project in state.items()
+        if project.tickets or project.escalated
+    }
+
+
+def _load_ladders(now: float) -> dict[str, ProjectState]:
+    """Ticket ladders saved by an earlier server process; empty if absent or unreadable."""
+    try:
+        raw = json.loads(_state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    loaded: dict[str, ProjectState] = {}
+    for project_id, entry in raw.items() if isinstance(raw, dict) else []:
+        try:
+            tickets = {
+                str(ticket_id): TicketLadder(
+                    step=int(ladder["step"]),
+                    at=float(ladder["at"]),
+                    ticket_mark=int(ladder["ticket_mark"]),
+                    stalled_since=float(ladder["stalled_since"]),
+                    worker_marks={str(k): int(v) for k, v in ladder["worker_marks"].items()},
+                )
+                for ticket_id, ladder in entry["tickets"].items()
+            }
+            escalated = {str(ticket_id) for ticket_id in entry["escalated"]}
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        loaded[str(project_id)] = ProjectState(
+            tickets=tickets, escalated=escalated & set(tickets), started_at=now
+        )
+    return loaded
+
+
 class ReliabilityLoop:
     """One per server process; :meth:`check_all` is safe to call directly in tests."""
 
     def __init__(self, app: Any) -> None:
         self.app = app
-        self.state: dict[str, ProjectState] = {}
+        self.state: dict[str, ProjectState] = _load_ladders(time.time())
+        self._saved: dict[str, Any] = _dump_ladders(self.state)
         self._lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
 
@@ -276,13 +326,33 @@ class ReliabilityLoop:
         if notifications is None or not _ENABLED:
             return
         async with self._lock:
-            for project_id, user_id, _main in await asyncio.to_thread(
-                notifications.projects.list_main_sessions
-            ):
+            projects = await asyncio.to_thread(notifications.projects.list_main_sessions)
+            for project_id, user_id, _main in projects:
                 try:
                     await self.check_project(project_id, user_id, now=now)
                 except Exception:
                     _logger.exception("Reliability check failed for project %s", project_id)
+            # Deleted projects, or ones without an orchestrator, keep no ladders.
+            listed = {str(project_id) for project_id, _user, _main in projects}
+            for project_id in set(self.state) - listed:
+                self.state.pop(project_id, None)
+            self._save()
+
+    def _save(self) -> None:
+        """Write the ticket ladders when they changed, so a restart resumes mid-cycle."""
+        dumped = _dump_ladders(self.state)
+        if dumped == self._saved:
+            return
+        path = _state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(dumped))
+            os.replace(temporary, path)
+        except OSError:
+            _logger.warning("Reliability: could not save ticket ladders", exc_info=True)
+            return
+        self._saved = dumped
 
     async def _session(self, session_id: str) -> SessionView | None:
         from omnigent.server.routes._sessions.common import _session_status_cache
@@ -369,15 +439,25 @@ class ReliabilityLoop:
     async def check_project(
         self, project_id: str, user_id: str | None, *, now: float | None
     ) -> None:
+        try:
+            await self._check_project(project_id, user_id, now=now)
+        finally:
+            self._save()
+
+    async def _check_project(
+        self, project_id: str, user_id: str | None, *, now: float | None
+    ) -> None:
         now = time.time() if now is None else now
         notifications = self._notifications
         project = await asyncio.to_thread(notifications.projects.get, project_id, user_id=user_id)
         if project is None:
+            self.state.pop(project_id, None)
             return
         config = settings(project.config)
         state = self.state.setdefault(project.id, ProjectState(started_at=now))
         if not config.enabled:
             state.tickets.clear()
+            state.escalated.clear()
             return
         lead_ok = await self._check_lead(project, state, config, now)
         board = await asyncio.to_thread(
