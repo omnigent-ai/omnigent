@@ -10,11 +10,7 @@
 
 import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import type { ConversationState } from "./chatStore";
-import {
-  createInitialConversationState,
-  isConversationStateKey,
-  unsentWorkOf,
-} from "./conversationState";
+import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 
 /**
  * Whether the origin's transport multiplexes requests over one connection.
@@ -259,12 +255,13 @@ export class ConversationRegistry {
       const existingPendingIds = new Set(
         existingState.pendingUserMessages.map((item) => item.tempId),
       );
-      const oldUnsent = unsentWorkOf(old.getState());
-      const missingPending = oldUnsent.pendingUserMessages.filter(
+      // Every pending message the live entry lacks, posted or not: a just-sent bubble stays until its echo.
+      const oldState = old.getState();
+      const missingPending = oldState.pendingUserMessages.filter(
         (item) => !existingPendingIds.has(item.tempId),
       );
       const existingFailedIds = new Set(existingState.failedUploads.map((item) => item.tempId));
-      const missingFailed = oldUnsent.failedUploads.filter(
+      const missingFailed = oldState.failedUploads.filter(
         (item) => !existingFailedIds.has(item.tempId),
       );
       if (missingPending.length > 0 || missingFailed.length > 0) {

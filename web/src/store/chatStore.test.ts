@@ -5037,6 +5037,31 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     expect(deleted).toEqual(["file_1"]);
   });
 
+  it("a send refused before its POST deletes the uploads it made, instead of orphaning them", async () => {
+    const file = new File(["bytes"], "refused.txt", { type: "text/plain" });
+    const deleted: string[] = [];
+    let uploads = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/resources/files") && init?.method === "POST") {
+        uploads += 1;
+        return mockResponse({ id: `file_${uploads}` });
+      }
+      if (url.includes("/resources/files/") && init?.method === "DELETE") {
+        deleted.push(url.split("/").at(-1)!);
+        return mockResponse({ deleted: true });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("refused", "agent_xyz", [file], {
+      beforePost: () => Promise.resolve("Held by the owner"),
+    });
+
+    expect(uploads).toBe(1);
+    expect(deleted).toEqual(["file_1"]);
+  });
+
   it("Remove drops the message and leaves the composer's own draft alone", async () => {
     const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
     const parked = await parkFailedUpload("read this", file);
@@ -5308,6 +5333,7 @@ describe("chatStore — reload records and unsent-work invariants", () => {
     | "sendLateCancel"
     | "sendShared"
     | "ownedRefusedBeforePost"
+    | "refusedBeforePost"
     | "cancel"
     | "retry"
     | "remove"
@@ -5344,6 +5370,9 @@ describe("chatStore — reload records and unsent-work invariants", () => {
     // An owned send held before its POST keeps its uploads for its owner's retry.
     ["ownedRefusedBeforePost", "sendShared"],
     ["ownedRefusedBeforePost", "sendShared", "remove"],
+    // A parkable send refused before its POST restores to the composer and removes its uploads.
+    ["refusedBeforePost"],
+    ["refusedBeforePost", "sendShared", "remove"],
   ];
 
   it.each(sequences)("keeps every unsent message owned exactly once: %s", async (...actions) => {
@@ -5419,6 +5448,14 @@ describe("chatStore — reload records and unsent-work invariants", () => {
           await useChatStore.getState().send(text, "agent_xyz", [sharedFile], {
             beforePost: () => Promise.resolve("Held by the owner"),
             onError: () => ownerHeld.push(text),
+          });
+          break;
+        }
+        case "refusedBeforePost": {
+          const text = message();
+          sent.push(text);
+          await useChatStore.getState().send(text, "agent_xyz", [sharedFile], {
+            beforePost: () => Promise.resolve("Held by the owner"),
           });
           break;
         }

@@ -3123,6 +3123,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Composer sends only: Cancel stops the upload and, before the fence below, parks the message.
     const interactive = !opts?.external;
     const uploadAbort = new AbortController();
+    // Only a send that can park keeps its uploads private; an owner's retry must reuse them.
+    const deferPublish =
+      !opts?.external && opts?.onError === undefined && initialDraft === undefined;
     const uploads = {
       uploading: false,
       cancelled: false,
@@ -3201,9 +3204,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           reuse: new Map(
             (opts?.inheritedUploads ?? []).map((upload) => [upload.file, upload.block]),
           ),
-          // Only a send that can park keeps its uploads private; an owner's retry must reuse them.
-          deferPublish:
-            !opts?.external && opts?.onError === undefined && initialDraft === undefined,
+          deferPublish,
           onProgress: (file, loaded, total) =>
             reportUploadProgress(uploadKeyOf(file), loaded, total),
         }),
@@ -3567,6 +3568,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             },
           },
         };
+      }
+      // A private upload that never reaches the POST, and isn't parked, is removed rather than orphaned.
+      if (deferPublish && !posting && parked === null && postedSessionId !== null) {
+        for (const { block } of uploads.owned) {
+          deleteSessionFile(postedSessionId, block.file_id).catch((error: unknown) =>
+            console.warn("Couldn't remove an unposted attachment upload", error),
+          );
+        }
       }
       // Roll back the optimistic bubble — no server idle will fire. A parked send moves to
       // `failedUploads` instead, so the consumed-event FIFO never sees it.
