@@ -79,7 +79,8 @@ export type FeatureKey =
   | "floating_composer"
   | "workspace_sidebar_v2"
   | "sidebar_saved_views"
-  | "floating_panes";
+  | "floating_panes"
+  | "shared_session_updates_socket";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
