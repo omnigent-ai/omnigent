@@ -228,6 +228,8 @@ class SysTicketGetTool(_TicketTool):
         "and related tickets, plus the project's current stage definitions. "
         "Compare the stage's meaning with actual work and the next step at progress and "
         "handoff checkpoints. "
+        "The ticket's product_approvers lists the only people whose product-ok counts; ask "
+        "them, by those names, when it needs product approval. "
         "Use kind=output to read PRs and other links. For routine re-reads, pass "
         "include_description=false and include_stages=false to keep the response small."
     )

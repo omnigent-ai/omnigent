@@ -34,6 +34,22 @@ def product_approvers(project: Any) -> set[str]:
     return approvers
 
 
+def approver_list(project: Any) -> list[str]:
+    """:func:`product_approvers` in a stable order to show people: the owner first."""
+    others = sorted(product_approvers(project) - {project.user_id})
+    return [project.user_id, *others] if project.user_id is not None else others
+
+
+def approver_refusal(project: Any) -> str:
+    """Why a non-approver can't add ``product-ok``, and how to become one."""
+    owner = project.user_id or "the project owner"
+    return (
+        f"Only product approvers can add `{PRODUCT_OK_LABEL}`: "
+        f"{', '.join(approver_list(project)) or 'none are set'}. "
+        f"To approve, ask {owner} to add you under Product approvers in project settings"
+    )
+
+
 def ticket_kind(labels: list[dict[str, Any]] | None) -> str | None:
     for label in labels or []:
         if label.get("key") == KIND_LABEL:

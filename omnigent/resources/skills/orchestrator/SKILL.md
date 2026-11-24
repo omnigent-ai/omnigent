@@ -531,7 +531,9 @@ it.
   `product-ok`, added by a product approver themselves: the owner, plus the
   project's `product_approvers` config, which only the owner can change.
   Build and review it as usual, then ask with `needs-human` and wait. Agents
-  can't add `product-ok`.
+  can't add `product-ok`. Ask exactly the people in the ticket's
+  `product_approvers` (from `sys_ticket_get`), by those names; don't name
+  anyone else as able to approve.
 - `fix`, `perf` and `ux` land on approval like any change.
 - A ticket you file records you as its requester, which counts as the owner.
   When you file or split one on a member's behalf, say so in its description

@@ -170,3 +170,53 @@ async def test_a_person_who_raises_an_ask_neither_sees_nor_answers_it(multi_user
     bob = (await client.get(PATH, headers=_as_user(BOB))).json()["data"]
     assert [item["title"] for item in bob] == ["Owner's feature"]
     assert bob[0]["question"] == "Bob, can you OK this?" and bob[0]["raised_by_user_id"] == ALICE
+
+
+async def test_agents_and_inbox_name_exactly_the_configured_product_approvers(multi_user_client):
+    client = multi_user_client
+    carol = "carol@example.com"
+    project = (
+        await client.post("/v1/projects", json={"name": "Approvers"}, headers=_as_user(ALICE))
+    ).json()
+    for member in (BOB, carol):
+        await client.post(
+            f"/v1/projects/{project['id']}/shares",
+            json={"user_id": member},
+            headers=_as_user(ALICE),
+        )
+    await client.patch(
+        f"/v1/projects/{project['id']}",
+        json={"config": {"product_approvers": [BOB]}},
+        headers=_as_user(ALICE),
+    )
+    base = f"/v1/projects/{project['id']}/tickets"
+    labels = [{"key": "kind", "value": "feature"}]
+    ticket = (
+        await client.post(base, json={"title": "Gated", "labels": labels}, headers=_as_user(BOB))
+    ).json()
+    path = f"{base}/{ticket['id']}"
+
+    # Ticket reads list the owner first, then the configured approvers; members aren't in it.
+    read = (await client.get(path, headers=_as_user(carol))).json()
+    assert read["product_approvers"] == [ALICE, BOB]
+
+    # A member who isn't an approver is told who can approve and how to become one.
+    refused = await client.patch(
+        path,
+        json={"labels": [*labels, {"key": "product-ok", "value": "yes"}]},
+        headers=_as_user(carol),
+    )
+    assert refused.status_code == 403, refused.text
+    message = refused.json()["error"]["message"]
+    assert f"{ALICE}, {BOB}" in message
+    assert f"ask {ALICE} to add you under Product approvers in project settings" in message
+
+    # The Inbox routes the product ask to exactly the people agents are told to ask.
+    raised = await client.patch(
+        path, json={"labels": [*labels, {"key": "needs-human"}]}, headers=_as_user(carol)
+    )
+    assert raised.status_code == 200, raised.text
+    for viewer in (ALICE, BOB):
+        items = (await client.get(PATH, headers=_as_user(viewer))).json()["data"]
+        assert [item["responders"] for item in items] == [sorted(read["product_approvers"])]
+    assert (await client.get(PATH, headers=_as_user(carol))).json()["data"] == []

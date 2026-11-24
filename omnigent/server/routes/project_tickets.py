@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 from collections.abc import Iterator
@@ -325,6 +326,22 @@ def create_project_tickets_router(
             )
         return TicketActor(user_id, source.id, source.agent_id)
 
+    async def load_project(request: Request, project_id: str, who: TicketActor) -> Any:
+        """The project as the caller sees it, with its owner and config."""
+        notifications = getattr(request.app.state, "project_ticket_notifications", None)
+        try:
+            normalized = uuid_to_bytes(project_id).hex()
+        except InvalidUuidError:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND) from None
+        project = (
+            await asyncio.to_thread(notifications.projects.get, normalized, user_id=who.user_id)
+            if notifications is not None
+            else None
+        )
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return project
+
     async def refuse_owner_label_change(
         request: Request,
         project_id: str,
@@ -363,23 +380,19 @@ def create_project_tickets_router(
             in (RISK_OK_LABEL, github_pr_intake.OWNER_OK_LABEL, product_approval.PRODUCT_OK_LABEL)
         ]
         if is_agent and sign_offs:
+            ask = "ask them on the ticket with needs-human"
+            if product_approval.PRODUCT_OK_LABEL in sign_offs:
+                project = await load_project(request, project_id, who)
+                ask = (
+                    "ask them on the ticket with needs-human; only these people can add "
+                    f"`{product_approval.PRODUCT_OK_LABEL}`: "
+                    f"{', '.join(product_approval.approver_list(project))}"
+                )
             raise OmnigentError(
-                f"Only a person can set {', '.join(f'`{key}`' for key in sign_offs)}"
-                "; ask them on the ticket with needs-human",
+                f"Only a person can set {', '.join(f'`{key}`' for key in sign_offs)}; {ask}",
                 code=ErrorCode.FORBIDDEN,
             )
-        notifications = getattr(request.app.state, "project_ticket_notifications", None)
-        try:
-            normalized = uuid_to_bytes(project_id).hex()
-        except InvalidUuidError:
-            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND) from None
-        project = (
-            await asyncio.to_thread(notifications.projects.get, normalized, user_id=who.user_id)
-            if notifications is not None
-            else None
-        )
-        if project is None:
-            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        project = await load_project(request, project_id, who)
         approvers = product_approval.product_approvers(project)
         if product_approval.KIND_LABEL in changed:
             if is_agent:
@@ -408,7 +421,7 @@ def create_project_tickets_router(
             return
         if product_approval.PRODUCT_OK_LABEL in changed and who.user_id not in approvers:
             raise OmnigentError(
-                "Only a product approver can set `product-ok`", code=ErrorCode.FORBIDDEN
+                product_approval.approver_refusal(project), code=ErrorCode.FORBIDDEN
             )
         owner_only = [
             key
@@ -749,6 +762,11 @@ def create_project_tickets_router(
         ticket = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
         if include_guidance and who.session_id is not None:
             ticket["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
+        # The only people whose `product-ok` counts, so agents ask them and nobody else.
+        with contextlib.suppress(OmnigentError):
+            ticket["product_approvers"] = product_approval.approver_list(
+                await load_project(request, project_id, who)
+            )
         await enrich(project_id, [ticket], who)
         return ticket
 
