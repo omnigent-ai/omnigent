@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import unicodedata
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
@@ -2170,6 +2171,21 @@ class SqlWorkflowShare(OmnigentBase):
     )
 
 
+def gadget_grantee_key(user_id: str) -> str:
+    """The key that finds a gadget grantee's grant in any letter case, on every database.
+
+    SQL ``lower()`` folds only ASCII on SQLite and follows the collation elsewhere, so
+    the fold is done here: SHA-256 of the NFC-normalized, case-folded ID, as 64 hex digits.
+    The grant itself keeps the exact ``user_id``, which authorization matches.
+    """
+    folded = unicodedata.normalize("NFC", user_id).casefold()
+    return hashlib.sha256(folded.encode()).hexdigest()
+
+
+def _gadget_grantee_key_default(context: Any) -> str:
+    return gadget_grantee_key(context.get_current_parameters()["user_id"])
+
+
 class SqlGadgetShare(OmnigentBase):
     """
     SQLAlchemy model for the ``gadget_shares`` table.
@@ -2183,6 +2199,8 @@ class SqlGadgetShare(OmnigentBase):
         at most 64 lowercase letters, digits, ``_`` and ``-`` (a store need not use UUIDs).
     :param user_id: The grantee, a user or group ID, e.g. ``"alice@example.com"``.
         String(128) matches ``session_permissions.user_id``.
+    :param user_key: :func:`gadget_grantee_key` of ``user_id``, filled in on insert, so a
+        re-share in another letter case finds the same grant.
     :param level: The permission level granted. No CHECK constraint: the permission
         store owns the set of valid levels.
     """
@@ -2200,6 +2218,9 @@ class SqlGadgetShare(OmnigentBase):
     gadget_id: Mapped[str] = mapped_column(String(64), primary_key=True, nullable=False)
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
     level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    user_key: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=_gadget_grantee_key_default
+    )
 
     __table_args__ = (
         # SQLite and D1 ignore VARCHAR lengths: 128 characters at up to four bytes each.
@@ -2211,6 +2232,11 @@ class SqlGadgetShare(OmnigentBase):
         CheckConstraint(
             "length(CAST(gadget_id AS BLOB)) <= 64",
             name="ck_gadget_shares_gadget_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # The grantee key is 64 hex digits.
+        CheckConstraint(
+            "length(CAST(user_key AS BLOB)) <= 64",
+            name="ck_gadget_shares_user_key_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         # SQLite and D1 store any value in an integer column.
         CheckConstraint(
@@ -2229,13 +2255,12 @@ class SqlGadgetShare(OmnigentBase):
             "user_id",
             "gadget_id",
         ),
-        # Case-insensitive grantee lookup; user_id completes the primary key. A function
-        # expression, so MySQL emits the parentheses its expression key parts need.
+        # A grantee's grant in any letter case; user_id completes the primary key.
         Index(
-            "ix_gadget_shares_gadget_user_lower",
+            "ix_gadget_shares_gadget_user_key",
             "workspace_id",
             "gadget_id",
-            func.lower(user_id),
+            "user_key",
             "user_id",
         ),
     )

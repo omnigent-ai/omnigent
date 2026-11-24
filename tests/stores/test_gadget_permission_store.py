@@ -158,6 +158,12 @@ def test_a_grantee_is_found_under_its_stored_spelling(store: SqlAlchemyPermissio
     assert store.gadget_grantee_spelling(gadget, "dave@example.com") is None
     assert store.gadget_grantee_spelling(other, "bob@example.com") is None
 
+    # Non-ASCII letters match in any case too, on every database; SQLite's lower() alone
+    # folds only ASCII.
+    store.ensure_user("Ömer@Example.com")
+    store.grant_for_gadget("Ömer@Example.com", gadget, LEVEL_READ)
+    assert store.gadget_grantee_spelling(gadget, "ömer@example.com") == "Ömer@Example.com"
+
 
 def test_the_default_store_finds_only_the_exact_grantee() -> None:
     store = _minimal_store(

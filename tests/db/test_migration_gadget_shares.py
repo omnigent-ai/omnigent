@@ -23,13 +23,13 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.schema import CreateIndex
 
-from omnigent.db.db_models import SqlGadgetShare
+from omnigent.db.db_models import SqlGadgetShare, gadget_grantee_key
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 
 _PREVIOUS = "bf30d7cbda61"
 _REVISION = "e4c7a91b2d3f"
 _TABLE = "gadget_shares"
-_LOWER_INDEX = "ix_gadget_shares_gadget_user_lower"
+_KEY_INDEX = "ix_gadget_shares_gadget_user_key"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -62,22 +62,29 @@ def db_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine
 
 
 def _share(shares: sa.Table, **values: object) -> sa.Insert:
-    row = {"workspace_id": 1, "gadget_id": "board-1", "user_id": "alice", "level": 1}
+    row = {
+        "workspace_id": 1,
+        "gadget_id": "board-1",
+        "user_id": "alice",
+        "level": 1,
+        "user_key": "a" * 64,
+    }
     return shares.insert().values(**{**row, **values})
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_columns_primary_key_and_index(db_engine: Engine) -> None:
-    """Four NOT NULL columns without DB defaults, one row per grantee per gadget, and
-    a non-unique user index for "shared with me" reads."""
+    """Five NOT NULL columns without DB defaults, one row per grantee per gadget, a
+    non-unique user index for "shared with me" reads, and the grantee-key index."""
     inspector = sa.inspect(db_engine)
     columns = {column["name"]: column for column in inspector.get_columns(_TABLE)}
-    assert set(columns) == {"workspace_id", "gadget_id", "user_id", "level"}
+    assert set(columns) == {"workspace_id", "gadget_id", "user_id", "level", "user_key"}
     assert all(column["nullable"] is False for column in columns.values())
     assert all(column["default"] is None for column in columns.values())
     assert columns["user_id"]["type"].length == 128
     # The gadget store's own ID, which need not be a UUID.
     assert columns["gadget_id"]["type"].length == 64
+    assert columns["user_key"]["type"].length == 64
     if db_engine.dialect.name == "cockroachdb":
         # CockroachDB reflects INT2 as INTEGER and drops the width, so read the stored type.
         with db_engine.connect() as conn:
@@ -103,18 +110,14 @@ def test_columns_primary_key_and_index(db_engine: Engine) -> None:
         "gadget_id",
     ]
     assert not indexes["ix_gadget_shares_user_id"]["unique"]
-    if db_engine.dialect.name == "sqlite":
-        # The migration created the functional index too, with user_id after the expression.
-        with db_engine.connect() as conn:
-            created = conn.execute(
-                sa.text(
-                    "SELECT sql FROM sqlite_master WHERE type = 'index' "
-                    "AND name = 'ix_gadget_shares_gadget_user_lower'"
-                )
-            ).scalar_one()
-        assert " ".join(created.split()).endswith(
-            "(workspace_id, gadget_id, lower(user_id), user_id)"
-        )
+    # user_id after the key completes the primary key.
+    assert indexes[_KEY_INDEX]["column_names"] == [
+        "workspace_id",
+        "gadget_id",
+        "user_key",
+        "user_id",
+    ]
+    assert not indexes[_KEY_INDEX]["unique"]
     assert inspector.get_foreign_keys(_TABLE) == []
 
 
@@ -183,23 +186,18 @@ def test_downgrade_drops_the_table_and_upgrade_restores_it(tmp_path: Path) -> No
     clear_engine_cache()
 
 
-# MySQL needs an expression key part in its own parentheses; the trailing user_id
-# completes the primary key, which lower(user_id) alone does not.
-_LOWER_INDEX_DDL = {
-    "sqlite": "(workspace_id, gadget_id, lower(user_id), user_id)",
-    "postgresql": "(workspace_id, gadget_id, lower(user_id), user_id)",
-    "mysql": "(workspace_id, gadget_id, (lower(user_id)), user_id)",
-}
 _DIALECTS = {"sqlite": sqlite.dialect, "postgresql": postgresql.dialect, "mysql": mysql.dialect}
 
 
-@pytest.mark.parametrize("dialect_name", sorted(_LOWER_INDEX_DDL))
-def test_case_insensitive_index_ddl_on_each_backend(dialect_name: str) -> None:
-    """The migration and the model emit the same, valid lower(user_id) index on every backend."""
+@pytest.mark.parametrize("dialect_name", sorted(_DIALECTS))
+def test_grantee_key_index_ddl_on_each_backend(dialect_name: str) -> None:
+    """The migration and the model emit the same plain-column key index on every backend."""
     dialect = _DIALECTS[dialect_name]()
-    expected = f"CREATE INDEX {_LOWER_INDEX} ON {_TABLE} {_LOWER_INDEX_DDL[dialect_name]}"
+    expected = (
+        f"CREATE INDEX {_KEY_INDEX} ON {_TABLE} (workspace_id, gadget_id, user_key, user_id)"
+    )
 
-    (index,) = [i for i in SqlGadgetShare.__table__.indexes if i.name == _LOWER_INDEX]
+    (index,) = [i for i in SqlGadgetShare.__table__.indexes if i.name == _KEY_INDEX]
     assert str(CreateIndex(index).compile(dialect=dialect)).strip() == expected
 
     output = StringIO()
@@ -212,3 +210,29 @@ def test_case_insensitive_index_ddl_on_each_backend(dialect_name: str) -> None:
     with Operations.context(context):
         migration.upgrade()
     assert expected in output.getvalue()
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_the_grantee_key_is_bounded(db_engine: Engine) -> None:
+    """A key over 64 characters is refused, by the width or, on SQLite and D1, the byte check."""
+    shares = sa.Table(_TABLE, sa.MetaData(), autoload_with=db_engine)
+    with pytest.raises(DBAPIError), db_engine.begin() as conn:
+        conn.execute(_share(shares, user_key="a" * 65))
+
+
+def test_the_model_fills_in_the_grantee_key(tmp_path: Path) -> None:
+    """The key folds case the same way for any letters, so a re-share finds its grant."""
+    assert gadget_grantee_key("Ömer@Example.com") == gadget_grantee_key("ömer@example.com")
+    assert gadget_grantee_key("alice") != gadget_grantee_key("alicia")
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'model.db'}")
+    SqlGadgetShare.__table__.create(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(SqlGadgetShare).values(
+                workspace_id=1, gadget_id="board-1", user_id="Ömer", level=1
+            )
+        )
+    with engine.connect() as conn:
+        stored = conn.execute(sa.select(SqlGadgetShare.user_key)).scalar_one()
+    assert stored == gadget_grantee_key("ömer")
+    engine.dispose()
