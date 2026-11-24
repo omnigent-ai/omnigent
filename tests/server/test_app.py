@@ -3073,26 +3073,16 @@ async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("child_counts_prompt", "expected_count"),
-    [
-        pytest.param(False, 0, id="repairs-a-count-nobody-holds"),
-        pytest.param(True, 1, id="keeps-child-prompt-from-another-replica"),
-    ],
-)
 async def test_on_runner_connect_rewrites_pending_count_written_by_another_replica(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    child_counts_prompt: bool,
-    expected_count: int,
 ) -> None:
     """Reconnect repairs the stored pending count even after this replica wrote the same value.
 
     This replica stored 0, then another replica stored a prompt that this replica's
     index does not hold. Skipping the repair because it repeats this replica's last
-    write leaves the session list counting a prompt nobody can answer. A child's
-    prompt recorded on another replica still counts, so the repair keeps that one.
+    write leaves the session list counting a prompt nobody can answer.
     """
     from omnigent.entities import Conversation
     from omnigent.runner.routing import RoutedRunner
@@ -3115,16 +3105,6 @@ async def test_on_runner_connect_rewrites_pending_count_written_by_another_repli
     session_live_state.persist_pending_count(session_id, 0)
     assert await stored_count() == 0
     store.set_pending_elicitation_count(session_id, 1)
-    if child_counts_prompt:
-        parent = store.get_conversation(session_id)
-        assert parent is not None
-        child = store.create_conversation(
-            kind="sub_agent",
-            parent_conversation_id=session_id,
-            agent_id=parent.agent_id,
-            runner_id="runner_child_replica",
-        )
-        store.set_pending_elicitation_count(child.id, 1)
 
     connection = _attach_live_connection(app, monkeypatch, runner_id)
     routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
@@ -3145,7 +3125,7 @@ async def test_on_runner_connect_rewrites_pending_count_written_by_another_repli
 
     await captured["callback"](runner_id, connection)  # type: ignore[operator]
 
-    assert await stored_count() == expected_count
+    assert await stored_count() == 0
 
 
 @pytest.mark.asyncio

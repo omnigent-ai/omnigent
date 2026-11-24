@@ -73,6 +73,8 @@ class _RecordingStore:
         self.children: dict[str, list[str]] = {}
         self.child_pending: dict[str, int] = {}
         self.on_child_read: Callable[[], None] | None = None
+        # Runs once, after an activity read has captured its answer.
+        self.after_activity_read: Callable[[], None] | None = None
 
     def get_conversation(self, conversation_id: str) -> SimpleNamespace:
         return SimpleNamespace(labels=self.labels.get(conversation_id, {}))
@@ -87,10 +89,14 @@ class _RecordingStore:
         ]
 
     def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SimpleNamespace]:
-        return {
+        activity = {
             child_id: SimpleNamespace(pending_elicitation_count=self.child_pending.get(child_id))
             for child_id in conversation_ids
         }
+        after, self.after_activity_read = self.after_activity_read, None
+        if after is not None:
+            after()
+        return activity
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
@@ -411,6 +417,60 @@ def test_reconcile_pending_count_failure_writes_nothing(
     assert repair is not None
     assert repair.result(timeout=10) is None
     assert recording_store.pending_writes == []
+
+
+@pytest.mark.parametrize("handed_off", ["while-queued", "during-child-read"])
+def test_reconcile_pending_count_writes_nothing_after_a_handoff(
+    recording_store: _RecordingStore,
+    handed_off: str,
+) -> None:
+    """A repair writes nothing once the session is handed to another replica.
+
+    The new owner may already have stored a genuine prompt, which this replica's
+    index never saw, so a repair queued or running across the handoff must not
+    overwrite it.
+    """
+    pending_elicitations.reset_for_tests()
+    release = threading.Event()
+    blocker = session_live_state.submit("test blocker", lambda: release.wait(10))
+    if handed_off == "during-child-read":
+        recording_store.on_child_read = lambda: session_live_state.forget_live_status("conv_1")
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1)
+    assert repair is not None
+    if handed_off == "while-queued":
+        session_live_state.forget_live_status("conv_1")
+    release.set()
+    blocker.result(timeout=10)
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == []
+
+
+def test_reconcile_pending_count_restores_a_child_prompt_published_after_its_check(
+    recording_store: _RecordingStore,
+) -> None:
+    """A child prompt another replica publishes after the child check survives the repair.
+
+    That replica writes the child's count, then mirrors the prompt into the
+    parent's row, after this repair read the child as idle. The repair finds
+    the child's prompt on a second look and restores the parent's count.
+    """
+    pending_elicitations.reset_for_tests()
+    recording_store.children["conv_1"] = ["child_1"]
+    recording_store.child_pending["child_1"] = 0
+
+    def _publish_on_another_replica() -> None:
+        recording_store.child_pending["child_1"] = 1
+        recording_store.set_pending_elicitation_count("conv_1", 1)
+
+    recording_store.after_activity_read = _publish_on_another_replica
+
+    repair = session_live_state.reconcile_pending_count("conv_1", 1)
+    assert repair is not None
+    repair.result(timeout=10)
+
+    assert recording_store.pending_writes == [("conv_1", 1), ("conv_1", 0), ("conv_1", 1)]
 
 
 def test_runner_liveness_touch_and_clear_pass_through(

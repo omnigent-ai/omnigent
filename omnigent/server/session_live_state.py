@@ -449,7 +449,8 @@ def reconcile_pending_count(conversation_id: str, stored_count: int | None) -> F
 
     Call only on the replica holding the session's runner, where the
     session's own prompts park. The repair runs on the ordered writer, so a
-    count change made while it reads queues its own write behind the repair.
+    count change made while it reads queues its own write behind the repair,
+    and it writes nothing once the session is handed to another replica.
     Raising the stored count is always safe. Lowering it is safe only when no
     child counts a prompt: whichever replica records a child's prompt also
     mirrors it into this count, and that replica may be another one.
@@ -457,12 +458,23 @@ def reconcile_pending_count(conversation_id: str, stored_count: int | None) -> F
     :param conversation_id: Session/conversation identifier.
     :param stored_count: The session's stored count as the caller read it,
         or ``None`` when never reported.
-    :returns: Future of the repair, or ``None`` without a store.
+    :returns: Future of ``True`` once the repair ran, of ``None`` when it was
+        skipped or failed; ``None`` without a store.
     """
     store = _store
     if store is None:
         return None
     stored = stored_count or 0
+    handoffs = _handoffs.get(conversation_id, 0)
+
+    def _write_while_owned(count: int) -> bool:
+        if _handoffs.get(conversation_id, 0) != handoffs:
+            return False
+        store.set_pending_elicitation_count(conversation_id, count)
+        # This replica's last write no longer describes the row, so the next
+        # count change must reach the store even when it repeats that value.
+        _last_pending.pop(conversation_id, None)
+        return True
 
     def _repair() -> None:
         live = pending_elicitations.count_for(conversation_id)
@@ -471,14 +483,15 @@ def reconcile_pending_count(conversation_id: str, stored_count: int | None) -> F
         ):
             return
         # Read again: a prompt published during the child reads is counted now.
-        store.set_pending_elicitation_count(
-            conversation_id, pending_elicitations.count_for(conversation_id)
-        )
-        # This replica's last write no longer describes the row, so the next
-        # count change must reach the store even when it repeats that value.
-        _last_pending.pop(conversation_id, None)
+        count = pending_elicitations.count_for(conversation_id)
+        if not _write_while_owned(count) or count >= stored:
+            return
+        # A child prompt published elsewhere after the check wrote the child's
+        # count before its mirror into this row, so a second look finds it.
+        if _children_may_count_prompts(store, conversation_id):
+            _write_while_owned(max(stored, pending_elicitations.count_for(conversation_id)))
 
-    return submit("pending_count_repair", _repair)
+    return _submit_while_owned(conversation_id, "pending_count_repair", _repair, handoffs=handoffs)
 
 
 def _children_may_count_prompts(store: ConversationStore, conversation_id: str) -> bool:
