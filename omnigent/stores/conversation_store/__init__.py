@@ -1756,6 +1756,27 @@ class ConversationStore(ABC):
         """
         ...
 
+    def add_session_daily_cost(self, conversation_id: str, day_utc: str, delta_usd: float) -> None:
+        """
+        Add *delta_usd* to one session's spend for one UTC day.
+
+        :param conversation_id: The session or sub-agent that incurred it.
+        :param day_utc: UTC day as ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
+        :param delta_usd: USD amount to add; ``<= 0`` is a no-op.
+        """
+        del conversation_id, day_utc, delta_usd
+
+    def sum_project_daily_cost(self, project_id: str, since_day_utc: str) -> float:
+        """
+        Sum the spend of a project's sessions on UTC days ``>= since_day_utc``.
+
+        :param project_id: The project whose sessions (and sub-agents) to sum.
+        :param since_day_utc: Inclusive lower-bound UTC day, ``"YYYY-MM-DD"``.
+        :returns: The summed ``cost_usd``, or ``0.0`` when nothing matches.
+        """
+        del project_id, since_day_utc
+        return 0.0
+
     @abstractmethod
     def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
         """

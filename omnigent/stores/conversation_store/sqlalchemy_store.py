@@ -52,6 +52,7 @@ from omnigent.db.db_models import (
     SqlPolicy,
     SqlPreference,
     SqlProject,
+    SqlSessionDailyCost,
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
@@ -2537,6 +2538,72 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
                 .where(func.length(SqlUserDailyCost.day_utc) == 10)
+            ).scalar_one()
+            return float(total or 0.0)
+
+    def add_session_daily_cost(self, conversation_id: str, day_utc: str, delta_usd: float) -> None:
+        """See :meth:`ConversationStore.add_session_daily_cost`."""
+        if delta_usd <= 0:
+            return
+        now = now_epoch()
+
+        def write(session: Session) -> None:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            if dialect == "sqlite" or is_postgresql_family(dialect):
+                stmt: Any
+                if dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                    stmt = sqlite_insert(SqlSessionDailyCost)
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                    stmt = pg_insert(SqlSessionDailyCost)
+                stmt = stmt.values(
+                    conversation_id=conversation_id,
+                    day_utc=day_utc,
+                    cost_usd=delta_usd,
+                    updated_at=now,
+                ).on_conflict_do_update(
+                    index_elements=["workspace_id", "conversation_id", "day_utc"],
+                    set_={
+                        "cost_usd": SqlSessionDailyCost.cost_usd + stmt.excluded.cost_usd,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+                session.execute(stmt)
+                return
+            existing = session.get(
+                SqlSessionDailyCost, (current_workspace_id(), conversation_id, day_utc)
+            )
+            if existing is None:
+                session.add(
+                    SqlSessionDailyCost(
+                        conversation_id=conversation_id,
+                        day_utc=day_utc,
+                        cost_usd=delta_usd,
+                        updated_at=now,
+                    )
+                )
+            else:
+                existing.cost_usd = existing.cost_usd + delta_usd
+                existing.updated_at = now
+
+        run_write_transaction(self._session_immediate, "add_session_daily_cost", write)
+
+    def sum_project_daily_cost(self, project_id: str, since_day_utc: str) -> float:
+        """See :meth:`ConversationStore.sum_project_daily_cost`."""
+        with self._session("sum_project_daily_cost") as session:
+            total = session.execute(
+                select(func.coalesce(func.sum(SqlSessionDailyCost.cost_usd), 0.0))
+                .join(
+                    SqlConversationMetadata,
+                    (SqlConversationMetadata.workspace_id == SqlSessionDailyCost.workspace_id)
+                    & (SqlConversationMetadata.id == SqlSessionDailyCost.conversation_id),
+                )
+                .where(SqlSessionDailyCost.workspace_id == current_workspace_id())
+                .where(SqlConversationMetadata.project_id == project_id)
+                .where(SqlSessionDailyCost.day_utc >= since_day_utc)
             ).scalar_one()
             return float(total or 0.0)
 
@@ -5551,6 +5618,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: Session/conversation identifier.
         """
+
         def write(session: Session) -> None:
             session.execute(
                 update(SqlConversationMetadata)
@@ -5571,6 +5639,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param at: Epoch seconds the turn ended.
         :returns: Whether a pending person-started turn was settled.
         """
+
         def write(session: Session) -> bool:
             result = cast(
                 _RowCountResult,
@@ -5595,6 +5664,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: Session/conversation identifier.
         :param at: Epoch seconds of the request.
         """
+
         def write(session: Session) -> None:
             session.execute(
                 update(SqlConversationMetadata)

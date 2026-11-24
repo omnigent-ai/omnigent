@@ -34,6 +34,7 @@ import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
 import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTickets";
 import { ProjectBoardActions } from "./ProjectBoardActions";
+import { ProjectCostBadge } from "./ProjectCost";
 import { ProjectMandateDialog, useProjectMandate } from "./ProjectMandateDialog";
 import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
 
@@ -87,6 +88,7 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
         small
       />
       <h1 className="min-w-0 truncate text-lg font-medium text-foreground">{projectName}</h1>
+      <ProjectCostBadge projectId={projectId} />
       <ProjectHomeActions projectName={projectName} />
     </div>
   );

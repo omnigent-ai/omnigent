@@ -2309,6 +2309,9 @@ def _record_daily_cost(
     """
     if conv is None or delta_usd <= 0:
         return
+    from omnigent.db.utils import now_epoch
+
+    conversation_store.add_session_daily_cost(conv.id, _utc_day(now_epoch()), delta_usd)
     owner = conversation_store.get_session_owner_authority(conv.id)
     if owner is None and conv.root_conversation_id != conv.id:
         # Sub-agent: no direct owner grant — fall back to the root session's
@@ -2317,7 +2320,6 @@ def _record_daily_cost(
     if owner is None:
         return
     from omnigent.db.account_authority import target_account_scope
-    from omnigent.db.utils import now_epoch
 
     with target_account_scope(owner.user_id, owner.generation):
         conversation_store.add_daily_cost(owner.user_id, _utc_day(now_epoch()), delta_usd)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -25,10 +26,12 @@ from omnigent.entities.project_ticket import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.policies.builder import load_session_usage_and_tree
 from omnigent.runtime.project_ticket_instructions import (
     FINAL_UPDATE_REMINDER,
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
+from omnigent.server import session_live_state
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
@@ -36,13 +39,11 @@ from omnigent.server.routes._sessions.helpers import (
     _permission_level_from_grants,
     _resolve_harness,
 )
-from omnigent.server import session_live_state
 from omnigent.server.session_orchestration import require_named_source_private
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
-
 
 # The label an agent adds when a person must act on a ticket.
 NEEDS_HUMAN_LABEL = "needs-human"
@@ -62,6 +63,57 @@ def _storage_errors() -> Iterator[None]:
         raise OmnigentError(
             "Ticket content exceeds its storage limit", code=ErrorCode.INVALID_INPUT
         ) from exc
+
+
+def trailing_window_start(days: int) -> str:
+    """First UTC day of a trailing window of *days* days ending today, as ``"YYYY-MM-DD"``."""
+    from omnigent.db.utils import now_epoch
+
+    today = datetime.fromtimestamp(now_epoch(), tz=UTC).date()
+    return (today - timedelta(days=days - 1)).isoformat()
+
+
+def linked_sessions_cost(
+    session_ids: list[str], conversations: ConversationStore
+) -> dict[str, Any]:
+    """
+    Sum the recorded cost of *session_ids*, each including its sub-agent subtree.
+
+    A linked session spawned inside another linked session is already in its
+    ancestor's subtree, so it is listed but not added again. A session with no
+    priced turn reports ``cost_usd: None`` rather than ``0``.
+    """
+    linked = set(session_ids)
+    rows: list[dict[str, Any]] = []
+    total = 0.0
+    unpriced = 0
+    for session_id in session_ids:
+        usage, tree = load_session_usage_and_tree(session_id, conversations)
+        parents = {conv.id: conv.parent_conversation_id for conv in tree}
+        ancestor = parents.get(session_id)
+        nested = False
+        while ancestor is not None:
+            if ancestor in linked:
+                nested = True
+                break
+            ancestor = parents.get(ancestor)
+        cost: float | None = None
+        if "total_cost_usd" in usage:
+            try:
+                cost = float(usage["total_cost_usd"])
+            except (TypeError, ValueError):
+                cost = None
+        if cost is None:
+            unpriced += 1
+        elif not nested:
+            total += cost
+        rows.append({"session_id": session_id, "cost_usd": cost, "nested": nested})
+    return {
+        "cost_usd": total,
+        "session_count": len(session_ids),
+        "unpriced_sessions": unpriced,
+        "sessions": rows,
+    }
 
 
 def _has_running_agents(
@@ -137,6 +189,27 @@ def create_project_tickets_router(
             )
         return session_id
 
+    async def visible_sessions(who: TicketActor, session_ids: list[str]) -> list[str]:
+        if permissions is None or not session_ids:
+            return session_ids
+        if who.user_id is None:
+            return []
+        grants = await asyncio.to_thread(
+            permissions.list_for_sessions, session_ids, user_id=who.user_id
+        )
+        public_grants = await asyncio.to_thread(
+            permissions.list_for_sessions, session_ids, user_id=RESERVED_USER_PUBLIC
+        )
+        is_admin = await asyncio.to_thread(permissions.is_admin, who.user_id)
+        return [
+            sid
+            for sid in session_ids
+            if _permission_level_from_grants(
+                who.user_id, grants.get(sid, []) + public_grants.get(sid, []), is_admin
+            )
+            is not None
+        ]
+
     async def enrich(project_id: str, tickets: list[dict[str, Any]], who: TicketActor) -> None:
         if not tickets:
             return
@@ -146,26 +219,9 @@ def create_project_tickets_router(
             [ticket["id"] for ticket in tickets],
             user_id=who.user_id,
         )
-        session_ids = sorted({sid for link in links.values() for sid in link.session_ids})
-        if permissions is not None and session_ids:
-            if who.user_id is None:
-                session_ids = []
-            else:
-                grants = await asyncio.to_thread(
-                    permissions.list_for_sessions, session_ids, user_id=who.user_id
-                )
-                public_grants = await asyncio.to_thread(
-                    permissions.list_for_sessions, session_ids, user_id=RESERVED_USER_PUBLIC
-                )
-                is_admin = await asyncio.to_thread(permissions.is_admin, who.user_id)
-                session_ids = [
-                    sid
-                    for sid in session_ids
-                    if _permission_level_from_grants(
-                        who.user_id, grants.get(sid, []) + public_grants.get(sid, []), is_admin
-                    )
-                    is not None
-                ]
+        session_ids = await visible_sessions(
+            who, sorted({sid for link in links.values() for sid in link.session_ids})
+        )
         sessions = await asyncio.to_thread(conversations.get_session_activity, session_ids)
 
         def identities() -> dict[str, tuple[str, str | None]]:
@@ -269,6 +325,20 @@ def create_project_tickets_router(
         who = await actor(request, project_id)
         return await asyncio.to_thread(store.summary, project_id, user_id=who.user_id)
 
+    @router.get("/cost")
+    async def project_cost(
+        request: Request, project_id: str, days: int = Query(7, ge=1, le=366)
+    ) -> dict[str, Any]:
+        """Spend by the project's sessions and sub-agents over the trailing *days* UTC days."""
+        who = await actor(request, project_id)
+        # Reading the stages checks the caller can see this project.
+        await asyncio.to_thread(store.stages, project_id, user_id=who.user_id)
+        since = trailing_window_start(days)
+        cost = await asyncio.to_thread(
+            conversations.sum_project_daily_cost, uuid_to_bytes(project_id).hex(), since
+        )
+        return {"cost_usd": cost, "days": days, "since_day_utc": since}
+
     @router.get("/{ticket_id}")
     async def get_ticket(request: Request, project_id: str, ticket_id: str) -> dict[str, Any]:
         who = await actor(request, project_id)
@@ -289,9 +359,7 @@ def create_project_tickets_router(
             and any(label.key == NEEDS_HUMAN_LABEL for label in body.labels)
         )
         if raises_human_request:
-            before = await asyncio.to_thread(
-                store.get, project_id, ticket_id, user_id=who.user_id
-            )
+            before = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
             raises_human_request = not _has_needs_human(before)
         with _storage_errors():
             ticket = await asyncio.to_thread(store.update, project_id, ticket_id, body, who)
@@ -358,6 +426,28 @@ def create_project_tickets_router(
         return await asyncio.to_thread(
             store.sessions, project_id, ticket_id, user_id=who.user_id, after=after, limit=limit
         )
+
+    @router.get("/{ticket_id}/cost")
+    async def ticket_cost(request: Request, project_id: str, ticket_id: str) -> dict[str, Any]:
+        """All-time spend of the ticket's linked sessions, each including its sub-agents."""
+        who = await actor(request, project_id)
+        linked: list[str] = []
+        after: str | None = None
+        while True:
+            page = await asyncio.to_thread(
+                store.sessions,
+                project_id,
+                ticket_id,
+                user_id=who.user_id,
+                after=after,
+                limit=100,
+            )
+            linked.extend(row["session_id"] for row in page["data"])
+            if not page["has_more"]:
+                break
+            after = page["last_id"]
+        visible = await visible_sessions(who, linked)
+        return await asyncio.to_thread(linked_sessions_cost, visible, conversations)
 
     @router.post("/{ticket_id}/sessions")
     async def link_session(

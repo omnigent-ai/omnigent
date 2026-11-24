@@ -51,6 +51,7 @@ import {
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
+import { TicketCostSection } from "./ProjectCost";
 import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketFileLinks } from "./TicketFileLinks";
 import { TicketMarkdown, useTicketImageUpload } from "./ticketImages";
@@ -473,6 +474,7 @@ function TicketDetails({
               </div>
               <TicketError error={configuration.error} />
               <TicketAgents projectId={projectId} projectName={projectName} ticket={ticket} />
+              <TicketCostSection projectId={projectId} ticketId={ticketId} />
               <section aria-label="Description" className="space-y-2">
                 <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Description</h3>
                 {ticket.description ? (

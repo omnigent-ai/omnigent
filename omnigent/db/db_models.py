@@ -1792,6 +1792,36 @@ class SqlUserDailyCost(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlSessionDailyCost(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_daily_cost`` table.
+
+    A per-session, per-UTC-day rollup of LLM spend, written beside
+    ``user_daily_cost`` at each priced turn. Lets a project sum the spend
+    that happened within a window (e.g. the trailing 7 days) across its
+    sessions instead of their lifetime totals.
+
+    :param conversation_id: The session (or sub-agent) that incurred the cost.
+    :param day_utc: UTC day as ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
+    :param cost_usd: USD spend for this session on this day.
+    :param updated_at: Unix epoch seconds of the last increment.
+    """
+
+    __tablename__ = "session_daily_cost"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    day_utc: Mapped[str] = mapped_column(String(10), primary_key=True)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer)
+
+
 class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.

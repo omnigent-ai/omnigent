@@ -22654,6 +22654,63 @@
         ]
       }
     },
+    "/v1/projects/{project_id}/tickets/cost": {
+      "get": {
+        "description": "Spend by the project's sessions and sub-agents over the trailing *days* UTC days.",
+        "operationId": "project_cost_v1_projects__project_id__tickets_cost_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 7,
+              "maximum": 366,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Project Cost V1 Projects  Project Id  Tickets Cost Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Project Cost",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
     "/v1/projects/{project_id}/tickets/stages": {
       "get": {
         "operationId": "ticket_stages_v1_projects__project_id__tickets_stages_get",
@@ -22976,6 +23033,60 @@
           }
         },
         "summary": "Comment",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/{ticket_id}/cost": {
+      "get": {
+        "description": "All-time spend of the ticket's linked sessions, each including its sub-agents.",
+        "operationId": "ticket_cost_v1_projects__project_id__tickets__ticket_id__cost_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ticket Cost V1 Projects  Project Id  Tickets  Ticket Id  Cost Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ticket Cost",
         "tags": [
           "project tickets"
         ]

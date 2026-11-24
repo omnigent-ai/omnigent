@@ -56,6 +56,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
 });
 
 vi.mock("@/components/ProjectIconPicker", () => ({ ProjectLandingIcon: () => null }));
+vi.mock("./ProjectCost", () => ({ ProjectCostBadge: () => null }));
 
 vi.mock("./ProjectMandateDialog", () => ({
   useProjectMandate: () => ({ data: { mandate_proposals: mocks.mandateProposals } }),
