@@ -577,3 +577,26 @@ async def test_review_on_the_default_board_is_still_chased(world) -> None:
     world.tickets.tickets[0]["stage_id"] = "review"
     await world.loop.check_project("p1", None, now=11 * MINUTE)
     assert [sid for sid, _ in world.inputs.sent] == ["worker"]
+
+
+async def test_a_worker_stuck_mid_turn_is_reported_to_the_lead_once(world) -> None:
+    worker = world.conversations.convs["worker"]
+    worker.live_status = "running"
+    for minute in (0, 5, 9):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert world.inputs.sent == []  # below the 10-minute threshold
+    for minute in (11, 15, 30):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    reports = [(sid, text) for sid, text in world.inputs.sent if "mid-turn" in text]
+    assert [sid for sid, _ in reports] == ["lead"] and "Alpha" in reports[0][1]
+    assert len(world.tickets.notes) == 1 and "no new output" in world.tickets.notes[0][1]
+    assert world.restarts == []  # the worker is never interrupted
+
+
+async def test_a_running_worker_with_new_output_is_left_alone(world) -> None:
+    worker = world.conversations.convs["worker"]
+    worker.live_status = "running"
+    for minute in range(0, 40, 4):
+        worker.next_position += 1  # a tool call or message landed
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert world.inputs.sent == [] and world.tickets.notes == []

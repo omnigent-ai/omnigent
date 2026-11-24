@@ -345,8 +345,17 @@ class ProjectState:
     last_review_at: float = 0.0
     reviewed_mark: int = 0
     escalated: set[str] = field(default_factory=set)
+    # Ticket id -> its running workers' output positions, when they last moved, reported.
+    mid_turn: dict[str, MidTurn] = field(default_factory=dict)
     # Ticket id -> the ticket's updated_at when the Lead was last reminded it's waiting to ship.
     ship_reminded: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class MidTurn:
+    marks: dict[str, int]
+    since: float
+    reported: bool = False
 
 
 @dataclass
@@ -622,6 +631,8 @@ class ReliabilityLoop:
             state.owner_waits.pop(ticket_id, None)
         for ticket_id in set(state.parks) - seen:
             state.parks.pop(ticket_id, None)
+        for ticket_id in set(state.mid_turn) - seen:
+            state.mid_turn.pop(ticket_id, None)
         for ticket_id in set(state.waits) - seen:
             state.waits.pop(ticket_id, None)
         for ticket_id in set(state.ship_reminded) - seen:
@@ -672,7 +683,9 @@ class ReliabilityLoop:
             state.escalated.discard(ticket_id)
             return
         if running:
+            await self._check_mid_turn(project, state, config, ticket, stage_name, running, now)
             return
+        state.mid_turn.pop(ticket_id, None)
         replied = ladder is not None and any(
             w.position > ladder.worker_marks.get(w.id, w.position) for w in workers
         )
@@ -768,6 +781,53 @@ class ReliabilityLoop:
         for worker in workers:
             refreshed = await self._session(worker.id)
             ladder.worker_marks[worker.id] = refreshed.position if refreshed else worker.position
+
+    async def _check_mid_turn(
+        self,
+        project: Any,
+        state: ProjectState,
+        config: Settings,
+        ticket: dict[str, Any],
+        stage_name: str,
+        running: list[SessionView],
+        now: float,
+    ) -> None:
+        """Tell the router, once, when running workers have shown no output for a long time.
+
+        A worker blocked inside one long command, or on something it can't reach, stays
+        "running" with no new transcript items; it gets no nudge, since that would only
+        queue behind the stuck turn.
+        """
+        ticket_id = ticket["id"]
+        marks = {worker.id: worker.position for worker in running}
+        entry = state.mid_turn.get(ticket_id)
+        if entry is None or entry.marks != marks:
+            state.mid_turn[ticket_id] = MidTurn(marks=marks, since=now)
+            return
+        quiet_since = max(entry.since, float(ticket.get("updated_at") or 0))
+        if entry.reported or now - quiet_since < config.threshold(ticket["stage_id"]):
+            return
+        entry.reported = True
+        minutes = int((now - quiet_since) // 60)
+        workers = ", ".join(f"`{worker.id[:8]}`" for worker in running)
+        router = await router_session_id(self.app, project)
+        if router is not None:
+            title = (ticket.get("title") or "")[:80]
+            await self._send(
+                router,
+                f'[{NOTE_PREFIX}] Ticket {ticket_id} ("{title}", {stage_name}): worker '
+                f"{workers} has been mid-turn for {minutes} min with no new output and no "
+                "ticket activity. It may be stuck in a long-running command or waiting on "
+                "something it can't reach. Check its session and interrupt or message it if "
+                "it's stuck.",
+                project.user_id,
+            )
+        await self._note(
+            project,
+            ticket_id,
+            f"worker {workers} has been running for {minutes} min with no new output; "
+            + (f"told the router `{router[:8]}`." if router else "no router to tell."),
+        )
 
     # -- waiting on the owner --------------------------------------------------
 
