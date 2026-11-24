@@ -710,8 +710,9 @@ class SysSessionGetInfoTool(Tool):
     linkage, workspace / git branch, project, persisted last-activity time, and
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
-    is advancing from one whose persisted output has stalled. For the
-    conversation transcript, use
+    is advancing from one whose persisted output has stalled. With
+    ``include_usage`` it also reports cost and token usage so far, the same
+    totals the session's cost badge shows. For the conversation transcript, use
     ``sys_session_get_history`` instead.
 
     ``session_id`` is optional — when omitted, the caller's own
@@ -743,7 +744,12 @@ class SysSessionGetInfoTool(Tool):
             "harness has no permission modes or the mode is unknown), "
             "parent session, workspace, project_id, project_name, "
             "persisted last-activity time, and outstanding approval "
-            "prompts. Global read — any "
+            "prompts. Pass include_usage: true to add a usage object with "
+            "cost so far (total_cost_usd) and token totals, overall and per "
+            "model. Usage counts the session and the sub-agents it started; "
+            "total_cost_usd is null when the session is unpriced or the "
+            "server hides cost, and for some harnesses it is an estimate. "
+            "Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
             "use sys_session_get_history for the conversation transcript."
@@ -754,7 +760,8 @@ class SysSessionGetInfoTool(Tool):
         Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict; ``session_id`` is optional.
+            ``"function"`` sub-dict; ``session_id`` and ``include_usage``
+            are optional.
         """
         return {
             "type": "function",
@@ -772,6 +779,14 @@ class SysSessionGetInfoTool(Tool):
                                 "from sys_session_list or a prior "
                                 "sys_session_send handle. Omit to "
                                 "describe the calling session itself."
+                            ),
+                        },
+                        "include_usage": {
+                            "type": "boolean",
+                            "description": (
+                                "Also return the session's cost and token "
+                                "usage so far. Off by default because it sums "
+                                "usage over the session's sub-agents."
                             ),
                         },
                     },
