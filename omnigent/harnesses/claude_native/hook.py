@@ -144,7 +144,13 @@ def _env_float(name: str, default: float) -> float:
 # legitimately-parked approval behind a severing proxy is never capped, while a
 # down server can no longer re-POST for a day. Overridable for operators who
 # want more slack against a flaky upstream.
-_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 8))
+#
+# With the 30s backoff ceiling, 40 fast failures span about 17 minutes. That
+# rides out a brief server outage, so the request reaches Omnigent and the web
+# card appears once the server is back. Claude's terminal prompt stays
+# answerable meanwhile. A cap of a few attempts would give up within 90s and
+# leave only a terminal prompt that a web-only session never sees.
+_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 40))
 
 
 def _never_connected_errors() -> tuple[type[Exception], ...]:
