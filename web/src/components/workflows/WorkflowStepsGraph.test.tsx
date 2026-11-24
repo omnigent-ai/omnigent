@@ -254,12 +254,32 @@ describe("a step's time limit", () => {
         steps={LIMITED}
         title="Triage flaky tests"
         onTimeLimitChange={onTimeLimitChange}
-        timeLimitSaving
+        timeLimitPaused
       />,
     );
     expect(
       screen.getByRole("button", { name: "Time limit for Fix the test: 2 hours" }),
     ).toBeDisabled();
+  });
+
+  it("opens a step's hover card again after its open menu goes away", async () => {
+    const { rerender } = renderWithQueries(
+      <WorkflowStepsGraph steps={LIMITED} title="Triage flaky tests" onTimeLimitChange={vi.fn()} />,
+    );
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Time limit for Fix the test: 2 hours" }),
+      { button: 0 },
+    );
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    // The step stops being editable while its menu is open, as when a proposal arrives.
+    rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <WorkflowStepsGraph steps={LIMITED} title="Triage flaky tests" />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByRole("menu")).toBeNull();
+    await userEvent.hover(screen.getAllByTestId("workflow-step-node")[1]!);
+    expect(await screen.findByTestId("workflow-step-card")).toHaveTextContent("Fix the test");
   });
 
   it("goes by a limit's length when its line says more", () => {

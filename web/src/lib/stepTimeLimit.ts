@@ -14,8 +14,10 @@ export const TIME_LIMIT_CHOICES = [
   "1 day",
 ] as const;
 
-const LIMIT_LINE = /^[ \t]*\*\*Time limit:\*\*[ \t]*(.*?)[ \t]*$/i;
-const DETAILS_LINE = /^[ \t]*\*\*Details:\*\*/i;
+// A line of its own, as a paragraph or a list item, e.g. "- **Time limit:** 2 hours".
+const LIMIT_LINE = /^([ \t]*(?:[-*+][ \t]+)?)\*\*Time limit:\*\*[ \t]*(.*?)[ \t]*$/i;
+const DETAILS_LINE = /^([ \t]*)([-*+][ \t]+)?\*\*Details:\*\*/i;
+const FENCE = /^[ \t]*(`{3,}|~{3,})/;
 // One part of a length, e.g. "1 hour" in "1 hour 30 minutes" or "1h" in "1h30m", with what
 // separates it from the next.
 const LENGTH_PART =
@@ -26,12 +28,33 @@ function descriptionLines(goal: string | null): string[] {
   return goal ? goal.split(/\r?\n/) : [];
 }
 
+/** Which lines sit in a fenced code block, fences included: an example there names no limit. */
+function fencedLines(lines: readonly string[]): boolean[] {
+  let fence: string | null = null;
+  return lines.map((line) => {
+    const marker = FENCE.exec(line)?.[1]?.[0];
+    if (fence === null) {
+      fence = marker ?? null;
+      return marker !== undefined;
+    }
+    if (marker === fence) fence = null;
+    return true;
+  });
+}
+
+/** The indexes of the lines *pattern* matches outside fenced code blocks. */
+function matchingLines(lines: readonly string[], pattern: RegExp): number[] {
+  const fenced = fencedLines(lines);
+  return lines.flatMap((line, index) => (!fenced[index] && pattern.test(line) ? [index] : []));
+}
+
 /** The step's time limit as its description words it, e.g. "2 hours"; null without one. */
 export function stepTimeLimit(goal: string | null): string | null {
-  for (const line of descriptionLines(goal)) {
+  const lines = descriptionLines(goal);
+  for (const index of matchingLines(lines, LIMIT_LINE)) {
     // An empty line names no limit; a later one may.
-    const match = LIMIT_LINE.exec(line);
-    if (match?.[1]) return match[1];
+    const text = LIMIT_LINE.exec(lines[index]!)?.[2];
+    if (text) return text;
   }
   return null;
 }
@@ -77,12 +100,13 @@ export function shortTimeLimit(limit: string): string | null {
 export function withStepTimeLimit(goal: string | null, limit: string | null): string | null {
   const lines = descriptionLines(goal);
   const limitLine = limit ? `**Time limit:** ${limit}` : null;
-  const found = lines.flatMap((line, index) => (LIMIT_LINE.test(line) ? [index] : []));
+  const found = matchingLines(lines, LIMIT_LINE);
   const kept = limitLine ? found[0] : undefined;
   // From the last, so the earlier lines keep their places.
   for (const at of [...found].reverse()) {
     if (at === kept) {
-      lines[at] = limitLine!;
+      // A list item stays one.
+      lines[at] = `${LIMIT_LINE.exec(lines[at]!)![1]}${limitLine}`;
       continue;
     }
     lines.splice(at, 1);
@@ -90,8 +114,13 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
     if (lines[at - 1]?.trim() === "" && lines[at]?.trim() === "") lines.splice(at, 1);
   }
   if (found.length === 0 && limitLine) {
-    const details = lines.findIndex((line) => DETAILS_LINE.test(line));
-    if (details < 0) {
+    const details = matchingLines(lines, DETAILS_LINE)[0] ?? -1;
+    const detailsMatch = details < 0 ? null : DETAILS_LINE.exec(lines[details]!);
+    const listMarker = detailsMatch?.[2] ? `${detailsMatch[1]}${detailsMatch[2]}` : "";
+    if (listMarker) {
+      // Details is a list item, so the limit joins the list just above it.
+      lines.splice(details, 0, `${listMarker}${limitLine}`);
+    } else if (details < 0) {
       if (lines.length > 0 && lines.at(-1)!.trim() !== "") lines.push("");
       lines.push(limitLine);
     } else {

@@ -61,6 +61,15 @@ export function StepTimeLimit({
     },
     [],
   );
+  const editable = onChange !== undefined;
+  // A menu that goes away while open, as when its step stops being editable, closes for the
+  // step's hover card too.
+  useEffect(() => {
+    if (!editable && openRef.current) {
+      openRef.current = false;
+      onOpenChangeRef.current?.(false);
+    }
+  }, [editable]);
   const limit = stepTimeLimit(goal);
   const short = limit ? shortTimeLimit(limit) : null;
   // A limit worded at more length, e.g. "2 hours. Tell me after.", goes by its length.

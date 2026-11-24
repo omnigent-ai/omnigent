@@ -114,11 +114,11 @@ vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
   WorkflowStepsGraph: ({
     steps,
     onTimeLimitChange,
-    timeLimitSaving,
+    timeLimitPaused,
   }: {
     steps: WorkflowStep[];
     onTimeLimitChange?: (change: StepTimeLimitChange) => void;
-    timeLimitSaving?: boolean;
+    timeLimitPaused?: boolean;
   }) => (
     <>
       <div
@@ -131,14 +131,14 @@ vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
         <>
           <button
             type="button"
-            disabled={timeLimitSaving}
+            disabled={timeLimitPaused}
             onClick={() => onTimeLimitChange({ stepId: "fix", limit: "4 hours" })}
           >
             Limit Fix the test to 4 hours
           </button>
           <button
             type="button"
-            disabled={timeLimitSaving}
+            disabled={timeLimitPaused}
             onClick={() => onTimeLimitChange({ stepId: "fix", limit: null })}
           >
             Clear Fix the test's limit
@@ -535,6 +535,27 @@ describe("WorkflowDetailPage", () => {
     expect(patches.at(-1)!.steps[1]!.goal).toBe("The suite passes");
     expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
     expect(runButton()).toBeEnabled();
+  });
+
+  it("pauses the time limit menus while the planning chat's journal loads", async () => {
+    await workflowWithProposals(WORKFLOW.steps, [plan(5, WORKFLOW.steps)]);
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [],
+      isLoading: true,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+      retry: vi.fn(),
+    });
+    const view = renderPage();
+    expect(
+      await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }),
+    ).toBeDisabled();
+
+    mockJournal([plan(5, WORKFLOW.steps)]);
+    view.rerender(<WorkflowDetailPage />);
+    expect(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeEnabled();
   });
 
   it("gives a proposal's new step its limit, and leaves a saved step's limit to the menu", async () => {

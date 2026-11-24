@@ -77,8 +77,8 @@ interface StepsGraphContextValue {
     pending: ReadonlyMap<string, readonly string[]>;
     menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
   };
-  /** On a saved workflow its owner can edit, sets a step's time limit. */
-  timeLimit?: { onChange: (change: StepTimeLimitChange) => void; saving: boolean };
+  /** On a saved workflow its owner can edit, sets a step's time limit; `paused` waits. */
+  timeLimit?: { onChange: (change: StepTimeLimitChange) => void; paused: boolean };
 }
 
 const StepsGraphContext = createContext<StepsGraphContextValue>({ total: 0 });
@@ -135,7 +135,7 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
               stepName={data.name}
               goal={data.goal}
               onChange={graph.timeLimit?.onChange}
-              disabled={graph.timeLimit?.saving}
+              disabled={graph.timeLimit?.paused}
               onOpenChange={setMenuOpen}
             />
             {menuAction && (
@@ -377,20 +377,20 @@ export function WorkflowStepsGraph({
   steps,
   title,
   onTimeLimitChange,
-  timeLimitSaving = false,
+  timeLimitPaused = false,
 }: {
   steps: readonly WorkflowStep[];
   /** The full-screen view's title, e.g. the workflow's name. */
   title: string;
   onTimeLimitChange?: (change: StepTimeLimitChange) => void;
-  /** Whether a time limit is being saved, which pauses the limit menus. */
-  timeLimitSaving?: boolean;
+  /** Pauses the limit menus, e.g. while a save is in flight. */
+  timeLimitPaused?: boolean;
 }) {
   const [fullscreen, setFullscreen] = useState(false);
   const timeLimit = useMemo(
     () =>
-      onTimeLimitChange ? { onChange: onTimeLimitChange, saving: timeLimitSaving } : undefined,
-    [onTimeLimitChange, timeLimitSaving],
+      onTimeLimitChange ? { onChange: onTimeLimitChange, paused: timeLimitPaused } : undefined,
+    [onTimeLimitChange, timeLimitPaused],
   );
   const { height: stepsHeight } = useMemo(() => layoutWorkflowSteps(steps), [steps]);
   // Full size when it fits, with room for fitView's margin; past the cap it zooms out.

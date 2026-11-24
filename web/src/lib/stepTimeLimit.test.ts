@@ -102,6 +102,28 @@ describe("withStepTimeLimit", () => {
     );
   });
 
+  it("reads and edits the line as a list item, and joins a list that holds Details", () => {
+    const listed =
+      "- **Outputs:** passing CI.\n- **Time limit:** 2 hours\n- **Details:** rerun it.";
+    expect(stepTimeLimit(listed)).toBe("2 hours");
+    expect(withStepTimeLimit(listed, "4 hours")).toBe(
+      "- **Outputs:** passing CI.\n- **Time limit:** 4 hours\n- **Details:** rerun it.",
+    );
+    expect(
+      withStepTimeLimit("- **Outputs:** passing CI.\n- **Details:** rerun it.", "1 hour"),
+    ).toBe("- **Outputs:** passing CI.\n- **Time limit:** 1 hour\n- **Details:** rerun it.");
+    expect(withStepTimeLimit("Fix it.\n\n  **Details:** rerun it.", "1 hour")).toBe(
+      "Fix it.\n\n**Time limit:** 1 hour\n\n  **Details:** rerun it.",
+    );
+  });
+
+  it("leaves a Time limit line in a fenced code block alone", () => {
+    const example = "Fix it.\n\n```markdown\n**Time limit:** 1 day\n```";
+    expect(stepTimeLimit(example)).toBeNull();
+    expect(withStepTimeLimit(example, "2 hours")).toBe(`${example}\n\n**Time limit:** 2 hours`);
+    expect(withStepTimeLimit(example, null)).toBe(example);
+  });
+
   it("keeps one Time limit line, the first, when a description has several", () => {
     const twice = "Fix it.\n\n**Time limit:** 1 hour\n\n**Time limit:** 2 hours\n\nShip it.";
     expect(withStepTimeLimit(twice, "4 hours")).toBe(

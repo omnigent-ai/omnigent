@@ -475,7 +475,8 @@ doesn't stop the step or make it fail, and it's no reason to rush or skip
 checks. You watch it even when a nested agent does the step's work.
 
 When you write `started` on a step with a limit, for its first start, a
-restart after done or failed, or a Continue after Stop:
+restart (after done or failed, or when the user chose to restart it after an
+overrun), or a Continue after Stop, it starts a new attempt:
 
 1. Call `sys_timer_set` with `seconds` set to the limit (7200 for 2 hours)
    and `note: "time limit: <step ID>"`. It's separate from the run's other
