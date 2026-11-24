@@ -33,7 +33,7 @@ export interface UseComposerAttachmentsOptions {
    * only validated files; a large plain-text paste arrives as one `.txt` file. Without it, pastes
    * attach to the tray as before.
    */
-  onPasteChips?: (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void;
+  onPasteChips?: (files: File[], target: ComposerTextTarget, trayFiles: File[]) => File[];
   /**
    * The tag tokens of the draft, live and released. An accepted file takes a name none of them
    * uses, so the tray never names a file the same as a chip.
@@ -190,7 +190,9 @@ export function useComposerAttachments({
         }
         e.preventDefault();
         setAttachmentError(null);
-        insertChips([largeText], e.currentTarget, filesRef.current);
+        // A refused insert keeps the text in the tray, so a paste never loses content.
+        const refused = insertChips([largeText], e.currentTarget, filesRef.current);
+        if (refused.length > 0) addFiles(refused);
         return;
       }
       e.preventDefault();
@@ -198,7 +200,9 @@ export function useComposerAttachments({
         // Insert first: the insert is a text change, which clears the error. Publish this batch's
         // rejections after it.
         const { accepted, errors } = validateAttachments(pasted, policyRef.current);
-        if (accepted.length > 0) insertChips(accepted, e.currentTarget, filesRef.current);
+        const refused =
+          accepted.length > 0 ? insertChips(accepted, e.currentTarget, filesRef.current) : [];
+        if (refused.length > 0) addFiles(refused);
         setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
         return;
       }

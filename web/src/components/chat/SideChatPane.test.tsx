@@ -1783,7 +1783,7 @@ describe("grid cell composer shares its session's draft", () => {
     expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt"]);
   });
 
-  it("keeps a restored failed send's text and tray file names unchanged", () => {
+  it("keeps a grid cell's text and tray file names unchanged when it sends", () => {
     const notes = new File(["n"], "notes.txt", { type: "text/plain" });
     const shot = new File(["s"], "shot.png", { type: "image/png" });
     bridgedCell({ text: "Summarize @notes.txt and @shot.png", files: [notes, shot] });

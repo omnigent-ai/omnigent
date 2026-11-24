@@ -166,11 +166,12 @@ export interface MentionBrowser {
   /** Tag a session, replacing the typed ``@query`` with its token. */
   attachSession: (session: SessionMention) => void;
   /** Pasted files, each inserted as a chip at its input's selection. Files are validated already. */
+  /** Returns the files it could not insert, so the caller can keep them in the tray. */
   attachPastedFiles: (
     files: readonly File[],
     target: ComposerTextTarget,
     trayFiles: readonly File[],
-  ) => void;
+  ) => File[];
   /** The pasted-file chips in the draft, released ones excluded. */
   mentionedAttachments: PastedAttachment[];
   /** Tokens of everything tagged so far, for highlighting and Backspace. */
@@ -506,12 +507,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     files: readonly File[],
     target: ComposerTextTarget,
     trayFiles: readonly File[],
-  ) => {
-    // A target that is not live cannot take the chip's text, so no chip is inserted.
-    if (!target.isConnected) return;
+  ): File[] => {
+    // A target that is not live cannot take the chip's text, so every file is refused.
+    if (!target.isConnected) return [...files];
     const added: PastedAttachment[] = [];
     const addedNames: string[] = [];
-    for (const file of files) {
+    for (const [index, file] of files.entries()) {
       // A chip is the composer's own reference, so it also avoids the spellings already typed.
       const named = nameAttachmentFile(file, {
         tokens: [...ownedMentionTokens(), ...added.map((it) => it.token)],
@@ -519,14 +520,18 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
         text: [liveText(target), ...draftSegments],
       });
       const token = `@${named.name}`;
-      if (!insertTokenAt(target, target.selectionStart, target.selectionEnd, token)) break;
+      if (!insertTokenAt(target, target.selectionStart, target.selectionEnd, token)) {
+        return files.slice(index);
+      }
       added.push({ token, file: named });
       addedNames.push(named.name);
     }
-    if (added.length === 0) return;
-    setMention(null);
-    setMentionIndex(-1);
-    setMentionedAttachments((prev) => [...prev, ...added]);
+    if (added.length > 0) {
+      setMention(null);
+      setMentionIndex(-1);
+      setMentionedAttachments((prev) => [...prev, ...added]);
+    }
+    return [];
   };
 
   const attachSession = (session: SessionMention) => {

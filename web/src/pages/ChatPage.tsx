@@ -2799,8 +2799,8 @@ function ComposerImpl(
 
   // Filled in once useMentionBrowser is set up below.
   const attachPastedFilesRef = useRef<
-    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void
-  >(() => {});
+    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => File[]
+  >(() => []);
   const tagTokensRef = useRef<() => readonly string[]>(() => []);
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the

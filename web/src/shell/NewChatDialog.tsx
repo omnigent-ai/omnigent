@@ -2742,8 +2742,8 @@ function NewChatLandingContent({
 
   // The chip inserter comes from useMentionBrowser, set up further down.
   const attachPastedFilesRef = useRef<
-    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void
-  >(() => {});
+    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => File[]
+  >(() => []);
   const tagTokensRef = useRef<() => readonly string[]>(() => []);
 
   // Attachments for the first message — same affordances as the in-session

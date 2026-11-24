@@ -1337,11 +1337,14 @@ describe("Composer pasted chips", () => {
     vi.restoreAllMocks();
   });
 
-  async function renderCodeMirrorComposer(onSend = vi.fn()) {
+  async function renderCodeMirrorComposer(
+    onSend = vi.fn(),
+    overrides: Partial<Parameters<typeof Composer>[0]> = {},
+  ) {
     render(
       <CapabilitiesProvider info={codeMirrorInfo}>
         <TooltipProvider>
-          <Composer {...composerProps({ onSend })} />
+          <Composer {...composerProps({ onSend, ...overrides })} />
         </TooltipProvider>
       </CapabilitiesProvider>,
     );
@@ -1451,6 +1454,14 @@ describe("Composer pasted chips", () => {
     expect(tokens()).toEqual([]);
   });
 
+  it("keeps a pasted file in the tray when the composer refuses the chip's insert", async () => {
+    await renderCodeMirrorComposer(undefined, { disabled: true });
+    paste({ files: [new File(["s"], "shot.png", { type: "image/png" })] });
+    // The paste's default was cancelled, so the file must not be lost: it lands in the tray.
+    expect(tokens()).toEqual([]);
+    expect(screen.getByAltText("shot.png")).toBeInTheDocument();
+  });
+
   it("inserts nothing for a rejected file and shows the rejection", async () => {
     await renderCodeMirrorComposer();
     paste({ files: [new File(["x"], "setup.exe", { type: "application/x-msdownload" })] });
@@ -1508,8 +1519,15 @@ describe("Composer pasted chips", () => {
   });
 
   it("keeps a large text paste inline when its .txt file is over the upload limit", async () => {
+    // A small stubbed limit: the .txt is rejected just as a 10 MB one would be, without the bulk.
+    const limits: { text: number } = ATTACHMENT_SIZE_LIMITS_MB;
+    const textLimit = limits.text;
+    limits.text = 0.0001;
+    onTestFinished(() => {
+      limits.text = textLimit;
+    });
     await renderCodeMirrorComposer();
-    const oversized = "x".repeat(ATTACHMENT_SIZE_LIMITS_MB.text * 1024 * 1024 + 1);
+    const oversized = "x".repeat(4000);
     paste({ text: oversized });
     expect(valueOf()).toBe(oversized);
     expect(tokens()).toEqual([]);
