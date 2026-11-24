@@ -1,8 +1,5 @@
-// The gadget session: the Omnigent session that carries out a gadget's actions and edits. A gadget
-// shown in a session's side panel sends them to that session; on the gadget's own page they go to
-// the viewer's gadget session, the last session they showed it in. Requests are queued in the
-// gadget's action ledger first, so the session can coordinate them and a new session can resume
-// from the ledger.
+// Send action requests to the viewer's registered gadget session; use the ledger to resume
+// delivery.
 
 import { randomUUID } from "@/lib/randomUUID";
 import { sendUserMessage } from "@/lib/sessionsApi";

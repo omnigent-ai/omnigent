@@ -25,7 +25,7 @@ from collections.abc import Callable
 
 from omnigent.db.db_models import DEFAULT_WORKSPACE_ID, current_workspace_id, workspace_scope
 from omnigent.gadgets.access import GadgetAccess
-from omnigent.stores.gadget_store import Conflict, CorruptData, GadgetStore, NotFound
+from omnigent.stores.gadget_store import Conflict, CorruptData, GadgetFiles, GadgetStore, NotFound
 
 _LOG = logging.getLogger(__name__)
 
@@ -35,8 +35,11 @@ GADGETS_PER_CLEANUP = 50
 PENDING_PER_RESUME = 4
 """The most left-over registrations one call goes on with, after its own."""
 
-# The notes of unfinished cleanups live in a scope of their own, which no account has.
+# The notes of unfinished cleanups live in a scope of their own, which no account has: a user
+# ID may be any string, so the scope also takes a registration no account can be given
+# (registrations are account timestamps or ``w<workspace>`` forms, never this).
 _CLEANUP_SCOPE = "omnigent.deleted-account-gadgets"
+_CLEANUP_REGISTRATION = "omnigent:internal"
 
 
 class DeletedAccountGadgets:
@@ -86,7 +89,7 @@ class DeletedAccountGadgets:
         """
         if not self._enabled():
             return
-        files = self._store.user_files(_CLEANUP_SCOPE)
+        files = self._cleanup_files()
         start = f"{secrets.token_hex(16)}.json"
         try:
             names, _ = files.list_page("pending", after=start, limit=PENDING_PER_RESUME + 1)
@@ -130,8 +133,11 @@ class DeletedAccountGadgets:
         key = hashlib.sha256(repr((user_id, registration)).encode()).hexdigest()[:32]
         return f"pending/{key}.json"
 
+    def _cleanup_files(self) -> GadgetFiles:
+        return self._store.user_files(_CLEANUP_SCOPE, owner_registration=_CLEANUP_REGISTRATION)
+
     def _note(self, user_id: str, registration: str | None) -> None:
-        files = self._store.user_files(_CLEANUP_SCOPE)
+        files = self._cleanup_files()
         files.mkdirs("pending")
         with contextlib.suppress(Conflict):  # Already noted.
             files.create_json(
@@ -154,7 +160,7 @@ class DeletedAccountGadgets:
         if cursor is not None:
             return False
         self._store.delete_user_files(user_id, owner_registration=registration)
-        files = self._store.user_files(_CLEANUP_SCOPE)
+        files = self._cleanup_files()
         if files.supports_delete:
             files.delete_tree(self._note_name(user_id, registration))
         return True

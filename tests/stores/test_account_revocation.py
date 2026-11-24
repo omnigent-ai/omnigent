@@ -2118,7 +2118,10 @@ def test_a_cleanup_that_keeps_failing_never_blocks_the_others(
     store, _, service = _gadgets(db_uri, tmp_path, accounts)
     gadgets = accounts._gadgets
     # An unreadable note, and a deleted account whose gadgets can't be listed.
-    pending = store._user_dir(gadget_accounts._CLEANUP_SCOPE) / "pending"
+    pending = (
+        store._user_dir(gadget_accounts._CLEANUP_SCOPE, gadget_accounts._CLEANUP_REGISTRATION)
+        / "pending"
+    )
     pending.mkdir(parents=True)
     (pending / ("0" * 32 + ".json")).write_text("{not json")
     gadgets._note("mallory", None)
@@ -2139,3 +2142,32 @@ def test_a_cleanup_that_keeps_failing_never_blocks_the_others(
         gadgets.resume()
     assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
     assert all(store.get(board["id"]) is None for board in boards)
+
+
+def test_an_account_named_like_the_cleanup_scope_keeps_the_others_cleanup_notes(
+    tmp_path, monkeypatch
+) -> None:
+    """A user ID may be any string, even the cleanup notes' scope name; deleting that
+    account's files must not delete the notes other deleted accounts' cleanups wait on."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    gadgets = DeletedAccountGadgets(store, NoGrants())  # type: ignore[arg-type]
+    gadgets._note("mallory", None)
+    # Mallory's cleanup is not run in this call, so only the scope-named account's goes.
+    monkeypatch.setattr(gadget_accounts, "PENDING_PER_RESUME", 0)
+    assert gadgets.delete_owned(gadget_accounts._CLEANUP_SCOPE, None) is True
+
+    resumed: list[str] = []
+    monkeypatch.setattr(gadget_accounts, "PENDING_PER_RESUME", 4)
+    monkeypatch.setattr(
+        gadgets, "_step", lambda user_id, registration: resumed.append(user_id) or True
+    )
+    gadgets.resume()
+    assert resumed == ["mallory"]

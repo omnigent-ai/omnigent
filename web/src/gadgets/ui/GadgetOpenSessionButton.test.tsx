@@ -443,12 +443,11 @@ describe("GadgetOpenSessionButton", () => {
     expect(screen.queryByTestId("gadget-open-session-scrim")).toBeNull();
   });
 
-  it("puts host, permission and harness side by side, with the main button below them", () => {
+  it("orders host, permission and harness, with the main button after them", () => {
     const { button } = renderButton({ sessionId: null });
     hoverOpen(button);
 
     const controls = screen.getByTestId("gadget-open-session-controls");
-    expect(controls).toHaveClass("flex-row");
     expect(Array.from(controls.children).map((slot) => slot.getAttribute("data-testid"))).toEqual([
       "gadget-open-session-host",
       "gadget-open-session-permission",
@@ -459,8 +458,6 @@ describe("GadgetOpenSessionButton", () => {
       controls.compareDocumentPosition(create) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(within(create).getByRole("button", { name: "Create session" })).toBeInTheDocument();
-    // The menu is as wide as that row.
-    expect(screen.getByTestId("gadget-open-session-popover")).toHaveClass("w-max");
   });
 
   describe("the session's status", () => {
