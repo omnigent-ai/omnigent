@@ -3744,6 +3744,91 @@ async def test_managed_launch_fails_when_runner_never_connects(
         assert fake.terminated == [actual_id]
 
 
+async def test_managed_launch_waits_for_runner_a_message_relaunched(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message that replaces a slow first runner leaves the fresh sandbox serving it."""
+    from omnigent.server.managed_hosts import launch_managed_host
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation()
+    fake = FakeSandboxLauncher(
+        on_host_start=lambda invocation: host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=RESERVED_USER_LOCAL,
+        ),
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+        )
+    )
+    managed = await launch_managed_host(
+        config=config, owner=RESERVED_USER_LOCAL, host_store=host_store
+    )
+    tracker = ManagedLaunchTracker()
+    tracker.begin(conv.id)
+    # A successful launch is forgotten once it settles, so hold the entry.
+    launch = tracker.get(conv.id)
+    assert launch is not None
+    stages: list[tuple[str, str | None]] = []
+    awaited: list[str] = []
+
+    async def _launch_runner(launched: Conversation, *_args: object, **_kwargs: object) -> object:
+        conversations.replace_runner_id(launched.id, "runner_slow_first")
+        return sessions_module._HostLaunchAttempt(runner_id="runner_slow_first")
+
+    class _HostRegistry:
+        def get(self, _host_id: str) -> object:
+            return object()
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> object | None:
+            del timeout_s
+            awaited.append(runner_id)
+            if runner_id == "runner_slow_first":
+                # A message rebinds the session while the first runner is still starting;
+                # the host stops the runner it replaced, so that one never connects.
+                conversations.replace_runner_id(conv.id, "runner_message_relaunch")
+                return None
+            return object()
+
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(
+        sessions_module,
+        "_publish_sandbox_status",
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
+    )
+
+    await sessions_module._bind_and_launch_managed_runner(
+        session_id=conv.id,
+        managed=managed,
+        sandbox_config=config,
+        tracker=tracker,
+        conversation_store=conversations,
+        host_store=host_store,
+        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+    )
+
+    assert awaited == ["runner_slow_first", "runner_message_relaunch"]
+    assert launch.settled.is_set()
+    assert launch.error is None
+    assert stages[-1] == ("ready", None)
+    remaining = conversations.get_conversation(conv.id)
+    assert remaining is not None
+    assert remaining.host_id == managed.host_id
+    assert remaining.runner_id == "runner_message_relaunch"
+    assert host_store.get_host(managed.host_id) is not None
+    assert fake.terminated == []
+
+
 async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3833,7 +3918,13 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
 
     session_id = "d3a6e13f0dbf4b6ea4b6e37f4a76f2a9"
     host_id = "9e6cf6f52ebb4a2c9c9a1a5f8e8f5f42"
-    conv = SimpleNamespace(id=session_id, labels={}, terminal_launch_args=None)
+    conv = SimpleNamespace(
+        id=session_id,
+        labels={},
+        terminal_launch_args=None,
+        host_id=host_id,
+        runner_id="runner_never_connects",
+    )
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     terminated: list[object] = []
@@ -3876,6 +3967,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
             clear_host_binding=lambda _sid, **_kwargs: conv,
+            get_conversation=lambda _sid: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
