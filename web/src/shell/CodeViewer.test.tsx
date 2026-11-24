@@ -691,6 +691,12 @@ describe("CodeViewer markdown preview copy", () => {
     ["a hidden comment", "a<!--INERT-->**b**", "a", "b"],
     ["a stripped element", 'a<script type="text/plain">INERT</script>**b**', "a", "b"],
     ["a link definition", "First para\n\n[//]: # (INERT)\n\nSecond para", "First", "Second para"],
+    [
+      "an unreferenced footnote definition",
+      "First para\n\n[^unused]: INERT\n\nSecond para",
+      "First",
+      "Second para",
+    ],
   ])("keeps the browser's copy across %s", (_shape, markdown, from, to) => {
     renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
     expect(document.querySelector(".markdown-preview")?.textContent).not.toContain("INERT");

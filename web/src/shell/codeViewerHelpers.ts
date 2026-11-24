@@ -855,10 +855,10 @@ export function rehypeSourceOffsets() {
   return stamp;
 }
 
-// Markdown the preview never shows as written: raw HTML, which can hold a
-// comment or a stripped `<script>`'s body, and link definitions such as
-// `[//]: # (a note)`.
-const HIDDEN_SOURCE_NODES = new Set(["html", "definition"]);
+// Markdown the preview doesn't show where it's written: raw HTML, which can hold
+// a comment or a stripped `<script>`'s body, link definitions such as
+// `[//]: # (a note)`, and footnotes, which render at the end, or not at all.
+const HIDDEN_SOURCE_NODES = new Set(["html", "definition", "footnoteDefinition"]);
 
 /**
  * Remark step that records in *spans* where source the preview never shows

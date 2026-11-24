@@ -581,6 +581,12 @@ describe("selectionMarkdown on copy", () => {
     expect(flavors.get("text/plain")).toBe(" ");
   });
 
+  it("keeps TipTap's plain text across a raw HTML block, whose hidden source stays out", () => {
+    const ed = openMarkdown("First para\n\n<!-- INERT -->\n\nSecond para");
+    const flavors = copySelection(ed, "First", "Second para");
+    expect(flavors.get("text/plain")).toBe("First para\n\n\n\nSecond para");
+  });
+
   it("copies a selected heading node whole, marker included", () => {
     const ed = openMarkdown("# Release notes\n\nBody text.");
     ed.commands.setNodeSelection(0);

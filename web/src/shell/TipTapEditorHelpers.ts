@@ -7,6 +7,7 @@ import { EditorState } from "@tiptap/pm/state";
 import { Mapping, StepMap } from "@tiptap/pm/transform";
 import type { MarkdownManager } from "@tiptap/markdown";
 import { exactIndex, markdownSourceMap, type SourceMap } from "./markdownSourceMap";
+import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import type { Comment } from "@/hooks/useComments";
 
 const SEP = "\n";
@@ -320,6 +321,16 @@ function soleTextblock(content: Fragment): ProseMirrorNode | null {
   return node;
 }
 
+/** Whether *content* holds a raw HTML block, whose source the editor never shows. */
+function holdsRawHtml(content: Fragment): boolean {
+  let found = false;
+  content.descendants((node) => {
+    found ||= node.type.name === HtmlPassthrough.name;
+    return !found;
+  });
+  return found;
+}
+
 /**
  * The Markdown a copy of *slice* puts on the clipboard as plain text, written by
  * the editor's own serializer so unsaved edits come along. Text within one
@@ -331,11 +342,13 @@ function soleTextblock(content: Fragment): ProseMirrorNode | null {
  * :param slice: What the copy takes, e.g. ``editor.state.selection.content()``,
  *     whose content is cut from the top of the document.
  * :returns: The Markdown, or null when *slice* can't stand as a document (a few
- *     table cells' bare rows) or nothing but whitespace would be copied.
+ *     table cells' bare rows), holds a raw HTML block whose hidden source (a
+ *     comment or `<script>`) would ride along, or would copy only whitespace.
  */
 export function selectionMarkdown(editor: Editor, slice: Slice): string | null {
   const manager = editor.markdown;
   if (!manager || !editor.schema.topNodeType.validContent(slice.content)) return null;
+  if (holdsRawHtml(slice.content)) return null;
   // Only a slice open down to its textblock lies inside it.
   const open = slice.openStart > 0 && slice.openEnd > 0;
   const textblock = open ? soleTextblock(slice.content) : null;
