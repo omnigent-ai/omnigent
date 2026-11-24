@@ -1508,7 +1508,7 @@ def register_resource_routes(
     ) -> JSONResponse:
         return await _github_call(
             session_id,
-            "pr_info",
+            "cached_pr_info",
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,

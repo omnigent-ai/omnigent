@@ -3633,6 +3633,10 @@ def register_resources_routes(
             runner_params=params or None,
             runner_path=f"/v1/sessions/{session_id}/resources/github",
         )
+        # A runner or host may answer from a read that began before this request.
+        age = info.pop("cache_age_s", 0)
+        if isinstance(age, int | float) and age > 0:
+            requested_at -= age
         return await _with_server_pull_requests(session_id, info, requested_at)
 
     async def _update_host_pull_requests(

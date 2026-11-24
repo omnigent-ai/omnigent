@@ -766,7 +766,7 @@ class WorkspaceReader:
         """PR context for an explicit session PR or the workspace branch."""
         return cast(
             "_WorkspacePayload",
-            pr_resource.pr_info(
+            pr_resource.cached_pr_info(
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,

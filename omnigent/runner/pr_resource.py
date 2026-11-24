@@ -12,6 +12,9 @@ Servers that track a session's PRs vouch for the PR a request targets
 
 from __future__ import annotations
 
+import contextvars
+import dataclasses
+import functools
 import logging
 import re
 import subprocess
@@ -24,7 +27,7 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 from filelock import Timeout as FileLockTimeout
 
@@ -106,6 +109,49 @@ _DISCOVERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-disco
 _DISCOVERY_LOCK = Lock()
 _DISCOVERY_JOBS: dict[tuple[str, str, str | None], Future[dict[str, Any]]] = {}
 _DISCOVERY_RESULT_LIMIT = 128
+
+# Panel polls share forge reads; see :func:`cached_pr_info`.
+_PANEL_READ_FRESH_SECONDS = 5.0
+_PANEL_READ_STALE_SECONDS = 60.0
+_PANEL_READ_LIMIT = 64
+_PANEL_READ_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-panel-read")
+_PANEL_READ_LOCK = Lock()
+# Every panel write bumps this, so no read that began before the write is served after it.
+_panel_read_generation = 0
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _PanelRead:
+    """One :func:`pr_info` read that identical panel requests share."""
+
+    generation: int
+    registry_version: object
+    started_at: float
+    result: Future[dict[str, Any]]
+    # The session's tracked PRs changed during the read, so it may have missed the change.
+    registry_changed: bool = False
+
+
+_PANEL_READS: OrderedDict[tuple[object, ...], _PanelRead] = OrderedDict()
+_RUNNING_PANEL_READS: dict[tuple[object, ...], _PanelRead] = {}
+
+
+def _invalidates_panel_reads(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    """Make panel requests after ``function`` returns wait for a read that starts later."""
+
+    @functools.wraps(function)
+    def write(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        global _panel_read_generation
+        try:
+            return function(*args, **kwargs)
+        finally:
+            with _PANEL_READ_LOCK:
+                _panel_read_generation += 1
+
+    return write
 
 
 @dataclass(frozen=True)
@@ -690,6 +736,104 @@ def pr_info(
     return info
 
 
+def _run_panel_read(
+    key: tuple[object, ...], read: _PanelRead, root: str, session_id: str, pr_url: str | None
+) -> None:
+    """Run one shared read; its outcome reaches every request that waits for it."""
+    payload: dict[str, Any] | None = None
+    try:
+        payload = pr_info(root, session_id=session_id, pr_url=pr_url)
+    except BaseException as exc:  # noqa: BLE001 - re-raised to each waiting request
+        read.result.set_exception(exc)
+    else:
+        read.result.set_result(payload)
+    version = SessionPrRegistry(session_id).version()
+    with _PANEL_READ_LOCK:
+        if _RUNNING_PANEL_READS.get(key) is read:
+            del _RUNNING_PANEL_READS[key]
+        latest = _PANEL_READS.get(key)
+        # Setup states and warnings change through user actions, so the next poll reads again.
+        if (
+            payload is not None
+            and isinstance(payload.get("pr"), dict)
+            and not payload.get("warnings")
+            and read.generation == _panel_read_generation
+            and (latest is None or latest.started_at <= read.started_at)
+        ):
+            _PANEL_READS[key] = dataclasses.replace(
+                read,
+                registry_version=version,
+                registry_changed=version != read.registry_version,
+            )
+            _PANEL_READS.move_to_end(key)
+            while len(_PANEL_READS) > _PANEL_READ_LIMIT:
+                _PANEL_READS.popitem(last=False)
+
+
+def _served(read: _PanelRead, requested_at: float) -> dict[str, Any]:
+    """Return a copy of ``read``'s payload, aged when the read began before the request."""
+    payload = dict(read.result.result())
+    if (age := requested_at - read.started_at) > 0:
+        payload["cache_age_s"] = round(age, 3)
+    return payload
+
+
+def cached_pr_info(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+) -> dict[str, Any]:
+    """Serve :func:`pr_info` to panel polls, sharing forge reads between them.
+
+    Identical concurrent requests share one read. A result showing a pull
+    request is kept: under :data:`_PANEL_READ_FRESH_SECONDS` old it is served
+    as is, and under :data:`_PANEL_READ_STALE_SECONDS` old it is served while
+    one background read replaces it. After a panel write or a change to the
+    session's tracked PRs, requests wait for a new read. A payload from a read
+    that began before the request carries ``cache_age_s``, the seconds between.
+
+    :param root: Absolute workspace path.
+    :param session_id: Session whose tracked PRs to list; ``None`` reads uncached.
+    :param pr_url: The selected PR, which must be tracked by the session.
+    :returns: A ``session.github.info`` payload.
+    """
+    if session_id is None:
+        return pr_info(root, pr_url=pr_url)
+    key = (root, session_id, pr_url, _SERVER_TRACKING.get())
+    version = SessionPrRegistry(session_id).version()
+    requested_at = time.monotonic()
+    with _PANEL_READ_LOCK:
+        done = _PANEL_READS.get(key)
+        if done is not None and (
+            done.generation != _panel_read_generation
+            or done.registry_version != version
+            or requested_at - done.started_at >= _PANEL_READ_STALE_SECONDS
+        ):
+            del _PANEL_READS[key]
+            done = None
+        if (
+            done is not None
+            and not done.registry_changed
+            and requested_at - done.started_at < _PANEL_READ_FRESH_SECONDS
+        ):
+            return _served(done, requested_at)
+        running = _RUNNING_PANEL_READS.get(key)
+        start = running is None or running.generation != _panel_read_generation
+        if start:
+            running = _PanelRead(_panel_read_generation, version, requested_at, Future())
+            _RUNNING_PANEL_READS[key] = running
+    assert running is not None
+    if start:
+        read = functools.partial(_run_panel_read, key, running, root, session_id, pr_url)
+        if done is None:
+            read()
+        else:
+            _PANEL_READ_POOL.submit(contextvars.copy_context().run, read)
+    return _served(done or running, requested_at)
+
+
+@_invalidates_panel_reads
 def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
     """Attach a PR the host can read, or remember that the user removed one.
 
@@ -716,6 +860,7 @@ def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict
     raise ValueError("Expected attach or remove")
 
 
+@_invalidates_panel_reads
 def set_pr_preference(
     root: str,
     *,
@@ -843,6 +988,7 @@ def pr_labels(
     return facet.repo_labels(root, reference)
 
 
+@_invalidates_panel_reads
 def update_pr_labels(
     root: str,
     *,
@@ -895,6 +1041,7 @@ def _merge_request(merge_method: object, expected_head: object) -> tuple[str, st
     return merge_method, expected_head
 
 
+@_invalidates_panel_reads
 def merge_pr(
     root: str,
     *,
@@ -916,6 +1063,7 @@ def merge_pr(
     return facet.merge(root, reference, merge_method=method, expected_head=head)
 
 
+@_invalidates_panel_reads
 def merge_pr_as(
     root: str,
     *,
@@ -950,6 +1098,7 @@ def merge_pr_as(
     )
 
 
+@_invalidates_panel_reads
 def disable_pr_auto_merge(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
@@ -992,6 +1141,7 @@ def pr_review_candidates(
     return facet.review_candidates(root, reference)
 
 
+@_invalidates_panel_reads
 def update_pr_reviewers(
     root: str,
     *,
@@ -1099,6 +1249,7 @@ def pr_review_thread_comments(
     )
 
 
+@_invalidates_panel_reads
 def reply_to_pr_review_thread(
     root: str,
     *,
@@ -1115,6 +1266,7 @@ def reply_to_pr_review_thread(
     )
 
 
+@_invalidates_panel_reads
 def create_pr_review_thread(
     root: str,
     *,
@@ -1159,6 +1311,7 @@ def create_pr_review_thread(
     )
 
 
+@_invalidates_panel_reads
 def create_pr_comment(
     root: str,
     *,
@@ -1191,6 +1344,7 @@ def _details_target(
     )
 
 
+@_invalidates_panel_reads
 def update_pr_details(
     root: str,
     *,
@@ -1248,6 +1402,7 @@ def _attachment_name(name: object, extension: str) -> str:
     return f"{stem}.{extension}"
 
 
+@_invalidates_panel_reads
 def upload_pr_attachment(
     root: str,
     *,

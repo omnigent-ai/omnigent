@@ -3699,6 +3699,25 @@ async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
 
 
 @pytest.mark.asyncio
+async def test_a_cached_runner_answer_does_not_replace_a_newer_stored_state(
+    pr_client: httpx.AsyncClient,
+) -> None:
+    """A runner answer from an earlier read is stored as of when that read began."""
+    path = f"/v1/sessions/{_PR_SESSION}/resources/github"
+    merged = {**_pr_info(), "pr": {**_pr_info()["pr"], "state": "MERGED"}}  # type: ignore[dict-item]
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=merged)))  # type: ignore[arg-type]
+    assert (await pr_client.get(path)).status_code == 200
+
+    cached = {**_pr_info(), "cache_age_s": 60.0}
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=cached)))  # type: ignore[arg-type]
+    answered = await pr_client.get(path)
+    assert answered.status_code == 200, answered.text
+    assert "cache_age_s" not in answered.json()
+    listed = await pr_client.get(f"/v1/sessions/{_PR_SESSION}/pull-requests")
+    assert listed.json()["data"][0]["state"] == "MERGED"
+
+
+@pytest.mark.asyncio
 async def test_linking_checks_the_session_limit_before_asking_the_host(
     pr_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
