@@ -5,6 +5,13 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+// Which hosts' SSH names were asked for, and for which session, as ⌘K opens.
+const sshNamesAsked = vi.hoisted(() => [] as [string | null, string | null][]);
+vi.mock("./fileCommands/useFileCommandFacts", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileCommandFactsModule>()),
+  useResolveFileSshTarget: (hostId: string | null, conversationId: string | null) => () =>
+    sshNamesAsked.push([hostId, conversationId]),
+}));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
@@ -12,6 +19,7 @@ import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as FileCommandFactsModule from "./fileCommands/useFileCommandFacts";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseWorkspaceModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
@@ -30,7 +38,11 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { setEmbedRoot } from "@/lib/host";
+import { getOmnigentServerIdentity, setEmbedRoot } from "@/lib/host";
+import * as identity from "@/lib/identity";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { setSessionHost } from "@/lib/sessionHost";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
 import { FileViewerContext, useFileViewer } from "./FileViewerContext";
@@ -7510,5 +7522,47 @@ describe("AppShell desktop Close", () => {
     expect(screen.queryByText("home")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(screen.getByText("home")).toBeInTheDocument();
+  });
+});
+
+describe("⌘K in a session grid", () => {
+  it("reads the SSH name of the selected pane's host as the palette opens", async () => {
+    sshNamesAsked.length = 0;
+    mockConversations([
+      { id: "conv_a", permission_level: 3, host_id: "host_a" },
+      { id: "conv_b", permission_level: 3, host_id: "host_b" },
+    ]);
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("local");
+    vi.spyOn(identity, "resolveIdentity").mockResolvedValue("local");
+    setSessionHost("conv_a", "host_a");
+    setSessionHost("conv_b", "host_b");
+    const key = `omnigent:session-grids:${getOmnigentServerIdentity() ?? "default"}:local`;
+    localStorage.setItem(
+      key,
+      JSON.stringify([
+        { id: "saved", name: "Pair", layout: { axis: "columns", children: ["conv_a", "conv_b"] } },
+      ]),
+    );
+    onTestFinished(() => localStorage.removeItem(key));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      render(
+        <CapabilitiesProvider
+          info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: true } }}
+        >
+          {shellTree(qc, "/grid/saved", <Route path="grid/:gridId" element={<div />} />)}
+        </CapabilitiesProvider>,
+      );
+    });
+    expect(sshNamesAsked).toEqual([]);
+    await act(async () => {
+      fireEvent.keyDown(window, {
+        key: "k",
+        code: "KeyK",
+        ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
+      });
+    });
+    // The grid's first pane is selected until another is.
+    expect(sshNamesAsked).toContainEqual(["host_a", "conv_a"]);
   });
 });
