@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { CheckIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { INLINE_RENAME_FIELD_PROPS } from "@/lib/inlineRename";
 
@@ -10,6 +9,9 @@ interface SidebarEditRowProps {
   onCommit: (title: string) => void;
   onCancel: () => void;
   label?: string;
+  /** Omitted for names the server doesn't limit, such as project names. */
+  maxLength?: number;
+  inputTestId?: string;
 }
 
 /** Shared inline rename: Enter or blur saves; Escape cancels. */
@@ -18,6 +20,8 @@ export function SidebarEditRow({
   onCommit,
   onCancel,
   label = "Rename session",
+  maxLength,
+  inputTestId = "rename-conversation-input",
 }: SidebarEditRowProps) {
   const [value, setValue] = useState(initialTitle);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -59,7 +63,7 @@ export function SidebarEditRow({
         {...INLINE_RENAME_FIELD_PROPS}
         type="text"
         aria-label={label}
-        maxLength={USER_SESSION_TITLE_MAX_CHARS}
+        maxLength={maxLength}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onCompositionStart={() => {
@@ -70,7 +74,7 @@ export function SidebarEditRow({
         }}
         onKeyDown={handleKeyDown}
         onBlur={handleBlur}
-        data-testid="rename-conversation-input"
+        data-testid={inputTestId}
         className="sidebar-compact-text min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
       />
       <Button

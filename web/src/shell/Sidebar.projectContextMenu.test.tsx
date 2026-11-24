@@ -1,3 +1,4 @@
+import type * as ToastModule from "@/components/ui/toast";
 import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { conversationPage, setConversationMutedMock } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
@@ -30,6 +31,12 @@ const mocks = vi.hoisted(() => ({
     error: null,
   },
   projectConfig: { host_id: "h1" } as Record<string, unknown>,
+  showToast: vi.fn(),
+}));
+
+vi.mock("@/components/ui/toast", async (importOriginal) => ({
+  ...(await importOriginal<typeof ToastModule>()),
+  showToast: mocks.showToast,
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
@@ -500,6 +507,145 @@ describe("project folder header context menu", () => {
     fireEvent.click(selectionHeader);
 
     expect(selectionHeader).toHaveAttribute("aria-expanded", before === "true" ? "false" : "true");
+  });
+});
+
+describe("project folder inline rename", () => {
+  function inlineInput(): HTMLInputElement {
+    return screen.getByTestId("rename-project-inline-input") as HTMLInputElement;
+  }
+
+  it("double-clicking the name opens a focused field with the name selected", () => {
+    renderSidebar();
+
+    fireEvent.doubleClick(folderHeader());
+
+    const input = inlineInput();
+    expect(input).toHaveAccessibleName("Rename project");
+    expect(input).toHaveValue(PROJECT_NAME);
+    expect(input).toHaveFocus();
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe(PROJECT_NAME.length);
+    expect(input).not.toHaveAttribute("maxlength");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("saves the trimmed name on Enter and shows it while the rename lands", async () => {
+    let finishRename: (id: string) => void = () => {};
+    mocks.renameProject.mutateAsync.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          finishRename = resolve;
+        }),
+    );
+    renderSidebar();
+
+    fireEvent.doubleClick(folderHeader());
+    fireEvent.change(inlineInput(), { target: { value: "  Sprint 43 " } });
+    fireEvent.keyDown(inlineInput(), { key: "Enter" });
+
+    expect(mocks.renameProject.mutateAsync).toHaveBeenCalledWith({
+      id: PROJECT_ID,
+      oldName: PROJECT_NAME,
+      newName: "Sprint 43",
+    });
+    expect(screen.queryByTestId("rename-project-inline-input")).toBeNull();
+    expect(screen.getByRole("button", { name: "Sprint 43" })).toBeInTheDocument();
+    await act(async () => finishRename(PROJECT_ID));
+  });
+
+  it("saves on blur and keeps an expanded folder expanded under its new name", async () => {
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([PROJECT_NAME]));
+    renderSidebar();
+
+    fireEvent.doubleClick(folderHeader());
+    fireEvent.change(inlineInput(), { target: { value: "Sprint 43" } });
+    fireEvent.blur(inlineInput());
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY)!)).toEqual([
+        "Sprint 43",
+      ]),
+    );
+  });
+
+  it("moves an open project home to the new name", async () => {
+    renderSidebar({
+      route: `/projects/${encodeURIComponent(PROJECT_NAME)}`,
+      features: { project_kanban: true },
+    });
+    expect(folderHeader()).toHaveAttribute("aria-current", "page");
+
+    fireEvent.doubleClick(folderHeader());
+    fireEvent.change(inlineInput(), { target: { value: "Sprint 43" } });
+    fireEvent.keyDown(inlineInput(), { key: "Enter" });
+
+    const renamedHeader = screen.getByRole("button", { name: "Sprint 43" });
+    await waitFor(() => expect(renamedHeader).not.toHaveAttribute("aria-current"));
+  });
+
+  it("cancels on Escape without renaming", () => {
+    renderSidebar();
+
+    fireEvent.doubleClick(folderHeader());
+    fireEvent.change(inlineInput(), { target: { value: "Sprint 43" } });
+    fireEvent.keyDown(inlineInput(), { key: "Escape" });
+
+    expect(screen.queryByTestId("rename-project-inline-input")).toBeNull();
+    expect(folderHeader()).toBeInTheDocument();
+    expect(mocks.renameProject.mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an unchanged", PROJECT_NAME],
+    ["an empty", "   "],
+  ])("sends nothing for %s name", (_case, value) => {
+    renderSidebar();
+
+    fireEvent.doubleClick(folderHeader());
+    fireEvent.change(inlineInput(), { target: { value } });
+    fireEvent.keyDown(inlineInput(), { key: "Enter" });
+
+    expect(folderHeader()).toBeInTheDocument();
+    expect(mocks.renameProject.mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("restores the old name and explains a rejected rename", async () => {
+    mocks.renameProject.mutateAsync.mockRejectedValueOnce(
+      new Error("A project named Sprint 43 already exists"),
+    );
+    renderSidebar();
+
+    fireEvent.doubleClick(folderHeader());
+    fireEvent.change(inlineInput(), { target: { value: "Sprint 43" } });
+    fireEvent.keyDown(inlineInput(), { key: "Enter" });
+
+    await waitFor(() =>
+      expect(mocks.showToast).toHaveBeenCalledWith(
+        "Couldn't rename the project: A project named Sprint 43 already exists",
+      ),
+    );
+    expect(folderHeader()).toBeInTheDocument();
+  });
+
+  it("leaves the chevron's double-click to the collapse toggle", () => {
+    renderSidebar();
+    const toggle = folderHeader().querySelector("[data-section-toggle]");
+    if (toggle === null) throw new Error("Folder header has no collapse toggle");
+
+    fireEvent.doubleClick(toggle);
+
+    expect(screen.queryByTestId("rename-project-inline-input")).toBeNull();
+  });
+
+  it("doesn't rename in bulk-selection mode", () => {
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("project-list-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    fireEvent.doubleClick(folderHeader());
+
+    expect(screen.queryByTestId("rename-project-inline-input")).toBeNull();
   });
 });
 
