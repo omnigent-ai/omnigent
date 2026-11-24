@@ -368,6 +368,12 @@ class ConstraintGuard:
             }
             if method != "delete":
                 primary["value"] = value
+            # A retry the store already answered (even for a record deleted since) or a write
+            # that can't land changes no record, so it must not reach the derived state; the
+            # store answers it without writing.
+            answered = self._answer(primary)
+            if answered is not None:
+                return answered
             try:
                 plan = self._plan(primary, current)
             except _IndexNeedsRebuild:
@@ -376,9 +382,11 @@ class ConstraintGuard:
                 self.mark_stale()
                 continue
             if plan is None:
-                # A retry of an applied write or a stale precondition: the store answers it
-                # without changing any record, so the derived state stays as it is.
-                return self._apply(primary)
+                # The record changed between the store's answer and the plan's read: ask
+                # again rather than let a write the plan didn't count reach the store.
+                lost += 1
+                _back_off(lost)
+                continue
             pending = {
                 **current,
                 "counts": plan.counts,
@@ -637,6 +645,19 @@ class ConstraintGuard:
         return found
 
     # -- applying ---------------------------------------------------------------
+
+    def _answer(self, primary: dict) -> dict | None:
+        """The store's answer to *primary* when it changes nothing; ``None`` when it would."""
+        result = self.data.answer(
+            primary["kind"],
+            primary["collection"],
+            primary["id"],
+            primary.get("value"),
+            primary.get("if_version"),
+            primary["operation_id"],
+            primary["actor"],
+        )
+        return None if result is None else result.to_dict()
 
     def _apply(self, operation: dict) -> dict:
         if operation["kind"] == "ref_add":

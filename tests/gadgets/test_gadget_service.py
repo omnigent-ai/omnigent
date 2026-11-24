@@ -950,6 +950,96 @@ def test_pruning_a_stale_index_entry_never_drops_one_its_record_needs_again(
     assert _run(service, app, "d")["value"]["cardId"] == "x"
 
 
+def test_a_create_racing_a_delete_of_its_record_never_lands_a_duplicate(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A create of an existing ID finds the record, then another writer deletes it before the
+    # create acts on what it found. The create must not then land over the tombstone outside
+    # the rules: x would take the title y holds.
+    service = gadgets.service()
+    rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    app = publish_ruled_board(service, [rule])
+    rpc(
+        service,
+        app,
+        "create",
+        id="y",
+        value={"title": "dup", "column": "todo"},
+        operation_id="c-y",
+    )
+    x = rpc(
+        service,
+        app,
+        "create",
+        id="x",
+        value={"title": "other", "column": "todo"},
+        operation_id="c-x",
+    )
+    real_get = documents_module.ImmutableDocumentStore.get
+    deleted: list[str] = []
+
+    def get(self, collection, record_id):
+        found = real_get(self, collection, record_id)
+        if collection == "cards" and record_id == "x" and not deleted:
+            deleted.append(record_id)
+            rpc(
+                gadgets.service(),
+                app,
+                "delete",
+                id="x",
+                if_version=x["version"],
+                operation_id="d-x",
+            )
+        return found
+
+    monkeypatch.setattr(documents_module.ImmutableDocumentStore, "get", get)
+    with contextlib.suppress(Conflict, ConstraintViolation):
+        rpc(
+            service,
+            app,
+            "create",
+            id="x",
+            value={"title": "dup", "column": "todo"},
+            operation_id="c-x2",
+        )
+    monkeypatch.setattr(documents_module.ImmutableDocumentStore, "get", real_get)
+    # Either x is gone, or it was created through the rules; "dup" stays y's alone.
+    current = rpc(service, app, "get", id="x")
+    assert current is None or current["value"]["title"] != "dup"
+    with pytest.raises(ConstraintViolation):
+        rpc(
+            service,
+            app,
+            "create",
+            id="z",
+            value={"title": "dup", "column": "todo"},
+            operation_id="c-z",
+        )
+
+
+@pytest.mark.parametrize("rule_kind", ["max_records", "unique"])
+def test_retrying_a_create_whose_record_was_deleted_changes_no_rule_state(
+    gadgets: Fixture, rule_kind: str
+) -> None:
+    # The retry gets its first receipt and creates nothing, so the rule state mustn't count
+    # it: the collection is empty and a fresh create still fits.
+    service = gadgets.service()
+    rule = (
+        {"name": "one", "kind": "max_records", "collection": "cards", "max": 1}
+        if rule_kind == "max_records"
+        else {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    )
+    app = publish_ruled_board(service, [rule])
+    value = {"title": "Ship", "column": "todo"}
+    first = rpc(service, app, "create", id="x", value=value, operation_id="op1")
+    rpc(service, app, "delete", id="x", if_version=first["version"], operation_id="d-x")
+    again = rpc(service, app, "create", id="x", value=value, operation_id="op1")
+    assert again["version"] == first["version"]
+    assert rpc(service, app, "get", id="x") is None
+    fresh = rpc(service, app, "create", id="z", value=value, operation_id="op2")
+    assert fresh["id"] == "z"
+
+
 def test_a_late_index_removal_from_a_finished_change_keeps_a_newer_entry(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -214,6 +214,9 @@ class StoreLimits:
     max_revisions_per_record: int = 10_000_000
     revisions_per_segment: int = 1000
     max_records_per_collection: int = 10_000
+    # Not enforced: a sizing check against max_records_per_collection only. A collection's
+    # listing order gains one entry per create (a record created again adds another) and
+    # entries aren't removed with their records, so pages skip the dead ones.
     max_list_entries: int = 20_000
     max_list_limit: int = 200
     max_scan_per_list: int = 500
@@ -764,6 +767,78 @@ class ImmutableDocumentStore:
                 "delete resolved to a non-delete revision", collection=collection, doc_id=id
             )
         return result
+
+    def answer(
+        self,
+        kind: str,
+        collection: str,
+        id: str,
+        value: Any,
+        if_version: str | None,
+        operation_id: str,
+        actor: str,
+    ) -> Document | DeleteResult | None:
+        """Answer a write without writing it: ``None`` when it would change the record.
+
+        A retry of an earlier identical write gets that write's receipt, and a write that
+        can't land gets the error it would get (``Conflict``, ``NotFound``). A caller that
+        keeps derived state about records (rules) uses this to tell those apart from a
+        write that changes something, which it must plan for first.
+        """
+        if kind not in (_CREATE, _REPLACE, _DELETE):
+            raise InvalidInput(f"unknown write kind {kind!r}")
+        ref = self._ref(collection, id)
+        clean = None if kind == _DELETE else self._validate_value(value)
+        _validate_operation_id(operation_id)
+        _validate_actor(actor)
+        if kind != _CREATE:
+            self._validate_version(if_version, ref)
+        digest = _request_digest(
+            method=kind,
+            collection=collection,
+            doc_id=id,
+            if_version=if_version if kind != _CREATE else None,
+            actor=actor,
+            value=clean,
+            has_value=kind != _DELETE,
+        )
+        head = self._load_head(ref)
+        if kind == _CREATE:
+            if head is None:
+                return None
+            if head.latest.kind == _PURGE:
+                if not self._older_than(head.latest, self._limits.purge_abandon_s):
+                    raise Conflict(
+                        "document is being removed; retry shortly", reason="concurrent_write"
+                    )
+                return None
+            replay = self._find_operation(ref, head, operation_id, self._limits.idempotency_window)
+            if replay is None and head.latest.kind == _DELETE:
+                replay = self._indexed_create(ref, head, operation_id)
+            if replay is not None:
+                return self._replay_create(ref, head, replay, digest)
+            if head.latest.kind != _DELETE:
+                raise Conflict(
+                    "document already exists",
+                    reason="already_exists",
+                    current_version=self._version_of(ref, head.latest),
+                )
+            return None
+        if head is None:
+            raise NotFound("document does not exist")
+        replay = self._find_operation(ref, head, operation_id, self._limits.idempotency_window)
+        if replay is not None:
+            return self._replay(ref, replay, digest)
+        if head.latest.kind in _GONE:
+            raise NotFound("document was deleted")
+        current = self._version_of(ref, head.latest)
+        if current != if_version:
+            raise Conflict(
+                "document changed since if_version",
+                reason="version_mismatch",
+                current_version=current,
+            )
+        return None
 
     def retire(self, collection: str, id: str, actor: str) -> bool:
         """Delete a record and remove it at once, giving its capacity back.
