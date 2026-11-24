@@ -65,6 +65,13 @@ describe("planProgressLine", () => {
     });
   });
 
+  it("doesn't call a plan done beside a prompt for a step still in progress", () => {
+    // The last step finished after an earlier one restarted, and a prompt now waits.
+    const progress = { total: 3, done: 2, started: 1, step: null };
+    expect(planProgressLine(progress, true)).toBeNull();
+    expect(planProgressLine(progress, false)?.text).toBe("All done");
+  });
+
   it("shows nothing until a step has a status", () => {
     // A planning chat's proposal, or a run whose first step hasn't started.
     expect(planProgressLine({ total: 5, step: step("Inventory", "next") }, false)).toBeNull();

@@ -17,7 +17,10 @@ from omnigent.db.db_models import (
     MAX_STORED_VALUE_BYTES,
     PLAN_PROGRESS_MAX_STORED_BYTES,
     SqlSessionJournalEntry,
+    SqlSessionJournalHead,
+    current_workspace_id,
 )
+from omnigent.db.enum_codecs import encode_journal_entry_kind
 from omnigent.db.utils import get_or_create_engine, shared_read_scope
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.session_journal import (
@@ -1295,3 +1298,46 @@ def test_a_legacy_replan_before_a_done_final_step_keeps_the_plan_open(
     journal.append(SESSION, "plan", {"name": "Renamed", "steps": inserted}, idempotency_key="k4")
 
     assert _progress(journal)["step"] == {"name": "Review", "state": "next"}
+
+
+def test_progress_an_older_server_left_behind_is_ignored_until_rewritten(
+    journal: SessionJournalStore,
+) -> None:
+    journal.append(SESSION, "plan", _plan("build", "ship"), idempotency_key="k0")
+    _status(journal, "k1", "build", "started")
+    assert _progress(journal)["step"] == {"name": "Build", "state": "started"}
+
+    # A server that doesn't record progress finishes build: it appends and
+    # advances the head, leaving the progress as it was.
+    plan = journal.current_plan(SESSION)
+    assert plan is not None
+    position = len(journal.list_entries(SESSION).entries)
+    done = {"status": "done", "text": "x", "graph_revision": plan.content["graph_revision"]}
+    with sa.create_engine(journal.storage_location).begin() as connection:
+        connection.execute(
+            sa.insert(SqlSessionJournalEntry).values(
+                workspace_id=current_workspace_id(),
+                conversation_id=SESSION,
+                position=position,
+                created_at=1,
+                id="e" * 32,
+                kind=encode_journal_entry_kind("status"),
+                step="build",
+                idempotency_key="older-server",
+                content=journal._stored_contents([done])[0],
+            )
+        )
+        connection.execute(
+            sa.update(SqlSessionJournalHead)
+            .where(SqlSessionJournalHead.conversation_id == SESSION)
+            .values(next_position=position + 1)
+        )
+    assert journal.plan_progress_by_session([SESSION]) == {}
+
+    # A note doesn't make the old progress current again.
+    _note(journal, "k2")
+    assert journal.plan_progress_by_session([SESSION]) == {}
+    # The next status write records it afresh, counting the older server's write.
+    _status(journal, "k3", "ship", "started")
+    progress = _progress(journal)
+    assert (progress["done"], progress["step"]) == (1, {"name": "Ship", "state": "started"})

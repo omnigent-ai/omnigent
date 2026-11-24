@@ -39,6 +39,8 @@ export interface PlanProgressLine {
 /**
  * The line for a row whose plan has started: null while no step has a status,
  * such as a planning chat's proposal or a run whose first step hasn't begun.
+ * Also null for a finished plan with a step still in progress while the badge
+ * says it needs a response, where the chat's preview names that step instead.
  *
  * @param badgeAwaiting - Whether the row's badge already says it needs a
  *   response, so a step waiting for the user needn't say so again.
@@ -55,6 +57,7 @@ export function planProgressLine(
   const line = { finished: done + failed, total: progress.total, lead: null, more: 0 };
   const step = progress.step;
   if (!step) {
+    if (badgeAwaiting && started > 0) return null;
     return { ...line, text: failed === 0 ? "All done" : `Finished, ${failed} failed` };
   }
   switch (step.state) {

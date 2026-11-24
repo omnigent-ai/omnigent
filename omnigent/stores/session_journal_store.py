@@ -6,7 +6,9 @@ which allocates positions, so one session's appends run one at a time while
 other sessions' appends and the session's metadata updates don't wait. An
 append carries an idempotency key, so a retried append returns the entry its
 first attempt wrote instead of writing it twice. A plan or status write also
-rewrites the heads row's plan progress, which session lists read by primary key.
+rewrites the heads row's plan progress, which session lists read by primary key,
+with the position it was recorded at, so progress a server that doesn't record
+it left behind is ignored rather than shown.
 
 An entry's content is the kind's compressed JSON, at most
 :data:`~omnigent.db.db_models.MAX_STORED_VALUE_BYTES` bytes stored. The store
@@ -26,7 +28,7 @@ from contextlib import AbstractContextManager, nullcontext
 from itertools import batched
 from typing import Any, TypeVar
 
-from sqlalchemy import Select, delete, func, select, tuple_, update
+from sqlalchemy import Select, case, delete, func, select, tuple_, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -113,21 +115,36 @@ class JournalSessionNotFoundError(Exception):
 
 
 def _set_next_position(
-    session: Session, conversation_id: str, next_position: int, plan_progress: Any = _UNSET
+    session: Session,
+    conversation_id: str,
+    next_position: int,
+    plan_progress: Any = _UNSET,
+    *,
+    carried_from: int | None = None,
 ) -> None:
     """Advance a session's heads row, a primary-key update.
 
-    :param plan_progress: The encoded progress to store with it, ``None`` to clear
-        it, or left out to keep it.
+    :param plan_progress: The encoded progress to store, recorded as of
+        *next_position*; ``None`` clears it. Left out, it stays as it is.
+    :param carried_from: The row's next position before this write. Progress left
+        as it is stays current only if it was current then, so progress an older
+        server left out of date stays out of date.
     """
+    heads = SqlSessionJournalHead
     values: dict[str, Any] = {"next_position": next_position}
     if plan_progress is not _UNSET:
         values["plan_progress"] = plan_progress
+        values["plan_progress_position"] = next_position
+    elif carried_from is not None:
+        values["plan_progress_position"] = case(
+            (heads.plan_progress_position == carried_from, next_position),
+            else_=heads.plan_progress_position,
+        )
     session.execute(
-        update(SqlSessionJournalHead)
+        update(heads)
         .where(
-            SqlSessionJournalHead.workspace_id == current_workspace_id(),
-            SqlSessionJournalHead.conversation_id == conversation_id,
+            heads.workspace_id == current_workspace_id(),
+            heads.conversation_id == conversation_id,
         )
         .values(**values)
         .with_hint("FORCE INDEX (PRIMARY)", dialect_name="mysql")
@@ -521,6 +538,7 @@ class SessionJournalStore:
 
         def write(session: Session) -> tuple[SqlSessionJournalEntry, bool, dict[str, Any] | None]:
             position = self._lock_head(session, conversation_id)
+            head_position = position
             if not self._session_exists(session, conversation_id):
                 raise JournalSessionNotFoundError(f"session {conversation_id!r} not found")
             earlier = session.execute(
@@ -697,7 +715,9 @@ class SessionJournalStore:
                 content=entry_text,
             )
             session.add(row)
-            _set_next_position(session, conversation_id, position + 1, progress)
+            _set_next_position(
+                session, conversation_id, position + 1, progress, carried_from=head_position
+            )
             return row, True, entry_content
 
         row, created, entry_content = run_write_transaction(
@@ -854,7 +874,8 @@ class SessionJournalStore:
         :param conversation_ids: The sessions, e.g. a page of the session list.
         :returns: Each session's progress by ID, as
             :func:`~omnigent.entities.plan_progress.plan_progress` returns it. A
-            session is left out until a plan or status write records it.
+            session is left out until a plan or status write records it, and
+            while a server that doesn't record progress has written since.
         """
         ids = list(dict.fromkeys(conversation_ids))
         if not ids:
@@ -862,14 +883,23 @@ class SessionJournalStore:
         heads = SqlSessionJournalHead
         with self._session("read_plan_progress") as session:
             rows = session.execute(
-                select(heads.conversation_id, heads.plan_progress)
+                select(
+                    heads.conversation_id,
+                    heads.next_position,
+                    heads.plan_progress_position,
+                    heads.plan_progress,
+                )
                 .where(
                     heads.workspace_id == current_workspace_id(),
                     heads.conversation_id.in_(ids),
                 )
                 .with_hint(heads, "FORCE INDEX (PRIMARY)", "mysql")
             ).all()
-        recorded = [(row.conversation_id, row.plan_progress) for row in rows if row.plan_progress]
+        recorded = [
+            (row.conversation_id, row.plan_progress)
+            for row in rows
+            if row.plan_progress and row.plan_progress_position == row.next_position
+        ]
         texts = self._decode_contents([stored for _, stored in recorded])
         return {
             conversation_id: json.loads(text)
