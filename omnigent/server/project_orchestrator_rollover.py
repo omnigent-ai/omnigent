@@ -480,17 +480,33 @@ async def start_fresh_main_session(
         payload["agent_id"] = await default_project_agent_id(
             request, getattr(app.state, "agent_store", None), payload.get("host_id")
         )
-    created = await create(request, user_id, payload, None)
+
+    async def queue_first_message(new_id: str) -> None:
+        # Runs after the bind but before launch, so the first turn starts with it
+        # even when ticket updates were queued the moment the pointer moved.
+        if first_message:
+            await _enqueue_message(
+                app, inputs, new_id, first_message, user_id, first=True, deliver=False
+            )
+
+    created = await create(request, user_id, payload, queue_first_message)
     session_id = getattr(created, "id", None) or getattr(created, "session_id", None)
     if not isinstance(session_id, str):
         raise OmnigentError("Session creation failed", code=ErrorCode.INTERNAL_ERROR)
     if first_message:
-        await _enqueue_message(app, inputs, session_id, first_message, user_id, first=True)
+        await inputs.deliver_pending(app, session_id)
     return session_id
 
 
 async def _enqueue_message(
-    app: Any, inputs: Any, session_id: str, text: str, user_id: str | None, *, first: bool
+    app: Any,
+    inputs: Any,
+    session_id: str,
+    text: str,
+    user_id: str | None,
+    *,
+    first: bool,
+    deliver: bool = True,
 ) -> None:
     from omnigent.server.schemas import SessionEventInput
 
@@ -504,7 +520,8 @@ async def _enqueue_message(
         headers=Headers(),
         first=first,
     )
-    await inputs.deliver_pending(app, session_id)
+    if deliver:
+        await inputs.deliver_pending(app, session_id)
 
 
 # -- Rollover ----------------------------------------------------------------
@@ -601,9 +618,13 @@ async def _rollover_now(
     _switching[old.id] = future
     successor: str | None = None
     try:
-        handoff, last_item_id = await build_handoff(app, project, old, notes=notes, reason=reason)
+        # Archive first: ticket updates then wait for the successor instead of
+        # landing in the old session after the handoff snapshot.
         await asyncio.to_thread(conversations.update_conversation, old.id, archived=True)
         try:
+            handoff, last_item_id = await build_handoff(
+                app, project, old, notes=notes, reason=reason
+            )
             successor = await start_fresh_main_session(
                 app,
                 project,
