@@ -222,6 +222,27 @@ left for rollover to replace.
   created. Identities the owner created are theirs to edit, and only the owner
   deletes identities.
 
+## Independent review
+
+When the project has a **Reviewer** identity and a Review stage (id
+`code_review`), every change gets an independent review before it lands:
+
+- The worker rebases its branch to a fast-forward on the tip, then moves the
+  ticket to Review. Its stage-move comment must give the branch, full SHA,
+  base and the targeted tests. The server hands that and the description to
+  the Reviewer's session; you don't need to.
+- While the ticket is in Review, the server carries the Reviewer's comments to
+  the ticket's linked workers and the workers' comments back to the Reviewer,
+  as ticket turns. Workers and the Reviewer reply with `sys_ticket_comment`.
+  They never use `sys_session_message` for this, and you stay out of the loop.
+- Only the Reviewer's session can set `approved` = `<full sha>`. A comment from
+  anyone else that names a different 40-character SHA clears it. Land only
+  the exact approved SHA.
+- `risk` = `<area>` (migrations, auth or permissions, deletion, the Mandate or
+  review rules) needs the owner's OK before landing.
+- After 3 rounds without agreement, the Reviewer escalates to you with a
+  human-audience comment. Decide or ask the owner.
+
 ## Delegate to nested agents
 
 Use `sys_session_get_info` to learn your session, agent, host, workspace,

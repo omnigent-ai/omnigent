@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ from omnigent.entities.project_ticket import (
     MarkTicketSeen,
     TicketActor,
     TicketEventKind,
+    TicketLabel,
     TicketStageId,
     UpdateTicket,
     UpdateTicketStages,
@@ -49,6 +51,19 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_harness,
 )
 from omnigent.server.session_orchestration import require_named_source_private
+from omnigent.server.ticket_review import (
+    APPROVED_LABEL,
+    REVIEW_STAGE_ID,
+    RouteLimiter,
+    check_approval_change,
+    find_reviewer,
+    is_reviewer_session,
+    label_value,
+    reviewer_handoff_message,
+    superseding_sha,
+    to_reviewer_message,
+    to_worker_message,
+)
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.project_ticket_store import ProjectTicketStore
@@ -205,6 +220,83 @@ def _spawn_mention_delivery(
     task.add_done_callback(_mention_tasks.discard)
 
 
+_review_limiter = RouteLimiter()
+# Reviewer rounds since the ticket last entered Review, for the escalation reminder.
+_review_rounds: dict[str, int] = {}
+
+
+def _stable_id(*parts: object) -> str:
+    return hashlib.sha256(":".join(str(part) for part in parts).encode()).hexdigest()[:32]
+
+
+def _spawn_review_routing(
+    request: Request,
+    targets: PersonaMentionTargets,
+    project: Any,
+    reviewer: Mention,
+    ticket: dict[str, Any],
+    text: str | None,
+    who: TicketActor,
+    *,
+    entered_review: bool,
+    author_is_reviewer: bool,
+) -> None:
+    """Carry a ticket in Review between its worker and the Reviewer, in the background."""
+    app = request.app
+    notifications = getattr(app.state, "project_ticket_notifications", None)
+    if notifications is None or who.session_id is None:
+        return
+    if not entered_review and not text:
+        return
+
+    async def deliver(session_id: str, stable_id: str, message: str) -> bool:
+        return await notifications.deliver_to_session(
+            app, project, session_id, stable_id=stable_id, text=message
+        )
+
+    async def run() -> None:
+        if not _review_limiter.allow(ticket["id"]):
+            _logger.warning("Review routing paused for ticket %s: too many turns", ticket["id"])
+            return
+        event = f"{ticket['id']}:{ticket['comment_count']}:{ticket.get('updated_at')}"
+        if entered_review:
+            _review_rounds[ticket["id"]] = 0
+            session_id = await targets.open(request, project, reviewer)
+            if session_id and session_id != who.session_id:
+                message = reviewer_handoff_message(ticket, text, who.session_id)
+                await deliver(session_id, _stable_id("review-handoff", event), message)
+            return
+        assert text is not None
+        if author_is_reviewer:
+            _review_rounds[ticket["id"]] = _review_rounds.get(ticket["id"], 0) + 1
+            linked = await asyncio.to_thread(
+                notifications.tickets.ticket_session_ids, project.id, ticket["id"]
+            )
+            for session_id in linked:
+                if session_id in (who.session_id, project.main_session_id):
+                    continue
+                message = to_worker_message(ticket, text)
+                await deliver(
+                    session_id, _stable_id("review-to-worker", event, session_id), message
+                )
+            return
+        session_id = await targets.open(request, project, reviewer)
+        if session_id and session_id != who.session_id:
+            rounds = _review_rounds.get(ticket["id"], 0)
+            message = to_reviewer_message(ticket, text, who.session_id, rounds)
+            await deliver(session_id, _stable_id("review-to-reviewer", event), message)
+
+    async def guarded() -> None:
+        try:
+            await run()
+        except Exception:
+            _logger.warning("Could not route review traffic for %s", ticket["id"], exc_info=True)
+
+    task = asyncio.create_task(guarded(), name=f"ticket-review-{ticket['id']}")
+    _mention_tasks.add(task)
+    task.add_done_callback(_mention_tasks.discard)
+
+
 def create_project_tickets_router(
     store: ProjectTicketStore,
     conversations: ConversationStore,
@@ -238,6 +330,79 @@ def create_project_tickets_router(
                 code=ErrorCode.FORBIDDEN,
             )
         return TicketActor(user_id, source.id, source.agent_id)
+
+    async def review_context(
+        request: Request, project_id: str, who: TicketActor
+    ) -> tuple[PersonaMentionTargets, Any, Mention, bool] | None:
+        """The project's Reviewer and whether *who* is its session, or None without one."""
+        targets: PersonaMentionTargets | None = getattr(
+            request.app.state, "persona_mention_targets", None
+        )
+        if targets is None:
+            return None
+        project = await targets.project(project_id, who.user_id)
+        reviewer = find_reviewer(await targets.personas(project))
+        if reviewer is None:
+            return None
+        conversation = (
+            await asyncio.to_thread(conversations.get_conversation, who.session_id)
+            if who.session_id is not None
+            else None
+        )
+        return targets, project, reviewer, is_reviewer_session(conversation, reviewer)
+
+    async def after_review_activity(
+        request: Request,
+        project_id: str,
+        ticket: dict[str, Any],
+        text: str | None,
+        who: TicketActor,
+        *,
+        entered_review: bool,
+        context: tuple[PersonaMentionTargets, Any, Mention, bool] | None,
+    ) -> dict[str, Any]:
+        """Clear a superseded approval and route Review traffic; returns the latest ticket."""
+        if who.session_id is None:
+            return ticket
+        context = context or await review_context(request, project_id, who)
+        if context is None:
+            return ticket
+        targets, project, reviewer, author_is_reviewer = context
+        approved = label_value(ticket.get("labels"), APPROVED_LABEL)
+        newer = None if author_is_reviewer else superseding_sha(text, approved)
+        if newer is not None:
+            kept = [
+                TicketLabel(**label)
+                for label in ticket.get("labels") or []
+                if label.get("key") != APPROVED_LABEL
+            ]
+            with _storage_errors():
+                ticket = await asyncio.to_thread(
+                    store.update,
+                    project_id,
+                    ticket["id"],
+                    UpdateTicket(
+                        labels=kept,
+                        comment=(
+                            f"Approval cleared: commit `{newer}` supersedes the approved "
+                            f"`{approved}`. The Reviewer re-reviews it."
+                        ),
+                    ),
+                    who,
+                )
+        if entered_review or ticket.get("stage_id") == REVIEW_STAGE_ID:
+            _spawn_review_routing(
+                request,
+                targets,
+                project,
+                reviewer,
+                ticket,
+                text,
+                who,
+                entered_review=entered_review,
+                author_is_reviewer=author_is_reviewer,
+            )
+        return ticket
 
     def wake(request: Request) -> None:
         notifications = getattr(request.app.state, "project_ticket_notifications", None)
@@ -437,8 +602,33 @@ def create_project_tickets_router(
         if raises_human_request:
             before = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
             raises_human_request = not _has_needs_human(before)
+        before = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
+        context = None
+        if body.labels is not None:
+            approved_after = label_value(
+                [label.model_dump() for label in body.labels], APPROVED_LABEL
+            )
+            approved_before = label_value(before.get("labels"), APPROVED_LABEL)
+            if approved_after is not None and approved_after != approved_before:
+                context = await review_context(request, project_id, who)
+                check_approval_change(
+                    approved_before,
+                    approved_after,
+                    author_session_id=who.session_id,
+                    author_is_reviewer=context is not None and context[3],
+                )
         with _storage_errors():
             ticket = await asyncio.to_thread(store.update, project_id, ticket_id, body, who)
+        ticket = await after_review_activity(
+            request,
+            project_id,
+            ticket,
+            body.comment,
+            who,
+            entered_review=body.stage_id == REVIEW_STAGE_ID
+            and before.get("stage_id") != REVIEW_STAGE_ID,
+            context=context,
+        )
         if raises_human_request and who.session_id is not None:
             # The asking session's chat holds the question, so it belongs in the Inbox.
             session_live_state.raise_attention(who.session_id)
@@ -484,6 +674,10 @@ def create_project_tickets_router(
         wake(request)
         if targets is not None and project is not None and mentions:
             _spawn_mention_delivery(request, targets, project, ticket, body.text, mentions, who)
+        if body.kind == "comment":
+            ticket = await after_review_activity(
+                request, project_id, ticket, body.text, who, entered_review=False, context=None
+            )
         return ticket
 
     @router.get("/{ticket_id}/events")

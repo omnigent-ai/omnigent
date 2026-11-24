@@ -631,6 +631,97 @@ async def test_a_comment_ccing_a_persona_reaches_only_that_personas_session(
     assert events[-1]["payload"]["mentions"] == [{"id": pm["id"], "name": "PM"}]
 
 
+async def test_review_routes_worker_and_reviewer_and_binds_approval_to_a_commit(
+    project_client: httpx.AsyncClient, project_app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Entering Review hands off to the Reviewer; comments route both ways; approval is gated."""
+    from omnigent.server.routes import project_tickets
+
+    delivered: list[tuple[str, str]] = []
+
+    async def deliver_to_session(app, project, session_id, *, stable_id, text) -> bool:
+        delivered.append((session_id, text))
+        return True
+
+    monkeypatch.setattr(
+        project_app.state.project_ticket_notifications,
+        "deliver_to_session",
+        deliver_to_session,
+        raising=False,
+    )
+
+    async def settle() -> list[tuple[str, str]]:
+        await asyncio.gather(*project_tickets._mention_tasks)
+        drained = list(delivered)
+        delivered.clear()
+        return drained
+
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    identities = f"/v1/projects/{created['id']}/identities"
+    reviewer = (
+        await project_client.post(identities, json={"name": "Reviewer", "instructions": "r"})
+    ).json()["active_session_id"]
+    worker = (
+        await project_client.post(identities, json={"name": "Builder", "instructions": "b"})
+    ).json()["active_session_id"]
+    as_reviewer = {ORCHESTRATION_SOURCE_HEADER: reviewer}
+    as_worker = {ORCHESTRATION_SOURCE_HEADER: worker}
+    tickets = f"/v1/projects/{created['id']}/tickets"
+    stages = (await project_client.get(f"{tickets}/stages")).json()["stages"]
+    review_stage = {"id": "code_review", "name": "Code review"}
+    staged = await project_client.put(
+        f"{tickets}/stages", json={"stages": [*stages[:2], review_stage, *stages[2:]]}
+    )
+    assert staged.status_code == 200, staged.text
+    ticket = (
+        await project_client.post(tickets, json={"title": "Fix it", "description": "Done when X"})
+    ).json()
+    path = f"{tickets}/{ticket['id']}"
+    await project_client.post(f"{path}/sessions", json={"session_id": worker}, headers=as_worker)
+    first, second, third = "a" * 40, "b" * 40, "c" * 40
+
+    moved = await project_client.patch(
+        path,
+        json={"stage_id": "code_review", "comment": f"Branch ptb/x at {first}, base main"},
+        headers=as_worker,
+    )
+    assert moved.status_code == 200, moved.text
+    [(session, handoff)] = await settle()
+    assert session == reviewer and first in handoff and "Done when X" in handoff
+
+    labels = [{"key": "approved", "value": first}]
+    refused = await project_client.patch(path, json={"labels": labels}, headers=as_worker)
+    assert refused.status_code == 403
+    malformed = [{"key": "approved", "value": "abc"}]
+    bad = await project_client.patch(path, json={"labels": malformed}, headers=as_reviewer)
+    assert bad.status_code == 400
+
+    finding = "Changes needed. blocking: off-by-one at x.py:3"
+    await project_client.post(f"{path}/comments", json={"text": finding}, headers=as_reviewer)
+    [(session, to_worker)] = await settle()
+    assert session == worker and "off-by-one" in to_worker
+
+    await project_client.post(
+        f"{path}/comments", json={"text": f"Fixed in {second}"}, headers=as_worker
+    )
+    [(session, to_reviewer)] = await settle()
+    assert session == reviewer and second in to_reviewer
+
+    approve = [{"key": "approved", "value": second}, {"key": "risk", "value": "migration"}]
+    approved = await project_client.patch(path, json={"labels": approve}, headers=as_reviewer)
+    assert approved.status_code == 200
+    await settle()
+
+    await project_client.post(
+        f"{path}/comments", json={"text": f"One more commit {third}"}, headers=as_worker
+    )
+    await settle()
+    after = (await project_client.get(path)).json()
+    assert {label["key"]: label.get("value") for label in after["labels"]} == {"risk": "migration"}
+    notes = (await project_client.get(f"{path}/events", params={"kind": "comment"})).json()
+    assert any("Approval cleared" in event["payload"]["text"] for event in notes["data"])
+
+
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     """DELETE removes the project; a second delete 404s."""
     created = (await project_client.post("/v1/projects", json={"name": "Doomed"})).json()
