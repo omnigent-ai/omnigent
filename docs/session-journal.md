@@ -187,11 +187,13 @@ resolves them or consolidates the remaining human question instead of sending
 the user to each worker. With the `sibling_sessions` feature on, these sessions
 are grouped with the session that started them.
 
-To hear when a step runs long, give it a time limit: ask the workflow page's
-planning chat ("tell me if opening the PRs takes over 2 hours", or "if any
-step does") and save the plan, or ask in a run's request. The agent writes it
-into the step's description, such as `**Time limit:** 2 hours`, so it shows on
-the step and carries into later runs. A limit never stops the step. When a
+To hear when a step runs long, give it a time limit. On the workflow page,
+pick one from the timer on the step's box in the plan, which can also use it
+for every step. Or ask the planning chat ("tell me if opening the PRs takes
+over 2 hours") and save the plan, or ask in a run's request. Either way the
+limit is a line in the step's description, such as `**Time limit:** 2 hours`,
+so it shows on the step and carries into later runs, and a proposal from the
+planning chat keeps a limit set on the page unless it sets its own. A limit never stops the step. When a
 step with a limit starts, the agent sets a timer for it with `sys_timer_set`,
 or a background timer of its own without one, and cancels it when the step
 finishes. If the step is still going when the timer fires, the agent checks

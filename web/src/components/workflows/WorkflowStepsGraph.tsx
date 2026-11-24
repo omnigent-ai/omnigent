@@ -15,6 +15,7 @@ import { GraphZoomControls } from "@/components/GraphZoomControls";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { StepDescription } from "@/components/workflows/StepDescription";
+import { StepTimeLimit, type StepTimeLimitChange } from "@/components/workflows/StepTimeLimit";
 import { getEmbedRoot } from "@/lib/host";
 import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { failedUpstream, type StepProgress, type StepState } from "@/lib/sessionJournal";
@@ -76,6 +77,8 @@ interface StepsGraphContextValue {
     pending: ReadonlyMap<string, readonly string[]>;
     menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
   };
+  /** On a saved workflow its owner can edit, sets a step's time limit. */
+  timeLimit?: { onChange: (change: StepTimeLimitChange) => void; saving: boolean };
 }
 
 const StepsGraphContext = createContext<StepsGraphContextValue>({ total: 0 });
@@ -127,6 +130,15 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
                 )
               )}
             </div>
+            <StepTimeLimit
+              stepId={id}
+              stepName={data.name}
+              goal={data.goal}
+              onChange={graph.timeLimit?.onChange}
+              disabled={graph.timeLimit?.saving}
+              canApplyToAll={graph.total > 1}
+              onOpenChange={setMenuOpen}
+            />
             {menuAction && (
               <TaskMenu
                 taskName={item.step.name}
@@ -180,17 +192,20 @@ const nodeTypes: NodeTypes = { step: StepNode };
  * The steps drawn with React Flow; *full* means the view owns the wheel, to zoom.
  *
  * @param menuActionFor - In a run, what a step's ⋯ menu offers; none when absent.
+ * @param timeLimit - Sets a step's time limit from its box; read-only when absent.
  */
 function StepsFlow({
   steps,
   progress,
   full = false,
   menuActionFor,
+  timeLimit,
 }: {
   steps: readonly WorkflowStep[];
   progress?: readonly StepProgress[];
   full?: boolean;
   menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
+  timeLimit?: StepsGraphContextValue["timeLimit"];
 }) {
   const { nodes, edges, pending } = useMemo(() => {
     if (!progress) return { ...layoutWorkflowSteps(steps), pending: undefined };
@@ -233,8 +248,9 @@ function StepsFlow({
               menuActionFor,
             }
           : undefined,
+      timeLimit,
     }),
-    [steps, progress, pending, menuActionFor],
+    [steps, progress, pending, menuActionFor, timeLimit],
   );
   return (
     <StepsGraphContext.Provider value={graph}>
@@ -275,6 +291,7 @@ export function WorkflowGraphOverlay({
   steps,
   progress,
   menuActionFor,
+  timeLimit,
   onClose,
 }: {
   title: string;
@@ -284,6 +301,8 @@ export function WorkflowGraphOverlay({
   progress?: readonly StepProgress[];
   /** What a step's ⋯ menu offers in the run, as its task's row does. */
   menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
+  /** Sets a step's time limit from its box; read-only when absent. */
+  timeLimit?: StepsGraphContextValue["timeLimit"];
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -326,7 +345,13 @@ export function WorkflowGraphOverlay({
         </Button>
       </div>
       <div className="relative mx-6 mb-6 min-h-0 flex-1 overflow-hidden rounded-xl border border-border bg-card">
-        <StepsFlow steps={steps} progress={progress} menuActionFor={menuActionFor} full />
+        <StepsFlow
+          steps={steps}
+          progress={progress}
+          menuActionFor={menuActionFor}
+          timeLimit={timeLimit}
+          full
+        />
         {progress && (
           <div className="absolute bottom-3 left-3 z-10 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border bg-card/90 px-2.5 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur">
             {LEGEND.map((state) => (
@@ -344,19 +369,30 @@ export function WorkflowGraphOverlay({
 }
 
 /**
- * A saved workflow's steps as a read-only graph, top to bottom by dependency.
- * Drag to pan; the corner buttons zoom, and "View fullscreen" opens it over
- * the whole window. Scrolling over it scrolls the page.
+ * A saved workflow's steps as a graph, top to bottom by dependency. Drag to pan;
+ * the corner buttons zoom, and "View fullscreen" opens it over the whole window.
+ * Scrolling over it scrolls the page. Given `onTimeLimitChange`, each step's box
+ * sets its time limit.
  */
 export function WorkflowStepsGraph({
   steps,
   title,
+  onTimeLimitChange,
+  timeLimitSaving = false,
 }: {
   steps: readonly WorkflowStep[];
   /** The full-screen view's title, e.g. the workflow's name. */
   title: string;
+  onTimeLimitChange?: (change: StepTimeLimitChange) => void;
+  /** Whether a time limit is being saved, which pauses the limit menus. */
+  timeLimitSaving?: boolean;
 }) {
   const [fullscreen, setFullscreen] = useState(false);
+  const timeLimit = useMemo(
+    () =>
+      onTimeLimitChange ? { onChange: onTimeLimitChange, saving: timeLimitSaving } : undefined,
+    [onTimeLimitChange, timeLimitSaving],
+  );
   const { height: stepsHeight } = useMemo(() => layoutWorkflowSteps(steps), [steps]);
   // Full size when it fits, with room for fitView's margin; past the cap it zooms out.
   const height = Math.ceil(stepsHeight * (1 + FIT_PADDING)) + 32;
@@ -366,7 +402,7 @@ export function WorkflowStepsGraph({
       style={{ height, minHeight: MIN_HEIGHT, maxHeight: MAX_HEIGHT }}
       data-testid="workflow-steps-graph"
     >
-      <StepsFlow steps={steps} />
+      <StepsFlow steps={steps} timeLimit={timeLimit} />
       <div className="absolute top-2 right-2 z-10 flex items-center rounded-md border border-sidebar bg-sidebar/80 px-1.5 py-1 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur">
         <Button
           aria-label="View fullscreen"
@@ -381,7 +417,12 @@ export function WorkflowStepsGraph({
         </Button>
       </div>
       {fullscreen && (
-        <WorkflowGraphOverlay title={title} steps={steps} onClose={() => setFullscreen(false)} />
+        <WorkflowGraphOverlay
+          title={title}
+          steps={steps}
+          timeLimit={timeLimit}
+          onClose={() => setFullscreen(false)}
+        />
       )}
     </div>
   );

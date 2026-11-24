@@ -36,6 +36,7 @@ import {
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
 import { WorkflowRunRow } from "@/components/workflows/WorkflowRunRow";
+import type { StepTimeLimitChange } from "@/components/workflows/StepTimeLimit";
 import { WorkflowStepsGraph } from "@/components/workflows/WorkflowStepsGraph";
 import { useNow } from "@/hooks/useNow";
 import {
@@ -59,6 +60,7 @@ import { UNSHAREABLE_WORKFLOW_MESSAGE, workflowSharingAvailable } from "@/lib/pe
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { currentPlan, planDescription, planSteps } from "@/lib/sessionJournal";
+import { withSavedTimeLimits, withStepTimeLimit } from "@/lib/stepTimeLimit";
 import { ApiError } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 
@@ -123,6 +125,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     source,
   );
   const savePlan = useSaveWorkflowPlan(workflowId);
+  const saveTimeLimit = useSaveWorkflowPlan(workflowId);
   useEffect(() => {
     if (plannerFlash === 0) return;
     const timer = setTimeout(() => setPlannerFlash(0), PLANNING_CHAT_FLASH_MS);
@@ -172,7 +175,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const summary = { id: workflow.id, name: workflow.name, description: workflow.description };
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
-  const proposedSteps = proposal ? planSteps(proposal) : null;
+  // A step keeps the time limit set on the saved workflow unless the proposal words its own.
+  const proposedSteps = proposal ? withSavedTimeLimits(planSteps(proposal), workflow.steps) : null;
   // Where the description's source sits in this journal: null when it came from another
   // planning chat, undefined until the server places it, which offers no description meanwhile.
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
@@ -205,6 +209,18 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     : workflow.shareable === false
       ? UNSHAREABLE_WORKFLOW_MESSAGE
       : undefined;
+  // A time limit is a line in the step's description, saved with the workflow's steps.
+  const changeTimeLimit = ({ stepId, limit }: StepTimeLimitChange) =>
+    saveTimeLimit.mutate(
+      {
+        steps: workflow.steps.map((step) =>
+          stepId === null || step.id === stepId
+            ? { ...step, goal: withStepTimeLimit(step.goal, limit) }
+            : step,
+        ),
+      },
+      { onError: (saveError) => showToast(`Couldn’t save the time limit. ${saveError.message}`) },
+    );
   const clone = () =>
     cloneWorkflow.mutate(workflow.id, {
       onSuccess: (copy) => navigate(`/workflows/${copy.id}`),
@@ -412,7 +428,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             </div>
           )}
           {(proposedSteps ?? workflow.steps).length > 0 ? (
-            <WorkflowStepsGraph steps={proposedSteps ?? workflow.steps} title={workflow.name} />
+            <WorkflowStepsGraph
+              steps={proposedSteps ?? workflow.steps}
+              title={workflow.name}
+              onTimeLimitChange={!isViewer && !hasChanges ? changeTimeLimit : undefined}
+              timeLimitSaving={saveTimeLimit.isPending}
+            />
           ) : (
             <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">
               <WorkflowIcon className="size-8 text-muted-foreground/50" />

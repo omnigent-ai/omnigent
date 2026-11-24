@@ -196,6 +196,92 @@ describe("WorkflowStepsGraph", () => {
   });
 });
 
+describe("a step's time limit", () => {
+  const LIMITED: WorkflowStep[] = [
+    STEPS[0]!,
+    { ...STEPS[1]!, goal: "The suite passes\n\n**Time limit:** 2 hours" },
+  ];
+
+  it("shows the limit from the step's description, read-only by default", () => {
+    render(<WorkflowStepsGraph steps={LIMITED} title="Triage flaky tests" />);
+    const [explore, fix] = screen.getAllByTestId("workflow-step-node");
+    expect(within(explore!).queryByTestId("workflow-step-time-limit")).toBeNull();
+    const limit = within(fix!).getByTestId("workflow-step-time-limit");
+    expect(limit).toHaveTextContent("2h");
+    expect(limit).toHaveAttribute("title", "Time limit: 2 hours");
+    expect(within(fix!).queryByRole("button")).toBeNull();
+  });
+
+  it("sets, spreads and clears a limit from the step's menu", () => {
+    const onTimeLimitChange = vi.fn();
+    const { rerender } = render(
+      <WorkflowStepsGraph
+        steps={LIMITED}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+      />,
+    );
+    const open = (name: string) =>
+      fireEvent.pointerDown(screen.getByRole("button", { name }), { button: 0 });
+
+    open("Set a time limit for Explore the failures");
+    expect(screen.getByRole("menuitemradio", { name: "No limit" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    // A step without a limit has none to use for every step.
+    expect(screen.queryByRole("menuitem", { name: /for every step/ })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "30 minutes" }));
+    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "explore", limit: "30 minutes" });
+
+    open("Time limit for Fix the test: 2 hours");
+    expect(screen.getByRole("menuitemradio", { name: "2 hours" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Use 2 hours for every step" }));
+    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: null, limit: "2 hours" });
+
+    open("Time limit for Fix the test: 2 hours");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "No limit" }));
+    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "fix", limit: null });
+
+    // A save in flight pauses the menus.
+    rerender(
+      <WorkflowStepsGraph
+        steps={LIMITED}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+        timeLimitSaving
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: "Time limit for Fix the test: 2 hours" }),
+    ).toBeDisabled();
+  });
+
+  it("goes by a limit's length when its line says more", () => {
+    const onTimeLimitChange = vi.fn();
+    const goal = "The suite passes\n\n**Time limit:** 4 hours. Tell me if it runs longer.";
+    render(
+      <WorkflowStepsGraph
+        steps={[STEPS[0]!, { ...STEPS[1]!, goal }]}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "Time limit for Fix the test: 4 hours" });
+    expect(button).toHaveTextContent("4h");
+    fireEvent.pointerDown(button, { button: 0 });
+    expect(screen.getByRole("menuitemradio", { name: "4 hours" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Use 4 hours for every step" }));
+    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: null, limit: "4 hours" });
+  });
+});
+
 describe("WorkflowGraphOverlay", () => {
   it("shows where each of a run's steps stands, with a legend", () => {
     const onClose = vi.fn();

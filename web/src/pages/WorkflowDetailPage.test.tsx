@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 
 import { showToast } from "@/components/ui/toast";
 import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
+import type { StepTimeLimitChange } from "@/components/workflows/StepTimeLimit";
 import type { WorkflowSessionRequest } from "@/components/workflows/WorkflowSessionDialog";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
@@ -107,11 +108,32 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => {
 vi.mock("@/hooks/useNow", () => ({ useNow: () => new Date("2026-11-12T18:00:00Z") }));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn(() => "loading") }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
-// The graph has its own tests; here it lists the steps it was given, and the
-// full-screen view where each stands.
+// The graph has its own tests; here it lists the steps it was given, with their goals,
+// a button for the time limit its owner can set, and the full-screen view where each stands.
 vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
-  WorkflowStepsGraph: ({ steps }: { steps: WorkflowStep[] }) => (
-    <div data-testid="workflow-steps-graph">{steps.map((step) => step.name).join(", ")}</div>
+  WorkflowStepsGraph: ({
+    steps,
+    onTimeLimitChange,
+  }: {
+    steps: WorkflowStep[];
+    onTimeLimitChange?: (change: StepTimeLimitChange) => void;
+  }) => (
+    <>
+      <div
+        data-testid="workflow-steps-graph"
+        data-goals={JSON.stringify(steps.map((step) => step.goal))}
+      >
+        {steps.map((step) => step.name).join(", ")}
+      </div>
+      {onTimeLimitChange && (
+        <button
+          type="button"
+          onClick={() => onTimeLimitChange({ stepId: "fix", limit: "2 hours" })}
+        >
+          Limit Fix the test to 2 hours
+        </button>
+      )}
+    </>
   ),
   WorkflowGraphOverlay: (props: {
     title: string;
@@ -394,6 +416,109 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(stored.steps).toEqual(edited));
     },
   );
+
+  it("saves a step's time limit into its description, which an older proposal keeps", async () => {
+    vi.mocked(useServerInfo).mockReturnValue(FALLBACK_SERVER_INFO);
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    let stored: WorkflowDetail = { ...WORKFLOW, planning_session_id: "a".repeat(32) };
+    const patches: { steps: WorkflowStep[] }[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        const body = JSON.parse(String(options.body)) as { steps: WorkflowStep[] };
+        patches.push(body);
+        stored = { ...stored, steps: body.steps };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    // The planning chat's last proposal is the saved plan, from before the limit.
+    const proposal: JournalEntry = {
+      id: "proposal",
+      position: 1,
+      created_at: 1,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      content: { steps: WORKFLOW.steps },
+    };
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [proposal],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+      retry: vi.fn(),
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 2 hours" }));
+    const limited = "The suite passes\n\n**Time limit:** 2 hours";
+    await waitFor(() =>
+      expect(patches).toEqual([
+        { steps: [WORKFLOW.steps[0], { ...WORKFLOW.steps[1], goal: limited }] },
+      ]),
+    );
+    // The proposal without the limit keeps it, so it isn't offered as a change.
+    await waitFor(() =>
+      expect(JSON.parse(screen.getByTestId("workflow-steps-graph").dataset.goals!)).toEqual([
+        null,
+        limited,
+      ]),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
+
+    // A later proposal that changes a step keeps the limit when it's saved.
+    proposal.content = {
+      steps: [WORKFLOW.steps[0], { ...WORKFLOW.steps[1], name: "Fix the flaky test" }],
+    };
+    cleanup();
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(patches).toHaveLength(2));
+    expect(patches[1]!.steps[1]).toEqual({
+      ...WORKFLOW.steps[1],
+      name: "Fix the flaky test",
+      goal: limited,
+    });
+  });
+
+  it("offers time limits only to the owner, and not while a proposal is unsaved", () => {
+    mockRuns([]);
+    mockWorkflow({ data: { ...WORKFLOW, viewer_role: "viewer" } });
+    renderPage();
+    expect(screen.getByTestId("workflow-steps-graph")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Limit Fix the test to 2 hours" })).toBeNull();
+
+    cleanup();
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: "a".repeat(32) } });
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [
+        {
+          id: "proposal",
+          position: 1,
+          created_at: 1,
+          scheduled_task_run_id: null,
+          step: null,
+          author: { type: "agent" },
+          kind: "plan",
+          content: { steps: [WORKFLOW.steps[0]] },
+        },
+      ],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+      retry: vi.fn(),
+    });
+    renderPage();
+    expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Limit Fix the test to 2 hours" })).toBeNull();
+  });
 
   it("expands the planner over the page in place, on wide screens only", () => {
     mockWorkflow({ data: { ...WORKFLOW, steps: [], is_draft: true } });

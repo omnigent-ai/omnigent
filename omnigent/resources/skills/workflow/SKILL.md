@@ -481,8 +481,9 @@ restart after done or failed, or a Continue after Stop:
    and `note: "time limit: <step ID>"`. It's separate from the run's other
    timers.
 2. Note it on the step with `sys_journal_write_note` (`step`: its ID): the
-   limit, the time now from `date -u`, and the `timer_id`, such as
-   `Time limit 2h from 14:05Z, timer 4f1c…`.
+   limit, the time now from `date -u +"%m-%d %H:%MZ"`, and the `timer_id`,
+   such as `Time limit 2h from 11-24 14:05Z, timer 4f1c…`. That time names
+   this attempt below.
 3. Cancel it with `sys_timer_cancel` when the step is done or failed, or when
    you replan without it. On Stop, cancel it with the run's other timers.
 
@@ -511,7 +512,8 @@ with the time in each limited step's note. For a step past its limit:
      name> is over its 2-hour time limit", a `body_md` with how long it has
      run, what it waits on and what you're doing about it, `links` with your
      session (`{"type": "session", "ref": "<your session ID>"}`, from
-     `sys_session_get_info`), and `topic: "time limit <step ID>"`.
+     `sys_session_get_info`), and `topic: "time limit <step ID> <time from
+     its note>"`, so a later attempt's overrun posts a new item.
    - Without either tool, say it in the step's status text, such as "Over
      its 2-hour limit; waiting on web-app's tests", and in your reply.
 4. Note on the step that you told the user, so a later check doesn't tell

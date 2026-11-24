@@ -1,5 +1,6 @@
 """Workflow menu actions through the built SPA and real server."""
 
+from typing import Literal
 from uuid import uuid4
 
 import httpx
@@ -84,3 +85,66 @@ def test_clone_workflow(page: Page, seeded_session: tuple[str, str], draft: bool
         finally:
             for workflow_id in workflow_ids:
                 client.delete(f"/v1/workflows/{workflow_id}")
+
+
+def test_a_step_time_limit_is_a_line_in_its_description(page: Page, live_server: str) -> None:
+    """The step time limit menu writes, spreads and clears its description's Time limit line."""
+    name = f"Fix flaky tests {uuid4().hex[:8]}"
+    fix_goal = "**Outputs:** passing CI.\n\n**Details:** rerun the test."
+    limited = "**Outputs:** passing CI.\n\n**Time limit:** 2 hours\n\n**Details:** rerun the test."
+    steps = [
+        {"id": "fix", "name": "Fix the test", "goal": fix_goal, "depends_on": []},
+        {"id": "report", "name": "Report", "goal": None, "depends_on": ["fix"]},
+    ]
+    with httpx.Client(base_url=live_server, timeout=10.0) as client:
+        response = client.post(
+            "/v1/workflows", json={"name": name, "description": "Fix one test.", "steps": steps}
+        )
+        response.raise_for_status()
+        workflow_id = response.json()["id"]
+        try:
+            page.goto(f"{live_server}/workflows/{workflow_id}")
+            graph = page.get_by_test_id("workflow-steps-graph")
+            expect(graph.get_by_test_id("workflow-step-node")).to_have_count(2)
+
+            def choose(
+                button: str,
+                item: str,
+                role: Literal["menuitemradio", "menuitem"] = "menuitemradio",
+            ) -> dict[str, str | None]:
+                with page.expect_response(
+                    lambda response: (
+                        response.url == f"{live_server}/v1/workflows/{workflow_id}"
+                        and response.request.method == "PATCH"
+                    )
+                ) as saved:
+                    graph.get_by_role("button", name=button, exact=True).click()
+                    page.get_by_role(role, name=item, exact=True).click()
+                assert saved.value.ok, saved.value.text()
+                return {step["id"]: step["goal"] for step in saved.value.json()["steps"]}
+
+            goals = choose("Set a time limit for Fix the test", "2 hours")
+            assert goals == {"fix": limited, "report": None}
+            fix_limit = graph.get_by_role(
+                "button", name="Time limit for Fix the test: 2 hours", exact=True
+            )
+            expect(fix_limit).to_have_text("2h")
+
+            goals = choose(
+                "Time limit for Fix the test: 2 hours", "Use 2 hours for every step", "menuitem"
+            )
+            assert goals == {"fix": limited, "report": "**Time limit:** 2 hours"}
+
+            page.reload()
+            expect(
+                graph.get_by_role("button", name="Time limit for Report: 2 hours", exact=True)
+            ).to_have_text("2h")
+            goals = choose("Time limit for Report: 2 hours", "No limit")
+            assert goals == {"fix": limited, "report": None}
+            expect(
+                graph.get_by_role("button", name="Set a time limit for Report", exact=True)
+            ).to_be_visible()
+            saved_steps = client.get(f"/v1/workflows/{workflow_id}").json()["steps"]
+            assert [step["goal"] for step in saved_steps] == [limited, None]
+        finally:
+            client.delete(f"/v1/workflows/{workflow_id}")
