@@ -789,7 +789,8 @@ and does not apply to the grid's shared panel. Covered by
 `web/electron/e2e/desktop_right_sidebar_widens_window.e2e.js`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
-strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
+strip offers edit, steer, reorder and delete. Mod+Enter steers them all, or
+queues the draft when Always steer is on.
 Closing the side chat discards the follow-ups queued on that device. Other
 devices keep their tabs and queued work. Closing still stops the chat's running
 turn, as before. A closed Codex side chat resumes on its next message or Resume,

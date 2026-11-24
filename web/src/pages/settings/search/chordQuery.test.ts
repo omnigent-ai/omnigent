@@ -275,6 +275,7 @@ const PAGE_CONTEXT: ShortcutPageContext = {
   browser: true,
   submitWithModEnter: false,
   preventsKeyboardSubmit: false,
+  alwaysSteer: false,
   contentSearch: true,
   grids: true,
   splitTerminal: true,
