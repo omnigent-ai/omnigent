@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextvars
 import dataclasses
 import functools
+import inspect
 import logging
 import re
 import subprocess
@@ -116,7 +117,8 @@ _PANEL_READ_STALE_SECONDS = 60.0
 _PANEL_READ_LIMIT = 64
 _PANEL_READ_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-panel-read")
 _PANEL_READ_LOCK = Lock()
-# Every panel write bumps this, so no read that began before the write is served after it.
+# Every panel write in this process bumps this. A write by another process serving the
+# session, such as the host while the runner is offline, changes the registry's write marker.
 _panel_read_generation = 0
 
 _P = ParamSpec("_P")
@@ -127,7 +129,8 @@ _T = TypeVar("_T")
 class _PanelRead:
     """One :func:`pr_info` read that identical panel requests share."""
 
-    generation: int
+    # The panel writes that preceded the read: this process's count and the session's marker.
+    generation: tuple[int, str | None]
     registry_version: object
     started_at: float
     result: Future[dict[str, Any]]
@@ -138,7 +141,8 @@ _RUNNING_PANEL_READS: dict[tuple[object, ...], _PanelRead] = {}
 
 
 def _invalidates_panel_reads(function: Callable[_P, _T]) -> Callable[_P, _T]:
-    """Make panel requests after ``function`` returns wait for a read that starts later."""
+    """Make panel requests after ``function`` returns, in any process, wait for a newer read."""
+    signature = inspect.signature(function)
 
     @functools.wraps(function)
     def write(*args: _P.args, **kwargs: _P.kwargs) -> _T:
@@ -148,6 +152,12 @@ def _invalidates_panel_reads(function: Callable[_P, _T]) -> Callable[_P, _T]:
         finally:
             with _PANEL_READ_LOCK:
                 _panel_read_generation += 1
+            session_id = signature.bind_partial(*args, **kwargs).arguments.get("session_id")
+            if isinstance(session_id, str):
+                try:
+                    SessionPrRegistry(session_id).note_panel_write()
+                except OSError:
+                    _logger.debug("Could not record a PR panel write", exc_info=True)
 
     return write
 
@@ -761,6 +771,7 @@ def _run_panel_read(
         read.result.set_result(payload)
     registry = SessionPrRegistry(session_id)
     version = registry.version()
+    write_marker = registry.panel_write_marker()
     # The read's own title cache writes change the files; a PR linked meanwhile must show.
     try:
         current = payload is not None and (
@@ -775,7 +786,7 @@ def _run_panel_read(
         latest = _PANEL_READS.get(key)
         if (
             current
-            and read.generation == _panel_read_generation
+            and read.generation == (_panel_read_generation, write_marker)
             and (latest is None or latest.started_at <= read.started_at)
         ):
             _PANEL_READS[key] = dataclasses.replace(read, registry_version=version)
@@ -818,12 +829,15 @@ def cached_pr_info(
     if session_id is None:
         return pr_info(root, pr_url=pr_url)
     key = (root, session_id, pr_url, _SERVER_TRACKING.get())
-    version = SessionPrRegistry(session_id).version()
+    registry = SessionPrRegistry(session_id)
+    version = registry.version()
+    write_marker = registry.panel_write_marker()
     requested_at = time.monotonic()
     with _PANEL_READ_LOCK:
+        generation = (_panel_read_generation, write_marker)
         done = _PANEL_READS.get(key) if allow_cached else None
         if done is not None and (
-            done.generation != _panel_read_generation
+            done.generation != generation
             or done.registry_version != version
             or requested_at - done.started_at >= _PANEL_READ_STALE_SECONDS
         ):
@@ -835,11 +849,11 @@ def cached_pr_info(
         start = (
             not allow_cached
             or running is None
-            or running.generation != _panel_read_generation
+            or running.generation != generation
             or running.registry_version != version
         )
         if start:
-            running = _PanelRead(_panel_read_generation, version, requested_at, Future())
+            running = _PanelRead(generation, version, requested_at, Future())
             _RUNNING_PANEL_READS[key] = running
     assert running is not None
     if start:

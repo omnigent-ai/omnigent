@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Literal
@@ -83,6 +84,7 @@ class SessionPrRegistry:
         key = hashlib.sha256(session_id.encode()).hexdigest()
         self.path = (root or data_dir() / "github" / "session-prs") / f"{key}.json"
         self._providers_path = self.path.with_suffix(".providers.json")
+        self._panel_writes_path = self.path.with_suffix(".panel-writes")
 
     def _read(self) -> _Registry:
         """Read both files under the legacy lock, migrating pre-split registries."""
@@ -142,6 +144,18 @@ class SessionPrRegistry:
             else:
                 versions.append((status.st_ino, status.st_mtime_ns, status.st_size))
         return tuple(versions)
+
+    def panel_write_marker(self) -> str | None:
+        """Identify the last PR panel write any process recorded for this session, if any."""
+        try:
+            return self._panel_writes_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def note_panel_write(self) -> None:
+        """Record a PR panel write, so every process serving the session drops older reads."""
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._panel_writes_path.write_text(uuid.uuid4().hex, encoding="utf-8")
 
     def _write(self, state: _Registry, *, legacy_first: bool = False) -> None:
         # Old hosts may rewrite this file; keep foreign associations out of it.

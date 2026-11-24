@@ -908,6 +908,19 @@ def test_panel_polls_share_a_recent_read_and_refresh_an_older_one_in_the_backgro
     assert poll()["pr"]["body"] == f"Read {len(views)}"
 
 
+def _count_polls_waiting_on_reads(monkeypatch: pytest.MonkeyPatch) -> threading.Semaphore:
+    """Release the returned semaphore each time a request waits for, or takes, a shared read."""
+    waiting = threading.Semaphore(0)
+    served = pr_resource._served
+
+    def counting(read: object, requested_at: float) -> dict[str, object]:
+        waiting.release()
+        return served(read, requested_at)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pr_resource, "_served", counting)
+    return waiting
+
+
 def test_concurrent_identical_panel_reads_share_one_forge_read(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -923,6 +936,7 @@ def test_concurrent_identical_panel_reads_share_one_forge_read(
         return 0, json.dumps({"number": 42, "title": "Shared"}), ""
 
     monkeypatch.setattr(github, "_gh", gh)
+    waiting = _count_polls_waiting_on_reads(monkeypatch)
     with ThreadPoolExecutor(max_workers=3) as pool:
         reads = [
             pool.submit(
@@ -935,10 +949,76 @@ def test_concurrent_identical_panel_reads_share_one_forge_read(
             for _ in range(3)
         ]
         assert read_started.wait(budget(5))
+        # The other two requests are waiting on the running read before it may finish.
+        assert all(waiting.acquire(timeout=budget(5)) for _ in range(2))
         read_may_finish.set()
         payloads = [read.result(timeout=budget(5)) for read in reads]
     assert [payload["pr"]["title"] for payload in payloads] == ["Shared"] * 3
     assert len(views) == 1
+
+
+def test_a_failed_shared_read_reaches_every_waiting_poll_and_the_next_poll_retries(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads_started: list[dict[str, object]] = []
+    first_read_started = threading.Event()
+    first_read_may_fail = threading.Event()
+    read_pr_info = pr_resource.pr_info
+
+    def first_read_fails(root: str, **kwargs: Any) -> dict[str, Any]:
+        reads_started.append(kwargs)
+        if len(reads_started) == 1:
+            first_read_started.set()
+            first_read_may_fail.wait(budget(5))
+            raise ValueError("PR tracking is busy; try again.")
+        return read_pr_info(root, **kwargs)
+
+    monkeypatch.setattr(github, "_gh", _forge({"value": "OPEN"}))
+    monkeypatch.setattr(pr_resource, "pr_info", first_read_fails)
+    waiting = _count_polls_waiting_on_reads(monkeypatch)
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        polls = [pool.submit(poll) for _ in range(2)]
+        assert first_read_started.wait(budget(5))
+        assert waiting.acquire(timeout=budget(5))
+        first_read_may_fail.set()
+        for result in polls:
+            with pytest.raises(ValueError, match="busy"):
+                result.result(timeout=budget(5))
+    assert poll()["pr"]["state"] == "OPEN"
+    assert len(reads_started) == 2
+
+
+def test_a_panel_write_by_another_process_makes_the_next_poll_read_again(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host serves edits while the runner is offline; the runner must not undo them."""
+    views: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    poll()
+    poll()
+    assert len(views) == 1
+    # Another process, such as the host, records its write without touching this one's count.
+    SessionPrRegistry("session").note_panel_write()
+    poll()
+    assert len(views) == 2
+    # This process's writes record the marker for the other processes too.
+    marker = SessionPrRegistry("session").panel_write_marker()
+    with suppress(ValueError, KeyError):
+        pr_resource.create_pr_comment(tracked, session_id="session", pr_url=B, body="Done")
+    assert SessionPrRegistry("session").panel_write_marker() not in (None, marker)
 
 
 def test_panel_writes_and_new_tracked_prs_make_the_next_poll_read_again(
