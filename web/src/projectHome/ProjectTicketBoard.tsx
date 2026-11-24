@@ -340,7 +340,7 @@ function TicketColumn({
         </span>
       </h2>
       <div
-        className="-mx-2 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-2 pt-0.5 pb-2"
+        className="-mx-2 flex min-h-0 flex-1 flex-col gap-3 overflow-x-hidden overflow-y-auto px-2 pt-0.5 pb-2"
         style={{ paddingBottom: overlayClearance }}
       >
         {projectId && filteredTickets === undefined && query.isPending ? (
@@ -467,7 +467,7 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           </p>
         )}
       <div className="flex items-center justify-between gap-2 text-sm text-muted-foreground">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           <time
             dateTime={new Date(ticket.updated_at * 1000).toISOString()}
             title={`Updated ${absoluteTime(ticket.updated_at * 1000)}`}
@@ -476,7 +476,7 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           </time>
           <TicketRequester ticket={ticket} />
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <TicketNewActivity ticket={ticket} />
           {ticket.comment_count > 0 && (
             <span
