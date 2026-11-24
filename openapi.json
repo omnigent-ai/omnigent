@@ -21331,7 +21331,7 @@
     },
     "/v1/projects/{project_id}": {
       "delete": {
-        "description": "Delete one of the caller's projects.\n\nMember sessions are not deleted; they are left for the caller to\nunfile (clearing their `project_id`).\n\n**Returns:** `{\"id\": ..., \"object\": \"project.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
+        "description": "Delete one of the caller's projects.\n\nMember sessions are not deleted; they are left for the caller to\nunfile (clearing their `project_id`). A project with tickets is\nrefused unless `delete_tickets` is set, which removes its tickets and\ntheir history too. That is allowed only for a throwaway project (name\nstarting with `zz-` or containing \"throwaway\") and only for the owner,\nnever an agent tool.\n\n**Returns:** `{\"id\": ..., \"object\": \"project.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 403 for an agent request with `delete_tickets`, 404 if not found / not owned by the caller, 409 if the project has tickets and `delete_tickets` is unset or the project is not a throwaway project.",
         "operationId": "delete_project_v1_projects__project_id__delete",
         "parameters": [
           {
@@ -21342,6 +21342,17 @@
             "schema": {
               "title": "Project Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Also delete the project's tickets.",
+            "in": "query",
+            "name": "delete_tickets",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Delete Tickets",
+              "type": "boolean"
             }
           }
         ],

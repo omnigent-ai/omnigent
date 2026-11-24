@@ -97,6 +97,11 @@ def _proposal_response(proposal: MandateProposal) -> dict[str, Any]:
     }
 
 
+def _is_throwaway_project_name(name: str) -> bool:
+    """Whether ``name`` marks a disposable verification project."""
+    return name.startswith("zz-") or "throwaway" in name.lower()
+
+
 def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
     """Keep the mandate owner-written: agents it bounds may only propose additions.
 
@@ -644,21 +649,47 @@ def create_projects_router(
         return {"session_id": session_id, "created": True}
 
     @router.delete("/projects/{project_id}")
-    async def delete_project(request: Request, project_id: str) -> dict[str, Any]:
+    async def delete_project(
+        request: Request,
+        project_id: str,
+        delete_tickets: bool = Query(default=False),
+    ) -> dict[str, Any]:
         """Delete one of the caller's projects.
 
         Member sessions are not deleted; they are left for the caller to
-        unfile (clearing their ``project_id``).
+        unfile (clearing their ``project_id``). A project with tickets is
+        refused unless ``delete_tickets`` is set, which removes its tickets and
+        their history too. That is allowed only for a throwaway project (name
+        starting with ``zz-`` or containing "throwaway") and only for the owner,
+        never an agent tool.
 
         :param request: The incoming request, used to identify the user.
         :param project_id: The project to delete.
+        :param delete_tickets: Also delete the project's tickets.
         :returns: ``{"id": ..., "object": "project.deleted", "deleted": True}``.
-        :raises OmnigentError: 401 if unauthenticated, 404 if not found / not
-            owned by the caller.
+        :raises OmnigentError: 401 if unauthenticated, 403 for an agent request
+            with ``delete_tickets``, 404 if not found / not owned by the caller,
+            409 if the project has tickets and ``delete_tickets`` is unset or
+            the project is not a throwaway project.
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
-        deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
+        if delete_tickets:
+            if ORCHESTRATION_SOURCE_HEADER in request.headers:
+                raise OmnigentError(
+                    "Only the project owner can delete a project's tickets",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            project = await _owned_project(project_id, user_id)
+            if not _is_throwaway_project_name(project.name):
+                raise OmnigentError(
+                    "Tickets can only be deleted with throwaway projects (a name starting "
+                    "with 'zz-' or containing 'throwaway'); ticket history is retained.",
+                    code=ErrorCode.CONFLICT,
+                )
+        deleted = await asyncio.to_thread(
+            project_store.delete, project_id, user_id=user_id, delete_tickets=delete_tickets
+        )
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         # Drop the folder from the owner's other connected clients live.

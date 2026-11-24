@@ -140,7 +140,12 @@ class ProjectStore(ABC):
 
     @abstractmethod
     def delete(
-        self, project_id: str, *, user_id: str | None, require_no_main: bool = False
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        require_no_main: bool = False,
+        delete_tickets: bool = False,
     ) -> bool:
         """
         Delete an owned project. Idempotent.
@@ -150,6 +155,8 @@ class ProjectStore(ABC):
 
         :param project_id: Opaque project identifier.
         :param user_id: The requesting owner.
+        :param delete_tickets: Also delete the project's tickets and their
+            history. Without it, a project with tickets is refused (409).
         :returns: ``True`` if removed; ``False`` if not found / not owned.
         """
         ...

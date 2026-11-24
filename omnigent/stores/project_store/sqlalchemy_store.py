@@ -9,7 +9,7 @@ import uuid
 from typing import Any
 
 import zstandard
-from sqlalchemy import LargeBinary, asc, select, tuple_, type_coerce, update
+from sqlalchemy import LargeBinary, asc, delete, select, tuple_, type_coerce, update
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
@@ -19,6 +19,10 @@ from omnigent.db.db_models import (
     SqlProject,
     SqlProjectIdentity,
     SqlProjectTicket,
+    SqlProjectTicketEvent,
+    SqlProjectTicketLink,
+    SqlProjectTicketRead,
+    SqlProjectTicketSession,
     current_workspace_id,
 )
 from omnigent.db.preference_rows import upsert_preference_row
@@ -468,9 +472,19 @@ class SqlAlchemyProjectStore(ProjectStore):
         return run_write_transaction(self._session_immediate, "update_project", write)
 
     def delete(
-        self, project_id: str, *, user_id: str | None, require_no_main: bool = False
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        require_no_main: bool = False,
+        delete_tickets: bool = False,
     ) -> bool:
-        """Delete an owned project. Idempotent; returns ``False`` if not found."""
+        """Delete an owned project. Idempotent; returns ``False`` if not found.
+
+        With ``delete_tickets`` the project's tickets go too, with their events,
+        session links, read state and related-ticket links; otherwise a project
+        with tickets is refused so its ticket history is retained.
+        """
 
         def write(session: Session) -> bool:
             row = session.scalar(
@@ -485,7 +499,21 @@ class SqlAlchemyProjectStore(ProjectStore):
                 return False
             if require_no_main and (row.main_session_id or row.legacy_orchestrator_session_id):
                 return False
-            if (
+            if delete_tickets:
+                for model in (
+                    SqlProjectTicketEvent,
+                    SqlProjectTicketSession,
+                    SqlProjectTicketRead,
+                    SqlProjectTicketLink,
+                    SqlProjectTicket,
+                ):
+                    session.execute(
+                        delete(model).where(
+                            model.workspace_id == current_workspace_id(),
+                            model.project_id == project_id,
+                        )
+                    )
+            elif (
                 session.scalar(
                     select(SqlProjectTicket.id)
                     .where(

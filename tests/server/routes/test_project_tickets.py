@@ -1446,3 +1446,34 @@ async def test_notifications_drain_through_normal_dispatch_after_reconnect(
     finally:
         await inputs.shutdown()
         await runner.aclose()
+
+
+async def test_delete_tickets_flag_is_owner_only_and_limited_to_throwaway_projects(
+    project_client,
+):
+    async def project_with_ticket(name):
+        project = (await project_client.post("/v1/projects", json={"name": name})).json()
+        created = await project_client.post(
+            f"/v1/projects/{project['id']}/tickets", json={"title": "Probe"}
+        )
+        assert created.status_code == 201, created.text
+        return f"/v1/projects/{project['id']}"
+
+    kept = await project_with_ticket("Real work")
+    refused = await project_client.delete(kept, params={"delete_tickets": "true"})
+    assert refused.status_code == 409
+    assert "throwaway" in refused.text
+    assert (await project_client.get(kept)).status_code == 200
+
+    throwaway = await project_with_ticket("zz-probe (throwaway)")
+    assert (await project_client.delete(throwaway)).status_code == 409
+    agent = await project_client.delete(
+        throwaway,
+        params={"delete_tickets": "true"},
+        headers={ORCHESTRATION_SOURCE_HEADER: uuid4().hex},
+    )
+    assert agent.status_code in (403, 404)
+    assert (await project_client.get(throwaway)).status_code == 200
+    deleted = await project_client.delete(throwaway, params={"delete_tickets": "true"})
+    assert deleted.status_code == 200, deleted.text
+    assert (await project_client.get(throwaway)).status_code == 404

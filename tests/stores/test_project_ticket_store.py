@@ -914,3 +914,36 @@ def test_stage_pages_paginate_once_with_the_last_stage_newest_first_and_move_tog
     assert len(tickets.list(project.id, user_id="alice", stage_id="queued")["data"]) == 6
     for ticket in records:
         assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "queued"
+
+
+def test_project_delete_with_tickets_removes_ticket_history_only_when_asked(board, db_uri):
+    tickets, projects, project = board
+    actor = TicketActor("alice")
+    first, second = [
+        tickets.create(project.id, CreateTicket(title=title), actor) for title in ("A", "B")
+    ]
+    tickets.link_ticket(project.id, first["id"], second["id"], "attach", actor)
+    worker = SqlAlchemyConversationStore(db_uri).create_conversation(project_id=project.id)
+    tickets.link_session(project.id, first["id"], worker.id, "attach", actor)
+    tickets.mark_seen(project.id, first["id"], MarkTicketSeen(seen_position=0), user_id="alice")
+    other = projects.create(uuid4().hex, "Other", "alice")
+    kept = tickets.create(other.id, CreateTicket(title="Kept"), actor)
+
+    with pytest.raises(OmnigentError, match="cannot be deleted"):
+        projects.delete(project.id, user_id="alice")
+    assert projects.delete(project.id, user_id="alice", delete_tickets=True) is True
+
+    assert projects.get(project.id, user_id="alice") is None
+    # Only the other project's ticket and its creation event remain.
+    remaining = {"project_tickets": 1, "project_ticket_events": 1}
+    with get_or_create_engine(db_uri).connect() as connection:
+        for table in (
+            "project_tickets",
+            "project_ticket_events",
+            "project_ticket_sessions",
+            "project_ticket_reads",
+            "project_ticket_links",
+        ):
+            count = connection.exec_driver_sql(f"SELECT COUNT(*) FROM {table}").scalar()
+            assert count == remaining.get(table, 0), table
+    assert tickets.get(other.id, kept["id"], user_id="alice")["title"] == "Kept"
