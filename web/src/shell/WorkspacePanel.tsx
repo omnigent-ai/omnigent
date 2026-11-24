@@ -1679,6 +1679,7 @@ function WorkspacePanelImpl({
     ...openTerminals,
     ...(showBrowserTab ? browsers.tabs : []).map((tabId) => `browser:${tabId}`),
     ...sideChats.tabs.map((childId) => `sidechat:${childId}`),
+    ...gadgetRail.tabs.map((tab) => `gadget:${tab.key}`),
   ];
   const openTabCount = openTabKeys.length;
   const openTabsSignature = JSON.stringify(openTabKeys);

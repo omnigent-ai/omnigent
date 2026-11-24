@@ -139,6 +139,18 @@ vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+// Tabs the gadget rail reports, for the cases that keep a gadget open; null uses the real hook.
+const gadgetRailTabs = vi.hoisted(() => ({ value: null as { key: string; label: string }[] | null }));
+vi.mock("@/gadgets/ui/GadgetRailTabs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/gadgets/ui/GadgetRailTabs")>();
+  return {
+    ...actual,
+    useGadgetRailTabState: (...args: Parameters<typeof actual.useGadgetRailTabState>) => {
+      const state = actual.useGadgetRailTabState(...args);
+      return gadgetRailTabs.value === null ? state : { ...state, tabs: gadgetRailTabs.value };
+    },
+  };
+});
 // A side chat's pane is covered by its own suite; the stub just names its child.
 vi.mock("@/components/chat/SideChatPane", () => ({
   SideChatPane: ({
@@ -513,6 +525,22 @@ describe("WorkspacePanel surface presentation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close notes.md" }));
     rerender({ openFiles: [], selectedFilePath: null });
     expect(onHide).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the rail when the user closes the last file but a gadget is still open", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    gadgetRailTabs.value = [{ key: "gadget:g1", label: "Board" }];
+    try {
+      const { rerender, onHide } = renderWorkspace({
+        selectedFilePath: "README.md",
+        openFiles: ["README.md"],
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Close README.md" }));
+      rerender({ openFiles: [], selectedFilePath: null });
+      expect(onHide).not.toHaveBeenCalled();
+    } finally {
+      gadgetRailTabs.value = null;
+    }
   });
 
   it("keeps the rail when Close other tabs keeps a pinned page", async () => {
