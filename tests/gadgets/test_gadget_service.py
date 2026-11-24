@@ -1986,8 +1986,9 @@ def test_comments_page_with_their_filter_and_reach_a_draft_past_the_first_page(
         )
         for n in range(5)
     ]
-    # The one draft left is the comment with the last ID, so it is on the last page.
-    draft = max(created, key=lambda comment: comment["id"])
+    # Comments page in the order they were made; the one draft left is the last made, so it
+    # is on the last page.
+    draft = created[-1]
     for comment in created:
         if comment is not draft:
             owner.update_comment(app["id"], comment["id"], {"status": "addressed"})

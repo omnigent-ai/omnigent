@@ -18852,7 +18852,7 @@
     },
     "/v1/gadgets/{app_id}/comments": {
       "get": {
-        "description": "A page of comments in ID order, `{\"items\", \"next_cursor\", \"can_comment\"}`,\noptionally only `?status=`; a page can be short and still continue.",
+        "description": "A page of comments in the order they were made,\n`{\"items\", \"next_cursor\", \"can_comment\"}`, optionally only `?status=`; a page\ncan be short and still continue.",
         "operationId": "list_comments_v1_gadgets__app_id__comments_get",
         "parameters": [
           {

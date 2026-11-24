@@ -12,6 +12,7 @@ Layout under ``root_path``::
     <collection>/<id>/00000003.json   # delete (tombstone)
     <collection>/<id>/00000004.json   # re-create after a tombstone
     <collection>/<id>/s00000002/00001001.json   # later revisions, one directory per segment
+    .order/<collection>/s00000001/00000001.json  # the collection's order: {"id", "first"}
 
 A record's revisions are numbered across segments of
 ``StoreLimits.revisions_per_segment`` files: the first segment sits in the
@@ -64,6 +65,12 @@ Guarantees
   reading revisions by number (a doubling probe, then bisection), so a read costs about
   ``2 * log2(revisions)`` file reads and no directory listing. ``verify_record`` verifies
   the whole chain and the numbering of the record's directories.
+* ``list`` pages records in the order they were first created. Each new record (or
+  one created again after it was removed) first gets the next numbered entry in the
+  collection's order, naming its ID and the digest of its first revision; a page reads
+  entries by number and skips those whose record is deleted, was removed and created
+  again, or never got that first revision. Entries are never removed, so a page whose
+  scan budget runs out on old entries is short and continues with its cursor.
 * Version tokens and list cursors are opaque, versioned and scoped to the
   store root, collection and record, so a token from another record or store
   fails with :class:`InvalidInput` instead of matching by accident.
@@ -167,6 +174,9 @@ _CAPACITY_PROBES: Final = 64
 # The characters a record ID starts with, in sort order; reclaim starts its search at one.
 _ID_ALPHABET: Final = "0123456789abcdefghijklmnopqrstuvwxyz"
 _REVISION_DIGITS: Final = 8
+# Entries per directory of a collection's order (``.order``).
+_ORDER_PER_SEGMENT: Final = 1000
+_ORDER_APPEND_ATTEMPTS: Final = 16
 _MAX_REVISION_NUMBER: Final = 10**_REVISION_DIGITS - 1
 
 _ENVELOPE_KEYS: Final = frozenset(
@@ -333,6 +343,8 @@ class _Head:
     count: int
     latest: _Revision
     previous: _Revision | None
+    # Revision 1's digest: names this incarnation of the record in the collection's order.
+    first_digest: str
 
 
 # The store defines a ``list`` method, which would shadow the builtin in class-level annotations.
@@ -481,58 +493,112 @@ class ImmutableDocumentStore:
         return None if revision.kind in _GONE else self._document(ref, revision)
 
     def list(self, collection: str, limit: int = 100, cursor: str | None = None) -> DocumentPage:
-        """One page of live documents ordered by id; not a snapshot across records.
+        """One page of live documents in the order they were first created; not a snapshot.
 
-        Reads the collection directory a page at a time (``GadgetFiles.list_page``) and
-        examines at most ``max_scan_per_list`` records, so a page costs bounded work however
-        many records, or deleted ones, the collection holds.
+        Walks the collection's order (``.order``), whose entries are addressed by number,
+        so a page reads at most ``max_scan_per_list`` entries and their records however
+        many records, or deleted ones, the collection holds, and never lists the
+        collection's directory.
         """
         _validate_identifier(collection, "collection")
         if type(limit) is not int or not 1 <= limit <= self._limits.max_list_limit:
             raise InvalidInput(f"limit must be an integer in 1..{self._limits.max_list_limit}")
-        after = self._decode_cursor(cursor, collection) if cursor is not None else None
-        directory = f"{self._root}/{collection}"
+        last = self._decode_cursor(cursor, collection) if cursor is not None else 0
         items: list[Document] = []
-        scanned = 0
         page_bytes = _PAGE_OVERHEAD_BYTES
-        last: str | None = after
         more = True
-        while more and len(items) < limit and scanned < self._limits.max_scan_per_list:
-            chunk = min(limit - len(items), self._limits.max_scan_per_list - scanned)
-            try:
-                names, more = self._files.list_page(directory, after=last, limit=chunk)
-            except NotFound:
-                names, more = [], False
-            stop = False
-            for name in names:
-                record_id = self._record_name(collection, name)
-                ref = self._ref(collection, record_id)
-                scanned += 1
-                head = self._load_head(ref)
-                if head is not None and head.latest.kind not in _GONE:
-                    document = self._document(ref, head.latest)
-                    item_bytes = _encoded_size(document.to_dict()) + 1  # +1 for the comma
-                    if page_bytes + item_bytes > self._limits.max_page_bytes:
-                        if not items:
-                            raise CapacityExceeded(
-                                "a single document does not fit in max_page_bytes"
-                            )
-                        # Leave it for the next page; the cursor stops before it.
-                        more, stop = True, True
-                        break
-                    page_bytes += item_bytes
-                    items.append(document)
-                last = record_id
-            if stop:
+        scanned = 0
+        while len(items) < limit:
+            if scanned >= self._limits.max_scan_per_list:
                 break
-            if not names:
+            entry = self._order_entry(collection, last + 1)
+            if entry is None:
                 more = False
+                break
+            scanned += 1
+            ref = self._ref(collection, entry[0])
+            head = self._load_head(ref)
+            if (
+                head is not None
+                and head.first_digest == entry[1]
+                and head.latest.kind not in _GONE
+            ):
+                document = self._document(ref, head.latest)
+                item_bytes = _encoded_size(document.to_dict()) + 1  # +1 for the comma
+                if page_bytes + item_bytes > self._limits.max_page_bytes:
+                    if not items:
+                        raise CapacityExceeded("a single document does not fit in max_page_bytes")
+                    break  # Leave it for the next page; the cursor stops before it.
+                page_bytes += item_bytes
+                items.append(document)
+            last += 1
         return DocumentPage(
             items=tuple(items),
-            next_cursor=self._encode_cursor(collection, last)
-            if more and last is not None
-            else None,
+            next_cursor=self._encode_cursor(collection, last) if more else None,
         )
+
+    # -- the collection's order ------------------------------------------------
+
+    def _order_path(self, collection: str, number: int) -> str:
+        segment = (number - 1) // _ORDER_PER_SEGMENT + 1
+        return (
+            f"{self._root}/.order/{collection}/s{segment:0{_REVISION_DIGITS}d}"
+            f"/{number:0{_REVISION_DIGITS}d}.json"
+        )
+
+    def _order_entry(self, collection: str, number: int) -> tuple[str, str] | None:
+        """Entry *number*: the record ID and its first revision's digest, or ``None``."""
+        try:
+            raw = self._files.read_json(self._order_path(collection, number))
+        except NotFound:
+            return None
+        doc_id, first = raw.get("id"), raw.get("first")
+        if (
+            not isinstance(doc_id, str)
+            or _IDENTIFIER_RE.fullmatch(doc_id) is None
+            or not isinstance(first, str)
+            or _HEX64_RE.fullmatch(first) is None
+        ):
+            raise CorruptData(f"{collection}: damaged order entry {number}", collection=collection)
+        return doc_id, first
+
+    def _order_end(self, collection: str) -> int:
+        """How many entries the collection's order has. Entries are numbered without gaps,
+        so the last is found by reading entries 1, 2, 4, ... and bisecting: about
+        ``2 * log2(entries)`` reads and no listing."""
+
+        def present(number: int) -> bool:
+            try:
+                self._files.read_json(self._order_path(collection, number))
+            except NotFound:
+                return False
+            return True
+
+        if not present(1):
+            return 0
+        low, high = 1, 2
+        while present(high):
+            low, high = high, high * 2
+        while high - low > 1:
+            middle = (low + high) // 2
+            if present(middle):
+                low = middle
+            else:
+                high = middle
+        return low
+
+    def _order_append(self, collection: str, doc_id: str, first: str) -> None:
+        """Add an entry after the order's last; a writer that loses a slot takes the next."""
+        end = self._order_end(collection)
+        for _attempt in range(_ORDER_APPEND_ATTEMPTS):
+            path = self._order_path(collection, end + 1)
+            try:
+                self._files.mkdirs(posixpath.dirname(path))
+                self._files.create_json(path, {"id": doc_id, "first": first})
+                return
+            except Conflict:
+                end = max(end + 1, self._order_end(collection))
+        raise Conflict("collection is busy; retry shortly", reason="concurrent_write")
 
     def _record_name(self, collection: str, name: str) -> str:
         name = posixpath.basename(str(name).rstrip("/"))
@@ -832,6 +898,9 @@ class ImmutableDocumentStore:
             body["value"] = copy.deepcopy(value)
         body["digest"] = compute_envelope_digest(body)
         if head is None:
+            # Listed in the collection's order before it exists: an entry whose record never
+            # got this first revision names no record and pages skip it.
+            self._order_append(ref.collection, ref.doc_id, body["digest"])
             self._files.mkdirs(ref.directory)
         path = self._revision_path(ref, number)
         try:
@@ -1003,7 +1072,8 @@ class ImmutableDocumentStore:
         if count > 1:
             previous = revision(count - 1)
             self._check_link(ref, previous, latest)
-        return _Head(count=count, latest=latest, previous=previous)
+        first = latest if count == 1 else revision(1)
+        return _Head(count=count, latest=latest, previous=previous, first_digest=first.digest)
 
     def _revision_exists(self, ref: _Ref, number: int, seen: dict[int, Any] | None = None) -> bool:
         try:
@@ -1413,29 +1483,21 @@ class ImmutableDocumentStore:
     def _reclaim(self, collection: str, doc_id: str) -> bool:
         """Remove some records deleted longer than the retention ago; whether any went.
 
-        Looks at most ``max_scan_per_list`` records, starting at a point derived from
-        *doc_id* and wrapping around once, so creates spread their search over the
-        collection and each costs bounded work.
+        Looks only at the records holding the capacity slots *doc_id* may claim (its probe
+        run), so each create costs bounded work and frees a slot it can actually take.
         """
         if not self._files.supports_delete:
             return False
-        directory = f"{self._root}/{collection}"
-        start = _ID_ALPHABET[
-            int(hashlib.sha256(doc_id.encode()).hexdigest(), 16) % len(_ID_ALPHABET)
-        ]
-        budget = self._limits.max_scan_per_list
+        # A new record can only take a slot in its own probe run, so the records worth
+        # removing are those holding those slots: a bounded, exact set of candidates.
         candidates: list[str] = []
-        for after in (start, None):
-            if budget <= 0:
-                break
+        for path in self._probe_slots(collection, doc_id):
             try:
-                names, _ = self._files.list_page(directory, after=after, limit=budget)
-            except NotFound:
-                return False
-            if after is None:
-                names = [name for name in names if name <= start]
-            candidates.extend(self._record_name(collection, name) for name in names)
-            budget -= len(names)
+                owner = self._read_claim(path, collection)
+            except CorruptData:
+                continue
+            if owner is not None and owner["id"] not in candidates:
+                candidates.append(owner["id"])
         removed = 0
         for candidate in candidates:
             if candidate == doc_id:
@@ -1636,13 +1698,13 @@ class ImmutableDocumentStore:
             raise InvalidInput("if_version belongs to a different document")
         return int(match.group(3))
 
-    def _encode_cursor(self, collection: str, last_id: str) -> str:
-        payload = {"v": 1, "s": self._scope(collection), "after": last_id}
+    def _encode_cursor(self, collection: str, last: int) -> str:
+        payload = {"v": 2, "s": self._scope(collection), "after": last}
         return _CURSOR_PREFIX + _b64encode(
             json.dumps(payload, sort_keys=True, separators=(",", ":"))
         )
 
-    def _decode_cursor(self, cursor: Any, collection: str) -> str:
+    def _decode_cursor(self, cursor: Any, collection: str) -> int:
         invalid = InvalidInput("cursor is not valid")
         if (
             not isinstance(cursor, str)
@@ -1657,16 +1719,13 @@ class ImmutableDocumentStore:
         if (
             not isinstance(payload, dict)
             or set(payload) != {"v", "s", "after"}
-            or payload["v"] != 1
+            or payload["v"] != 2
         ):
             raise invalid
         after = payload["after"]
-        if not isinstance(payload["s"], str) or not isinstance(after, str):
+        if not isinstance(payload["s"], str) or type(after) is not int or after < 0:
             raise invalid
-        if (
-            _IDENTIFIER_RE.fullmatch(after) is None
-            or self._encode_cursor(collection, after) != cursor
-        ):
+        if self._encode_cursor(collection, after) != cursor:
             if payload["s"] != self._scope(collection):
                 raise InvalidInput("cursor belongs to a different collection")
             raise invalid

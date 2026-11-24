@@ -453,8 +453,9 @@ def create_gadgets_router(
         },
     )
     async def list_comments(app_id: str, request: Request) -> Response:
-        """A page of comments in ID order, ``{"items", "next_cursor", "can_comment"}``,
-        optionally only ``?status=``; a page can be short and still continue."""
+        """A page of comments in the order they were made,
+        ``{"items", "next_cursor", "can_comment"}``, optionally only ``?status=``; a page
+        can be short and still continue."""
         status = request.query_params.get("status")
         limit, cursor = _page(request, 100)
         return _json(

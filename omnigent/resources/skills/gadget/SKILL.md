@@ -71,7 +71,7 @@ collection at a time:
 | `op` | Arguments | Result |
 | --- | --- | --- |
 | `get` | `id` | `{"record": record}`, `{"record": null}` when it does not exist |
-| `list` | `limit` (1–200), `cursor` | `{"items": [record, ...], "next_cursor": string or null}`, ordered by ID |
+| `list` | `limit` (1–200), `cursor` | `{"items": [record, ...], "next_cursor": string or null}`, in the order records were first created |
 | `create` | `value`, optional `id` | the record |
 | `replace` | `id`, `value` (the whole record), `if_version` | the record |
 | `delete` | `id`, `if_version` | `{"id", "version", "deleted": true}` |

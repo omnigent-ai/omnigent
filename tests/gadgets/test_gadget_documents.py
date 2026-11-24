@@ -63,6 +63,18 @@ class Env:
         return version
 
 
+def _list_all(docs: ImmutableDocumentStore, collection: str) -> list[str]:
+    """Every live record's ID, following cursors past pages a scan budget cut short."""
+    ids: list[str] = []
+    cursor = None
+    while True:
+        page = docs.list(collection, cursor=cursor)
+        ids.extend(item.id for item in page.items)
+        if page.next_cursor is None:
+            return ids
+        cursor = page.next_cursor
+
+
 @pytest.fixture
 def env(tmp_path: Path) -> Env:
     return Env(tmp_path)
@@ -216,14 +228,14 @@ def test_records_deleted_past_retention_give_their_capacity_back(env: Env) -> No
     created = env.docs.create("cards", "c", {"n": 1}, "op-c", ACTOR)
     assert created.id == "c"
     assert not (env.root / "cards" / "a").exists()
-    assert [item.id for item in env.docs.list("cards").items] == ["b", "c"]
+    assert _list_all(env.docs, "cards") == ["b", "c"]
     # Churn never exhausts the collection: delete and create again, many times over.
     current = created
     for n in range(6):
         env.docs.delete("cards", current.id, current.version, f"del-{n}", ACTOR)
         env.clock.advance(61)
         current = env.docs.create("cards", f"n{n}", {"n": n}, f"op-n{n}", ACTOR)
-    assert sorted(item.id for item in env.docs.list("cards").items) == ["b", "n5"]
+    assert sorted(_list_all(env.docs, "cards")) == ["b", "n5"]
 
 
 def test_a_removed_record_can_be_created_again_from_scratch(env: Env) -> None:
@@ -561,7 +573,10 @@ class CountingFiles(GadgetFiles):
 
     def list_page(self, path: str, *, after: str | None, limit: int) -> tuple[list[str], bool]:
         names, more = self.inner.list_page(path, after=after, limit=limit)
-        self.examined += len(names)
+        # The local store reads the whole directory to seek, so count every entry in it,
+        # not only the page returned.
+        self.examined += len(self.inner.list_paths(path))
+        self.full_listings.append(path)
         return names, more
 
     def mkdirs(self, path: str) -> None:
@@ -602,7 +617,7 @@ def test_a_page_examines_a_bounded_number_of_records_however_many_were_deleted(
 
     page = docs.list("cards", limit=5)
 
-    # Twenty records looked at (the scan budget), each its directory plus two revisions.
+    # Twenty order entries looked at (the scan budget), each with its record's head.
     assert page.items == () and page.next_cursor is not None
     assert not any(path.endswith("/cards") for path in files.full_listings)
     assert files.examined <= WIDE.max_scan_per_list * 6
@@ -616,6 +631,26 @@ def test_a_page_examines_a_bounded_number_of_records_however_many_were_deleted(
         if cursor is None:
             break
     assert seen == [f"c{n:03d}" for n in range(190, 200)]
+
+
+def test_a_page_costs_the_same_however_large_the_collection_grows(tmp_path: Path) -> None:
+    files, docs, _clock = _counting(tmp_path)
+    costs: dict[int, int] = {}
+    for n in range(600):
+        docs.create("cards", f"c{n:03d}", {"n": n}, f"create-{n}", ACTOR)
+        if n + 1 in (30, 300, 600):
+            files.reset()
+            first = docs.list("cards", limit=10)
+            later = docs.list("cards", limit=10, cursor=first.next_cursor)
+            assert [item.id for item in later.items] == [f"c{k:03d}" for k in range(10, 20)]
+            costs[n + 1] = files.examined
+            # Pages list only each record's own newest segment, never the collection's
+            # directory or its order.
+            assert all(
+                path.startswith("data/cards/c") and ".order" not in path
+                for path in files.full_listings
+            ), files.full_listings
+    assert costs[600] == costs[30], costs
 
 
 def test_a_late_create_retry_after_a_delete_is_answered_without_reading_the_history(
@@ -679,7 +714,9 @@ def test_a_create_probes_a_bounded_run_of_capacity_slots(tmp_path: Path) -> None
     docs.create("cards", "fresh", {"n": 1}, "create-fresh", ACTOR)
 
     assert not any(path.endswith("/cards") for path in files.full_listings)
-    assert files.examined <= 80
+    # 64 capacity slots, plus about 2*log2(300) reads to find the end of the collection's
+    # order for its new entry.
+    assert files.examined <= 100
 
 
 def test_reclaiming_capacity_looks_at_a_bounded_number_of_records(tmp_path: Path) -> None:

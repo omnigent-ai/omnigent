@@ -784,8 +784,8 @@ class GadgetService:
     def list_comments(
         self, app_id: str, status: Any = None, limit: Any = 100, cursor: Any = None
     ) -> dict:
-        """One page of the gadget's comments in ID order, optionally only one *status*:
-        ``{"items", "next_cursor", "can_comment"}``.
+        """One page of the gadget's comments in the order they were made, optionally only
+        one *status*: ``{"items", "next_cursor", "can_comment"}``.
 
         The filter applies while paging, so a short or empty page can still continue;
         follow ``next_cursor`` to the end before sorting comments by time.
