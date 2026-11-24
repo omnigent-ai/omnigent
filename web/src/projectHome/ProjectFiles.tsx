@@ -25,7 +25,7 @@ export function ProjectFiles({ projectId }: { projectId: string | null }) {
       <PopoverTrigger asChild>
         <Button variant="ghost" size={isMobile ? "icon" : "sm"} aria-label="Files">
           <FolderOpenIcon />
-          {!isMobile && "Files"}
+          {!isMobile && <span className="max-xl:hidden">Files</span>}
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-96 p-0">

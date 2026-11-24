@@ -15,12 +15,12 @@ export function ProjectBoardActions({ projectName }: { projectName: string }) {
   const { projectId, projects } = useTicketProject(projectName);
   const leadRemoved = useProjectRecord(projectId).data?.lead_removed;
   return (
-    <div className="flex items-center gap-2" role="group" aria-label="Project actions">
+    <div className="flex shrink-0 items-center gap-2" role="group" aria-label="Project actions">
       {!leadRemoved && (
         <Button asChild variant="ghost" size={isMobile ? "icon" : "sm"}>
           <Link to={projectOrchestratorPath(projectName, search)} aria-label="Lead">
             <MessageSquareIcon />
-            {!isMobile && "Lead"}
+            {!isMobile && <span className="max-xl:hidden">Lead</span>}
           </Link>
         </Button>
       )}
