@@ -64,7 +64,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.host.workspace_git.ignored import DirectoryIgnores
-from omnigent.host.workspace_git.runner import GitError, GitProblem
+from omnigent.host.workspace_git.runner import Deadline, GitError, GitProblem, GitRepository
 from omnigent.host.workspace_service import (
     _SERVED,
     WorkspaceService,
@@ -436,6 +436,36 @@ async def test_list_directory_marks_ignored_entries_of_a_subfolder(
         "src/generated.py": True,
         "src/main.py": False,
     }
+
+
+async def test_list_directory_reads_ignore_rules_where_the_listing_is_read(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _ignoring_workspace(tmp_path / "repo")
+    (root / "allowed").mkdir()
+    (root / "allowed" / "main.py").write_text("x")
+    # Outside the workspace, a repository whose rules would hide the same name.
+    outside = _repository(tmp_path / "outside")
+    (outside / "inner").mkdir()
+    (outside / "allowed").mkdir()
+    (outside / "allowed" / ".gitignore").write_text("main.py\n")
+    (root / "link").symlink_to(outside / "inner")
+    discovered: list[Path] = []
+    discover = GitRepository.discover
+
+    async def record(directory: Path, deadline: Deadline) -> GitRepository | None:
+        discovered.append(directory)
+        return await discover(directory, deadline)
+
+    monkeypatch.setattr(GitRepository, "discover", record)
+    client = client_for(root)
+
+    # The listing reads "link/../allowed" as "allowed", so Git must look there too.
+    direct = await client.list_directory(ListDirectoryRequest(path="allowed"))
+    through_link = await client.list_directory(ListDirectoryRequest(path="link/../allowed"))
+
+    assert _listed(through_link.entries) == _listed(direct.entries) == {"allowed/main.py": False}
+    assert discovered == [root.resolve() / "allowed"] * 2
 
 
 async def test_read_file_matches_rest_file_content(tmp_path: Path, client_for: ClientFor) -> None:

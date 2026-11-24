@@ -217,8 +217,9 @@ class WorkspaceService(WorkspaceServiceMethods):
             )
 
         page = await read_page(after)
-        # The listing has accepted the path: one repository answers for the whole request.
-        ignores = await _directory_ignores(reader.root / request.path, deadline)
+        # Git reads the confined directory the listing read; one repository answers for it all.
+        directory = await _read(reader.resolve_directory, request.path)
+        ignores = await _directory_ignores(directory, deadline)
         while True:
             paths = [item["path"] for item in page.data]
             # The REST listing has no symlink flag, so look at each entry itself.
