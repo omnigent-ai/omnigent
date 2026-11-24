@@ -217,6 +217,7 @@ import {
 } from "@/hooks/useConversations";
 import { fetchConversationById, useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { ProjectMembersNotMovedError } from "@/lib/projectsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -238,6 +239,7 @@ import { useActiveRootSessionId } from "@/hooks/useSession";
 import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { SidebarEditRow } from "./SidebarEditRow";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -1977,6 +1979,31 @@ function ProjectFolder({
     icon,
     onProjectRenamed,
   );
+  // Double-clicking the name renames it inline, as a session row does. The
+  // header shows the committed name until the renamed folder replaces this one.
+  const renameProject = useRenameProject();
+  const [renamingInline, setRenamingInline] = useState(false);
+  const [pendingName, setPendingName] = useState<string | null>(null);
+  const shownName = pendingName ?? name;
+  const commitInlineRename = async (value: string) => {
+    setRenamingInline(false);
+    const newName = value.trim();
+    if (newName === "" || newName === name) return;
+    setPendingName(newName);
+    try {
+      await renameProject.mutateAsync({ id: projectId, oldName: name, newName });
+      onProjectRenamed?.(name, newName);
+    } catch (error) {
+      if (error instanceof ProjectMembersNotMovedError) {
+        onProjectRenamed?.(name, newName);
+        showToast(error.message);
+        return;
+      }
+      setPendingName(null);
+      const message = error instanceof Error ? error.message : String(error);
+      showToast(`Couldn't rename the project: ${message}`);
+    }
+  };
 
   const headerDrag = useSortable({
     id: projectDragId(name),
@@ -2039,7 +2066,21 @@ function ProjectFolder({
       )}
       <ConversationSection
         headerDrag={placeholder ? undefined : headerDrag}
-        title={name}
+        title={shownName}
+        onRenameHeader={
+          placeholder || pendingName !== null ? undefined : () => setRenamingInline(true)
+        }
+        headerEditor={
+          renamingInline ? (
+            <SidebarEditRow
+              initialTitle={name}
+              label="Rename project"
+              inputTestId="rename-project-inline-input"
+              onCommit={(value) => void commitInlineRename(value)}
+              onCancel={() => setRenamingInline(false)}
+            />
+          ) : undefined
+        }
         icon={
           icon ? (
             <span className="text-[14px] leading-none">{icon}</span>
@@ -2961,6 +3002,15 @@ function ConversationList({
       return next;
     });
   }, []);
+  // The project home is addressed by name, so follow its project to the new name,
+  // keeping the query (an open session panel).
+  const navigate = useNavigate();
+  const location = useLocation();
+  const handleProjectRenamed = useStableCallback((oldName: string, newName: string) => {
+    renameExpandedProject(oldName, newName);
+    if (projectHomeName !== oldName) return;
+    navigate({ pathname: projectHomePath(newName), search: location.search }, { replace: true });
+  });
 
   const revealedDrafts = useRef(new Set<string>());
   useEffect(() => {
@@ -3877,7 +3927,7 @@ function ConversationList({
                               selectedIds={selectedIds}
                               onToggleSelected={onToggleSelected}
                               onProjectAssigned={expandProject}
-                              onProjectRenamed={renameExpandedProject}
+                              onProjectRenamed={handleProjectRenamed}
                               onConversationsLoaded={handleFolderConversationsLoaded}
                               reorderable={reorderable}
                             />
@@ -4165,6 +4215,7 @@ function SectionHeader({
   collapsed,
   onToggleCollapsed,
   onActivate,
+  onRename,
   contextMenu,
   contextMenuDisabled,
 }: {
@@ -4192,6 +4243,8 @@ function SectionHeader({
   /** When set, a header click outside its chevron runs this instead of toggling;
       the chevron and Left/Right arrows still collapse and expand. */
   onActivate?: () => void;
+  /** When set, a double-click outside the chevron runs this (inline rename). */
+  onRename?: () => void;
   /** Optional context-menu content for the header button. */
   contextMenu?: ReactNode;
   /** Suppresses the header context menu while another interaction owns it. */
@@ -4250,6 +4303,15 @@ function SectionHeader({
         if (onActivate && !onToggle) onActivate();
         else onToggleCollapsed();
       }}
+      onDoubleClick={
+        onRename
+          ? (event) => {
+              if ((event.target as Element).closest("[data-section-toggle]")) return;
+              event.preventDefault();
+              onRename();
+            }
+          : undefined
+      }
       className={cn(
         headerDrag &&
           !headerDrag.attributes["aria-disabled"] &&
@@ -4805,6 +4867,8 @@ function ConversationSection({
   collapsed,
   onToggleCollapsed,
   onActivate,
+  onRenameHeader,
+  headerEditor,
   collapsedFamilies,
   onToggleFamily,
   onRowClick,
@@ -4848,6 +4912,10 @@ function ConversationSection({
   onToggleCollapsed: () => void;
   /** Header click outside its chevron (see SectionHeader). */
   onActivate?: () => void;
+  /** Header double-click outside its chevron, ignored in selection mode. */
+  onRenameHeader?: () => void;
+  /** Shown in place of the header and its controls while the title is edited. */
+  headerEditor?: ReactNode;
   collapsedFamilies: ReadonlySet<string>;
   onToggleFamily: (familyId: string) => void;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -4931,7 +4999,8 @@ function ConversationSection({
   const protectsCollapsedBadge = isCollapsed && marker != null;
   return (
     <section className="group/section relative">
-      {title && (
+      {title && headerEditor}
+      {title && !headerEditor && (
         // Header + its hover-revealed kebab share a `group/header` scope so the
         // kebab keys off hovering the header alone — NOT the whole section,
         // which would also reveal it when hovering a child row.
@@ -4952,6 +5021,7 @@ function ConversationSection({
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
             onActivate={selectionMode ? undefined : onActivate}
+            onRename={selectionMode ? undefined : onRenameHeader}
             headerDrag={headerDrag}
             contextMenu={headerContextMenu}
             contextMenuDisabled={selectionMode}
@@ -6437,6 +6507,7 @@ function ConversationRowImpl({
           // Prefer the just-committed name so a rename reopened before the
           // prop catches up starts from what the row shows.
           initialTitle={pendingTitle ?? conversation.title ?? ""}
+          maxLength={USER_SESSION_TITLE_MAX_CHARS}
           onCommit={(title) => {
             // Bail on no-op edits so we don't fire an unnecessary PATCH.
             const trimmed = title.trim();
@@ -7531,10 +7602,13 @@ export function useProjectFolderMenu(
                     config: next,
                   });
                 }
-              } catch {
+              } catch (error) {
                 // Errors surface via the mutation state below. A rename that
-                // lands before a failed icon write is already persisted; only
-                // the icon needs retrying.
+                // lands before a failed icon write or member move is already
+                // persisted; only the rest needs retrying.
+                if (error instanceof ProjectMembersNotMovedError) {
+                  onRenamed?.(projectName, newName);
+                }
                 return;
               }
               setRenameOpen(false);
