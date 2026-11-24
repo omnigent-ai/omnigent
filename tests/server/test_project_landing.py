@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -473,3 +474,54 @@ def test_only_a_plausible_new_head_supersedes_an_approval(world) -> None:
     git(world.repo, "merge", "-q", "--ff-only", approved)  # the approval landed
     assert not landing.could_supersede(config, approved, new_head)
     assert landing.could_supersede({"landing": {"checkout": "/nonexistent"}}, approved, new_head)
+
+
+def install_pnpm_layout(repo: Path) -> None:
+    """Untracked pnpm-style packages: the checker lives in the root ``node_modules/.pnpm``
+    and ``web/node_modules/.bin`` holds a shim that reaches it through ``../../../``,
+    as pnpm's shims do; it fails when ``web/src/broken.ts`` exists."""
+    (repo / ".gitignore").write_text("node_modules\n")
+    store = repo / "node_modules" / ".pnpm" / "checker"
+    store.mkdir(parents=True)
+    (store / "run.sh").write_text(
+        '#!/bin/sh\n[ ! -e src/broken.ts ] || { echo "broken.ts"; exit 1; }\n'
+    )
+    shims = repo / "web" / "node_modules" / ".bin"
+    shims.mkdir(parents=True)
+    shim = shims / "check"
+    shim.write_text(
+        '#!/bin/sh\nbasedir=$(dirname "$0")\n'
+        'exec sh "$basedir/../../../node_modules/.pnpm/checker/run.sh" "$@"\n'
+    )
+    shim.chmod(0o755)
+    scripts = {"type-check": "check", "lint": "check", "build": "check"}
+    (repo / "web" / "package.json").write_text(
+        '{"name": "web", "private": true, "scripts": '
+        + ", ".join(f'"{name}": "{cmd}"' for name, cmd in scripts.items()).join("{}")
+        + "}\n"
+    )
+    git(repo, "add", ".gitignore", "web/package.json")
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "web")
+
+
+@pytest.mark.skipif(shutil.which("npm") is None, reason="needs npm")
+async def test_a_carried_web_change_runs_its_checks_with_the_root_packages(world) -> None:
+    """The scratch worktree gets the root node_modules too, so a pnpm shim resolves:
+    a clean web rebase carries its approval and lands; a broken one is refused."""
+    install_pnpm_layout(world.repo)
+    world.base = git(world.repo, "rev-parse", BRANCH)
+    approved, rebased = approve_then_rebase(world, {"web/src/app.ts": "export {};\n"})
+    tip = git(world.repo, "rev-parse", BRANCH)
+    assert landing.safety_net(world.repo, rebased, tip, []) is None
+    queued = await submit(world, rebased)
+    assert queued["carried_from"] == approved
+    await world.queue.run_batch()
+    assert git(world.repo, "rev-parse", BRANCH) == rebased
+    assert {"key": "approved", "value": rebased} in world.tickets.ticket["labels"]
+
+    broken = branch(world, "broken", {"web/src/broken.ts": "x"}, rebased)
+    error = landing.safety_net(world.repo, broken, rebased, [])
+    assert error is not None and "broken.ts" in error
+    (world.repo / "node_modules").rename(world.repo / "node_modules.off")
+    missing = landing.safety_net(world.repo, rebased, tip, [])
+    assert missing == "node_modules is missing in the landing checkout"

@@ -280,6 +280,21 @@ def _run(command: list[str], cwd: Path, timeout: float, env: dict[str, str]) -> 
     return None
 
 
+def _link_node_modules(checkout: Path, scratch: Path) -> str | None:
+    """Give *scratch* the checkout's installed packages, or say which are missing.
+
+    pnpm keeps the packages in the root ``node_modules/.pnpm``; ``web/node_modules``
+    holds links and ``.bin`` shims that reach them through ``../../../node_modules``
+    relative to the path they're run from, so both directories are needed.
+    """
+    for relative in ("node_modules", "web/node_modules"):
+        modules = checkout / relative
+        if not modules.is_dir():
+            return f"{relative} is missing in the landing checkout"
+        (scratch / relative).symlink_to(modules)
+    return None
+
+
 def safety_net(checkout: Path, sha: str, tip: str, tests: list[str]) -> str | None:
     """Checks for a carried approval at *sha*; the first failure, or None.
 
@@ -293,10 +308,9 @@ def safety_net(checkout: Path, sha: str, tip: str, tests: list[str]) -> str | No
     with _scratch_worktree(checkout, sha) as scratch, tempfile.TemporaryDirectory() as home:
         env = _isolated_env(Path(home))
         if web_changed:
-            modules = checkout / "web" / "node_modules"
-            if not modules.is_dir():
-                return "web/node_modules is missing in the landing checkout"
-            (scratch / "web" / "node_modules").symlink_to(modules)
+            error = _link_node_modules(checkout, scratch)
+            if error:
+                return error
             for script in ("type-check", "lint"):
                 error = _run(
                     ["npm", "run", "--silent", script], scratch / "web", _BUILD_TIMEOUT_S, env
