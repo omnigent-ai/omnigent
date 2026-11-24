@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
-from ._bwrap_request_init import _ADMIT, _EXIT, _READY
+from ._bwrap_request_init import _ADMIT, _EXIT, _READY, _validate_control_socket
 
 _POLL_S = 0.05
 _CREDENTIALS = struct.Struct("iII")
@@ -65,8 +65,9 @@ def _kill_pinned(descriptor: int) -> None:
 class BwrapRequestControl:
     """Own a trusted init and its launcher after receiving kernel-bound readiness.
 
-    The launcher owner enables SO_PASSCRED before spawn and retains its outer
-    pidfd until receive succeeds. Only run closes the transferred resources.
+    Control uses AF_UNIX SOCK_SEQPACKET. The launcher owner enables SO_PASSCRED
+    before spawn and retains its outer pidfd until receive succeeds. Only run
+    closes the transferred resources.
     """
 
     def __init__(
@@ -77,6 +78,7 @@ class BwrapRequestControl:
         init_pidfd: int,
         launcher_pidfd: int,
     ) -> None:
+        _validate_control_socket(control)
         self._control = control
         self._process = process
         self._token = token
@@ -100,6 +102,7 @@ class BwrapRequestControl:
         launcher_pidfd: int,
     ) -> BwrapRequestControl:
         """Take ownership only after validating the init's actual transferred pidfd."""
+        _validate_control_socket(control)
         if len(token) != 64 or any(value not in b"0123456789abcdef" for value in token):
             raise ValueError("Request admission token is invalid")
         if expected_init_pid <= 0 or _pidfd_identity(launcher_pidfd)[0] != process.pid:
@@ -251,15 +254,24 @@ class BwrapRequestControl:
             pass
         while not _pidfd_exited(self._launcher_pidfd, round(_POLL_S * 1000)):
             pass
-        self._process.communicate()
-        # Serialize descriptor retirement with cancellation to prevent fd reuse races.
-        with self._lock:
-            self._owned_pidfds = None
-            try:
-                with contextlib.ExitStack() as cleanup:
-                    cleanup.callback(self._control.close)
-                    cleanup.callback(os.close, self._launcher_pidfd)
-                    cleanup.callback(os.close, self._init_pidfd)
-            finally:
-                # A close error must not strand an already settled request.
-                self.done.set()
+        try:
+            self._process.communicate()
+        finally:
+            # Serialize descriptor retirement with cancellation to prevent fd reuse races.
+            with self._lock:
+                self._owned_pidfds = None
+                try:
+                    with contextlib.ExitStack() as cleanup:
+                        cleanup.callback(self._control.close)
+                        cleanup.callback(os.close, self._launcher_pidfd)
+                        cleanup.callback(os.close, self._init_pidfd)
+                        for stream in (
+                            self._process.stdin,
+                            self._process.stdout,
+                            self._process.stderr,
+                        ):
+                            if stream is not None:
+                                cleanup.callback(stream.close)
+                finally:
+                    # Output or close errors must not strand an already settled request.
+                    self.done.set()

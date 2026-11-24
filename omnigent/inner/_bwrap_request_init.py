@@ -28,6 +28,15 @@ _PR_SET_PDEATHSIG = 1
 _PR_SET_DUMPABLE = 4
 
 
+def _validate_control_socket(control: socket.socket) -> None:
+    """Require packet framing and connection-oriented owner-loss notification."""
+    if (
+        control.family != socket.AF_UNIX
+        or control.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
+    ):
+        raise ValueError("Request control requires AF_UNIX SOCK_SEQPACKET")
+
+
 @dataclass(frozen=True)
 class _RequestConfig:
     token: bytes
@@ -89,6 +98,8 @@ def _protect_init() -> None:
 
 
 def _wait_for_command(control: socket.socket, command_pid: int) -> int:
+    poller = select.poll()
+    poller.register(control.fileno(), select.POLLIN)
     while True:
         while True:
             pid, status = os.waitpid(-1, os.WNOHANG)
@@ -96,14 +107,14 @@ def _wait_for_command(control: socket.socket, command_pid: int) -> int:
                 return os.waitstatus_to_exitcode(status)
             if pid == 0:
                 break
-        readable, _, _ = select.select([control], [], [], _OWNER_POLL_S)
-        if readable:
+        if poller.poll(round(_OWNER_POLL_S * 1000)):
             # EOF or any additional frame means the sole admission channel ended.
             control.recv(1)
             raise ConnectionError("Request owner channel ended")
 
 
 def _run_request(control: socket.socket, config: _RequestConfig) -> None:
+    _validate_control_socket(control)
     _protect_init()
     control.set_inheritable(False)
     control.settimeout(_ADMISSION_TIMEOUT_S)

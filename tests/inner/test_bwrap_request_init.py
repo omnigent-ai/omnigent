@@ -21,6 +21,14 @@ _TOKEN = b"5" * 64
 _CONFIG = request_init._RequestConfig(_TOKEN, ("/bin/sh", "-c", "true"), "/workspace", {})
 
 
+def _control_socket() -> MagicMock:
+    control = MagicMock(spec=socket.socket)
+    control.family = socket.AF_UNIX
+    control.getsockopt.return_value = socket.SOCK_SEQPACKET
+    control.fileno.return_value = 17
+    return control
+
+
 @pytest.fixture
 def init_calls(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
     protection = MagicMock()
@@ -40,7 +48,7 @@ def test_init_never_starts_a_command_without_its_exact_admission(
     init_calls: tuple[MagicMock, MagicMock],
     admission: bytes,
 ) -> None:
-    control = MagicMock(spec=socket.socket)
+    control = _control_socket()
     control.sendmsg.return_value = len(request_init._READY + _TOKEN)
     control.recv.return_value = admission
     monkeypatch.setattr(request_init.os, "waitpid", lambda *_: pytest.fail("No command exists"))
@@ -51,16 +59,30 @@ def test_init_never_starts_a_command_without_its_exact_admission(
     request_init.os.close.assert_called_once_with(41)
 
 
-@pytest.mark.parametrize("status", [7 << 8, signal.SIGTERM])
+@pytest.mark.parametrize(
+    ("control_fd", "status"), [(17, 7 << 8), (17, signal.SIGTERM), (4096, 7 << 8)]
+)
 def test_init_exports_its_handle_before_admission_and_reports_the_exact_child_result(
     monkeypatch: pytest.MonkeyPatch,
     init_calls: tuple[MagicMock, MagicMock],
     status: int,
+    control_fd: int,
 ) -> None:
     events: list[str] = []
     protection, launch = init_calls
     protection.side_effect = lambda: events.append("protected")
-    control = MagicMock(spec=socket.socket)
+    control = _control_socket()
+    control.fileno.return_value = control_fd
+    poller = MagicMock()
+    poller.poll.return_value = []
+    monkeypatch.setattr(request_init.select, "poll", lambda: poller, raising=False)
+
+    def limited_select(channels: list[MagicMock], *_args: object) -> tuple[list, list, list]:
+        if channels[0].fileno() >= 1024:
+            raise ValueError("filedescriptor out of range in select()")
+        return [], [], []
+
+    monkeypatch.setattr(request_init.select, "select", limited_select)
 
     def ready(buffers: list[bytes], ancillary: list[tuple[int, int, array.array]]) -> int:
         assert events == ["protected"]
@@ -84,19 +106,23 @@ def test_init_exports_its_handle_before_admission_and_reports_the_exact_child_re
     expected_exit = 7 if status == 7 << 8 else -signal.SIGTERM
     result = b"exit:" + _TOKEN + b":" + str(expected_exit).encode()
     control.send.return_value = len(result)
-    monkeypatch.setattr(request_init.os, "waitpid", MagicMock(side_effect=[(91, 0), (73, status)]))
+    monkeypatch.setattr(
+        request_init.os, "waitpid", MagicMock(side_effect=[(91, 0), (0, 0), (73, status)])
+    )
     request_init._run_request(control, _CONFIG)
     launch.assert_called_once_with(_CONFIG.argv, cwd="/workspace", env={}, close_fds=True)
     assert events == ["protected", "ready", "admitted"]
     control.set_inheritable.assert_called_once_with(False)
     control.send.assert_called_once_with(result)
     assert launch.return_value.returncode == expected_exit
+    poller.register.assert_called_once_with(control_fd, request_init.select.POLLIN)
+    poller.poll.assert_called_once_with(50)
 
 
-@pytest.mark.parametrize("status", [7 << 8, signal.SIGTERM])
 def test_child_interrupt_cannot_replace_the_commands_exact_result(
-    monkeypatch: pytest.MonkeyPatch, status: int
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    status = 7 << 8
     handlers: dict[int, object] = {signal.SIGINT: signal.default_int_handler}
 
     def install_handler(signum: int, handler: object) -> object:
@@ -115,10 +141,11 @@ def test_child_interrupt_cannot_replace_the_commands_exact_result(
     process = MagicMock(spec=subprocess.Popen)
     process.pid = 73
     monkeypatch.setattr(request_init.subprocess, "Popen", MagicMock(return_value=process))
-    control = MagicMock(spec=socket.socket)
+    control = _control_socket()
+    monkeypatch.setattr(request_init.select, "poll", lambda: MagicMock(), raising=False)
     control.sendmsg.return_value = len(b"ready:" + _TOKEN)
     control.recv.return_value = b"admit:" + _TOKEN
-    exit_code = 7 if status == 7 << 8 else -signal.SIGTERM
+    exit_code = 7
     result = b"exit:" + _TOKEN + b":" + str(exit_code).encode()
     control.send.return_value = len(result)
 
@@ -145,7 +172,7 @@ def test_setup_failure_cannot_admit_a_command(
     failure: str,
 ) -> None:
     protection, launch = init_calls
-    control = MagicMock(spec=socket.socket)
+    control = _control_socket()
     control.sendmsg.return_value = len(b"ready:" + _TOKEN)
     control.recv.return_value = b"admit:" + _TOKEN
     if failure == "protection":
@@ -164,14 +191,34 @@ def test_setup_failure_cannot_admit_a_command(
         request_init.os.close.assert_called_once_with(41)
 
 
+@pytest.mark.parametrize("transport", ["family", "stream", "datagram"])
+def test_control_transport_must_frame_messages_and_report_owner_loss(
+    init_calls: tuple[MagicMock, MagicMock], transport: str
+) -> None:
+    control = _control_socket()
+    if transport == "family":
+        control.family = socket.AF_INET
+    else:
+        control.getsockopt.return_value = (
+            socket.SOCK_STREAM if transport == "stream" else socket.SOCK_DGRAM
+        )
+    with pytest.raises(ValueError, match="AF_UNIX SOCK_SEQPACKET"):
+        request_init._run_request(control, _CONFIG)
+    init_calls[0].assert_not_called()
+    init_calls[1].assert_not_called()
+    control.sendmsg.assert_not_called()
+
+
 @pytest.mark.parametrize("frame", [b"", b"admit:" + _TOKEN])
 def test_owner_channel_loss_or_repeated_admission_exits_the_init(
     monkeypatch: pytest.MonkeyPatch, frame: bytes
 ) -> None:
-    control = MagicMock(spec=socket.socket)
+    control = _control_socket()
     control.recv.return_value = frame
     monkeypatch.setattr(request_init.os, "waitpid", lambda *_: (0, 0))
-    monkeypatch.setattr(request_init.select, "select", lambda *_: ([control], [], []))
+    poller = MagicMock()
+    poller.poll.return_value = [(control.fileno(), 1)]
+    monkeypatch.setattr(request_init.select, "poll", lambda: poller, raising=False)
     with pytest.raises(ConnectionError, match="owner channel ended"):
         request_init._wait_for_command(control, 73)
     control.send.assert_not_called()
@@ -231,7 +278,7 @@ def test_entry_point_rejects_invalid_descriptors_and_always_exits_its_socket_con
         "overflow": ["41", "2147483648"],
         "not-integer": ["invalid", "42"],
     }
-    control = MagicMock(spec=socket.socket)
+    control = _control_socket()
     control.__enter__.return_value = control
     open_control = MagicMock(return_value=control)
     read_config = MagicMock(return_value=_CONFIG)

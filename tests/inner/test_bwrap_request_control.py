@@ -30,6 +30,8 @@ _LAUNCHER_FD = 42
 @pytest.fixture
 def readiness(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock, MagicMock]:
     control = MagicMock(spec=socket.socket)
+    control.family = socket.AF_UNIX
+    control.getsockopt.return_value = socket.SOCK_SEQPACKET
     process = MagicMock(spec=subprocess.Popen)
     process.pid = 83
     control.recvmsg.return_value = (
@@ -79,6 +81,9 @@ def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
         "extra-handle",
         "truncated",
         "unexpected-before-rights",
+        "family",
+        "stream",
+        "datagram",
     ],
 )
 def test_invalid_readiness_never_admits_and_releases_every_received_handle(
@@ -89,7 +94,15 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
     control, process, close = readiness
     payload, metadata, flags, address = control.recvmsg.return_value
     handles = [_INIT_FD]
-    if problem == "token":
+    if problem in {"family", "stream", "datagram"}:
+        handles = []
+        if problem == "family":
+            control.family = socket.AF_INET
+        else:
+            control.getsockopt.return_value = (
+                socket.SOCK_STREAM if problem == "stream" else socket.SOCK_DGRAM
+            )
+    elif problem == "token":
         payload = b"ready:" + b"6" * 64
     elif problem == "missing-credentials":
         metadata.pop()
@@ -117,12 +130,14 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
     else:
         metadata.insert(0, (socket.SOL_SOCKET, -1, b"unknown"))
     control.recvmsg.return_value = (payload, metadata, flags, address)
-    with pytest.raises(OSError):
+    with pytest.raises((OSError, ValueError)):
         request_control.BwrapRequestControl.receive(
             control, process, _TOKEN, expected_init_pid=73, launcher_pidfd=_LAUNCHER_FD
         )
     assert sorted(call.args[0] for call in close.call_args_list) == sorted(handles)
     control.send.assert_not_called()
+    if problem in {"family", "stream", "datagram"}:
+        control.recvmsg.assert_not_called()
 
 
 def test_invalid_readiness_retires_other_handles_when_one_close_fails(
@@ -158,9 +173,14 @@ class _RequestCase:
 @pytest.fixture
 def request_case(monkeypatch: pytest.MonkeyPatch) -> _RequestCase:
     control = MagicMock(spec=socket.socket)
+    control.family = socket.AF_UNIX
+    control.getsockopt.return_value = socket.SOCK_SEQPACKET
     control.send.side_effect = len
     control.recv.return_value = b"exit:" + _TOKEN + b":7"
     process = MagicMock(spec=subprocess.Popen)
+    process.stdin = MagicMock()
+    process.stdout = MagicMock()
+    process.stderr = MagicMock()
     exited = {_INIT_FD: False, _LAUNCHER_FD: False}
     events: list[tuple[str, int | None]] = []
 
@@ -247,12 +267,23 @@ def test_completion_waits_for_each_pinned_lifetime_and_output(
     assert case.owner.admitted and case.owner.done.is_set()
 
 
-def test_cancel_before_admission_executes_nothing_and_retires_only_pinned_handles(
+@pytest.mark.parametrize("refusal", ["cancelled", "deadline", "init-exited", "launcher-exited"])
+def test_refusal_before_admission_executes_nothing_and_retires_only_pinned_handles(
+    monkeypatch: pytest.MonkeyPatch,
     request_case: _RequestCase,
+    refusal: str,
 ) -> None:
     case = request_case
-    case.owner.cancel()
-    with pytest.raises(request_control.RequestCancelled):
+    error: type[Exception] = request_control.RequestCancelled
+    if refusal == "cancelled":
+        case.owner.cancel()
+    elif refusal == "deadline":
+        monkeypatch.setattr(request_control, "monotonic", lambda: 2.0)
+        error = TimeoutError
+    else:
+        case.exited[_INIT_FD if refusal == "init-exited" else _LAUNCHER_FD] = True
+        error = OSError
+    with pytest.raises(error):
         case.owner.run(deadline=1.0)
     assert not case.owner.admitted and case.owner.done.is_set()
     case.control.send.assert_not_called()
@@ -261,22 +292,39 @@ def test_cancel_before_admission_executes_nothing_and_retires_only_pinned_handle
     assert case.events == events
 
 
-def test_descriptor_close_failure_cannot_make_later_cancellation_signal_a_reused_fd(
-    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase
+@pytest.mark.parametrize("failure", ["descriptor", "output", "output-and-stream"])
+def test_cleanup_failure_cannot_make_later_cancellation_signal_a_reused_fd(
+    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase, failure: str
 ) -> None:
     case = request_case
 
     def close(descriptor: int) -> None:
         case.events.append(("close", descriptor))
-        if descriptor == _LAUNCHER_FD:
+        if failure == "descriptor" and descriptor == _LAUNCHER_FD:
             raise OSError("Descriptor close failed")
 
     monkeypatch.setattr(request_control.os, "close", close)
-    with pytest.raises(OSError, match="Descriptor close failed"):
+    error: type[Exception] = OSError
+    message = "Descriptor close failed"
+    if failure != "descriptor":
+        case.process.communicate.side_effect = [
+            ValueError("stdin is closed"),
+            AttributeError("Output bookkeeping was not initialized"),
+        ]
+        error = AttributeError
+        message = "Output bookkeeping"
+        if failure == "output-and-stream":
+            case.process.stdout.close.side_effect = OSError("Output stream close failed")
+            error = OSError
+            message = "Output stream close failed"
+    with pytest.raises(error, match=message):
         case.owner.run(deadline=1.0)
     assert case.owner.done.is_set()
     assert ("close", _INIT_FD) in case.events
     case.control.close.assert_called_once()
+    if failure != "descriptor":
+        for stream in (case.process.stdin, case.process.stdout, case.process.stderr):
+            stream.close.assert_called_once()
     events = list(case.events)
     case.owner.cancel()
     assert case.events == events
