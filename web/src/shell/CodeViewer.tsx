@@ -25,6 +25,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent as ReactClipboardEvent,
   type ComponentPropsWithoutRef,
   type ReactNode,
   type RefObject,
@@ -75,6 +76,9 @@ import {
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
+  markdownPreviewSelectionSource,
+  rehypeSourceOffsets,
+  selectedPreviewHtml,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
 import { DataTablePreview } from "./DataTablePreview";
@@ -179,6 +183,8 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   // `language-math` code nodes as plain text; KaTeX then renders that trusted
   // output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
   MATH_PLUGIN.rehypePlugin,
+  // Last, so sanitize keeps the source offsets that copy maps a selection through.
+  rehypeSourceOffsets,
 ];
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
@@ -307,12 +313,29 @@ function MarkdownPreview({
     ),
     [content],
   );
+  // Plain text gets the selection's Markdown source, and HTML its rendered form
+  // for rich paste. The math rewrite above keeps every offset, so they index
+  // *content* too. A selection that can't be mapped keeps the browser's copy.
+  const handleCopy = useCallback(
+    (event: ReactClipboardEvent<HTMLDivElement>) => {
+      const selection = window.getSelection();
+      if (selection?.rangeCount !== 1) return;
+      const range = selection.getRangeAt(0);
+      const source = markdownPreviewSelectionSource(range, event.currentTarget, content);
+      if (source === null) return;
+      event.preventDefault();
+      event.clipboardData.setData("text/plain", source);
+      event.clipboardData.setData("text/html", selectedPreviewHtml(range, event.currentTarget));
+    },
+    [content],
+  );
   return (
     <div className="flex h-full">
       <div
         ref={rootRef}
         data-preview-scroll
         onScroll={onScroll}
+        onCopy={handleCopy}
         className={cn(
           "markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none",
           deferOffscreen &&

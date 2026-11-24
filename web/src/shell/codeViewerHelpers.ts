@@ -808,3 +808,245 @@ export function hasNoTextDiff(path: string): boolean {
     isModelFile(path)
   );
 }
+
+// ---------------------------------------------------------------------------
+// Markdown preview copy: rendered selection → Markdown source
+// ---------------------------------------------------------------------------
+
+interface SourcedHastNode {
+  type: string;
+  properties?: Record<string, unknown>;
+  position?: { start: { offset?: number }; end: { offset?: number } };
+  children?: SourcedHastNode[];
+}
+
+/**
+ * Rehype step that stamps each element with its `[start, end)` offsets in the
+ * Markdown source as `data-md-start` / `data-md-end`, so a copy can map the
+ * rendered selection back to the Markdown it came from. It runs after sanitize
+ * and adds only numbers.
+ */
+export function rehypeSourceOffsets() {
+  const stamp = (node: SourcedHastNode) => {
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
+    if (node.type === "element" && start !== undefined && end !== undefined) {
+      node.properties = { ...node.properties, dataMdStart: start, dataMdEnd: end };
+    }
+    node.children?.forEach(stamp);
+  };
+  return stamp;
+}
+
+/** A place in rendered text: a text node and a character offset into it. */
+interface TextPoint {
+  node: Text;
+  offset: number;
+}
+
+/** A `[start, end)` stretch of the Markdown source. */
+interface SourceSpan {
+  start: number;
+  end: number;
+}
+
+type SelectionSide = "start" | "end";
+
+// Blocks whose Markdown still reads the same when a copy starts or ends inside
+// them. A selection leaving anything else (bold, links, inline code, code
+// blocks, tables, embedded HTML) copies that element whole, so its markers balance.
+const CUTTABLE_BLOCKS = new Set([
+  "P",
+  "H1",
+  "H2",
+  "H3",
+  "H4",
+  "H5",
+  "H6",
+  "UL",
+  "OL",
+  "LI",
+  "BLOCKQUOTE",
+  "THEAD",
+  "TBODY",
+  "TR",
+  "TH",
+  "TD",
+]);
+
+function stampedSpan(element: Element): SourceSpan | null {
+  const start = element.getAttribute("data-md-start");
+  const end = element.getAttribute("data-md-end");
+  return start === null || end === null ? null : { start: Number(start), end: Number(end) };
+}
+
+/**
+ * The first and last selected characters of *range*. Boundaries that select
+ * only whitespace, such as a triple-click ending at the next block's start,
+ * move to the nearest selected text. Null when only whitespace is selected.
+ */
+function selectedTextBounds(range: Range): { start: TextPoint; end: TextPoint } | null {
+  const common = range.commonAncestorContainer;
+  const walker = document.createTreeWalker(common, NodeFilter.SHOW_TEXT);
+  let start: TextPoint | null = null;
+  let end: TextPoint | null = null;
+  let node = common instanceof Text ? common : walker.nextNode();
+  for (; node; node = walker.nextNode()) {
+    if (!(node instanceof Text) || !range.intersectsNode(node)) continue;
+    const from = node === range.startContainer ? range.startOffset : 0;
+    const to = node === range.endContainer ? range.endOffset : node.length;
+    if (!node.data.slice(from, to).trim()) continue;
+    start ??= { node, offset: from };
+    end = { node, offset: to };
+  }
+  return start && end ? { start, end } : null;
+}
+
+/** The source a text node renders from: its element's span, narrowed by stamped siblings. */
+function textSourceSpan(node: Text, owner: SourceSpan): SourceSpan {
+  let { start, end } = owner;
+  for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) {
+    const span = sibling instanceof Element ? stampedSpan(sibling) : null;
+    if (span) {
+      start = span.end;
+      break;
+    }
+  }
+  for (let sibling = node.nextSibling; sibling; sibling = sibling.nextSibling) {
+    const span = sibling instanceof Element ? stampedSpan(sibling) : null;
+    if (span) {
+      end = span.start;
+      break;
+    }
+  }
+  return { start, end };
+}
+
+/**
+ * Each character of *text*'s offset in *source*, the Markdown it renders from.
+ * Verbatim text is found whole; otherwise characters match in order, skipping
+ * syntax such as escapes, entities and quote markers. Null when a character
+ * has no source of its own, like an emoji shortcode's glyph.
+ */
+function alignText(text: string, source: string): number[] | null {
+  const verbatim = source.indexOf(text);
+  if (verbatim !== -1) return Array.from({ length: text.length }, (_, i) => verbatim + i);
+  const offsets: number[] = [];
+  let at = 0;
+  for (let i = 0; i < text.length; i++) {
+    at = source.indexOf(text[i], at);
+    if (at === -1) return null;
+    offsets.push(at++);
+  }
+  return offsets;
+}
+
+/**
+ * Where *point* falls in the Markdown *source*. A point the source can't place,
+ * such as one inside a rendered formula, takes its stamped element's *side* edge.
+ * Null when no stamped element holds the point.
+ */
+function sourceOffset(point: TextPoint, side: SelectionSide, source: string): number | null {
+  const parent = point.node.parentElement;
+  const owner = parent?.closest("[data-md-start]");
+  const ownerSpan = owner ? stampedSpan(owner) : null;
+  if (!parent || !ownerSpan) return null;
+  const span = owner === parent ? textSourceSpan(point.node, ownerSpan) : ownerSpan;
+  const offsets =
+    owner === parent ? alignText(point.node.data, source.slice(span.start, span.end)) : null;
+  if (!offsets) return side === "start" ? span.start : span.end;
+  // Just past the character before the point, so syntax leading the next one
+  // (an escape's backslash) stays with it.
+  return span.start + (point.offset === 0 ? offsets[0] : offsets[point.offset - 1] + 1);
+}
+
+/** Whether *element* renders text before (start) or after (end) *point*. */
+function hasTextBeyond(element: Element, point: TextPoint, side: SelectionSide): boolean {
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  if (side === "start") range.setEnd(point.node, point.offset);
+  else range.setStart(point.node, point.offset);
+  return range.toString().trim() !== "";
+}
+
+/**
+ * Widens *offset* over each stamped element the selection leaves on *side*:
+ * the ancestors of *point* below the element that also holds *other*. An
+ * element that can't be cut copies whole; a block does when the selection
+ * covers it from that edge, which brings in its `#`s, list marker or `>`.
+ */
+function widenOverLeftElements(
+  point: TextPoint,
+  other: Text,
+  side: SelectionSide,
+  offset: number,
+  root: Element,
+): number {
+  let widened = offset;
+  for (let el = point.node.parentElement; el && el !== root; el = el.parentElement) {
+    if (el.contains(other)) break;
+    const span = stampedSpan(el);
+    if (!span || (CUTTABLE_BLOCKS.has(el.tagName) && hasTextBeyond(el, point, side))) continue;
+    widened = side === "start" ? Math.min(widened, span.start) : Math.max(widened, span.end);
+  }
+  return widened;
+}
+
+/**
+ * The Markdown source behind a selection in the rendered preview, mapped
+ * through the offsets `rehypeSourceOffsets` stamped on its elements.
+ *
+ * Within one block the selection copies its slice of source, and a partially
+ * selected bold, italic, link or code span widens to its whole source. Across
+ * blocks, each block the selection covers from its edge copies whole, markers
+ * included, while one entered mid-text starts or ends mid-line. Code blocks and
+ * tables are never cut.
+ *
+ * :param range: The selection, e.g. `window.getSelection().getRangeAt(0)`.
+ * :param root: The element holding the rendered document.
+ * :param source: The Markdown the preview rendered.
+ * :returns: The selection's Markdown, or null when it reaches outside *root* or
+ *     can't be mapped, so the browser's own copy applies.
+ */
+export function markdownPreviewSelectionSource(
+  range: Range,
+  root: Element,
+  source: string,
+): string | null {
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null;
+  const bounds = selectedTextBounds(range);
+  if (!bounds) return null;
+  const start = sourceOffset(bounds.start, "start", source);
+  const end = sourceOffset(bounds.end, "end", source);
+  if (start === null || end === null) return null;
+  const from = widenOverLeftElements(bounds.start, bounds.end.node, "start", start, root);
+  const to = widenOverLeftElements(bounds.end, bounds.start.node, "end", end, root);
+  const markdown = source.slice(from, to);
+  return markdown.trim() ? markdown : null;
+}
+
+/**
+ * The selection's rendered HTML, wrapped in the elements it sits inside so a
+ * rich paste keeps list items in their list and cells in their table. The
+ * source-offset stamps are dropped.
+ *
+ * :param range: The selection.
+ * :param root: The element holding the rendered document; it is not included.
+ */
+export function selectedPreviewHtml(range: Range, root: Element): string {
+  let fragment: Node = range.cloneContents();
+  const common = range.commonAncestorContainer;
+  let el = common instanceof Element ? common : common.parentElement;
+  for (; el && el !== root && root.contains(el); el = el.parentElement) {
+    const wrapper = el.cloneNode(false);
+    wrapper.appendChild(fragment);
+    fragment = wrapper;
+  }
+  const container = document.createElement("div");
+  container.appendChild(fragment);
+  for (const stamped of container.querySelectorAll("[data-md-start]")) {
+    stamped.removeAttribute("data-md-start");
+    stamped.removeAttribute("data-md-end");
+  }
+  return container.innerHTML;
+}

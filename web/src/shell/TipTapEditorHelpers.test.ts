@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { NodeSelection } from "@tiptap/pm/state";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
-import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
+import {
+  installMarkdownParserPatch,
+  installMarkdownSerializerPatch,
+} from "./tiptapMarkdownPatches";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import {
   applyExternalMarkdown,
@@ -12,6 +15,8 @@ import {
 import type { Comment } from "@/hooks/useComments";
 
 installMarkdownParserPatch();
+// The viewer serializes copies through the patched serializer, as it does saves.
+installMarkdownSerializerPatch();
 
 describe("repeated words in Markdown", () => {
   let editor: Editor | undefined;
@@ -446,5 +451,127 @@ describe("applyExternalMarkdown", () => {
     ed.commands.setTextSelection(positionAfter(ed.state.doc, "Same"));
     applyExternalMarkdown(ed, "Same text.\n");
     expect(ed.state.selection.from).toBe(positionAfter(ed.state.doc, "Same"));
+  });
+});
+
+describe("selectionMarkdown on copy", () => {
+  let editor: Editor | undefined;
+  afterEach(() => {
+    editor?.destroy();
+    editor = undefined;
+  });
+
+  function openMarkdown(markdown: string): Editor {
+    editor = new Editor({
+      extensions: createMarkdownDocumentExtensions("conversation", "doc.md"),
+      content: markdown,
+      contentType: "markdown",
+    });
+    return editor;
+  }
+
+  /** Document position where *needle* starts (or, with *after*, ends) in a text node. */
+  function textPosition(ed: Editor, needle: string, after = false): number {
+    let found = -1;
+    ed.state.doc.descendants((node, pos) => {
+      if (found !== -1 || !node.isText || !node.text?.includes(needle)) return;
+      found = pos + node.text.indexOf(needle) + (after ? needle.length : 0);
+    });
+    if (found === -1) throw new Error(`no text holds ${JSON.stringify(needle)}`);
+    return found;
+  }
+
+  /** Selects from the start of *from* through the end of *to*, copies, and returns each flavor. */
+  function copySelection(ed: Editor, from: string, to: string): Map<string, string> {
+    ed.commands.setTextSelection({ from: textPosition(ed, from), to: textPosition(ed, to, true) });
+    const flavors = new Map<string, string>();
+    const event = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        clearData: vi.fn(),
+        setData: (type: string, data: string) => flavors.set(type, data),
+      },
+    });
+    ed.view.dom.dispatchEvent(event);
+    return flavors;
+  }
+
+  it.each([
+    ["text inside one paragraph", "Plain words here.", "words", "words", "words"],
+    [
+      "text across a hard-wrapped line",
+      "First line words\nsecond line words.",
+      "words",
+      "second",
+      "words\nsecond",
+    ],
+    [
+      "a selection ending inside bold",
+      "Plain **bold text** after",
+      "Plain",
+      "bold",
+      "Plain **bold**",
+    ],
+    [
+      "a selection starting inside a link",
+      "See [the docs](https://example.com/docs) now",
+      "docs",
+      "now",
+      "[docs](https://example.com/docs) now",
+    ],
+    ["a selection crossing inline code", "Run `make test` today", "Run", "make", "Run `make`"],
+    ["text inside a heading", "# Release notes\n\nBody text.", "Release", "notes", "Release notes"],
+    [
+      "a heading and the paragraph after it",
+      "# Release notes\n\nBody text.",
+      "Release",
+      "Body",
+      "# Release notes\n\nBody",
+    ],
+    ["text inside a list item", "- first item\n- second item", "first", "item", "first item"],
+    [
+      "whole list items",
+      "- first item\n- second item\n- third item",
+      "first",
+      "second item",
+      "- first item\n- second item",
+    ],
+    ["a code block's text", "```js\nconst answer = 42;\n```", "const", "42;", "const answer = 42;"],
+    [
+      "a selection leaving a code block",
+      "Intro line\n\n```js\nconst answer = 42;\n```",
+      "Intro",
+      "answer",
+      "Intro line\n\n```js\nconst answer\n```",
+    ],
+    [
+      "table cells",
+      "| Name | Value |\n| --- | --- |\n| alpha | 1 |",
+      "Name",
+      "1",
+      // The editor's serializer pads columns, as it does when saving.
+      "| Name  | Value |\n| ----- | ----- |\n| alpha | 1     |",
+    ],
+  ])("copies %s as Markdown", (_shape, markdown, from, to, expected) => {
+    const flavors = copySelection(openMarkdown(markdown), from, to);
+    expect(flavors.get("text/plain")).toBe(expected);
+  });
+
+  it("copies unsaved edits and keeps ProseMirror's HTML", () => {
+    const ed = openMarkdown("Plain words here.");
+    ed.commands.setTextSelection({
+      from: textPosition(ed, "words"),
+      to: textPosition(ed, "words", true),
+    });
+    ed.commands.toggleBold();
+    const flavors = copySelection(ed, "Plain", "here.");
+    expect(flavors.get("text/plain")).toBe("Plain **words** here.");
+    expect(flavors.get("text/html")).toContain("<strong>words</strong>");
+  });
+
+  it("keeps the plain text of a whitespace-only selection", () => {
+    const ed = openMarkdown("Plain words here.");
+    const flavors = copySelection(ed, " ", " ");
+    expect(flavors.get("text/plain")).toBe(" ");
   });
 });

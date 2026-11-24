@@ -230,20 +230,21 @@ describe("video previews", () => {
 });
 
 /**
- * Dispatches a `copy` event to `document` with a mock clipboardData.
- * Returns the `setData` spy so the caller can assert on what was written.
+ * Dispatches a `copy` event to *target* (default `document`) with a mock
+ * clipboardData. Returns the `setData` spy so the caller can assert on what
+ * was written.
  *
  * Uses a plain `Event` rather than `new ClipboardEvent(...)` because jsdom
  * does not expose `ClipboardEvent` as a global constructor.
  */
-function fireCopyEvent(): ReturnType<typeof vi.fn> {
+function fireCopyEvent(target: EventTarget = document): ReturnType<typeof vi.fn> {
   const setData = vi.fn();
   const event = new Event("copy", { bubbles: true, cancelable: true });
   Object.defineProperty(event, "clipboardData", {
     value: { setData, getData: vi.fn() },
     writable: false,
   });
-  document.dispatchEvent(event);
+  target.dispatchEvent(event);
   return setData;
 }
 
@@ -468,6 +469,156 @@ describe("CodeViewer Cmd+A select-all and copy interception", () => {
     const setData = fireCopyEvent();
 
     expect(setData).not.toHaveBeenCalled();
+  });
+});
+
+describe("CodeViewer markdown preview copy", () => {
+  /** The first rendered text node holding *needle*, and where it starts in it. */
+  function previewText(needle: string): { node: Text; offset: number } {
+    const root = document.querySelector(".markdown-preview");
+    if (!root) throw new Error("no Markdown preview rendered");
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const offset = (node as Text).data.indexOf(needle);
+      if (offset !== -1) return { node: node as Text, offset };
+    }
+    throw new Error(`no rendered text holds ${JSON.stringify(needle)}`);
+  }
+
+  /** Selects from the start of *from*'s text through the end of *to*'s, then copies. */
+  function copyPreviewSelection(from: string, to: string): ReturnType<typeof vi.fn> {
+    const start = previewText(from);
+    const end = previewText(to);
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset + to.length);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    return fireCopyEvent(start.node);
+  }
+
+  afterEach(() => window.getSelection()?.removeAllRanges());
+
+  it.each([
+    ["text inside one text node", "Plain words here.", "words", "words", "words"],
+    [
+      "a selection ending inside bold",
+      "Plain **bold text** after",
+      "Plain",
+      "bold",
+      "Plain **bold text**",
+    ],
+    [
+      "a selection starting inside italic",
+      "Some *italic text* after",
+      "text",
+      "after",
+      "*italic text* after",
+    ],
+    [
+      "a selection inside a link",
+      "See [the docs](https://example.com/docs) now",
+      "the",
+      "docs",
+      "the docs",
+    ],
+    [
+      "a selection leaving a link",
+      "See [the docs](https://example.com/docs) now",
+      "docs",
+      "now",
+      "[the docs](https://example.com/docs) now",
+    ],
+    ["a selection crossing inline code", "Run `make test` today", "Run", "make", "Run `make test`"],
+    ["an escaped character", "Price is 5\\*3 today", "*3", "today", "\\*3 today"],
+    ["TeX delimiters", "Inline \\(x^2\\) math", "Inline", "math", "Inline \\(x^2\\) math"],
+    [
+      "whole list items",
+      "- first item\n- second item\n- third item",
+      "first",
+      "second item",
+      "- first item\n- second item",
+    ],
+    [
+      "list items entered mid-text",
+      "- first item\n- second item\n- third item",
+      "item",
+      "second",
+      "item\n- second",
+    ],
+    ["text inside a heading", "# Release notes\n\nBody text.", "Release", "notes", "Release notes"],
+    [
+      "a heading and the paragraph after it",
+      "# Release notes\n\nBody text.",
+      "Release",
+      "Body",
+      "# Release notes\n\nBody",
+    ],
+    [
+      "a quote and the paragraph after it",
+      "> Quoted line\n\nAfter it.",
+      "Quoted",
+      "After",
+      "> Quoted line\n\nAfter",
+    ],
+    ["a code block's text", "```js\nconst answer = 42;\n```", "const", "42;", "const answer = 42;"],
+    [
+      "a selection leaving a code block",
+      "Intro line\n\n```js\nconst answer = 42;\n```",
+      "Intro",
+      "answer",
+      "Intro line\n\n```js\nconst answer = 42;\n```",
+    ],
+    [
+      "table cells",
+      "| Name | Value |\n| ---- | ----- |\n| alpha | 1 |",
+      "Name",
+      "1",
+      "| Name | Value |\n| ---- | ----- |\n| alpha | 1 |",
+    ],
+    [
+      "a selection leaving a table",
+      "Intro\n\n| Name | Value |\n| ---- | ----- |\n| alpha | 1 |",
+      "Intro",
+      "Name",
+      "Intro\n\n| Name | Value |\n| ---- | ----- |\n| alpha | 1 |",
+    ],
+  ])("copies %s as its Markdown source", (_shape, markdown, from, to, expected) => {
+    renderViewer(markdown, true, "doc.md", { viewMode: "preview" });
+    const setData = copyPreviewSelection(from, to);
+    expect(setData).toHaveBeenCalledWith("text/plain", expected);
+  });
+
+  it("keeps the selection's rendered HTML, wrapped in its list, for rich paste", () => {
+    renderViewer("- first **item**\n- second item", true, "doc.md", { viewMode: "preview" });
+    const setData = copyPreviewSelection("first", "second");
+    expect(setData).toHaveBeenCalledWith(
+      "text/html",
+      "<ul><li>first <strong>item</strong></li>\n<li>second</li></ul>",
+    );
+  });
+
+  it("keeps the browser's copy for a selection reaching outside the preview", () => {
+    renderViewer("Plain words here.", true, "doc.md", { viewMode: "preview" });
+    const outside = document.createElement("p");
+    outside.textContent = "Outside text";
+    document.body.appendChild(outside);
+    const range = document.createRange();
+    range.setStart(previewText("words").node, 0);
+    range.setEnd(outside.firstChild as Text, 7);
+    window.getSelection()?.addRange(range);
+    expect(fireCopyEvent(previewText("words").node)).not.toHaveBeenCalled();
+    outside.remove();
+  });
+
+  it("keeps the browser's copy when only whitespace is selected", () => {
+    renderViewer("Plain words here.", true, "doc.md", { viewMode: "preview" });
+    const { node } = previewText(" words");
+    const range = document.createRange();
+    range.setStart(node, 5);
+    range.setEnd(node, 6);
+    window.getSelection()?.addRange(range);
+    expect(fireCopyEvent(node)).not.toHaveBeenCalled();
   });
 });
 
