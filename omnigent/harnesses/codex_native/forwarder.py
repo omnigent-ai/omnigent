@@ -8361,17 +8361,18 @@ async def _post_collab_agent_statuses(
         ap_status = _omnigent_status_from_collab_state(state)
         if ap_status is None:
             continue
-        own_status = forwarder_state.child_turn_status(thread_id)
-        if own_status is not None and ap_status != own_status:
-            _logger.info(
-                "Codex forwarder ignored collab snapshot %s for child with own status %s: "
-                "thread_id=%s",
-                ap_status,
-                own_status,
-                thread_id,
-            )
-            continue
-        await _post_status(client, child_session_id, ap_status)
+        async with _conversation_item_delivery_scope(child_session_id):
+            own_status = forwarder_state.child_turn_status(thread_id)
+            if own_status is not None and ap_status != own_status:
+                _logger.info(
+                    "Codex forwarder ignored collab snapshot %s for child with own status %s: "
+                    "thread_id=%s",
+                    ap_status,
+                    own_status,
+                    thread_id,
+                )
+                continue
+            await _post_status(client, child_session_id, ap_status)
 
 
 def _omnigent_status_from_collab_state(state: _JsonObject) -> str | None:
@@ -9464,12 +9465,13 @@ async def _post_status(
     if compaction_model is not None and selected_model is not None:
         data["compaction_model"] = compaction_model
         data["selected_model"] = selected_model
-    response = await _post_session_event(
-        client,
-        session_id,
-        event_type="external_session_status",
-        data=data,
-    )
+    async with _conversation_item_delivery_scope(session_id):
+        response = await _post_session_event(
+            client,
+            session_id,
+            event_type="external_session_status",
+            data=data,
+        )
     _log_failed_session_event_post("external_session_status", response)
     return response is not None and response.status_code < 400
 
