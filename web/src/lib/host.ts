@@ -426,17 +426,17 @@ function fetchReportingUpload(
       onUploadProgress(event.loaded, event.lengthComputable ? event.total : null);
     request.onload = () => {
       settle();
-      const headers = new Headers();
-      for (const line of request
-        .getAllResponseHeaders()
-        .trim()
-        .split(/[\r\n]+/)) {
-        const at = line.indexOf(":");
-        if (at > 0) headers.append(line.slice(0, at).trim(), line.slice(at + 1).trim());
-      }
       // A Response can't carry a body with a null-body status.
       const nullBody = [101, 204, 205, 304].includes(request.status);
       try {
+        const headers = new Headers();
+        for (const line of request
+          .getAllResponseHeaders()
+          .trim()
+          .split(/[\r\n]+/)) {
+          const at = line.indexOf(":");
+          if (at > 0) headers.append(line.slice(0, at).trim(), line.slice(at + 1).trim());
+        }
         resolve(
           new Response(nullBody ? null : (request.response as ArrayBuffer), {
             status: request.status,
@@ -464,7 +464,7 @@ function fetchReportingUpload(
       new Headers(init?.headers).forEach((value, name) => request.setRequestHeader(name, value));
       request.send((init?.body ?? null) as XMLHttpRequestBodyInit | null);
     } catch {
-      // Setup or a body XHR refuses (an invalid header, a ReadableStream) fails as `fetch` would.
+      // `open`, a header, or `send` can throw (e.g. an invalid header); fail as `fetch` would.
       settle();
       reject(new TypeError("Failed to fetch"));
     }

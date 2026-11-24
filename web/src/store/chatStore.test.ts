@@ -4996,6 +4996,47 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     ]);
   });
 
+  it("a Cancel after the batch, then another send of the same File, then Remove: the other send's file is intact", async () => {
+    const shared = new File(["shared"], "shared.txt", { type: "text/plain" });
+    const deleted: string[] = [];
+    const posted: string[] = [];
+    let uploads = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/resources/files") && init?.method === "POST") {
+        uploads += 1;
+        return mockResponse({ id: `file_${uploads}` });
+      }
+      if (url.includes("/resources/files/") && init?.method === "DELETE") {
+        deleted.push(url.split("/").at(-1)!);
+        return mockResponse({ deleted: true });
+      }
+      if (url.endsWith(eventsUrl) && init?.method === "POST") {
+        const content = JSON.parse(init.body as string).data.content as { file_id?: string }[];
+        posted.push(...content.flatMap((b) => (b.file_id ? [b.file_id] : [])));
+        return mockResponse({ queued: true, item_id: "item" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    // The batch finishes, the POST waits on `beforePost`, and Cancel lands.
+    void useChatStore.getState().send("first", "agent_xyz", [shared], {
+      beforePost: () => new Promise<string | null>(() => {}),
+    });
+    await flush();
+    const first = useChatStore.getState().pendingUserMessages[0]!;
+    useUploadProgressStore.getState().uploads[
+      uploadProgressKey(first.tempId, pendingFileId(first))
+    ]!.cancel!();
+    await flush();
+    // Another send of the same File posts its own upload, not the parked one.
+    await useChatStore.getState().send("second", "agent_xyz", [shared]);
+    useChatStore.getState().failedUploads[0]!.uploadFailure!.remove();
+    await flush();
+
+    expect(posted).toEqual(["file_2"]);
+    expect(deleted).toEqual(["file_1"]);
+  });
+
   it("Remove drops the message and leaves the composer's own draft alone", async () => {
     const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
     const parked = await parkFailedUpload("read this", file);
@@ -5113,6 +5154,7 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
 
     expect(useChatStore.getState().failedUploads).toEqual([]);
     expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    expect(useChatStore.getState().queuedMessages[0]).not.toHaveProperty("uploadFailure");
   });
 
   it("a rebind with a live parked entry leaves the composer untouched", async () => {
@@ -5263,6 +5305,8 @@ describe("chatStore — reload records and unsent-work invariants", () => {
     | "sendOk"
     | "sendFails"
     | "sendHeld"
+    | "sendLateCancel"
+    | "sendShared"
     | "cancel"
     | "retry"
     | "remove"
@@ -5292,10 +5336,15 @@ describe("chatStore — reload records and unsent-work invariants", () => {
     ["sendHeld", "cancel", "reload"],
     ["sendFails", "remove", "reload"],
     ["sendFails", "sendFails", "remove", "sendOk", "reload"],
+    // A Cancel after the batch finished, then another send of the same File, then Remove.
+    ["sendLateCancel", "cancel", "sendShared", "remove"],
+    ["sendLateCancel", "cancel", "remove"],
+    ["sendLateCancel", "cancel", "sendShared", "reload"],
   ];
 
   it.each(sequences)("keeps every unsent message owned exactly once: %s", async (...actions) => {
     let seq = 0;
+    const sharedFile = new File(["shared"], "shared.txt", { type: "text/plain" });
     const sent: string[] = [];
     const removed: { text: string; at: number }[] = [];
     const postLog: { text: string; at: number; fileIds: string[] }[] = [];
@@ -5341,7 +5390,6 @@ describe("chatStore — reload records and unsent-work invariants", () => {
     const pendingProgress = () =>
       Object.values(useUploadProgressStore.getState().uploads).filter((u) => u.cancel);
 
-    // The actions run in order, each against the state the last one left.
     const step = async (action: Action): Promise<void> => {
       uploadMode = "ok";
       postMode = "ok";
@@ -5359,6 +5407,24 @@ describe("chatStore — reload records and unsent-work invariants", () => {
           await useChatStore
             .getState()
             .send(text, "agent_xyz", [new File(["x"], `f${seq}.txt`, { type: "text/plain" })]);
+          break;
+        }
+        case "sendShared": {
+          const text = message();
+          sent.push(text);
+          // Queues behind a held send in this conversation, so it is not awaited here.
+          void useChatStore.getState().send(text, "agent_xyz", [sharedFile]);
+          await flush();
+          break;
+        }
+        case "sendLateCancel": {
+          // The uploads finish, and the POST waits on `beforePost`: Cancel lands after the batch.
+          const text = message();
+          sent.push(text);
+          void useChatStore.getState().send(text, "agent_xyz", [sharedFile], {
+            beforePost: () => new Promise<string | null>(() => {}),
+          });
+          await flush();
           break;
         }
         case "sendHeld": {

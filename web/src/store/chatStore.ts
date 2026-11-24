@@ -180,7 +180,7 @@ import type {
   SessionStatus,
 } from "@/lib/types";
 import { deleteSessionFile, downloadSessionFile, uploadFile } from "@/lib/filesApi";
-import { attachmentKey } from "@/lib/attachments";
+import { attachmentFilename, attachmentKey } from "@/lib/attachments";
 import {
   beginUploadProgress,
   endUploadProgress,
@@ -298,7 +298,7 @@ export interface SendOptions {
    */
   retryOfParkedUpload?: boolean;
   /** Resources a parked attempt created, which this Retry carries on as its own to delete. */
-  inheritedUploads?: { file: File; fileId: string }[];
+  inheritedUploads?: OwnedUpload[];
 }
 
 // Who hears of each send the runner takes, by its committed item's id and by the pending
@@ -2030,6 +2030,20 @@ const backgroundFlushCooldownUntil = new Map<string, number>();
 // could be sent to more than one. WeakMap so entries vanish when the File is
 // dropped from the queue/pending state.
 type UploadedFileBlock = Extract<ContentBlock, { file_id: string }>;
+/** A resource one send attempt created, held privately until its POST starts. */
+interface OwnedUpload {
+  file: File;
+  block: UploadedFileBlock;
+}
+
+/** Publishes uploads to the shared cache, so a later send with the same File reuses them. */
+function publishUploads(sessionId: string, uploads: readonly OwnedUpload[]): void {
+  for (const { file, block } of uploads) {
+    const bySession = uploadedFileBlockCache.get(file) ?? new Map<string, UploadedFileBlock>();
+    bySession.set(sessionId, block);
+    uploadedFileBlockCache.set(file, bySession);
+  }
+}
 const uploadedFileBlockCache = new WeakMap<File, Map<string, UploadedFileBlock>>();
 /** The error a stopped upload's send reports; a parked one shows it in place of a server reason. */
 const UPLOAD_CANCELLED_MESSAGE = "Upload cancelled";
@@ -2046,7 +2060,11 @@ export interface UploadBatchGuard {
   onFileStart?: (file: File) => void;
   onProgress?: (file: File, loaded: number, total: number | null) => void;
   /** Told of each resource this batch created; a reused cache hit is not reported. */
-  onUploaded?: (file: File, fileId: string) => void;
+  onUploaded?: (file: File, block: UploadedFileBlock) => void;
+  /** Uploads already created for these Files, reused before the shared cache is consulted. */
+  reuse?: Map<File, UploadedFileBlock>;
+  /** Keep the batch's uploads out of the shared cache; the caller publishes them once posted. */
+  deferPublish?: boolean;
 }
 
 /** Keep new uploads private to their batch until every file succeeds. */
@@ -2056,7 +2074,10 @@ async function uploadFileBlock(
   newUploads: Map<File, UploadedFileBlock>,
   guard: UploadBatchGuard,
 ): Promise<UploadedFileBlock> {
-  const cached = newUploads.get(file) ?? uploadedFileBlockCache.get(file)?.get(sessionId);
+  const cached =
+    newUploads.get(file) ??
+    guard.reuse?.get(file) ??
+    uploadedFileBlockCache.get(file)?.get(sessionId);
   if (cached !== undefined) return cached;
   guard.onFileStart?.(file);
   const { onProgress } = guard;
@@ -2068,7 +2089,7 @@ async function uploadFileBlock(
     ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
     : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
   newUploads.set(file, block);
-  guard.onUploaded?.(file, block.file_id);
+  guard.onUploaded?.(file, block);
   return block;
 }
 
@@ -2144,10 +2165,11 @@ export async function uploadFileBlocks(
     );
     throw error;
   }
-  for (const [file, block] of newUploads) {
-    const bySession = uploadedFileBlockCache.get(file) ?? new Map<string, UploadedFileBlock>();
-    bySession.set(sessionId, block);
-    uploadedFileBlockCache.set(file, bySession);
+  if (!guard.deferPublish) {
+    publishUploads(
+      sessionId,
+      [...newUploads].map(([file, block]) => ({ file, block })),
+    );
   }
   return blocks;
 }
@@ -3106,7 +3128,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       cancelled: false,
       file: undefined as File | undefined,
       /** Resources this attempt's batch created, which Remove may delete; reuses are not included. */
-      owned: [...(opts?.inheritedUploads ?? [])],
+      owned: [...(opts?.inheritedUploads ?? [])] as OwnedUpload[],
     };
     const uploadKeyOf = (file: File) => uploadProgressKey(tempId, pendingFileIdOf(file));
     const cancelUpload = () => {
@@ -3160,7 +3182,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (interactive) {
         for (const file of files ?? []) {
           beginUploadProgress(uploadKeyOf(file), {
-            name: file.name || "image.png",
+            name: attachmentFilename(file),
             size: file.size,
             cancel: cancelUpload,
           });
@@ -3173,9 +3195,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           onFileStart: (file) => {
             uploads.file = file;
           },
-          onUploaded: (file, fileId) => {
-            uploads.owned.push({ file, fileId });
+          onUploaded: (file, block) => {
+            uploads.owned.push({ file, block });
           },
+          reuse: new Map(
+            (opts?.inheritedUploads ?? []).map((upload) => [upload.file, upload.block]),
+          ),
+          deferPublish: true,
           onProgress: (file, loaded, total) =>
             reportUploadProgress(uploadKeyOf(file), loaded, total),
         }),
@@ -3190,10 +3216,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       ];
       if (initialDraft && !initialSendPending()) return;
       opts?.signal?.throwIfAborted();
-      const heldBack = opts?.beforePost ? await opts.beforePost() : null;
-      if (heldBack !== null) throw new Error(heldBack);
+      // A Cancel stops waiting on the hook, so the message can't stay stuck behind it.
+      const heldBack = opts?.beforePost
+        ? await unlessAborted(opts.beforePost(), uploadAbort.signal)
+        : null;
       opts?.signal?.throwIfAborted();
       if (uploads.cancelled) throw new DOMException(UPLOAD_CANCELLED_MESSAGE, "AbortError");
+      if (heldBack !== null) throw new Error(heldBack);
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -3226,6 +3255,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       // The fence: no await since the cancel check above, so Cancel can't race the POST.
       endProgress();
+      // Only a message that is going to the server publishes its uploads for reuse.
+      publishUploads(sessionId, uploads.owned);
       posting = true;
       const postResult = await withStillSendingMark(sessionId, tempId, () => {
         const post = postEvent(
@@ -3522,12 +3553,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
               }));
               forgetUnsentSend(parkedIn, stableId);
-              // Only resources this attempt created: a reused one may belong to a delivered message.
-              for (const { file, fileId } of ownedUploads) {
-                if (uploadedFileBlockCache.get(file)?.get(parkedIn)?.file_id === fileId) {
+              // Only uploads this attempt created privately: none is in the shared cache yet.
+              for (const { file, block } of ownedUploads) {
+                if (uploadedFileBlockCache.get(file)?.get(parkedIn)?.file_id === block.file_id) {
                   uploadedFileBlockCache.get(file)?.delete(parkedIn);
                 }
-                deleteSessionFile(parkedIn, fileId).catch((error: unknown) =>
+                deleteSessionFile(parkedIn, block.file_id).catch((error: unknown) =>
                   console.warn("Couldn't remove a removed message's upload", error),
                 );
               }
