@@ -230,3 +230,32 @@ async def test_an_overlong_wait_asks_the_lead_once(world: SimpleNamespace) -> No
     confirms = [sid for sid, text in world.inputs.sent if "confirm the wait" in text]
     assert confirms == ["lead"]
     assert all(sid == "lead" for sid, _ in world.inputs.sent)  # the worker is never pinged
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        [{"key": "needs-human", "value": None}],
+        [{"key": "approved", "value": "a" * 40}, {"key": "risk", "value": "migration"}],
+    ],
+)
+async def test_a_ticket_waiting_on_the_owner_is_left_alone(world, labels) -> None:
+    world.tickets.tickets[0]["labels"] = labels
+    for minute in (11, 20, 40, 90):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert world.inputs.sent == [] and world.tickets.notes == [] and world.restarts == []
+    # Once the owner answers, the stall checks resume from the ticket's update.
+    world.tickets.tickets[0]["labels"] = []
+    world.tickets.tickets[0]["updated_at"] = int(100 * MINUTE)
+    await world.loop.check_project("p1", None, now=105 * MINUTE)
+    assert world.inputs.sent == []
+    await world.loop.check_project("p1", None, now=111 * MINUTE)
+    assert [sid for sid, _ in world.inputs.sent] == ["worker"]
+
+
+async def test_a_long_owner_wait_reminds_the_lead_once(world) -> None:
+    world.tickets.tickets[0]["labels"] = [{"key": "needs-human", "value": None}]
+    for hours in (0, 23, 25, 30, 50):
+        await world.loop.check_project("p1", None, now=hours * 3600 + MINUTE)
+    owner = [text for sid, text in world.inputs.sent if "waiting on the owner" in text]
+    assert len(owner) == 1 and world.tickets.notes == []

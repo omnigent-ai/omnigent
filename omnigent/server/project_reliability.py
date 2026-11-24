@@ -52,6 +52,7 @@ _DEFAULTS: dict[str, Any] = {
     "lead_response_minutes": 15.0,
     "review_hours": 4.0,
     "max_wait_hours": 72.0,
+    "owner_wait_hours": 24.0,
 }
 WAITING_LABEL = "waiting"
 # The loop writes as an agent, not a person: its notes and label edits must not
@@ -76,6 +77,7 @@ class Settings:
     lead_response_s: float
     review_s: float
     max_wait_s: float
+    owner_wait_s: float
 
     def threshold(self, stage_id: str) -> float:
         return self.stage_s.get(stage_id, self.stall_s)
@@ -105,6 +107,7 @@ def settings(config: dict[str, Any]) -> Settings:
         lead_response_s=number("lead_response_minutes") * 60,
         review_s=number("review_hours") * 3600,
         max_wait_s=number("max_wait_hours") * 3600,
+        owner_wait_s=number("owner_wait_hours") * 3600,
     )
 
 
@@ -155,6 +158,17 @@ def parse_wait(ticket: dict[str, Any]) -> tuple[str, float, str] | None:
     return None
 
 
+def owner_wait_reason(ticket: dict[str, Any]) -> str | None:
+    """Why the ticket is waiting on the owner, or ``None``: ``needs-human``, or an
+    approved change whose ``risk`` still lacks the owner's ``risk-ok``."""
+    keys = {label.get("key") for label in ticket.get("labels") or []}
+    if "needs-human" in keys:
+        return "needs-human"
+    if "risk" in keys and "risk-ok" not in keys and "approved" in keys:
+        return "risk awaiting risk-ok"
+    return None
+
+
 def _when(timestamp: float) -> str:
     from datetime import UTC, datetime
 
@@ -165,6 +179,8 @@ def _when(timestamp: float) -> str:
 class ProjectState:
     tickets: dict[str, TicketLadder] = field(default_factory=dict)
     waits: dict[str, Wait] = field(default_factory=dict)
+    # Ticket id -> (when the loop first saw it waiting on the owner, reminder sent).
+    owner_waits: dict[str, tuple[float, bool]] = field(default_factory=dict)
     lead: LeadLadder = field(default_factory=LeadLadder)
     started_at: float = field(default_factory=time.time)
     last_review_at: float = 0.0
@@ -338,9 +354,13 @@ class ReliabilityLoop:
             seen.add(ticket["id"])
             if await self._check_wait(project, state, config, ticket, now):
                 continue
+            if await self._check_owner_wait(project, state, config, ticket, now):
+                continue
             await self._check_ticket(
                 project, state, config, ticket, working[ticket["stage_id"]], excluded, now
             )
+        for ticket_id in set(state.owner_waits) - seen:
+            state.owner_waits.pop(ticket_id, None)
         for ticket_id in set(state.waits) - seen:
             state.waits.pop(ticket_id, None)
         for ticket_id in set(state.tickets) - seen:
@@ -470,6 +490,38 @@ class ReliabilityLoop:
         for worker in workers:
             refreshed = await self._session(worker.id)
             ladder.worker_marks[worker.id] = refreshed.position if refreshed else worker.position
+
+    # -- waiting on the owner --------------------------------------------------
+
+    async def _check_owner_wait(
+        self,
+        project: Any,
+        state: ProjectState,
+        config: Settings,
+        ticket: dict[str, Any],
+        now: float,
+    ) -> bool:
+        """Leave a ticket alone while it waits on the owner; remind the lead once, much later."""
+        reason = owner_wait_reason(ticket)
+        ticket_id = ticket["id"]
+        if reason is None:
+            state.owner_waits.pop(ticket_id, None)
+            return False
+        state.tickets.pop(ticket_id, None)
+        state.escalated.discard(ticket_id)
+        since, reminded = state.owner_waits.get(ticket_id, (now, False))
+        if not reminded and now - since >= config.owner_wait_s and project.main_session_id:
+            title = (ticket.get("title") or "")[:80]
+            await self._send(
+                project.main_session_id,
+                f'[{NOTE_PREFIX}] Ticket {ticket_id} ("{title}") has been waiting on the owner '
+                f"({reason}) for {int((now - since) // 3600)} h. If the ask is still open and "
+                "clear, leave it; otherwise restate it or unblock the ticket.",
+                project.user_id,
+            )
+            reminded = True
+        state.owner_waits[ticket_id] = (since, reminded)
+        return True
 
     # -- deliberate waits ----------------------------------------------------
 
