@@ -1747,24 +1747,11 @@ describe("grid cell composer shares its session's draft", () => {
     expect(useChatStore.getState().sideChatComposers[gridCellComposerKey(childId)]).toBeUndefined();
   });
 
-  it("sends a pasted chip's file with the cell's message, directly and when queued", () => {
-    writeAlwaysSteer(false);
+  it("sends a pasted chip's file with the cell's message, directly", () => {
     const shot = new File(["a"], "shot.png", { type: "image/png" });
     const text = "Look at @shot.png";
     // A chip leaves the main composer as a tray file, so the shared draft carries its file.
-    const sharedDraft = { text, files: [shot] };
-    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
-    bridgedCell(sharedDraft);
-    fireEvent.click(screen.getByTestId("side-chat-send"));
-    const queued = useChatStore.getState().queuedMessages[0]!;
-    expect(queued.files).toHaveLength(1);
-    expect(queued.files![0]).toBe(shot);
-
-    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
-    cleanup();
-    setSessionDraft(childId, sharedDraft);
-    useChatStore.setState({ queuedMessages: [] });
-    gridCell();
+    bridgedCell({ text, files: [shot] });
     fireEvent.click(screen.getByTestId("side-chat-send"));
     expect(send).toHaveBeenCalledExactlyOnceWith(
       text,
@@ -1772,6 +1759,19 @@ describe("grid cell composer shares its session's draft", () => {
       [shot],
       expect.objectContaining({ pinnedConversationId: childId }),
     );
+    expect(send.mock.calls[0]![2]![0]).toBe(shot);
+  });
+
+  it("queues a pasted chip's file with the cell's message while its session runs", () => {
+    writeAlwaysSteer(false);
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    bridgedCell({ text: "Look at @shot.png", files: [shot] });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const queued = useChatStore.getState().queuedMessages[0]!;
+    expect(queued.text).toBe("Look at @shot.png");
+    expect(queued.files).toHaveLength(1);
+    expect(queued.files![0]).toBe(shot);
   });
 
   it("keeps an ordinary side chat's tray file name when the text refers to it", () => {

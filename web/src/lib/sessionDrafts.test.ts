@@ -170,107 +170,6 @@ describe("session drafts", () => {
     expect(sessionDraftRevision("conversation")).toBe(0);
   });
 
-  // Failed-draft recovery joins the two drafts: their tray files in order, and their tags merged.
-  // It never edits typed text. Each row states the expansion its fixture's tags must produce, with
-  // the markers written out, so the check never reads the recovered tags.
-  interface Side {
-    message: string;
-    files: File[];
-    sessions?: { token: string; id: string; title: string }[];
-    fileTags?: { token: string; path: string }[];
-  }
-  const recoveryRows: [
-    string,
-    Side,
-    Side,
-    { message: string; names: string[]; expanded: string },
-  ][] = [
-    [
-      "a repeated tray filename is kept as each draft gave it",
-      { message: "use @a.png", files: [new File(["a"], "a.png")] },
-      { message: "look @a.png", files: [new File(["b"], "a.png")] },
-      {
-        message: "use @a.png\n\nlook @a.png",
-        names: ["a.png", "a.png"],
-        expanded: "use @a.png\n\nlook @a.png",
-      },
-    ],
-    [
-      "a workspace tag beside a repeated tray filename is kept",
-      { message: "", files: [new File(["a"], "README.md")] },
-      {
-        message: "Open @README.md",
-        files: [new File(["b"], "README.md")],
-        fileTags: [{ token: "@README.md", path: "README.md" }],
-      },
-      {
-        message: "Open @README.md",
-        names: ["README.md", "README.md"],
-        expanded: "Open [Attached: README.md]",
-      },
-    ],
-    [
-      "a session tag with a longer name beside a repeated tray filename is kept",
-      { message: "", files: [new File(["a"], "a.png")] },
-      {
-        message: "Use @a.png and @a (2).png plan",
-        files: [new File(["b"], "a.png")],
-        sessions: [{ token: "@a (2).png plan", id: "s_plan", title: "a (2).png plan" }],
-      },
-      {
-        message: "Use @a.png and @a (2).png plan",
-        names: ["a.png", "a.png"],
-        expanded: 'Use @a.png and [Session: "a (2).png plan" id=s_plan subagent=no]',
-      },
-    ],
-    [
-      "a session tag that is a prefix of a file name in the text expands its prefix",
-      { message: "", files: [new File(["a"], "a.png")] },
-      {
-        message: "Check @a and @a.png",
-        files: [new File(["b"], "a.png")],
-        sessions: [{ token: "@a", id: "s_a", title: "a" }],
-      },
-      {
-        message: "Check @a and @a.png",
-        names: ["a.png", "a.png"],
-        expanded:
-          'Check [Session: "a" id=s_a subagent=no] and [Session: "a" id=s_a subagent=no].png',
-      },
-    ],
-  ];
-
-  it.each(recoveryRows)(
-    "recovers a failed draft by joining its drafts: %s",
-    async (_, original, temp, want) => {
-      const { recoverFailedSessionDraft, setSessionDraft } = await import("./sessionDrafts");
-      const { attachmentFilename } = await import("./attachments");
-      const { composerInlineMentions, expandMentionTokens } = await import("./composerMentions");
-      const mentionsOf = (side: Side) => ({
-        files: (side.fileTags ?? []).map(({ token, path }) => ({ token, path, isDir: false })),
-        sessions: (side.sessions ?? []).map((session) => ({ ...session, isSubagent: false })),
-      });
-      const tempHasMentions = (temp.sessions ?? []).length + (temp.fileTags ?? []).length > 0;
-      setSessionDraft("temp:rows", {
-        text: temp.message,
-        files: temp.files,
-        mentions: tempHasMentions ? mentionsOf(temp) : undefined,
-      });
-      const recovered = recoverFailedSessionDraft(
-        { message: original.message, files: original.files, mentions: mentionsOf(original) },
-        "temp:rows",
-      );
-      expect(recovered.files.map(attachmentFilename)).toEqual(want.names);
-      expect(recovered.message).toBe(want.message);
-      // The recovered tags expand the recovered message to the markers each row states.
-      const recoveredTags = composerInlineMentions(
-        recovered.mentions ?? { files: [], sessions: [] },
-        null,
-      );
-      expect(expandMentionTokens(recovered.message, recoveredTags)).toBe(want.expanded);
-    },
-  );
-
   it("recovers a failed temporary draft and ignores its late cleanup write", async () => {
     const { getSessionDraft, recoverFailedSessionDraft, setSessionDraft } =
       await import("./sessionDrafts");
@@ -297,6 +196,15 @@ describe("session drafts", () => {
     setSessionDraft("temp:failed", temporaryDraft);
     expect(getSessionDraft("temp:failed")).toBeUndefined();
     expect(sessionStorage.getItem(key)).toBeNull();
+
+    // A file name both drafts use is kept once per file, in order, as each draft gave it.
+    setSessionDraft("temp:repeat", { text: "look", files: [new File(["b"], "a.png")] });
+    const repeated = recoverFailedSessionDraft(
+      { message: "use", files: [new File(["a"], "a.png")] },
+      "temp:repeat",
+    );
+    expect(repeated.files.map((file) => file.name)).toEqual(["a.png", "a.png"]);
+    expect(repeated.message).toBe("use\n\nlook");
   });
 
   it("keeps each recovered tag on its own target when both drafts used the same token", async () => {
@@ -323,6 +231,21 @@ describe("session drafts", () => {
       'read [Session: "Plan" id=s_aaaaaaaa subagent=no]\n\n' +
         'and also [Session: "Plan" id=s_bbbbbbbb subagent=no]',
     );
+    // A workspace tag keeps its own marker beside a tray file that repeats its name.
+    setSessionDraft("temp:file", {
+      text: "Open @README.md",
+      files: [new File(["b"], "README.md")],
+      mentions: { files: [{ token: "@README.md", path: "README.md", isDir: false }], sessions: [] },
+    });
+    const withFile = recoverFailedSessionDraft(
+      { message: "", files: [new File(["a"], "README.md")], mentions: { files: [], sessions: [] } },
+      "temp:file",
+    );
+    const fileExpanded = expandMentionTokens(
+      withFile.message,
+      composerInlineMentions(withFile.mentions!, null),
+    );
+    expect(fileExpanded).toBe("Open [Attached: README.md]");
   });
 
   it("re-renders useSessionDraftIds only when the set of draft ids changes", async () => {

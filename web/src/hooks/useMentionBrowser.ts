@@ -510,7 +510,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     target: ComposerTextTarget,
     trayFiles: readonly File[],
   ): File[] => {
-    // Detached input: hand every file back.
+    // The input may have unmounted between the paste and this call.
     if (!target.isConnected) return [...files];
     const added: PastedAttachment[] = [];
     const addedNames: string[] = [];

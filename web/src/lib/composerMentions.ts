@@ -542,6 +542,17 @@ export interface AttachmentNamespace {
   text?: readonly string[];
 }
 
+// Line breaks and other control characters would not survive the editor's own normalization, so
+// a token could not match its text. Each run becomes one space; a name left empty falls back.
+// oxlint-disable-next-line no-control-regex -- the control characters are what this removes.
+const CONTROL_CHARACTERS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g;
+
+/** A filename as it may appear in a chip's token: no line breaks or control characters. */
+export function canonicalAttachmentName(name: string): string {
+  const cleaned = name.replace(CONTROL_CHARACTERS_RE, " ").replace(/ {2,}/g, " ").trim();
+  return cleaned || "pasted-file";
+}
+
 /**
  * ``file`` under a name the namespace leaves free: its own name when that is free, else a
  * suffixed one. Returns ``file`` itself when its name is kept. Every creation or rename of an
@@ -550,7 +561,7 @@ export interface AttachmentNamespace {
 export function nameAttachmentFile(file: File, namespace: AttachmentNamespace): File {
   const spelled = namespace.text?.join("\n") ?? null;
   const name = uniqueAttachmentName(
-    attachmentFilename(file),
+    canonicalAttachmentName(attachmentFilename(file)),
     (candidate) =>
       namespace.tokens.includes(`@${candidate}`) ||
       namespace.trayNames.includes(candidate) ||

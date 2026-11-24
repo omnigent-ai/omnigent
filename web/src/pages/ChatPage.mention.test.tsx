@@ -1453,6 +1453,53 @@ describe("Composer pasted chips", () => {
     expect(onSend).toHaveBeenCalledWith("Look", undefined);
   });
 
+  it("brings a Backspace-deleted chip back on undo with the same File", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("Look ");
+    const shot = new File(["a"], "shot.png", { type: "image/png" });
+    paste({ files: [shot] });
+    caretAt("Look @shot.png".length);
+    fireEvent.keyDown(composerInput(), { key: "Backspace" });
+    expect(tokens()).toEqual([]);
+
+    act(() => void undo(editorView()));
+    expect(tokens()).toEqual(["@shot.png"]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)![0]).toBe(shot);
+  });
+
+  it("keeps a live chip's file in its session when the composer switches sessions and back", async () => {
+    const sessionA = useChatStore.getState().conversationId!;
+    const onSend = vi.fn();
+    const tree = (
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...composerProps({ onSend })} />
+        </TooltipProvider>
+      </CapabilitiesProvider>
+    );
+    const view = render(tree);
+    await waitFor(() => expect(composerInput()).toHaveClass("cm-content"));
+    typeAt("Look ");
+    paste({ files: [new File(["a"], "shot.png", { type: "image/png" })] });
+
+    // Switch to session B without unmounting the composer.
+    act(() => useChatStore.setState({ conversationId: `${sessionA}_other` }));
+    view.rerender(tree);
+    expect(valueOf()).toBe("");
+    expect(tokens()).toEqual([]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend).not.toHaveBeenCalled();
+
+    // Back on A, the chip's text is literal and its file is still in the tray.
+    act(() => useChatStore.setState({ conversationId: sessionA }));
+    view.rerender(tree);
+    expect(valueOf()).toBe("Look @shot.png ");
+    expect(tokens()).toEqual([]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)!.map((file) => file.name)).toEqual(["shot.png"]);
+  });
+
   it("⌘Z removes a fresh chip with its file, and ⌘⇧Z brings both back for the send", async () => {
     const onSend = await renderCodeMirrorComposer();
     const shot = new File(["a"], "shot.png", { type: "image/png" });
@@ -1542,6 +1589,25 @@ describe("Composer pasted chips", () => {
     expect(onSend.mock.calls[0]![0]).toBe("first @shot.png \n\nAsk again");
     expect(sentFiles(onSend)).toHaveLength(1);
     expect(sentFiles(onSend)![0]).toBe(newer);
+  });
+
+  it("sends a file whose name has line breaks under a canonical name its reference matches", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    paste({
+      files: [
+        new File(["1"], "note\r.txt", { type: "text/plain" }),
+        new File(["2"], "a\r\nb.txt", { type: "text/plain" }),
+        new File(["3"], "c\nd.txt", { type: "text/plain" }),
+      ],
+    });
+    expect(tokens()).toEqual(["@note .txt", "@a b.txt", "@c d.txt"]);
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe("@note .txt @a b.txt @c d.txt");
+    expect(sentFiles(onSend)!.map((file) => file.name)).toEqual([
+      "note .txt",
+      "a b.txt",
+      "c d.txt",
+    ]);
   });
 
   it("replaces a selected range with the chip", async () => {
