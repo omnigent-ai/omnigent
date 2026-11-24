@@ -707,6 +707,80 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_args", "effort", "expected_thinking"),
+    [
+        (None, "high", ["--thinking", "high"]),
+        (["--provider", "p", "--model", "m"], "high", ["--thinking", "high"]),
+        (["--thinking", "low"], "high", None),
+        (None, "bogus", None),
+    ],
+)
+async def test_auto_create_pi_terminal_unmanaged_applies_session_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_args: list[str] | None,
+    effort: str,
+    expected_thinking: list[str] | None,
+) -> None:
+    """Own-login and terminal-pinned launches still pass session effort as --thinking."""
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=terminal_args,
+            external_session_id=None,
+            reasoning_effort=effort,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry(SessionResourceRegistry):
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, spec: Any, **_kwargs: Any
+        ) -> SessionResourceView:
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_pi_terminal(
+        _PI_SESSION_ID,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    args = captured["spec"].args
+    if expected_thinking is None:
+        assert args.count("--thinking") == (1 if terminal_args == ["--thinking", "low"] else 0)
+        if terminal_args:
+            assert args[args.index("--thinking") + 1] == "low"
+    else:
+        assert args[args.index("--thinking") + 1] == expected_thinking[1]
+        assert args.count("--thinking") == 1
+
+
+@pytest.mark.asyncio
 async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

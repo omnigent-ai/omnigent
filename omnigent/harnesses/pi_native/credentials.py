@@ -1973,6 +1973,22 @@ class PiNativeLaunch(NamedTuple):
     effort_warning: str | None = None
 
 
+def pi_thinking_launch_args(reasoning_effort: str | None) -> tuple[list[str], str | None]:
+    """Translate a session effort into Pi ``--thinking`` args.
+
+    :param reasoning_effort: Canonical omnigent effort, or ``None``.
+    :returns: ``(args, warning)``; *warning* is set when the effort is unsupported.
+    """
+    if not reasoning_effort or reasoning_effort in EFFORT_CLEAR_VALUES:
+        return [], None
+    try:
+        effort = validate_effort(reasoning_effort, "pi", PI_EFFORTS)
+    except ValueError as exc:
+        _LOGGER.warning("pi-native: %s", exc)
+        return [], str(exc)
+    return ["--thinking", to_pi_thinking_level(effort)], None
+
+
 def pi_native_provider_launch(
     agent_dir: Path,
     provider: PiProviderConfig,
@@ -2064,19 +2080,8 @@ def pi_native_provider_launch(
         f"{model_provider_id}/{selected_model}" if "/" in selected_model else selected_model
     )
     args = ["--provider", model_provider_id, "--model", model_arg]
-    thinking: str | None = None
-    effort_warning: str | None = None
-    if reasoning_effort and reasoning_effort not in EFFORT_CLEAR_VALUES:
-        try:
-            effort = validate_effort(reasoning_effort, "pi", PI_EFFORTS)
-        except ValueError as exc:
-            effort = None
-            effort_warning = str(exc)
-            _LOGGER.warning("pi-native: %s", exc)
-        if effort is not None:
-            thinking = to_pi_thinking_level(effort)
-    if thinking is not None:
-        args.extend(["--thinking", thinking])
+    thinking_args, effort_warning = pi_thinking_launch_args(reasoning_effort)
+    args.extend(thinking_args)
     from omnigent.inner.pi_gateway import pi_gateway_extension_args
 
     args.extend(pi_gateway_extension_args(agent_dir, rendered))
