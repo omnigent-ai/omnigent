@@ -18,10 +18,8 @@ import { selectionMarkdown } from "./TipTapEditorHelpers";
 // table; `block+` keeps that doc schema-valid so the first transaction doesn't throw.
 const SafeListItem = ListItem.extend({ content: "block+" });
 
-// A copy's plain text is the selection's Markdown; its HTML stays ProseMirror's,
-// which a paste back into an editor reads. Priority 101 puts it ahead of
-// TipTap's core plain-text serializer (100): ProseMirror takes the first
-// non-empty answer, so an empty one leaves the copy to that serializer.
+// Copies plain text as Markdown; the HTML stays ProseMirror's. Priority 101 runs
+// ahead of TipTap's core serializer (100), and an empty answer falls back to it.
 const MarkdownClipboardText = Extension.create({
   name: "markdownClipboardText",
   priority: 101,

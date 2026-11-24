@@ -628,6 +628,18 @@ describe("CodeViewer markdown preview copy", () => {
     );
   });
 
+  it("places text after a rendered formula past the same text before it", () => {
+    renderViewer("a b $$x$$ b\n\nNext line", true, "doc.md", { viewMode: "preview" });
+    // The paragraph ends with " b", after KaTeX's unstamped markup.
+    const afterFormula = document.querySelector(".markdown-preview p")?.lastChild as Text;
+    expect(afterFormula.data).toBe(" b");
+    const range = document.createRange();
+    range.setStart(afterFormula, 1);
+    range.setEnd(previewText("Next").node, 4);
+    window.getSelection()?.addRange(range);
+    expect(fireCopyEvent(afterFormula)).toHaveBeenCalledWith("text/plain", "b\n\nNext");
+  });
+
   it("keeps the browser's copy for a selection reaching outside the preview", () => {
     renderViewer("Plain words here.", true, "doc.md", { viewMode: "preview" });
     const outside = document.createElement("p");

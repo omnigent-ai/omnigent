@@ -902,24 +902,41 @@ function selectedTextBounds(range: Range): { start: TextPoint; end: TextPoint } 
   return start && end ? { start, end } : null;
 }
 
-/** The source a text node renders from: its element's span, narrowed by stamped siblings. */
-function textSourceSpan(node: Text, owner: SourceSpan): SourceSpan {
-  let { start, end } = owner;
-  for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) {
-    const span = sibling instanceof Element ? stampedSpan(sibling) : null;
-    if (span) {
-      start = span.end;
-      break;
-    }
-  }
+/** Where the next stamped sibling after *node* starts, else *end*. */
+function nextStampedStart(node: Node, end: number): number {
   for (let sibling = node.nextSibling; sibling; sibling = sibling.nextSibling) {
     const span = sibling instanceof Element ? stampedSpan(sibling) : null;
-    if (span) {
-      end = span.start;
-      break;
-    }
+    if (span) return span.start;
   }
-  return { start, end };
+  return end;
+}
+
+/**
+ * The source a text node renders from (*stretch*) and each of its characters'
+ * source. Its element's children are matched in order, so the text is found
+ * after the text before it, even past an unstamped rendered formula.
+ */
+function textSource(
+  node: Text,
+  owner: SourceSpan,
+  source: string,
+): { stretch: SourceSpan; characters: SourceSpan[] | null } {
+  let start = owner.start;
+  for (let child = node.parentNode?.firstChild ?? null; child; child = child.nextSibling) {
+    const stamped = child instanceof Element ? stampedSpan(child) : null;
+    if (stamped) start = stamped.end;
+    if (!(child instanceof Text)) continue;
+    const stretch = { start, end: nextStampedStart(child, owner.end) };
+    const aligned = alignText(child.data, source.slice(stretch.start, stretch.end));
+    const characters =
+      aligned?.map((span) => ({
+        start: stretch.start + span.start,
+        end: stretch.start + span.end,
+      })) ?? null;
+    if (child === node) return { stretch, characters };
+    if (characters?.length) start = characters[characters.length - 1].end;
+  }
+  return { stretch: owner, characters: null };
 }
 
 // A character reference such as `&amp;`, `&#42;` or `&#x2A;`, matched where it starts.
@@ -992,13 +1009,11 @@ function sourceOffset(point: TextPoint, side: SelectionSide, source: string): nu
   const owner = parent?.closest("[data-md-start]");
   const ownerSpan = owner ? stampedSpan(owner) : null;
   if (!parent || !ownerSpan) return null;
-  const span = owner === parent ? textSourceSpan(point.node, ownerSpan) : ownerSpan;
-  const characters =
-    owner === parent ? alignText(point.node.data, source.slice(span.start, span.end)) : null;
-  if (!characters) return side === "start" ? span.start : span.end;
+  if (owner !== parent) return side === "start" ? ownerSpan.start : ownerSpan.end;
+  const { stretch, characters } = textSource(point.node, ownerSpan, source);
+  if (!characters) return side === "start" ? stretch.start : stretch.end;
   // A start takes its first character's whole source, an end its last one's.
-  const character = side === "start" ? characters[point.offset] : characters[point.offset - 1];
-  return span.start + (side === "start" ? character.start : character.end);
+  return side === "start" ? characters[point.offset].start : characters[point.offset - 1].end;
 }
 
 /** Whether *element* renders text before (start) or after (end) *point*. */
