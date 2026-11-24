@@ -746,6 +746,175 @@ def test_a_reference_rule_checks_targets_and_applies_its_delete_rule(
     assert rpc(service, app, "get", collection="runs", id="r2")["value"] == {"state": "done"}
 
 
+_UNSET_RUN_CARD = {
+    "name": "run_card",
+    "kind": "reference",
+    "collection": "runs",
+    "field": "cardId",
+    "target": "cards",
+    "on_delete": "unset",
+}
+
+
+def test_a_rule_never_leaves_a_dependent_that_breaks_its_schema(gadgets: Fixture) -> None:
+    service = gadgets.service()
+    app = service.create("Synthetic ruled board")
+    collections = {
+        **_RULED_COLLECTIONS,
+        "notes": {
+            "type": "object",
+            "required": ["label"],
+            "minProperties": 2,
+            "properties": {"label": {"type": "string"}, "card": {"type": "string"}},
+        },
+    }
+    revision = service.create_revision(
+        app["id"],
+        {
+            "html": "<main>Synthetic ruled board</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read", "data.write"],
+            "collections": collections,
+            "constraints": [{**_UNSET_RUN_CARD, "collection": "notes", "field": "card"}],
+        },
+    )["id"]
+    app = service.publish(app["id"], {"revision_id": revision, "if_version": None})
+    target = card(service, app, "a", "todo")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="notes",
+        id="n1",
+        value={"label": "b", "card": "a"},
+        operation_id="n1",
+    )
+    # Unsetting `card` would leave {"label": "b"}, which minProperties refuses.
+    with pytest.raises(InvalidInput, match="notes record n1"):
+        rpc(service, app, "delete", id="a", if_version=target["version"], operation_id="d-a")
+    assert rpc(service, app, "get", id="a") is not None
+    assert rpc(service, app, "get", collection="notes", id="n1")["value"] == {
+        "label": "b",
+        "card": "a",
+    }
+
+
+def _fail_dependent_update_once(monkeypatch: pytest.MonkeyPatch, error: Exception) -> list[str]:
+    """Make the first update of a ``runs`` record fail, after the change's own write."""
+    real_replace = documents_module.ImmutableDocumentStore.replace
+    failed: list[str] = []
+
+    def replace(self, collection, record_id, *args, **kwargs):
+        if collection == "runs" and not failed:
+            failed.append(record_id)
+            raise error
+        return real_replace(self, collection, record_id, *args, **kwargs)
+
+    monkeypatch.setattr(documents_module.ImmutableDocumentStore, "replace", replace)
+    return failed
+
+
+def test_a_rule_update_that_fails_after_the_change_is_finished_later(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_UNSET_RUN_CARD])
+    target = card(service, app, "a", "todo")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="r1",
+        value={"cardId": "a", "state": "done"},
+        operation_id="r1",
+    )
+    failed = _fail_dependent_update_once(monkeypatch, CapacityExceeded("full"))
+    # The card is deleted, but the run still names it: the change says it isn't finished.
+    with pytest.raises(constraints_module.IncompleteChange):
+        rpc(service, app, "delete", id="a", if_version=target["version"], operation_id="d-a")
+    assert failed == ["r1"]
+    assert rpc(service, app, "get", id="a") is None
+    assert rpc(service, app, "get", collection="runs", id="r1")["value"]["cardId"] == "a"
+    # Retrying the same delete finishes it, without deleting anything twice.
+    rpc(service, app, "delete", id="a", if_version=target["version"], operation_id="d-a")
+    assert rpc(service, app, "get", collection="runs", id="r1")["value"] == {"state": "done"}
+
+
+def test_a_dependent_changed_after_the_plan_is_updated_from_its_current_version(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_UNSET_RUN_CARD])
+    target = card(service, app, "a", "todo")
+    run = rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="r1",
+        value={"cardId": "a", "state": "done"},
+        operation_id="r1",
+    )
+    real_replace = documents_module.ImmutableDocumentStore.replace
+    raced: list[str] = []
+
+    def replace(self, collection, record_id, value, if_version, *args, **kwargs):
+        if collection == "runs" and not raced:
+            # Someone else updates the run between the plan and the rule's update of it.
+            raced.append(record_id)
+            real_replace(
+                self,
+                "runs",
+                "r1",
+                {"cardId": "a", "state": "again"},
+                run["version"],
+                "r1-again",
+                "x",
+            )
+        return real_replace(self, collection, record_id, value, if_version, *args, **kwargs)
+
+    monkeypatch.setattr(documents_module.ImmutableDocumentStore, "replace", replace)
+    rpc(service, app, "delete", id="a", if_version=target["version"], operation_id="d-a")
+    assert raced == ["r1"]
+    # Unset from the current version, keeping the other change.
+    assert rpc(service, app, "get", collection="runs", id="r1")["value"] == {"state": "again"}
+
+
+def test_a_rule_update_that_fails_when_resumed_stays_pending_for_the_next_writer(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = gadgets.service()
+    app = publish_ruled_board(service, [_UNSET_RUN_CARD])
+    target = card(service, app, "a", "todo")
+    rpc(
+        service,
+        app,
+        "create",
+        collection="runs",
+        id="r1",
+        value={"cardId": "a", "state": "done"},
+        operation_id="r1",
+    )
+    original_run = ConstraintGuard._run
+
+    def stop_after_recording(self, epoch, started):
+        raise RuntimeError("writer stopped")
+
+    monkeypatch.setattr(ConstraintGuard, "_run", stop_after_recording)
+    with pytest.raises(RuntimeError):
+        rpc(service, app, "delete", id="a", if_version=target["version"], operation_id="d-a")
+    monkeypatch.setattr(ConstraintGuard, "_run", original_run)
+    # The next writer resumes the delete; its update of the run fails once. The plan stays
+    # pending rather than being dropped, so the writer's next try finishes it.
+    failed = _fail_dependent_update_once(monkeypatch, CapacityExceeded("full"))
+    card(gadgets.service(), app, "b", "todo")
+    assert failed == ["r1"]
+    assert rpc(service, app, "get", id="a") is None
+    assert rpc(service, app, "get", id="b") is not None
+    assert rpc(service, app, "get", collection="runs", id="r1")["value"] == {"state": "done"}
+
+
 def _republish(service: GadgetService, app: dict, revision_id: str) -> dict:
     return service.publish(app["id"], {"revision_id": revision_id, "if_version": app["version"]})
 

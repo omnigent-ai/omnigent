@@ -1423,8 +1423,21 @@ class GadgetService:
         store = ImmutableDocumentStore(files, "data", limits=_DATA_STORE_LIMITS)
         rules = revision.get("constraints", [])
         # `_guard` cannot be a collection name, so the guard never shares a directory with records.
+        collections = revision["collections"]
+
+        def validate(dependent: str, dependent_id: str, value: Any) -> None:
+            error = jsonschema.exceptions.best_match(
+                jsonschema.Draft202012Validator(collections.get(dependent, {})).iter_errors(value)
+            )
+            if error is not None:
+                raise InvalidInput(
+                    f"Deleting this record would leave {dependent} record {dependent_id} "
+                    f"not matching its schema: {error.message[:200]}",
+                    details={"collection": dependent, "id": dependent_id},
+                )
+
         guard = (
-            ConstraintGuard(files, "data/_guard", store, rules, self.viewer.user_id)
+            ConstraintGuard(files, "data/_guard", store, rules, self.viewer.user_id, validate)
             if rules
             else None
         )

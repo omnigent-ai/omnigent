@@ -52,6 +52,7 @@ import math
 import random
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -119,6 +120,17 @@ class ConstraintViolation(Conflict):
             "kind": rule["kind"],
             "collection": rule["collection"],
         }
+
+
+class IncompleteChange(Conflict):
+    """A change was saved, but not yet every record its rules update; the next write retries."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The change was saved, but the records that depend on it are not all updated yet. "
+            "They are updated with the next change; try again to finish now.",
+            reason="incomplete_change",
+        )
 
 
 def _back_off(attempt: int) -> None:
@@ -292,8 +304,11 @@ class ConstraintGuard:
         data: ImmutableDocumentStore,
         rules: list[dict],
         actor: str,
+        validate: Callable[[str, str, Any], None] | None = None,
     ) -> None:
         self.files = files
+        # Raises InvalidInput when a value a rule would write breaks its collection's schema.
+        self.validate = validate
         self.guard_root = guard_root
         self.guard = ImmutableDocumentStore(files, guard_root, limits=GUARD_LIMITS)
         self.data = data
@@ -450,6 +465,13 @@ class ConstraintGuard:
                         "actor": self.actor,
                     }
                     plan.operations.append(operation)
+                # Which deleted record each field named: a repeat after the dependent changed
+                # updates it only while it still names that record.
+                targets = {
+                    **operation.get("targets", {}),
+                    **{r["field"]: changed_id for r in rules},
+                }
+                operation["targets"] = targets
                 if any(rule["on_delete"] == "cascade" for rule in rules):
                     operation["kind"] = "delete"
                     operation.pop("fields", None)
@@ -460,6 +482,10 @@ class ConstraintGuard:
                     fields = sorted({*operation.get("fields", []), *(r["field"] for r in rules)})
                     operation["kind"], operation["fields"] = "unset", fields
                     remaining = {k: v for k, v in current.items() if k not in fields}
+                    if self.validate is not None:
+                        # The record left behind must still match its schema, checked before
+                        # anything is written.
+                        self.validate(key[0], dependent.id, remaining)
                     planned[key] = (operation, remaining)
                     queue.append((key[0], dependent.id, current, remaining))
                 if len(plan.operations) > MAX_PLAN_OPERATIONS:
@@ -628,9 +654,12 @@ class ConstraintGuard:
                 actor,
             ).to_dict()
         if kind == "delete":
-            return self.data.delete(
-                collection, record_id, operation["if_version"], operation_id, actor
-            ).to_dict()
+            try:
+                return self.data.delete(
+                    collection, record_id, operation["if_version"], operation_id, actor
+                ).to_dict()
+            except Conflict:
+                return self._apply_again(operation)
         # Derived from the immutable version the plan saw, so a repeat sends the same request.
         source = self.data.get_version(collection, record_id, operation["if_version"])
         if source is None:
@@ -638,12 +667,46 @@ class ConstraintGuard:
         # Older pending plans named one field.
         fields = set(operation.get("fields") or [operation["field"]])
         value = {key: item for key, item in source.value.items() if key not in fields}
+        try:
+            return self.data.replace(
+                collection, record_id, value, operation["if_version"], operation_id, actor
+            ).to_dict()
+        except Conflict:
+            return self._apply_again(operation)
+
+    def _apply_again(self, operation: dict) -> dict:
+        """A rule's update of a dependent that changed after the plan: done against its
+        current version while it still names the deleted record, and dropped once it doesn't.
+
+        Only derived updates carry ``targets``; a primary write's conflict stands.
+        """
+        targets = operation.get("targets")
+        if not targets:
+            raise Conflict("record changed before it could be updated", reason="concurrent_write")
+        collection, record_id = operation["collection"], operation["id"]
+        current = self.data.get(collection, record_id)
+        if current is None:
+            return {}
+        naming = [field for field, target in targets.items() if current.value.get(field) == target]
+        if not naming:
+            return {}
+        operation_id = f"{operation['operation_id']}.{_digest(current.version)[:16]}"
+        if operation["kind"] == "delete":
+            return self.data.delete(
+                collection, record_id, current.version, operation_id, operation["actor"]
+            ).to_dict()
+        value = {key: item for key, item in current.value.items() if key not in naming}
+        if self.validate is not None:
+            self.validate(collection, record_id, value)
         return self.data.replace(
-            collection, record_id, value, operation["if_version"], operation_id, actor
+            collection, record_id, value, current.version, operation_id, operation["actor"]
         ).to_dict()
 
-    def _execute(self, operations: list[dict]) -> tuple[dict | None, Exception | None]:
-        """Applies a change; the follow-on writes (cascades) run only once its own write landed."""
+    def _execute(self, operations: list[dict]) -> tuple[dict | None, Exception | None, bool]:
+        """Applies a change; the follow-on writes (cascades) run only once its own write landed.
+
+        Returns its own write's result, the first failure, and whether that write landed.
+        """
         result: dict | None = None
         failure: Exception | None = None
         for index, operation in enumerate(operations):
@@ -652,14 +715,18 @@ class ConstraintGuard:
             except (Conflict, NotFound, CapacityExceeded, InvalidInput) as exc:
                 failure = failure or exc
                 if index == 0:
-                    break
+                    return None, failure, False
                 continue
             if index == 0:
                 result = outcome
-        return result, failure
+        return result, failure, True
 
     def _run(self, epoch: str, started: Document) -> dict:
-        result, failure = self._execute(started.value["pending"])
+        result, failure, landed = self._execute(started.value["pending"])
+        if landed and failure is not None:
+            # The change itself was saved, but not every record its rules update: the plan
+            # stays pending, and the next writer (or a retry of this one) finishes it.
+            raise IncompleteChange() from failure
         self._clear(epoch, started, failed=failure is not None)
         if result is None:
             raise (
@@ -670,7 +737,9 @@ class ConstraintGuard:
         return result
 
     def _finish(self, epoch: str, state: Document) -> None:
-        _, failure = self._execute(state.value["pending"])
+        _, failure, landed = self._execute(state.value["pending"])
+        if landed and failure is not None:
+            return  # Still unfinished; it stays pending for the next writer.
         self._clear(epoch, state, failed=failure is not None)
 
     def _clear(self, epoch: str, state: Document, *, failed: bool) -> None:
