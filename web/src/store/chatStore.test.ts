@@ -5032,11 +5032,9 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
-  it("Retry that fails at the post parks again and never overwrites the composer's draft", async () => {
+  it("Retry whose POST fails takes the ordinary failure path and is not parked", async () => {
     const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
     const parked = await parkFailedUpload("read this", file);
-    const composerDraft = { conversationId, text: "typed since", files: [], serverRefused: false };
-    useChatStore.setState({ failedSendDraft: composerDraft });
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/resources/files")) return mockResponse({ id: "file_retry" });
@@ -5049,9 +5047,88 @@ describe("chatStore — a stopped upload keeps its message until the user acts",
     parked.uploadFailure!.retry();
     await flush();
 
-    expect(useChatStore.getState().failedSendDraft).toEqual(composerDraft);
+    // Once the POST starts, the message belongs to the ordinary send path, as a send without files.
+    expect(useChatStore.getState().failedUploads).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "read this" });
+  });
+
+  it("Retry whose POST response is lost, then confirmed delivered, is not parked and deletes nothing", async () => {
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const parked = await parkFailedUpload("read this", file);
+    let stableIdSent = "";
+    let answerPost: (error: Error) => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/resources/files")) return mockResponse({ id: "file_kept" });
+      if (url.endsWith(eventsUrl) && init?.method === "POST") {
+        stableIdSent = JSON.parse(init.body as string).data.stable_id;
+        return new Promise<Response>((_resolve, reject) => {
+          answerPost = reject;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    parked.uploadFailure!.retry();
+    await flush();
+    // The consumed event proves delivery while the POST's answer is still missing.
+    handleSessionEvent(
+      {
+        type: "session_input_consumed",
+        itemId: stableIdSent,
+        data: { user_authored: true },
+      } as never,
+      conversationId,
+    );
+    answerPost(new TypeError("Failed to fetch"));
+    await flush();
+
+    expect(useChatStore.getState().failedUploads).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
+  });
+
+  it("Retry held for a host that is offline is held only, and Remove is not offered", async () => {
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const parked = await parkFailedUpload("read this", file);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/resources/files")) return mockResponse({ id: "file_held" });
+      if (url.endsWith(eventsUrl) && init?.method === "POST") {
+        return mockResponse(
+          { error: { code: "host_offline", message: "The host is offline." } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    parked.uploadFailure!.retry();
+    await flush();
+
+    expect(useChatStore.getState().failedUploads).toEqual([]);
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+  });
+
+  it("a rebind with a live parked entry leaves the composer untouched", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+    seedSession("conv_other");
+    const file = new File(["bytes"], "notes.txt", { type: "text/plain" });
+    const parked = await parkFailedUpload("read this", file);
+    rememberUnsentSend(conversationId, {
+      stableId: parked.uploadFailure!.stableId,
+      text: "read this",
+      authorId: "user_a",
+    });
+
+    await useChatStore.getState().switchTo("conv_other");
+    const entry = conversationRegistry.peek(conversationId)!;
+    entry.getState().abortController?.abort();
+    entry.setState({ abortController: null });
+    await useChatStore.getState().switchTo(conversationId);
+
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(useChatStore.getState().failedUploads).toHaveLength(1);
-    expect(useChatStore.getState().failedUploads[0]!.uploadFailure!.message).toBe("Runner offline");
   });
 
   it("Retry does not clear the composer's own restored-send tracker", async () => {

@@ -1272,6 +1272,7 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
         fileId: "pending:a.zip",
         message: "Too big",
         retry: vi.fn(),
+        stableId: "stable",
         remove: vi.fn(),
       },
     };
@@ -1320,6 +1321,7 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
         fileId: "pending:big.zip",
         message: "Too big",
         retry: vi.fn(),
+        stableId: "stable",
         remove: vi.fn(),
       },
     };
@@ -1338,7 +1340,12 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
   });
 
   it("names the whole message when its failure names no attachment", () => {
-    const failure = { message: "Upload cancelled", retry: vi.fn(), remove: vi.fn() };
+    const failure = {
+      message: "Upload cancelled",
+      retry: vi.fn(),
+      stableId: "stable",
+      remove: vi.fn(),
+    };
     render(
       <QueryClientProvider client={new QueryClient()}>
         <BubbleView
@@ -1368,6 +1375,7 @@ describe("withUncommittedUserBubbles with failed uploads", () => {
       fileId: "pending:a.png",
       message: "Too big",
       retry: vi.fn(),
+      stableId: "stable",
       remove: vi.fn(),
     };
     render(

@@ -294,7 +294,7 @@ export interface SendOptions {
   beforePost?: () => Promise<string | null>;
   /**
    * A parked upload's Retry. Its message is not the composer's: the composer's restored-send
-   * tracker stays as it is, and a failure parks the message again instead of restoring the draft.
+   * tracker stays as it is. A failure before the POST parks it again.
    */
   retryOfParkedUpload?: boolean;
 }
@@ -3388,18 +3388,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // A send whose owner already handles failure (its onError, a held first message, an
       // external send) keeps the ordinary failure path. Any other send stopped during its upload
       // (failed, or cancelled) keeps its message on its bubble until the user retries or removes it.
-      const retrying = opts?.retryOfParkedUpload === true;
       const owned =
         opts?.onError !== undefined ||
-        (heldForHost && !retrying) ||
+        heldForHost ||
         opts?.external === true ||
         (initialDraft !== undefined && !initialDispatched);
-      // A retry re-parks any failure: its message is still the user's, and the composer is not.
+      // Parking is the upload phase's owner only: once the POST starts, the ordinary send path owns it.
       const parkable =
         !owned &&
-        (cancelled ||
-          (uploads.uploading && opts?.signal?.aborted !== true) ||
-          (retrying && inFlightSends.get(stableId) !== true)) &&
+        (cancelled || (uploads.uploading && opts?.signal?.aborted !== true)) &&
         draftSessionId !== null &&
         (files?.length ?? 0) > 0;
       const parkedEntry = parkable
@@ -3501,6 +3498,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           uploadFailure: {
             fileId: failedFile === undefined ? undefined : pendingFileIdOf(failedFile),
             message: cancelled ? UPLOAD_CANCELLED_MESSAGE : message,
+            stableId,
             retry: () => {
               if (settled) return;
               settled = true;
@@ -8698,6 +8696,11 @@ function unsentSendToRestore(
   const unsent = peekUnsentSend(conversationId);
   // A send still open in this tab settles on its own.
   if (unsent !== null && inFlightSends.has(unsent.stableId)) return null;
+  // A parked upload on this conversation owns its record until the user acts on it.
+  const parkedHere = conversationRegistry.peek(conversationId)?.getState().failedUploads ?? [];
+  if (unsent !== null && parkedHere.some((p) => p.uploadFailure?.stableId === unsent.stableId)) {
+    return null;
+  }
   // Messages this page still queues aren't lost; only a reload empties the queue.
   const queuedHere = new Set(useChatStore.getState().queuedMessages.map((m) => m.stableId));
   const stored = peekQueuedSends(conversationId);

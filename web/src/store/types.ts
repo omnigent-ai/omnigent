@@ -34,6 +34,8 @@ export interface UploadFailure {
   fileId?: string;
   /** The failure's text, as the send's error shows it. */
   message: string;
+  /** The send's id: its reload record is the parked entry's, and recovery must leave it alone. */
+  stableId: string;
   /** Re-uploads the same files and sends the message once they're in. */
   retry: () => void;
   /** Drops the message: it is not restored anywhere. */

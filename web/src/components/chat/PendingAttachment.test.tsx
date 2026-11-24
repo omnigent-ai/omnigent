@@ -99,7 +99,13 @@ describe("PendingAttachment", () => {
   it("shows a failed upload's reason with Retry and Remove", () => {
     const retry = vi.fn();
     const remove = vi.fn();
-    renderAttachment({ fileId, message: "Attachment quota reached", retry, remove });
+    renderAttachment({
+      fileId,
+      message: "Attachment quota reached",
+      stableId: "stable",
+      retry,
+      remove,
+    });
 
     expect(screen.getByText("Attachment quota reached")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Retry upload of big.zip" }));
@@ -112,6 +118,7 @@ describe("PendingAttachment", () => {
     renderAttachment({
       fileId: "pending:other.zip",
       message: "Too big",
+      stableId: "stable",
       retry: vi.fn(),
       remove: vi.fn(),
     });
