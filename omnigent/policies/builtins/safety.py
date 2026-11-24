@@ -477,11 +477,12 @@ def scheduled_task_review_error(
     )
     missing = sorted(required.difference(args))
     if require_complete and missing:
-        hint = (
-            "List the task and retry with its full prompt and permission_mode."
-            if action == "update"
-            else f"Retry with prompt and permission_mode: {_PERMISSION_MODE_VALUES}."
-        )
+        if action == "update":
+            hint = "List the task and retry with its full prompt and permission_mode."
+        elif runs_workflow:
+            hint = f"Retry with permission_mode: {_PERMISSION_MODE_VALUES}."
+        else:
+            hint = f"Retry with prompt and permission_mode: {_PERMISSION_MODE_VALUES}."
         return f"Missing review fields ({', '.join(missing)}). {hint}"
     if runs_workflow:
         workflow_id = args["workflow_id"]
@@ -509,8 +510,12 @@ def scheduled_task_review_error(
 
 def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str) -> str:
     """Render supplied instructions in full and identify legacy omissions."""
-    if "prompt" not in args and action == "create" and "workflow_id" in args:
-        prompt: object = f"Runs the saved workflow {args['workflow_id']}"
+    workflow_id = args.get("workflow_id")
+    if action == "create" and "prompt" not in args and "workflow_id" in args:
+        prompt: object = f"Runs the saved workflow {workflow_id}"
+    elif action == "update" and workflow_id:
+        # The server replaces a resent prompt with the one that runs the workflow.
+        prompt = f"Runs the saved workflow {workflow_id}; the server writes its prompt"
     else:
         prompt = args.get("prompt", "(unchanged; not supplied by legacy caller)")
     if "workflow_details" in args:

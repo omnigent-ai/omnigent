@@ -7445,6 +7445,45 @@ describe("CreateScheduledTaskDialog workflow", () => {
     });
   });
 
+  it("saves other edits to a stored workflow's schedule once the workflow is gone", async () => {
+    savedWorkflowsList.current = [];
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    // Unchanged, so the server needn't load the workflow to save the rest.
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited.name).toBe("Renamed");
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited).not.toHaveProperty("workflowDetails");
+    expect(edited.prompt).toBeUndefined();
+  });
+
+  it("stops running a stored workflow when its schedule becomes a trigger's prompt", async () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+    const triggerPrompt =
+      "This automation watches Jira and starts one Omnigent session for each new issue.";
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: triggerPrompt },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      workflowId: null,
+      prompt: triggerPrompt,
+    });
+  });
+
   it("stops showing saved instructions once they're saved empty", async () => {
     const view = renderWithWorkflows(
       <CreateScheduledTaskDialog

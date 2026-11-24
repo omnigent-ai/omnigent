@@ -869,21 +869,37 @@ def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -
     ) in reason.splitlines()
 
 
-def test_ask_on_scheduled_task_change_shows_the_saved_workflow_it_runs() -> None:
-    """A task created to run a saved workflow has no prompt; its details show in full."""
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        (
+            "sys_scheduled_task_create",
+            {
+                "name": "nightly triage",
+                "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                "agent_id": "ag_1",
+            },
+        ),
+        # The server replaces the prompt an update resends with the one that runs the workflow.
+        ("sys_scheduled_task_update", {"scheduled_task_id": "st_1", "prompt": "Summarize."}),
+    ],
+    ids=["create", "update"],
+)
+def test_ask_on_scheduled_task_change_shows_the_saved_workflow_it_runs(
+    tool: str, arguments: dict[str, object]
+) -> None:
+    """The approval names the saved workflow the task will run, with its details in full."""
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
     details = "Only the upload tests. " * 20
     result = ask_on_scheduled_task_change(
         {
             "type": "tool_call",
-            "target": "sys_scheduled_task_create",
+            "target": tool,
             "data": {
-                "name": "sys_scheduled_task_create",
+                "name": tool,
                 "arguments": {
-                    "name": "nightly triage",
-                    "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-                    "agent_id": "ag_1",
+                    **arguments,
                     "permission_mode": None,
                     "workflow_id": "0123456789abcdef0123456789abcdef",
                     "workflow_details": details,
@@ -898,6 +914,18 @@ def test_ask_on_scheduled_task_change_shows_the_saved_workflow_it_runs() -> None
     assert instructions.startswith("Runs the saved workflow 0123456789abcdef0123456789abcdef")
     assert details in instructions
     assert "workflow_details=" not in reason
+    assert "Summarize." not in instructions
+
+
+def test_a_workflow_create_is_asked_only_for_its_permission_mode() -> None:
+    from omnigent.policies.builtins.safety import scheduled_task_review_error
+
+    error = scheduled_task_review_error(
+        {"name": "n", "workflow_id": "0123456789abcdef0123456789abcdef"}, action="create"
+    )
+    assert error is not None
+    assert "Retry with permission_mode" in error
+    assert "prompt" not in error
 
 
 @pytest.mark.parametrize(

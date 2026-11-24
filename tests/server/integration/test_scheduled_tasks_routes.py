@@ -4582,6 +4582,43 @@ async def test_a_prompt_in_the_exact_form_saves_the_workflow_it_runs(
     assert store.get(legacy.id).workflow_id == workflow_id
 
 
+async def test_an_unchanged_workflow_doesnt_block_other_edits_once_it_is_gone(
+    workflows_client: httpx.AsyncClient,
+) -> None:
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json={**_workflow_create_body(workflow_id), "workflow_details": "Only bugs"},
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    deleted = await client.delete(f"/v1/workflows/{workflow_id}", headers=_headers())
+    assert deleted.status_code == 200, deleted.text
+    # Resending the workflow and details it runs leaves them as they are.
+    renamed = await client.patch(
+        url,
+        json={"name": "renamed", "workflow_id": workflow_id, "workflow_details": "Only bugs"},
+        headers=_headers(),
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["prompt"] == task["prompt"]
+    # Another agent's harness invokes the workflow skill its own way.
+    switched = await client.patch(
+        url, json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}, headers=_headers()
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["prompt"] == f"${task['prompt'][1:]}"
+    # Changing what it runs needs a workflow its owner can run.
+    detailed = await client.patch(
+        url, json={"workflow_details": "Only flakes"}, headers=_headers()
+    )
+    assert detailed.status_code == 400, detailed.text
+    assert detailed.json()["error"]["message"].startswith("workflow_not_found")
+
+
 async def test_a_workflow_runs_with_its_agents_skill_prefix(
     workflows_client: httpx.AsyncClient,
 ) -> None:
@@ -4598,15 +4635,18 @@ async def test_a_workflow_runs_with_its_agents_skill_prefix(
 
 
 @pytest.mark.parametrize(
-    "change",
+    ("change", "message"),
     [
-        {"prompt": "triage the queue"},
-        {"workflow_details": "Only bugs", "workflow_id": None},
+        ({"prompt": "triage the queue"}, scheduled_tasks_routes._PROMPT_WITH_WORKFLOW_MSG),
+        (
+            {"prompt": "triage the queue", "workflow_details": "Only bugs", "workflow_id": None},
+            scheduled_tasks_routes._DETAILS_WITHOUT_WORKFLOW_MSG,
+        ),
     ],
     ids=["prompt-with-workflow", "details-without-workflow"],
 )
 async def test_a_create_names_either_a_prompt_or_a_workflow(
-    workflows_client: httpx.AsyncClient, change: dict[str, object]
+    workflows_client: httpx.AsyncClient, change: dict[str, object], message: str
 ) -> None:
     workflow_id = await _save_workflow(workflows_client)
     body = {**_workflow_create_body(workflow_id), **change}
@@ -4614,6 +4654,51 @@ async def test_a_create_names_either_a_prompt_or_a_workflow(
         body.pop("workflow_id")
     refused = await workflows_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
     assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"][0]["msg"] == f"Value error, {message}"
+
+
+async def test_an_edit_checked_before_a_concurrent_attach_cant_replace_its_prompt(
+    workflows_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The edit checked while the task ran no workflow lands second, and is refused."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    assert created.status_code == 200, created.text
+    url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    check = scheduled_tasks_routes._workflow_reuse_problem
+    checked = asyncio.Barrier(2)
+    workflow_saved = asyncio.Event()
+
+    async def check_together(
+        prompt: str, session_mode: str, workflow_id: str | None = None
+    ) -> str | None:
+        problem = await check(prompt, session_mode, workflow_id)
+        await checked.wait()
+        if workflow_id is None:
+            await workflow_saved.wait()
+        return problem
+
+    async def attach_workflow() -> httpx.Response:
+        try:
+            return await client.patch(url, json={"workflow_id": workflow_id}, headers=_headers())
+        finally:
+            workflow_saved.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_workflow_reuse_problem", check_together)
+    async with asyncio.timeout(10):
+        attached, reworded = await asyncio.gather(
+            attach_workflow(),
+            client.patch(url, json={"prompt": "Summarize overnight activity"}, headers=_headers()),
+        )
+    assert attached.status_code == 200, attached.text
+    assert reworded.status_code == 409, reworded.text
+    assert reworded.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_CHANGED_MSG
+    saved = (await client.get(url, headers=_headers())).json()
+    assert (saved["prompt"], saved["workflow_id"]) == (
+        _workflow_run_prompt(workflow_id),
+        workflow_id,
+    )
 
 
 async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(

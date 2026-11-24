@@ -1110,17 +1110,20 @@ export function CreateScheduledTaskDialog({
   // A schedule's saved workflow, sent as itself to a server that stores it: the server
   // writes the prompt, and only workflowId null stops running the workflow.
   const scheduledWorkflowInput = () => {
-    if (!scheduledWorkflowSupported || trigger !== null || isTriggerPrompt(freeTextPrompt)) {
-      return {};
+    if (!scheduledWorkflowSupported) return {};
+    const stopsStoredWorkflow = editingTask?.workflowId ? { workflowId: null } : {};
+    // A trigger runs its own prompt, so a schedule turned into one stops running the workflow.
+    if (trigger !== null || isTriggerPrompt(freeTextPrompt)) return stopsStoredWorkflow;
+    if (workflowChoice === null) return stopsStoredWorkflow;
+    const workflowDetails = keepsWorkflowDetails ? prompt.trim() : "";
+    // Unchanged, so other edits save without the server loading the workflow, which may be gone.
+    if (
+      editingTask?.workflowId === workflowChoice.id &&
+      workflowDetails === (editingTask.workflowDetails ?? "")
+    ) {
+      return { prompt: undefined };
     }
-    if (workflowChoice !== null) {
-      return {
-        prompt: undefined,
-        workflowId: workflowChoice.id,
-        workflowDetails: keepsWorkflowDetails ? prompt.trim() : "",
-      };
-    }
-    return editingTask?.workflowId ? { workflowId: null } : {};
+    return { prompt: undefined, workflowId: workflowChoice.id, workflowDetails };
   };
   const workflowField =
     workflowsEnabled && (savedWorkflows.workflows.length > 0 || workflowChoice) ? (
