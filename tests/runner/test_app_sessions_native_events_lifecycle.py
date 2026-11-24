@@ -3347,6 +3347,7 @@ async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_he
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner import app as runner_app_module
+    from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.conftest import _BlockingHarnessClient, _sse
 
     conv_id = "7a4e2c9b1d3f4e6a8c0b2d4f6a8c0e1b"
@@ -3358,13 +3359,22 @@ async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_he
         raise RuntimeError("launch config disabled in test")
 
     monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
-    never_released = asyncio.Event()
-    harness = _BlockingHarnessClient(
+
+    class _HarnessEndingOnInterrupt(_BlockingHarnessClient):
+        """Hold the turn's stream open until interrupted, then end it cancelled."""
+
+        async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+            response = await super().post(url, json=json, timeout=timeout)
+            if json == {"type": "interrupt"}:
+                self._gate.set()
+            return response
+
+    harness = _HarnessEndingOnInterrupt(
         [
             _sse({"type": "response.created", "response": {"id": "resp_held"}}),
-            _sse({"type": "response.completed", "response": {"id": "resp_held"}}),
+            _sse({"type": "response.cancelled", "response": {"id": "resp_held"}}),
         ],
-        never_released,
+        asyncio.Event(),
     )
     codex_native_spec = _harness_spec("codex-native")
 
@@ -3395,6 +3405,8 @@ async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_he
         assert sent.status_code == 202, sent.text
         await asyncio.wait_for(harness.post_seen.wait(), timeout=5)
         turn = app.state.active_turns[conv_id]
+        queue = _session_event_queues_ref.get(conv_id)
+        _drain_session_event_queue(queue)
         if bridge_published:
             codex_native_bridge.write_bridge_state(
                 codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
@@ -3416,11 +3428,15 @@ async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_he
         assert stopped.status_code == 204, stopped.text
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.wait_for(turn, timeout=5)
+        events = _drain_session_event_queue(queue)
 
-    # The harness was told to stop the held turn, and the runner cancelled it and settled the Stop.
+    # The harness was told to stop the held turn, which ended cancelled, and the Stop settled.
     assert {"type": "interrupt"} in harness.patched_events
-    assert turn.cancelled()
+    assert turn.done()
     assert conv_id not in app.state.interrupted_sessions
+    # No Codex turn will close the turn's ``running`` edge, so the runner does.
+    statuses = [e.get("status") for e in events if e.get("type") == "session.status"]
+    assert statuses == ["idle"], events
 
 
 class _StaleTurnCodexAppServerClient(_RecordingCodexAppServerClient):

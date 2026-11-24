@@ -4835,6 +4835,26 @@ def create_runner_app(
         if known:
             _publish_turn_status(conv_id, "idle")
 
+    def _publish_idle_for_codex_turn_stopped_before_codex(conv_id: str) -> None:
+        """
+        Publish ``idle`` for a stopped Codex-native turn while Codex itself runs no turn.
+
+        Codex's own turn events close a Codex session's ``running`` edge, so a turn
+        stopped before its message reached Codex (held while Codex was starting) has
+        nothing else to close it.
+
+        :param conv_id: Session whose turn was stopped.
+        """
+        from omnigent.harnesses.codex_native.bridge import read_bridge_state
+
+        if _session_harness_name(conv_id) != "codex-native":
+            return
+        state = read_bridge_state(_native_runtime.codex_native_bridge_dir(conv_id))
+        if state is not None and state.active_turn_id is not None:
+            return
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        resource_registry.note_external_session_status(conv_id, "idle")
+
     def _on_proxy_stream_end(
         conv_id: str,
         *,
@@ -4889,6 +4909,7 @@ def create_runner_app(
                 _append_cancellation_items(conv_id)
             if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
+                _publish_idle_for_codex_turn_stopped_before_codex(conv_id)
         elif sign_in_hold:
             # Nothing failed: the queued message is sent once the sign-in completes.
             pass
