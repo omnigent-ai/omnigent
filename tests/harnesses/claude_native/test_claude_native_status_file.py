@@ -289,19 +289,57 @@ def test_poller_reports_idle_tracks_last_read_status(tmp_path: Path) -> None:
 
 def test_poller_gives_up_when_file_never_appears(tmp_path: Path) -> None:
     """With no file (old Claude), the poller retires and stays inactive."""
-    (tmp_path / "sessions").mkdir()
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
     published: list[str] = []
     poller = SessionStatusPoller(
         on_status=lambda status, _reason: published.append(status),
         pane_pid_getter=_StubPidGetter(404),
-        session_id_getter=lambda: None,
+        session_id_getter=lambda: "s",
         config_dir=tmp_path,
     )
     # Drive well past the resolve-attempt cap.
     for _ in range(60):
         poller.tick()
     assert not poller.active
+    # Retired for good: a file written afterwards is never picked up.
+    _write_session_file(sessions, pid=404, session_id="s", status="busy")
+    poller.tick()
+    assert not poller.active
     assert published == []
+
+
+def test_poller_waits_for_a_wrapped_claude_to_start(tmp_path: Path) -> None:
+    """A wrapper launcher (``wrapper -- <claude args>``) starting Claude late still resolves.
+
+    The pane pid names the wrapper, so only the session-id scan can find the
+    file of Claude, its child; that scan needs the id the first hook reports.
+    """
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    claude_session = {"id": None}
+    statuses: list[str] = []
+    background: list[bool] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: statuses.append(status),
+        pane_pid_getter=_StubPidGetter(500),
+        session_id_getter=lambda: claude_session["id"],
+        config_dir=tmp_path,
+        on_background=background.append,
+    )
+    # The wrapper boots for longer than the resolve-attempt cap.
+    for _ in range(60):
+        poller.tick()
+    assert not poller.active
+
+    # Claude starts under the wrapper, ends a turn with a dev server running,
+    # and its first hook names the session.
+    _write_session_file(sessions, pid=501, session_id="sid", status="shell")
+    claude_session["id"] = "sid"
+    poller.tick()
+    assert poller.active
+    assert statuses == [IDLE]
+    assert background == [True]
 
 
 def test_poller_deactivates_when_file_vanishes(tmp_path: Path) -> None:

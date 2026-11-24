@@ -389,12 +389,12 @@ def _is_recorded_process(pid: int, proc_start: object) -> bool:
     return len(fields) <= 19 or fields[19] == proc_start
 
 
-# Attempts to resolve the file before giving up and leaving the PTY
-# watcher authoritative for the session's lifetime. At the claude-native
-# poll cadence (~0.2s) this is a few seconds — long enough for a booting
-# Claude to write its file and for the first hook to report the session
-# id, short enough that an old Claude (pre-v2.1.139, no file) or a broken
-# config dir falls back promptly without scanning forever.
+# Attempts to resolve the file, counted once the first hook has reported the
+# session id, before giving up and leaving the PTY watcher authoritative for
+# the session's lifetime. At the claude-native poll cadence (~0.2s) this is a
+# few seconds — long enough for a running Claude to write its file, short
+# enough that an old Claude (pre-v2.1.139, no file) or a broken config dir
+# falls back promptly without scanning forever.
 _MAX_RESOLVE_ATTEMPTS = 40
 
 
@@ -412,7 +412,8 @@ class SessionStatusPoller:
     Lifecycle:
 
     - **Resolving:** each :meth:`tick` retries :func:`resolve_status_file`
-      until it locks on or :data:`_MAX_RESOLVE_ATTEMPTS` is exhausted.
+      until it locks on or, once the session id is known,
+      :data:`_MAX_RESOLVE_ATTEMPTS` is exhausted.
     - **Active:** once resolved, :attr:`active` is ``True`` and each tick
       reads the file and fires the callback on a changed runner status.
     - **Exhausted:** if resolution never succeeds, :attr:`active` stays
@@ -539,12 +540,20 @@ class SessionStatusPoller:
         self._read_and_publish(publish_status=publish_status, reassert=requested)
 
     def _try_resolve(self) -> None:
-        """Attempt one resolution, retiring to the PTY watcher on timeout."""
-        self._attempts += 1
+        """Attempt one resolution, retiring to the PTY watcher on timeout.
+
+        Only attempts made once Claude's first hook has named its session count
+        toward giving up: a wrapper launcher (e.g. ``wrapper -- <claude args>``)
+        starts Claude as its child, often after the cap would have run out, and until
+        then the session-id scan that finds such a child's file cannot run.
+        """
         pane_pid = self._pane_pid_getter()
+        session_id = self._session_id_getter()
+        if session_id is not None:
+            self._attempts += 1
         path = resolve_status_file(
             pane_pid=pane_pid,
-            expected_session_id=self._session_id_getter(),
+            expected_session_id=session_id,
             config_dir=self._config_dir,
         )
         if path is not None:
