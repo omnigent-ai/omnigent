@@ -189,6 +189,8 @@ function loadNavigationHarness({
   localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
   clipboardWriteText = async () => {},
   localHostNow = Date.now,
+  // Chords another app holds: the fake GlobalShortcut's register returns false for them.
+  refusedChords = [],
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -458,7 +460,7 @@ function loadNavigationHarness({
       register: (accelerator, press) => {
         (calls.globalShortcuts ??= []).push(["register", accelerator]);
         (calls.presses ??= new Map()).set(accelerator, press);
-        return true;
+        return !refusedChords.includes(accelerator);
       },
       unregister: (accelerator) => (calls.globalShortcuts ??= []).push(["unregister", accelerator]),
     },
@@ -4022,6 +4024,32 @@ describe("floating panel wiring", () => {
       ["register", chord],
       ["unregister", chord],
     ]);
+  });
+
+  it("retries a failed saved show shortcut when Settings opens, and proposes a free chord meanwhile", (t) => {
+    const refusedChords = ["Alt+Space"];
+    const h = loadNavigationHarness({ platform: "linux", refusedChords });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    const getShortcut = h.ipc.get("omnigent:get-global-shortcut");
+    // Never turned on: Settings reads it without registering anything.
+    assert.deepEqual(getShortcut(event), { enabled: false, accelerator: "Alt+Space" });
+    assert.equal(h.calls.globalShortcuts, undefined);
+
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ global_shortcut: { enabled: true, accelerator: "Alt+Space" } }),
+    );
+    assert.deepEqual(getShortcut(event), {
+      enabled: true,
+      accelerator: "Alt+Space",
+      error: "Alt+Space isn't working. Another app may be using it.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+    refusedChords.length = 0;
+    assert.deepEqual(getShortcut(event), { enabled: true, accelerator: "Alt+Space" });
+    assert.deepEqual(h.calls.globalShortcuts.at(-1), ["register", "Alt+Space"]);
   });
 
   it("holds nothing off macOS, and says the panel isn't available there", (t) => {
