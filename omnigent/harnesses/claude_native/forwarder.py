@@ -32,6 +32,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
     HookReadResult,
+    PaneSignals,
     ResumeCostBaseline,
     TranscriptReadResult,
     _display_text,
@@ -1027,6 +1028,7 @@ class _ForwardDedupeState:
     api_retry_reported: bool = False
     api_retry_interrupted: bool = False
     api_retry_prompt_cursor: int | None = None
+    api_retry_observed_hooks: HookForwardState | None = None
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
@@ -6477,6 +6479,24 @@ async def _post_external_permission_mode_change(
     resp.raise_for_status()
 
 
+def _read_pane_observation(
+    bridge_dir: Path, *, session_id: str
+) -> tuple[PaneSignals, HookForwardState]:
+    """Snapshot complete hooks before capturing the pane, starting at the durable checkpoint."""
+    checkpoint = _read_hook_state(bridge_dir)
+    if checkpoint is None:
+        checkpoint = HookForwardState(event_cursor=0, byte_offset=0)
+    else:
+        checkpoint = _validated_hook_state(bridge_dir, checkpoint, session_id=session_id)
+    hooks = _read_hook_events_for_state(bridge_dir, checkpoint)
+    observed = HookForwardState(
+        event_cursor=hooks.event_cursor,
+        byte_offset=hooks.byte_offset,
+        cursor_fingerprint=_jsonl_cursor_fingerprint(bridge_dir / _HOOKS_FILE, hooks.byte_offset),
+    )
+    return read_pane_signals(bridge_dir), observed
+
+
 async def _forward_pane_signals(
     client: httpx.AsyncClient,
     *,
@@ -6506,7 +6526,9 @@ async def _forward_pane_signals(
     if now < dedupe.pane_next_read:
         return
     dedupe.pane_next_read = now + _PANE_POLL_INTERVAL_S
-    signals = await asyncio.to_thread(read_pane_signals, bridge_dir)
+    signals, observed_hooks = await asyncio.to_thread(
+        _read_pane_observation, bridge_dir, session_id=session_id
+    )
     await _relay_permission_mode(
         client, session_id=session_id, mode=signals.permission_mode, dedupe=dedupe
     )
@@ -6518,6 +6540,7 @@ async def _forward_pane_signals(
         session_id=session_id,
         bridge_dir=bridge_dir,
         retry=signals.api_retry,
+        observed_hooks=observed_hooks,
         response_id=response_id,
         dedupe=dedupe,
     )
@@ -6529,6 +6552,7 @@ async def _stop_rejected_api_retry(
     session_id: str,
     bridge_dir: Path,
     retry: ApiRetry | None,
+    observed_hooks: HookForwardState,
     response_id: str | None,
     dedupe: _ForwardDedupeState,
 ) -> None:
@@ -6546,6 +6570,7 @@ async def _stop_rejected_api_retry(
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Claude bridge directory.
     :param retry: The retry row parsed from the pane, or ``None``.
+    :param observed_hooks: Complete hook position observed before the pane capture.
     :param response_id: Active turn's response id, or ``None`` when unknown.
     :param dedupe: Shared per-session dedupe state; mutated in place.
     """
@@ -6554,10 +6579,13 @@ async def _stop_rejected_api_retry(
         dedupe.api_retry_reported = False
         dedupe.api_retry_interrupted = False
         dedupe.api_retry_prompt_cursor = dedupe.prompt_submit_cursor
+        dedupe.api_retry_observed_hooks = None
     if retry is None:
         return
     if retry.status not in _REJECTED_API_RETRY_STATUSES or dedupe.api_retry_interrupted:
         return
+    if dedupe.api_retry_observed_hooks is None:
+        dedupe.api_retry_observed_hooks = observed_hooks
     if not dedupe.api_retry_reported:
         detail = _display_text(
             f"API Error: {retry.error}\n\nOmnigent stopped Claude Code from retrying this "
@@ -6599,7 +6627,7 @@ async def _stop_rejected_api_retry(
             _interrupt_api_retry_if_current,
             bridge_dir,
             retry=retry,
-            prompt_submit_cursor=dedupe.api_retry_prompt_cursor,
+            observed_hooks=dedupe.api_retry_observed_hooks,
         )
     except RuntimeError:
         _logger.warning(
@@ -6612,16 +6640,24 @@ async def _stop_rejected_api_retry(
 
 
 def _interrupt_api_retry_if_current(
-    bridge_dir: Path, *, retry: ApiRetry, prompt_submit_cursor: int | None
+    bridge_dir: Path, *, retry: ApiRetry, observed_hooks: HookForwardState
 ) -> bool:
     """Recheck the pane and on-disk turn hooks immediately before sending Escape."""
     if read_pane_signals(bridge_dir).api_retry != retry:
         return False
-    cursor = prompt_submit_cursor or 0
-    hooks = read_hook_events_since_with_position(bridge_dir, cursor)
+    if (
+        observed_hooks.byte_offset
+        and observed_hooks.cursor_fingerprint
+        != _jsonl_cursor_fingerprint(bridge_dir / _HOOKS_FILE, observed_hooks.byte_offset)
+    ):
+        return False
+    hooks = _read_hook_events_for_state(bridge_dir, observed_hooks)
     parent_ids = read_seen_claude_session_ids(bridge_dir)
-    if hooks.event_cursor < cursor or any(
-        record.event_name in {"UserPromptSubmit", "SessionStart", "Stop", "StopFailure"}
+    if any(
+        (
+            record.event_name in {"UserPromptSubmit", "Stop", "StopFailure"}
+            or (record.event_name == "SessionStart" and record.source != "compact")
+        )
         and not _is_subagent_hook_record(record, parent_claude_session_ids=parent_ids)
         for record in hooks.records
     ):

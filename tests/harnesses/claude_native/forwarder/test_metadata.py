@@ -1236,25 +1236,33 @@ async def test_forward_pane_signals_leaves_other_api_retries_running(
     assert sent_keys == []
 
 
-@pytest.mark.parametrize("during_report", ["unchanged", "stopped", "followup", "identical-retry"])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "unchanged",
+        "stopped",
+        "followup",
+        "identical-retry",
+        "compacted",
+        "compact-during-report",
+        "restarted",
+        "restarted-followup",
+    ],
+)
 @pytest.mark.asyncio
 async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_reporting_it(
-    during_report: str,
+    scenario: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    An unreported rejection is not interrupted; the next poll reports it, then interrupts.
-
-    The Escape's trailing idle would otherwise settle the turn without the
-    error. A failed Escape is retried without reposting, but a turn replaced
-    during the report must never receive the old turn's Escape.
-    """
+    """Report before Escape, recover delivery failures, and protect replacement turns."""
+    recover_failures = scenario == "unchanged"
+    should_interrupt = scenario in {"unchanged", "compacted", "compact-during-report", "restarted"}
     timeline: list[str] = []
     bridge_dir, panes, sent_keys = _fake_tmux_pane(
         monkeypatch,
         tmp_path,
-        failed_send_keys=1,
+        failed_send_keys=int(recover_failures),
         on_send_keys=lambda: timeline.append("escape"),
     )
     panes.append(_claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 2s · attempt 3/10"))
@@ -1263,11 +1271,11 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
     finish_report = asyncio.Event()
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        """Reject the first failure report and suspend the successful retry."""
+        """Suspend the successful report; inject delivery failure only in its recovery case."""
         body = json.loads(request.content.decode("utf-8"))
         calls.append(body)
         if _failed_status_posts([body]):
-            if len(_failed_status_posts(calls)) == 1:
+            if recover_failures and len(_failed_status_posts(calls)) == 1:
                 timeline.append("report_failed")
                 return httpx.Response(503, json={})
             timeline.append("report_started")
@@ -1280,18 +1288,39 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
-        record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
-        await forwarder._forward_available_status_events(
-            client=client,
-            session_id="conv1",
-            bridge_dir=bridge_dir,
-            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-            task_subjects={},
-            task_statuses={},
-            task_order=[],
+
+        async def _forward_hooks(state: forwarder.HookForwardState) -> None:
+            await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv1",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+            )
+
+        record_hook_event(
+            bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "parent-session"}
         )
+        await _forward_hooks(forwarder.HookForwardState(event_cursor=0, byte_offset=0))
+        if scenario == "compacted":
+            record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "SessionStart",
+                    "source": "compact",
+                    "session_id": "parent-session",
+                },
+            )
+        if scenario in {"restarted", "restarted-followup"}:
+            dedupe = forwarder._ForwardDedupeState()
+            restored = forwarder._read_hook_state(bridge_dir)
+            assert restored is not None and restored.event_cursor == 1
+            await _forward_hooks(restored)
+            assert dedupe.prompt_submit_cursor is None
 
         async def _poll() -> None:
             await forwarder._forward_pane_signals(
@@ -1302,30 +1331,52 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
                 response_id="resp_1",
             )
 
-        await _poll()
-        assert len(_failed_status_posts(calls)) == 1
-        assert sent_keys == []
+        if recover_failures:
+            await _poll()
+            assert len(_failed_status_posts(calls)) == 1
+            assert sent_keys == []
+        recovery_timeline = ["report_failed"] if recover_failures else []
 
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(_poll())
             try:
                 await asyncio.wait_for(report_started.wait(), timeout=5.0)
-                assert timeline == ["report_failed", "report_started"]
-                if during_report in {"stopped", "followup"}:
-                    panes.append(
-                        _claude_pane("✻ Billowing…" if during_report == "followup" else "")
+                assert timeline == [*recovery_timeline, "report_started"]
+                if scenario in {"stopped", "followup"}:
+                    panes.append(_claude_pane("✻ Billowing…" if scenario == "followup" else ""))
+                if scenario in {"followup", "identical-retry", "restarted-followup"}:
+                    record_hook_event(
+                        bridge_dir,
+                        {"hook_event_name": "UserPromptSubmit", "session_id": "parent-session"},
                     )
-                if during_report in {"followup", "identical-retry"}:
-                    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
-                    assert dedupe.prompt_submit_cursor == 1
+                    assert dedupe.prompt_submit_cursor == (
+                        None if scenario == "restarted-followup" else 1
+                    )
+                if scenario == "compact-during-report":
+                    record_hook_event(
+                        bridge_dir,
+                        {
+                            "hook_event_name": "SessionStart",
+                            "source": "compact",
+                            "session_id": "parent-session",
+                        },
+                    )
             finally:
                 finish_report.set()
-        assert len(_failed_status_posts(calls)) == 2
-        assert sent_keys == []
+        report_count = 2 if recover_failures else 1
+        assert len(_failed_status_posts(calls)) == report_count
+        assert len(sent_keys) == int(should_interrupt and not recover_failures)
 
         await _poll()
 
-    assert [post["response_id"] for post in _failed_status_posts(calls)] == ["resp_1", "resp_1"]
-    expected_escapes = ["escape", "escape"] if during_report == "unchanged" else []
-    assert timeline == ["report_failed", "report_started", "report_completed", *expected_escapes]
-    assert len(sent_keys) == (1 if during_report == "unchanged" else 0)
+    assert [post["response_id"] for post in _failed_status_posts(calls)] == [
+        "resp_1"
+    ] * report_count
+    escape_count = (2 if recover_failures else 1) if should_interrupt else 0
+    assert timeline == [
+        *recovery_timeline,
+        "report_started",
+        "report_completed",
+        *(["escape"] * escape_count),
+    ]
+    assert len(sent_keys) == int(should_interrupt)
