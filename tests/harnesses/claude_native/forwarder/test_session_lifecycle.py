@@ -1108,12 +1108,14 @@ async def test_forwarder_mirrors_external_session_id_at_most_once(
     assert leftover_patches == []
 
 
-def _start_failing_patch_server() -> tuple[
-    ThreadingHTTPServer, threading.Thread, str, list[float]
-]:
+def _start_failing_patch_server(
+    failures: int | None = None,
+) -> tuple[ThreadingHTTPServer, threading.Thread, str, list[float]]:
     """
-    Start a server that answers POSTs with 202 and every PATCH with 503.
+    Start a server that answers POSTs with 202 and PATCHes with 503.
 
+    :param failures: How many PATCHes fail before the rest succeed with 200,
+        or ``None`` to fail every PATCH.
     :returns: ``(server, thread, base_url, patch_times)``; ``patch_times``
         collects the monotonic arrival time of each PATCH.
     """
@@ -1135,7 +1137,8 @@ def _start_failing_patch_server() -> tuple[
 
         def do_PATCH(self) -> None:
             patch_times.append(time.monotonic())
-            self._reply(503)
+            failing = failures is None or len(patch_times) <= failures
+            self._reply(503 if failing else 200)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1196,6 +1199,59 @@ async def test_forwarder_backs_off_external_session_id_mirror_after_transient_fa
     assert 2 <= len(patch_times) <= 5, patch_times
     gaps = [later - earlier for earlier, later in itertools.pairwise(patch_times)]
     assert min(gaps) >= 0.25, gaps
+
+
+@pytest.mark.asyncio
+async def test_forwarder_mirror_lands_once_the_server_recovers_then_stops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    After transient mirror failures, the PATCH lands once the server answers, then stops.
+
+    Cold resume needs ``external_session_id`` on the row, so failures may delay
+    the mirror but never give it up, and a landed mirror is never re-sent.
+    """
+    monkeypatch.setattr(forwarder, "_EXTERNAL_SESSION_ID_RETRY_BASE_S", 0.02, raising=False)
+    monkeypatch.setattr(forwarder, "_EXTERNAL_SESSION_ID_RETRY_MAX_S", 0.05, raising=False)
+    bridge_dir = tmp_path / "bridge"
+    (tmp_path / "session.jsonl").write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-sid-recovers",
+            "transcript_path": str(tmp_path / "session.jsonl"),
+        },
+    )
+    server, thread, base_url, patch_times = _start_failing_patch_server(failures=2)
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_recovers",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        deadline = time.monotonic() + 10.0
+        while len(patch_times) < 3 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert len(patch_times) == 3, patch_times
+        # Latched: dozens of polls later, the landed mirror is not sent again.
+        await asyncio.sleep(0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert len(patch_times) == 3, patch_times
 
 
 @pytest.mark.asyncio
