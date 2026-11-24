@@ -3,6 +3,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   clearGadgetRailRequest,
   exitGadgetRailFullScreen,
+  gadgetCount,
+  noteGadgetFrameConnected,
+  noteGadgetStartFailed,
   requestGadgetRailTab,
   resetGadgetRailRequests,
   setGadgetNewSessionTabMaximized,
@@ -42,5 +45,18 @@ describe("gadget rail requests", () => {
     expect(withGadgetFullScreen("/?prompt=x%3Fy&gadget_start=a#end", "a")).toBe(
       "/?prompt=x%3Fy&gadget_start=a&gadget=a#end",
     );
+  });
+});
+
+describe("per-gadget counts", () => {
+  it("counts a gadget whose ID is also an Object property like any other", () => {
+    expect(gadgetCount({}, "constructor")).toBe(0);
+    noteGadgetFrameConnected("constructor");
+    noteGadgetFrameConnected("constructor");
+    noteGadgetStartFailed("constructor");
+    const state = useGadgetRailRequest.getState();
+    expect(gadgetCount(state.frameConnections, "constructor")).toBe(2);
+    expect(gadgetCount(state.failedStarts, "constructor")).toBe(1);
+    expect(gadgetCount(state.frameConnections, "toString")).toBe(0);
   });
 });

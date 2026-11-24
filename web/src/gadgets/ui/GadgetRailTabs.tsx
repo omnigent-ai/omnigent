@@ -15,6 +15,8 @@ import { isTempConvId } from "@/lib/tempConversationId";
 import {
   GADGET_FULL_SCREEN_PARAM,
   clearGadgetRailRequest,
+  gadgetCount,
+  noteGadgetFullScreenUnavailable,
   requestGadgetRailTab,
   setFullScreenGadget,
   setGadgetNewSessionTabMaximized,
@@ -499,6 +501,16 @@ export function useGadgetRailTabState(
   const fullScreenGadgetId = fullScreen && selected !== null ? gadgetIdFromRailKey(selected) : null;
   const handledUrlRef = useRef<string | null>(null);
   const keepSidebar = gadgetOpenKeepsSidebar(location);
+  // A URL naming a gadget this panel can't show leaves the session showing; the page then
+  // marks its messages read again.
+  const urlGadgetUnavailable =
+    urlGadget !== null && !loading && !tabKeys.includes(gadgetRailKey(urlGadget));
+  useEffect(() => {
+    if (!routed) return;
+    noteGadgetFullScreenUnavailable(
+      urlGadgetUnavailable && urlGadget !== null ? { conversationId, gadgetId: urlGadget } : null,
+    );
+  }, [routed, urlGadgetUnavailable, urlGadget, conversationId]);
   useEffect(() => {
     if (urlGadget === null) {
       handledUrlRef.current = null;
@@ -860,8 +872,8 @@ export function GadgetNewSessionPanel({
       setHandoff({
         gadgetId: lastFullScreen,
         sessionId: routeSessionId,
-        connections: frameConnections[lastFullScreen] ?? 0,
-        failures: failedStarts[lastFullScreen] ?? 0,
+        connections: gadgetCount(frameConnections, lastFullScreen),
+        failures: gadgetCount(failedStarts, lastFullScreen),
       });
     }
   } else if (handoff !== null && routeSessionId !== handoff.sessionId) {
@@ -877,10 +889,11 @@ export function GadgetNewSessionPanel({
     (state) =>
       handoff !== null &&
       state.fullScreenGadgetId === handoff.gadgetId &&
-      (state.frameConnections[handoff.gadgetId] ?? 0) > handoff.connections,
+      gadgetCount(state.frameConnections, handoff.gadgetId) > handoff.connections,
   );
   const handoffFailed = useGadgetRailRequest(
-    (state) => handoff !== null && (state.failedStarts[handoff.gadgetId] ?? 0) > handoff.failures,
+    (state) =>
+      handoff !== null && gadgetCount(state.failedStarts, handoff.gadgetId) > handoff.failures,
   );
   // Whether the session took the gadget over full screen, for the sidebar below.
   const handedOverRef = useRef(false);

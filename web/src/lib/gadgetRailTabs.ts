@@ -38,6 +38,11 @@ interface GadgetRailState {
    */
   frameConnections: Record<string, number>;
   failedStarts: Record<string, number>;
+  /**
+   * A gadget a session's URL names to fill the screen that the session's panel can't show (it
+   * isn't linked there, or gadgets are off): the session shows instead.
+   */
+  fullScreenUnavailable: { conversationId: string; gadgetId: string } | null;
 }
 
 /** A message gadget code wrote for a new session, and the gadget it came from. */
@@ -56,6 +61,7 @@ export const useGadgetRailRequest = create<GadgetRailState>(() => ({
   createSessionReview: null,
   frameConnections: {},
   failedStarts: {},
+  fullScreenUnavailable: null,
 }));
 
 /**
@@ -141,12 +147,17 @@ export function takeGadgetCreateSessionMenuRequest(): boolean {
   return true;
 }
 
+/** The count kept for `gadgetId`; an ID such as "constructor" is as ordinary as any other. */
+export function gadgetCount(counts: Record<string, number>, gadgetId: string): number {
+  return Object.hasOwn(counts, gadgetId) ? counts[gadgetId] : 0;
+}
+
 /** Notes that a frame of `gadgetId` connected to its gadget. */
 export function noteGadgetFrameConnected(gadgetId: string): void {
   useGadgetRailRequest.setState((state) => ({
     frameConnections: {
       ...state.frameConnections,
-      [gadgetId]: (state.frameConnections[gadgetId] ?? 0) + 1,
+      [gadgetId]: gadgetCount(state.frameConnections, gadgetId) + 1,
     },
   }));
 }
@@ -154,8 +165,39 @@ export function noteGadgetFrameConnected(gadgetId: string): void {
 /** Notes that the session started beside `gadgetId` couldn't show it. */
 export function noteGadgetStartFailed(gadgetId: string): void {
   useGadgetRailRequest.setState((state) => ({
-    failedStarts: { ...state.failedStarts, [gadgetId]: (state.failedStarts[gadgetId] ?? 0) + 1 },
+    failedStarts: {
+      ...state.failedStarts,
+      [gadgetId]: gadgetCount(state.failedStarts, gadgetId) + 1,
+    },
   }));
+}
+
+/** Notes which full screen gadget a session's URL names that its panel can't show, if any. */
+export function noteGadgetFullScreenUnavailable(
+  unavailable: { conversationId: string; gadgetId: string } | null,
+): void {
+  const current = useGadgetRailRequest.getState().fullScreenUnavailable;
+  if (
+    current?.conversationId === unavailable?.conversationId &&
+    current?.gadgetId === unavailable?.gadgetId
+  )
+    return;
+  useGadgetRailRequest.setState({ fullScreenUnavailable: unavailable });
+}
+
+/**
+ * Whether a gadget fills the screen over `conversationId`, or is about to: its URL names one the
+ * panel hasn't shown or ruled out yet. Its new messages stay unread meanwhile.
+ */
+export function gadgetCoversConversation(
+  state: GadgetRailState,
+  conversationId: string | undefined,
+  urlGadget: string | null,
+): boolean {
+  if (state.fullScreenGadgetId !== null) return true;
+  if (conversationId === undefined || urlGadget === null) return false;
+  const unavailable = state.fullScreenUnavailable;
+  return !(unavailable?.conversationId === conversationId && unavailable.gadgetId === urlGadget);
 }
 
 export function clearGadgetRailRequest(): void {
@@ -173,5 +215,6 @@ export function resetGadgetRailRequests(): void {
     createSessionReview: null,
     frameConnections: {},
     failedStarts: {},
+    fullScreenUnavailable: null,
   });
 }

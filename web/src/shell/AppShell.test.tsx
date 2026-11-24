@@ -18,7 +18,12 @@ import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
 import { getGadgetShelf, getSessionGadgets, listGadgets } from "@/gadgets/api/gadgetApi";
-import { resetGadgetRailRequests } from "@/lib/gadgetRailTabs";
+import {
+  GADGET_FULL_SCREEN_PARAM,
+  gadgetCoversConversation,
+  resetGadgetRailRequests,
+  useGadgetRailRequest,
+} from "@/lib/gadgetRailTabs";
 import { MOBILE_BREAKPOINT_PX } from "@/hooks/useIsMobileViewport";
 import { gadgetFixture } from "@/gadgets/ui/testUtils";
 import { IN_APP_GADGET_OPEN } from "@/gadgets/ui/gadgetNavigation";
@@ -2697,6 +2702,50 @@ describe("gadget full screen contract", () => {
 
     await expectGadgetFullScreen();
     expect(sidebar()).toHaveAttribute("data-open", "true");
+  });
+
+  /** What the session page asks: whether a gadget covers conv_abc, so it leaves it unread. */
+  function CoverProbe() {
+    const { search } = useLocation();
+    const urlGadget = new URLSearchParams(search).get(GADGET_FULL_SCREEN_PARAM);
+    const covers = useGadgetRailRequest((state) =>
+      gadgetCoversConversation(state, "conv_abc", urlGadget),
+    );
+    return <span data-testid="covers-chat">{String(covers)}</span>;
+  }
+  const covers = () => screen.getByTestId("covers-chat").textContent;
+
+  it("keeps the session unread from the start of a gadget link until Open session", async () => {
+    // The session's gadgets are still loading when the page first shows.
+    let listed: (gadgets: (typeof BOARD)[]) => void = () => {};
+    vi.mocked(getSessionGadgets).mockReturnValue(
+      new Promise((resolve) => {
+        listed = resolve;
+      }),
+    );
+    renderSession("/c/conv_abc?gadget=board", <CoverProbe />);
+    expect(covers()).toBe("true");
+
+    await act(async () => listed([BOARD]));
+    await expectGadgetFullScreen();
+    expect(covers()).toBe("true");
+
+    fireEvent.click(within(rail()).getByRole("button", { name: "Open session" }));
+    await waitFor(() => expect(covers()).toBe("false"));
+  });
+
+  it("reads the session when the gadget its link names isn't linked there", async () => {
+    let listed: (gadgets: (typeof BOARD)[]) => void = () => {};
+    vi.mocked(getSessionGadgets).mockReturnValue(
+      new Promise((resolve) => {
+        listed = resolve;
+      }),
+    );
+    renderSession("/c/conv_abc?gadget=elsewhere", <CoverProbe />);
+    expect(covers()).toBe("true");
+
+    await act(async () => listed([BOARD]));
+    await waitFor(() => expect(covers()).toBe("false"));
   });
 
   describe("opened from a fresh link", () => {
