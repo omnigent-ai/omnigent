@@ -34,7 +34,9 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
         true,
       );
       assert.equal(isAgentNavigationAllowed(`https://${host}/`, { allowLocalhost: true }).ok, true);
-      assert.equal(isAgentNavigationAllowed(`http://${host}/`).ok, false);
+      const blocked = isAgentNavigationAllowed(`http://${host}/`);
+      assert.equal(blocked.ok, false);
+      assert.equal(blocked.localhostBlocked, true);
     }
     assert.equal(
       isAgentNavigationAllowed("https://SPOG.dev.localhost:23090/one?view=1", {
@@ -61,6 +63,7 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
       "data:text/html,test",
     ]) {
       assert.equal(isAgentNavigationAllowed(url, { allowLocalhost: true }).ok, false, url);
+      assert.equal(isAgentNavigationAllowed(url).localhostBlocked, undefined, url);
     }
   });
   it("allows ordinary public http(s) URLs", () => {

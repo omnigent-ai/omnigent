@@ -19,17 +19,20 @@ firing:
    ``reasoning_effort``.
 #. **Grants ownership.** The spawned session gets a ``LEVEL_OWNER`` grant for the
    task's ``user_id`` — or :data:`RESERVED_USER_LOCAL` when it is NULL
-   (single-user / OSS). Without the grant the run is invisible.
+   (single-user / OSS). Without the grant the run is invisible. It is then shared
+   with the automation's grantees (:mod:`~omnigent.server.scheduled.run_sharing`).
 #. **Launches the runner and dispatches the prompt** so the agent actually runs
    (a seeded prompt with no launched runner would just sit as history). The
-   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run.
+   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run;
+   the note opens with the run time.
 #. **Records the run** — stamps ``last_run_at`` + ``last_run_conversation_id`` on
    the task row and writes a ``scheduled_task_runs`` history row.
 
 A task with ``session_mode = "continue"`` skips host resolution and session
 creation once it has a ``session_id``: the prompt goes into that session
-instead, waking its runner the way a user message would. Its first firing
-creates the session as usual and records it as the task's ``session_id``.
+instead, waking its runner the way a user message would, after the session's
+sharing is synced to the automation's grantees. Its first firing creates the
+session as usual and records it as the task's ``session_id``.
 
 **Fire-and-forget.** The re-read + state guard run synchronously so an obviously
 dead fire costs nothing, but the session creation / launch is dispatched onto a
@@ -66,25 +69,35 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
-from omnigent.db.account_authority import account_authority_scope
+from omnigent.db.account_authority import account_authority_scope, account_checks_enabled
 from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
+from omnigent.entities.workflow import Workflow
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.managed_hosts import (
@@ -93,6 +106,8 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.permissions import check_session_access
+from omnigent.server.proactive_agent import fire_skip_reason, is_proactive_task
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -109,11 +124,27 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLease,
 )
 from omnigent.server.scheduled.harness_settings import (
+    forget_unrecorded_legacy_run_session,
     inherited_approval_skipping_problem,
+    launch_args_contain,
+    note_unrecorded_legacy_run_session,
+    permission_mode_launch_options,
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
+from omnigent.server.scheduled.rrule import is_one_time_rule
+from omnigent.server.scheduled.run_sharing import (
+    delete_task_grants,
+    is_managed_run_session,
+    share_new_run_session,
+    sync_continued_session,
+)
+from omnigent.server.scheduled.schedule import (
+    continued_sandbox_host_id,
+    is_trigger_automation,
+    strip_trigger_header,
+    task_timezone,
+)
 from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
     SourceHistoryUnsupportedError,
@@ -134,18 +165,49 @@ from omnigent.server.scheduled.telemetry import (
     start_fire_stage,
     startup_failure_stage,
 )
+from omnigent.server.scheduled.workflow_automations import task_workflow_id
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.session_journal import (
+    WorkflowNotFoundError,
+    initialize_workflow_plan,
+    load_workflow_for_run,
+)
+from omnigent.server.session_mcp_selection import (
+    SessionMcpSelection,
+    mcp_selection_for,
+    run_sandbox,
+    session_mcp_label_keys,
+)
+from omnigent.server.workflows import workflows_enabled
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
 )
+from omnigent.util.session_lifecycle import is_session_closed
 
 if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PromptSendProgress:
+    """Whether a continued run's dispatch has begun sending its prompt."""
+
+    started: bool = False
+
+
+# Set by a continued run around its dispatch; ``_send_prompt`` marks it just
+# before sending. A shared object rather than a flag, so a mark made in a
+# child task is still seen.
+_PROMPT_SEND_PROGRESS: ContextVar[_PromptSendProgress | None] = ContextVar(
+    "scheduled_prompt_send_progress", default=None
+)
 
 # How long to wait for a freshly launched runner to connect before giving up on
 # dispatching the prompt this fire. The session + grant are already persisted, so
@@ -289,6 +351,16 @@ class _FireRecorder(Protocol):
     records progress on the run it already claimed, under a startup lease.
     """
 
+    @property
+    def run_id(self) -> str:
+        """The run's ID, known before the run row exists for legacy timers."""
+        ...
+
+    @property
+    def managed_host_id(self) -> str | None:
+        """The sandbox host id this fire's managed session is created with and launched under."""
+        ...
+
     async def check(self) -> None:
         """Raise before an external action if the fire may no longer proceed."""
         ...
@@ -322,12 +394,32 @@ class _NewRunRecorder:
         self._deps = deps
         self._task = task
         self._scheduled_at = scheduled_at
+        # Chosen now so the session can name its run before the row is written.
+        self._run_id = _new_id()
+        self._session_id: str | None = None
+        # No run row carries an id, so a fresh managed fire chooses one here.
+        self._fresh_host_id = uuid.uuid4().hex
+
+    @property
+    def managed_host_id(self) -> str | None:
+        if self._task.execution_target != "managed_sandbox":
+            return None
+        if self._task.session_mode == "continue":
+            return continued_sandbox_host_id(self._task.id, self._task.workspace_id)
+        return self._fresh_host_id
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
 
     async def check(self) -> None:
         return None
 
-    async def session_created(self, conversation_id: str) -> None:  # noqa: ARG002
-        return None
+    async def session_created(self, conversation_id: str) -> None:
+        # The run row is written only after the prompt is sent, so workers the
+        # turn starts first still need to count as this run's.
+        self._session_id = conversation_id
+        note_unrecorded_legacy_run_session(conversation_id, self._task.id)
 
     async def finish(
         self,
@@ -337,15 +429,24 @@ class _NewRunRecorder:
         error: str | None = None,
         error_code: str | None = None,
     ) -> None:
-        await _record_run(
-            self._deps,
-            self._task,
-            conversation_id,
-            self._scheduled_at,
-            status=status,
-            error=error,
-            error_code=error_code,
-        )
+        try:
+            await _record_run(
+                self._deps,
+                self._task,
+                conversation_id,
+                self._scheduled_at,
+                status=status,
+                error=error,
+                error_code=error_code,
+                run_id=self._run_id,
+            )
+        finally:
+            self.release()
+
+    def release(self) -> None:
+        """Stop counting the fired session as this run's before a run row exists."""
+        if self._session_id is not None:
+            forget_unrecorded_legacy_run_session(self._session_id)
 
     async def hand_off_managed(
         self, conv: Conversation, task: ScheduledTask, start: ManagedLaunchStart | None
@@ -354,14 +455,9 @@ class _NewRunRecorder:
         if start is None:
             return
         # Started only after the run exists, so a fast launch failure has a
-        # running run to fail. A continue task keeps one sandbox host.
-        host_id = (
-            continued_sandbox_host_id(task.id, task.workspace_id)
-            if task.session_mode == "continue"
-            else None
-        )
+        # running run to fail.
         try:
-            start(conv, task, host_id, _LEGACY_LAUNCH_ERRORS)
+            start(conv, task, self.managed_host_id, _LEGACY_LAUNCH_ERRORS)
         except Exception as exc:
             _logger.exception(
                 "scheduled fire: managed launch did not start for task %s (session %s)",
@@ -377,13 +473,23 @@ class _NewRunRecorder:
 def _scheduled_session_title(task: ScheduledTask) -> str:
     if is_trigger_automation(task):
         return f"[automation job] {task.name}"
-    return task.name
+    if task.session_mode == "continue":
+        return task.name
+    # Every run of a new-session task would otherwise share the task's name,
+    # leaving the sidebar with a column of identical titles.
+    return f"{task.name} ({format_run_time(time.time(), task_timezone(task))})"
+
+
+def format_run_time(epoch_seconds: float, timezone: ZoneInfo) -> str:
+    """Render a fire time like ``2026-11-13 09:05`` in the task's timezone."""
+    return f"{datetime.fromtimestamp(epoch_seconds, timezone):%Y-%m-%d %H:%M}"
 
 
 # Follows the prompt in every message a fire sends. No one watches a run, so a
 # question or a permission request stalls it instead of reaching a person. Only
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
-# automation pages never show it.
+# automation pages never show it. The chat hides it by exact text, so a change
+# here or to its run-time line also goes in web/src/lib/systemMessage.ts.
 UNATTENDED_RUN_NOTE = (
     "<omnigent-automation-context>\n"
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
@@ -397,19 +503,54 @@ UNATTENDED_RUN_NOTE = (
     "independent work that does not depend on those decisions. If an action is denied or "
     "requires unavailable approval, skip that action and explain the blocker. Continue "
     "independent work and permitted alternatives. Do not change permission settings to "
-    "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
-    "prioritizing those the user is most likely to want to change, then summarize what "
-    "you did and anything you couldn't do.\n"
+    "get past the restriction. If you have the sys_journal tools, start by reading your "
+    "journal with sys_journal_read; if the session has no plan, write one with "
+    "sys_journal_write_plan (one step is fine); and before your final reply, write a "
+    "status for each step you worked on with sys_journal_write_status. Lead your final "
+    "reply with unresolved decisions and assumptions, prioritizing those the user is most "
+    "likely to want to change, then summarize what you did and anything you couldn't do.\n"
     "</omnigent-automation-context>"
 )
 
 
+_AUTOMATION_CONTEXT_OPEN = "<omnigent-automation-context>\n"
+
+
+def unattended_run_note(sent_at: float) -> str:
+    """:data:`UNATTENDED_RUN_NOTE`, opening with the time the fire sent it.
+
+    The run time saves the agent a clock lookup; the chat hides this line with the note.
+    """
+    seconds = int(sent_at)
+    run_time = f"{datetime.fromtimestamp(seconds, UTC):%Y-%m-%dT%H:%M:%SZ}"
+    return UNATTENDED_RUN_NOTE.replace(
+        _AUTOMATION_CONTEXT_OPEN,
+        f"{_AUTOMATION_CONTEXT_OPEN}Run time: {run_time} (Unix time {seconds}).\n",
+        1,
+    )
+
+
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
-    text = f"{prompt.rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
+    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{unattended_run_note(time.time())}"
     return SessionEventInput(
         type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+    )
+
+
+def _task_event(task: ScheduledTask) -> SessionEventInput:
+    """The message a firing sends: a timer's hidden wake, or the task's prompt."""
+    if task.kind != "timer":
+        return _prompt_event(run_prompt_text(task))
+    # Hidden from transcripts, but still a user message, so it starts or steers a turn.
+    return SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": task.prompt}],
+        },
     )
 
 
@@ -659,6 +800,9 @@ async def _run_fire(
                 await _run_fire_for_task(deps, task, fire_dispatch, recorder)
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
+        finally:
+            # A fire that fails before recording its run must not leave its session counted.
+            recorder.release()
 
 
 async def _run_fire_for_task(
@@ -681,6 +825,12 @@ async def _run_fire_for_task(
     if await _owner_is_deleted(deps, task):
         await _disable_for_deleted_owner(deps, task, recorder)
         return
+    if is_proactive_task(task):
+        skip = await asyncio.to_thread(fire_skip_reason, deps.app_state, deps.agent_store, task)
+        if skip is not None:
+            _logger.info("scheduled fire: proactive task %s skipped: %s", task.id, skip)
+            await recorder.finish("skipped", error=skip, error_code="proactive_agent_off")
+            return
     managed = task.execution_target == "managed_sandbox"
     if not managed and task.execution_target != "connected_host":
         _logger.info(
@@ -695,8 +845,10 @@ async def _run_fire_for_task(
         )
         return
 
-    if task.continues_session:
-        task = await _release_deleted_session(deps, task)
+    if task.continues_session and not is_one_time_rule(task.rrule):
+        # A one-time task, such as a reminder, belongs to its session: with the
+        # session gone it fails instead of running in a new one without its context.
+        task = await _release_replaceable_session(deps, task)
     if task.continues_session:
         await _continue_session(
             deps, task, fire_dispatch.reuse or _make_reuse_dispatch(deps), recorder
@@ -716,6 +868,18 @@ async def _run_fire_for_task(
                 # Every later run would fail the same way.
                 await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="paused")
             return
+
+    try:
+        start_fire_stage("workflow_validation")
+        # An automation saved continuing one session keeps sending its prompt as before.
+        workflow = None if task.session_mode == "continue" else await _task_workflow(deps, task)
+    except _CannotLaunchScheduledFire as exc:
+        _logger.warning("scheduled fire: task %s cannot start its workflow: %s", task.id, exc)
+        await recorder.finish("failed", error=str(exc), error_code=exc.error_code)
+        if exc.error_code == "workflow_missing":
+            # Every later run would fail the same way.
+            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="paused")
+        return
 
     dispatch = fire_dispatch.managed if managed else fire_dispatch.connected
     preflight = None if managed else fire_dispatch.connected_preflight
@@ -775,7 +939,19 @@ async def _run_fire_for_task(
     try:
         start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
-        conv = await _create_session(deps, effective, labels=_session_labels(task))
+        mcp_selection = await _run_mcp_selection(
+            deps, task, effective.host_id or recorder.managed_host_id
+        )
+        conv = await _create_session(
+            deps,
+            effective,
+            labels={
+                **_session_labels(task, mcp_selection, recorder.managed_host_id),
+                SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id,
+                SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: recorder.run_id,
+            },
+            workflow=workflow,
+        )
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
         _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
@@ -851,6 +1027,15 @@ async def _run_fire_for_task(
             task.id,
             conv.id,
         )
+    # Before dispatch, so recipients can follow the run from its first turn.
+    start_fire_stage("session_sharing", session_id=conv.id)
+    await share_new_run_session(
+        effective,
+        conv,
+        permission_store=deps.permission_store,
+        app_state=deps.app_state,
+        host_registry=deps.host_registry,
+    )
 
     await recorder.check()
     try:
@@ -890,6 +1075,12 @@ async def _disable_for_deleted_owner(
         task.user_id,
     )
     await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+    scheduler = getattr(deps.app_state, "scheduled_task_scheduler", None)
+    if scheduler is not None and not getattr(
+        deps.app_state, "scheduled_task_dispatch_enabled", False
+    ):
+        scheduler.remove(task.id)
+    await delete_task_grants(deps.permission_store, task.id)
     await recorder.finish(
         "failed",
         error=f"owner {task.user_id!r} registration is no longer active; task disabled",
@@ -921,24 +1112,84 @@ async def _source_session_problem(deps: FireDeps, task: ScheduledTask) -> tuple[
     return None
 
 
-async def _release_deleted_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
-    """Drop a continued session that was deleted, so this run starts a new one.
+async def _task_workflow(deps: FireDeps, task: ScheduledTask) -> Workflow | None:
+    """The saved workflow each run of *task* starts as a run of, or ``None`` if it runs none.
 
-    Only a session that no longer exists is replaced: one the owner archived or
-    that no longer fits the task still fails the run, so a change they made is
-    never undone silently. The new session is recorded like a first run's, and a
-    managed sandbox is provisioned again when the deleted session's workspace is
-    gone (see :func:`_continued_host_binding`).
+    :raises _CannotLaunchScheduledFire: ``workflows_disabled``, ``workflow_missing``
+        when the owner can no longer run it, or ``workflow_invalid``.
+    """
+    workflow_id = await asyncio.to_thread(task_workflow_id, task)
+    if workflow_id is None:
+        return None
+    if not workflows_enabled(deps.app_state):
+        raise _CannotLaunchScheduledFire(
+            "this automation runs a saved workflow, but workflows are disabled on this server",
+            error_code="workflows_disabled",
+        )
+    try:
+        return await load_workflow_for_run(
+            deps.conversation_store,
+            workflow_id,
+            user_id=task.user_id,
+            permission_store=deps.permission_store,
+        )
+    except WorkflowNotFoundError as exc:
+        raise _CannotLaunchScheduledFire(
+            "the saved workflow this automation runs was deleted or is no longer shared "
+            "with its owner, so the automation is paused",
+            error_code="workflow_missing",
+        ) from exc
+    except OmnigentError as exc:
+        raise _CannotLaunchScheduledFire(
+            f"the saved workflow this automation runs can't start: {exc}",
+            error_code="workflow_invalid",
+        ) from exc
+
+
+async def _start_workflow_run(
+    deps: FireDeps, task: ScheduledTask, conv: Conversation, workflow: Workflow
+) -> None:
+    """Write *workflow*'s steps as the new session's plan, as a manual launch does.
+
+    :raises _CannotLaunchScheduledFire: With ``workflow_plan_failed``, whose message
+        leaves out the storage error, which can carry SQL; the server log keeps it.
+    """
+    try:
+        await initialize_workflow_plan(
+            deps.conversation_store, conv, workflow, user_id=task.user_id
+        )
+    # Any storage failure, not only the journal's own errors; cancellation still propagates.
+    except Exception as exc:
+        _logger.exception(
+            "scheduled fire: task %s could not write workflow %s's plan", task.id, workflow.id
+        )
+        raise _CannotLaunchScheduledFire(
+            "could not start the run of the saved workflow",
+            error_code="workflow_plan_failed",
+        ) from exc
+
+
+async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
+    """Drop a continued session that was deleted or never started, so this run starts a new one.
+
+    Not called for one-time (``COUNT=1``) tasks, which fail instead. Only a
+    session that no longer exists, or the task's sandbox session whose first
+    launch failed, is replaced: nothing ever ran in the latter. One the owner
+    archived or that no longer fits the task still fails the run, so a change
+    they made is never undone silently. The new session is recorded like a first
+    run's, and a managed sandbox is provisioned again when the earlier session's
+    workspace is gone (see :func:`_continued_host_binding`).
     """
     session_id = task.session_id
     assert session_id is not None  # guarded by the caller
     start_fire_stage("session_validation", session_id=session_id)
     conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
-    if conv is not None:
+    if conv is not None and not await _sandbox_never_started(deps, task, conv):
         return task
     _logger.info(
-        "scheduled fire: task %s continues deleted session %s; starting a new one",
+        "scheduled fire: task %s continues %s session %s; starting a new one",
         task.id,
+        "deleted" if conv is None else "unstarted",
         session_id,
     )
     await asyncio.to_thread(deps.scheduled_task_store.release_session, task.id, session_id)
@@ -947,6 +1198,27 @@ async def _release_deleted_session(deps: FireDeps, task: ScheduledTask) -> Sched
     if stored is None or stored.state == "deleted":
         return task
     return replace(task, session_id=stored.session_id)
+
+
+async def _sandbox_never_started(deps: FireDeps, task: ScheduledTask, conv: Conversation) -> bool:
+    """Whether *conv* is the task's sandbox session left hostless by a failed first launch."""
+    from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_SETTLED_BY_LABEL
+
+    if task.execution_target != "managed_sandbox" or conv.host_id is not None:
+        return False
+    # Only a create's launch fails without a move claim; a failed move ran elsewhere first.
+    if conv.labels.get(STARTUP_LABEL) != "failed" or STARTUP_SETTLED_BY_LABEL in conv.labels:
+        return False
+    # A run abandoning its unregistered sandbox fails the prompt before tearing the
+    # sandbox down; until that run finishes, no replica may start a replacement.
+    if await asyncio.to_thread(
+        deps.scheduled_task_store.has_starting_run_for_conversation, conv.id
+    ):
+        return False
+    problem = await continued_session_problem(
+        task, conv, host_store=deps.host_store, permission_store=deps.permission_store
+    )
+    return problem is None
 
 
 async def _continue_session(
@@ -961,7 +1233,8 @@ async def _continue_session(
     busy with an earlier turn, and the run succeeds once it is delivered. Never
     falls back to a new session: one that cannot take the prompt records a
     failed run telling the owner how to start a new one. (A session that was
-    deleted is dropped earlier, by :func:`_release_deleted_session`.)
+    deleted or never started is dropped earlier, by
+    :func:`_release_replaceable_session`.)
     """
     session_id = task.session_id
     assert session_id is not None  # guarded by the caller
@@ -974,7 +1247,7 @@ async def _continue_session(
         reason, error_code = problem
         _logger.warning("scheduled fire: task %s cannot continue its session: %s", task.id, reason)
         await recorder.finish(
-            "failed", error=f"{reason}; {_NEW_SESSION_HINT}", error_code=error_code
+            "failed", error=f"{reason}; {_recovery_hint(task)}", error_code=error_code
         )
         return
     assert conv is not None
@@ -1016,14 +1289,42 @@ async def _continue_session(
             "failed",
             conversation_id=session_id,
             error="the session already has a cost cap this automation did not set; remove it "
-            f"from the session's policies, or {_NEW_SESSION_HINT}",
+            f"from the session's policies, or {_recovery_hint(task)}",
             error_code="continued_session_budget_conflict",
         )
         return
+    start_fire_stage("session_sharing", session_id=session_id)
+    await sync_continued_session(
+        task,
+        conv,
+        # A run changes the session's sharing only once the automation is shared.
+        forced=False,
+        permission_store=deps.permission_store,
+        app_state=deps.app_state,
+        host_registry=deps.host_registry,
+    )
+    progress = _PromptSendProgress()
+    progress_token = _PROMPT_SEND_PROGRESS.set(progress)
+    # Stamped before the prompt goes in, so the journal entries the session records
+    # are attributed to this run on any replica, even after a restart. A task, so
+    # a cancelled fire can still learn whether the write landed.
+    stamp = asyncio.ensure_future(
+        asyncio.to_thread(
+            deps.conversation_store.update_scheduled_run_label,
+            session_id,
+            recorder.run_id,
+            action="begin",
+        )
+    )
     try:
+        await asyncio.shield(stamp)
+        conv.labels[SCHEDULED_TASK_RUN_LABEL_KEY] = recorder.run_id
         start_fire_stage("runner_start", session_id=session_id)
         await dispatch(conv, task)
-    except Exception:
+    except BaseException as exc:
+        await _settle_run_label(deps, session_id, recorder.run_id, stamp, sent=progress.started)
+        if not isinstance(exc, Exception):
+            raise
         _logger.exception(
             "scheduled fire: dispatch into continued session %s failed for task %s",
             session_id,
@@ -1036,13 +1337,61 @@ async def _continue_session(
             error_code="launch_failed",
         )
         return
+    else:
+        await _settle_run_label(deps, session_id, recorder.run_id, stamp, sent=True)
+    finally:
+        _PROMPT_SEND_PROGRESS.reset(progress_token)
     await recorder.finish("succeeded", conversation_id=session_id)
     _logger.info("scheduled fire: task %s continued session %s", task.id, session_id)
 
 
+async def _settle_run_label(
+    deps: FireDeps,
+    session_id: str,
+    run_id: str,
+    stamp: asyncio.Future[None],
+    *,
+    sent: bool,
+) -> None:
+    """Settle tentative attribution after dispatch or a failure before sending.
+
+    Waits for an outstanding *stamp* first, and is shielded, so a cancelled
+    fire still settles the write. Once sending began, delivery is uncertain
+    and later failed attempts must be able to restore this run's label.
+    """
+
+    async def settle() -> None:
+        await asyncio.wait([stamp])
+        if stamp.cancelled() or stamp.exception() is not None:
+            return  # The stamp never landed.
+        try:
+            await asyncio.to_thread(
+                deps.conversation_store.update_scheduled_run_label,
+                session_id,
+                run_id,
+                action="commit" if sent else "rollback",
+            )
+        except Exception:
+            _logger.exception(
+                "scheduled fire: could not settle the run label on session %s",
+                session_id,
+            )
+
+    await asyncio.shield(asyncio.ensure_future(settle()))
+
+
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
+# A one-time task, such as a reminder, has no next run to change.
+_ONE_TIME_HINT = "it has no later run; set a new reminder or create a new automation"
+
+
+def _recovery_hint(task: ScheduledTask) -> str:
+    """What the owner can do about a continued run that failed."""
+    return _ONE_TIME_HINT if is_one_time_rule(task.rrule) else _NEW_SESSION_HINT
+
 
 UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
+CONTEXT_FULL_ERROR_CODE = "continued_session_context_full"
 
 # Launch flags that start a native CLI without an approval gate, for sessions whose
 # live mode has no label; Codex's full bypass is what spec-derived args emit for ``yolo``.
@@ -1059,11 +1408,6 @@ _APPROVAL_SKIPPING_LAUNCH_ARGS: tuple[tuple[str, ...], ...] = (
 )
 
 
-def _contains_args(args: list[str], needle: tuple[str, ...]) -> bool:
-    width = len(needle)
-    return any(tuple(args[i : i + width]) == needle for i in range(len(args) - width + 1))
-
-
 def session_approval_skipping_mode(conv: Conversation) -> str | None:
     """The approval-skipping permission mode *conv* is running in, or ``None``.
 
@@ -1077,9 +1421,17 @@ def session_approval_skipping_mode(conv: Conversation) -> str | None:
         return "bypass"
     launch_args = list(getattr(conv, "terminal_launch_args", None) or [])
     for needle in _APPROVAL_SKIPPING_LAUNCH_ARGS:
-        if _contains_args(launch_args, needle):
+        if launch_args_contain(launch_args, needle):
             return " ".join(needle)
     return None
+
+
+def _asks_for_approval(task: ScheduledTask) -> bool:
+    """Whether *task* selects a permission mode that keeps approval."""
+    return (
+        task.permission_mode is not None
+        and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES
+    )
 
 
 async def _inherited_permission_problem(
@@ -1088,14 +1440,10 @@ async def _inherited_permission_problem(
     """Why *task* may not run in its agent's default permission mode.
 
     A new session applies the task's own mode over that default, so any selected mode
-    opts out of it. A continued session keeps the agent's default, so only a task that
-    selects an approval-skipping mode itself opts in to running in one.
+    opts out of it. A continued session wakes in its own mode, the agent's default, so
+    only a task that selects a mode keeping approval objects to one that skips it.
     """
-    opted_in = (
-        task.permission_mode in APPROVAL_SKIPPING_PERMISSION_MODES
-        if continued
-        else task.permission_mode is not None
-    )
+    opted_in = not _asks_for_approval(task) if continued else task.permission_mode is not None
     if opted_in:
         return None
     problem = await inherited_approval_skipping_problem(agent, deps.agent_cache)
@@ -1112,7 +1460,8 @@ async def continued_session_problem(
     """Why ``conv`` cannot take *task*'s prompts, with an error code, or ``None`` if it can.
 
     Checked when the owner picks a session and again on every firing, since the
-    session and the task can both change in between.
+    session and the task can both change in between. A session whose last turn
+    overflowed its context window cannot take prompts until it is compacted.
     """
     if conv is None:
         return "the session no longer exists", "continued_session_missing"
@@ -1127,12 +1476,13 @@ async def continued_session_problem(
         return "the session is a sub-agent's session", "continued_session_incompatible"
     if conv.agent_id != task.agent_id:
         return "the session runs a different agent", "continued_session_incompatible"
+    # A task without a mode wakes the session in whatever mode it is in.
     session_mode = session_approval_skipping_mode(conv)
-    if session_mode is not None and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES:
+    if session_mode is not None and _asks_for_approval(task):
         return (
             f"the session is in permission mode {session_mode!r}, which skips approval, but the "
-            "automation does not select such a mode; switch the session to a mode that asks for "
-            "approval or uses the auto classifier",
+            f"automation selects {task.permission_mode!r}, which asks for it; switch the session "
+            "to a mode that asks for approval, or clear the automation's mode",
             UNATTENDED_PERMISSION_ERROR_CODE,
         )
     # A pin the task changed since would otherwise be ignored silently: the
@@ -1198,6 +1548,17 @@ async def continued_session_problem(
                 f"the session runs {where}, unlike the automation's execution target",
                 "continued_session_incompatible",
             )
+    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
+
+    # Classify the stored error as the session's snapshot does. Another prompt
+    # would fail the same way and only add to the full history.
+    last_error = _last_task_error_from_labels(conv.labels)
+    if last_error is not None and last_error["code"] == "context_length_exceeded":
+        return (
+            "the session's context window is full, so every prompt fails until /compact "
+            "runs in it",
+            CONTEXT_FULL_ERROR_CODE,
+        )
     return None
 
 
@@ -1361,7 +1722,12 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
     if task.user_id is None or deps.permission_store is None:
         return False
     owner = await asyncio.to_thread(deps.permission_store.get_user, task.user_id)
-    return owner is None or owner.account_generation != task.account_generation
+    if owner is None:
+        return True
+    # External auth does not capture a generation; accounts mode stays strict.
+    if task.account_generation is None and not account_checks_enabled():
+        return False
+    return owner.account_generation != task.account_generation
 
 
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
@@ -1512,17 +1878,14 @@ async def _permission_mode_launch_options(
             "Restore access to the agent and retry.",
             error_code="permission_harness_unresolved",
         )
-    args = PERMISSION_LAUNCH_ARGS.get(harness, {}).get(task.permission_mode)
-    if args is None:
+    options = permission_mode_launch_options(harness, task.permission_mode)
+    if options is None:
         raise _CannotLaunchScheduledFire(
             f"Saved permission setting {task.permission_mode!r} is not supported by {harness!r}. "
             "Edit the automation to choose a supported permission or clear the override.",
             error_code="permission_mode_unsupported",
         )
-    labels = {}
-    if harness == "codex-native" and task.permission_mode == "bypass":
-        labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
-    return list(args) or None, labels
+    return options
 
 
 async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:
@@ -1537,7 +1900,12 @@ async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | N
         agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
         if agent is None or getattr(agent, "bundle_location", None) is None:
             return None
-        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
+        loaded = await asyncio.to_thread(
+            deps.agent_cache.load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
+        )
         executor = getattr(loaded.spec, "executor", None)
         return getattr(executor, "reasoning_effort", None) if executor else None
     except Exception:
@@ -1671,28 +2039,57 @@ def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
     return []
 
 
-def _session_labels(task: ScheduledTask) -> dict[str, str]:
+async def _run_mcp_selection(
+    deps: FireDeps, task: ScheduledTask, host_id: str | None
+) -> SessionMcpSelection:
+    """The selection of the sandbox a run's session lands in, or the registry's."""
+    sandbox = await asyncio.to_thread(
+        run_sandbox, deps.sandbox_config, deps.host_store, task.execution_target, host_id
+    )
+    return mcp_selection_for(sandbox)
+
+
+def _session_labels(
+    task: ScheduledTask,
+    mcp_selection: SessionMcpSelection | None = None,
+    managed_host_id: str | None = None,
+) -> dict[str, str]:
     """Labels a fired session starts with.
 
-    A continue task's sandbox session records the host id it routes by, so a
-    relaunched sandbox keeps connecting to the replica that owns that id.
+    The task's MCP services become its selection's labels, so every run starts
+    with the same services. A managed fire's session records the
+    sandbox host id it was launched under, so the host routes by that id from
+    its first connection and a relaunch keeps the same replica. A task with no
+    services writes no selection labels, so a copied session keeps its own.
     """
+    selection_labels = (
+        (mcp_selection or mcp_selection_for(None)).session_labels(task.mcp_services)
+        if task.mcp_services
+        else {}
+    )
     labels = {
+        **selection_labels,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id,
         **managed_repo_labels(_sandbox_workspaces(task)),
     }
-    if task.execution_target == "managed_sandbox" and task.session_mode == "continue":
+    if task.execution_target == "managed_sandbox" and managed_host_id is not None:
         from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 
-        labels[REQUESTED_HOST_ID_LABEL_KEY] = continued_sandbox_host_id(task.id, task.workspace_id)
+        labels[REQUESTED_HOST_ID_LABEL_KEY] = managed_host_id
     return labels
 
 
 async def _create_session(
-    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+    deps: FireDeps,
+    task: ScheduledTask,
+    *,
+    labels: dict[str, str],
+    workflow: Workflow | None,
 ) -> Conversation:
     # Host operations and database threads can commit after caller cancellation.
-    creation = asyncio.create_task(_create_session_resources(deps, task, labels=labels))
+    creation = asyncio.create_task(
+        _create_session_resources(deps, task, labels=labels, workflow=workflow)
+    )
     try:
         return await asyncio.shield(creation)
     except asyncio.CancelledError:
@@ -1714,9 +2111,21 @@ async def _create_session(
 
 
 async def _create_session_resources(
-    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+    deps: FireDeps,
+    task: ScheduledTask,
+    *,
+    labels: dict[str, str],
+    workflow: Workflow | None,
 ) -> Conversation:
-    """Create a conversation bound to the task's agent, carrying the stored spec."""
+    """Create a conversation bound to the task's agent, carrying the stored spec.
+
+    :param labels: The session's labels, including the run's
+        ``SCHEDULED_TASK_RUN_LABEL_KEY``, which the workflow plan records.
+    :param workflow: The saved workflow the session starts as a run of, if any: its
+        steps become the session's plan before the prompt is sent.
+    :raises _CannotLaunchScheduledFire: With ``workflow_plan_failed`` if the plan
+        can't be written; the session is discarded.
+    """
     from omnigent.server.routes._host_worktree import (
         WORKTREE_ROOT_LABEL_KEY,
         WorktreeHostUnavailableError,
@@ -1796,6 +2205,8 @@ async def _create_session_resources(
         if labels:
             await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
             conv.labels.update(labels)
+        if workflow is not None:
+            await _start_workflow_run(deps, task, conv, workflow)
         return conv
     except Exception:
         if conv is not None:
@@ -1885,6 +2296,10 @@ async def _copy_source_session_for_run(
     dropped = run_copy_dropped_label_keys(
         source.labels if source is not None else {}, agent_changed=agent_changed
     )
+    if task.mcp_services and source is not None:
+        # The task's own MCP services replace the copy's rather than adding to
+        # them, whichever selection wrote the copy's.
+        dropped = dropped | session_mcp_label_keys(deps.sandbox_config, source.labels)
     project_id = await _fire_project_id(deps, task)
     try:
         conv = await asyncio.to_thread(
@@ -1904,6 +2319,9 @@ async def _copy_source_session_for_run(
             copy_model_settings=False,
             # The copy's provider binding belongs to its agent; another agent resolves its own.
             copy_inference_snapshot=not agent_changed,
+            # The run plans and tracks its own work, as a run in a new session
+            # does; its copied history still shows the source's plan.
+            copy_journal=False,
             terminal_launch_args=launch_args,
             override_terminal_launch_args=True,
         )
@@ -2056,14 +2474,9 @@ async def _grant_default_public(deps: FireDeps, task: ScheduledTask, conversatio
     """
     if deps.permission_store is None or deps.app_state is None:
         return
-    from omnigent.server.sharing_settings import (
-        host_is_managed_sandbox,
-        new_session_starts_public,
-    )
+    from omnigent.server.sharing_settings import new_session_starts_public
 
-    managed = task.execution_target == "managed_sandbox" or host_is_managed_sandbox(
-        deps.host_registry, task.host_id
-    )
+    managed = is_managed_run_session(task, task.host_id, deps.host_registry)
     if not new_session_starts_public(deps.app_state, managed=managed, workspace=task.workspace):
         return
     await asyncio.to_thread(deps.permission_store.ensure_user, RESERVED_USER_PUBLIC)
@@ -2081,6 +2494,7 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Stamp last_run_* on the task and write a scheduled_task_runs row."""
     await asyncio.to_thread(
@@ -2092,6 +2506,7 @@ async def _record_run(
         status,
         error=error,
         error_code=error_code,
+        run_id=run_id,
     )
 
 
@@ -2104,11 +2519,12 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = _stamp_last_run_sync(deps, task, conversation_id)
     deps.scheduled_task_store.create_run(
-        _new_id(),
+        run_id or _new_id(),
         task.id,
         status,
         scheduled_at,
@@ -2358,6 +2774,9 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
             ensure_runner_connected,
         )
 
+        if task.kind == "timer":
+            # Before any runner is woken, as for a message to the session.
+            await _check_timer_wake(deps, task, conv)
         with fire_stage("runner_start", session_id=conv.id):
             launch = None
             if conv.host_id is None and task.execution_target == "managed_sandbox":
@@ -2406,6 +2825,10 @@ async def _send_prompt(
     with fire_stage("prompt_prepare", session_id=conv.id):
         agent_revision = await _agent_revision(deps, conv)
     with fire_stage("prompt_send", session_id=conv.id):
+        progress = _PROMPT_SEND_PROGRESS.get()
+        if progress is not None:
+            # From here a failure may come after the runner took the prompt.
+            progress.started = True
         dispatch_id = uuid.uuid4().hex
         log_delivery(
             "scheduled_run_prompt_dispatch_started", session_id=conv.id, dispatch_id=dispatch_id
@@ -2413,7 +2836,7 @@ async def _send_prompt(
         result = await _dispatch_session_event_to_runner(
             conv.id,
             conv,
-            _prompt_event(run_prompt_text(task)),
+            _task_event(task),
             deps.conversation_store,
             runner_client,
             agent_name=None,
@@ -2433,6 +2856,9 @@ async def _send_prompt(
                 failure_stage="prompt_send",
                 outcome="not_sent",
             )
+            if task.kind == "timer":
+                # The timer's run must say its wake never went in; nothing resends it.
+                raise RuntimeError(f"session {conv.id} did not accept the timer's wake")
 
 
 def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
@@ -2519,6 +2945,7 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
                     if existing is not None and existing.sandbox_provider is not None
                     else None,
                     sandbox_profiles=getattr(deps.app_state, "sandbox_profiles", None),
+                    adopt_default_profile=True,
                 )
             except Exception as exc:
                 await _fail_running_run(
@@ -2602,12 +3029,24 @@ class _ClaimedRunRecorder:
         self._lease = lease
         self._registration_timeout_s = registration_timeout_s
 
+    @property
+    def run_id(self) -> str:
+        return self._lease.run.id
+
+    @property
+    def managed_host_id(self) -> str | None:
+        return self._lease.run.host_id
+
     async def check(self) -> None:
         await self._lease.check()
 
     async def session_created(self, conversation_id: str) -> None:
         set_current_session_id(conversation_id)
         await self._lease.attach_session(conversation_id)
+
+    async def hand_back_timer_firing(self, host_id: str) -> None:
+        """Return a timer's firing unsent, for the replica that owns *host_id* to claim."""
+        await self._lease.hand_back_timer_firing(host_id)
 
     async def finish(
         self,
@@ -2629,6 +3068,9 @@ class _ClaimedRunRecorder:
             if status == "failed"
             else None,
         )
+        if self._task.kind == "timer":
+            # A timer's newest run is its summary; writing its task would race its next claim.
+            return
         # The outcome is already recorded; a failed stamp only leaves the task's
         # last-run summary stale.
         try:
@@ -2723,7 +3165,12 @@ class _ClaimedRunRecorder:
         reason = await self._fail_saved_prompt(conversation_id, failure_reason)
         launch_task.cancel()
         await asyncio.wait({launch_task}, timeout=_ABANDONED_LAUNCH_SETTLE_S)
-        await _terminate_run_sandbox(self._deps, self._lease.run.host_id, conversation_id)
+        try:
+            await _terminate_run_sandbox(self._deps, self._lease.run.host_id, conversation_id)
+        finally:
+            # A launch cancelled before it binds never settles its tracker entry.
+            if tracker is not None and launch is not None and not launch.settled.is_set():
+                tracker.fail(conversation_id, reason)
         await self.finish(
             "failed",
             conversation_id=conversation_id,
@@ -2817,6 +3264,131 @@ def _delivered_run_outcome(
     return "running"
 
 
+async def _timer_session_problem(
+    deps: FireDeps, task: ScheduledTask, conv: Conversation | None
+) -> str | None:
+    """Why a timer can no longer wake *conv*, its session, or ``None`` if it can.
+
+    A timer wakes the session in whatever permission mode the session is in.
+    """
+    if conv is None:
+        return "the session no longer exists"
+    if conv.archived:
+        return "the session is archived"
+    if is_session_closed(conv.labels, conv.title):
+        return "the session is closed to new messages"
+    if deps.permission_store is not None and not await asyncio.to_thread(
+        check_session_access,
+        task.user_id or RESERVED_USER_LOCAL,
+        conv.id,
+        LEVEL_EDIT,
+        deps.permission_store,
+        deps.conversation_store,
+        conversation=conv,
+    ):
+        return "the timer's owner can no longer send messages to the session"
+    return None
+
+
+class TimerWakeRefused(Exception):
+    """The session's input policies refused a timer's wake; the message is the reason."""
+
+
+async def _check_timer_wake(deps: FireDeps, task: ScheduledTask, conv: Conversation) -> None:
+    """Check a timer's wake against the session's input policies, as a message is checked.
+
+    A refusal is recorded in the session as a message's is. A policy that asks for
+    approval refuses the wake too: no one is there to approve it.
+
+    :raises TimerWakeRefused: With the policy's reason, when the wake must not be sent.
+    """
+    from omnigent.server.routes.sessions import (
+        _build_actor,
+        _evaluate_input_policy,
+        _persist_policy_deny_sentinel,
+    )
+
+    if conv.agent_id is None:
+        return
+    start_fire_stage("input_policy", session_id=conv.id)
+    try:
+        verdict = await _evaluate_input_policy(
+            None,
+            conv.id,
+            conv,
+            _task_event(task),
+            deps.conversation_store,
+            deps.agent_store,
+            deps.runner_router,
+            actor=_build_actor(task.user_id),
+            file_store=deps.file_store,
+            artifact_store=deps.artifact_store,
+        )
+    except Exception as exc:
+        # As for a message, a policy that can't be checked refuses the input.
+        _logger.warning("Input policy evaluation failed for timer %s", task.id, exc_info=True)
+        verdict = {"reason": f"Denied by policy (policy evaluation error: {type(exc).__name__})."}
+    if verdict is None:
+        return
+    reason = str(verdict.get("reason") or "Denied by policy")
+    await _persist_policy_deny_sentinel(
+        conv.id, conv, reason, deps.conversation_store, deps.agent_store
+    )
+    raise TimerWakeRefused(reason)
+
+
+async def _fire_timer(
+    deps: FireDeps, task: ScheduledTask, recorder: _ClaimedRunRecorder, dispatch: LaunchDispatch
+) -> None:
+    """Wake a timer's session with its hidden firing message.
+
+    A session that was deleted, archived or closed, or that the timer's owner can no
+    longer send to, stops the timer instead: it is never woken or recreated. A session
+    that moved to another host gets the firing back unsent, for the replica that owns
+    that host to claim at its next poll. The session's input policies check the wake as
+    they would a message. A cancel stops later firings; one already on its way may still
+    arrive.
+    """
+    session_id = task.session_id
+    assert session_id is not None  # a timer always names its session
+    start_fire_stage("session_validation", session_id=session_id)
+    conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
+    problem = await _timer_session_problem(deps, task, conv)
+    if problem is not None:
+        _logger.info("scheduled fire: timer %s stopped: %s", task.id, problem)
+        await recorder.finish("skipped", error=problem, error_code="timer_session_unavailable")
+        await asyncio.to_thread(deps.scheduled_task_store.delete, task.id)
+        return
+    assert conv is not None
+    # Firings are claimed by the replica that owns the timer's saved host, which may no
+    # longer serve the session; a session without a host keeps the saved one.
+    if conv.host_id is not None and conv.host_id != task.host_id:
+        _logger.info("scheduled fire: timer %s follows its session to %s", task.id, conv.host_id)
+        await recorder.hand_back_timer_firing(conv.host_id)
+        return
+    try:
+        await dispatch(conv, task)
+    except TimerWakeRefused as refused:
+        _logger.info("scheduled fire: a policy refused timer %s's wake: %s", task.id, refused)
+        await recorder.finish(
+            "skipped",
+            conversation_id=conv.id,
+            error=str(refused),
+            error_code="timer_policy_denied",
+        )
+        return
+    except Exception:
+        _logger.exception("scheduled fire: timer %s could not wake session %s", task.id, conv.id)
+        await recorder.finish(
+            "failed",
+            conversation_id=conv.id,
+            error="runner launch/dispatch failed",
+            error_code="launch_failed",
+        )
+        return
+    await recorder.finish("succeeded", conversation_id=conv.id)
+
+
 class ClaimedRunExecutor:
     """Start runs the persistent scheduler claimed, and recover interrupted startups.
 
@@ -2864,8 +3436,21 @@ class ClaimedRunExecutor:
                 )
                 await recorder.finish(
                     "failed",
-                    error="Could not act as the automation's owner. The next run tries again.",
+                    error="Could not act as the automation's owner. "
+                    + (
+                        "It has no later run, so set it again."
+                        if is_one_time_rule(task.rrule)
+                        else "The next run tries again."
+                    ),
                     error_code="owner_identity_unavailable",
+                )
+                return
+            if task.kind == "timer":
+                await _fire_timer(
+                    self._deps,
+                    task,
+                    recorder,
+                    self._fire_dispatch.reuse or _make_reuse_dispatch(self._deps),
                 )
                 return
             await _run_fire_for_task(self._deps, task, self._fire_dispatch, recorder)
@@ -2899,6 +3484,10 @@ class ClaimedRunExecutor:
         checks the run again.
         """
         task = await asyncio.to_thread(self._deps.scheduled_task_store.get, run.scheduled_task_id)
+        if task is not None and task.kind == "timer":
+            # A timer's wake is never resent; an interrupted firing is lost, and the
+            # finished run removes a spent one-shot timer.
+            return "failed"
         async with contextlib.AsyncExitStack() as stack:
             if task is not None:
                 try:

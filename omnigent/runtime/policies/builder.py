@@ -30,9 +30,11 @@ from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.policies.base import Policy
 from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
 from omnigent.policies.function import resolve_function_policy
+from omnigent.policies.registry import function_policy_handler_allowed
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
     SESSION_COST_UNPRICED_APPROVED_KEY,
@@ -50,7 +52,11 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    SPAWN_TREE_READ_CAP,
+    ConversationStore,
+    DailyCostState,
+)
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -866,8 +872,43 @@ def build_policy_engine(
         harness = (
             conv.harness_override if conv is not None and conv.harness_override else spec_harness
         )
+        # Price sessions on non-default providers at their configured rate,
+        # not the harness default's. A sub-agent session runs the CHILD
+        # spec's executor, so its auth decides the provider identity.
+        from omnigent.spec.types import ProviderAuth
+
+        _executor = child_spec.executor if child_spec is not None else spec.executor
+        _provider_entry = None
+        if (
+            isinstance(_executor.auth, ProviderAuth)
+            and _executor.auth.name
+            and harness is not None
+        ):
+            try:
+                from omnigent.inference_config import load_runtime_inference_config
+                from omnigent.onboarding.detected import resolve_named_provider
+
+                _provider_entry = resolve_named_provider(
+                    _executor.auth.name, load_runtime_inference_config(provider_config)
+                )
+                if _provider_entry is None:
+                    # A declared provider absent from config silently reverts
+                    # to default-provider pricing; surface the misconfiguration.
+                    _logger.warning(
+                        "session executor names provider %r but it is not "
+                        "configured; pricing falls back to the default provider",
+                        _executor.auth.name,
+                    )
+            except Exception:
+                # Provider resolution must never break policy pricing; fall back
+                # to the default-provider lookup. Warn, not debug: this runs once
+                # per policy build, so a broken config is worth surfacing.
+                _logger.warning("named-provider lookup failed for pricing", exc_info=True)
         token_pricing = fetch_model_pricing_with_provider(
-            initial_model, provider_config=provider_config, harness=harness
+            initial_model,
+            provider_config=provider_config,
+            harness=harness,
+            provider_entry=_provider_entry,
         )
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to
@@ -994,10 +1035,10 @@ def _build_policy_llm_client(
 
 def _normalize_policy_model(model: str) -> str:
     """
-    Apply the ``databricks-`` → ``databricks/`` provider-prefix fixup.
+    Apply the ``databricks/`` provider-prefix fixup to bare Databricks ids.
 
-    Models prefixed with ``databricks-`` (e.g.
-    ``databricks-claude-sonnet-4-6``) need the ``databricks/``
+    Bare Databricks models (e.g. ``databricks-claude-sonnet-4-6`` or the
+    Unity Catalog ``system.ai.claude-sonnet-4-6``) need the ``databricks/``
     provider prefix so the LLM adapter routes through
     ``DatabricksAdapter`` (Chat Completions) rather than
     ``OpenAIAdapter`` (Responses API). Without this, the request
@@ -1006,11 +1047,11 @@ def _normalize_policy_model(model: str) -> str:
     fallback path routes the same way as the primary.
 
     :param model: A model id from the server ``llm:`` config,
-        possibly a bare ``databricks-`` name.
+        possibly a bare ``databricks-`` or ``system.ai.`` name.
     :returns: The model id with the ``databricks/`` prefix applied
         when needed; otherwise unchanged.
     """
-    if "/" not in model and model.startswith("databricks-"):
+    if "/" not in model and is_databricks_model_id(model):
         return f"databricks/{model}"
     return model
 
@@ -1213,10 +1254,10 @@ def _load_session_state(
     return dict(conv.session_state)
 
 
-# Page size for walking a spawn tree when summing sub-agent usage.
-# Sub-agent trees are small in practice, but we still paginate so a
-# large tree is not silently truncated (see load_session_usage).
-_SUBTREE_USAGE_PAGE_SIZE = 100
+# Page size for summing a spawn tree's usage: the root plus the sub-agents one
+# bounded tree read covers, so nearly every policy check reads its tree once.
+# Bigger trees still page, so none is silently truncated.
+_SUBTREE_USAGE_PAGE_SIZE = SPAWN_TREE_READ_CAP + 1
 
 # Usage counters summed across a conversation subtree. Restricted to the
 # known numeric keys the PolicyEngine reads so an unexpected key in one
@@ -1759,6 +1800,16 @@ def _load_default_policy_specs(
                 policy.type,
             )
             continue
+        if not function_policy_handler_allowed(policy.handler, policy.factory_params):
+            # A row whose handler is no longer registered would fail engine construction
+            # for every session; skip it so one stale row cannot take the server down.
+            _logger.warning(
+                "Skipping default policy %r (id=%r): handler %r is not registered.",
+                policy.name,
+                policy.id,
+                policy.handler,
+            )
+            continue
         specs.append(_stored_policy_to_spec(policy))
     _DEFAULT_POLICY_SPECS_CACHE[_DEFAULT_POLICY_SPECS_KEY] = (specs, loaded_at)
     return specs
@@ -1894,6 +1945,12 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
         (e.g. ``type="url"``).
     """
     if policy.type == "python":
+        # Persisted rows can predate the API handler allowlist.
+        if not function_policy_handler_allowed(policy.handler, policy.factory_params):
+            raise OmnigentError(
+                f"Policy handler {policy.handler!r} is not a registered policy handler",
+                code=ErrorCode.INVALID_INPUT,
+            )
         return FunctionPolicySpec(
             name=policy.name,
             # Session policies self-select: on=None means the

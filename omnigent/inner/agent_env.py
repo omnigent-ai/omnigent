@@ -11,6 +11,8 @@ harness added is filtered by construction rather than by remembering.
 The model is not "no credentials ever". It is:
 
     shared safe base  +  this harness's own config/provider families
+                      +  exact names the host owner forwarded through
+                         ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
                       +  whatever the spec declared in
                          ``os_env.sandbox.env_passthrough``
 
@@ -26,7 +28,11 @@ from collections.abc import Iterable, Mapping
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.databricks_ai_gateway import CI_CONTEXT_ENV, ci_request_tags
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR, RUNNER_SESSION_ENV_NAMES_ENV_VAR
+from omnigent.runner.identity import (
+    OMNIGENT_SESSION_ENV_VAR,
+    RUNNER_AUTH_SECRET_ENV_VARS,
+    RUNNER_SESSION_ENV_NAMES_ENV_VAR,
+)
 
 # Desktop access requires an explicit grant outside the sandbox.
 DESKTOP_SESSION_ENV_VARS: frozenset[str] = frozenset(
@@ -112,16 +118,28 @@ def clean_agent_env(
         ``os_env.sandbox.env_passthrough``. This is the documented escape hatch
         for an agent that authenticates from a variable outside its own family.
     :param source: Environment to filter. Defaults to ``os.environ``; injectable
-        for tests.
-    :returns: A filtered copy that also keeps the variables the launching CLI
-        forwarded for this session; desktop-session variables require
-        ``extra_allowed``.
+        for tests. Its ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names are also
+        allowed, subject to the deny rules.
+    :returns: A filtered copy without runner-auth secrets that also keeps the
+        variables the launching CLI forwarded for this session; desktop-session
+        variables require ``extra_allowed``.
     """
     env_source = os.environ if source is None else source
     prefixes = BASE_ALLOW_PREFIXES + tuple(allow_prefixes)
+    operator_names = {
+        name.strip()
+        for name in env_source.get("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "").split(",")
+        if name.strip()
+    }
     extra = set(extra_allowed)
-    exact = BASE_ALLOW_EXACT | set(allow_exact) | extra | forwarded_session_env_names(env_source)
-    denied = set(deny_exact) | (DESKTOP_SESSION_ENV_VARS - extra)
+    exact = (
+        BASE_ALLOW_EXACT
+        | set(allow_exact)
+        | extra
+        | operator_names
+        | forwarded_session_env_names(env_source)
+    )
+    denied = set(deny_exact) | RUNNER_AUTH_SECRET_ENV_VARS | (DESKTOP_SESSION_ENV_VARS - extra)
     filtered = {
         key: value
         for key, value in env_source.items()

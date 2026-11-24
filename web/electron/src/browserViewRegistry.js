@@ -17,6 +17,7 @@
  *    detached on hide and destroyed only on explicit close.
  */
 
+const { randomUUID } = require("node:crypto");
 const {
   checkAgentNavigation,
   isAgentConnectionAllowed,
@@ -26,8 +27,13 @@ const {
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
+const { isDesktopOpenRequest } = require("./desktopOpenServer");
+const { createAgentNavigation } = require("./agentNavigation");
+const { hasHostLocalAccess } = require("./hostIdentity");
+const { agentInputInFlight } = require("./browserInput");
 
-const DEFAULT_CAP = 10;
+// Each view is a separate renderer process; the cap bounds memory per window.
+const DEFAULT_CAP = 20;
 
 // Map WebSocket handshakes onto the HTTP URL rules.
 function httpUrlForWebSocket(url) {
@@ -94,6 +100,7 @@ function createBrowserViewRegistry({
   resolveHost = lookupHostAddresses,
   resolveProxy = async () => "DIRECT",
   cap = DEFAULT_CAP,
+  historyLoadTimeoutMs = 10_000,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
@@ -101,19 +108,25 @@ function createBrowserViewRegistry({
   const entries = new Map(); // conversationId -> BrowserViewEntry
   const pendingNavigations = new Map();
 
-  function beginAgentNavigation(conversationId) {
-    const generation = Symbol();
+  // A continuation consumes its original generation without superseding a newer navigation.
+  function beginAgentNavigation(conversationId, retryToken) {
+    if (retryToken !== undefined && pendingNavigations.get(conversationId) !== retryToken) {
+      return null;
+    }
+    const generation = randomUUID();
     pendingNavigations.set(conversationId, generation);
-    return () => pendingNavigations.get(conversationId) === generation;
+    return Object.assign(() => pendingNavigations.get(conversationId) === generation, {
+      retryToken: generation,
+    });
   }
   const allowsLocalhost = (context) => !context?.revoked && contextAllowsLocalhost(context);
 
   function needsAgentViewRevocation(entry, nextContext) {
     const context = entry?.agentContext;
     return (
-      context?.hostIsThisMachine === true &&
+      hasHostLocalAccess(context) &&
       (context.revoked ||
-        !nextContext?.hostIsThisMachine ||
+        !hasHostLocalAccess(nextContext) ||
         nextContext.sourceHostId !== context.sourceHostId)
     );
   }
@@ -262,6 +275,7 @@ function createBrowserViewRegistry({
         return { action: "deny" };
       }
       try {
+        beginAgentNavigation(entry.conversationId);
         wc.loadURL(url);
       } catch {
         /* view destroyed mid-click */
@@ -279,6 +293,8 @@ function createBrowserViewRegistry({
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     wc.on("context-menu", (_event, params) => {
+      // An agent's right-click opens the page's own menu, never the shell's.
+      if (entry.suppressContextMenuUntil > Date.now()) return;
       const items = [];
       if (params.linkURL) {
         if (/^https?:\/\//i.test(params.linkURL)) {
@@ -321,9 +337,14 @@ function createBrowserViewRegistry({
           url: targetUrl,
           error: verdict.error,
         });
+        // Lets agent history navigation report the block.
+        if (event?.isMainFrame !== false) entry.agentNavBlockedError = verdict.error;
       }
     };
-    wc.on("will-navigate", guard);
+    wc.on("will-navigate", (event, targetUrl) => {
+      beginAgentNavigation(conversationId);
+      guard(event, targetUrl);
+    });
     wc.on("will-redirect", guard);
     // Subframe navigations (iframes) can also reach an internal host; guard them
     // too. Older Electron may not emit this event — harmless if it never fires.
@@ -374,10 +395,17 @@ function createBrowserViewRegistry({
   }
 
   function attachRecentSessionInput(entry) {
-    const wc = entry.view && entry.view.webContents;
+    // Another view taking keys for the page (the design tools' overlay) forwards them too.
+    entry.forwardRecentSessionInput = (wc) => forwardRecentSessionInputFrom(entry, wc);
+    forwardRecentSessionInputFrom(entry, entry.view && entry.view.webContents);
+  }
+
+  function forwardRecentSessionInputFrom(entry, wc) {
     if (!wc || typeof wc.on !== "function") return;
     wc.on("before-input-event", (event, input) => {
       if (!recentSessionSwitchSupported) return;
+      // An agent's key presses are for the page, never the shell.
+      if (agentInputInFlight(wc)) return;
       const type =
         input && input.type === "keyDown"
           ? "keydown"
@@ -428,6 +456,15 @@ function createBrowserViewRegistry({
     });
   }
 
+  // Agent viewport sizing and back / forward / reload.
+  const agentNavigation = createAgentNavigation({
+    entries,
+    isActive: (conversationId) => activeConversationId === conversationId,
+    checkAgentNavigationFor,
+    historyLoadTimeoutMs,
+    beginAgentNavigation,
+  });
+
   function entryForWebContents(webContentsId) {
     for (const entry of entries.values()) {
       try {
@@ -474,6 +511,8 @@ function createBrowserViewRegistry({
   // IP literals and exact loopback names need only the URL check; `*.localhost`
   // must also be on a direct route so a proxy never receives the request.
   async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
+    // A page in an embedded browser pane must not steer the user's main window.
+    if (isDesktopOpenRequest(url)) return true;
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
@@ -759,6 +798,7 @@ function createBrowserViewRegistry({
     needsAgentViewRevocation,
     revokeAgentView,
     checkAgentNavigation: checkAgentNavigationFor,
+    ...agentNavigation,
     shouldCancelAgentRequest,
     agentRequestHeaders,
     shouldCancelAgentResponse,

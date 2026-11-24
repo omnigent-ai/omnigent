@@ -20,7 +20,7 @@ Filename search remains in Files.
 - `navigate`: open a result at its line and return to the preserved search;
   switching conversations restores each conversation's query, options and results.
 - `states`: initial, searching, no matches, errors and partial results.
-- `gate`: the feature is absent unless `workspace_content_search` is enabled.
+- `gate`: on by default; `OMNIGENT_FEATURES=-workspace_content_search` hides it.
 
 ## How to get to it (user POV)
 
@@ -34,11 +34,17 @@ Filename search remains in Files.
   also works from the editor and terminal. The tab strip's arrows can select the
   tab too, and so can its number: **Ctrl+1–9** on macOS (**Alt+1–9** on
   Windows/Linux, except in a terminal) from anywhere in the app.
+- Tabs sidebar: with `workspace_sidebar_v2` on, in a desktop app or desktop
+  browser (not a touch client), the sidebar shows tabs instead of the Workspace
+  panel, in the Workspace drawer when the window is narrower than 1181px. Choose
+  **New tab → Search text** to search in a tab of its own, and move between tabs
+  from the strip or tab search. The Workspace panel's **Cmd+Shift+F** isn't
+  bound while the tabs show.
 
 ## Driving it with the repro environment
 
-Preconditions: enable `OMNIGENT_FEATURES=workspace_content_search` on the test
-server before launch, install `rg` on the runner's PATH, and use a session with
+Preconditions: leave `workspace_content_search` enabled (the default) on the test
+server, install `rg` on the runner's PATH, and use a session with
 filesystem access and a connected runner. Follow the
 [verification skill](skills/verify-omnigent/SKILL.md).
 
@@ -54,8 +60,8 @@ switch back and confirm its query, options and results return without a new sear
 Click Filter files, include `src/**` and exclude `**/tests/**`, then submit.
 Confirm results respect both filters, including after collapsing the filters or
 switching conversations. Clear both fields and submit to restore the full search.
-Restart the test server without the flag and reload: the tab, picker entry and
-shortcut should be unavailable.
+Restart the test server with `OMNIGENT_FEATURES=-workspace_content_search` and
+reload: the tab, picker entry and shortcut should be unavailable.
 
 - Browser navigation through the tab, picker and search shortcut:
   `tests/browser_ui/files/test_file_line_navigation.py::test_content_search_opens_line_and_preserves_results`.
@@ -93,7 +99,8 @@ shortcut should be unavailable.
 - Searches return at most 500 matching lines and stop after 15 seconds. Partial
   results are labeled; exceptionally long matching lines may be omitted with a warning.
 - Older runners show guidance to update the host and restart the session. Offline
-  runners or missing ripgrep show an error. Search has no host-daemon fallback.
+  runners or missing ripgrep show an error. Search tries the workspace API first
+  when the host lists it, and otherwise uses the REST search.
 - Workspace file-sharing permissions apply. A shared conversation alone does not
   grant access to its file contents.
 - On mobile, tapping a result opens the file viewer; its back button returns

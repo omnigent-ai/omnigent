@@ -57,6 +57,12 @@ Additive fields:
 - ``auth``: a :class:`PullRequestAuth`; null when ``available`` is false.
 - ``capabilities``: :meth:`ProviderCapabilities.to_json`; null for an unsupported remote.
 - ``remote_host``: only with ``reason: "unsupported_remote"``.
+- ``repo.host``: the host of the repository's forge instance, e.g. ``"github.com"``;
+  omitted when the provider doesn't know it.
+- ``workspace_repo``: ``{name_with_owner, host}`` of the workspace checkout's own
+  repository, whichever PR ``repo`` describes. Omitted on explicit PR reads and when
+  the preferred remote (gh's resolved base, else origin) isn't recognized on that
+  host; with no remotes, the provider's answer (e.g. from ``GH_REPO``) stands.
 - PR associations in ``prs`` carry ``provider``.
 - The dispatcher adds descriptor ``provider_display`` to info and associations.
 - ``checks`` may also count ``cancelled`` and ``skipped`` jobs, with matching ``runs``
@@ -144,6 +150,9 @@ class ProviderCapabilities:
     :ivar commit_history: The PR's commits can be listed and each one's patch read
         through the optional :class:`CommitsFacet`; the optional
         :class:`CommitCompareFacet` adds the changes after one of them.
+    :ivar merge_as_account: With ``merging`` and ``account_switching``, the merge
+        dialog lets the user choose the account a merge runs as, through the
+        optional :class:`AccountMergeFacet`.
     """
 
     account_switching: bool
@@ -160,6 +169,7 @@ class ProviderCapabilities:
     details_editing: bool = False
     attachment_uploads: bool = False
     commit_history: bool = False
+    merge_as_account: bool = False
 
     def to_json(self) -> dict[str, bool]:
         """Return the capabilities as the payload's ``capabilities`` object."""
@@ -252,6 +262,66 @@ class CommitsFacet(Protocol):
         self, root: str, reference: PullRequestRef, *, commit_sha: str
     ) -> dict[str, Any]:
         """Return one commit's patch, a ``session.github.pr_diff``."""
+        ...
+
+
+@runtime_checkable
+class AccountMergeFacet(Protocol):
+    """Optional merging as a chosen account.
+
+    Gated by :attr:`ProviderCapabilities.merge_as_account`.
+    """
+
+    def merge_as(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        merge_method: str,
+        expected_head: str,
+        account: str,
+    ) -> dict[str, Any]:
+        """Merge like :meth:`PullRequestFacet.merge`, but as ``account``.
+
+        The account must bind this call alone: never read it back from a saved
+        preference, which a concurrent request can change before the merge runs.
+        Raise ``ValueError`` when ``account`` can't run the merge.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class PullRequestStatus:
+    """A PR's title, state and draft flag from one lookup.
+
+    :ivar title: The stripped, non-empty title, or ``None``.
+    :ivar state: ``"OPEN"``, ``"MERGED"`` or ``"CLOSED"``, or ``None`` when the
+        forge's answer had a title but no state it recognizes.
+    :ivar is_draft: Whether the PR is a draft.
+    """
+
+    title: str | None
+    state: str | None
+    is_draft: bool
+
+
+@runtime_checkable
+class PullRequestStatusFacet(Protocol):
+    """Optional lookup of a PR's state along with its title.
+
+    When a provider has it, title refreshes use it instead of
+    :meth:`PullRequestFacet.pr_title`, so the server learns every tracked PR's
+    state, not only the selected one's.
+    """
+
+    def pr_status(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[PullRequestStatus | None, bool]:
+        """Look up one PR's title, state and draft flag, giving up at ``deadline``. Never raises.
+
+        :returns: ``(status, timed_out)``, as :meth:`PullRequestFacet.pr_title` returns
+            ``(title, timed_out)``; ``status`` is ``None`` when the lookup failed.
+        """
         ...
 
 
@@ -643,6 +713,40 @@ class PullRequestFacet(Protocol):
             ``tool_name`` is not one of this provider's PR tools.
         """
         ...
+
+
+def offered_capabilities(facet: PullRequestFacet, host: str | None) -> ProviderCapabilities:
+    """Return the capabilities *facet* offers for a pull request or workspace on *host*.
+
+    Every panel step that checks a capability, and every info payload, asks here, so
+    one place decides what a code host offers. Today that is the facet's own
+    :attr:`PullRequestFacet.capabilities` on every host.
+
+    :param facet: The provider's pull request facet.
+    :param host: The pull request's host, else the workspace remote's host; ``None``
+        when neither is known.
+    """
+    del host  # Every host gets the facet's own capabilities.
+    return facet.capabilities
+
+
+def with_offered_capabilities(
+    info: dict[str, Any], facet: PullRequestFacet, host: str | None
+) -> dict[str, Any]:
+    """Return *info* with its ``capabilities`` narrowed to :func:`offered_capabilities`.
+
+    A capability the payload reports stays on only when *facet* offers it on *host*;
+    nothing is turned on, and a payload without ``capabilities`` is returned as is.
+    """
+    reported = info.get("capabilities")
+    if not isinstance(reported, dict):
+        return info
+    offered = offered_capabilities(facet, host).to_json()
+    info["capabilities"] = {
+        name: (value and offered[name]) if name in offered else value
+        for name, value in reported.items()
+    }
+    return info
 
 
 def unsupported_remote_info(host: str) -> dict[str, Any]:

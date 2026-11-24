@@ -118,7 +118,9 @@ def open_daemon_client(
         databricks_request_headers,
     )
 
-    pinned = {**headers, **databricks_request_headers(base_url, host_id=host_id)}
+    # httpx.Headers so a caller's lowercase header name replaces the builder's, not duplicates it.
+    pinned = httpx.Headers(headers)
+    pinned.update(databricks_request_headers(base_url, host_id=host_id))
 
     async def pin_request(request: httpx.Request) -> None:
         # Auth refresh may inject this machine's key; the selected host wins.

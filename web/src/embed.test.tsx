@@ -89,6 +89,9 @@ describe("macOS Electron embed", () => {
     const scope = container.querySelector(".omnigent-app")!;
     expect(scope.getAttribute("data-electron-mac")).toBe(expected ? "true" : null);
     expect(document.documentElement).not.toHaveAttribute("data-electron-mac");
+    // Every desktop app keeps the desktop layout, so the marker isn't macOS-only.
+    expect(scope.getAttribute("data-desktop-app")).toBe(electron ? "true" : null);
+    expect(document.documentElement).not.toHaveAttribute("data-desktop-app");
 
     const keyboardScope = getEmbedRoot()!;
     expect(keyboardScope.getAttribute("tabindex")).toBe(electron ? null : "-1");

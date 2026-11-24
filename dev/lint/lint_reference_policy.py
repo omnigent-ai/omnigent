@@ -88,7 +88,13 @@ def git(root: Path, *args: str) -> bytes:
     return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True).stdout
 
 
-def check(root: Path, base: str | None = None, head: str | None = None) -> list[str]:
+def check(
+    root: Path,
+    base: str | None = None,
+    head: str | None = None,
+    *,
+    remote: str | None = None,
+) -> list[str]:
     """Check staged changes, or the branch diff from a merge base."""
     if head and not base:
         raise ValueError("--head requires --base")
@@ -96,6 +102,24 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
     if base:
         target = head or "HEAD"
         ancestor = git(root, "merge-base", base, target).decode().strip()
+        if remote:
+            try:
+                upstream = git(
+                    root,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/remotes/{remote}/HEAD^{{commit}}",
+                )
+            except subprocess.CalledProcessError as error:
+                if error.returncode != 1:
+                    raise
+            else:
+                # Check the whole branch, excluding history already on the remote default.
+                # The old push tip can retain prerequisite commits from before a rebase.
+                ancestor = (
+                    git(root, "merge-base", upstream.decode().strip(), target).decode().strip()
+                )
         revisions = [ancestor, target]
     options = ["--no-ext-diff", "--no-textconv", "--no-color"]
     entries = iter(
@@ -178,7 +202,12 @@ def main() -> int:
     try:
         if args.pre_push and not (args.base and args.head):
             raise ValueError("--pre-push requires both --base and --head")
-        findings = check(Path.cwd(), args.base, args.head)
+        findings = check(
+            Path.cwd(),
+            args.base,
+            args.head,
+            remote=os.environ.get("PRE_COMMIT_REMOTE_NAME", "origin") if args.pre_push else None,
+        )
     except (subprocess.CalledProcessError, ValueError):
         print(
             "reference-policy: cannot determine changes; check the base/head revisions",

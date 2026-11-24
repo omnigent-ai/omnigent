@@ -1,8 +1,9 @@
 import { useEffect } from "react";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /**
  * True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. Never in the
@@ -13,16 +14,7 @@ export function isSettingsHotkey(
   isMac = isMacPlatform(),
   desktopMenu = supportsDesktopCommands(),
 ): boolean {
-  if (
-    desktopMenu ||
-    !hasCommandModifier(event, isMac) ||
-    !event.altKey ||
-    event.shiftKey ||
-    event.getModifierState("AltGraph")
-  ) {
-    return false;
-  }
-  return event.code === "Comma";
+  return matchesShortcut(event, "settings.open", { mac: isMac, desktopMenu });
 }
 
 /** Navigate to Settings from anywhere in the app. */

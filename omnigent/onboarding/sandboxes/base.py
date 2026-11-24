@@ -399,9 +399,10 @@ class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
 
     The only optional primitive today is
     :meth:`SandboxLauncher.forward_local_port` — providers without a
-    local-to-sandbox forwarding path (e.g. Modal) raise this, and the
-    OAuth flow surfaces the message (which should name the ``--no-auth``
-    escape hatch) to the user.
+    local-to-sandbox forwarding path (e.g. Modal) raise this, and
+    callers surface the message to the user. The OAuth flow's copy
+    names the ``--no-auth`` escape hatch; a preview caller surfacing
+    this error should use its own wording instead.
     """
 
 
@@ -638,8 +639,9 @@ class SandboxLifecycle(ABC):
     def forward_capability_error(self) -> SandboxCapabilityError:
         """
         Build the error explaining that this provider cannot forward a
-        local port into the sandbox (and therefore cannot run the
-        in-sandbox App OAuth flow).
+        local port into the sandbox (and therefore cannot run flows
+        that need a local port bridged in, such as the in-sandbox App
+        OAuth flow or a browser preview of a sandbox-local service).
 
         Single source for the message: raised both by the default
         :meth:`forward_local_port` and by the bootstrap's fail-fast
@@ -659,6 +661,9 @@ class SandboxLifecycle(ABC):
         Forward ``localhost:<port>`` on the local machine into the
         sandbox (``ssh -L`` semantics), yielding once the local port is
         bound and tearing the forward down on exit.
+
+        Not limited to the OAuth callback: any sandbox loopback port
+        can be bridged, e.g. a dev server for browser preview.
 
         Optional capability: the default implementation raises
         :class:`SandboxCapabilityError`. Providers with an inbound
@@ -716,6 +721,25 @@ class SandboxLifecycle(ABC):
         :raises click.ClickException: If the stop fails.
         """
         raise self._capability_error("stop a sandbox without deleting it")
+
+    def stop_when_archived(self, *, owner: str, configured: bool) -> bool:
+        """
+        Whether to :meth:`stop` a managed sandbox whose session was archived.
+
+        Asked only for a sandbox this provider can resume. If this returns
+        ``True``, the server then checks that no other session uses the sandbox
+        before it stops it. The default follows the provider's
+        ``stop_on_archive`` server setting. Override it to decide per owner at
+        archive time, for example from a feature flag, so a rollout or rollback
+        needs no server restart. Runs in a worker thread, after the archive
+        request has returned. An exception leaves the sandbox running.
+
+        :param owner: The host owner (the session creator), e.g.
+            ``"alice@example.com"``.
+        :param configured: The provider's ``stop_on_archive`` setting.
+        :returns: ``True`` to stop the sandbox.
+        """
+        return configured
 
     def resume(self, sandbox_id: str) -> None:
         """
@@ -971,6 +995,14 @@ class SandboxHostLauncher(SandboxLifecycle):
     supports_sandbox_profile_lookup: ClassVar[bool] = False
     """Whether sandbox-scoped discovery returns the durable assigned revision."""
 
+    automation_notice: ClassVar[str | None] = None
+    """User-safe note on what this provider's unattended runs need from their owner.
+
+    ``/v1/info`` reports it in ``sandbox_provider_automation_notices``, and the
+    automation form shows it while a new sandbox is the run target, e.g. for a
+    credential that must stay fresh on the owner's machine. ``None`` shows nothing.
+    """
+
     def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile] | None:
         """Return only profiles currently authorized for the trusted caller context.
 
@@ -1063,6 +1095,19 @@ class SandboxHostLauncher(SandboxLifecycle):
         """
         del sandbox_id
         return None
+
+    def bind_owner(self, owner: str) -> None:
+        """
+        Bind the session owner this launcher instance acts for.
+
+        Called by the server right after it builds a launcher for a host's
+        owner, before any other method. Providers that act on the owner's
+        behalf (for example, passing it to an external API for authorization
+        or attribution) override it; the default ignores the owner.
+
+        :param owner: The host's user id, e.g. ``alice@example.com``.
+        """
+        del owner
 
     @abstractmethod
     def start_host(

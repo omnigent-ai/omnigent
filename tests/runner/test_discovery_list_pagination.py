@@ -518,6 +518,99 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     assert received_visibilities == ["mine", "mine", "mine"]
 
 
+def _opaque_token_page(request: httpx.Request, rows: list[dict[str, object]]) -> httpx.Response:
+    """A cursor page whose ``last_id`` is an opaque token, rejecting any other ``after``."""
+    after = request.url.params.get("after")
+    start = 0
+    if after is not None:
+        if not after.startswith("token-"):
+            return httpx.Response(400, json={"detail": {"code": "SESSION_LIST_CURSOR_INVALID"}})
+        start = int(after.removeprefix("token-"))
+    end = start + int(request.url.params["limit"])
+    return httpx.Response(
+        200,
+        json={
+            "data": rows[start:end],
+            "has_more": end < len(rows),
+            "last_id": f"token-{end}" if end < len(rows) else None,
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("large", [False, True], ids=["full-page", "trimmed-page"])
+async def test_sys_session_list_resumes_from_opaque_server_tokens(large: bool) -> None:
+    """Continuations send the server's page token, and a trimmed page is refetched to fit."""
+    rows = _session_rows(large=large)
+    received: list[tuple[str | None, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/sessions":
+            received.append((request.url.params.get("after"), request.url.params["limit"]))
+            return _opaque_token_page(request, rows)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    listed: list[str] = []
+    arguments: dict[str, object] = {} if large else {"limit": 5}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        for _ in range(_ROW_COUNT + 1):
+            payload = await _call_session(client, arguments)
+            assert "error" not in payload
+            listed += [row["session_id"] for row in payload["sessions"]]
+            if not payload["page"]["has_more"]["sessions"]:
+                break
+            arguments = {**arguments, "cursor": payload["page"]["next_cursor"]}
+
+    assert listed == [row["id"] for row in rows]
+    assert all(after is None or after.startswith("token-") for after, _ in received)
+    if large:
+        # The default 50-row fetch overflows the output budget, so the first
+        # page is read again at the size that fits.
+        fitted = received[1][1]
+        assert received[:2] == [(None, "50"), (None, fitted)]
+        assert received[2] == (f"token-{fitted}", "50")
+    else:
+        assert received == [(None, "5"), ("token-5", "5"), ("token-10", "5")]
+
+
+@pytest.mark.asyncio
+async def test_sys_agent_list_resumes_session_agents_from_opaque_server_tokens(
+    tmp_path: Path,
+) -> None:
+    """``session_agents`` continues from the server's token, not a session id."""
+    rows = _session_rows(large=False)
+    session_afters: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agents":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions":
+            session_afters.append(request.url.params.get("after"))
+            return _opaque_token_page(request, rows)
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(404)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        first = await _call_agent(client, tmp_path, {"limit": 5})
+        second = await _call_agent(
+            client, tmp_path, {"limit": 5, "cursor": first["page"]["next_cursor"]}
+        )
+
+    assert [row["session_id"] for row in first["session_agents"] + second["session_agents"]] == [
+        row["id"] for row in rows[:10]
+    ]
+    assert session_afters == [None, "token-5"]
+
+
 _VIEWER = "alice@example.com"
 _OTHER_USER = "bob@example.com"
 
@@ -573,11 +666,11 @@ def _archive_scope_server(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        requests.append((path, dict(request.url.params)))
         if path == "/v1/sessions/conv_caller/child_sessions":
             return httpx.Response(200, json={"data": []})
         if path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
-        requests.append((path, dict(request.url.params)))
         if path == "/v1/info":
             return httpx.Response(
                 200, json={"session_list_scoped_archives": True} if scoped_archives else {}
@@ -671,6 +764,95 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
     ] == [(listing, "true"), (listing, "true"), ("mine", None), (shared_listing, "true")]
     # Only an older server needs the caller's identity.
     assert ("/v1/me" in [path for path, _ in requests]) is not scoped_archives
+
+
+def _worker_rows(total: int, worker_indexes: set[int]) -> list[dict[str, object]]:
+    """The caller's sessions, newest first; only *worker_indexes* were started by it."""
+    rows = [_scope_row(index, _VIEWER, archived=index % 2 == 0) for index in range(total)]
+    for index, row in enumerate(rows):
+        if index not in worker_indexes:
+            row["labels"] = {"omnigent.created_by_session_id": "conv_other_manager"}
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_created_by_this_session_finds_workers_in_one_call() -> None:
+    """Workers scattered across many sessions come back from one call, archived included.
+
+    The runner pages the server in large pages and keeps the caller's own rows, so
+    the model doesn't follow a cursor through every session it owns. The named
+    sub-agent view isn't needed to find workers and isn't read.
+    """
+    workers = {3, 1_400, 2_999}
+    rows = _worker_rows(3_000, workers)
+    requests: list[tuple[str, dict[str, str]]] = []
+    handler = _archive_scope_server(rows, requests, scoped_archives=True)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = await _call_session(
+            client, {"include_archived": True, "created_by_this_session": True}
+        )
+        filtered_paths = [path for path, _ in requests]
+        unfiltered_cursor = (await _call_session(client, {"limit": 1}))["page"]["next_cursor"]
+        mismatched = await _call_session(
+            client, {"created_by_this_session": True, "cursor": unfiltered_cursor}
+        )
+
+    assert result["sub_agents"] == []
+    assert "/v1/sessions/conv_caller/child_sessions" not in filtered_paths
+    assert "/v1/sessions/conv_caller" not in filtered_paths
+    assert "page" not in result
+    assert [row["session_id"] for row in result["sessions"]] == [
+        f"conv_{index:04d}" for index in sorted(workers)
+    ]
+    assert {row["archived"] for row in result["sessions"]} == {True, False}
+    listing_limits = [params["limit"] for path, params in requests if path == "/v1/sessions"]
+    assert listing_limits[:3] == ["1000", "1000", "1000"]
+    # A cursor minted without the filter can't continue a filtered listing.
+    assert mismatched == {"error": "sys_session_list: cursor uses different filter arguments"}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_created_by_this_session_stops_at_the_scan_limit() -> None:
+    """A huge account gets a cursor after the scan limit, and continuing finds the rest."""
+    scan_limit = tool_dispatch._CREATED_SESSIONS_SCAN_LIMIT
+    rows = _worker_rows(scan_limit + 10, {scan_limit + 5})
+    requests: list[tuple[str, dict[str, str]]] = []
+    handler = _archive_scope_server(rows, requests, scoped_archives=True)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        arguments: dict[str, object] = {"include_archived": True, "created_by_this_session": True}
+        first = await _call_session(client, arguments)
+        second = await _call_session(client, {**arguments, "cursor": first["page"]["next_cursor"]})
+
+    assert first["sessions"] == []
+    assert first["page"]["has_more"] == {"sessions": True}
+    assert len([path for path, _ in requests if path == "/v1/sessions"]) == (
+        scan_limit // tool_dispatch._AGENT_LIST_PAGE_LIMIT + 1
+    )
+    assert [row["session_id"] for row in second["sessions"]] == [f"conv_{scan_limit + 5:04d}"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_created_by_this_session_reports_a_failed_read() -> None:
+    """A listing failure is never reported as "no workers", which would start a duplicate."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(503, json={"error": "unavailable"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = await _call_session(client, {"created_by_this_session": True})
+
+    assert result["sessions"] == []
+    assert result["page"]["has_more"] == {"sessions": True}
 
 
 @pytest.mark.asyncio
@@ -1192,3 +1374,26 @@ async def test_discovery_list_rejects_invalid_windows(
         )
 
     assert error in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("project", ["Reviews", ""])
+async def test_session_project_filter_is_forwarded_and_bound_to_cursor(project):
+    queries = []
+
+    def respond(request):
+        if request.url.path == "/v1/sessions":
+            queries.append(dict(request.url.params))
+            return _server_page(request, _session_rows(large=False))
+        return httpx.Response(200, json={"data": []})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        first = await _call_session(client, {"project": project, "limit": 1})
+        cursor = first["page"]["next_cursor"]
+        second = await _call_session(client, {"project": project, "limit": 1, "cursor": cursor})
+        mismatch = await _call_session(client, {"limit": 1, "cursor": cursor})
+    assert first["sessions"][0] != second["sessions"][0]
+    assert all(query["project"] == project for query in queries)
+    assert mismatch == {"error": "sys_session_list: cursor uses different filter arguments"}

@@ -13,7 +13,6 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
-from omnigent.runtime import get_caps
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
@@ -21,6 +20,11 @@ from omnigent.tools.base import Tool, ToolContext, is_valid_tool_name
 from omnigent.tools.builtins import (
     ListCommentsTool,
     LoadSkillTool,
+    MemoryDeleteTool,
+    MemoryGetTool,
+    MemoryListTool,
+    MemorySearchTool,
+    MemoryWriteTool,
     ReadSkillFileTool,
     SysAdviseModelsTool,
     SysAgentDownloadTool,
@@ -32,6 +36,7 @@ from omnigent.tools.builtins import (
     SysProjectListTool,
     SysProjectUpdateTool,
     SysReadInboxTool,
+    SysReminderSetTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
@@ -40,6 +45,7 @@ from omnigent.tools.builtins import (
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
+    SysSessionLinkPrTool,
     SysSessionListTool,
     SysSessionRenameTool,
     SysSessionSendTool,
@@ -47,6 +53,8 @@ from omnigent.tools.builtins import (
     SysSessionUpdateTool,
     SysTimerCancelTool,
     SysTimerSetTool,
+    SysUserInboxListTool,
+    SysUserInboxPostTool,
     UpdateCommentTool,
     any_skill_has_resources,
     get_builtin_tool,
@@ -192,8 +200,12 @@ class ToolManager:
         # The framework-owned groups below register without the spec
         # opting in; a spec drops one it cannot use via ``tool_groups:``.
         self._register_comment_tools()
+        self._register_file_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
+        self._register_journal_tools()
+        self._register_user_inbox_tools()
+        self._register_memory_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -218,10 +230,10 @@ class ToolManager:
         Auto-register the scheduled-task management builtins.
 
         Registered without spec opt-in so an agent can create, list,
-        update, and delete recurring scheduled tasks at runtime;
-        ``tool_groups.scheduled_tasks: false`` drops all four. The runner
-        dispatches them via the Omnigent server's ``/v1/scheduled-tasks``
-        REST endpoints.
+        update, and delete recurring scheduled tasks, and set one-time
+        reminders, at runtime; ``tool_groups.scheduled_tasks: false`` drops
+        all five. The runner dispatches them via the Omnigent server's
+        ``/v1/scheduled-tasks`` REST endpoints.
         """
         if not self._spec.tool_groups.scheduled_tasks:
             return
@@ -230,7 +242,53 @@ class ToolManager:
             SysScheduledTaskListTool(),
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
+            SysReminderSetTool(),
         ):
+            self._tools[tool.name()] = tool
+
+    def _register_journal_tools(self) -> None:
+        """
+        Auto-register the ``sys_journal_*`` tools for the session's journal.
+
+        Registered without spec opt-in, so every agent can keep a plan, step
+        statuses and notes; ``tool_groups.journal: false`` drops all four. The
+        runner dispatches them via the server's ``/v1/sessions/{id}/journal``.
+        """
+        if not self._spec.tool_groups.journal:
+            return
+        from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+
+        for tool_class in JOURNAL_TOOLS:
+            self._tools[tool_class.name()] = tool_class()
+
+    def _register_user_inbox_tools(self) -> None:
+        """Register the owner-Inbox tools for agents that opt in."""
+        if not self._spec.tool_groups.user_inbox:
+            return
+        for tool in (SysUserInboxPostTool(), SysUserInboxListTool()):
+            self._tools[tool.name()] = tool
+
+    def _register_memory_tools(self) -> None:
+        """
+        Auto-register the long-term memory builtins.
+
+        Registered without spec opt-in so every agent can save and recall memory
+        across sessions; ``tool_groups.memory: false`` drops all five, and
+        ``memory_search`` is left out when the server's backend cannot search.
+        The runner dispatches them via the Omnigent server's ``/v1/memory`` REST
+        endpoints.
+        """
+        if not self._spec.tool_groups.memory:
+            return
+        tools: list[Tool] = [
+            MemoryGetTool(),
+            MemoryListTool(),
+            MemoryWriteTool(),
+            MemoryDeleteTool(),
+        ]
+        if self._spec.memory_search_available:
+            tools.insert(0, MemorySearchTool())
+        for tool in tools:
             self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:
@@ -327,9 +385,9 @@ class ToolManager:
 
         Most tools are looked up in the built-in registry and
         instantiated with spec-level config. Some (``web_search``,
-        ``web_fetch``, ``upload_file``) need runtime context the
-        registry doesn't have and are dispatched through
-        :meth:`_create_builtin` instead.
+        ``web_fetch``) need runtime context the registry doesn't
+        have and are dispatched through :meth:`_create_builtin`
+        instead.
         """
         for entry in self._spec.tools.builtins:
             tool = self._create_builtin(entry.name, entry.config)
@@ -337,11 +395,12 @@ class ToolManager:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
                     "Available: web_search, web_read, web_fetch, "
-                    "upload_file, list_files, download_file, "
                     "search_conversations, export_agent. "
                     "Note: list_comments and update_comment are "
-                    "framework-owned and auto-registered; they cannot "
-                    "be declared in the spec. "
+                    "framework-owned and auto-registered, and "
+                    "sys_files_upload, sys_files_list and "
+                    "sys_files_download come from tool_groups.files: true; "
+                    "none of them can be declared in the spec. "
                     "(Interactive shells now go through the "
                     "spec-level `terminals:` block + sys_terminal_*; "
                     "one-shot shells use sys_os_shell.)",
@@ -366,10 +425,6 @@ class ToolManager:
             return self._create_web_search(config)
         if name == "web_fetch":
             return self._create_web_fetch()
-        if name == "upload_file":
-            from omnigent.tools.builtins.upload_file import UploadFileTool
-
-            return UploadFileTool()
         return get_builtin_tool(name, config=config)
 
     def _create_web_search(self, config: dict[str, str] | None) -> Tool:
@@ -500,9 +555,9 @@ class ToolManager:
         # Advise-models is capability-gated: expose it only when some router can
         # answer. Hiding the tool prevents agents from probing router_on via a
         # no-op call when routing is disabled.
-        from omnigent.server.routing_backend import routing_available
+        from omnigent.runtime import routing_stamp
 
-        if routing_available(get_caps()):
+        if routing_stamp():
             self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents
@@ -552,6 +607,7 @@ class ToolManager:
         if not self._spec.tool_groups.projects:
             return
         self._tools[SysProjectListTool.name()] = SysProjectListTool()
+        self._tools[SysSessionLinkPrTool.name()] = SysSessionLinkPrTool()
         self._tools[SysSessionUpdateTool.name()] = SysSessionUpdateTool()
         self._tools[SysProjectUpdateTool.name()] = SysProjectUpdateTool()
 
@@ -593,6 +649,25 @@ class ToolManager:
         self._tools[ListCommentsTool.name()] = ListCommentsTool()
         self._tools[UpdateCommentTool.name()] = UpdateCommentTool()
 
+    def _register_file_tools(self) -> None:
+        """
+        Register ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``.
+
+        Off by default: an agent opts in with ``tool_groups.files: true`` to
+        share workspace files with the user and read the session's files. The
+        runner dispatches them through the server's session-scoped
+        ``/v1/sessions/{id}/resources/files`` routes, and uploads only read
+        files inside the session workspace.
+        """
+        if not self._spec.tool_groups.files:
+            return
+        from omnigent.tools.builtins.download_file import DownloadFileTool
+        from omnigent.tools.builtins.list_files import ListFilesTool
+        from omnigent.tools.builtins.upload_file import UploadFileTool
+
+        for tool in (UploadFileTool(), ListFilesTool(), DownloadFileTool()):
+            self._tools[tool.name()] = tool
+
     def _register_browser_tools(self) -> None:
         """
         Auto-register the embedded-browser tools (``browser_navigate`` /
@@ -625,6 +700,11 @@ class ToolManager:
             BrowserScreenshotTool,
         ):
             self._tools[_cls.name()] = _cls()
+        # The advanced browser tools, and click / type with their trusted-input options.
+        # Imported here: the tool classes build on this module's registry.
+        from omnigent.tools.builtins.browser_advanced import register_browser_agent_tools
+
+        register_browser_agent_tools(self._tools)
 
     def _register_os_env_tools(self, *, schema_only: bool = False) -> None:
         """

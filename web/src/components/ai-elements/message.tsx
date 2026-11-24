@@ -4,10 +4,13 @@ import { Button } from "@/components/ui/button";
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { copyText } from "@/lib/clipboard";
+import { toggleCodeBlockWordWrap, useCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
 import { getEmbedRoot } from "@/lib/host";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
 import { ShellCommandContext } from "@/shell/ShellCommandContext";
+import type { Comment } from "@/hooks/useComments";
+import { LOCAL_REVIEW_COMMENT_LANGUAGE, parseLocalReviewComment } from "@/lib/localReviewComments";
 import type { UIMessage } from "ai";
 import { ChevronLeftIcon, ChevronRightIcon, PlayIcon, XIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
@@ -115,7 +118,8 @@ export const MessageAction = ({
       type="button"
       variant={variant}
       className={cn(
-        "mobile-touch-target mobile-app:[&_svg]:size-5!",
+        // Full-height touch targets, narrowed so a row of actions sits closer together.
+        "mobile-touch-target mobile-app:min-w-8! mobile-app:[&_svg]:size-4!",
         "text-muted-foreground hover:text-foreground",
         className,
       )}
@@ -328,7 +332,7 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
    * Opt-in: only callers that supply that override may set it.
    */
   markFileLinks?: boolean;
-  /** Show images hosted as GitHub attachments, e.g. in a PR description; others stay blocked. */
+  /** Show GitHub attachment images and videos, e.g. in a PR description; others stay blocked. */
   allowGitHubAttachmentImages?: boolean;
   /** Preserve workspace images for a session-aware, authenticated component override. */
   allowWorkspaceImages?: boolean;
@@ -336,7 +340,12 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   allowShellCommands?: boolean;
   /** The text is still growing, so its last code fence may be open. */
   isStreaming?: boolean;
+  /** Render sent review snapshots as cards; nested comment bodies remain ordinary Markdown. */
+  renderLocalReviewComment?: (comment: Comment) => ReactNode;
 };
+
+const LocalReviewCommentRendererContext =
+  createContext<MessageResponseProps["renderLocalReviewComment"]>(undefined);
 
 // Up to three spaces of indent; a tab counts as four columns, so it never does.
 const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)/;
@@ -476,6 +485,7 @@ function ChatTable({ children, className, node: _node, ...props }: ChatTableProp
           aria-label="View fullscreen"
           aria-modal="true"
           className="fixed inset-0 z-50 flex flex-col bg-background"
+          data-fullscreen-overlay=""
           data-streamdown="table-fullscreen"
           onClick={closeFullscreen}
           role="dialog"
@@ -636,6 +646,7 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
 
 export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
+  const renderLocalReviewComment = useContext(LocalReviewCommentRendererContext);
   const getCode = useCallback(() => code, [code]);
   const shellCommands = useContext(ShellCommandContext);
   const codeProps = isValidElement<{ language?: string; className?: string }>(children)
@@ -649,9 +660,8 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const showShellAction = shellCommands && /^(bash|sh|zsh|fish|shell)$/.test(language);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
   // to read code blocks. The toggle restores Streamdown's native
-  // horizontal-scroll view for when column alignment matters.
-  const [wrap, setWrap] = useState(true);
-  const toggleWrap = useCallback(() => setWrap((w) => !w), []);
+  // horizontal-scroll view for every block, and the choice persists.
+  const wrap = useCodeBlockWordWrap();
   const isMermaid = isMermaidPre(children);
   const fenceOpen = useIsCodeFenceIncomplete();
   // A diagram drawn from a fence that is still streaming redraws on every update,
@@ -682,7 +692,7 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
-        <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
+        <ChatCodeBlockWrapToggle onToggle={toggleCodeBlockWordWrap} wrap={wrap} />
         {showShellAction && (
           <Button
             aria-label="Open in a new shell"
@@ -701,6 +711,15 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       </div>
     </div>
   );
+
+  if (
+    renderLocalReviewComment &&
+    isValidElement<{ className?: string }>(children) &&
+    children.props.className?.split(/\s+/).includes(`language-${LOCAL_REVIEW_COMMENT_LANGUAGE}`)
+  ) {
+    const comment = parseLocalReviewComment(code);
+    if (comment) return renderLocalReviewComment(comment);
+  }
 
   if (!isMermaid) return codeBlock(block);
 
@@ -746,6 +765,7 @@ export const MessageResponse = memo(
     allowWorkspaceImages = false,
     allowShellCommands = false,
     isStreaming = false,
+    renderLocalReviewComment,
     ...props
   }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
@@ -776,29 +796,31 @@ export const MessageResponse = memo(
     return (
       <MarkdownErrorBoundary source={props.children}>
         <ShellCommandContext.Provider value={shellAction}>
-          <StreamingTextContext.Provider value={isStreaming}>
-            {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+          <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
+            <StreamingTextContext.Provider value={isStreaming}>
+              {/* Streamdown is memoized and its comparator ignores the mermaid prop,
               so remount on theme change to recolor already-rendered diagrams. */}
-            <Streamdown
-              key={themeMode}
-              // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-              className={cn(
-                "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-                className,
-              )}
-              plugins={STREAMDOWN_PLUGINS}
-              // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-              // instead of Streamdown's default "Open external link?" modal.
-              linkSafety={CHAT_LINK_SAFETY}
-              {...props}
-              BlockComponent={StreamingTextBlock}
-              components={messageComponents}
-              controls={messageControls}
-              mermaid={mermaidOptions}
-              // Block remote image fetches that can exfiltrate data through URLs.
-              rehypePlugins={rehypePlugins}
-            />
-          </StreamingTextContext.Provider>
+              <Streamdown
+                key={themeMode}
+                // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+                className={cn(
+                  "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+                  className,
+                )}
+                plugins={STREAMDOWN_PLUGINS}
+                // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+                // instead of Streamdown's default "Open external link?" modal.
+                linkSafety={CHAT_LINK_SAFETY}
+                {...props}
+                BlockComponent={StreamingTextBlock}
+                components={messageComponents}
+                controls={messageControls}
+                mermaid={mermaidOptions}
+                // Block remote image fetches that can exfiltrate data through URLs.
+                rehypePlugins={rehypePlugins}
+              />
+            </StreamingTextContext.Provider>
+          </LocalReviewCommentRendererContext.Provider>
         </ShellCommandContext.Provider>
       </MarkdownErrorBoundary>
     );

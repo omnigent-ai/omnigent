@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -509,3 +511,119 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
     ]
     assert hook_posts == []
     assert fake_client.responses == []
+
+
+def test_supervise_forwarder_relaunches_terminal_on_thread_it_started(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A web clear-context answer moves the transferred TUI onto the fresh thread.
+
+    The forwarder starts that thread itself, so the TUI is still attached to the
+    planning thread. Once the rotated session is subscribed to the new thread, the
+    runner must relaunch the TUI there, or the new session's Terminal view keeps
+    showing the old conversation.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temporary directory.
+    """
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
+    )
+    monkeypatch.setattr(
+        codex_native_forwarder,
+        "_CodexForwarderState",
+        functools.partial(
+            codex_native_forwarder._CodexForwarderState,
+            forwarder_started_thread_id="thread_new",
+        ),
+    )
+    relaunches: list[tuple[str, str, bool]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve AP calls made while the forwarder rotates sessions.
+
+        :param request: HTTP request from the forwarder.
+        :returns: Fake AP response.
+        """
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": "conv_old", "agent_id": "ag_codex"})
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"id": "conv_new"})
+        return httpx.Response(200, json={})
+
+    async def run() -> None:
+        """
+        Rotate onto the started thread and wait for the terminal relaunch.
+
+        :returns: None.
+        """
+        relaunched = asyncio.Event()
+
+        class _RotatingClient(_FakeCodexAppServerClient):
+            async def iter_events(self) -> Any:
+                yield _thread_started_event("thread_new")
+                await asyncio.wait_for(relaunched.wait(), timeout=10)
+
+        fake_client = _RotatingClient()
+
+        async def relaunch_terminal(session_id: str, thread_id: str) -> None:
+            subscribed = (
+                "thread/resume",
+                {"threadId": thread_id, "excludeTurns": True},
+            ) in fake_client.requests
+            relaunches.append((session_id, thread_id, subscribed))
+            relaunched.set()
+
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_old",
+            bridge_dir=tmp_path,
+            app_server_url="ws://127.0.0.1:9876",
+            thread_id="thread_old",
+            client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(handler),
+            relaunch_terminal=relaunch_terminal,
+        )
+
+    asyncio.run(run())
+
+    assert relaunches == [("conv_new", "thread_new", True)]
+
+
+@pytest.mark.parametrize("outcome", ["tui_thread", "relaunch_fails"])
+def test_terminal_relaunch_skips_tui_threads_and_contains_failures(
+    outcome: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Only forwarder-started threads relaunch the TUI, and a failed relaunch is contained.
+
+    A TUI ``/clear`` already shows its new thread, so relaunching it would only
+    flicker. A relaunch error must not end the forwarder's subscription.
+
+    :param outcome: Which case the parameter exercises.
+    :param caplog: Pytest log capture fixture.
+    """
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        forwarder_started_thread_id=None if outcome == "tui_thread" else "thread_new"
+    )
+    relaunch_terminal = AsyncMock(side_effect=RuntimeError("terminal launch failed"))
+
+    asyncio.run(
+        codex_native_forwarder._relaunch_terminal_on_forwarder_thread(
+            relaunch_terminal,
+            forwarder_state,
+            session_id="conv_new",
+            thread_id="thread_new",
+        )
+    )
+
+    if outcome == "tui_thread":
+        relaunch_terminal.assert_not_awaited()
+    else:
+        relaunch_terminal.assert_awaited_once_with("conv_new", "thread_new")
+        assert "Codex terminal relaunch on thread thread_new failed" in caplog.text
