@@ -31,6 +31,7 @@ const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
 const CODEX_NATIVE_WRAPPER = "codex-native-ui";
 const PI_NATIVE_WRAPPER = "pi-native-ui";
 const DEVIN_NATIVE_WRAPPER = "devin-native-ui";
+const ANTIGRAVITY_NATIVE_WRAPPER = "antigravity-native-ui";
 
 // Reasoning-effort ladder per server ``EffortFamily`` (``/v1/harnesses`` →
 // ``capabilities.effort``). Mirrors ``omnigent/util/reasoning_effort.py``;
@@ -40,6 +41,7 @@ const EFFORT_FAMILY_LEVELS: Readonly<Record<string, readonly string[]>> = {
   anthropic: ["low", "medium", "high", "xhigh", "max"],
   openai: ["none", "minimal", "low", "medium", "high", "xhigh"],
   gemini: ["low", "medium", "high"],
+  "antigravity-native": ["low", "medium", "high", "xhigh", "max"],
   copilot: ["low", "medium", "high", "xhigh"],
   pi: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
 };
@@ -89,6 +91,7 @@ export function supportsEffortControl(
     wrapper === CLAUDE_NATIVE_WRAPPER ||
     wrapper === CODEX_NATIVE_WRAPPER ||
     wrapper === PI_NATIVE_WRAPPER ||
+    wrapper === ANTIGRAVITY_NATIVE_WRAPPER ||
     // Devin has no --effort flag: effort is a model-variant suffix the executor
     // recombines and re-applies via /model, so the in-chat effort dial is live.
     wrapper === DEVIN_NATIVE_WRAPPER ||

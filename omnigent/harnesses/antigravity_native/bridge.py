@@ -16,9 +16,12 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
+
+from filelock import FileLock
 
 from omnigent.install_ledger import atomic_write_json
 from omnigent.native import native_bridge_common
@@ -1661,6 +1664,33 @@ def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s:
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
+_INJECTION_LOCKS_GUARD = threading.Lock()
+_INJECTION_LOCKS: dict[str, threading.Lock] = {}
+_SLASH_COMMIT_TIMEOUT_S = 2.0
+_SLASH_SUBMIT_VERIFY_TIMEOUT_S = 2.0
+_SLASH_MAX_SUBMIT_ATTEMPTS = 2
+
+
+def _bridge_injection_lock(bridge_dir: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))
+    with _INJECTION_LOCKS_GUARD:
+        return _INJECTION_LOCKS.setdefault(key, threading.Lock())
+
+
+def _bridge_injection_file_lock(bridge_dir: Path) -> FileLock:
+    """Coordinate agy tmux pane writes between the runner and harness processes."""
+    lock_dir = bridge_dir.parent / ".locks"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return FileLock(str(lock_dir / f"{bridge_dir.name}.injection.lock"), mode=0o600)
+
+
+@contextlib.contextmanager
+def _bridge_injection_guard(bridge_dir: Path) -> Iterator[None]:
+    """Serialize tmux pane writes across threads and processes for one bridge."""
+    with _bridge_injection_lock(bridge_dir), _bridge_injection_file_lock(bridge_dir):
+        yield
+
+
 def _submit_and_verify(
     socket_path: str,
     tmux_target: str,
@@ -1669,6 +1699,8 @@ def _submit_and_verify(
     baseline_region: str = "",
     draft_seen: bool = False,
     extra_needles: tuple[str, ...] = (),
+    max_attempts: int = _MAX_SUBMIT_ATTEMPTS,
+    verify_timeout_s: float = _SUBMIT_VERIFY_TIMEOUT_S,
 ) -> None:
     """
     Press Enter to submit the pasted draft, verifying by composer state.
@@ -1710,7 +1742,7 @@ def _submit_and_verify(
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         return
     last_pane = _capture_pane(socket_path, tmux_target)
-    for _ in range(_MAX_SUBMIT_ATTEMPTS):
+    for _ in range(max_attempts):
         # Re-check liveness each attempt: if the TUI exited between the paste and
         # now, every capture returns "" and the draft never clears — so fail
         # fast with the real cause instead of spinning the full budget and then
@@ -1721,7 +1753,7 @@ def _submit_and_verify(
                 "restart the session"
             )
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        deadline = time.monotonic() + verify_timeout_s
         while time.monotonic() < deadline:
             if not _session_alive(socket_path, tmux_target):
                 raise RuntimeError(
@@ -1913,39 +1945,113 @@ def inject_user_message_via_tui(
     # only the budget the tmux-target gate did not consume, capping total
     # readiness latency at timeout_s (the gates were previously each given a full
     # timeout_s, so a stuck launch cost 2x before delivery even began).
-    deadline = time.monotonic() + timeout_s
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
-    # Fast-fail if the TUI already exited: otherwise the readiness gate polls a
-    # dead pane for the full timeout and the web message is silently lost. A clear
-    # error lets the executor surface an ExecutorError so the UI can say "restart".
-    if not _session_alive(socket_path, tmux_target):
-        raise RuntimeError(
-            "the agy terminal is no longer running (the TUI exited); restart the session"
-        )
-    _wait_for_agy_prompt_ready(
-        socket_path, tmux_target, timeout_s=max(0.0, deadline - time.monotonic())
-    )
-    # Deliver, then re-deliver for as long as agy keeps answering with its
-    # account-verification notice (see ``_account_verification_rejected``). The
-    # happy path costs one extra pane capture: a started turn is detected on the
-    # first poll and returns immediately.
-    retry_deadline = time.monotonic() + _VERIFY_RETRY_TIMEOUT_S
-    while True:
-        _paste_and_submit(bridge_dir, socket_path, tmux_target, content=content)
-        if not _account_verification_rejected(socket_path, tmux_target):
-            return
-        if time.monotonic() >= retry_deadline:
+    with _bridge_injection_guard(bridge_dir):
+        deadline = time.monotonic() + timeout_s
+        info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+        socket_path = info["socket_path"]
+        tmux_target = info["tmux_target"]
+        # Fast-fail if the TUI already exited: otherwise the readiness gate polls a
+        # dead pane for the full timeout and the web message is silently lost. A clear
+        # error lets the executor surface an ExecutorError so the UI can say "restart".
+        if not _session_alive(socket_path, tmux_target):
             raise RuntimeError(
-                "agy is still verifying the Antigravity account and rejected the message "
-                f"for {_VERIFY_RETRY_TIMEOUT_S:.0f}s; the turn was not started"
+                "the agy terminal is no longer running (the TUI exited); restart the session"
             )
-        _logger.info(
-            "agy rejected the turn while verifying the account; re-delivering in %.0fs",
-            _VERIFY_RETRY_INTERVAL_S,
+        _wait_for_agy_prompt_ready(
+            socket_path, tmux_target, timeout_s=max(0.0, deadline - time.monotonic())
         )
-        time.sleep(_VERIFY_RETRY_INTERVAL_S)
+        # Deliver, then re-deliver for as long as agy keeps answering with its
+        # account-verification notice (see ``_account_verification_rejected``). The
+        # happy path costs one extra pane capture: a started turn is detected on the
+        # first poll and returns immediately.
+        retry_deadline = time.monotonic() + _VERIFY_RETRY_TIMEOUT_S
+        while True:
+            _paste_and_submit(bridge_dir, socket_path, tmux_target, content=content)
+            if not _account_verification_rejected(socket_path, tmux_target):
+                return
+            if time.monotonic() >= retry_deadline:
+                raise RuntimeError(
+                    "agy is still verifying the Antigravity account and rejected the message "
+                    f"for {_VERIFY_RETRY_TIMEOUT_S:.0f}s; the turn was not started"
+                )
+            _logger.info(
+                "agy rejected the turn while verifying the account; re-delivering in %.0fs",
+                _VERIFY_RETRY_INTERVAL_S,
+            )
+            time.sleep(_VERIFY_RETRY_INTERVAL_S)
+
+
+def inject_slash_command(
+    bridge_dir: Path,
+    *,
+    command: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """
+    Type a single-line agy slash command (e.g. ``/effort high``) and submit it.
+
+    Reuses the composer clear, render-wait, and verified-submit mechanics from
+    :func:`inject_user_message_via_tui`, typing literally via ``send-keys -l``
+    so no trailing newline is pasted into agy's slash-command parser.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param command: Single-line slash command starting with ``/``.
+    :param timeout_s: Shared readiness budget for ``tmux.json`` and prompt mount.
+    :returns: None.
+    :raises ValueError: When *command* does not start with ``/`` or contains newlines.
+    :raises RuntimeError: When the tmux pane is unavailable, exited, or did not
+        accept the command.
+    """
+    if not command or not command.startswith("/"):
+        raise ValueError(f"slash command must start with '/'; got {command!r}")
+    if "\n" in command or "\r" in command:
+        raise ValueError("slash command must be a single line")
+    with _bridge_injection_guard(bridge_dir):
+        deadline = time.monotonic() + timeout_s
+        info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+        socket_path = info["socket_path"]
+        tmux_target = info["tmux_target"]
+        if not _session_alive(socket_path, tmux_target):
+            raise RuntimeError(
+                "the agy terminal is no longer running (the TUI exited); restart the session"
+            )
+        _wait_for_agy_prompt_ready(
+            socket_path, tmux_target, timeout_s=max(0.0, deadline - time.monotonic())
+        )
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+        baseline_region = _agy_input_region(_capture_pane(socket_path, tmux_target))
+        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "--", command)
+        needles = _submit_needles(command)
+        needle = needles[0] if needles else ""
+        extra_needles = tuple(needles[1:]) if len(needles) > 1 else ()
+        mid_turn = _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target)
+        draft_seen = False
+        last_commit_pane = ""
+        commit_deadline = time.monotonic() + _SLASH_COMMIT_TIMEOUT_S
+        while time.monotonic() < commit_deadline:
+            pane = _capture_pane(socket_path, tmux_target)
+            last_commit_pane = pane or last_commit_pane
+            if _draft_in_input_region(pane, needle, baseline_region, extra_needles=extra_needles):
+                draft_seen = True
+                break
+            time.sleep(_TMUX_POLL_INTERVAL_S)
+        if not draft_seen and not mid_turn:
+            raise RuntimeError(
+                "agy did not render the slash command in its input box before submit; "
+                f"pane_tail:\n{_format_pane_debug_tail(last_commit_pane)}"
+            )
+        time.sleep(_PASTE_SETTLE_S)
+        _submit_and_verify(
+            socket_path,
+            tmux_target,
+            needle=needle,
+            baseline_region=baseline_region,
+            draft_seen=draft_seen,
+            extra_needles=extra_needles,
+            max_attempts=_SLASH_MAX_SUBMIT_ATTEMPTS,
+            verify_timeout_s=_SLASH_SUBMIT_VERIFY_TIMEOUT_S,
+        )
 
 
 def send_interaction_keys_via_tui(

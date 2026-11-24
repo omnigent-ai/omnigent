@@ -1347,3 +1347,141 @@ async def test_cli_cold_start_falls_back_when_port_unattributable(
 
     assert len(started) == 1
     assert started[0][0] == 52548  # safe candidate fallback (agy is up in the pane)
+
+
+@pytest.mark.asyncio
+async def test_create_antigravity_session_persists_reasoning_effort() -> None:
+    """_create_antigravity_session includes reasoning_effort in metadata only when set."""
+    captured_metadata: list[dict[str, object]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        # Multipart body contains a JSON metadata form part.
+        body = request.content.decode("utf-8", errors="ignore")
+        start = body.find('{"labels":')
+        assert start != -1
+        end = body.find("\r\n--", start)
+        captured_metadata.append(json.loads(body[start:end]))
+        return httpx.Response(201, json={"session_id": "conv_agy_effort"})
+
+    async with httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        sid_with = await _mod._create_antigravity_session(
+            client,
+            b"bundle",
+            bridge_id="bridge_1",
+            effort="xhigh",
+        )
+        sid_without = await _mod._create_antigravity_session(
+            client,
+            b"bundle",
+            bridge_id="bridge_2",
+        )
+
+    assert sid_with == "conv_agy_effort"
+    assert sid_without == "conv_agy_effort"
+    assert captured_metadata[0]["reasoning_effort"] == "xhigh"
+    assert "reasoning_effort" not in captured_metadata[1]
+
+
+def test_cli_agy_effort_option_threads_into_run_antigravity_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """omni agy --effort validates choices and forwards effort to run_antigravity_native."""
+    from click.testing import CliRunner
+
+    from omnigent import cli as cli_mod
+
+    recorded: list[dict[str, object]] = []
+
+    monkeypatch.setattr(cli_mod, "_load_effective_config", dict)
+    monkeypatch.setattr(cli_mod, "_ensure_backend", lambda server: server)
+    monkeypatch.setattr(
+        _mod,
+        "run_antigravity_native",
+        lambda **kwargs: recorded.append(kwargs),
+    )
+
+    runner = CliRunner()
+    ok = runner.invoke(cli_mod.cli, ["agy", "--effort", "max"])
+    assert ok.exit_code == 0, ok.output
+    assert recorded == [recorded[0]]
+    assert recorded[0]["effort"] == "max"
+
+    bad = runner.invoke(cli_mod.cli, ["agy", "--effort", "bogus"])
+    assert bad.exit_code != 0
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_terminal_forwards_reasoning_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner auto-create passes validated snapshot reasoning_effort to build_agy_launch."""
+    from omnigent.harnesses.antigravity_native import launch as launch_mod
+    from omnigent.runner.native import orchestration as orch_mod
+
+    captured_efforts: list[str | None] = []
+
+    class _StopAfterLaunch(RuntimeError):
+        pass
+
+    def _recording_build_agy_launch(**kwargs: object) -> tuple[list[str], dict[str, str]]:
+        effort = kwargs.get("effort")
+        captured_efforts.append(effort if isinstance(effort, str) else None)
+        raise _StopAfterLaunch("stop after inspecting build_agy_launch")
+
+    monkeypatch.setattr(launch_mod, "build_agy_launch", _recording_build_agy_launch)
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT",
+        tmp_path / "antigravity-native",
+    )
+
+    for raw_effort in ("xhigh", "unsupported-value"):
+
+        async def _fake_snapshot(
+            _client: object,
+            _sid: str,
+            *,
+            _effort: str = raw_effort,
+        ) -> dict[str, object]:
+            return {
+                "workspace": str(tmp_path),
+                "labels": {},
+                "reasoning_effort": _effort,
+            }
+
+        monkeypatch.setattr(orch_mod, "_session_payload_for_host_spawn_check", _fake_snapshot)
+        async with httpx.AsyncClient(base_url="http://test") as fake_server_client:
+            with pytest.raises(_StopAfterLaunch):
+                await orch_mod._auto_create_antigravity_terminal(
+                    "conv_agy_auto",
+                    resource_registry=object(),  # type: ignore[arg-type]
+                    publish_event=lambda *_args, **_kwargs: None,
+                    server_client=fake_server_client,
+                )
+
+    assert captured_efforts == ["xhigh", None]
+
+
+@pytest.mark.asyncio
+async def test_patch_antigravity_session_effort_sends_silent_patch() -> None:
+    """Cold-resume effort override PATCHes reasoning_effort with silent=True."""
+    captured: list[tuple[str, str, dict[str, object]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"session_id": "conv_cold"})
+
+    async with httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        await _mod._patch_antigravity_session_effort(client, "conv_cold", "max")
+
+    assert captured == [
+        ("PATCH", "/v1/sessions/conv_cold", {"reasoning_effort": "max", "silent": True})
+    ]
+    assert _mod._persisted_effort_from_payload({"reasoning_effort": "xhigh"}) == "xhigh"
+    assert _mod._persisted_effort_from_payload({"reasoning_effort": "bogus"}) is None

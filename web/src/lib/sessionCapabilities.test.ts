@@ -51,6 +51,13 @@ describe("effortLevelsForFamily", () => {
       "xhigh",
     ]);
     expect(effortLevelsForFamily("gemini")).toEqual(["low", "medium", "high"]);
+    expect(effortLevelsForFamily("antigravity-native")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
     expect(effortLevelsForFamily("copilot")).toEqual(["low", "medium", "high", "xhigh"]);
     expect(effortLevelsForFamily("pi")).toEqual([
       "none",
@@ -96,6 +103,9 @@ describe("supportsEffortControl with a declared effort family", () => {
 
   it("leaves the native wrapper-label gate exactly as before", () => {
     expect(supportsEffortControl({ labels: { "omnigent.wrapper": "claude-code-native-ui" } })).toBe(
+      true,
+    );
+    expect(supportsEffortControl({ labels: { "omnigent.wrapper": "antigravity-native-ui" } })).toBe(
       true,
     );
     expect(supportsEffortControl({ labels: { "omnigent.wrapper": "cursor-native-ui" } })).toBe(

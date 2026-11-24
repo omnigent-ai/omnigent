@@ -9,6 +9,9 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/** Antigravity efforts for antigravity-native sessions (matches ANTIGRAVITY_EFFORTS in reasoning_effort.py). */
+const ANTIGRAVITY_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+
 /** Pi thinking ladder (matches PI_EFFORTS in reasoning_effort.py; ``ultra`` aliases to ``max`` on Pi so omitted). */
 const PI_NATIVE_EFFORT_LEVELS = [
   "none",
@@ -86,6 +89,8 @@ export function effortLevelsForConv(
   switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
+    case "antigravity-native-ui":
+      return ANTIGRAVITY_NATIVE_EFFORT_LEVELS;
     case "devin-native-ui":
     case "codex-native-ui":
       // Both catalogs declare effort per model; Devin encodes it as a model variant.

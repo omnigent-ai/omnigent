@@ -43,6 +43,7 @@ from pathlib import Path
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
+from omnigent.util.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -197,6 +198,7 @@ def build_agy_launch(
     conversation_id: str | None,
     model: str | None,
     resume: bool,
+    effort: str | None = None,
     permission_mode: str | None = None,
     headless: bool = False,
     extra_args: tuple[str, ...] = (),
@@ -273,6 +275,11 @@ def build_agy_launch(
         argv.extend(["--conversation", conversation_id])
     if model is not None:
         argv.extend(["--model", model])
+    validated_effort = validate_effort(effort, "antigravity", ANTIGRAVITY_EFFORTS)
+    if validated_effort is not None and not any(
+        arg == "--effort" or arg.startswith("--effort=") for arg in extra_args
+    ):
+        argv.extend(["--effort", validated_effort])
     # Append the coarse bypass flag iff permission mode / headless calls for it,
     # and only when the caller's pass-through args have not already added it
     # (a user can pass it explicitly; avoid a confusing duplicate).

@@ -41,6 +41,7 @@ from omnigent.cli_common import (
 # Sourced from the stdlib-only bridge leaf, so importing it here adds no
 # launcher/runner imports to CLI startup.
 from omnigent.harnesses.devin_native.bridge import DEVIN_EFFORTS, DEVIN_PERMISSION_MODES
+from omnigent.util.reasoning_effort import ANTIGRAVITY_EFFORT_CHOICES
 
 _Args = ParamSpec("_Args")
 _Return = TypeVar("_Return")
@@ -1251,12 +1252,19 @@ def register_native_commands(cli: click.Group) -> None:
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
     @click.option("--model", default=None, help="Antigravity (agy) model to use for the session.")
+    @click.option(
+        "--effort",
+        default=None,
+        type=click.Choice(ANTIGRAVITY_EFFORT_CHOICES),
+        help="Reasoning effort for the Antigravity (agy) session.",
+    )
     @click.argument("antigravity_args", nargs=-1, type=click.UNPROCESSED)
     def antigravity(
         server: str | None,
         resume: str | None,
         session_id: str | None,
         model: str | None,
+        effort: str | None,
         antigravity_args: tuple[str, ...],
     ) -> None:
         """Launch Antigravity (agy) with Omnigent.
@@ -1264,6 +1272,7 @@ def register_native_commands(cli: click.Group) -> None:
         \b
         Examples:
           omni agy
+          omni agy --effort high
           omni agy --resume conv_abc123
           omni agy --resume                  # interactive picker
           omni agy --server https://<app>.databricksapps.com
@@ -1310,6 +1319,7 @@ def register_native_commands(cli: click.Group) -> None:
             resume_picker=choice.picker,
             extra_args=_resolve_harness_startup_args(cfg, "antigravity-native", antigravity_args),
             model=model,
+            effort=effort,
             auto_open_conversation=auto_open_conversation,
             command=resolved_command or None,
         )

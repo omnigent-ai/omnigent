@@ -61,6 +61,9 @@ class EffortFamily(str, Enum):
     # The real codex process is the per-model authority on reasoning levels
     # (Sol reaches ``ultra``); the SDK codex wire caps at ``xhigh``.
     CODEX_NATIVE = "codex-native"
+    # agy supports low|medium|high|xhigh|max via --effort and /effort, while
+    # the direct Gemini API family stays low|medium|high.
+    ANTIGRAVITY_NATIVE = "antigravity-native"
 
 
 class ModelFamily(str, Enum):

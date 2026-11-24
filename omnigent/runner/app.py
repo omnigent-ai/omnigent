@@ -8774,7 +8774,12 @@ def create_runner_app(
                 _session_reasoning_effort[conversation_id] = effort
             else:
                 _session_reasoning_effort.pop(conversation_id, None)
-            if harness in ("claude-native", "pi-native", "devin-native"):
+            if harness in ("antigravity-native", "claude-native", "pi-native", "devin-native"):
+                if harness == "antigravity-native":
+                    return await _handle_antigravity_native_effort_change(
+                        conversation_id,
+                        effort,
+                    )
                 if harness == "pi-native":
                     return await _handle_pi_native_effort_change(
                         conversation_id,
@@ -9325,6 +9330,9 @@ def create_runner_app(
         server_client=server_client,
     )
     _codex_native_model_options = _native_controls.codex_native_model_options
+    _handle_antigravity_native_effort_change = (
+        _native_controls.handle_antigravity_native_effort_change
+    )
     _handle_claude_native_btw_dismiss = _native_controls.handle_claude_native_btw_dismiss
     _handle_claude_native_clear = _native_controls.handle_claude_native_clear
     _handle_claude_native_compact = _native_controls.handle_claude_native_compact

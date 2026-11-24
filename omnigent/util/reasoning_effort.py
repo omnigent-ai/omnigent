@@ -30,7 +30,9 @@ CODEX_EFFORTS = OPENAI_EFFORTS
 CODEX_NATIVE_EFFORTS = EFFORT_VALUES
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
-ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
+# agy accepts low|medium|high|xhigh|max via --effort and in-session /effort.
+ANTIGRAVITY_EFFORT_CHOICES: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+ANTIGRAVITY_EFFORTS = frozenset(ANTIGRAVITY_EFFORT_CHOICES)
 # The GitHub Copilot SDK's ``create_session(reasoning_effort=...)`` accepts
 # exactly these levels (``copilot.session.ReasoningEffort`` literal); per-model
 # support is gated by the Copilot backend (``list_models()``).
@@ -141,6 +143,7 @@ def efforts_for_harness(harness: str | None) -> frozenset[str] | None:
         EffortFamily.COPILOT: COPILOT_EFFORTS,
         EffortFamily.PI: PI_EFFORTS,
         EffortFamily.CODEX_NATIVE: CODEX_NATIVE_EFFORTS,
+        EffortFamily.ANTIGRAVITY_NATIVE: ANTIGRAVITY_EFFORTS,
     }.get(capabilities.effort, frozenset())
 
 

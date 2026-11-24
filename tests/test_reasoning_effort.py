@@ -237,11 +237,17 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     returns ``None`` (callers cannot classify it, so a filter must pass the
     value through rather than drop what a plugin harness might accept).
     """
-    from omnigent.util.reasoning_effort import GEMINI_EFFORTS, efforts_for_harness
+    from omnigent.util.reasoning_effort import (
+        ANTIGRAVITY_EFFORTS,
+        GEMINI_EFFORTS,
+        efforts_for_harness,
+    )
 
     assert efforts_for_harness("claude-sdk") == ANTHROPIC_EFFORTS
     assert efforts_for_harness("claude-native") == ANTHROPIC_EFFORTS
-    assert efforts_for_harness("antigravity-native") == GEMINI_EFFORTS
+    assert efforts_for_harness("antigravity-native") == ANTIGRAVITY_EFFORTS
+    assert {"xhigh", "max"} <= ANTIGRAVITY_EFFORTS
+    assert frozenset({"low", "medium", "high"}) == GEMINI_EFFORTS
     # pi declares its own family, so it resolves to a real vocabulary.
     assert efforts_for_harness("pi") == PI_EFFORTS
     assert efforts_for_harness("pi-native") == PI_EFFORTS

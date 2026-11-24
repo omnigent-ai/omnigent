@@ -7301,6 +7301,21 @@ async def _auto_create_antigravity_terminal(
     _model_override = snapshot.get("model_override")
     model = _model_override if isinstance(_model_override, str) and _model_override else None
 
+    from omnigent.util.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort
+
+    _raw_effort = snapshot.get("reasoning_effort")
+    reasoning_effort: str | None = None
+    if isinstance(_raw_effort, str) and _raw_effort:
+        try:
+            reasoning_effort = validate_effort(_raw_effort, "antigravity", ANTIGRAVITY_EFFORTS)
+        except ValueError:
+            _logger.warning(
+                "Ignoring unsupported reasoning_effort %r for Antigravity session %s",
+                _raw_effort,
+                session_id,
+                extra={"session_id": session_id},
+            )
+
     # Bridge id mirrors the CLI/harness derivation: the session's bridge-id
     # label when present (so the spawn env built by
     # ``build_antigravity_native_spawn_env`` and the reader share one dir),
@@ -7332,6 +7347,7 @@ async def _auto_create_antigravity_terminal(
         conversation_id=external_session_id if resume else None,
         model=model,
         resume=resume,
+        effort=reasoning_effort,
         # Web-attended: a web client drives agy's request-review prompt over the
         # tunnel, so this is NOT headless. Bypass comes only via the pass-through
         # args below (see docstring). permission_mode is left unset for the same
@@ -10731,6 +10747,37 @@ async def _delete_native_bridge_dirs(
                 session_id,
                 exc,
             )
+
+
+async def _antigravity_native_bridge_id_for_session(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    session_labels: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the bridge id label for an Antigravity-native session.
+
+    :param server_client: Omnigent server client used to fetch the session
+        snapshot.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param session_labels: Optional pre-fetched session labels.
+    :returns: Opaque bridge id from ``omnigent.antigravity_native.bridge_id``
+        when present, otherwise *session_id*.
+    """
+    from omnigent.harnesses.antigravity_native.bridge import ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY
+
+    labels = (
+        session_labels
+        if session_labels is not None
+        else await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
+    )
+    bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
+    if isinstance(bridge_id, str) and bridge_id:
+        return bridge_id
+    return session_id
 
 
 async def _claude_native_bridge_id_for_session(

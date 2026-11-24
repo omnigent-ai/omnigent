@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.harnesses.antigravity_native import bridge as antigravity_native_bridge
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
@@ -4612,3 +4613,113 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
         f"swallowed); got {len(in_progress)} from types {[e.get('type') for e in events]}"
     )
     assert completed == [], "no completed should appear when nothing compacted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested", "expected_command"),
+    [
+        ("low", "/effort low"),
+        ("xhigh", "/effort xhigh"),
+        ("max", "/effort max"),
+        ("ultra", "/effort xhigh"),
+    ],
+)
+async def test_events_effort_change_on_antigravity_native_injects_slash_command(
+    monkeypatch: pytest.MonkeyPatch,
+    requested: str,
+    expected_command: str,
+) -> None:
+    """effort_change on antigravity-native injects /effort <level> into the resolved bridge dir."""
+    captured: list[tuple[Path, str, float]] = []
+
+    def _fake_inject(bridge_dir: Path, *, command: str, timeout_s: float) -> None:
+        captured.append((bridge_dir, command, timeout_s))
+
+    async def _fake_bridge_id(**kwargs: Any) -> str:
+        return "agy_bridge_custom"
+
+    monkeypatch.setattr(antigravity_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(
+        native_controls, "_antigravity_native_bridge_id_for_session", _fake_bridge_id
+    )
+
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    sid = "1c88519bd9daa4e9bc2df649fe4685fa"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "effort_change", "effort": requested},
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert len(captured) == 1
+    expected_dir = antigravity_native_bridge.bridge_dir_for_bridge_id("agy_bridge_custom")
+    assert captured[0][0] == expected_dir
+    assert captured[0][1] == expected_command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort_value", ["none", "minimal", None])
+async def test_events_effort_change_on_antigravity_native_skips_unsupported_level(
+    monkeypatch: pytest.MonkeyPatch,
+    effort_value: str | None,
+) -> None:
+    """Unsupported or null effort values 204 without injecting into the agy TUI."""
+
+    def _fail_inject(bridge_dir: Path, *, command: str, timeout_s: float) -> None:
+        del bridge_dir, command, timeout_s
+        raise AssertionError(f"inject_slash_command must not run for effort={effort_value!r}")
+
+    monkeypatch.setattr(antigravity_native_bridge, "inject_slash_command", _fail_inject)
+
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    sid = "2c88519bd9daa4e9bc2df649fe4685fa"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "effort_change", "effort": effort_value},
+        )
+
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, OSError])
+async def test_events_effort_change_on_antigravity_native_returns_503_on_bridge_error(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    """Bridge injection failures surface as 503 antigravity_native_effort_failed."""
+
+    def _failing_inject(bridge_dir: Path, *, command: str, timeout_s: float) -> None:
+        del bridge_dir, command, timeout_s
+        raise error_type("tmux target is not advertised")
+
+    monkeypatch.setattr(antigravity_native_bridge, "inject_slash_command", _failing_inject)
+
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    sid = "3c88519bd9daa4e9bc2df649fe4685fa"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "antigravity_native_effort_failed"
