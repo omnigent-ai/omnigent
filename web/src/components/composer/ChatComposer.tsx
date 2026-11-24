@@ -3,7 +3,6 @@ import {
   forwardRef,
   useCallback,
   useContext,
-  useEffect,
   useLayoutEffect,
   useRef,
   useState,
@@ -18,14 +17,13 @@ import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { cn } from "@/lib/utils";
-import { insertComposerText, registerComposerInsertAdjuster } from "@/lib/composerText";
+import { insertComposerText } from "@/lib/composerText";
 import {
   COMPOSER_INPUT_ID_ATTRIBUTE,
   COMPOSER_INPUT_MARKER,
   COMPOSER_TAIL_INPUT_ID,
   type ComposerInputEngine,
   type ComposerInputProps,
-  type ComposerInsertAdjuster,
   type ComposerKeyboardEvent,
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
@@ -514,6 +512,7 @@ export function ComposerEngineInput({
     className,
     mentionTokens,
     commandToken,
+    adjustInsert,
     autoFocus,
     ...rest
   } = input;
@@ -539,6 +538,7 @@ export function ComposerEngineInput({
         inputId={inputId}
         heightMode={heightMode}
         mentionTokens={mentionTokens}
+        adjustInsert={adjustInsert}
         commandToken={commandToken}
         autoFocus={autoFocusOnMount}
         onKeyDown={handleKeyDown}
@@ -656,53 +656,15 @@ export function ComposerFeedbackRow({
 
 export const ComposerTextarea = forwardRef<
   HTMLTextAreaElement,
-  ComponentPropsWithoutRef<"textarea"> & { adjustInsert?: ComposerInsertAdjuster }
+  ComponentPropsWithoutRef<"textarea">
 >(function ComposerTextarea(
-  { className, onKeyDown, onCompositionStart, onCompositionEnd, adjustInsert, ...props },
+  { className, onKeyDown, onCompositionStart, onCompositionEnd, ...props },
   ref,
 ) {
   const isComposingRef = useRef(false);
-  const elementRef = useRef<HTMLTextAreaElement | null>(null);
-  const adjustRef = useRef(adjustInsert);
-  useLayoutEffect(() => {
-    adjustRef.current = adjustInsert;
-  });
-  const setElement = useCallback(
-    (element: HTMLTextAreaElement | null) => {
-      elementRef.current = element;
-      assignRef(ref, element);
-    },
-    [ref],
-  );
-  // Native beforeinput: React's onBeforeInput does not carry the inserted text for every input.
-  // Every insert, typed or programmatic, is adjusted in insertComposerText via the registration.
-  useEffect(() => {
-    const element = elementRef.current;
-    if (!element) return;
-    const unregister = registerComposerInsertAdjuster(
-      element,
-      (value, insert) => adjustRef.current?.(value, insert) ?? null,
-    );
-    const onBeforeInput = (event: InputEvent) => {
-      // Only inserts at the selection: a drop or a spell correction targets another range.
-      if (!event.cancelable || event.isComposing) return;
-      if (event.inputType !== "insertText" && event.inputType !== "insertFromPaste") return;
-      const text = event.data ?? event.dataTransfer?.getData("text/plain") ?? "";
-      if (text === "") return;
-      const { selectionStart: start, selectionEnd: end, value } = element;
-      if (!adjustRef.current?.(value, { start, end, text })) return;
-      event.preventDefault();
-      insertComposerText(element, text, start, end, { separateUndo: true });
-    };
-    element.addEventListener("beforeinput", onBeforeInput);
-    return () => {
-      element.removeEventListener("beforeinput", onBeforeInput);
-      unregister();
-    };
-  }, []);
   return (
     <textarea
-      ref={setElement}
+      ref={ref}
       className={cn(
         "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:min-h-[42px] md:select-text [&::-webkit-scrollbar]:hidden",
         className,

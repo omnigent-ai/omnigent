@@ -10268,6 +10268,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    resetCodeMirrorComposerLoadForTests();
   });
 
   function input() {
@@ -10389,31 +10390,26 @@ describe("NewChatLandingScreen @-file-mention", () => {
   });
 
   it("keeps a tag when text is typed right after its token", async () => {
-    renderLanding();
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
-    fireEvent.change(input(), { target: { value: "@RE", selectionStart: 3 } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    act(() => insertComposerText(composerTargetOf(input())!, "@RE"));
     fireEvent.click(screen.getByTitle("Attach README.md"));
-    expect((input() as HTMLTextAreaElement).value).toBe("@README.md ");
+    expect(composerTargetOf(input())!.value).toBe("@README.md ");
 
-    // A key as a browser sends it: beforeinput first, then the insert unless it was cancelled.
-    const field = input() as HTMLTextAreaElement;
-    act(() => {
-      field.setSelectionRange("@README.md".length, "@README.md".length);
-      const beforeInput = new InputEvent("beforeinput", {
-        bubbles: true,
-        cancelable: true,
-        inputType: "insertText",
-        data: "x",
-      });
-      // Not cancelled: the browser inserts the key itself, without the composer's adjustment.
-      if (field.dispatchEvent(beforeInput)) {
-        field.setRangeText("x", field.selectionStart, field.selectionEnd, "end");
-        field.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    });
-    expect((input() as HTMLTextAreaElement).value).toBe("@README.md x ");
+    act(() => insertComposerText(composerTargetOf(input())!, "x", 10, 10));
+    expect(composerTargetOf(input())!.value).toBe("@README.md x ");
     expect(screen.getByTestId("composer-mention-token").textContent).toBe("@README.md");
   });
 
