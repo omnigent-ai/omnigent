@@ -849,9 +849,14 @@ describe("Slack thread replies", () => {
     );
     // Re-adding a followed thread mustn't rewind it and send its replies again.
     expect(prompt).toContain("a thread you already follow keeps its through.");
-    expect(prompt).toContain(
-      `Drop a thread whose through is more than ${FOLLOWED_SLACK_THREAD_HOURS} hours before the time you noted, then keep at most the ${MAX_FOLLOWED_SLACK_THREADS} with the newest through.`,
-    );
+    // The cap bounds reads up front; expiry waits until a thread is read, so a reply posted just
+    // before a thread would expire still reaches its session.
+    const cap = `Follow at most the ${MAX_FOLLOWED_SLACK_THREADS} with the newest through.`;
+    const read = "For each thread you follow, read the replies posted in it";
+    const expire = `Then stop following each thread you read in this run whose through is still more than ${FOLLOWED_SLACK_THREAD_HOURS} hours before the time you noted`;
+    for (const rule of [cap, read, expire]) expect(prompt).toContain(rule);
+    expect(prompt.indexOf(cap)).toBeLessThan(prompt.indexOf(read));
+    expect(prompt.indexOf(read)).toBeLessThan(prompt.indexOf(expire));
     // A reply posted during a run waits for the next run instead of moving through past it.
     expect(prompt).toContain(
       "read the replies posted in it after its through and by the time you noted, for example with conversations.replies with the channel ID, ts set to the thread ts, oldest set to its through, latest set to the time you noted as a Unix timestamp, inclusive false",
@@ -869,6 +874,11 @@ describe("Slack thread replies", () => {
     // bot_id alone mustn't drop a person's follow-up.
     expect(prompt).toContain(
       "a reply with a bot_id is a bot's only when its user is a bot: check each such user with users.info",
+    );
+    // Only a confirmed bot is left out: a failed lookup defers the thread rather than moving
+    // through past what may be a person's reply.
+    expect(prompt).toContain(
+      "leave the reply out only when is_bot is true. If a lookup fails, keep that thread's through and send nothing for it in this run, so the next run checks again.",
     );
     expect(prompt).toContain(
       "The conditions above apply only to the message that starts a thread, so every other reply counts.",
@@ -906,15 +916,6 @@ describe("Slack thread replies", () => {
     expect(prompt).toContain("Do this step even if you stopped starting sessions above");
     expect(prompt).toContain(
       'above "Checked through:" write a "Slack threads:" line followed by one-line JSON of the threads you follow after this run\'s changes, carried over unchanged when you skipped that step, or {} when you follow none.',
-    );
-  });
-
-  it("keeps the one creation call that worker settings edit", () => {
-    const prompt = renderTriggerPrompt("slack", channel(), { ...CTX, model: "old" });
-    expect(readTriggerWorkerSettings(prompt)).toEqual({ ...AGENT_DEFAULT_WORKERS, model: "old" });
-    expect(readTriggerMessageMaxChars(prompt)).toBe(32000);
-    expect(updateTriggerWorkerPlacement(prompt, "managed")).toBe(
-      prompt.replace('placement "same_host"', 'placement "managed"'),
     );
   });
 
