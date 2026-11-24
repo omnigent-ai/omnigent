@@ -112,6 +112,9 @@ _LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
 _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
+# Turn starts awaiting Codex's acknowledgment, by bridge directory. An interrupt
+# that finds no recorded turn waits for the start to record the one Codex accepted.
+_TURN_STARTS_IN_FLIGHT: dict[Path, asyncio.Event] = {}
 _CODEX_STARTUP_WAIT_MESSAGE = (
     "Codex is still starting in this session's terminal. Your message will be sent "
     "once it's ready, so you don't need to send it again."
@@ -665,6 +668,38 @@ async def _start_codex_turn(
         failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, switched)
         for key, value in failed.items():
             _logger.warning("Failed to mirror codex %s switch into config.toml: %s", key, value)
+    acknowledged = asyncio.Event()
+    _TURN_STARTS_IN_FLIGHT[bridge_dir] = acknowledged
+    try:
+        turn_id = await _request_codex_turn_start(client, bridge_dir, state, input_items)
+    finally:
+        acknowledged.set()
+        if _TURN_STARTS_IN_FLIGHT.get(bridge_dir) is acknowledged:
+            del _TURN_STARTS_IN_FLIGHT[bridge_dir]
+    if turn_id is None:
+        return None
+    return NativeTurnAcceptance(
+        session_id=state.session_id,
+        thread_id=state.thread_id,
+        response_id=f"codex_{turn_id}",
+    )
+
+
+async def _request_codex_turn_start(
+    client: CodexAppServerClient,
+    bridge_dir: Path,
+    state: CodexNativeBridgeState,
+    input_items: list[dict[str, object]],
+) -> str | None:
+    """
+    Send ``turn/start`` and record the turn id Codex acknowledges.
+
+    :param client: Connected app-server client.
+    :param bridge_dir: Native Codex bridge directory.
+    :param state: Bridge state the turn starts on.
+    :param input_items: Codex input items, e.g. ``[{"type": "text", "text": "hi"}]``.
+    :returns: The acknowledged turn id, e.g. ``"turn_123"``, or ``None`` without one.
+    """
     response = await _native_delivery_request(
         client,
         "turn/start",
@@ -684,21 +719,16 @@ async def _start_codex_turn(
     result = _json_object(response.get("result")) if response is not None else None
     turn = _json_object(result.get("turn")) if result is not None else None
     turn_id = turn.get("id") if turn is not None else None
-    if isinstance(turn_id, str) and turn_id:
-        if record_acknowledged_turn_id(bridge_dir, state, turn_id):
-            _logger.info("Codex native started turn: turn_id=%s", turn_id)
-        else:
-            _logger.info(
-                "Codex native turn start acknowledged after the active turn changed: turn_id=%s",
-                turn_id,
-            )
-
-        return NativeTurnAcceptance(
-            session_id=state.session_id,
-            thread_id=state.thread_id,
-            response_id=f"codex_{turn_id}",
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+    if record_acknowledged_turn_id(bridge_dir, state, turn_id):
+        _logger.info("Codex native started turn: turn_id=%s", turn_id)
+    else:
+        _logger.info(
+            "Codex native turn start acknowledged after the active turn changed: turn_id=%s",
+            turn_id,
         )
-    return None
+    return turn_id
 
 
 async def _steer_codex_turn(
@@ -1145,73 +1175,74 @@ class CodexNativeExecutor(Executor):
         cancelled the way the Codex TUI does — ``turn/interrupt`` with an
         empty turn id (its ``startup_interrupt``). Either alone also works:
         no recorded turn cancels just the startup; no pending startup
-        interrupts just the turn. It waits for a submission in flight, so the
-        turn that submission started is the one interrupted.
+        interrupts just the turn. A turn start awaiting Codex's acknowledgment is
+        waited for, so the turn Codex accepted is the one interrupted.
 
         :param session_key: Adapter session key. Unused because the
             bridge is per conversation.
         :returns: ``True`` when an interrupt or a startup cancel was sent.
         """
         del session_key
-        # A submission in flight holds this lock until Codex's turn id is recorded,
-        # so a Stop that races it interrupts the turn Codex accepted.
-        async with self._inject_lock:
+        state = read_bridge_state(self._bridge_dir)
+        turn_start = _TURN_STARTS_IN_FLIGHT.get(self._bridge_dir)
+        if state is not None and state.active_turn_id is None and turn_start is not None:
+            # Codex may have accepted a turn whose id the start is about to record.
+            await turn_start.wait()
             state = read_bridge_state(self._bridge_dir)
-            if state is None:
-                return False
-            # Flip the local map first: the cancelled record is what the web
-            # band and turn-error text read, even if Codex never acknowledges.
-            # Unlike the runner's Stop handler, the flipped map is not
-            # published here — the inner process has no server client; web
-            # Stop routes through the runner handler, which does publish.
-            pending = cancel_pending_mcp_startup(self._bridge_dir)
-            if state.active_turn_id is None and not pending:
-                return False
-            client = client_for_transport(
-                state.socket_path,
-                client_name="omnigent-codex-native",
-            )
-            await client.connect()
-            try:
-                if pending:
-                    # Startup interrupt first and best-effort: the local
-                    # cancel above already updated what Omnigent shows, and a
-                    # failure here must not block the active-turn interrupt.
-                    try:
-                        await client.request(
-                            "turn/interrupt",
-                            {"threadId": state.thread_id, "turnId": ""},
-                        )
-                    except Exception:  # the local cancel above already took effect.
-                        _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
-                    _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
-                if state.active_turn_id is not None:
-                    try:
-                        await client.request(
-                            "turn/interrupt",
-                            {
-                                "threadId": state.thread_id,
-                                "turnId": state.active_turn_id,
-                            },
-                        )
-                    except CodexAppServerResponseError as error:
-                        # The recorded turn already ended or was replaced by a
-                        # newer one, so there is nothing left to interrupt — not a
-                        # failure. The local cancel map was already flipped above.
-                        if not is_stale_active_turn_error(error):
-                            raise
-                        # Drop the stale record unless a newer turn/started already
-                        # replaced it.
-                        clear_active_turn_id_if_matches(self._bridge_dir, state.active_turn_id)
-                        _logger.info(
-                            "Codex native interrupt skipped: recorded turn %s already "
-                            "superseded (%s)",
-                            state.active_turn_id,
-                            error.message,
-                        )
-            finally:
-                await client.close()
-            return True
+        if state is None:
+            return False
+        # Flip the local map first: the cancelled record is what the web
+        # band and turn-error text read, even if Codex never acknowledges.
+        # Unlike the runner's Stop handler, the flipped map is not
+        # published here — the inner process has no server client; web
+        # Stop routes through the runner handler, which does publish.
+        pending = cancel_pending_mcp_startup(self._bridge_dir)
+        if state.active_turn_id is None and not pending:
+            return False
+        client = client_for_transport(
+            state.socket_path,
+            client_name="omnigent-codex-native",
+        )
+        await client.connect()
+        try:
+            if pending:
+                # Startup interrupt first and best-effort: the local
+                # cancel above already updated what Omnigent shows, and a
+                # failure here must not block the active-turn interrupt.
+                try:
+                    await client.request(
+                        "turn/interrupt",
+                        {"threadId": state.thread_id, "turnId": ""},
+                    )
+                except Exception:  # the local cancel above already took effect.
+                    _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
+                _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
+            if state.active_turn_id is not None:
+                try:
+                    await client.request(
+                        "turn/interrupt",
+                        {
+                            "threadId": state.thread_id,
+                            "turnId": state.active_turn_id,
+                        },
+                    )
+                except CodexAppServerResponseError as error:
+                    # The recorded turn already ended or was replaced by a
+                    # newer one, so there is nothing left to interrupt — not a
+                    # failure. The local cancel map was already flipped above.
+                    if not is_stale_active_turn_error(error):
+                        raise
+                    # Drop the stale record unless a newer turn/started already
+                    # replaced it.
+                    clear_active_turn_id_if_matches(self._bridge_dir, state.active_turn_id)
+                    _logger.info(
+                        "Codex native interrupt skipped: recorded turn %s already superseded (%s)",
+                        state.active_turn_id,
+                        error.message,
+                    )
+        finally:
+            await client.close()
+        return True
 
     async def run_turn(
         self,

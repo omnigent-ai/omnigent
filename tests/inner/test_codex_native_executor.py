@@ -4618,6 +4618,51 @@ async def test_interrupt_during_submission_stops_the_turn_codex_accepted(
     }
 
 
+@pytest.mark.asyncio
+async def test_interrupt_does_not_wait_for_a_steer_held_for_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop interrupts a compacting turn at once, even while a steer waits for it to settle.
+
+    Only a turn start awaiting Codex's acknowledgment is waited for. A steer
+    refused during compaction waits up to a minute for the very turn change the
+    interrupt causes, so waiting for it would leave Stop doing nothing meanwhile.
+    """
+
+    class _CompactingClient(_FakeCodexNativeClient):
+        requests: list[tuple[str, dict[str, Any]]] = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/steer":
+                type(self).requests.append((method, params))
+                raise _compact_steer_refusal()
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _CompactingClient
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    steer = asyncio.create_task(executor.enqueue_session_message("session", "hello"))
+    async with asyncio.timeout(5):
+        while not _CompactingClient.requests:
+            await asyncio.sleep(0.01)
+
+    try:
+        async with asyncio.timeout(2):
+            assert await executor.interrupt_session("session") is True
+        assert _CompactingClient.requests[-1] == (
+            "turn/interrupt",
+            {"threadId": "thread_123", "turnId": "turn_compact"},
+        )
+    finally:
+        steer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await steer
+
+
 def test_stop_as_codex_finishes_starting_submits_nothing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
