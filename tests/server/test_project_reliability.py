@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -68,7 +69,10 @@ class FakeTickets:
     def comment(self, project_id: str, ticket_id: str, body: Any, actor: Any) -> dict[str, Any]:
         assert body.audience == "agents"
         self.notes.append((ticket_id, body.text))
-        return {"updated_at": 10_000_000}
+        # Like the store, the returned row predates the write's updated_at stamp.
+        ticket = next(t for t in self.tickets if t["id"] == ticket_id)
+        before, ticket["updated_at"] = ticket["updated_at"], int(time.time())
+        return {"updated_at": before}
 
 
 @pytest.fixture()
@@ -78,7 +82,7 @@ def world(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     conversations.convs["worker"] = FakeConv("worker", updated_at=0)
     inputs = FakeInputs(conversations)
     tickets = FakeTickets(
-        [{"id": "t1", "title": "Alpha", "stage_id": "in_progress", "updated_at": 0}],
+        [{"id": "t1", "title": "Alpha", "stage_id": "in_progress", "updated_at": 1}],
         {"t1": ["worker", "lead"]},
     )
     project = SimpleNamespace(
@@ -145,7 +149,7 @@ async def test_a_reply_without_ticket_progress_skips_the_restart(world: SimpleNa
 
 async def test_ticket_activity_resets_the_ladder(world: SimpleNamespace) -> None:
     await world.loop.check_project("p1", None, now=11 * MINUTE)
-    world.tickets.tickets[0]["updated_at"] = 10_000_001
+    world.tickets.tickets[0]["updated_at"] = 2**40
     await world.loop.check_project("p1", None, now=17 * MINUTE)
     assert world.restarts == [] and "t1" not in world.loop.state["p1"].tickets
 

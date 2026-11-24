@@ -95,6 +95,7 @@ class TicketLadder:
     step: int = 0
     at: float = 0.0
     ticket_mark: int = 0
+    stalled_since: float = 0.0
     worker_marks: dict[str, int] = field(default_factory=dict)
 
 
@@ -220,7 +221,8 @@ class ReliabilityLoop:
             CommentOnTicket(text=f"{NOTE_PREFIX}: {text}"[:2000], audience="agents"),
             TicketActor(user_id=project.user_id),
         )
-        return int(result.get("updated_at") or time.time())
+        # The returned row predates the write's own updated_at stamp.
+        return max(int(result.get("updated_at") or 0), int(time.time()))
 
     async def _restart(self, session_id: str, user_id: str | None) -> bool:
         """Replace the session's runner once it is idle (the Reload tools path)."""
@@ -336,11 +338,11 @@ class ReliabilityLoop:
             idle_s = now - last
             if idle_s < config.threshold(ticket["stage_id"]):
                 return
-            ladder = TicketLadder()
+            ladder = TicketLadder(stalled_since=last)
             state.tickets[ticket_id] = ladder
         elif now - ladder.at < config.step_s:
             return
-        minutes = int((now - max([updated, *(w.activity_at for w in workers)])) // 60)
+        minutes = int((now - ladder.stalled_since) // 60)
         title = (ticket.get("title") or "")[:80]
         alive = [w for w in workers if not w.dead]
         dead = [w for w in workers if w.dead]
