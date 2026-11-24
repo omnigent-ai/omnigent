@@ -296,7 +296,6 @@ def _comment(session_id: str | None, text: str, audience: str = "human") -> dict
         (
             [
                 _comment("worker", "Should I push?"),
-                _comment("worker", "Still on it", audience="agents"),
                 {
                     **_comment(None, "Reliability check: step 1/3"),
                     "agent_id": reliability.LOOP_AGENT_ID,
@@ -304,6 +303,8 @@ def _comment(session_id: str | None, text: str, audience: str = "human") -> dict
             ],
             "ask",
         ),
+        ([_comment("worker", "Should I use X?"), _comment("worker", "Using X", "agents")], None),
+        ([_comment("worker", "Should I use X?"), _comment("lead", "Owner says use X")], None),
     ],
 )
 def test_implied_owner_wait(events, expected) -> None:
@@ -341,3 +342,13 @@ async def test_a_stuck_ticket_is_parked_once_after_one_cycle(world) -> None:
     ]
     parked = [text for _, text in world.tickets.notes if "waiting on you" in text]
     assert len(parked) == 1 and len(world.tickets.notes) == 4
+
+
+async def test_a_later_agent_note_clears_an_earlier_question(world) -> None:
+    world.tickets.events_by_ticket["t1"] = [
+        _comment("worker", "Should I use X?"),
+        _comment("worker", "Using X", audience="agents"),
+    ]
+    await world.loop.check_project("p1", None, now=11 * MINUTE)
+    assert [sid for sid, _ in world.inputs.sent] == ["worker"]
+    assert "needs-human" not in str(world.tickets.tickets[0].get("labels"))

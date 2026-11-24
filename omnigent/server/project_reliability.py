@@ -184,7 +184,7 @@ _URL = re.compile(r"https?://\S+")
 def implied_owner_wait(
     events: list[dict[str, Any]], lead_sessions: set[Any]
 ) -> tuple[str, dict[str, Any]] | None:
-    """An unlabeled wait on the owner: the latest worker comment addressed to them.
+    """An unlabeled wait on the owner: the latest session comment, from a worker to them.
 
     Returns ``("ask", event)`` when that comment reads as a question or request,
     ``("maybe", event)`` for any other human-audience worker comment, else ``None``.
@@ -200,13 +200,10 @@ def implied_owner_wait(
             changes = payload.get("changes") or {}
             if "stage_id" in changes or "labels" in changes:
                 found = None
-        elif (
-            event.get("kind") == "comment"
-            and session_id is not None
-            and session_id not in lead_sessions
-            and payload.get("audience") == "human"
-        ):
-            found = event
+        elif event.get("kind") in ("comment", "execution") and session_id is not None:
+            # Only the latest session comment counts; a lead's reply clears it too.
+            human = event.get("kind") == "comment" and payload.get("audience") == "human"
+            found = event if human and session_id not in lead_sessions else None
     if found is None:
         return None
     text = _URL.sub("", (found.get("payload") or {}).get("text") or "")
