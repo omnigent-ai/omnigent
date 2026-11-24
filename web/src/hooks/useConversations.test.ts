@@ -61,7 +61,6 @@ import {
 } from "./useUnseenConversations";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
-import { sessionFamilyGroups } from "@/lib/sessionFamilies";
 import { useScopeCache } from "./useScopeCache";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
@@ -3259,36 +3258,85 @@ describe("useMoveToNest", () => {
         expect(queryClient.getQueryData(headBackfillKey)).toEqual(streamed);
       }
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", head.id] });
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: headBackfillKey });
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["conversation-backfill"] });
       expect(withMoveTombstone(head)).toEqual(head);
       expect(withMoveTombstone(row)).toEqual(row);
     },
   );
 
-  it("keeps a head's former nest apart from the new one while the move is pending", async () => {
-    const head = conversation({ id: "head", title: "Head" });
-    // The head left this nest, which keeps the head's id until the server re-keys it.
-    const leftBehind = conversation({
-      id: "left",
-      family: { id: "head", representative_id: "left", pinned: false },
-    });
+  it.each(["list", "backfill"])(
+    "keeps a head's former nest apart from the new one until the server answers (member in %s)",
+    async (shownIn) => {
+      const head = conversation({ id: "head", title: "Head" });
+      // The head left this nest, which keeps the head's id until the server re-keys it.
+      const leftBehind = conversation({
+        id: "left",
+        family: { id: "head", representative_id: "left", pinned: false },
+      });
+      const row = conversation({ id: "moved" });
+      let respond!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((done) => {
+          respond = done;
+        }),
+      );
+      const queryClient = new QueryClient();
+      const key = ["conversations", "", false];
+      queryClient.setQueryData(
+        key,
+        infinitePage(shownIn === "list" ? [head, leftBehind, row] : [head, row]),
+      );
+      if (shownIn === "backfill")
+        queryClient.setQueryData(["conversation-backfill", "left"], leftBehind);
+      const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToNest(), { wrapper });
+      result.current.mutate({ id: row.id, destination: head });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      const rows = queryClient.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data;
+      expect(rows.find((item) => item.id === "head")?.family ?? null).toBeNull();
+      expect(withMoveTombstone(row).family ?? null).toBeNull();
+      respond(
+        mockResponse({ ...row, family: { id: "head", representative_id: "head", pinned: false } }),
+      );
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      // The former nest's members, wherever they are shown, refetch with their new key.
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["conversation-backfill"] });
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    },
+  );
+
+  it("leaves an open destination's first fetch running when its nest move fails", async () => {
     const row = conversation({ id: "moved" });
-    fetchMock.mockReturnValue(new Promise<Response>(() => {}));
-    const queryClient = new QueryClient();
-    const key = ["conversations", "", false];
-    queryClient.setQueryData(key, infinitePage([head, leftBehind, row]));
+    const destination = conversation({
+      id: "member",
+      family: { id: "nest", representative_id: "nest", pinned: false },
+    });
+    fetchMock.mockResolvedValue(
+      mockResponse({ detail: "Move rejected" }, { ok: false, status: 500 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["conversations", "", false], infinitePage([row]));
+    // The destination was opened directly, and its first row fetch hasn't answered.
+    const backfillKey = ["conversation-backfill", destination.id];
+    let answer!: (value: Conversation) => void;
+    void queryClient.prefetchQuery({
+      queryKey: backfillKey,
+      queryFn: () =>
+        new Promise<Conversation>((done) => {
+          answer = done;
+        }),
+    });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useMoveToNest(), { wrapper });
-    result.current.mutate({ id: row.id, destination: head });
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    const rows = queryClient.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data;
-    expect(
-      sessionFamilyGroups(rows)
-        .get("head")
-        ?.map((member) => member.id),
-    ).toEqual(["left"]);
-    expect(withMoveTombstone(row).family ?? null).toBeNull();
+    result.current.mutate({ id: row.id, destination });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    await act(async () => {
+      answer(destination);
+    });
+    expect(queryClient.getQueryData(backfillKey)).toEqual(destination);
   });
 
   it("keeps an open head's new nest when its earlier backfill fetch answers late", async () => {
@@ -3322,7 +3370,7 @@ describe("useMoveToNest", () => {
     });
   });
 
-  it("leaves a head's own in-flight move tombstone in place", async () => {
+  it("waits for the server to nest under a head whose own move is in flight", async () => {
     const row = conversation({ id: "moved" });
     const head = conversation({ id: "head", title: "Head", project_id: "project" });
     // The head's unfile never answers; the nest move answers when the test says.
@@ -3344,11 +3392,11 @@ describe("useMoveToNest", () => {
     await waitFor(() => expect(withMoveTombstone(head).project_id).toBeNull());
     result.current.nest.mutate({ id: row.id, destination: head });
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    // The head's own tombstone carries the new nest while it is pending.
-    expect(withMoveTombstone(head)).toMatchObject({
-      project_id: null,
-      family: { id: "head", representative_id: "head" },
-    });
+    // Neither row shows the nest yet, so the head and its new member can't disagree,
+    // and the head keeps its own move's tombstone.
+    expect(withMoveTombstone(head).project_id).toBeNull();
+    expect(withMoveTombstone(head).family).toBeUndefined();
+    expect(withMoveTombstone(row).family).toBeUndefined();
     respond(mockResponse({ ...row, project_id: "project" }));
     await waitFor(() => expect(result.current.nest.isSuccess).toBe(true));
     expect(withMoveTombstone(head).project_id).toBeNull();

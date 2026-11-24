@@ -49,7 +49,8 @@ the header menu), and each place is a separate entry point.
   the upper or lower edge of another row of the same list, project or group (its center
   nests instead), or use Move up/down, to switch
   Ordering to Custom. Positions are saved on this device and new sessions appear
-  above them; a drop on another project's row still files the session there.
+  above them; a drop on the edge of another project's row still files the session there
+  (its center nests the session under that row, in that row's project).
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
 - `title-instructions`: Settings → General → Sessions → **Title instructions**
