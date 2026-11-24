@@ -20469,6 +20469,29 @@
         ]
       }
     },
+    "/v1/inbox/ticket-requests": {
+      "get": {
+        "operationId": "list_ticket_requests_v1_inbox_ticket_requests_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Ticket Requests V1 Inbox Ticket Requests Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Ticket Requests",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
     "/v1/info": {
       "get": {
         "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a build without accounts for header / OIDC\ndeploys (in particular, hosted deployments).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
