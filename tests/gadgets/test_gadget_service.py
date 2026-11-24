@@ -1753,12 +1753,14 @@ def test_a_failed_edit_names_itself_and_creates_nothing(
         },
     )
 
+    before = gadgets.snapshot()
     with pytest.raises(InvalidInput) as refused:
         service.create_revision(app["id"], {"base_revision_id": base["id"], "edits": edits})
 
     assert str(refused.value).startswith(message)
     if reason is not None:
         assert refused.value.details["reason"] == reason
+    assert gadgets.snapshot() == before
 
 
 def test_derived_revisions_need_their_base_and_keep_the_size_limit(gadgets: Fixture) -> None:

@@ -1,12 +1,5 @@
-// Where was I? template: what the viewer's recent sessions add up to, and what needs them next.
-// The gadget session writes fixed records (the whole picture as one `radar` record per scan) and
-// designs the page itself to fit the viewer's work, so different people see different pages.
-//
-// The page is a kit plus a view. The kit is everything a design keeps: the scan status, Rescan,
-// Next up, Done recently, the look line with Back to the previous look, the guide, a plain view,
-// and the fallback to that plain view when a design fails to draw. The view sits between the
-// VIEW_START and VIEW_END markers; the session replaces only that region with its own design,
-// which calls `Radar.view({ render })`. The template's own view is the plain one.
+// Where was I? template. Keep the kit outside the editable view region (VIEW_START to VIEW_END),
+// which is the only part a session's design replaces.
 //
 // The scripts are plain ES2018 inside template literals: keep them free of backticks, `${`, and
 // backslashes.

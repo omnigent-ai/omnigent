@@ -302,7 +302,7 @@ describe("startGadgetBridge", () => {
     const callRpc = vi.fn<CallRpc>().mockRejectedValue(
       new GadgetApiError({
         status: 409,
-        code: "DATA_LOSS",
+        code: "FUTURE_CODE",
         message: "Stored record failed validation",
       }),
     );
@@ -313,7 +313,7 @@ describe("startGadgetBridge", () => {
     await waitFor(() =>
       expect(port.responseFor("r1")).toMatchObject({
         ok: false,
-        error: { code: "DATA_LOSS", message: "Stored record failed validation" },
+        error: { code: "FUTURE_CODE", message: "Stored record failed validation" },
       }),
     );
   });

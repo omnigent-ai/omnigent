@@ -377,11 +377,11 @@ describe("omnigent SDK runtime", () => {
       respond(hostPort, {
         id: lastRequestId(hostPort),
         ok: false,
-        error: { code: "DATA_LOSS", message: "Stored record failed validation" },
+        error: { code: "FUTURE_CODE", message: "Stored record failed validation" },
       });
 
       await expect(result).rejects.toMatchObject({
-        code: "DATA_LOSS",
+        code: "FUTURE_CODE",
         message: "Stored record failed validation",
         retryable: false,
       });

@@ -85,7 +85,7 @@ with their own terminal retain the switcher.
   In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
   workspace tab, using the same terminal confirmation. A read-only viewer's
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.
-- Tabs sidebar: with `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a
+- Tabs sidebar: with `workspace_sidebar_v2` on and the `gadgets` feature off, in a desktop app or desktop browser (not a
   touch client), shells open as tabs in the workspace sidebar. The
   session-actions menu's **Shells** shows the session's selected or last shell tab,
   or a New tab to start one. A shell tab that can't show its terminal yet says why:

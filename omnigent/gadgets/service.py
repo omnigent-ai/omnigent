@@ -515,11 +515,10 @@ class GadgetService:
             after=cursor,
             owner_registration=self.viewer.registration,
         )
+        # One batched lookup for the page, not one per gadget.
+        permissions = self.access.permissions_many(self.viewer.user_id, owned)
         return {
-            "items": [
-                self._app(gadget, self.access.permissions(self.viewer.user_id, gadget))
-                for gadget in owned
-            ],
+            "items": [self._app(gadget, permissions[gadget.id]) for gadget in owned],
             "next_cursor": next_cursor,
         }
 
@@ -538,10 +537,14 @@ class GadgetService:
         owners = sorted({item.gadget.owner_id for item in shared})
         names = self._display_names(owners) if self._display_names and owners else {}
         items = []
-        for item in shared:
-            if owned_by(item.gadget, self.viewer.user_id, self.viewer.registration):
-                continue
-            permissions = self.access.permissions(self.viewer.user_id, item.gadget)
+        others = [
+            item
+            for item in shared
+            if not owned_by(item.gadget, self.viewer.user_id, self.viewer.registration)
+        ]
+        found = self.access.permissions_many(self.viewer.user_id, [item.gadget for item in others])
+        for item in others:
+            permissions = found[item.gadget.id]
             if not permissions.read:
                 continue
             items.append(

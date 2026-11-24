@@ -258,9 +258,9 @@ def create_gadgets_router(
     """
     router = APIRouter(route_class=_GadgetRoute)
 
-    def _viewer(request: Request) -> GadgetViewer:
-        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
-        # Gadgets belong to the account's registration, which a password change keeps.
+    def _viewer(user_id: str) -> GadgetViewer:
+        # Gadgets belong to the account's registration, which a password change keeps. A
+        # database read, so it runs in the request's worker thread.
         registrations = (
             permission_store.account_registrations([user_id]) if permission_store else {}
         )
@@ -284,9 +284,10 @@ def create_gadgets_router(
         return display_names_or_ids(permission_store, user_ids)
 
     async def run(request: Request, operation: Callable[[GadgetService], Any]) -> Any:
-        viewer = _viewer(request)
+        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
 
         def call() -> Any:
+            viewer = _viewer(user_id)
             # An agent's call, read or write, must come from the caller's own private
             # session: a collaborator on a shared session must not read the owner's
             # gadgets through the owner's agent, as with memory.

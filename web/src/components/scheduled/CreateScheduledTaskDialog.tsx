@@ -709,13 +709,19 @@ export function CreateScheduledTaskDialog({
         setStartNewSession(false);
         setTrigger(sourceSession ? null : initialTrigger);
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
+        const prefilled =
+          !(initialTrigger && !sourceSession) && initialSchedule
+            ? parseRRuleToScheduleModel(initialSchedule)
+            : null;
         setSchedule(
           initialTrigger && !sourceSession
             ? defaultTriggerSchedule
-            : ((initialSchedule ? parseRRuleToScheduleModel(initialSchedule) : null) ??
-                DEFAULT_SCHEDULE_MODEL),
+            : (prefilled ?? DEFAULT_SCHEDULE_MODEL),
         );
-        setScheduleUnsupported(false);
+        // A prefilled schedule this form can't show says so instead of becoming the default.
+        setScheduleUnsupported(
+          !(initialTrigger && !sourceSession) && Boolean(initialSchedule) && prefilled === null,
+        );
         setHostId("");
         setWorkspace("");
         setBaseBranch(null);

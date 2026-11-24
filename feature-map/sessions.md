@@ -333,7 +333,9 @@ the header menu), and each place is a separate entry point.
   session, and **Close** shows the session again. New gadgets start on the
   Gadget page's **New** button (also at `/gadget/new`): describe one and press
   **Build**, or open a template's **Preview** and press **Use template**; Blank
-  is made in one click.
+  is made in one click. With gadgets on, sessions keep this side panel even when
+  `workspace_sidebar_v2` is on, because gadget tabs and full screen live only in
+  it.
 
 ## How to get to it (user POV)
 
@@ -743,7 +745,7 @@ from the composer's add tray. Selecting assistant text also offers **Ask in side
 chat** unless the composer is read-only. Viewers and editors of a shared session
 see none of these. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
-chats** reopens it. With `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a touch client), side chats open as
+chats** reopens it. With `workspace_sidebar_v2` on and the `gadgets` feature off, in a desktop app or desktop browser (not a touch client), side chats open as
 tabs in the workspace sidebar, and **Side chats** shows the session's side chat
 tab, or a New tab to start one. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Sending to
