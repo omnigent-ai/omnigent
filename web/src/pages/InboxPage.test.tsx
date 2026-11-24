@@ -266,12 +266,16 @@ afterEach(() => {
 
 /** A finished session whose latest turn the viewer hasn't opened yet. */
 function unreadConversation(overrides: Partial<Conversation> = {}): Conversation {
+  const updatedAt = overrides.updated_at ?? 1_700_000_100;
   const row = conversation({
     id: "sess_unread",
     title: "Unread Session",
     status: "idle",
     pending_elicitations_count: 0,
-    updated_at: 1_700_000_100,
+    updated_at: updatedAt,
+    // The Inbox lists only the owner's sessions whose person-started turn ended.
+    attention_at: updatedAt,
+    permission_level: 4,
     ...overrides,
   });
   // Last seen before the turn finished — the sidebar dot's condition.
@@ -802,8 +806,10 @@ describe("InboxPage unread sessions", () => {
     fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
     await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
 
-    // A new reply lands after the read baseline (which is anchored at "now").
-    const replied = { ...row, updated_at: Math.floor(Date.now() / 1000) + 60 };
+    // A new reply lands after the read baseline (which is anchored at "now"); the
+    // server stamps attention_at when that person-started turn ends.
+    const repliedAt = Math.floor(Date.now() / 1000) + 60;
+    const replied = { ...row, updated_at: repliedAt, attention_at: repliedAt };
     vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([replied]));
     rerender(tree());
 
@@ -1435,7 +1441,8 @@ describe("InboxPage replies", () => {
     fireEvent.click(within(item).getByRole(role, { name: new RegExp(name) }));
     await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
 
-    pushRows([{ ...row, updated_at: Math.floor(Date.now() / 1000) + 60 }]);
+    const repliedAt = Math.floor(Date.now() / 1000) + 60;
+    pushRows([{ ...row, updated_at: repliedAt, attention_at: repliedAt }]);
     await screen.findByTestId("inbox-unread");
     const resurfaced = expandUnread();
     expect(within(resurfaced).getByRole("textbox", { name: /Reply to/ })).toHaveValue("");

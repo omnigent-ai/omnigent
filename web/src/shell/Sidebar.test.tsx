@@ -1288,7 +1288,10 @@ describe("Sidebar session list", () => {
 
   it.each(["/", "/inbox"])("counts an unread session in the Inbox badge on %s", (route) => {
     seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
-    mockConversations([conv("conv_unread", "Codex", { status: "idle", updated_at: 200 })]);
+    // The badge counts a finished person-started turn, which the server stamps.
+    mockConversations([
+      conv("conv_unread", "Codex", { status: "idle", updated_at: 200, attention_at: 200 }),
+    ]);
     renderSidebar(true, route);
 
     const row = screen.getByRole("link", { name: /conv_unread/ }).closest("li")!;
