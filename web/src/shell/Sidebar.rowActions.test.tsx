@@ -242,7 +242,8 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
 }
 
 function CurrentPath() {
-  return <span data-testid="current-path">{useLocation().pathname}</span>;
+  const location = useLocation();
+  return <span data-testid="current-path">{`${location.pathname}${location.search}`}</span>;
 }
 
 // `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
@@ -1540,17 +1541,22 @@ describe("right-click context menu", () => {
   );
 
   it.each(["kebab", "context"])(
-    "opens the session in its own window from %s without leaving the current page",
+    "opens another session in its own window from %s without leaving the current page",
     (menu) => {
       const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
       const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
       try {
-        renderSidebar(undefined, undefined, { header: <CurrentPath /> });
+        mockConversations([CONV, { ...CONV, id: "conv_2", title: "Current Session" }]);
+        renderSidebar("conv_2", undefined, { header: <CurrentPath /> });
+        const targetRow = screen.getByRole("link", { name: /My Session/ });
 
         if (menu === "kebab") {
-          fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+          fireEvent.pointerDown(
+            within(targetRow.closest("li")!).getByTestId("conversation-actions"),
+            { button: 0 },
+          );
         } else {
-          fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+          fireEvent.contextMenu(targetRow);
         }
         fireEvent.click(screen.getByTestId("open-session-window"));
 
@@ -1561,7 +1567,7 @@ describe("right-click context menu", () => {
         );
         expect(popup.location.href).toBe("/c/conv_1?window=session");
         expect(popup.focus).toHaveBeenCalled();
-        expect(screen.getByTestId("current-path")).toHaveTextContent(/^\/$/);
+        expect(screen.getByTestId("current-path")).toHaveTextContent(/^\/c\/conv_2$/);
       } finally {
         open.mockRestore();
       }

@@ -104,39 +104,3 @@ def test_header_menu_pops_the_session_out_and_chats_there(
     assert len(page.context.pages) == 2
     assert popup.evaluate("window.__popOutStillLoaded === true")
     expect(assistant).to_be_visible()
-
-
-@_DESKTOP_CONTEXT
-def test_sidebar_row_menu_pops_another_session_out(
-    request: pytest.FixtureRequest,
-    seeded_session_pair: tuple[str, str, str],
-) -> None:
-    """Right-click a different session's row → Open in new window opens that session."""
-    base_url, current_id, other_id = seeded_session_pair
-    patch_session(base_url, current_id, title="Release checklist")
-    patch_session(base_url, other_id, title="Design review notes")
-    seed_committed_turn(
-        other_id,
-        prompt=f"List the open design questions. {_HISTORY_MARKER}",
-        reply="Two questions remain open.",
-    )
-    page: Page = request.getfixturevalue("page")
-    page.goto(f"{base_url}/c/{current_id}")
-    expect(page.get_by_test_id("header-title")).to_have_text("Release checklist", timeout=30_000)
-    row = page.get_by_role("link", name=re.compile("Design review notes"))
-    expect(row).to_be_visible(timeout=30_000)
-    _hold_for_viewer(page, 800)
-
-    row.click(button="right")
-    open_item = page.get_by_role("menuitem", name="Open in new window")
-    expect(open_item).to_be_visible()
-    _hold_for_viewer(page, 800)
-    with page.context.expect_page() as popup_info:
-        open_item.click()
-    popup = popup_info.value
-    _expect_session_popup(popup, other_id, "Design review notes")
-    expect(popup.get_by_text(_HISTORY_MARKER)).to_be_visible(timeout=30_000)
-    _hold_for_viewer(popup, 2_000)
-
-    expect(page).to_have_url(re.compile(rf"/c/{re.escape(current_id)}$"))
-    expect(page.get_by_test_id("header-title")).to_have_text("Release checklist")

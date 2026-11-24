@@ -253,7 +253,7 @@ describe("HeaderConversationMenu", () => {
       );
       expect(popup.location.href).toBe("/c/conv-1?window=session");
       expect(popup.focus).toHaveBeenCalled();
-      expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+      expect(screen.getByTestId("location")).toHaveTextContent(/^\/c\/conv-1$/);
     } finally {
       open.mockRestore();
     }
