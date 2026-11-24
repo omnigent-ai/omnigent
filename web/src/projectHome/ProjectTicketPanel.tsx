@@ -58,7 +58,7 @@ import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { TICKET_ASK_PARAM, ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCopyLinkButton } from "./TicketCopyLinkButton";
-import { TicketCostSection } from "./ProjectCost";
+import { TicketCostBadge } from "./ProjectCost";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { SessionImage } from "@/components/SessionImage";
 import { MentionTextarea } from "./MentionTextarea";
@@ -553,6 +553,7 @@ function TicketDetails({
                   ))}
                 </SelectContent>
               </Select>
+              <TicketCostBadge projectId={projectId} ticketId={ticketId} />
               {ticket.labels.length > 0 && <TicketLabels labels={ticket.labels} />}
               <LabelEditor
                 labels={ticket.labels}
@@ -570,7 +571,6 @@ function TicketDetails({
               </p>
             )}
             <TicketAgents projectId={projectId} projectName={projectName} ticket={ticket} />
-            <TicketCostSection projectId={projectId} ticketId={ticketId} />
             <section aria-label="Description" className="space-y-2">
               <div className="flex items-center gap-2">
                 <h3 className="flex-1 text-[length:calc(var(--text-ui)+2px)] font-bold">
