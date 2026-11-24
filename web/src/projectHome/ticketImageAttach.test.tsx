@@ -76,6 +76,23 @@ describe("ticket image attachments", () => {
     expect((screen.getByLabelText("Text") as HTMLTextAreaElement).value).toBe("Steps");
   });
 
+  it("keeps uploading the rest, in order, after one image fails", async () => {
+    uploadTicketImage
+      .mockRejectedValueOnce(new Error("Too large"))
+      .mockResolvedValueOnce({ filename: "ok.png", url: url("e") });
+    const { container } = render(<Harness />);
+    const user = userEvent.setup({ applyAccept: false });
+    await user.upload(container.querySelector<HTMLInputElement>("input[type=file]")!, [
+      new File(["png"], "big.png", { type: "image/png" }),
+      new File(["png"], "ok.png", { type: "image/png" }),
+    ]);
+    await waitFor(() =>
+      expect(screen.getByTestId("body").textContent).toBe(`Steps\n\n![ok.png](${url("e")})`),
+    );
+    expect(screen.queryByRole("img", { name: "big.png" })).toBeNull();
+    expect(screen.getByRole("img", { name: "ok.png" })).toBeTruthy();
+  });
+
   it("drops an image whose upload fails and reports the error", async () => {
     uploadTicketImage.mockRejectedValue(new Error("Too large"));
     const { container } = render(<Harness />);

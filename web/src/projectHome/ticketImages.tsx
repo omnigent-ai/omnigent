@@ -40,15 +40,23 @@ export function TicketMarkdown({ children, className }: { children: string; clas
   const segments = splitTicketImages(children);
   if (segments.length === 1 && segments[0].kind === "markdown")
     return <ProseMarkdown className={className}>{children}</ProseMarkdown>;
+  // Each segment's text or path plus its position keeps keys unique and stable.
+  const seen = new Map<string, number>();
+  const keyed = segments.map((segment) => {
+    const base = segment.kind === "markdown" ? `text:${segment.text}` : `image:${segment.path}`;
+    const repeat = seen.get(base) ?? 0;
+    seen.set(base, repeat + 1);
+    return { segment, key: `${base}#${repeat}` };
+  });
   return (
     <div className="space-y-2">
-      {segments.map((segment, index): ReactNode =>
+      {keyed.map(({ segment, key }): ReactNode =>
         segment.kind === "markdown" ? (
-          <ProseMarkdown key={index} className={className}>
+          <ProseMarkdown key={key} className={className}>
             {segment.text}
           </ProseMarkdown>
         ) : (
-          <SessionImage key={index} path={segment.path} alt={segment.alt} />
+          <SessionImage key={key} path={segment.path} alt={segment.alt} />
         ),
       )}
     </div>
@@ -93,7 +101,9 @@ export function useTicketImageUpload(resolveProjectId: () => Promise<string>) {
         setImages((previous) => previous.filter((image) => !added.includes(image)));
         return;
       }
-      for (const pending of added) {
+      // One at a time, in pick order; a failed image doesn't stop the rest.
+      await added.reduce(async (previousUpload, pending) => {
+        await previousUpload;
         try {
           const uploaded = await uploadTicketImage(projectId, pending.file);
           const markdown = ticketImageMarkdown(uploaded.filename, uploaded.url);
@@ -104,7 +114,7 @@ export function useTicketImageUpload(resolveProjectId: () => Promise<string>) {
           setError(caught instanceof Error ? caught : new Error(String(caught)));
           setImages((previous) => previous.filter((image) => image.id !== pending.id));
         }
-      }
+      }, Promise.resolve());
     })();
   };
 
