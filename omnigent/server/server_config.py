@@ -275,19 +275,30 @@ class PullRequestLinks:
         }
 
 
+def _is_http_destination(url: str) -> bool:
+    """
+    Whether *url* is an absolute http(s) URL with a hostname and, if any, a usable port.
+    """
+    parts = urlsplit(url)
+    try:
+        # ``port`` raises for a non-numeric or out-of-range port.
+        has_usable_port = parts.port is None or parts.port > 0
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname) and has_usable_port
+
+
 def _pull_request_link_template(raw: object) -> str:
     """
     Validate a pull request link template, returning it stripped.
     """
     template = raw.strip() if isinstance(raw, str) else ""
     without_fields = _PULL_REQUEST_LINK_FIELD.sub("", template)
-    destination = urlsplit(_PULL_REQUEST_LINK_FIELD.sub("x", template))
     if (
         "{number}" not in template
         or "{" in without_fields
         or "}" in without_fields
-        or destination.scheme not in ("http", "https")
-        or not destination.netloc
+        or not _is_http_destination(_PULL_REQUEST_LINK_FIELD.sub("x", template))
     ):
         raise ValueError(
             f"{PULL_REQUEST_LINKS_KEY}.url_template must be an http(s) URL with a {{number}}"

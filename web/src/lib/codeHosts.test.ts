@@ -66,7 +66,7 @@ describe("pullRequestLink", () => {
   const REVIEW: PullRequestLinks = {
     url_template: "https://review.example.com/{host}/{owner}/{repo}/pull/{number}",
     name: "Code Review",
-    applies_to: ["github.com/example-org", "ghe.example.com"],
+    applies_to: ["github.com/example-org", "ghe.example.com", "github.com/other-org/tools"],
   };
 
   it.each([
@@ -85,6 +85,16 @@ describe("pullRequestLink", () => {
       "https://github.com/Example-Org/app/pull/1234",
       "https://review.example.com/github.com/Example-Org/app/pull/1234",
     ],
+    [
+      "a repository under a repository prefix",
+      "https://github.com/other-org/tools/pull/5",
+      "https://review.example.com/github.com/other-org/tools/pull/5",
+    ],
+    [
+      "a repository spelled with escaped characters, decoded once",
+      "https://github.com/example-org/ap%70/pull/42",
+      "https://review.example.com/github.com/example-org/app/pull/42",
+    ],
   ])("moves %s to the destination", (_case, url, href) => {
     expect(pullRequestLink(url, REVIEW)).toEqual({ href, destination: "Code Review" });
   });
@@ -93,6 +103,14 @@ describe("pullRequestLink", () => {
     ["another owner on the same host", "https://github.com/other-org/app/pull/1"],
     ["an owner that only starts with the prefix", "https://github.com/example-org-fork/app/pull/1"],
     ["an unlisted Enterprise host", "https://ghe2.example.com/team/svc/pull/7"],
+    ["a sibling of a listed repository", "https://github.com/other-org/docs/pull/5"],
+    [
+      "a repository that only starts with a listed one",
+      "https://github.com/other-org/tools-v2/pull/5",
+    ],
+    ["an escaped slash in the owner", "https://github.com/example-org%2Fx/app/pull/5"],
+    ["an escaped space in the repository", "https://github.com/example-org/a%20b/pull/5"],
+    ["a malformed escape", "https://github.com/example-org/a%zz/pull/5"],
     ["a pull request's files tab", `${PULL_REQUEST}/files`],
     ["a comment on the pull request", `${PULL_REQUEST}#issuecomment-1`],
     ["a pull request with a query", `${PULL_REQUEST}?w=1`],
@@ -105,15 +123,5 @@ describe("pullRequestLink", () => {
 
   it("leaves every link alone when the deployment sets no destination", () => {
     expect(pullRequestLink(PULL_REQUEST, null)).toEqual({ href: PULL_REQUEST, destination: null });
-  });
-
-  it("encodes each field it fills in", () => {
-    const links = {
-      ...REVIEW,
-      url_template: "https://review.example.com/?pr={owner}%2F{repo}%23{number}",
-    };
-    expect(pullRequestLink("https://github.com/example-org/a%20b/pull/9", links).href).toBe(
-      "https://review.example.com/?pr=example-org%2Fa%2520b%239",
-    );
   });
 });

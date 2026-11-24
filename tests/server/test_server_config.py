@@ -860,6 +860,22 @@ def test_pull_request_links_normalize_the_configured_block() -> None:
             {"name": "Review", "applies_to": ["github.com"], "url_template": "/review/{number}"},
             "url_template",
         ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://review.example.com:invalid/{number}",
+            },
+            "url_template",
+        ),
+        (
+            {
+                "name": "Review",
+                "applies_to": ["github.com"],
+                "url_template": "https://:8443/{number}",
+            },
+            "url_template",
+        ),
     ],
     ids=[
         "not-a-mapping",
@@ -877,6 +893,8 @@ def test_pull_request_links_normalize_the_configured_block() -> None:
         "template-escaped-braces",
         "template-not-http",
         "template-relative",
+        "template-invalid-port",
+        "template-no-hostname",
     ],
 )
 def test_malformed_pull_request_links_stop_startup(block: object, message: str) -> None:

@@ -90,11 +90,24 @@ export interface PullRequestLinkTarget {
 }
 
 const PULL_REQUEST_LINK_FIELD = /\{(host|owner|repo|number)\}/g;
+// The characters GitHub allows in owner and repository names.
+const REPOSITORY_SEGMENT = /^[A-Za-z0-9._-]+$/;
+
+/** A link's `owner/repo` decoded once, or null when a segment isn't a valid name. */
+function repositorySegments(repository: string): { owner: string; repo: string } | null {
+  try {
+    const [owner, repo] = repository.split("/").map((segment) => decodeURIComponent(segment));
+    return REPOSITORY_SEGMENT.test(owner) && REPOSITORY_SEGMENT.test(repo) ? { owner, repo } : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Where a pull request link opens: the deployment's configured destination when
  * `links` applies to the pull request, otherwise the link unchanged. Only a link to
- * the pull request itself moves; one with a query, fragment or subpage stays put.
+ * the pull request itself moves; one with a query, fragment or subpage stays put,
+ * as does one whose owner or repository isn't a valid name once decoded.
  *
  * @param url A pull request's code-host link, e.g. `https://github.com/acme/app/pull/7`.
  * @param links The deployment's destination, or null/undefined for none.
@@ -111,22 +124,19 @@ export function pullRequestLink(
   );
   if (!pullRequest) return unchanged;
   const { search, hash } = new URL(url);
-  if (search || hash) return unchanged;
-  const path = `${pullRequest.host}/${pullRequest.repository}`.toLowerCase();
+  const segments = repositorySegments(pullRequest.repository);
+  if (search || hash || !segments) return unchanged;
+  const path = `${pullRequest.host}/${segments.owner}/${segments.repo}`.toLowerCase();
   if (!links.applies_to.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))) {
     return unchanged;
   }
-  const [owner, repo] = pullRequest.repository.split("/");
   const fields: Record<string, string> = {
     host: pullRequest.host,
-    owner,
-    repo,
+    ...segments,
     number: String(pullRequest.number),
   };
   return {
-    href: links.url_template.replace(PULL_REQUEST_LINK_FIELD, (_, field: string) =>
-      encodeURIComponent(fields[field]),
-    ),
+    href: links.url_template.replace(PULL_REQUEST_LINK_FIELD, (_, field: string) => fields[field]),
     destination: links.name,
   };
 }
