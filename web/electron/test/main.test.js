@@ -3604,14 +3604,16 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
 
   const HOST_URL = "https://host.example/ml/omnigents";
   const reload = (h) => h.emit("did-start-navigation", HOST_URL, false, true);
-  const COMMAND_K = { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false };
+  const chord = (key) => ({ key, metaKey: true, ctrlKey: false, altKey: false, shiftKey: false });
   // The outgoing renderer can still send its list while the window loads the next document.
-  const updateMidReload = (h, registry) => (reload(h), registry.setForwardedChords([COMMAND_K]));
-  for (const [scenario, navigate, pageKeepsKeys] of [
+  const updateMidReload = (h, registry) => (reload(h), registry.setForwardedChords([chord("j")]));
+  // Each case ends with the keys the window still takes from the page: none, its first list,
+  // or the list it sent mid-reload.
+  for (const [scenario, navigate, forwardedKeys] of [
     [
       "an update mid-reload, then a new document",
       (h, registry) => (updateMidReload(h, registry), h.emit("did-navigate")),
-      true,
+      [],
     ],
     [
       "an update mid-reload, then an error page",
@@ -3619,7 +3621,7 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
         updateMidReload(h, registry),
         h.emit("did-fail-load", -105, "", HOST_URL, true)
       ),
-      true,
+      [],
     ],
     [
       "an update mid-reload, then a cancelled reload",
@@ -3628,15 +3630,15 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
         h.emit("did-fail-load", -3, "", HOST_URL, true),
         h.emit("did-stop-loading")
       ),
-      false,
+      ["j"],
     ],
-    ["a reload into a bundle that never asks", (h) => (reload(h), h.emit("did-navigate")), true],
+    ["a reload into a bundle that never asks", (h) => (reload(h), h.emit("did-navigate")), []],
     [
       "an error page replacing the shell",
       (h) => (reload(h), h.emit("did-fail-load", -105, "", HOST_URL, true)),
-      true,
+      [],
     ],
-    ["a crashed renderer", (h) => h.emit("render-process-gone", {}, { reason: "crashed" }), true],
+    ["a crashed renderer", (h) => h.emit("render-process-gone", {}, { reason: "crashed" }), []],
     [
       "a cancelled reload",
       (h) => (
@@ -3644,12 +3646,12 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
         h.emit("did-fail-load", -3, "", HOST_URL, true),
         h.emit("did-stop-loading")
       ),
-      false,
+      ["k"],
     ],
     [
       "a reload that stopped without a new document",
       (h) => (reload(h), h.emit("did-stop-loading")),
-      false,
+      ["k"],
     ],
     [
       "an in-page or subframe navigation",
@@ -3657,10 +3659,10 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
         h.emit("did-start-navigation", `${HOST_URL}#c/1`, true, true),
         h.emit("did-start-navigation", "https://frame.example/", false, false)
       ),
-      false,
+      ["k"],
     ],
   ]) {
-    it(`${pageKeepsKeys ? "leaves a page its keys" : "keeps forwarding keys"} after ${scenario}`, () => {
+    it(`${forwardedKeys.length ? "keeps forwarding keys" : "leaves a page its keys"} after ${scenario}`, () => {
       const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
       try {
         Object.assign(h.webContents, { focus() {} });
@@ -3680,13 +3682,13 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
         const registry = h.api.createBrowserRegistryForWindow(h.win);
         const page = registry.openOrNavigate("browser-tab:conv:t1", "https://page.example/").entry
           .view.webContents;
-        const pressCommandK = () => {
+        const press = (key) => {
           let prevented = false;
           const before = h.calls.progress.length;
           page.emit(
             "before-input-event",
             { preventDefault: () => (prevented = true) },
-            { type: "keyDown", key: "k", code: "KeyK", meta: true },
+            { type: "keyDown", key, code: `Key${key.toUpperCase()}`, meta: true },
           );
           const forwarded = h.calls.progress
             .slice(before)
@@ -3694,15 +3696,19 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
           return { prevented, forwarded: forwarded.length };
         };
 
-        registry.setForwardedChords([COMMAND_K]);
-        assert.deepEqual(pressCommandK(), { prevented: true, forwarded: 1 });
+        registry.setForwardedChords([chord("k")]);
+        assert.deepEqual(press("k"), { prevented: true, forwarded: 1 });
         navigate(h, registry);
         // A finished load that follows never hands back keys a new document didn't ask for.
         h.emit("did-stop-loading");
-        assert.deepEqual(
-          pressCommandK(),
-          pageKeepsKeys ? { prevented: false, forwarded: 0 } : { prevented: true, forwarded: 1 },
-        );
+        for (const key of ["k", "j"]) {
+          const forwarded = forwardedKeys.includes(key);
+          assert.deepEqual(
+            press(key),
+            { prevented: forwarded, forwarded: forwarded ? 1 : 0 },
+            `⌘${key.toUpperCase()}`,
+          );
+        }
       } finally {
         h.cleanup();
       }
