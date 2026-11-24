@@ -95,7 +95,7 @@ describe("buildGadgetFrameDocument", () => {
     expect(buildGadgetFrameDocument("<p>Hi</p>", "").startsWith("<!DOCTYPE html><meta")).toBe(true);
   });
 
-  it("sets a content security policy with no network sources", () => {
+  it("sets a content security policy that lists no network sources", () => {
     expect(GADGET_CONTENT_SECURITY_POLICY).toContain("connect-src 'none'");
     expect(GADGET_CONTENT_SECURITY_POLICY).toContain("default-src 'none'");
     expect(GADGET_CONTENT_SECURITY_POLICY).toContain("webrtc 'none'");
@@ -483,7 +483,8 @@ describe("GadgetFrame", () => {
     });
   });
 
-  it("stops a frame that navigates and says so, then reloads it on request", () => {
+  // Teardown after the navigation, not prevention: its request has already left by then.
+  it("tears down a frame that navigated and says so, then reloads it on request", () => {
     const { frame } = renderFrame();
     const first = mountOf(frame());
     const frameWindow = frame().contentWindow as Window;

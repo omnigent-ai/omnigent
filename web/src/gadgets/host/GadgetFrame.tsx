@@ -63,7 +63,9 @@ import { buildOmnigentSdkBootstrapScript } from "../sdk/omnigentSdkRuntimeSource
 
 /**
  * Policy for the uploaded document. Inline script and style only (the gadget is one
- * self-contained HTML file); no network, nested frames, forms, plugins, or workers.
+ * self-contained HTML file); no network requests, nested frames, forms, plugins, or workers.
+ * It can't stop the document navigating itself, so gadget code can still send out what it
+ * reads (designs/GADGETS.md, "What gadget code can send out").
  */
 export const GADGET_CONTENT_SECURITY_POLICY = [
   "default-src 'none'",
@@ -183,7 +185,8 @@ function newMount(): FrameMount {
 
 /**
  * Runs a gadget's published HTML and answers its SDK calls. The default frame is a sandboxed
- * `srcdoc` iframe with an opaque origin and a CSP that blocks the network; a host can supply its
+ * `srcdoc` iframe with an opaque origin and a CSP that blocks network requests (not the
+ * document navigating itself); a host can supply its
  * own frame (`OmnigentHostConfig.gadgetFrame`). Each frame document gets one MessagePort, handed
  * over only after a hello carrying this mount's nonce from the frame's own window; the bridge
  * checks every call against the gadget's capabilities and the viewer's permissions, and the
