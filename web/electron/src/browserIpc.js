@@ -39,8 +39,8 @@ const CHROME_COOKIE_IMPORT_PLATFORM_ERROR = "Importing Chrome cookies is only su
 // decides what is blocked; these only say how to preview the page another way.
 const FILE_URL_HINT =
   "To preview a local HTML file, open it from Files, or, from a session on this computer, " +
-  'serve its folder with a local web server (for example, "python3 -m http.server 8000") ' +
-  "and open its http://localhost URL.";
+  "serve its folder on loopback only and open that address (for example, run " +
+  '"python3 -m http.server 8000 --bind 127.0.0.1" in it, then open http://127.0.0.1:8000/).';
 const LOOPBACK_HINT =
   "Localhost pages open only for sessions confirmed to run on this computer or on a host " +
   "you've allowed. To preview an HTML file from this session's workspace, open it from Files.";
