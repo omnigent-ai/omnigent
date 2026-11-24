@@ -610,6 +610,38 @@ def test_a_late_create_retry_after_a_delete_is_answered_without_reading_the_hist
     assert files.reads < 10
 
 
+@pytest.mark.parametrize("retried_at_once", [False, True])
+def test_a_create_whose_index_write_stopped_still_cannot_come_back_after_a_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retried_at_once: bool
+) -> None:
+    files, docs, _clock = _counting(tmp_path)
+    real_index = ImmutableDocumentStore._index_create
+    stopped = {"once": True}
+
+    def stop_once(self, ref, operation_id, number):  # type: ignore[no-untyped-def]
+        if stopped["once"] and operation_id == "create-once":
+            stopped["once"] = False
+            raise OSError("process stopped after the revision committed")
+        return real_index(self, ref, operation_id, number)
+
+    monkeypatch.setattr(ImmutableDocumentStore, "_index_create", stop_once)
+    with pytest.raises(OSError):
+        docs.create("cards", "c1", {"n": 0}, "create-once", ACTOR)
+    version = docs.get("cards", "c1").version  # type: ignore[union-attr]
+    if retried_at_once:
+        # A retry answered right away notes the create too.
+        assert docs.create("cards", "c1", {"n": 0}, "create-once", ACTOR).value == {"n": 0}
+    # Push the create far past the replay window, then delete the record.
+    for n in range(1, 40):
+        version = docs.replace("cards", "c1", {"n": n}, version, f"replace-{n}", ACTOR).version
+    docs.delete("cards", "c1", version, "delete-1", ACTOR)
+
+    replay = docs.create("cards", "c1", {"n": 0}, "create-once", ACTOR)
+
+    assert replay.value == {"n": 0}
+    assert docs.get("cards", "c1") is None
+
+
 def test_a_create_probes_a_bounded_run_of_capacity_slots(tmp_path: Path) -> None:
     files, docs, _clock = _counting(tmp_path)
     for n in range(300):

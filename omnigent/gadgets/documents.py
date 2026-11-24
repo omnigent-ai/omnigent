@@ -41,7 +41,10 @@ Guarantees
   answered from the ``StoreLimits.idempotency_window`` most recent revisions;
   older ones fail closed with :class:`Conflict`. Re-creating a tombstoned record also
   checks an index of the record's creates (``.creates``), so a late retry of a create
-  cannot bring a deleted record back, without reading its history.
+  cannot bring a deleted record back, without reading its history. A create notes itself
+  in that index after its revision commits; a writer that stopped in between leaves only
+  the newest revision unindexed, and the next write to the record (or a retry of that
+  create) notes it first, so no create is ever unindexed once older revisions follow it.
 * Tombstones are revisions, so creation can never reset a record's history, a
   stale ``if_version`` from a deleted generation cannot touch a re-created
   record, and a stale ``create`` retry cannot resurrect a deleted record.
@@ -588,13 +591,13 @@ class ImmutableDocumentStore:
         else:
             replay = self._find_operation(ref, head, operation_id, 2)
             if replay is not None:
-                return _expect_document(self._replay(ref, replay, digest))
+                return _expect_document(self._replay_create(ref, head, replay, digest))
             if head.latest.kind != _DELETE:
                 replay = self._find_operation(
                     ref, head, operation_id, self._limits.idempotency_window
                 )
                 if replay is not None:
-                    return _expect_document(self._replay(ref, replay, digest))
+                    return _expect_document(self._replay_create(ref, head, replay, digest))
                 raise Conflict(
                     "document already exists",
                     reason="already_exists",
@@ -606,7 +609,7 @@ class ImmutableDocumentStore:
                 ref, head, operation_id, self._limits.idempotency_window
             ) or self._indexed_create(ref, head, operation_id)
             if replay is not None:
-                return _expect_document(self._replay(ref, replay, digest))
+                return _expect_document(self._replay_create(ref, head, replay, digest))
         return _expect_document(
             self._append(ref, head, _CREATE, clean, operation_id, actor, digest, claim=claim)
         )
@@ -763,6 +766,12 @@ class ImmutableDocumentStore:
         claim: str | None,
     ) -> Document | DeleteResult:
         now = self._now()
+        if head is not None and head.latest.kind == _CREATE:
+            # A create notes itself in the index after its revision commits; a writer that
+            # stopped in between left the newest revision unindexed. Every later revision is
+            # written here, under the lock, so noting it now leaves no create unindexed once
+            # it is no longer the newest.
+            self._index_create(ref, head.latest.operation_id, head.count)
         if head is None:
             number, generation, prev_digest = 1, 1, None
             created_at, created_by = now, actor
@@ -901,6 +910,19 @@ class ImmutableDocumentStore:
                 return revision
             successor = revision
         return None
+
+    def _replay_create(
+        self, ref: _Ref, head: _Head, revision: _Revision, digest: str
+    ) -> Document | DeleteResult:
+        """Answer a create retry, first noting the create in the index if a stop left it out."""
+        result = self._replay(ref, revision, digest)
+        # Only the newest revision can be an unindexed create: every append notes the one
+        # before it (see _append_locked).
+        if revision.kind == _CREATE and revision is head.latest:
+            with self._record_lock(ref) as held:
+                if held:
+                    self._index_create(ref, revision.operation_id, head.count)
+        return result
 
     def _replay(self, ref: _Ref, revision: _Revision, digest: str) -> Document | DeleteResult:
         if revision.request_digest != digest:
