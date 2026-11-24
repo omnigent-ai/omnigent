@@ -14,6 +14,8 @@ from omnigent.git_providers import (
     ParsedPullRequest,
     ParsedRemote,
 )
+from omnigent.git_providers.github_host import HOST_ENV_VAR as GITHUB_HOST_ENV_VAR
+from omnigent.git_providers.github_host import normalize_host
 
 # An unindented key in the gh CLI's hosts.yml names a host gh is signed in to.
 _HOSTS_YML_KEY = re.compile(r"^([A-Za-z0-9.-]+):\s*$")
@@ -121,15 +123,18 @@ class GitHubProvider:
     facets = FacetModules(pull_requests="omnigent.runner.git_providers.github")
 
     def matches_host(self, host: str, instances: Instances) -> bool:
-        """Claim github.com, ``GH_HOST``, configured instances, and gh's signed-in hosts.
+        """Claim github.com, the configured GitHub host, ``GH_HOST``, instances and gh's hosts.
 
-        GitHub Enterprise Server users have their host in ``GH_HOST`` or in gh's
-        ``hosts.yml``, so their remotes keep resolving to GitHub.
+        GitHub Enterprise Server users have their host in ``OMNIGENT_GITHUB_HOST``
+        (the server's GitHub App host), ``GH_HOST`` or gh's ``hosts.yml``, so
+        their remotes keep resolving to GitHub.
         """
         host = host.lower()
         if not host:
             return False
         if host in self.default_hosts:
+            return True
+        if host == normalize_host(os.environ.get(GITHUB_HOST_ENV_VAR)):
             return True
         if host == (os.environ.get("GH_HOST") or "").strip().lower():
             return True
