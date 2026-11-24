@@ -1128,7 +1128,10 @@ export function CreateScheduledTaskDialog({
     if (!workflowsEnabled || systemPrompt !== null) {
       return parseSavedWorkflowMessage(effectivePrompt) === null ? stopsStoredWorkflow : {};
     }
-    if (workflowChoice === null) return stopsStoredWorkflow;
+    // Cleared, the field leaves the prompt as typed, which may itself run a workflow.
+    if (workflowChoice === null) {
+      return parseSavedWorkflowMessage(effectivePrompt) === null ? stopsStoredWorkflow : {};
+    }
     const workflowDetails = keepsWorkflowDetails ? prompt.trim() : "";
     // Unchanged, so other edits save without the server loading the workflow, which may be gone.
     if (

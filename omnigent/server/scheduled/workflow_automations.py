@@ -161,18 +161,16 @@ def workflow_skill_prefix(harness: str | None) -> str:
     return "$" if harness == "codex-native" else "/"
 
 
-def saved_workflow_run_message(
-    skill_prefix: str, name: str, workflow_id: str, details: str
-) -> str:
+def saved_workflow_run_message(prefix: str, name: str, workflow_id: str, details: str) -> str:
     """The prompt that runs a saved workflow, as ``savedWorkflowMessage`` in
     web/src/lib/workflow.ts writes it for an automation.
 
-    :param skill_prefix: From :func:`workflow_skill_prefix`, e.g. ``"/"``.
+    :param prefix: From :func:`workflow_skill_prefix`, e.g. ``"/"``.
     :param name: The workflow's name, e.g. ``"Triage"``.
     :param workflow_id: The workflow's ID, e.g. ``"0123456789abcdef0123456789abcdef"``.
     :param details: This run's specifics, e.g. ``"Only bugs"``; may be empty.
     """
-    message = f'{skill_prefix}workflow Run the saved workflow "{name}" (ID {workflow_id}).'
+    message = f'{prefix}workflow Run the saved workflow "{name}" (ID {workflow_id}).'
     details = details.strip(_JS_WHITESPACE)
     return f"{message}\n\n{details}" if details else message
 

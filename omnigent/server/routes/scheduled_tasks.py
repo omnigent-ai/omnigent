@@ -149,8 +149,9 @@ _SOURCE_SESSION_CONTINUE_MSG = (
 _PROMPT_OR_WORKFLOW_MSG = "prompt is required unless workflow_id names a saved workflow to run"
 _DETAILS_WITHOUT_WORKFLOW_MSG = "workflow_details needs a saved workflow; send workflow_id"
 _PROMPT_WITH_WORKFLOW_MSG = (
-    "leave out prompt with workflow_id or workflow_details: the server writes the message "
-    "that runs the workflow, and workflow_details carries this run's specifics"
+    "with workflow_id or workflow_details, leave out prompt, or on an update resend it "
+    "unchanged: the server writes the message that runs the workflow, and "
+    "workflow_details carries this run's specifics"
 )
 # Only an explicit workflow_id null detaches a workflow, so a reworded prompt can't.
 _WORKFLOW_PROMPT_OWNED_MSG = (
@@ -1302,6 +1303,9 @@ def create_scheduled_tasks_router(
         :returns: Whether ``prompt`` or ``workflow_id`` came from the snapshot rather than
             the request, so they mustn't land on a row that has changed since.
         """
+        if fields.get("prompt") == existing.prompt:
+            # Resent unchanged, as the agent tool does, it mustn't undo a concurrent edit.
+            fields.pop("prompt")
         current = await asyncio.to_thread(task_workflow_id, existing)
         saved_run = (
             await asyncio.to_thread(saved_workflow_run, existing.prompt)

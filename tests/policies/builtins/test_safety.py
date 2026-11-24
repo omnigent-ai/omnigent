@@ -954,17 +954,30 @@ _RUN = '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789
 
 
 @pytest.mark.parametrize(
-    ("prompt", "keeps"),
+    ("prompt", "keeps", "effect"),
     [
         # The server, like the web form, trims only what JavaScript's trim removes.
-        (f"\x1c{_RUN}\n\nRead-only: make no changes", False),
-        (f"\N{ZERO WIDTH NO-BREAK SPACE}{_RUN}\n\nOnly the upload tests", True),
-        (f"<!-- omnigent-trigger v1 {{}} -->\n{_RUN}\n\nOnly the upload tests", True),
+        (
+            f"\x1c{_RUN}\n\nRead-only: make no changes",
+            False,
+            "whose instructions no longer run",
+        ),
+        (
+            f"\N{ZERO WIDTH NO-BREAK SPACE}{_RUN}\n\nOnly the upload tests",
+            True,
+            "keeping the specifics of the current prompt",
+        ),
+        # The server rewrites no run inside other text, so it keeps or refuses.
+        (
+            f"<!-- omnigent-trigger v1 {{}} -->\n{_RUN}\n\nOnly the upload tests",
+            True,
+            "otherwise refuses the update",
+        ),
     ],
     ids=["unicode-separator", "byte-order-mark", "trigger-header"],
 )
 def test_an_update_says_what_the_server_keeps_of_the_prompt_it_sends(
-    prompt: str, keeps: bool
+    prompt: str, keeps: bool, effect: str
 ) -> None:
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
     from omnigent.server.scheduled.workflow_automations import saved_workflow_run
@@ -985,10 +998,30 @@ def test_an_update_says_what_the_server_keeps_of_the_prompt_it_sends(
         }
     )
     instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
-    assert ("keeping the specifics of the current prompt" in instructions) is keeps
-    assert ("whose instructions no longer run" in instructions) is not keeps
-    # The server keeps the current specifics exactly when it reads a run in that prompt.
+    assert effect in instructions
+    # The server reads a run in that prompt exactly when the card says it can keep one.
     assert (saved_workflow_run(prompt) is not None) is keeps
+
+
+def test_an_update_that_leaves_the_prompt_out_claims_no_outcome() -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "workflow_id": "0123456789abcdef0123456789abcdef",
+                },
+            },
+        }
+    )
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert "if it already runs a saved workflow" in instructions
+    assert "whose instructions no longer run" not in instructions
 
 
 def test_an_update_that_attaches_a_workflow_says_the_plain_prompt_stops_running() -> None:

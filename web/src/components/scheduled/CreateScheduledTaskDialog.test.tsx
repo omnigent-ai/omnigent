@@ -7540,6 +7540,24 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(edited.prompt).toBeUndefined();
   });
 
+  it("saves the workflow a typed run message runs after the field is cleared", async () => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: run("The download tests") },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited.prompt).toBe(run("The download tests"));
+  });
+
   it("stops running a stored workflow when its schedule becomes a trigger's prompt", async () => {
     render(
       <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,

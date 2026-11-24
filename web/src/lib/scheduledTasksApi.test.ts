@@ -415,9 +415,11 @@ describe("updateScheduledTask", () => {
     fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
     await updateScheduledTask("st_1", { workflowId: null, prompt: "Summarize" });
     await updateScheduledTask("st_1", { workflowDetails: "Only bugs" });
+    await updateScheduledTask("st_1", { workflowDetails: null });
     const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
     expect(bodies[0]).toEqual({ workflow_id: null, prompt: "Summarize" });
     expect(bodies[1]).toEqual({ workflow_details: "Only bugs" });
+    expect(bodies[2]).toEqual({ workflow_details: null });
   });
 
   it.each([undefined, null, 2.5])(

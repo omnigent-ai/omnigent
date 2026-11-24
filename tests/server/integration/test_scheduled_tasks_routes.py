@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -4836,6 +4837,58 @@ async def test_an_edit_derived_before_a_concurrent_detach_cant_restore_the_workf
     assert stale.json()["error"]["message"] == scheduled_tasks_routes._WORKFLOW_CHANGED_MSG
     saved = (await client.get(url, headers=_headers())).json()
     assert (saved["prompt"], saved["workflow_id"]) == ("Summarize overnight activity", None)
+
+
+async def test_a_resent_prompt_cant_undo_a_detach_that_lands_first(
+    workflows_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The agent tool resends the current prompt with a rename; it saves nothing new."""
+    client = workflows_client
+    workflow_id = await _save_workflow(client)
+    created = await client.post(
+        "/v1/scheduled-tasks", json=_workflow_create_body(workflow_id), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    align = scheduled_tasks_routes._align_stored_workflow
+    read = threading.Event()
+    detached = threading.Event()
+
+    def align_after_detach(existing: Any, fields: dict[str, Any]) -> bool:
+        # Runs in a worker thread, so waiting here leaves the detach free to land.
+        if fields.get("name") == "renamed":
+            read.set()
+            assert detached.wait(timeout=10)
+        return align(existing, fields)
+
+    async def detach() -> httpx.Response:
+        await asyncio.to_thread(read.wait, 10)
+        try:
+            return await client.patch(
+                url,
+                json={"workflow_id": None, "prompt": "Summarize overnight activity"},
+                headers=_headers(),
+            )
+        finally:
+            detached.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_align_stored_workflow", align_after_detach)
+    async with asyncio.timeout(15):
+        renamed, stopped = await asyncio.gather(
+            client.patch(
+                url, json={"name": "renamed", "prompt": task["prompt"]}, headers=_headers()
+            ),
+            detach(),
+        )
+    assert stopped.status_code == 200, stopped.text
+    assert renamed.status_code == 200, renamed.text
+    saved = (await client.get(url, headers=_headers())).json()
+    assert (saved["name"], saved["prompt"], saved["workflow_id"]) == (
+        "renamed",
+        "Summarize overnight activity",
+        None,
+    )
 
 
 async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(

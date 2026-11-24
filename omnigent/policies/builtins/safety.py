@@ -517,16 +517,32 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     elif action == "update" and workflow_id:
         # Read as the server reads the task's prompt: its specifics stay only if it runs a
         # saved workflow.
-        from omnigent.server.scheduled.workflow_automations import saved_workflow_run
-
-        keeps = isinstance(supplied, str) and saved_workflow_run(supplied) is not None
-        effect = (
-            "keeping the specifics of the current prompt below unless workflow_details "
-            "replaces them"
-            if keeps
-            else "in place of the current prompt below, whose instructions no longer run; "
-            "each run gets only the specifics in workflow_details"
+        from omnigent.server.scheduled.workflow_automations import (
+            is_bare_saved_workflow_run,
+            saved_workflow_run,
         )
+
+        if "prompt" not in args:
+            effect = (
+                "keeping the specifics of the stored prompt if it already runs a saved "
+                "workflow, unless workflow_details replaces them, and otherwise in its place"
+            )
+        elif not isinstance(supplied, str) or saved_workflow_run(supplied) is None:
+            effect = (
+                "in place of the current prompt below, whose instructions no longer run; "
+                "each run gets only the specifics in workflow_details"
+            )
+        elif not is_bare_saved_workflow_run(supplied):
+            effect = (
+                "but the current prompt below runs its workflow inside other text, so the "
+                "server keeps it only if this is the workflow it runs and workflow_details "
+                "is left out, and otherwise refuses the update"
+            )
+        else:
+            effect = (
+                "keeping the specifics of the current prompt below unless workflow_details "
+                "replaces them"
+            )
         prompt = (
             f"Runs the saved workflow {workflow_id}. The server writes the prompt that runs "
             f"it, {effect}.\n{supplied}"
