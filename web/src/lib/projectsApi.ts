@@ -107,15 +107,21 @@ export interface Project {
 /** The Lead's identity id; it keeps its original value so stored links stay valid. */
 export const LEAD_IDENTITY_ID = "orchestrator";
 
-/** A user the owner shared a project with; members read and write everything in it. */
+/** `manager` may also invite and remove ordinary members; only the owner sets it. */
+export type ProjectShareRole = "member" | "manager";
+
+/** A user a project is shared with; members read and write everything in it. */
 export interface ProjectShare {
   user_id: string;
   created_at: number;
   created_by?: string | null;
+  role?: ProjectShareRole;
 }
 
 export interface ProjectShareList {
   owner_user_id: string | null;
+  /** The caller's own role; absent from older servers. */
+  viewer_role?: "owner" | ProjectShareRole | null;
   data: ProjectShare[];
 }
 
@@ -131,18 +137,37 @@ export async function listProjectShares(projectId: string): Promise<ProjectShare
   return (await res.json()) as ProjectShareList;
 }
 
-/** Share a project with another user by their sign-in ID. Owner-only. */
-export async function shareProject(projectId: string, userId: string): Promise<ProjectShare> {
+/** Share a project with another user by their sign-in ID. The owner or a Manager. */
+export async function shareProject(
+  projectId: string,
+  userId: string,
+  role: ProjectShareRole = "member",
+): Promise<ProjectShare> {
   const res = await authenticatedFetch(sharesPath(projectId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId }),
+    body: JSON.stringify(role === "member" ? { user_id: userId } : { user_id: userId, role }),
   });
   if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as ProjectShare;
 }
 
-/** Revoke a user's share. Owner-only. */
+/** Make a member a Manager or back. Owner-only. */
+export async function setProjectShareRole(
+  projectId: string,
+  userId: string,
+  role: ProjectShareRole,
+): Promise<ProjectShare> {
+  const res = await authenticatedFetch(sharesPath(projectId, userId), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role }),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectShare;
+}
+
+/** Revoke a user's share. The owner, or a Manager for an ordinary member. */
 export async function revokeProjectShare(projectId: string, userId: string): Promise<void> {
   const res = await authenticatedFetch(sharesPath(projectId, userId), { method: "DELETE" });
   if (!res.ok) throw await apiErrorFromResponse(res);

@@ -991,7 +991,11 @@ class SqlProject(OmnigentBase):
 
 
 class SqlProjectShare(OmnigentBase):
-    """A user the owner shared a project with; members read and write everything in it."""
+    """A user the owner shared a project with; members read and write everything in it.
+
+    ``role`` is ``member`` or ``manager``; a Manager may also invite and remove
+    ordinary members.
+    """
 
     __tablename__ = "project_shares"
 
@@ -1000,6 +1004,9 @@ class SqlProjectShare(OmnigentBase):
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    role: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="member", server_default="member"
+    )
 
     # "Projects shared with me" for the sidebar and session access checks.
     __table_args__ = (Index("ix_project_shares_user", "workspace_id", "user_id", "project_id"),)

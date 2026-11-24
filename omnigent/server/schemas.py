@@ -6550,13 +6550,16 @@ class ProjectShareObject(BaseModel):
 
     :param user_id: The member, e.g. ``"alice@example.com"``.
     :param created_at: Unix epoch seconds when the share was added.
-    :param created_by: The owner who added it.
+    :param created_by: The owner or Manager who added it.
+    :param role: ``"member"``, or ``"manager"`` for one who may also invite and
+        remove ordinary members.
     """
 
     object: Literal["project.share"] = "project.share"
     user_id: str
     created_at: int
     created_by: str | None = None
+    role: Literal["member", "manager"] = "member"
 
 
 class ProjectShareList(BaseModel):
@@ -6564,6 +6567,7 @@ class ProjectShareList(BaseModel):
 
     object: Literal["list"] = "list"
     owner_user_id: str | None = None
+    viewer_role: Literal["owner", "manager", "member"] | None = None
     data: list[ProjectShareObject]
 
 
@@ -6572,9 +6576,20 @@ class ShareProjectRequest(BaseModel):
 
     :param user_id: The user to share with, as the server identifies them
         (e.g. the email the sign-in proxy asserts).
+    :param role: ``"member"`` (default), or ``"manager"``, which only the owner may grant.
     """
 
     user_id: str = Field(min_length=1, max_length=128)
+    role: Literal["member", "manager"] = "member"
+
+
+class UpdateProjectShareRequest(BaseModel):
+    """Body for ``PATCH /v1/projects/{project_id}/shares/{member_id}``; owner-only.
+
+    :param role: The member's new role: ``"member"`` or ``"manager"``.
+    """
+
+    role: Literal["member", "manager"]
 
 
 class ProjectList(BaseModel):

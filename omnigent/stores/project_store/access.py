@@ -1,4 +1,7 @@
-"""Project membership: the owner plus users the owner shared the project with.
+"""Project membership: the owner plus users the project is shared with.
+
+A share is a ``member`` or a ``manager``; a Manager may also invite and remove
+ordinary members. Everything else owner-only stays with the owner.
 
 Shared by the project, ticket, conversation and permission stores so every
 gate agrees on who may open a project and the sessions filed in it.
@@ -22,7 +25,9 @@ from omnigent.db.db_models import (
 # Session owner level; mirrors ``omnigent.server.auth.LEVEL_OWNER`` without importing the server.
 LEVEL_OWNER = 4
 
-ProjectRole = Literal["owner", "member"]
+ProjectRole = Literal["owner", "manager", "member"]
+ShareRole = Literal["manager", "member"]
+SHARE_ROLES: tuple[ShareRole, ...] = ("member", "manager")
 
 
 def project_role(
@@ -36,7 +41,9 @@ def project_role(
     if user_id is None:
         return None
     share = session.get(SqlProjectShare, (row.workspace_id, row.id, user_id))
-    return "member" if share is not None else None
+    if share is None:
+        return None
+    return "manager" if share.role == "manager" else "member"
 
 
 def accessible_project_ids(user_id: str | None) -> Select[tuple[str]]:

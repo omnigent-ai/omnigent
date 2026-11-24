@@ -767,6 +767,58 @@ def test_share_grants_member_access_until_revoked(store: SqlAlchemyProjectStore)
     assert store.list_shares(_uid("shared"), user_id="alice@example.com") == []
 
 
+def test_manager_invites_and_removes_members_but_not_managers(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """A Manager adds and removes ordinary members; roles and Managers stay owner-only."""
+    pid = _uid("managed")
+    store.create(pid, "Managed", "alice@example.com")
+    store.add_share(pid, "bob@example.com", user_id="alice@example.com")
+    assert store.list_shares(pid, user_id="bob@example.com")[0].role == "member"
+    # A member can't promote themselves, by re-invite or by role change.
+    for attempt in (
+        lambda: store.add_share(pid, "bob@example.com", user_id="bob@example.com", role="manager"),
+        lambda: store.set_share_role(pid, "bob@example.com", "manager", user_id="bob@example.com"),
+    ):
+        with pytest.raises(OmnigentError) as denied:
+            attempt()
+        assert denied.value.code == ErrorCode.FORBIDDEN
+
+    promoted = store.set_share_role(pid, "bob@example.com", "manager", user_id="alice@example.com")
+    assert promoted.role == "manager"
+    carol = store.add_share(pid, "carol@example.com", user_id="bob@example.com")
+    assert (carol.role, carol.created_by) == ("member", "bob@example.com")
+    assert store.get(pid, user_id="carol@example.com") is not None
+
+    for attempt in (
+        lambda: store.add_share(pid, "dan@example.com", user_id="bob@example.com", role="manager"),
+        lambda: store.set_share_role(
+            pid, "carol@example.com", "manager", user_id="bob@example.com"
+        ),
+        lambda: store.set_lead_charter(pid, user_id="bob@example.com", charter="Mine."),
+    ):
+        with pytest.raises(OmnigentError) as denied:
+            attempt()
+        assert denied.value.code == ErrorCode.FORBIDDEN
+    assert store.delete(pid, user_id="bob@example.com") is False
+
+    # A second Manager can't be removed by the first; members can.
+    store.add_share(pid, "erin@example.com", user_id="alice@example.com", role="manager")
+    with pytest.raises(OmnigentError) as denied:
+        store.remove_share(pid, "erin@example.com", user_id="bob@example.com")
+    assert denied.value.code == ErrorCode.FORBIDDEN
+    # Re-inviting a Manager as a member through a Manager changes nothing.
+    assert store.add_share(pid, "erin@example.com", user_id="bob@example.com").role == "manager"
+    assert store.remove_share(pid, "carol@example.com", user_id="bob@example.com")
+    assert store.get(pid, user_id="carol@example.com") is None
+
+    demoted = store.set_share_role(pid, "bob@example.com", "member", user_id="alice@example.com")
+    assert demoted.role == "member"
+    with pytest.raises(OmnigentError) as denied:
+        store.add_share(pid, "carol@example.com", user_id="bob@example.com")
+    assert denied.value.code == ErrorCode.FORBIDDEN
+
+
 def test_members_edit_the_leads_session_defaults_but_only_the_owner_its_charter(
     store: SqlAlchemyProjectStore,
 ) -> None:

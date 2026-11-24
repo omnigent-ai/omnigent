@@ -176,9 +176,11 @@ class ProjectShare:
 
     :param user_id: The member, e.g. ``"alice@example.com"``.
     :param created_at: Unix epoch seconds when the share was added.
-    :param created_by: The owner who added it, or ``None`` in single-user mode.
+    :param created_by: Who added it (the owner or a Manager), or ``None`` in single-user mode.
+    :param role: ``"member"``, or ``"manager"`` for one who may invite and remove members.
     """
 
     user_id: str
     created_at: int
     created_by: str | None
+    role: str = "member"

@@ -8,7 +8,8 @@ here.
 
 Every method is scoped by ``user_id``: a caller sees and edits projects they
 own or that the owner shared with them (``project_shares``). Deleting a project
-and managing its shares stay owner-only.
+and changing share roles stay owner-only; a Manager may invite and remove
+ordinary members.
 """
 
 from __future__ import annotations
@@ -245,18 +246,34 @@ class ProjectStore(ABC):
         """
         raise NotImplementedError
 
-    # -- Shares: users the owner shared the project with --
+    # -- Shares: users the project is shared with, as members or Managers --
 
     def list_shares(self, project_id: str, *, user_id: str | None) -> builtins.list[ProjectShare]:
         """List the users a project is shared with; readable by any member."""
         raise NotImplementedError
 
-    def add_share(self, project_id: str, member_id: str, *, user_id: str | None) -> ProjectShare:
-        """Share a project with *member_id*. Owner-only; idempotent."""
+    def add_share(
+        self, project_id: str, member_id: str, *, user_id: str | None, role: str = "member"
+    ) -> ProjectShare:
+        """Share a project with *member_id* as *role*.
+
+        The owner may add a member or a Manager, and re-adding an existing share
+        sets its role. A Manager may add ordinary members only; re-adding an
+        existing share changes nothing. Anyone else is refused.
+        """
+        raise NotImplementedError
+
+    def set_share_role(
+        self, project_id: str, member_id: str, role: str, *, user_id: str | None
+    ) -> ProjectShare:
+        """Change an existing share's role. Owner-only; ``NOT_FOUND`` when absent."""
         raise NotImplementedError
 
     def remove_share(self, project_id: str, member_id: str, *, user_id: str | None) -> bool:
-        """Revoke *member_id*'s share. Owner-only; ``False`` when absent."""
+        """Revoke *member_id*'s share; ``False`` when absent.
+
+        The owner may remove anyone; a Manager may remove ordinary members only.
+        """
         raise NotImplementedError
 
     # -- Identities: named persistent roles, each with one active session --

@@ -47,8 +47,8 @@ from omnigent.entities.mandate_sections import (
 from omnigent.entities.project import (
     MANDATE_PROPOSAL_MAX_BYTES,
     MANDATE_PROPOSAL_MODES,
-    MANDATE_PROPOSALS_MAX_STORED_BYTES,
     MANDATE_PROPOSALS_MAX_PENDING,
+    MANDATE_PROPOSALS_MAX_STORED_BYTES,
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
     PROJECT_IDENTITY_MAX_COUNT,
     PROJECT_MANDATE_MAX_BYTES,
@@ -62,7 +62,12 @@ from omnigent.entities.project_routing import choose_router
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
-from omnigent.stores.project_store.access import accessible_project_ids, project_role
+from omnigent.stores.project_store.access import (
+    SHARE_ROLES,
+    ProjectRole,
+    accessible_project_ids,
+    project_role,
+)
 
 # Max serialized length of a project's config blob. The value is persisted
 # verbatim and reflected back on every read, so an unbounded blob is a mild
@@ -260,7 +265,8 @@ def _validate_proposal_shape(text: str, mode: str, section: str | None) -> str:
     """Return the trimmed text, or raise ``INVALID_INPUT`` for a malformed proposal."""
     if mode not in MANDATE_PROPOSAL_MODES:
         raise OmnigentError(
-            f"mode must be one of {', '.join(MANDATE_PROPOSAL_MODES)}", code=ErrorCode.INVALID_INPUT
+            f"mode must be one of {', '.join(MANDATE_PROPOSAL_MODES)}",
+            code=ErrorCode.INVALID_INPUT,
         )
     trimmed = text.strip()
     size = len(trimmed.encode("utf-8"))
@@ -995,6 +1001,37 @@ class SqlAlchemyProjectStore(ProjectStore):
             raise OmnigentError(f"Only the project owner can {action}", code=ErrorCode.FORBIDDEN)
         return row
 
+    def _require_share_manager(
+        self, session: Session, project_id: str, user_id: str | None
+    ) -> tuple[SqlProject, ProjectRole]:
+        """Load the project for a share write by its owner or a Manager."""
+        row = session.get(SqlProject, (current_workspace_id(), project_id))
+        role = project_role(session, row, user_id)
+        if row is None or role is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if role not in ("owner", "manager"):
+            raise OmnigentError(
+                "Only the project owner or a Manager can manage its shares",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return row, role
+
+    @staticmethod
+    def _share_entity(row: SqlProjectShare) -> ProjectShare:
+        return ProjectShare(
+            user_id=row.user_id,
+            created_at=row.created_at,
+            created_by=row.created_by,
+            role=row.role or "member",
+        )
+
+    @staticmethod
+    def _check_share_role(role: str) -> None:
+        if role not in SHARE_ROLES:
+            raise OmnigentError(
+                f"Share role must be one of {', '.join(SHARE_ROLES)}", code=ErrorCode.INVALID_INPUT
+            )
+
     def list_shares(self, project_id: str, *, user_id: str | None) -> builtins.list[ProjectShare]:
         with self._session("list_project_shares") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
@@ -1008,15 +1045,20 @@ class SqlAlchemyProjectStore(ProjectStore):
                 )
                 .order_by(asc(SqlProjectShare.created_at), asc(SqlProjectShare.user_id))
             ).all()
-            return [
-                ProjectShare(user_id=r.user_id, created_at=r.created_at, created_by=r.created_by)
-                for r in rows
-            ]
+            return [self._share_entity(r) for r in rows]
 
-    def add_share(self, project_id: str, member_id: str, *, user_id: str | None) -> ProjectShare:
+    def add_share(
+        self, project_id: str, member_id: str, *, user_id: str | None, role: str = "member"
+    ) -> ProjectShare:
+        self._check_share_role(role)
+
         def write(session: Session) -> ProjectShare:
             require_active_account(session, user_id)
-            row = self._require_owner(session, project_id, user_id)
+            row, caller_role = self._require_share_manager(session, project_id, user_id)
+            if caller_role != "owner" and role != "member":
+                raise OmnigentError(
+                    "Only the project owner can make someone a Manager", code=ErrorCode.FORBIDDEN
+                )
             if member_id == row.user_id:
                 raise OmnigentError(
                     "The owner already has access to this project", code=ErrorCode.INVALID_INPUT
@@ -1031,29 +1073,54 @@ class SqlAlchemyProjectStore(ProjectStore):
                     user_id=member_id,
                     created_at=now_epoch(),
                     created_by=user_id,
+                    role=role,
                 )
                 session.add(existing)
                 session.flush()
-            return ProjectShare(
-                user_id=existing.user_id,
-                created_at=existing.created_at,
-                created_by=existing.created_by,
-            )
+            elif caller_role == "owner" and existing.role != role:
+                # A Manager re-inviting someone never changes their role.
+                existing.role = role
+                session.flush()
+            return self._share_entity(existing)
 
         return run_write_transaction(self._session_immediate, "add_project_share", write)
+
+    def set_share_role(
+        self, project_id: str, member_id: str, role: str, *, user_id: str | None
+    ) -> ProjectShare:
+        self._check_share_role(role)
+
+        def write(session: Session) -> ProjectShare:
+            require_active_account(session, user_id)
+            self._require_owner(session, project_id, user_id, action="change a member's role")
+            existing = session.get(
+                SqlProjectShare, (current_workspace_id(), project_id, member_id)
+            )
+            if existing is None:
+                raise OmnigentError("Share not found", code=ErrorCode.NOT_FOUND)
+            if existing.role != role:
+                existing.role = role
+                session.flush()
+            return self._share_entity(existing)
+
+        return run_write_transaction(self._session_immediate, "set_project_share_role", write)
 
     def remove_share(self, project_id: str, member_id: str, *, user_id: str | None) -> bool:
         def write(session: Session) -> bool:
             require_active_account(session, user_id)
-            self._require_owner(session, project_id, user_id)
-            result = session.execute(
-                delete(SqlProjectShare).where(
-                    SqlProjectShare.workspace_id == current_workspace_id(),
-                    SqlProjectShare.project_id == project_id,
-                    SqlProjectShare.user_id == member_id,
-                )
+            _, caller_role = self._require_share_manager(session, project_id, user_id)
+            existing = session.get(
+                SqlProjectShare, (current_workspace_id(), project_id, member_id)
             )
-            return bool(result.rowcount)
+            if existing is None:
+                return False
+            if caller_role != "owner" and existing.role != "member":
+                raise OmnigentError(
+                    "Only the project owner can remove a Manager", code=ErrorCode.FORBIDDEN
+                )
+            session.delete(existing)
+            session.flush()
+            return True
 
         return run_write_transaction(self._session_immediate, "remove_project_share", write)
 

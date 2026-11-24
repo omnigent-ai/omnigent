@@ -1,16 +1,26 @@
 // Project sharing: the owner adds or revokes users who may read and write
-// everything in the project (board, tickets, files and every session).
+// everything in the project (board, tickets, files and every session), and may
+// make a member a Manager, who can also add and remove ordinary members.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckIcon, LinkIcon, UsersIcon, XIcon } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useCopyLink } from "@/hooks/useCopyLink";
 import {
   getProject,
   listProjectShares,
+  type ProjectShareRole,
   revokeProjectShare,
+  setProjectShareRole,
   shareProject,
   updateProjectConfig,
 } from "@/lib/projectsApi";
@@ -54,7 +64,12 @@ function CopyProjectLinkButton({ projectName }: { projectName: string }) {
   );
 }
 
-/** The settings dialog's Sharing section; members see the list but can't change it. */
+const ROLE_LABELS: Record<ProjectShareRole, string> = { member: "Member", manager: "Manager" };
+
+/**
+ * The settings dialog's Sharing section. The owner adds, removes and sets roles;
+ * a Manager adds and removes ordinary members; members see the list read-only.
+ */
 export function ProjectSharingSection({ projectId }: { projectId: string }) {
   const queryClient = useQueryClient();
   const project = useQuery({
@@ -82,7 +97,14 @@ export function ProjectSharingSection({ projectId }: { projectId: string }) {
     mutationFn: (userId: string) => revokeProjectShare(projectId, userId),
     onSuccess: refresh,
   });
+  const setRole = useMutation({
+    mutationFn: ({ userId, role }: { userId: string; role: ProjectShareRole }) =>
+      setProjectShareRole(projectId, userId, role),
+    onSuccess: refresh,
+  });
   const isOwner = project.data !== undefined && project.data.shared !== true;
+  const isManager = !isOwner && shares.data?.viewer_role === "manager";
+  const canInvite = isOwner || isManager;
   const owner = shares.data?.owner_user_id ?? project.data?.owner_user_id ?? null;
   const members = shares.data?.data ?? [];
 
@@ -101,10 +123,12 @@ export function ProjectSharingSection({ projectId }: { projectId: string }) {
       </div>
       <p className="text-muted-foreground text-sm">
         {isOwner
-          ? "People you share with can open the board, tickets, files and every session here, and chat in them. Sessions you started still run on your agents and hosts."
-          : `Shared with you by ${owner ?? "the owner"}. Only the owner can change who has access.`}
+          ? "People you share with can open the board, tickets, files and every session here, and chat in them. Sessions you started still run on your agents and hosts. Managers can also add and remove members."
+          : isManager
+            ? `Shared with you by ${owner ?? "the owner"}. As a Manager you can add and remove members; only the owner can change roles or remove a Manager.`
+            : `Shared with you by ${owner ?? "the owner"}. Only the owner or a Manager can change who has access.`}
       </p>
-      {isOwner && (
+      {canInvite && (
         <form onSubmit={onSubmit} className="flex gap-2">
           <Input
             value={draft}
@@ -125,9 +149,9 @@ export function ProjectSharingSection({ projectId }: { projectId: string }) {
           </Button>
         </form>
       )}
-      {(add.isError || revoke.isError) && (
+      {(add.isError || revoke.isError || setRole.isError) && (
         <p className="text-destructive text-sm" role="alert">
-          {((add.error ?? revoke.error) as Error).message}
+          {((add.error ?? revoke.error ?? setRole.error) as Error).message}
         </p>
       )}
       <ul className="flex flex-col gap-1" data-testid="project-share-list">
@@ -137,30 +161,60 @@ export function ProjectSharingSection({ projectId }: { projectId: string }) {
             <span className="text-muted-foreground">Owner</span>
           </li>
         )}
-        {members.map((share) => (
-          <li
-            key={share.user_id}
-            className="flex items-center justify-between gap-2 text-sm"
-            data-testid="project-share-row"
-          >
-            <span className="truncate">{share.user_id}</span>
-            {isOwner ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label={`Stop sharing with ${share.user_id}`}
-                data-testid="project-share-revoke"
-                onClick={() => revoke.mutate(share.user_id)}
-                disabled={revoke.isPending}
-              >
-                <XIcon className="size-3.5" />
-              </Button>
-            ) : (
-              <span className="text-muted-foreground">Member</span>
-            )}
-          </li>
-        ))}
+        {members.map((share) => {
+          const role: ProjectShareRole = share.role ?? "member";
+          const canRemove = isOwner || (isManager && role === "member");
+          return (
+            <li
+              key={share.user_id}
+              className="flex items-center justify-between gap-2 text-sm"
+              data-testid="project-share-row"
+            >
+              <span className="truncate">{share.user_id}</span>
+              <span className="flex shrink-0 items-center gap-1">
+                {isOwner ? (
+                  <Select
+                    value={role}
+                    onValueChange={(next) =>
+                      setRole.mutate({ userId: share.user_id, role: next as ProjectShareRole })
+                    }
+                    disabled={setRole.isPending}
+                  >
+                    <SelectTrigger
+                      size="sm"
+                      className="w-28"
+                      aria-label={`Role for ${share.user_id}`}
+                      data-testid="project-share-role"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="member">{ROLE_LABELS.member}</SelectItem>
+                      <SelectItem value="manager">{ROLE_LABELS.manager}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <span className="text-muted-foreground" data-testid="project-share-role-label">
+                    {ROLE_LABELS[role]}
+                  </span>
+                )}
+                {canRemove && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={`Stop sharing with ${share.user_id}`}
+                    data-testid="project-share-revoke"
+                    onClick={() => revoke.mutate(share.user_id)}
+                    disabled={revoke.isPending}
+                  >
+                    <XIcon className="size-3.5" />
+                  </Button>
+                )}
+              </span>
+            </li>
+          );
+        })}
         {shares.isSuccess && members.length === 0 && (
           <li className="text-muted-foreground text-sm">Not shared with anyone yet.</li>
         )}

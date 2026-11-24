@@ -25,8 +25,8 @@ from typing import Any
 from fastapi import APIRouter, Query, Request
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.entities.mandate_sections import proposal_is_stale, proposal_target
 from omnigent.entities import Project
+from omnigent.entities.mandate_sections import proposal_is_stale, proposal_target
 from omnigent.entities.project import (
     PROJECT_IDENTITY_LABEL_KEY,
     MandateProposal,
@@ -80,6 +80,7 @@ from omnigent.server.schemas import (
     ProposeMandateRequest,
     ShareProjectRequest,
     UpdateProjectRequest,
+    UpdateProjectShareRequest,
 )
 from omnigent.server.session_orchestration import require_named_source_private
 from omnigent.stores.conversation_store import ConversationStore
@@ -143,13 +144,16 @@ def _share_response(share: ProjectShare) -> dict[str, Any]:
         "user_id": share.user_id,
         "created_at": share.created_at,
         "created_by": share.created_by,
+        "role": share.role,
     }
 
 
 def _refuse_agent_share_write(request: Request) -> None:
-    """Sharing is a person's decision: agent tools may never add or revoke a share."""
+    """Sharing is a person's decision: agent tools may never add, change or revoke a share."""
     if ORCHESTRATION_SOURCE_HEADER in request.headers:
-        raise OmnigentError("Only the project owner can share a project", code=ErrorCode.FORBIDDEN)
+        raise OmnigentError(
+            "Agents can't change who has access to a project", code=ErrorCode.FORBIDDEN
+        )
 
 
 def _is_throwaway_project_name(name: str) -> bool:
@@ -1155,17 +1159,26 @@ def create_projects_router(
         )
         return {"session_id": identity.active_session_id, "created": created}
 
-    # -- Shares: the owner gives other users read/write access to the project --
+    # -- Shares: the owner (or a Manager, for ordinary members) gives other users access --
 
     @router.get("/projects/{project_id}/shares")
     async def list_project_shares(request: Request, project_id: str) -> dict[str, Any]:
-        """List the users a project is shared with; any member may read it."""
+        """List the users a project is shared with; any member may read it.
+
+        ``viewer_role`` is the caller's own role: ``owner``, ``manager`` or ``member``.
+        """
         user_id = require_user(request, auth_provider)
         project = await _owned_project(project_id, user_id)
         shares = await asyncio.to_thread(project_store.list_shares, project.id, user_id=user_id)
+        viewer_role = "owner" if project.user_id == user_id else None
+        if viewer_role is None:
+            viewer_role = next(
+                (share.role for share in shares if share.user_id == user_id), "member"
+            )
         return {
             "object": "list",
             "owner_user_id": project.user_id,
+            "viewer_role": viewer_role,
             "data": [_share_response(share) for share in shares],
         }
 
@@ -1173,11 +1186,12 @@ def create_projects_router(
     async def share_project(
         request: Request, project_id: str, body: ShareProjectRequest
     ) -> dict[str, Any]:
-        """Share a project with another user. Owner-only and never from an agent tool.
+        """Share a project with another user. Never from an agent tool.
 
-        The member can then open the board, tickets, files and every session in
-        the project. Their actions in owner-created sessions run on the owner's
-        agents and hosts.
+        The owner may add a member or a Manager (re-adding sets the role). A
+        Manager may add ordinary members only. The member can then open the
+        board, tickets, files and every session in the project. Their actions
+        in owner-created sessions run on the owner's agents and hosts.
         """
         user_id = require_user(request, auth_provider)
         _refuse_agent_share_write(request)
@@ -1189,10 +1203,24 @@ def create_projects_router(
         if not member_id or member_id in (RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL):
             raise OmnigentError("Share with a signed-in user's ID", code=ErrorCode.INVALID_INPUT)
         share = await asyncio.to_thread(
-            project_store.add_share, project_id, member_id, user_id=user_id
+            project_store.add_share, project_id, member_id, user_id=user_id, role=body.role
         )
         if permission_store is not None:
             permission_store.invalidate_access_cache()
+        announce_projects_changed(user_id)
+        announce_projects_changed(member_id)
+        return _share_response(share)
+
+    @router.patch("/projects/{project_id}/shares/{member_id}")
+    async def update_project_share(
+        request: Request, project_id: str, member_id: str, body: UpdateProjectShareRequest
+    ) -> dict[str, Any]:
+        """Make a member a Manager or back. Owner-only and never from an agent tool."""
+        user_id = require_user(request, auth_provider)
+        _refuse_agent_share_write(request)
+        share = await asyncio.to_thread(
+            project_store.set_share_role, project_id, member_id, body.role, user_id=user_id
+        )
         announce_projects_changed(user_id)
         announce_projects_changed(member_id)
         return _share_response(share)
@@ -1201,7 +1229,10 @@ def create_projects_router(
     async def revoke_project_share(
         request: Request, project_id: str, member_id: str
     ) -> dict[str, Any]:
-        """Revoke a user's share. Owner-only and never from an agent tool."""
+        """Revoke a user's share. Never from an agent tool.
+
+        The owner may remove anyone; a Manager may remove ordinary members only.
+        """
         user_id = require_user(request, auth_provider)
         _refuse_agent_share_write(request)
         removed = await asyncio.to_thread(

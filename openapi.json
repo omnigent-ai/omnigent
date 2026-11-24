@@ -16122,6 +16122,16 @@
       "ShareProjectRequest": {
         "description": "Body for `POST /v1/projects/{project_id}/shares`.",
         "properties": {
+          "role": {
+            "default": "member",
+            "description": "`\"member\"` (default), or `\"manager\"`, which only the owner may grant.",
+            "enum": [
+              "member",
+              "manager"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
           "user_id": {
             "description": "The user to share with, as the server identifies them (e.g. the email the sign-in proxy asserts).",
             "maxLength": 128,
@@ -17231,6 +17241,25 @@
           }
         },
         "title": "UpdateProjectRequest",
+        "type": "object"
+      },
+      "UpdateProjectShareRequest": {
+        "description": "Body for `PATCH /v1/projects/{project_id}/shares/{member_id}`; owner-only.",
+        "properties": {
+          "role": {
+            "description": "The member's new role: `\"member\"` or `\"manager\"`.",
+            "enum": [
+              "member",
+              "manager"
+            ],
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "UpdateProjectShareRequest",
         "type": "object"
       },
       "UpdateScheduledTaskRequest": {
@@ -23755,7 +23784,7 @@
     },
     "/v1/projects/{project_id}/shares": {
       "get": {
-        "description": "List the users a project is shared with; any member may read it.",
+        "description": "List the users a project is shared with; any member may read it.\n\n`viewer_role` is the caller's own role: `owner`, `manager` or `member`.",
         "operationId": "list_project_shares_v1_projects__project_id__shares_get",
         "parameters": [
           {
@@ -23798,7 +23827,7 @@
         ]
       },
       "post": {
-        "description": "Share a project with another user. Owner-only and never from an agent tool.\n\nThe member can then open the board, tickets, files and every session in\nthe project. Their actions in owner-created sessions run on the owner's\nagents and hosts.",
+        "description": "Share a project with another user. Never from an agent tool.\n\nThe owner may add a member or a Manager (re-adding sets the role). A\nManager may add ordinary members only. The member can then open the\nboard, tickets, files and every session in the project. Their actions\nin owner-created sessions run on the owner's agents and hosts.",
         "operationId": "share_project_v1_projects__project_id__shares_post",
         "parameters": [
           {
@@ -23853,7 +23882,7 @@
     },
     "/v1/projects/{project_id}/shares/{member_id}": {
       "delete": {
-        "description": "Revoke a user's share. Owner-only and never from an agent tool.",
+        "description": "Revoke a user's share. Never from an agent tool.\n\nThe owner may remove anyone; a Manager may remove ordinary members only.",
         "operationId": "revoke_project_share_v1_projects__project_id__shares__member_id__delete",
         "parameters": [
           {
@@ -23900,6 +23929,68 @@
           }
         },
         "summary": "Revoke Project Share",
+        "tags": [
+          "projects"
+        ]
+      },
+      "patch": {
+        "description": "Make a member a Manager or back. Owner-only and never from an agent tool.",
+        "operationId": "update_project_share_v1_projects__project_id__shares__member_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "member_id",
+            "required": true,
+            "schema": {
+              "title": "Member Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectShareRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Project Share V1 Projects  Project Id  Shares  Member Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Project Share",
         "tags": [
           "projects"
         ]

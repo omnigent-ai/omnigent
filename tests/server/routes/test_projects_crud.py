@@ -1610,3 +1610,49 @@ async def test_the_server_refuses_coordination_from_a_role_side_chat(
     assert moved.status_code == 200, moved.text
     plain = await project_client.post(f"{project}/tickets", json={"title": "By hand"})
     assert plain.status_code == 201, plain.text
+
+
+async def test_a_manager_invites_members_but_owner_only_settings_stay_with_the_owner(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """The owner promotes a member to Manager and back; a Manager only adds and removes members."""
+    client = multi_user_client
+    owner, bob = _as_user(ALICE), _as_user(BOB)
+    carol, dan = "carol@example.com", "dan@example.com"
+    created = (await client.post("/v1/projects", json={"name": "Managed"}, headers=owner)).json()
+    path = f"/v1/projects/{created['id']}"
+    shares = f"{path}/shares"
+    added = await client.post(shares, json={"user_id": BOB}, headers=owner)
+    assert added.json()["role"] == "member"
+
+    # A member neither invites nor promotes themselves.
+    assert (await client.post(shares, json={"user_id": carol}, headers=bob)).status_code == 403
+    selfie = await client.patch(f"{shares}/{BOB}", json={"role": "manager"}, headers=bob)
+    assert selfie.status_code == 403
+
+    promoted = await client.patch(f"{shares}/{BOB}", json={"role": "manager"}, headers=owner)
+    assert promoted.json()["role"] == "manager", promoted.text
+    listed = (await client.get(shares, headers=bob)).json()
+    assert listed["viewer_role"] == "manager"
+    assert (await client.get(shares, headers=owner)).json()["viewer_role"] == "owner"
+
+    invited = await client.post(shares, json={"user_id": carol}, headers=bob)
+    assert (invited.json()["role"], invited.json()["created_by"]) == ("member", BOB)
+    assert (await client.get(shares, headers=_as_user(carol))).json()["viewer_role"] == "member"
+    for refused in (
+        await client.post(shares, json={"user_id": dan, "role": "manager"}, headers=bob),
+        await client.patch(f"{shares}/{carol}", json={"role": "manager"}, headers=bob),
+        await client.patch(path, json={"config": {"product_approvers": [BOB]}}, headers=bob),
+        await client.delete(path, headers=bob),
+        # Agents never change access, even in the owner's own sessions.
+        await client.post(
+            shares, json={"user_id": dan}, headers={**owner, ORCHESTRATION_SOURCE_HEADER: "x"}
+        ),
+    ):
+        assert refused.status_code in (403, 404), refused.text
+    assert (await client.get(path, headers=bob)).status_code == 200
+
+    assert (await client.delete(f"{shares}/{carol}", headers=bob)).status_code == 200
+    demoted = await client.patch(f"{shares}/{BOB}", json={"role": "member"}, headers=owner)
+    assert demoted.json()["role"] == "member"
+    assert (await client.post(shares, json={"user_id": dan}, headers=bob)).status_code == 403
