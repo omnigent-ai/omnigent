@@ -96,7 +96,12 @@ PROJECT_TICKET_WORK_INSTRUCTION = (
     "Correct clear drift with a stage update and a concise rationale, or ask the agents doing "
     "the work to resolve an ambiguous boundary. Stage changes never grant approval or "
     "satisfy human/permission prompts. Keep needs-human until its request is resolved. "
-    "Do not add stage-check timers."
+    "Do not add stage-check timers. "
+    "When a ticket must wait for an outside event, such as a release tomorrow, add the label "
+    "waiting with the value '<ISO-8601 time with offset> <what to do then>' (for example "
+    "'2026-11-25T10:00Z release is out: run the smoke test') with sys_ticket_update, keeping "
+    "the other labels. Until then the server leaves the ticket alone; at that time it wakes "
+    "you once with the note and removes the label. Remove or change it if plans change."
 )
 
 FINAL_UPDATE_REMINDER = (

@@ -66,6 +66,15 @@ class FakeTickets:
     def sessions(self, project_id: str, ticket_id: str, **_: Any) -> dict[str, Any]:
         return {"data": [{"session_id": sid} for sid in self.links.get(ticket_id, [])]}
 
+    def events(self, project_id: str, ticket_id: str, **_: Any) -> dict[str, Any]:
+        return {"data": [], "has_more": False}
+
+    def update(self, project_id: str, ticket_id: str, body: Any, actor: Any) -> dict[str, Any]:
+        ticket = next(t for t in self.tickets if t["id"] == ticket_id)
+        ticket["labels"] = [label.model_dump() for label in body.labels]
+        ticket["updated_at"] = int(time.time())
+        return dict(ticket)
+
     def comment(self, project_id: str, ticket_id: str, body: Any, actor: Any) -> dict[str, Any]:
         assert body.audience == "agents"
         self.notes.append((ticket_id, body.text))
@@ -176,3 +185,47 @@ def test_settings_defaults_and_overrides() -> None:
     )
     assert config.threshold("in_progress") == 120 and config.threshold("review") == 5400
     assert config.step_s == 15 * 60 and config.enabled
+
+
+def _wait_label(world: SimpleNamespace, wake_at: float, note: str = "release is out") -> None:
+    from datetime import UTC, datetime
+
+    when = datetime.fromtimestamp(wake_at, UTC).isoformat()
+    world.tickets.tickets[0]["labels"] = [
+        {"key": "keep", "value": None},
+        {"key": "waiting", "value": f"{when} {note}"},
+    ]
+
+
+async def test_a_waiting_ticket_is_left_alone_then_woken_once(world: SimpleNamespace) -> None:
+    _wait_label(world, 60 * MINUTE)
+    for minute in (11, 20, 40, 59):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert world.inputs.sent == [] and world.tickets.notes == [] and world.restarts == []
+    await world.loop.check_project("p1", None, now=61 * MINUTE)
+    await world.loop.check_project("p1", None, now=62 * MINUTE)
+    # No setter is known, so the lead is woken, once, and the label is cleared.
+    assert [sid for sid, _ in world.inputs.sent] == ["lead"]
+    assert "release is out" in world.inputs.sent[0][1]
+    assert world.tickets.tickets[0]["labels"] == [{"key": "keep", "value": None}]
+
+
+async def test_a_missed_wake_up_resumes_the_ladder(world: SimpleNamespace) -> None:
+    _wait_label(world, 30 * MINUTE)
+    # The server was down through the wake time and the 10-minute grace.
+    await world.loop.check_project("p1", None, now=45 * MINUTE)
+    assert world.inputs.sent == [] and "was missed" in world.tickets.notes[-1][1]
+    await world.loop.check_project("p1", None, now=46 * MINUTE)
+    assert [sid for sid, _ in world.inputs.sent] == ["worker"]
+
+
+async def test_an_overlong_wait_asks_the_lead_once(world: SimpleNamespace) -> None:
+    _wait_label(world, 200 * 3600)
+    state = world.loop.state.setdefault("p1", reliability.ProjectState(started_at=0))
+    await world.loop.check_project("p1", None, now=MINUTE)
+    state.waits["t1"].set_at = 0
+    for hours in (73, 74):
+        await world.loop.check_project("p1", None, now=hours * 3600)
+    confirms = [sid for sid, text in world.inputs.sent if "confirm the wait" in text]
+    assert confirms == ["lead"]
+    assert all(sid == "lead" for sid, _ in world.inputs.sent)  # the worker is never pinged

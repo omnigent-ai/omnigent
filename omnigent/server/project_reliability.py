@@ -30,7 +30,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from omnigent.entities.project_ticket import CommentOnTicket, TicketActor
+from omnigent.entities.project_ticket import (
+    CommentOnTicket,
+    TicketActor,
+    TicketLabel,
+    UpdateTicket,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -46,7 +51,9 @@ _DEFAULTS: dict[str, Any] = {
     "step_minutes": 15.0,
     "lead_response_minutes": 15.0,
     "review_hours": 4.0,
+    "max_wait_hours": 72.0,
 }
+WAITING_LABEL = "waiting"
 NUDGE, RESTART, ESCALATE = 1, 2, 3
 LEAD_RESTART, LEAD_ROLLOVER = 1, 2
 
@@ -59,6 +66,7 @@ class Settings:
     step_s: float
     lead_response_s: float
     review_s: float
+    max_wait_s: float
 
     def threshold(self, stage_id: str) -> float:
         return self.stage_s.get(stage_id, self.stall_s)
@@ -87,6 +95,7 @@ def settings(config: dict[str, Any]) -> Settings:
         step_s=number("step_minutes") * 60,
         lead_response_s=number("lead_response_minutes") * 60,
         review_s=number("review_hours") * 3600,
+        max_wait_s=number("max_wait_hours") * 3600,
     )
 
 
@@ -107,8 +116,46 @@ class LeadLadder:
 
 
 @dataclass
+class Wait:
+    """A ticket's ``waiting`` label: wake *setter* at *wake_at* with *note*."""
+
+    raw: str
+    wake_at: float
+    note: str
+    set_at: float | None = None
+    setter: str | None = None
+    confirm_asked: bool = False
+
+
+def parse_wait(ticket: dict[str, Any]) -> tuple[str, float, str] | None:
+    """Read ``waiting: <ISO-8601 time with offset> <note>``; ``None`` if absent or unreadable."""
+    from datetime import datetime
+
+    for label in ticket.get("labels") or []:
+        if label.get("key") != WAITING_LABEL:
+            continue
+        raw = (label.get("value") or "").strip()
+        when, _, note = raw.partition(" ")
+        try:
+            parsed = datetime.fromisoformat(when)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return raw, parsed.timestamp(), note.strip()
+    return None
+
+
+def _when(timestamp: float) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(timestamp, UTC).strftime("%a %d %b %H:%M UTC")
+
+
+@dataclass
 class ProjectState:
     tickets: dict[str, TicketLadder] = field(default_factory=dict)
+    waits: dict[str, Wait] = field(default_factory=dict)
     lead: LeadLadder = field(default_factory=LeadLadder)
     started_at: float = field(default_factory=time.time)
     last_review_at: float = 0.0
@@ -280,9 +327,13 @@ class ReliabilityLoop:
             if ticket.get("stage_id") not in working:
                 continue
             seen.add(ticket["id"])
+            if await self._check_wait(project, state, config, ticket, now):
+                continue
             await self._check_ticket(
                 project, state, config, ticket, working[ticket["stage_id"]], excluded, now
             )
+        for ticket_id in set(state.waits) - seen:
+            state.waits.pop(ticket_id, None)
         for ticket_id in set(state.tickets) - seen:
             state.tickets.pop(ticket_id, None)
             state.escalated.discard(ticket_id)
@@ -410,6 +461,136 @@ class ReliabilityLoop:
         for worker in workers:
             refreshed = await self._session(worker.id)
             ladder.worker_marks[worker.id] = refreshed.position if refreshed else worker.position
+
+    # -- deliberate waits ----------------------------------------------------
+
+    async def _wait_origin(
+        self, project: Any, ticket_id: str, raw: str
+    ) -> tuple[float | None, str | None]:
+        """When and by which session the current ``waiting`` label was set."""
+        tickets = self._notifications.tickets
+        found: tuple[float | None, str | None] = (None, None)
+        after = -1
+        for _ in range(20):
+            page = await asyncio.to_thread(
+                tickets.events,
+                project.id,
+                ticket_id,
+                user_id=project.user_id,
+                after=after,
+                limit=100,
+                kind="updated",
+            )
+            for event in page.get("data", []):
+                labels = ((event.get("payload") or {}).get("changes") or {}).get("labels")
+                if isinstance(labels, list) and any(
+                    isinstance(label, dict)
+                    and label.get("key") == WAITING_LABEL
+                    and (label.get("value") or "").strip() == raw
+                    for label in labels
+                ):
+                    found = (float(event["created_at"]), event.get("session_id"))
+            if not page.get("has_more"):
+                break
+            after = page.get("last_position", after)
+        return found
+
+    async def _clear_wait(self, project: Any, ticket: dict[str, Any], text: str) -> int:
+        """Remove the ``waiting`` label, keep the others, and note why."""
+        labels = [
+            TicketLabel(key=label["key"], value=label.get("value"))
+            for label in ticket.get("labels") or []
+            if label.get("key") != WAITING_LABEL
+        ]
+        await asyncio.to_thread(
+            self._notifications.tickets.update,
+            project.id,
+            ticket["id"],
+            UpdateTicket(labels=labels),
+            TicketActor(user_id=project.user_id),
+        )
+        return await self._note(project, ticket["id"], text)
+
+    async def _check_wait(
+        self,
+        project: Any,
+        state: ProjectState,
+        config: Settings,
+        ticket: dict[str, Any],
+        now: float,
+    ) -> bool:
+        """Handle a ticket's deliberate wait; return whether the ticket was handled."""
+        ticket_id = ticket["id"]
+        parsed = parse_wait(ticket)
+        if parsed is None:
+            state.waits.pop(ticket_id, None)
+            return False
+        raw, wake_at, note = parsed
+        wait = state.waits.get(ticket_id)
+        if wait is None or wait.raw != raw:
+            set_at, setter = await self._wait_origin(project, ticket_id, raw)
+            # Without a recorded set time, the max-wait clock starts when first seen.
+            wait = Wait(raw=raw, wake_at=wake_at, note=note, set_at=set_at or now, setter=setter)
+            state.waits[ticket_id] = wait
+        # A waiting ticket is never nudged, restarted or escalated.
+        state.tickets.pop(ticket_id, None)
+        state.escalated.discard(ticket_id)
+        title = (ticket.get("title") or "")[:80]
+        if now < wake_at:
+            started = wait.set_at if wait.set_at is not None else now
+            if not wait.confirm_asked and now - started >= config.max_wait_s:
+                wait.confirm_asked = True
+                if project.main_session_id:
+                    await self._send(
+                        project.main_session_id,
+                        f'[{NOTE_PREFIX}] Ticket {ticket_id} ("{title}") has been waiting '
+                        f"{int((now - started) // 3600)} h, until {_when(wake_at)}: {note}. "
+                        "Please confirm the wait is still right, or change or remove its "
+                        "`waiting` label.",
+                        project.user_id,
+                    )
+                await self._note(
+                    project, ticket_id, "the wait is past its maximum; asked the lead to confirm."
+                )
+            return True
+        grace = config.threshold(ticket["stage_id"])
+        if now >= wake_at + grace:
+            # The wake-up was missed (server down, or it kept failing): resume the
+            # normal ladder from the nudge, as if the ticket stalled at its wake time.
+            mark = await self._clear_wait(
+                project,
+                ticket,
+                f"the wake-up for {_when(wake_at)} ({note}) was missed; normal checks resume.",
+            )
+            state.waits.pop(ticket_id, None)
+            state.tickets[ticket_id] = TicketLadder(stalled_since=wake_at, ticket_mark=mark)
+            return True
+        target, how = await self._wake_target(project, wait.setter)
+        if target is None:
+            return True
+        await self._send(
+            target,
+            f'[Wake-up] Ticket {ticket_id} ("{title}"): you asked to wait until '
+            f"{_when(wake_at)}" + (f": {note}" if note else "") + ". It's time: do the next "
+            "step, or set a new `waiting` label if it isn't ready yet.",
+            project.user_id,
+        )
+        await self._clear_wait(
+            project, ticket, f"woke `{target[:8]}`{how} for: {note or 'the wait'}."
+        )
+        state.waits.pop(ticket_id, None)
+        return True
+
+    async def _wake_target(self, project: Any, setter: str | None) -> tuple[str | None, str]:
+        """The setter, restarted first if dead; the lead when it's gone or unknown."""
+        if setter and setter != project.main_session_id:
+            view = await self._session(setter)
+            if view is not None:
+                if view.dead and await self._restart(view.id, project.user_id):
+                    return view.id, " (restarted first)"
+                return view.id, ""
+            return project.main_session_id, " (the lead; the setter's session is gone)"
+        return project.main_session_id, ""
 
     # -- the lead ------------------------------------------------------------
 
