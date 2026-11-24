@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { markSessionsDeleting, unmarkSessionsDeleting } from "@/hooks/useConversations";
 import { useRecentSessionSwitchStore } from "@/hooks/useRecentSessionSwitch";
 import { SidebarDataContext } from "@/hooks/useSidebarData";
 import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
@@ -90,6 +91,22 @@ describe("RecentSessionSwitchHost", () => {
     // A session the viewer lost access to, or one deleted elsewhere, reads as null.
     client.setQueryData(["conversation-backfill", "deep"], null);
     expect(live()).toEqual(["a", "b"]);
+  });
+
+  it("leaves out a session being deleted, whose fetched row stays until the DELETE confirms", () => {
+    const { client, rerender } = renderHost({ data: undefined, isError: false });
+    rerender({ data: { pages: [] }, isError: false });
+    const live = () =>
+      [...(useRecentSessionSwitchStore.getState().readLiveSessionIds?.() ?? [])].toSorted();
+    client.setQueryData(["conversation-backfill", "deep"], conversation("deep"));
+    // The optimistic delete drops the list rows at once but leaves the fetched row cached.
+    markSessionsDeleting(["deep", "a"]);
+    try {
+      expect(live()).toEqual(["b"]);
+    } finally {
+      unmarkSessionsDeleting(["deep", "a"]);
+    }
+    expect(live()).toEqual(["a", "b", "deep"]);
   });
 
   it("records each session the sidebar opens as the latest visit", () => {

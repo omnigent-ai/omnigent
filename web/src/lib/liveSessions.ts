@@ -2,12 +2,13 @@
 // session lists (sidebar scopes, project folders, pins) and the rows fetched for
 // sessions opened outside them, whether or not the sidebar shows it. The cache
 // patchers apply WS deltas, archives, deletes and lost access to all of these, so a
-// removed session drops out here too.
+// removed session drops out here too. A session being deleted is left out at once.
 
 import type { QueryClient } from "@tanstack/react-query";
 
 import {
   type Conversation,
+  isSessionDeleting,
   PINNED_CONVERSATIONS_KEY,
   type PinnedConversationsResult,
 } from "@/hooks/useConversations";
@@ -18,7 +19,9 @@ export function liveSessionsInCache(queryClient: QueryClient): Map<string, Conve
   const sessions = new Map<string, Conversation>();
   const addLive = (rows: readonly Conversation[]) => {
     for (const row of rows) {
-      if (row.archived !== true && !sessions.has(row.id)) sessions.set(row.id, row);
+      // A fetched row outlives the optimistic delete that drops the list rows.
+      if (row.archived === true || sessions.has(row.id) || isSessionDeleting(row.id)) continue;
+      sessions.set(row.id, row);
     }
   };
   for (const queryKey of [["conversations"], ["project-sessions"]]) {
