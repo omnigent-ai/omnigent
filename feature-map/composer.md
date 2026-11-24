@@ -1245,6 +1245,9 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   with the transcript or composer focused.
 - A refused model or effort change rolls the pill back to the applied setting.
   Read any actionable error card or saved-text notice that accompanies it.
+- On older or unverified Claude Code, a cancelled model change can leave an
+  unsubmitted `/model` command drafted. Inspect or clear Terminal before
+  pressing Enter; the dependent message has not been sent.
 - Claude's own line wrapping can prevent automatic replay of a long first
   message. A refused required selection keeps that message saved but unsent;
   copying and explicit resubmission remain necessary. Notice delivery can

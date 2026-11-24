@@ -5714,9 +5714,17 @@ def inject_model_command(
                 )
             return _inject_model_command_locked(bridge_dir, transaction)
     except ClaudeInjectionCancelled as exc:
-        raise transaction.refuse(
-            "Claude's model switch was cancelled; the prompt was not sent."
-        ) from exc
+        detail = "Claude's model switch was cancelled; the prompt was not sent."
+        if (
+            transaction.phase == "legacy"
+            and transaction.command_draft
+            and not transaction.submitted
+        ):
+            detail += (
+                " An unsubmitted /model command may remain in the terminal. "
+                "Inspect or clear it before pressing Enter."
+            )
+        raise transaction.refuse(detail) from exc
 
 
 @_serialize_model_injection

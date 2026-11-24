@@ -552,6 +552,12 @@ def test_legacy_model_switch_sends_no_keys_after_its_observation_budget(
     assert composer.model == composer.saved_default == (target if submitted else initial_model)
     assert sent_at and all(at < budget_s for at in sent_at)
     assert composer.confirmations == 0
+    if not submitted:
+        assert composer.text == f"/model {target}"
+        assert "An unsubmitted /model command may remain" in str(caught.value)
+        assert "before pressing Enter" in str(caught.value)
+    else:
+        assert "An unsubmitted /model command may remain" not in str(caught.value)
 
 
 @pytest.mark.parametrize("changed", ["advertisement", "target", "owner", "native-session"])

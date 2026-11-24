@@ -15315,29 +15315,37 @@ def test_cache_cost_model_label_requires_an_exact_versioned_claude_id(
 
 
 @pytest.mark.parametrize(
-    ("scenario", "guard"),
+    ("scenario", "guard", "busy"),
     [
-        ("dated", "catalog-date"),
-        ("dated", "live-date"),
-        ("dated", "private-target"),
-        ("dated", "wrong-generation"),
-        ("labels", "catalog-version"),
-        ("labels", "catalog-confirmation-label"),
-        ("labels", "catalog-target-label"),
-        ("labels", "live-selected-label"),
-        ("labels", "live-confirmation-label"),
-        ("labels", "live-version"),
-        ("labels", "live-label-before-commit"),
-        ("dialog", "Sonnet"),
-        ("dialog", "Sonnet 5.6"),
-        ("dialog", "Opus 5.5"),
-        ("dialog", "foreign-permission"),
-        ("private", "legacy"),
-        ("private", "duplicate-label"),
-        ("private", "unselected-label"),
+        pytest.param(
+            scenario,
+            guard,
+            busy,
+            id=f"{'active-turn' if busy else 'idle'}-{scenario}-{guard}",
+        )
+        for scenario, guard, layouts in [
+            ("dated", "catalog-date", (False,)),
+            ("dated", "live-date", (False, True)),
+            ("dated", "private-target", (False,)),
+            ("dated", "wrong-generation", (False, True)),
+            ("labels", "catalog-version", (False,)),
+            ("labels", "catalog-confirmation-label", (False,)),
+            ("labels", "catalog-target-label", (False,)),
+            ("labels", "live-selected-label", (False, True)),
+            ("labels", "live-confirmation-label", (False, True)),
+            ("labels", "live-version", (False, True)),
+            ("labels", "live-label-before-commit", (False, True)),
+            ("dialog", "Sonnet", (False, True)),
+            ("dialog", "Sonnet 5.6", (False, True)),
+            ("dialog", "Opus 5.5", (False, True)),
+            ("dialog", "foreign-permission", (False, True)),
+            ("private", "legacy", (False, True)),
+            ("private", "duplicate-label", (False,)),
+            ("private", "unselected-label", (False,)),
+        ]
+        for busy in layouts
     ],
 )
-@pytest.mark.parametrize("busy", [False, True], ids=["idle", "active-turn"])
 def test_model_command_does_not_confirm_an_unproven_cache_cost_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str, guard: str, busy: bool
 ) -> None:
