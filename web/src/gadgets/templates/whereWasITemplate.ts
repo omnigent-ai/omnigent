@@ -973,8 +973,8 @@ ${GADGET_KIT_HELPERS}
   function giveReason(step, reason) {
     var doc = dismissedDocs[step.id];
     if (!canWrite || !doc) return;
-    var value = {};
-    Object.keys(doc.value || {}).forEach(function (key) { value[key] = doc.value[key]; });
+    // A JSON copy keeps every key as its own, even one named like a built-in.
+    var value = JSON.parse(JSON.stringify(doc.value || {}));
     value.reason = reason;
     dismissed.replace(step.id, value, { ifVersion: doc.version }).then(function (saved) {
       dismissedDocs[step.id] = saved;

@@ -333,7 +333,7 @@ ${GADGET_KIT_HELPERS}
   var viewDirty = true;
   var previewSeeded = false;
   var lastWidth = 0;
-  var hiddenSeries = {};
+  var hiddenSeries = dict();
 
   // ---- The view, and the fallback to the plain one
 
@@ -420,7 +420,7 @@ ${GADGET_KIT_HELPERS}
   function sections() { var value = story(); return value ? value.sections.filter(function (item) { return item && item.id && item.heading; }) : []; }
   function layoutValue() { return layoutDoc && layoutDoc.value && layoutDoc.value.revision_id ? layoutDoc.value : null; }
   function seriesById() {
-    var out = {};
+    var out = dict();
     Object.keys(seriesDocs).forEach(function (key) {
       var value = seriesDocs[key].value;
       if (value && Array.isArray(value.series)) out[key] = value;

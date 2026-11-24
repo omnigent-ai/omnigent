@@ -364,6 +364,30 @@ describe("data story template", () => {
     expect(byId("refresh").hidden).toBe(false);
   });
 
+  it("draws a chart named like a built-in as missing until its series arrives", async () => {
+    const { load, ready } = startStory();
+    await waitFor(() => expect(ready()).toBe(true));
+    const story = {
+      ...STORY,
+      sections: [STORY.sections[0], { ...STORY.sections[1], chart: "constructor" }],
+    };
+    load({ ideas: IDEAS, story, series: { weekly: WEEKLY } });
+    await waitFor(() => expect(byId("content").hidden).toBe(false));
+    const view = byId("view");
+    expect(view.querySelector("#section-where")?.textContent).toContain(
+      "No data for this chart yet.",
+    );
+    expect(view.querySelector("#section-trend svg.chart")).not.toBeNull();
+    expect(byId("about").textContent).toContain("one row per signup");
+
+    load({
+      ideas: IDEAS,
+      story,
+      series: { weekly: WEEKLY, constructor: { ...WEEKLY, title: "Referrals" } },
+    });
+    await waitFor(() => expect(view.querySelector("#section-where svg.chart")).not.toBeNull());
+  });
+
   it.each([
     ["negative", [-40, -10, -25]],
     ["equal negative", [-20, -20, -20]],
