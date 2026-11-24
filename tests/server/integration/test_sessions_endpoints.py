@@ -4746,12 +4746,17 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
 
 
 @pytest.mark.parametrize(
-    ("holds_runner", "child_counts_prompt", "child_read_fails", "expected_count"),
+    ("holds_runner", "child_runner", "child_read_fails", "expected_count"),
     [
-        pytest.param(True, False, False, 0, id="repairs-on-runner-replica"),
-        pytest.param(False, False, False, 1, id="keeps-count-off-runner-replica"),
-        pytest.param(True, True, False, 1, id="keeps-child-prompt-from-another-replica"),
-        pytest.param(True, False, True, 1, id="serves-snapshot-when-repair-fails"),
+        pytest.param(True, None, False, 0, id="repairs-on-runner-replica"),
+        pytest.param(False, None, False, 1, id="keeps-count-off-runner-replica"),
+        pytest.param(
+            True, "runner_child_replica", False, 1, id="keeps-child-prompt-from-another-replica"
+        ),
+        pytest.param(
+            True, "runner_stale_pending", False, 0, id="repairs-a-stale-child-on-the-same-runner"
+        ),
+        pytest.param(True, None, True, 1, id="serves-snapshot-when-repair-fails"),
     ],
 )
 async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
@@ -4760,7 +4765,7 @@ async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     holds_runner: bool,
-    child_counts_prompt: bool,
+    child_runner: str | None,
     child_read_fails: bool,
     expected_count: int,
 ) -> None:
@@ -4768,9 +4773,10 @@ async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
 
     A prompt recorded on one replica and resolved on another leaves the stored
     count at 1, so the list keeps showing a prompt the snapshot no longer has.
-    The replica holding the session's runner repairs the count, unless a child
-    counts a prompt: another replica may have recorded that prompt and mirrored
-    it into this session's count. A replica without the runner leaves it alone,
+    The replica holding the session's runner repairs the count, unless a child on
+    another runner counts a prompt: another replica may have recorded that prompt
+    and mirrored it into this session's count. A stale child on the same runner is
+    repaired with its parent. A replica without the runner leaves the count alone,
     and a repair that fails never fails the snapshot.
 
     :param app: The app behind ``client``; its tunnel registry gets the runner.
@@ -4778,7 +4784,7 @@ async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
     :param db_uri: The app's DB, opened directly to seed the stored counts.
     :param monkeypatch: Breaks the repair's child read in the failure case.
     :param holds_runner: Whether this replica holds the session's runner.
-    :param child_counts_prompt: Whether a child counts a prompt held elsewhere.
+    :param child_runner: The runner of a child whose stored count is 1, if any.
     :param child_read_fails: Whether the repair's child read raises.
     :param expected_count: The listed count once the session has been opened.
     """
@@ -4794,12 +4800,12 @@ async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
     store = SqlAlchemyConversationStore(db_uri)
     assert store.set_runner_id(session_id, "runner_stale_pending")
     store.set_pending_elicitation_count(session_id, 1)
-    if child_counts_prompt:
+    if child_runner is not None:
         child = store.create_conversation(
             kind="sub_agent",
             parent_conversation_id=session_id,
             agent_id=agent["id"],
-            runner_id="runner_child_replica",
+            runner_id=child_runner,
         )
         store.set_pending_elicitation_count(child.id, 1)
     if child_read_fails:

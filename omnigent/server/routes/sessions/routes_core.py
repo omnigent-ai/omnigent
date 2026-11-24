@@ -2542,7 +2542,9 @@ def register_core_routes(
         if bound_runner_connection(tunnel_registry, conv.runner_id) is not None and (
             pending_elicitations.count_for(conv.id) != (conv.pending_elicitation_count or 0)
         ):
-            session_live_state.reconcile_pending_count(conv.id, conv.pending_elicitation_count)
+            session_live_state.reconcile_pending_count(
+                conv.id, conv.pending_elicitation_count, runner_id=conv.runner_id
+            )
         return snapshot
 
     @router.get(
