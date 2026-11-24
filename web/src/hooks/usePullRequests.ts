@@ -296,6 +296,8 @@ export interface PullRequestInfo {
   discovery_warnings?: string[];
   auth?: PullRequestAuth;
   capabilities?: PullRequestCapabilities;
+  /** True when the reader isn't the session's owner, so it can't change the PR here. */
+  owner_only_changes?: boolean;
   /** Whether the `gh` CLI is present on the host.
    *  @deprecated Legacy GitHub field; read `auth.cli`. Removal in 0.19.0. */
   gh_available?: boolean;

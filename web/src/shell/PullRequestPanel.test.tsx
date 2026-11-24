@@ -2668,6 +2668,74 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
   });
 
+  it("shows someone other than the owner the PRs without the controls that change them", async () => {
+    const user = userEvent.setup();
+    const pr = state.info!.data!.pr!;
+    Object.assign(state.info!.data!, {
+      owner_only_changes: true,
+      // What the server sends a non-owner: only read capabilities stay on.
+      capabilities: {
+        account_switching: false,
+        base_remote_selection: false,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: false,
+      },
+      tracking_available: true,
+      prs: [
+        OTHER_PR,
+        {
+          url: pr.url,
+          repository: "example/repo",
+          host: "github.com",
+          number: pr.number,
+          relationship: "created",
+        },
+      ],
+    });
+    renderPanel();
+
+    expect(
+      screen.getByText(/Only the session’s owner can change its pull requests here/),
+    ).toHaveTextContent("Open the pull request on GitHub to make changes.");
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Actions for example/repo #6000" }));
+    expect(screen.queryByRole("menuitem", { name: "Unlink PR" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Copy PR link" })).toBeEnabled();
+    await user.keyboard("{Escape}");
+  });
+
+  it("offers a non-owner no unlink on a PR's details", async () => {
+    const url = state.info!.data!.pr!.url;
+    Object.assign(state.info!.data!, {
+      owner_only_changes: true,
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [
+        { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
+      ],
+    });
+    renderPanel();
+    expect(await screen.findByRole("tab", { name: "Summary" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Unlink PR" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  });
+
+  it("offers a non-owner no link in the empty state", () => {
+    Object.assign(state.info!.data!, {
+      pr: null,
+      prs: [],
+      tracking_available: true,
+      owner_only_changes: true,
+    });
+    renderPanel();
+    expect(screen.getByText(/Pull requests created in this session appear here/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+  });
+
   it("shows the diff immediately when its hunks render the threshold's lines", async () => {
     state.parsedFiles = [{ name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD)] }];
     state.changes = {
