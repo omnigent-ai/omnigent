@@ -1,6 +1,5 @@
 import { useSyncExternalStore } from "react";
 import {
-  findMentionTokens,
   mergeTaggedDrafts,
   nameAttachmentFile,
   readTaggedMentions,
@@ -175,7 +174,8 @@ export function recoverFailedSessionDraft<
   // The temporary draft's tray files are the incoming ones: each takes a name no tag or earlier
   // tray file uses.
   // Every incoming name is reserved before any is chosen, so a rename never takes a name a later
-  // incoming file keeps. The typed text is rewritten once, from all the renames together.
+  // incoming file keeps. The typed text is never edited.
+  // shortcut: literal @name text in a recovered draft is not updated when its tray file is renamed; upgrade if recovery collisions turn out to matter in practice.
   const incomingNames = temporaryDraft.files.map(attachmentFilename);
   const tokens = tagTokensOf(merged.mentions);
   const finalNames: string[] = [];
@@ -189,18 +189,7 @@ export function recoverFailedSessionDraft<
     finalNames.push(named.name);
     incoming.push(named);
   });
-  // A typed @name refers to the tray file it was typed for, so its spellings follow the rename.
-  const renames = temporaryDraft.files.flatMap((file, index) =>
-    file.name === incoming[index]!.name
-      ? []
-      : [[`@${file.name}`, `@${incoming[index]!.name}`] as const],
-  );
-  const namespace = [
-    ...tagTokensOf(merged.mentions),
-    ...tagTokensOf(originalDraft.mentions),
-    ...tagTokensOf(temporaryDraft.mentions),
-  ];
-  const mergedText = respellMentions(merged.text, renames, namespace);
+  const mergedText = merged.text;
   const message = [originalDraft.message, mergedText]
     .filter((part) => part.trim() !== "")
     .join("\n\n");
@@ -210,29 +199,6 @@ export function recoverFailedSessionDraft<
     files: [...originalDraft.files, ...incoming],
     ...(merged.mentions ? { mentions: merged.mentions } : {}),
   };
-}
-
-/**
- * ``text`` with each mention in ``renames`` spelled as its new name. The scan is the composer's
- * longest-first one over every token in ``namespace``, so a longer tag that contains a renamed
- * spelling (``@a.png plan``) is matched whole and left alone.
- */
-function respellMentions(
-  text: string,
-  renames: readonly (readonly [string, string])[],
-  namespace: readonly string[],
-): string {
-  if (renames.length === 0) return text;
-  const spelled = new Map(renames);
-  let out = "";
-  let at = 0;
-  for (const range of findMentionTokens(text, [...namespace, ...spelled.keys()])) {
-    const next = spelled.get(range.token);
-    if (next === undefined) continue;
-    out += text.slice(at, range.start) + next;
-    at = range.end;
-  }
-  return out + text.slice(at);
 }
 
 /** Move an unsent draft when a temporary conversation receives its real id. */
