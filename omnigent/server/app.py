@@ -2585,15 +2585,21 @@ def create_app(
 
         session_pull_requests.install_refresher(pull_request_refresher)
         auto_rollover = None
+        reliability_loop = None
         if project_ticket_notifications is not None:
             project_ticket_notifications.start(app_inst)
             from omnigent.server.project_orchestrator_rollover import start_auto_rollover
 
             auto_rollover = start_auto_rollover(app_inst)
+            from omnigent.server import project_reliability
+
+            reliability_loop = project_reliability.start(app_inst)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            if reliability_loop is not None:
+                await reliability_loop.stop()
             if auto_rollover is not None:
                 auto_rollover.cancel()
                 with suppress(asyncio.CancelledError):
