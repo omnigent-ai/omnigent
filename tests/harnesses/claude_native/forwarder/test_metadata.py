@@ -1276,5 +1276,5 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
 
         await _poll()
 
-    assert len(_failed_status_posts(calls)) == 2
+    assert [post["response_id"] for post in _failed_status_posts(calls)] == ["resp_1", "resp_1"]
     assert len(sent_keys) == 1
