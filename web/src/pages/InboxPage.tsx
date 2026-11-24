@@ -54,6 +54,7 @@ import {
   AlertTriangleIcon,
   ArrowRightIcon,
   ArrowUpIcon,
+  AtSignIcon,
   CheckIcon,
   CircleAlertIcon,
   CircleCheckIcon,
@@ -88,6 +89,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import { useSessionTickets } from "@/hooks/useTicketRequests";
 import type { SessionTicket, TicketRequest } from "@/lib/ticketRequestsApi";
+import { markTicketSeen } from "@/lib/projectTicketsApi";
 import {
   TICKET_ASK_PARAM,
   projectHomePath,
@@ -439,11 +441,14 @@ export function InboxPage() {
     unreadItems.length +
     automationInbox.items.length +
     proactiveInbox.items.length;
+  const ticketCcs = ticketRequests.items.filter((item) => item.reason === "cc");
+  const ticketAsks = ticketRequests.items.filter((item) => item.reason !== "cc");
   const summary = [
-    ticketRequests.items.length > 0 &&
-      (ticketRequests.items.length === 1
+    ticketAsks.length > 0 &&
+      (ticketAsks.length === 1
         ? "1 ticket needs your response"
-        : `${ticketRequests.items.length} tickets need your response`),
+        : `${ticketAsks.length} tickets need your response`),
+    ticketCcs.length > 0 && (ticketCcs.length === 1 ? "1 cc" : `${ticketCcs.length} cc's`),
     items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
     commentInbox.items.length > 0 &&
       (commentInbox.items.length === 1 ? "1 comment" : `${commentInbox.items.length} comments`),
@@ -472,7 +477,7 @@ export function InboxPage() {
   const groups = groupInboxEntries<InboxEntry>([
     ...visibleTicketRequests.map((item) => ({
       kind: "ticket" as const,
-      key: `ticket:${item.project_id}:${item.ticket_id}`,
+      key: `ticket:${item.reason === "cc" ? "cc:" : ""}${item.project_id}:${item.ticket_id}`,
       at: item.raised_at,
       item,
     })),
@@ -721,6 +726,55 @@ export function InboxPage() {
                 {action.label}
               </Button>
             ))}
+          </InboxActions>
+        </InboxCard>
+      );
+    }
+    if (entry.kind === "ticket" && entry.item.reason === "cc") {
+      const { item } = entry;
+      const author = item.raised_by_user_id ?? "Someone";
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-ticket-cc"
+          dataKind="ticket"
+          tile={<KindTile icon={AtSignIcon} tone="gray" />}
+          kindLabel="You were cc'd"
+          title={item.title}
+          preview={item.question ?? item.project_name}
+          at={entry.at}
+          unread
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <p className="text-ui font-medium">{item.title}</p>
+          <p className="text-sm text-muted-foreground">
+            {item.project_name} · {item.stage.name}
+          </p>
+          <p className="text-sm text-muted-foreground">{author} cc'd you:</p>
+          {item.question && (
+            <p className="text-ui whitespace-pre-wrap text-muted-foreground">{item.question}</p>
+          )}
+          <InboxActions>
+            <Button
+              variant="outline"
+              size="xs"
+              className={OUTLINE_ACTION}
+              onClick={() => {
+                if (item.ask_position === null) return;
+                void markTicketSeen(item.project_id, item.ticket_id, item.ask_position).then(() =>
+                  queryClient.invalidateQueries({ queryKey: ["inbox-ticket-requests"] }),
+                );
+              }}
+              componentId="inbox.ticket_cc.mark_read"
+            >
+              <CheckIcon className="size-3.5" /> Mark read
+            </Button>
+            <Button asChild size="xs" className={PRIMARY_ACTION}>
+              <Link to={ticketLocation(item, item.ask_position)} componentId="inbox.ticket_cc.open">
+                Open ticket <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
           </InboxActions>
         </InboxCard>
       );

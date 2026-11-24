@@ -281,3 +281,51 @@ async def test_an_approver_cannot_clear_what_only_the_owner_can_answer(multi_use
 
     assert await _requests(client, ALICE) == ["Owner question", "Risky feature"]
     assert await _requests(client, BOB) == []
+
+
+async def test_a_persons_cc_lists_the_ticket_in_a_members_inbox_until_read(
+    multi_user_client, db_uri
+):
+    client = multi_user_client
+    project = (
+        await client.post("/v1/projects", json={"name": "Cc"}, headers=_as_user(ALICE))
+    ).json()
+    shared = await client.post(
+        f"/v1/projects/{project['id']}/shares", json={"user_id": BOB}, headers=_as_user(ALICE)
+    )
+    assert shared.status_code == 200, shared.text
+    store = ProjectTicketStore(db_uri)
+    ticket = store.create(project["id"], CreateTicket(title="Export"), TicketActor(ALICE))
+    path = f"/v1/projects/{project['id']}/tickets/{ticket['id']}"
+
+    # An agent naming a person doesn't cc them; agents ask with needs-human instead.
+    store.comment(
+        project["id"],
+        ticket["id"],
+        CommentOnTicket(text="@Bob have a look"),
+        TicketActor(ALICE, uuid4().hex, uuid4().hex),
+    )
+    posted = await client.post(
+        f"{path}/comments", json={"text": "@Bob can you check the CSV?"}, headers=_as_user(ALICE)
+    )
+    assert posted.status_code == 201, posted.text
+
+    response = await client.get(PATH, headers=_as_user(BOB))
+    [entry] = response.json()["data"]
+    assert entry["reason"] == "cc" and entry["title"] == "Export"
+    assert entry["raised_by_user_id"] == ALICE
+    assert entry["question"] == "@Bob can you check the CSV?"
+    # The commenter isn't cc'd, and the cc is recorded on the comment for display.
+    assert await _requests(client, ALICE) == []
+    events = (await client.get(f"{path}/events", headers=_as_user(BOB))).json()["data"]
+    assert events[-1]["payload"]["cc"] == [{"user_id": BOB, "name": "Bob"}]
+    assert "mentions" not in events[-1]["payload"]
+
+    # Reading the ticket past the comment clears it.
+    seen = await client.put(
+        f"{path}/read-state",
+        json={"seen_position": entry["ask_position"]},
+        headers=_as_user(BOB),
+    )
+    assert seen.status_code == 200, seen.text
+    assert await _requests(client, BOB) == []

@@ -11,6 +11,8 @@ from omnigent.server.persona_mentions import (
     find_mentions,
     mention_message,
     mention_stable_id,
+    person_aliases,
+    split_mentions,
 )
 
 PM = Mention("pm", "PM")
@@ -23,6 +25,25 @@ def test_find_mentions_matches_whole_names_longest_first_and_dedupes() -> None:
     text = "cc @pm lead and @Orchestrator, again @PM; not a@pm.example or @PMs"
     assert find_mentions(text, PERSONAS) == [LEAD, ORCHESTRATOR, PM]
     assert find_mentions("no mentions here", PERSONAS) == []
+
+
+def test_people_match_by_id_local_part_and_unique_names_and_personas_win() -> None:
+    people = ["ann.lee@example.com", "ann.kim@example.com", "pm@example.com"]
+    candidates = [*PERSONAS, *person_aliases(people, PERSONAS)]
+    # "Ann" is shared, so only the full names match; "PM" stays the persona.
+    personas, cc = split_mentions(
+        find_mentions("@Ann Lee and @ann.kim, also @Ann and @PM", candidates)
+    )
+    assert personas == [PM]
+    assert cc == [
+        {"user_id": "ann.lee@example.com", "name": "Ann Lee"},
+        {"user_id": "ann.kim@example.com", "name": "Ann Kim"},
+    ]
+    # A unique first name and a full sign-in ID both match.
+    _, cc = split_mentions(
+        find_mentions("@Ann and @pm@example.com", [*person_aliases(people[:1], []), *person_aliases(people[2:], [])])
+    )
+    assert [entry["user_id"] for entry in cc] == ["ann.lee@example.com", "pm@example.com"]
 
 
 def test_rate_limiter_caps_wakes_per_persona_within_the_window() -> None:

@@ -6,6 +6,8 @@ works on, so a card opens the ticket rather than the worker's chat.
 A ticket's open ``needs-human`` ask goes to the people who must answer it (see
 :func:`omnigent.server.product_approval.human_request_routing`) and leaves every
 one of their Inboxes once any of them acts on the ticket or the label is removed.
+A person cc'd with ``@name`` in a comment gets a ``reason: "cc"`` entry until they
+read the ticket past that comment.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from fastapi import APIRouter, Query, Request
 
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.stores.project_ticket_store import ProjectTicketStore
+from omnigent.stores.project_ticket_store import HUMAN_REQUEST_MAX, ProjectTicketStore
 
 
 def create_ticket_requests_router(
@@ -28,7 +30,17 @@ def create_ticket_requests_router(
     @router.get("")
     async def list_ticket_requests(request: Request) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
-        return await asyncio.to_thread(store.human_requests, user_id=user_id)
+        asks, cc = await asyncio.gather(
+            asyncio.to_thread(store.human_requests, user_id=user_id),
+            asyncio.to_thread(store.ticket_cc, user_id=user_id),
+        )
+        # A cc is informational (reason "cc") and sorts in with the asks by time.
+        data = sorted([*asks["data"], *cc], key=lambda item: item["raised_at"], reverse=True)
+        return {
+            **asks,
+            "data": data[:HUMAN_REQUEST_MAX],
+            "has_more": asks["has_more"] or len(data) > HUMAN_REQUEST_MAX,
+        }
 
     @router.get("/sessions")
     async def list_session_tickets(

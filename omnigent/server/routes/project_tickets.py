@@ -47,6 +47,8 @@ from omnigent.server.persona_mentions import (
     PersonaMentionTargets,
     deliver_mentions,
     find_mentions,
+    person_aliases,
+    split_mentions,
 )
 from omnigent.server.project_landing import RISK_OK_LABEL, could_supersede, is_pure_rebase
 from omnigent.server.project_status_spend import project_total_cents
@@ -921,9 +923,21 @@ def create_project_tickets_router(
             request.app.state, "persona_mention_targets", None
         )
         project = mentions = None
+        cc: list[dict[str, str]] = []
         if targets is not None and body.kind == "comment" and "@" in body.text:
             project = await targets.project(project_id, who.user_id)
-            mentions = find_mentions(body.text, await targets.personas(project))
+            personas = await targets.personas(project)
+            # Only people cc people; agents ask a person with needs-human instead.
+            people = (
+                await targets.people(project)
+                if targets.people is not None and who.session_id is None and who.agent_id is None
+                else []
+            )
+            candidates = [
+                *personas,
+                *person_aliases([p for p in people if p != who.user_id], personas),
+            ]
+            mentions, cc = split_mentions(find_mentions(body.text, candidates))
         with _storage_errors():
             ticket = await asyncio.to_thread(
                 store.comment,
@@ -932,6 +946,7 @@ def create_project_tickets_router(
                 body,
                 who,
                 mentions=[{"id": entry.id, "name": entry.name} for entry in mentions or []],
+                cc=cc,
             )
         wake(request)
         if targets is not None and project is not None and mentions:

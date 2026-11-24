@@ -8,7 +8,9 @@ import {
   emphasizeMentions,
   insertMention,
   mentionQueryAt,
+  payloadCc,
   payloadMentions,
+  personDisplayName,
 } from "./personaMentions";
 
 vi.mock("@/lib/projectsApi", async (importOriginal) => ({
@@ -93,5 +95,19 @@ describe("MentionTextarea", () => {
     // The caret sits after the mention as soon as the value renders, not a frame later.
     expect([input.selectionStart, input.selectionEnd]).toEqual([13, 13]);
     expect(screen.queryByTestId("persona-mention-suggestions")).toBeNull();
+  });
+});
+
+describe("person cc", () => {
+  it("names a person from their sign-in ID like the server", () => {
+    expect(personDisplayName("ann.lee@example.com")).toBe("Ann Lee");
+    expect(personDisplayName("bob@example.com")).toBe("Bob");
+  });
+
+  it("reads only well-formed cc entries from a payload", () => {
+    expect(
+      payloadCc({ cc: [{ user_id: "bob@example.com", name: "Bob" }, { user_id: 3 }, "x"] }),
+    ).toEqual([{ user_id: "bob@example.com", name: "Bob" }]);
+    expect(payloadCc({})).toEqual([]);
   });
 });

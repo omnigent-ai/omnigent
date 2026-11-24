@@ -51,6 +51,59 @@ def find_mentions(text: str, personas: Sequence[Mention]) -> list[Mention]:
     return list(seen.values())
 
 
+# Mention ids for people carry this prefix, so they never collide with persona ids.
+PERSON_MENTION_PREFIX = "user:"
+_NAME_SPLIT = re.compile(r"[._\-+]+")
+
+
+def person_display_name(user_id: str) -> str:
+    """A readable name from a sign-in ID: ``ann.lee@example.com`` reads ``Ann Lee``."""
+    local = user_id.split("@", 1)[0]
+    words = [word for word in _NAME_SPLIT.split(local) if word]
+    return " ".join(word[:1].upper() + word[1:] for word in words) or user_id
+
+
+def person_aliases(people: Sequence[str], personas: Sequence[Mention]) -> list[Mention]:
+    """The ``@`` forms that name each person, as mentions with ``user:<id>`` ids.
+
+    Every person matches their full sign-in ID and its local part. Their display
+    name and first name match only when no other person or persona shares them;
+    a persona's name always wins.
+    """
+    taken = {persona.name.casefold() for persona in personas}
+    forms: dict[str, list[str]] = {}
+    for user_id in dict.fromkeys(people):
+        local = user_id.split("@", 1)[0]
+        display = person_display_name(user_id)
+        first = display.split(" ", 1)[0]
+        forms[user_id] = list(dict.fromkeys([user_id, local, display, first]))
+    owners: dict[str, set[str]] = {}
+    for user_id, names in forms.items():
+        for name in names:
+            owners.setdefault(name.casefold(), set()).add(user_id)
+    aliases: list[Mention] = []
+    for user_id, names in forms.items():
+        for name in names:
+            key = name.casefold()
+            if key in taken or len(owners[key]) > 1:
+                continue
+            aliases.append(Mention(PERSON_MENTION_PREFIX + user_id, name))
+    return aliases
+
+
+def split_mentions(found: Sequence[Mention]) -> tuple[list[Mention], list[dict[str, str]]]:
+    """Separate personas from people; people come back as ``{"user_id", "name"}``."""
+    personas: list[Mention] = []
+    people: dict[str, dict[str, str]] = {}
+    for mention in found:
+        if mention.id.startswith(PERSON_MENTION_PREFIX):
+            user_id = mention.id[len(PERSON_MENTION_PREFIX) :]
+            people.setdefault(user_id, {"user_id": user_id, "name": person_display_name(user_id)})
+        else:
+            personas.append(mention)
+    return personas, list(people.values())
+
+
 class MentionRateLimiter:
     """Sliding-window cap on agent-authored mention wakes per target persona."""
 
@@ -115,6 +168,8 @@ class PersonaMentionTargets:
     project: Callable[[str, str | None], Awaitable[Project]]
     personas: Callable[[Project], Awaitable[list[Mention]]]
     open: Callable[[Any, Project, Mention], Awaitable[str | None]]
+    # The owner and shared members' sign-in IDs; empty where nothing is shared.
+    people: Callable[[Project], Awaitable[list[str]]] | None = None
 
 
 def mention_stable_id(event_id: str, persona_id: str) -> str:

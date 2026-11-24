@@ -13,6 +13,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { insertMention, mentionQueryAt } from "./personaMentions";
 import { useProjectIdentities } from "./useProjectIdentities";
+import { useProjectPeople } from "./useProjectPeople";
 
 const MAX_SUGGESTIONS = 8;
 
@@ -22,7 +23,16 @@ type MentionTextareaProps = Omit<ComponentProps<typeof Textarea>, "value" | "onC
   onValueChange: (value: string) => void;
 };
 
-/** A textarea that offers the project's personas when the user types `@`. */
+/** One autocomplete row: a persona, or a project member to cc. */
+interface MentionOption {
+  key: string;
+  name: string;
+  insert: string;
+  detail?: string;
+  builtin?: boolean;
+}
+
+/** A textarea that offers the project's personas and members when the user types `@`. */
 export function MentionTextarea({
   projectId,
   value,
@@ -44,10 +54,32 @@ export function MentionTextarea({
     target.setSelectionRange(pendingCaret.current, pendingCaret.current);
     pendingCaret.current = null;
   }, [value]);
+  const personas = identities.data ?? [];
+  const people = useProjectPeople(
+    projectId,
+    personas.map((identity) => identity.name),
+  );
+  const options: MentionOption[] = [
+    ...personas.map((identity) => ({
+      key: `persona:${identity.id}`,
+      name: identity.name,
+      insert: identity.name,
+      builtin: identity.builtin,
+    })),
+    ...people.map((person) => ({
+      key: `person:${person.userId}`,
+      name: person.name,
+      insert: person.mention,
+      detail: person.userId,
+    })),
+  ];
   const needle = query?.query.toLowerCase() ?? "";
+  const matches = (option: MentionOption) =>
+    option.name.toLowerCase().includes(needle) ||
+    (option.detail?.toLowerCase().includes(needle) ?? false);
   const suggestions = query
-    ? (identities.data ?? [])
-        .filter((identity) => identity.name.toLowerCase().includes(needle))
+    ? options
+        .filter(matches)
         .sort(
           (a, b) =>
             Number(!a.name.toLowerCase().startsWith(needle)) -
@@ -83,7 +115,7 @@ export function MentionTextarea({
       if (event.key === "Enter" || event.key === "Tab") {
         event.preventDefault();
         event.stopPropagation();
-        choose(suggestions[Math.min(active, suggestions.length - 1)].name);
+        choose(suggestions[Math.min(active, suggestions.length - 1)].insert);
         return;
       }
       if (event.key === "Escape") {
@@ -122,14 +154,14 @@ export function MentionTextarea({
           <ul
             id={listId}
             role="listbox"
-            aria-label="Mention a persona"
+            aria-label="Mention a persona or person"
             data-testid="persona-mention-suggestions"
             style={listPosition(containerRef.current)}
             className="fixed z-50 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
           >
-            {suggestions.map((identity, index) => (
+            {suggestions.map((option, index) => (
               <li
-                key={identity.id}
+                key={option.key}
                 role="option"
                 aria-selected={index === active}
                 data-testid="persona-mention-option"
@@ -140,14 +172,19 @@ export function MentionTextarea({
                 // Keep focus in the textarea so the caret position survives the click.
                 onMouseDown={(event) => {
                   event.preventDefault();
-                  choose(identity.name);
+                  choose(option.insert);
                 }}
                 onMouseEnter={() => setActive(index)}
               >
-                <PersonaAvatar name={identity.name} size="xs" />
-                <span className="truncate">{identity.name}</span>
-                {identity.builtin && (
+                <PersonaAvatar name={option.name} size="xs" />
+                <span className="truncate">{option.name}</span>
+                {option.builtin && (
                   <span className="ml-auto text-xs text-muted-foreground">built in</span>
+                )}
+                {option.detail && (
+                  <span className="ml-auto truncate text-xs text-muted-foreground">
+                    {option.detail}
+                  </span>
                 )}
               </li>
             ))}

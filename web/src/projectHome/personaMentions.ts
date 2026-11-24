@@ -56,3 +56,29 @@ export function insertMention(
   const inserted = after.startsWith(" ") ? `@${name}` : `@${name} `;
   return { text: text.slice(0, start) + inserted + after, caret: start + name.length + 2 };
 }
+
+/** A person cc'd in a ticket comment, as the server records it. */
+export interface PersonCc {
+  user_id: string;
+  name: string;
+}
+
+/** A readable name from a sign-in ID, matching the server: `ann.lee@example.com` reads `Ann Lee`. */
+export function personDisplayName(userId: string): string {
+  const local = userId.split("@", 1)[0] ?? userId;
+  const words = local.split(/[._\-+]+/).filter(Boolean);
+  return words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ") || userId;
+}
+
+/** Read the people a comment cc'd from its event payload. */
+export function payloadCc(payload: Record<string, unknown>): PersonCc[] {
+  const raw = payload.cc;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (entry): entry is PersonCc =>
+      typeof entry === "object" &&
+      entry !== null &&
+      typeof (entry as PersonCc).user_id === "string" &&
+      typeof (entry as PersonCc).name === "string",
+  );
+}

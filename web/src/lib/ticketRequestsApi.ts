@@ -8,8 +8,11 @@ export interface TicketRequest {
   ticket_id: string;
   title: string;
   stage: { id: string; name: string };
-  /** `"product-ok"` for a feature awaiting a product approver; `"owner"` otherwise. */
-  reason: "product-ok" | "owner";
+  /**
+   * `"product-ok"` for a feature awaiting a product approver; `"owner"` for other asks;
+   * `"cc"` when a person cc'd the viewer in a comment they haven't read yet.
+   */
+  reason: "product-ok" | "owner" | "cc";
   /** Everyone the ask is routed to; any one of them answering clears it for all. */
   responders: string[];
   /** Activity position of the ask's question (or of the label change), to scroll to. */

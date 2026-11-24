@@ -66,6 +66,10 @@ TICKET_ACTIVITY_SESSION_MAX = 100
 TICKET_SUMMARY_SCAN_MAX = 1000
 # The Inbox lists at most this many open needs-human asks per viewer.
 HUMAN_REQUEST_MAX = 100
+# A cc stays in the Inbox until read, for at most this long.
+CC_WINDOW_SECONDS = 30 * 24 * 3600
+# Person-authored comments read per project when looking for cc's.
+CC_SCAN_MAX = 200
 # Outputs ride along with a comment, so only these kinds count as new activity.
 NEW_COMMENT_KINDS = (EVENT_CODES["comment"], EVENT_CODES["execution"])
 NEW_UPDATE_KINDS = (EVENT_CODES["created"], EVENT_CODES["updated"])
@@ -920,6 +924,84 @@ class ProjectTicketStore:
                 "is_complete": complete,
             }
 
+    def ticket_cc(self, *, user_id: str | None) -> builtins.list[dict[str, Any]]:
+        """Tickets where a person cc'd the viewer in a comment they haven't read yet.
+
+        One entry per ticket, for its newest such comment; opening the ticket past
+        it (its read marker) clears it.
+        """
+        if user_id is None or user_id == RESERVED_USER_LOCAL:
+            return []
+        event, ticket_row, read = SqlProjectTicketEvent, SqlProjectTicket, SqlProjectTicketRead
+        since = now_epoch() - CC_WINDOW_SECONDS
+        entries: dict[tuple[str, str], dict[str, Any]] = {}
+        with self._session("list_viewer_ticket_cc") as session:
+            projects = session.scalars(
+                select(SqlProject).where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id.in_(accessible_project_ids(user_id)),
+                )
+            ).all()
+            for project in projects:
+                rows = session.execute(
+                    select(event, ticket_row)
+                    .join(
+                        ticket_row,
+                        and_(
+                            ticket_row.workspace_id == event.workspace_id,
+                            ticket_row.project_id == event.project_id,
+                            ticket_row.id == event.ticket_id,
+                        ),
+                    )
+                    .outerjoin(
+                        read,
+                        and_(
+                            read.workspace_id == event.workspace_id,
+                            read.project_id == event.project_id,
+                            read.ticket_id == event.ticket_id,
+                            read.user_id == user_id,
+                        ),
+                    )
+                    .where(
+                        event.workspace_id == project.workspace_id,
+                        event.project_id == project.id,
+                        event.kind == EVENT_CODES["comment"],
+                        event.session_id.is_(None),
+                        event.agent_id.is_(None),
+                        event.user_id != user_id,
+                        event.created_at >= since,
+                        or_(read.seen_position.is_(None), event.position > read.seen_position),
+                    )
+                    .order_by(event.created_at.desc(), event.position.desc())
+                    .limit(CC_SCAN_MAX)
+                ).all()
+                stages = _stages(project)
+                for row, ticket in rows:
+                    cc = row.payload.get("cc")
+                    if not isinstance(cc, builtins.list) or not any(
+                        isinstance(entry, dict) and entry.get("user_id") == user_id
+                        for entry in cc
+                    ):
+                        continue
+                    key = (project.id, ticket.id)
+                    if key in entries:
+                        continue
+                    entries[key] = {
+                        "project_id": project.id,
+                        "project_name": project.name,
+                        "ticket_id": ticket.id,
+                        "title": ticket.title,
+                        "stage": _stage_snapshot(_stage(stages, _stage_id(ticket))),
+                        "reason": "cc",
+                        "responders": [user_id],
+                        "ask_position": row.position,
+                        "raised_at": row.created_at,
+                        "raised_by_session_id": None,
+                        "raised_by_user_id": row.user_id,
+                        "question": (row.payload.get("text") or "")[:500],
+                    }
+        return builtins.list(entries.values())
+
     def _open_human_request(
         self,
         session: Session,
@@ -1419,6 +1501,7 @@ class ProjectTicketStore:
         actor: TicketActor,
         *,
         mentions: builtins.list[dict[str, str]] | None = None,
+        cc: builtins.list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
@@ -1437,6 +1520,9 @@ class ProjectTicketStore:
             if mentions:
                 # The personas this comment cc'd, as {"id", "name"}; shown and delivered.
                 payload["mentions"] = mentions
+            if cc:
+                # The people this comment cc'd, as {"user_id", "name"}; listed in their Inbox.
+                payload["cc"] = cc
             answers_ask = body.kind == "comment" and self._answers_open_ask(
                 session, project, row, actor
             )

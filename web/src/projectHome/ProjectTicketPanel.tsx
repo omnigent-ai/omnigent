@@ -62,7 +62,7 @@ import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { SessionImage } from "@/components/SessionImage";
 import { MentionTextarea } from "./MentionTextarea";
 import { usePersonaForSession, useProjectPersonaLookup } from "./usePersonaSessions";
-import { payloadMentions } from "./personaMentions";
+import { payloadCc, payloadMentions, type PersonaMention } from "./personaMentions";
 import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketFileLinks } from "./TicketFileLinks";
 import {
@@ -701,7 +701,7 @@ function TicketCommentComposer({
           onPaste={images.onPaste}
           onDragOver={images.onDragOver}
           onDrop={images.onDrop}
-          placeholder="Add a comment… type @ to cc a persona"
+          placeholder="Add a comment… type @ to cc a persona or person"
         />
         <TicketImagePreviews upload={images} className="px-3" />
         {attaching && (
@@ -1072,6 +1072,14 @@ function TicketOutputLink({ output, inline = false }: { output: TicketOutput; in
   );
 }
 
+/** The personas and people a comment cc'd, shown together under it. */
+function commentMentions(payload: Record<string, unknown>): PersonaMention[] {
+  return [
+    ...payloadMentions(payload),
+    ...payloadCc(payload).map((person) => ({ id: `user:${person.user_id}`, name: person.name })),
+  ];
+}
+
 function ActivityChange({ event }: { event: TicketEvent }) {
   if (event.kind === "created") return <>created this ticket</>;
   if (event.kind === "output") {
@@ -1440,7 +1448,7 @@ function TicketActivityItem({
         {outputImage && <TicketArtifactImage output={outputImage} />}
         {body && (
           <TicketFileLinks sessionId={event.session_id ?? fallbackSessionId}>
-            <TicketCommentBody body={body} mentions={payloadMentions(event.payload)} />
+            <TicketCommentBody body={body} mentions={commentMentions(event.payload)} />
           </TicketFileLinks>
         )}
       </div>

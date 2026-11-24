@@ -1236,10 +1236,22 @@ def create_projects_router(
         identity, _ = await ensure_identity_session(request, project, mention.id)
         return identity.active_session_id
 
+    async def mention_people(project: Project) -> list[str]:
+        """The owner and shared members, who can be cc'd; none on a single-user server."""
+        if project.user_id is None or project.user_id == RESERVED_USER_LOCAL:
+            return []
+        shares = await asyncio.to_thread(
+            project_store.list_shares, project.id, user_id=project.user_id
+        )
+        return [project.user_id, *(share.user_id for share in shares)]
+
     if register_mention_targets is not None:
         register_mention_targets(
             PersonaMentionTargets(
-                project=_owned_project, personas=mention_personas, open=open_mention_session
+                project=_owned_project,
+                personas=mention_personas,
+                open=open_mention_session,
+                people=mention_people,
             )
         )
 
