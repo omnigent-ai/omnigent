@@ -950,6 +950,47 @@ def test_an_update_that_keeps_a_workflows_specifics_shows_them(workflow_id: str)
     assert saved in instructions
 
 
+_RUN = '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'
+
+
+@pytest.mark.parametrize(
+    ("prompt", "keeps"),
+    [
+        # The server, like the web form, trims only what JavaScript's trim removes.
+        (f"\x1c{_RUN}\n\nRead-only: make no changes", False),
+        (f"\N{ZERO WIDTH NO-BREAK SPACE}{_RUN}\n\nOnly the upload tests", True),
+        (f"<!-- omnigent-trigger v1 {{}} -->\n{_RUN}\n\nOnly the upload tests", True),
+    ],
+    ids=["unicode-separator", "byte-order-mark", "trigger-header"],
+)
+def test_an_update_says_what_the_server_keeps_of_the_prompt_it_sends(
+    prompt: str, keeps: bool
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+    from omnigent.server.scheduled.workflow_automations import saved_workflow_run
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "prompt": prompt,
+                    "permission_mode": None,
+                    "workflow_id": "fedcba9876543210fedcba9876543210",
+                },
+            },
+        }
+    )
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert ("keeping the specifics of the current prompt" in instructions) is keeps
+    assert ("whose instructions no longer run" in instructions) is not keeps
+    # The server keeps the current specifics exactly when it reads a run in that prompt.
+    assert (saved_workflow_run(prompt) is not None) is keeps
+
+
 def test_an_update_that_attaches_a_workflow_says_the_plain_prompt_stops_running() -> None:
     """A plain prompt has no specifics to keep: the server writes the workflow's in its place."""
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change

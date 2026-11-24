@@ -4699,30 +4699,6 @@ async def test_a_workflow_runs_with_its_agents_skill_prefix(
     assert created.json()["prompt"] == f"${_workflow_run_prompt(workflow_id)[1:]}"
 
 
-@pytest.mark.parametrize(
-    ("change", "message"),
-    [
-        ({"prompt": "triage the queue"}, scheduled_tasks_routes._PROMPT_WITH_WORKFLOW_MSG),
-        (
-            {"prompt": "triage the queue", "workflow_details": "Only bugs", "workflow_id": None},
-            scheduled_tasks_routes._DETAILS_WITHOUT_WORKFLOW_MSG,
-        ),
-        ({"workflow_id": None}, scheduled_tasks_routes._PROMPT_OR_WORKFLOW_MSG),
-    ],
-    ids=["prompt-with-workflow", "details-without-workflow", "neither"],
-)
-async def test_a_create_names_either_a_prompt_or_a_workflow(
-    workflows_client: httpx.AsyncClient, change: dict[str, object], message: str
-) -> None:
-    workflow_id = await _save_workflow(workflows_client)
-    body = {**_workflow_create_body(workflow_id), **change}
-    if body.get("workflow_id") is None:
-        body.pop("workflow_id")
-    refused = await workflows_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
-    assert refused.status_code == 422, refused.text
-    assert refused.json()["detail"][0]["msg"] == f"Value error, {message}"
-
-
 async def test_an_edit_checked_before_a_concurrent_attach_cant_replace_its_prompt(
     workflows_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

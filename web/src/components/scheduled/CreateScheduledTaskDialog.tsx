@@ -1123,6 +1123,11 @@ export function CreateScheduledTaskDialog({
     const stopsStoredWorkflow = editingTask?.workflowId ? { workflowId: null } : {};
     // A trigger runs its own prompt, so a schedule turned into one stops running the workflow.
     if (trigger !== null || isTriggerPrompt(freeTextPrompt)) return stopsStoredWorkflow;
+    // A prompt edited as text, with the Workflow field off or a run inside template text,
+    // saves as typed: the server stores the workflow it runs, or stops one it no longer does.
+    if (!workflowsEnabled || systemPrompt !== null) {
+      return parseSavedWorkflowMessage(effectivePrompt) === null ? stopsStoredWorkflow : {};
+    }
     if (workflowChoice === null) return stopsStoredWorkflow;
     const workflowDetails = keepsWorkflowDetails ? prompt.trim() : "";
     // Unchanged, so other edits save without the server loading the workflow, which may be gone.
@@ -1154,8 +1159,9 @@ export function CreateScheduledTaskDialog({
   const workflowIdSupported =
     workflowsEnabled && info !== "loading" && info.session_create_workflow_id === true;
   // The server stores the saved workflow a schedule runs and writes the prompt for it.
-  const scheduledWorkflowSupported =
-    workflowsEnabled && info !== "loading" && info.scheduled_task_workflow_id === true;
+  // Whether the server takes the workflow a schedule runs as itself, whether or not
+  // workflows are offered here.
+  const scheduledWorkflowSupported = info !== "loading" && info.scheduled_task_workflow_id === true;
   // The prompt when no trigger form is open: as typed, or an older trigger's instructions
   // inside its saved template text, whose creation call follows the workflow they run.
   const syncedFreeTextPrompt = syncTriggerWorkflowId(

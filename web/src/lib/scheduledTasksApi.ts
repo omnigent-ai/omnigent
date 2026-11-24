@@ -609,7 +609,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
     agent_id: input.agentId,
   };
   if (input.prompt !== undefined) body.prompt = input.prompt;
-  if (input.workflowId != null) body.workflow_id = input.workflowId;
+  if (input.workflowId) body.workflow_id = input.workflowId;
   if (input.workflowDetails) body.workflow_details = input.workflowDetails;
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride != null) body.model_override = input.modelOverride;

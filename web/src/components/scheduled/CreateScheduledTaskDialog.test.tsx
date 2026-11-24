@@ -7445,12 +7445,8 @@ describe("CreateScheduledTaskDialog workflow", () => {
     });
   });
 
-  it("reads a stored workflow from the task's fields, not its prompt's wording", async () => {
-    // A run message this client can't read back, for example from another harness.
-    const editingTask = {
-      ...storedWorkflowTask(),
-      prompt: "%workflow Run the saved workflow, then report back.",
-    };
+  it("reads a stored workflow run with another harness's skill prefix", async () => {
+    const editingTask = { ...storedWorkflowTask(), prompt: "$" + run("The upload tests").slice(1) };
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />, {
       info: STORED_WORKFLOW_INFO,
     });
@@ -7466,6 +7462,64 @@ describe("CreateScheduledTaskDialog workflow", () => {
     const edited = updateMutateAsync.mock.calls[0][0].input;
     expect(edited).not.toHaveProperty("workflowId");
     expect(edited.prompt).toBeUndefined();
+  });
+
+  it.each([
+    ["keeps an unchanged prompt's workflow", null],
+    ["stops the workflow when the prompt is replaced", "Summarize the day."],
+  ])("with workflows off, %s", async (_label, replacement) => {
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={storedWorkflowTask()} />,
+      { info: { scheduled_task_workflow_id: true } },
+    );
+    expect(screen.queryByTestId("task-workflow-trigger")).toBeNull();
+    if (replacement !== null) {
+      fireEvent.change(screen.getByTestId("task-prompt-input"), {
+        target: { value: replacement },
+      });
+    }
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    if (replacement === null) {
+      expect(edited).not.toHaveProperty("workflowId");
+      expect(edited.prompt).toBe(run("The upload tests"));
+    } else {
+      expect(edited).toMatchObject({ workflowId: null, prompt: replacement });
+    }
+  });
+
+  it("saves a workflow run inside template text as the whole prompt", async () => {
+    // Template text around the run that no trigger opening marks, so it saves as typed.
+    const wrapped = renderTriggerPrompt(
+      "jira",
+      {
+        event: "created",
+        scope: "ES",
+        conditions: [],
+        instructions: run("The upload tests"),
+        linkBack: true,
+      },
+      { placement: "same_host", sessionLink: "https://omni.example.com/c/CONVERSATION_ID" },
+    ).replace("and starts one Omnigent session", "and opens one Omnigent session");
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={{ ...storedWorkflowTask(), prompt: wrapped }}
+      />,
+      { info: STORED_WORKFLOW_INFO },
+    );
+    fireEvent.change(screen.getByLabelText("Additional instructions (optional)"), {
+      target: { value: "The download tests" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const edited = updateMutateAsync.mock.calls[0][0].input;
+    expect(edited).not.toHaveProperty("workflowId");
+    expect(edited.prompt).toBe(wrapped.replace("The upload tests", "The download tests"));
   });
 
   it("saves other edits to a stored workflow's schedule once the workflow is gone", async () => {
