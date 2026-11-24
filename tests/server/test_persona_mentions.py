@@ -100,4 +100,5 @@ def test_mention_message_links_the_ticket_and_names_the_author() -> None:
     assert "cc'd by session `s1`" in message
     assert "> line one\n> line two" in message
     assert "/projects/My%20project?ticket=t1" in message
+    assert "Don't link yourself to the ticket" in message
     assert len(mention_stable_id("e1", "pm")) == 32

@@ -93,7 +93,9 @@ def mention_message(
         f"{quoted}\n\n"
         f"Open it: {link}\n"
         "Read it with sys_ticket_get and act if it needs you; reply on the ticket with "
-        "sys_ticket_comment. If it doesn't need you, no reply is needed."
+        "sys_ticket_comment. If it doesn't need you, no reply is needed. Don't link "
+        "yourself to the ticket with sys_session_link_ticket unless you take on its work; "
+        "linked sessions receive every later comment on it."
     )
 
 
