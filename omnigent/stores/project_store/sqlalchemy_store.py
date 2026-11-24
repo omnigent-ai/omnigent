@@ -44,6 +44,7 @@ from omnigent.entities.project import (
     ProjectIdentity,
     ProjectShare,
 )
+from omnigent.entities.project_routing import choose_router
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
@@ -261,6 +262,20 @@ def _to_entity(row: SqlProject) -> Project:
         router_identity_id=_router_identity_id(row.config),
         lead_removed=_decode_config(row.config).get(LEAD_REMOVED_CONFIG_KEY) is True,
     )
+
+
+def router_session_id_for_row(session: Session, row: SqlProject) -> str | None:
+    """The session of the project's router (see ``choose_router``), read in *session*."""
+    identities = session.scalars(
+        select(SqlProjectIdentity)
+        .where(
+            SqlProjectIdentity.workspace_id == row.workspace_id,
+            SqlProjectIdentity.project_id == row.id,
+        )
+        .order_by(asc(SqlProjectIdentity.created_at), asc(SqlProjectIdentity.id))
+    )
+    personas = [_identity_entity(identity) for identity in identities]
+    return choose_router(_to_entity(row), personas).session_id
 
 
 def _encode_order(preference: ProjectOrderPreference) -> str:

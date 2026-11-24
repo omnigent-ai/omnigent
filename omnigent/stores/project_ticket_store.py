@@ -54,6 +54,7 @@ from omnigent.entities.project_ticket_legacy import legacy_ticket_notes
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.project_store.access import project_role
+from omnigent.stores.project_store.sqlalchemy_store import router_session_id_for_row
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 TICKET_ACTIVITY_SESSION_MAX = 100
@@ -115,8 +116,9 @@ def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
     }
 
 
-def _orchestrator_session_id(project: SqlProject) -> str | None:
-    return project.main_session_id or project.legacy_orchestrator_session_id
+def _orchestrator_session_id(session: Session, project: SqlProject) -> str | None:
+    """The project's router session: its Lead by default, or the owner's chosen persona."""
+    return router_session_id_for_row(session, project)
 
 
 def _author_audience(
@@ -362,7 +364,7 @@ class ProjectTicketStore:
         needs_human_changed: bool = False,
     ) -> None:
         own = actor.session_id is not None and actor.session_id == _orchestrator_session_id(
-            project
+            session, project
         )
         answered = False
         if not own and actor.session_id is not None and kind in _WORKER_REPLY_KINDS:
@@ -450,7 +452,7 @@ class ProjectTicketStore:
         if requested is not None:
             return requested
         audience = _author_audience(
-            actor.session_id, actor.agent_id, _orchestrator_session_id(project)
+            actor.session_id, actor.agent_id, _orchestrator_session_id(session, project)
         )
         if audience == "human" or adds_needs_human:
             return "human"
@@ -741,7 +743,7 @@ class ProjectTicketStore:
 
             # Only human-facing comments count; stage, label and other edits are routine.
             # Who a comment is for lives in its payload, so agent notes are filtered here.
-            orchestrator_session_id = _orchestrator_session_id(project)
+            orchestrator_session_id = _orchestrator_session_id(session, project)
             asks_by_ticket: dict[str, builtins.list[_HumanAsk]] = {}
             for row in session.scalars(
                 select(event)
@@ -1004,7 +1006,7 @@ class ProjectTicketStore:
         limit = max(1, min(limit, TICKET_PAGE_MAX))
         with self._session("list_ticket_events") as session:
             project = self._project(session, project_id, user_id)
-            orchestrator_session_id = _orchestrator_session_id(project)
+            orchestrator_session_id = _orchestrator_session_id(session, project)
             ticket = self._row(session, project_id, ticket_id)
             stmt = select(SqlProjectTicketEvent).where(
                 SqlProjectTicketEvent.workspace_id == current_workspace_id(),

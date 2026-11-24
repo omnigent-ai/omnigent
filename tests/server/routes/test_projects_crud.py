@@ -513,6 +513,26 @@ async def test_the_owner_routes_events_to_a_persona_and_can_remove_the_lead(
             headers={ORCHESTRATION_SOURCE_HEADER: session_id},
         )
         assert patched.status_code == status, (session_id, patched.text)
+    # The router's own comment is for the owner and isn't routed back to it.
+    for session_id in (qa["active_session_id"], pm["active_session_id"]):
+        posted = await project_client.post(
+            f"{project}/tickets/{ticket['id']}/comments",
+            json={"text": f"note from {session_id[:8]}"},
+            headers={ORCHESTRATION_SOURCE_HEADER: session_id},
+        )
+        assert posted.status_code == 201, posted.text
+    comments = (
+        await project_client.get(
+            f"{project}/tickets/{ticket['id']}/events", params={"kind": "comment"}
+        )
+    ).json()["data"]
+    assert [
+        (event["session_id"], event["payload"]["audience"], event["notification_pending"])
+        for event in comments[-2:]
+    ] == [
+        (qa["active_session_id"], "human", False),
+        (pm["active_session_id"], "agents", True),
+    ]
     # A client config replace keeps the server-owned routing settings.
     await project_client.patch(project, json={"config": {"model": "m"}})
     assert (await project_client.get(project)).json()["router"]["name"] == "QA"
