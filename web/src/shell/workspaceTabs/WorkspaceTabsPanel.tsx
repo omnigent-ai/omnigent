@@ -806,11 +806,6 @@ function WorkspaceTabsPanelImpl({
   }, [session]);
 
   const docsTab = knownTabs.find((tab) => tab.place.kind === "google-docs");
-  const docsTabId = docsTab?.id;
-  const registerDocsLeaveGuard = useCallback(
-    (guard: LeaveGuard) => (docsTabId ? session.registerLeaveGuard(docsTabId, guard) : () => {}),
-    [session, docsTabId],
-  );
 
   const renderTabContent = (tab: WorkspaceTab, selected: boolean): ReactNode => {
     const active = selected && open && !inert;
@@ -1252,7 +1247,6 @@ function WorkspaceTabsPanelImpl({
               sessionId={conversationId}
               permissionLevel={permissionLevel}
               visible={!pending && selectedTab?.place.kind === "google-docs" && open && !inert}
-              registerLeaveGuard={registerDocsLeaveGuard}
             />
           )}
           {pending ? (

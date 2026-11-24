@@ -116,15 +116,12 @@ it.each([false, true])(
 );
 
 it.each([false, true])(
-  "confirms explicit attachment before POST and reveals only after committed success (user=%s)",
+  "attaches without confirmation and reveals only after committed success (user=%s)",
   async (user) => {
     render(tree({ user }));
     const add = await screen.findByRole("button", { name: "Add to session" });
     const editor = screen.getByTitle("Google Docs editor");
-    vi.mocked(window.confirm).mockReturnValueOnce(false);
-    fireEvent.click(add);
-    expect(methods()).toEqual(["GET"]);
-    expect(reveal).not.toHaveBeenCalled();
+    vi.mocked(window.confirm).mockReturnValue(false);
     const saved = deferred<Response>();
     fetcher.mockImplementationOnce(() => saved.promise);
     fireEvent.click(add);
@@ -141,10 +138,12 @@ it.each([false, true])(
     expect(reveal).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("button", { name: "Open in Docs pane" }));
     expect(methods()).toEqual(["GET", "POST"]);
+    expect(window.confirm).not.toHaveBeenCalled();
   },
 );
 
 it("lets a reader open an already linked document ID and tab without a write", async () => {
+  vi.mocked(window.confirm).mockReturnValue(false);
   render(tree({ permission: 1, href: A.replace("t.one", "t.other") }));
   fireEvent.click(await screen.findByRole("button", { name: "Open in Docs pane" }));
   expect(screen.getByTitle("Google Docs editor")).toHaveAttribute(
@@ -153,6 +152,7 @@ it("lets a reader open an already linked document ID and tab without a write", a
   );
   expect(methods()).toEqual(["GET"]);
   expect(reveal).toHaveBeenCalledOnce();
+  expect(window.confirm).not.toHaveBeenCalled();
 });
 
 it.each([
@@ -170,7 +170,7 @@ it.each([
   expect(methods()).toEqual(["GET"]);
 });
 
-it("does not offer unlinked writes to readers or while membership is loading or failed", async () => {
+it("hides unlinked writes for initial loading, failures, and readers; retains the action during background refresh", async () => {
   const loading = deferred<Response>();
   fetcher.mockImplementationOnce(() => loading.promise);
   const view = render(tree());
@@ -180,18 +180,20 @@ it("does not offer unlinked writes to readers or while membership is loading or 
   );
   expect(screen.queryByRole("button", { name: "Add to session" })).toBeNull();
   fireEvent.focus(window);
-  await screen.findByRole("button", { name: "Add to session" });
+  const add = await screen.findByRole("button", { name: "Add to session" });
   const refreshing = deferred<Response>();
   fetcher.mockImplementationOnce(() => refreshing.promise);
   fireEvent.focus(window);
-  await waitFor(() => expect(screen.queryByRole("button", { name: "Add to session" })).toBeNull());
+  expect(screen.getByRole("button", { name: "Add to session" })).toBe(add);
   await act(async () => refreshing.resolve(response()));
+  expect(screen.getByRole("button", { name: "Add to session" })).toBe(add);
   view.rerender(tree({ permission: 1 }));
   expect(screen.queryByRole("button", { name: "Add to session" })).toBeNull();
   expect(methods().every((method) => method === "GET")).toBe(true);
 });
 
 it("shows failed explicit adds beside the chat link and leaves its editor hidden and unchanged", async () => {
+  vi.mocked(window.confirm).mockReturnValue(false);
   render(tree());
   const add = await screen.findByRole("button", { name: "Add to session" });
   const editor = screen.getByTitle("Google Docs editor");
@@ -201,7 +203,9 @@ it("shows failed explicit adds beside the chat link and leaves its editor hidden
   fireEvent.click(add);
   await screen.findByText("Cannot link document", { selector: "span" });
   expect(screen.getByTitle("Google Docs editor")).toBe(editor);
+  expect(editor).toHaveAttribute("src", A + "&embedded=true");
   expect(reveal).not.toHaveBeenCalled();
+  expect(window.confirm).not.toHaveBeenCalled();
 });
 
 it.each(["session", "backend", "unmount"])(

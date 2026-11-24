@@ -845,42 +845,44 @@ describe("a shell's tab", () => {
 });
 
 describe("shared Google Docs pane", () => {
-  it("retains its real iframe across tabs and guards cancelling and confirming tab close", async () => {
-    const id = "docs_tabs";
-    const url = "https://docs.google.com/document/d/example/edit";
-    vi.stubGlobal(
-      "fetch",
-      vi
-        .fn<typeof fetch>()
-        .mockImplementation(async (input) =>
-          String(input).includes("/session-documents")
-            ? Response.json({ session_id: id, entries: [{ document_url: url, added_at: 1 }] })
-            : Response.json({}),
-        ),
-    );
-    const session = workspaceTabsSession(id);
-    await session.store.open({ place: { kind: "google-docs" } }, { opener: "user" });
-    renderPanels([{ conversationId: id, googleDocs: true }]);
-    const editor = await screen.findByTitle("Google Docs editor");
-    const docs = session.store
-      .tabs()
-      .find((tab) => "place" in tab && tab.place.kind === "google-docs")!;
-    await act(async () => {
-      await session.store.open({ place: { kind: "files" } }, { opener: "user" });
-    });
-    expect(screen.getByTitle("Google Docs editor")).toBe(editor);
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-    await act(async () => {
-      await session.store.close(docs.id);
-    });
-    expect(session.store.tabs().some((tab) => tab.id === docs.id)).toBe(true);
-    expect(screen.getByTitle("Google Docs editor")).toBe(editor);
-    confirm.mockReturnValue(true);
-    await act(async () => {
-      await session.store.close(docs.id);
-    });
-    expect(screen.queryByTitle("Google Docs editor")).toBeNull();
-    confirm.mockRestore();
-    vi.unstubAllGlobals();
-  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it.each(["close", "replace"])(
+    "retains its real iframe across tabs and allows %s without confirmation",
+    async (action) => {
+      const id = `docs_tabs_${action}`;
+      const url = "https://docs.google.com/document/d/example/edit";
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn<typeof fetch>()
+          .mockImplementation(async (input) =>
+            String(input).includes("/session-documents")
+              ? Response.json({ session_id: id, entries: [{ document_url: url, added_at: 1 }] })
+              : Response.json({}),
+          ),
+      );
+      const session = workspaceTabsSession(id);
+      await session.store.open({ place: { kind: "google-docs" } }, { opener: "user" });
+      renderPanels([{ conversationId: id, googleDocs: true }]);
+      const editor = await screen.findByTitle("Google Docs editor");
+      const docs = session.store
+        .tabs()
+        .find((tab) => "place" in tab && tab.place.kind === "google-docs")!;
+      await act(async () => {
+        await session.store.open({ place: { kind: "files" } }, { opener: "user" });
+      });
+      expect(screen.getByTitle("Google Docs editor")).toBe(editor);
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      await act(async () => {
+        if (action === "close") await session.store.close(docs.id);
+        else await session.store.navigate(docs.id, { kind: "files" }, { replace: true });
+      });
+      if (action === "close")
+        expect(session.store.tabs().some((tab) => tab.id === docs.id)).toBe(false);
+      else expect(session.store.findTab(docs.id)).toMatchObject({ place: { kind: "files" } });
+      expect(screen.queryByTitle("Google Docs editor")).toBeNull();
+      expect(confirm).not.toHaveBeenCalled();
+    },
+  );
 });

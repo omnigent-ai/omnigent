@@ -1,6 +1,5 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { ExternalLink, MoreHorizontal, Plus, Trash2 } from "lucide-react";
-import { useGoogleDocsEditorLifecycle } from "@/components/GoogleDocsPane/editorLifecycle";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -19,21 +18,18 @@ import {
 import { classifyGoogleDocsUrl } from "@/lib/googleDocs";
 import { requestGoogleDocReview } from "@/lib/googleDocsRequests";
 import { GoogleDocsSessionProvider, useGoogleDocsSession } from "./GoogleDocsSessionContext";
-import type { LeaveGuard } from "./workspaceTabs/workspaceTabsSessions";
 
 export interface GoogleDocsWorkspacePaneProps {
   sessionId: string;
   visible?: boolean;
   permissionLevel?: number | null;
-  registerLeaveGuard?: (guard: LeaveGuard) => () => void;
 }
 const EDITOR_SANDBOX =
   "allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-modals";
 
-function PaneContent({ visible = true, registerLeaveGuard }: GoogleDocsWorkspacePaneProps) {
+function PaneContent({ visible = true }: GoogleDocsWorkspacePaneProps) {
   const state = useGoogleDocsSession()!;
-  const { displayed, entries, busy, canEdit, registerEditor } = state;
-  const editorOpen = displayed !== null;
+  const { displayed, entries, busy, canEdit } = state;
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const inputId = useId();
@@ -59,18 +55,6 @@ function PaneContent({ visible = true, registerLeaveGuard }: GoogleDocsWorkspace
       if (captured.isCurrent()) setReviewBusy(false);
     }
   }
-  useGoogleDocsEditorLifecycle(displayed !== null, state.sessionId);
-  useEffect(() => (editorOpen ? registerEditor() : undefined), [editorOpen, registerEditor]);
-  useEffect(() => {
-    if (!editorOpen || !registerLeaveGuard) return;
-    return registerLeaveGuard(async () =>
-      window.confirm(
-        "Close or replace the document editor? Check that Google Docs has saved your edits and comments before continuing.",
-      )
-        ? "leave"
-        : "cancel",
-    );
-  }, [editorOpen, registerLeaveGuard]);
   const active = entries.find((entry) => {
     const link = classifyGoogleDocsUrl(entry.documentUrl);
     return link.kind === "embed" && link.reference.documentId === displayed?.documentId;

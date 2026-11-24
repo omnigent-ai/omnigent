@@ -2,11 +2,14 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { initChatStore, useChatStore } from "@/store/chatStore";
 import { writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { resolveIdentity, setSessionHostResolver } from "@/lib/identity";
+import { Link, useNavigate } from "@/lib/routing";
 import { GoogleDocsWorkspacePane } from "./GoogleDocsWorkspacePane";
+import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import {
   GoogleDocsSessionProvider,
   useGoogleDocsSession,
@@ -90,6 +93,18 @@ function tree(id = sessionId, permission = 2, visible = true) {
     </GoogleDocsSessionProvider>
   );
 }
+function DocsRoute() {
+  const navigate = useNavigate();
+  return (
+    <>
+      {tree()}
+      <Link to="/settings">Settings</Link>
+      <button type="button" onClick={() => navigate("/c/other")}>
+        Other session
+      </button>
+    </>
+  );
+}
 beforeEach(() => {
   sessionId = `docs_${++sequence}`;
   entries = [
@@ -121,6 +136,53 @@ it("restores newest, preserves the original external URL, and retains the same h
   view.rerender(tree());
   expect(frame()).toBe(editor);
   expect(methods()).toEqual(["GET"]);
+});
+
+it.each(["Settings", "Other session"])(
+  "leaves the real Docs pane for %s without confirmation",
+  async (action) => {
+    vi.mocked(window.confirm).mockReturnValue(false);
+    render(
+      <MemoryRouter initialEntries={["/c/one"]}>
+        <Routes>
+          <Route path="/c/one" element={<DocsRoute />} />
+          <Route path="*" element={<p>Destination</p>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const editor = await screen.findByTitle("Google Docs editor");
+    fireEvent.click(screen.getByText(action));
+    expect(screen.getByText("Destination")).toBeVisible();
+    expect(editor).not.toBeInTheDocument();
+    expect(window.confirm).not.toHaveBeenCalled();
+  },
+);
+
+it("moves the real Docs pane between layouts without confirmation and retains its iframe", async () => {
+  vi.mocked(window.confirm).mockReturnValue(false);
+  const target = document.createElement("div");
+  document.body.appendChild(target);
+  const slot = (mobile: boolean) => (
+    <ResponsiveViewerSlot mobile={mobile} mobileTarget={target}>
+      {tree()}
+    </ResponsiveViewerSlot>
+  );
+  const view = render(slot(false));
+  try {
+    const editor = await screen.findByTitle("Google Docs editor");
+    for (const mobile of [true, false, true]) {
+      view.rerender(slot(mobile));
+      expect(target.contains(editor)).toBe(mobile);
+      expect(frame()).toBe(editor);
+      expect(editor).toHaveAttribute("src", canonicalA);
+      expect(screen.queryByRole("button", { name: "Move editor" })).not.toBeInTheDocument();
+    }
+    expect(methods()).toEqual(["GET"]);
+    expect(window.confirm).not.toHaveBeenCalled();
+  } finally {
+    view.unmount();
+    target.remove();
+  }
 });
 
 it("coalesces focus and picker refreshes while the initial collection is loading", async () => {
@@ -165,6 +227,7 @@ it("refreshes the open picker without a loading row or requests from internal fo
 });
 
 it("opens linked documents through the shared seam and dropdown without writing", async () => {
+  vi.mocked(window.confirm).mockReturnValue(false);
   render(tree(sessionId, 1));
   await screen.findByTitle("Google Docs editor");
   expect(screen.getByLabelText("B membership")).toHaveTextContent("linked");
@@ -179,16 +242,14 @@ it("opens linked documents through the shared seam and dropdown without writing"
   await user.click(await screen.findByRole("option", { name: A }));
   expect(frame()).toHaveAttribute("src", canonicalA);
   expect(methods().every((method) => method === "GET")).toBe(true);
+  expect(window.confirm).not.toHaveBeenCalled();
 });
 
-it("cancels add before POST and waits for committed add before navigating even when focus refreshes", async () => {
+it("adds without confirmation and waits for committed success before navigating even when focus refreshes", async () => {
   entries = entries.slice(0, 1);
   render(tree());
   const editor = await screen.findByTitle("Google Docs editor");
-  vi.mocked(window.confirm).mockReturnValueOnce(false);
-  fireEvent.click(screen.getByRole("button", { name: "Add B intent" }));
-  expect(methods()).toEqual(["GET"]);
-  expect(frame()).toBe(editor);
+  vi.mocked(window.confirm).mockReturnValue(false);
   const saved = deferred<Response>();
   fetchMock.mockImplementationOnce(() => saved.promise);
   fireEvent.click(screen.getByRole("button", { name: "Add B intent" }));
@@ -200,6 +261,7 @@ it("cancels add before POST and waits for committed add before navigating even w
   await act(async () => saved.resolve(response()));
   await waitFor(() => expect(frame()).toHaveAttribute("src", B + "&embedded=true"));
   await waitFor(() => expect(methods()).toEqual(["GET", "POST", "GET"]));
+  expect(window.confirm).not.toHaveBeenCalled();
 });
 
 it("keeps the shared entry unchanged while explicitly opening another tab of its document", async () => {
@@ -223,10 +285,16 @@ it("confirms active removal, retains its editor until DELETE succeeds, and never
   vi.mocked(window.confirm).mockReturnValueOnce(false);
   fireEvent.click(screen.getByRole("button", { name: "Remove document" }));
   expect(methods()).toEqual(["GET"]);
+  expect(frame()).toBe(editor);
+  expect(editor).toHaveAttribute("src", canonicalA);
+  expect(window.confirm).toHaveBeenCalledExactlyOnceWith(
+    "Remove this document from the shared session? The Google Doc will not be deleted.",
+  );
   const removed = deferred<Response>();
   fetchMock.mockImplementationOnce(() => removed.promise);
   fireEvent.click(screen.getByRole("button", { name: "Remove document" }));
   await waitFor(() => expect(methods()).toEqual(["GET", "DELETE"]));
+  expect(window.confirm).toHaveBeenCalledTimes(2);
   expect(frame()).toBe(editor);
   entries = entries.slice(1);
   await act(async () => removed.resolve(response()));
@@ -349,8 +417,9 @@ it.each(["session", "backend", "unmount", "return"])(
   },
 );
 
-it("adds from empty state with compact controls and registers/cleans up unload protection", async () => {
+it("adds from empty state with compact controls without beforeunload warnings", async () => {
   entries = [];
+  vi.mocked(window.confirm).mockReturnValue(false);
   const view = render(tree());
   await waitFor(() => expect(screen.queryByText("Loading session documents…")).toBeNull());
   expect(screen.queryByTitle("Google Docs editor")).toBeNull();
@@ -358,8 +427,11 @@ it("adds from empty state with compact controls and registers/cleans up unload p
   fireEvent.click(screen.getByRole("button", { name: "Add to session" }));
   await screen.findByTitle("Google Docs editor");
   const unload = new Event("beforeunload", { cancelable: true });
+  const preventDefault = vi.spyOn(unload, "preventDefault");
   window.dispatchEvent(unload);
-  expect(unload.defaultPrevented).toBe(true);
+  expect(unload.defaultPrevented).toBe(false);
+  expect(preventDefault).not.toHaveBeenCalled();
+  expect(window.confirm).not.toHaveBeenCalled();
   for (const name of [/Reload/, /Refresh history/, /Create/, /Close editor/])
     expect(screen.queryByRole("button", { name })).toBeNull();
   const user = userEvent.setup();

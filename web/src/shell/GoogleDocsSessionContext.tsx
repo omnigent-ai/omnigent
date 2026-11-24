@@ -9,7 +9,6 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { confirmGoogleDocsNavigation } from "@/components/GoogleDocsPane/editorLifecycle";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { classifyGoogleDocsUrl } from "@/lib/googleDocs";
@@ -53,7 +52,6 @@ export interface GoogleDocsSession {
   openLinked: (url: string) => boolean;
   remove: (entry: SessionDocumentEntry) => Promise<boolean>;
   retry: () => void;
-  registerEditor: () => () => void;
 }
 const Context = createContext<GoogleDocsSession | null>(null);
 export const useGoogleDocsSession = () => useContext(Context);
@@ -112,7 +110,6 @@ function SessionState({
   const read = useRef<SessionDocumentsRequest | null>(null);
   const selected = useRef(displayed);
   selected.current = displayed;
-  const editors = useRef(new Set<symbol>());
   if (boundScope !== scope) {
     setBoundScope(scope);
     setEntries([]);
@@ -191,19 +188,11 @@ function SessionState({
     };
   }, [refresh]);
 
-  const confirmOpen = useCallback(
-    (next: DisplayedDocument) =>
-      !editors.current.size ||
-      selected.current?.canonicalUrl === next.canonicalUrl ||
-      confirmGoogleDocsNavigation("Switch document"),
-    [],
-  );
   const confirmRemove = useCallback(
     (id: string) =>
       selected.current?.documentId !== id ||
-      !editors.current.size ||
-      confirmGoogleDocsNavigation(
-        "Remove document from this session and close its editor (the Google Doc will not be deleted)",
+      window.confirm(
+        "Remove this document from the shared session? The Google Doc will not be deleted.",
       ),
     [],
   );
@@ -268,7 +257,6 @@ function SessionState({
       if (!editable.current || busyRef.current || !current()) return false;
       try {
         const next = reference(url);
-        if (!confirmOpen(next)) return false;
         const pending = failure.current;
         const request =
           pending?.open?.canonicalUrl === next.canonicalUrl
@@ -281,20 +269,19 @@ function SessionState({
         return false;
       }
     },
-    [current, confirmOpen, sessionId, perform],
+    [current, sessionId, perform],
   );
   const openLinked = useCallback(
     (url: string): boolean => {
       if (busyRef.current || !current() || membership(url) !== "linked") return false;
       const next = reference(url);
-      if (!confirmOpen(next)) return false;
       restored.current = true;
       setDisplayed(next);
       setError(null);
       reveal.current?.(current);
       return true;
     },
-    [current, membership, confirmOpen],
+    [current, membership],
   );
   const remove = useCallback(
     async (entry: SessionDocumentEntry): Promise<boolean> => {
@@ -319,21 +306,9 @@ function SessionState({
       void refresh();
       return;
     }
-    if (
-      !editable.current ||
-      (pending.open && !confirmOpen(pending.open)) ||
-      (pending.remove && !confirmRemove(pending.remove))
-    )
-      return;
+    if (!editable.current || (pending.remove && !confirmRemove(pending.remove))) return;
     void perform({ ...pending, request: pending.request.retry() });
-  }, [current, refresh, confirmOpen, confirmRemove, perform]);
-  const registerEditor = useCallback(() => {
-    const token = Symbol();
-    editors.current.add(token);
-    return () => {
-      editors.current.delete(token);
-    };
-  }, []);
+  }, [current, refresh, confirmRemove, perform]);
   const value = useMemo<GoogleDocsSession>(
     () => ({
       sessionId,
@@ -352,7 +327,6 @@ function SessionState({
       openLinked,
       remove,
       retry,
-      registerEditor,
     }),
     [
       sessionId,
@@ -371,7 +345,6 @@ function SessionState({
       openLinked,
       remove,
       retry,
-      registerEditor,
     ],
   );
   return <Context.Provider value={value}>{children}</Context.Provider>;

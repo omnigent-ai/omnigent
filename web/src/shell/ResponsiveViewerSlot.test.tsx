@@ -5,7 +5,7 @@ import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 
 afterEach(cleanup);
 
-it("retains a conditionally mounted target until an accepted move has completed", () => {
+it("retains a conditionally mounted target until the move completes without confirmation", () => {
   function Host({ mobile }: { mobile: boolean }) {
     const [target, setTarget] = useState<HTMLDivElement | null>(null);
     const [placedInDrawer, setPlacedInDrawer] = useState(false);
@@ -26,31 +26,16 @@ it("retains a conditionally mounted target until an accepted move has completed"
       </>
     );
   }
-  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
   const view = render(<Host mobile />);
   const frame = screen.getByTitle("Conditional editor");
   const host = frame.parentElement!;
   const append = vi.spyOn(Node.prototype, "appendChild");
   const ancestor = screen.getByTestId("drawer-ancestor");
   expect(ancestor).toContainElement(frame);
-  confirm.mockClear();
-  confirm.mockImplementation(() => {
-    expect(frame).toBeInTheDocument();
-    return false;
-  });
   view.rerender(<Host mobile={false} />);
-  expect(confirm).toHaveBeenCalledOnce();
-  expect(ancestor).toBeInTheDocument();
-  expect(ancestor).toContainElement(frame);
-  expect(ancestor).not.toContainElement(screen.getByRole("button", { name: "Move editor" }));
-  expect(append.mock.calls.filter(([child]) => child === host)).toHaveLength(0);
-  confirm.mockClear();
-  confirm.mockImplementation(() => {
-    expect(frame).toBeInTheDocument();
-    return true;
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Move editor" }));
-  expect(confirm).toHaveBeenCalledOnce();
+  expect(confirm).not.toHaveBeenCalled();
+  expect(screen.queryByRole("button", { name: "Move editor" })).not.toBeInTheDocument();
   expect(append.mock.calls.filter(([child]) => child === host)).toHaveLength(1);
   expect(ancestor).not.toBeInTheDocument();
   expect(screen.getByTitle("Conditional editor")).toBe(frame);
@@ -59,7 +44,7 @@ it("retains a conditionally mounted target until an accepted move has completed"
   confirm.mockRestore();
 });
 
-it("confirms moving a Google Docs iframe and keeps it in place on cancel until explicitly retried", () => {
+it("moves a Google Docs iframe between layouts without confirmation or retry", () => {
   const target = document.createElement("div");
   document.body.appendChild(target);
   const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
@@ -70,13 +55,14 @@ it("confirms moving a Google Docs iframe and keeps it in place on cancel until e
   );
   const view = render(slot(false));
   const frame = screen.getByTitle("Docs moving editor");
-  view.rerender(slot(true));
-  expect(target).not.toContainElement(frame);
-  expect(target).toContainElement(screen.getByRole("button", { name: "Move editor" }));
-  expect(frame).toBeInTheDocument();
-  confirm.mockReturnValue(true);
-  fireEvent.click(screen.getByRole("button", { name: "Move editor" }));
-  expect(target).toContainElement(frame);
+  for (const mobile of [true, false, true]) {
+    view.rerender(slot(mobile));
+    expect(target.contains(frame)).toBe(mobile);
+    expect(screen.getByTitle("Docs moving editor")).toBe(frame);
+    expect(frame).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Move editor" })).not.toBeInTheDocument();
+  }
+  expect(confirm).not.toHaveBeenCalled();
   view.unmount();
   target.remove();
   confirm.mockRestore();

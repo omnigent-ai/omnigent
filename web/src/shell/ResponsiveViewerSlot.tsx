@@ -1,7 +1,5 @@
 import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { confirmGoogleDocsNavigation } from "@/components/GoogleDocsPane/editorLifecycle";
-import { Button } from "@/components/ui/button";
 
 const FILL_HOST = "flex min-h-0 flex-1 flex-col overflow-hidden";
 const FILL_TARGET = "flex min-h-0 flex-1 flex-col";
@@ -26,8 +24,6 @@ export function ResponsiveViewerSlot({
 }) {
   const desktopTarget = useRef<HTMLDivElement>(null);
   const focusedElement = useRef<HTMLElement | null>(null);
-  const [moveBlocked, setMoveBlocked] = useState(false);
-  const [moveAttempt, setMoveAttempt] = useState(0);
   // The layout is fixed for the slot's life, as the host is.
   const [host] = useState(() => {
     const element = document.createElement("div");
@@ -62,20 +58,9 @@ export function ResponsiveViewerSlot({
     const target = mobile && mobileTarget ? mobileTarget : desktopTarget.current;
     if (!target) return;
     if (host.parentElement === target) {
-      setMoveBlocked(false);
       onPlacementChange?.(mobile && mobileTarget !== null);
       return;
     }
-    // Reparenting an existing iframe can reload its cross-origin browsing context.
-    if (
-      host.parentElement &&
-      host.querySelector("iframe[data-google-docs-editor]") &&
-      !confirmGoogleDocsNavigation("Move the document editor to another layout")
-    ) {
-      setMoveBlocked(true);
-      return;
-    }
-    setMoveBlocked(false);
     // Reparenting can clear focus and the native selection even though React
     // keeps the editor instance. Preserve both once for the layout transition.
     const activeElement = document.activeElement;
@@ -121,24 +106,13 @@ export function ResponsiveViewerSlot({
         savedSelection.focusOffset,
       );
     }
-  }, [host, mobile, mobileTarget, moveAttempt, onPlacementChange]);
+  }, [host, mobile, mobileTarget, onPlacementChange]);
 
   useLayoutEffect(() => () => host.remove(), [host]);
 
-  const retryMove = moveBlocked && (
-    <div role="status" className="p-3 text-sm">
-      Google Docs is still open in the previous layout. Check that it has saved before moving.
-      <Button size="sm" variant="outline" onClick={() => setMoveAttempt((value) => value + 1)}>
-        Move editor
-      </Button>
-    </div>
-  );
   return (
     <>
-      <div ref={desktopTarget} className={layout === "contents" ? "contents" : FILL_TARGET}>
-        {!mobile && retryMove}
-      </div>
-      {mobile && mobileTarget && retryMove && createPortal(retryMove, mobileTarget)}
+      <div ref={desktopTarget} className={layout === "contents" ? "contents" : FILL_TARGET} />
       {createPortal(children, host)}
     </>
   );

@@ -1,12 +1,12 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { useGoogleDocsEditorLifecycle } from "@/components/GoogleDocsPane/editorLifecycle";
+import { useEffect } from "react";
 import { Link, useLocation, useNavigate } from "./routing";
 import { registerRouteLeaveGuard } from "./routeLeaveGuards";
 
 function EditorRoute() {
-  useGoogleDocsEditorLifecycle(true);
+  useEffect(() => registerRouteLeaveGuard(() => window.confirm("Leave the pending editor?")), []);
   const navigate = useNavigate();
   const location = useLocation();
   return (
