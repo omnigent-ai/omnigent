@@ -339,6 +339,26 @@ def test_picker_row_matches_complete_display_label(
     assert cursor_native_bridge._picker_row_matches_display(row, display_name) is expected
 
 
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        ("→ /model model-a\n →  Model A   High", None),
+        ('→ /model model-a\nModels matching "model-a"\n   Model A', None),
+        ('→ /model model-a\nModels matching "model-a"\n →  Model A   High', "Model A   High"),
+        (
+            'Models matching "model-a"\n →  Model A\nModels matching "model-b"\n →  Model B',
+            "Model B",
+        ),
+    ],
+    ids=["no-header", "no-highlight-below-header", "composer-above-header", "last-header-wins"],
+)
+def test_picker_highlighted_row_reads_below_the_last_header(
+    pane: str, expected: str | None
+) -> None:
+    """Only a highlighted row under the latest picker header counts."""
+    assert cursor_native_bridge._picker_highlighted_row(pane) == expected
+
+
 class TestHooksConfig:
     """The ``hooks.json`` that registers cursor's per-turn usage ``stop`` hook."""
 
