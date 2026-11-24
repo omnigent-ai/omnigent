@@ -58,7 +58,7 @@ import {
   fileContentToBlob,
   type useFileContent,
 } from "@/hooks/useFileContent";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceImage";
@@ -578,7 +578,7 @@ export function CodeViewer({
   onRequestEditMode,
   attachToAgent = false,
 }: CodeViewerProps) {
-  const canEdit = useCanEdit(conversationId);
+  const canEdit = useCanComment(conversationId);
   const activeCommentId = activeSelection?.comment_id;
   const previewComments = useMemo(
     () => [...comments, ...addressedComments.filter((c) => c.id === activeCommentId)],

@@ -4676,6 +4676,7 @@ def create_app(
                         ticket_store,
                         file_store,
                         artifact_store,
+                        comment_store=comment_store,
                         auth_provider=auth_provider,
                     ),
                     prefix="/v1",

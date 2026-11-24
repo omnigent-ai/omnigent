@@ -22,7 +22,7 @@ import type { Transaction } from "@tiptap/pm/state";
 import type { Node } from "@tiptap/pm/model";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment, useCanEdit } from "@/hooks/usePermissions";
 import { useSessionActive } from "@/hooks/useWorkspaceChangedFiles";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { useFileViewer } from "./FileViewerContext";
@@ -241,6 +241,7 @@ function MarkdownRichTextViewerInner({
   searchInputRef,
   setContentRef,
 }: InnerProps) {
+  const canComment = useCanComment(conversationId);
   const openFile = useFileViewer();
   const [isCopied, setIsCopied] = useState(false);
   const copyTimeoutRef = useRef<number>(0);
@@ -605,7 +606,7 @@ function MarkdownRichTextViewerInner({
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
         pendingBodyRef={pendingBodyRef}
-        canEdit={canEdit}
+        canEdit={canComment}
       />
     </div>
   );

@@ -19,6 +19,7 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
+import { commentsApiBase, parseProjectFileScope } from "@/lib/projectFileScope";
 
 export interface Comment {
   id: string;
@@ -57,8 +58,8 @@ export async function fetchComments(
   signal?: AbortSignal,
 ): Promise<Comment[]> {
   const url = path
-    ? `/v1/sessions/${encodeURIComponent(sessionId)}/comments?path=${encodeURIComponent(path)}`
-    : `/v1/sessions/${encodeURIComponent(sessionId)}/comments`;
+    ? `${commentsApiBase(sessionId)}/comments?path=${encodeURIComponent(path)}`
+    : `${commentsApiBase(sessionId)}/comments`;
   const pageUrl = `${url}${path ? "&" : "?"}include_pr_comments=true&limit=100`;
   const comments: Comment[] = [];
   let cursor: string | null = null;
@@ -111,7 +112,7 @@ export async function createComment(
   payload: AddCommentPayload,
 ): Promise<Comment> {
   const response = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/comments`,
+    `${commentsApiBase(sessionId)}/comments`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -142,7 +143,7 @@ export async function createComment(
 
 async function deleteComment(sessionId: string, commentId: string): Promise<void> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
+    `${commentsApiBase(sessionId)}/comments/${encodeURIComponent(commentId)}`,
     { method: "DELETE" },
   );
   if (!res.ok && res.status !== 404) throw new Error(`${res.status} ${res.statusText}`);
@@ -187,7 +188,7 @@ export function useUpdateComment(sessionId: string) {
     mutationFn: async (payload: { commentId: string; status?: string; body?: string }) => {
       const { commentId, ...fields } = payload;
       const res = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
+        `${commentsApiBase(sessionId)}/comments/${encodeURIComponent(commentId)}`,
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
@@ -196,7 +197,11 @@ export function useUpdateComment(sessionId: string) {
       );
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       const comment: Comment = await res.json();
-      if (comment.id !== commentId || comment.conversation_id !== sessionId) {
+      if (
+        comment.id !== commentId ||
+        // A project file's comments carry its file ID, not the client scope ID.
+        (comment.conversation_id !== sessionId && !parseProjectFileScope(sessionId))
+      ) {
         throw new Error(
           "This server returned a different comment. Your attached context is unchanged.",
         );
@@ -228,7 +233,7 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
   return useMutation({
     mutationFn: async (payload: { comment_ids: string[]; instruction?: string }) => {
       const res = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(sessionId)}/comments/send`,
+        `${commentsApiBase(sessionId)}/comments/send`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

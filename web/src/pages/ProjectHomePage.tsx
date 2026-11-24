@@ -21,7 +21,8 @@ import { ProjectSessionPanel } from "@/projectHome/ProjectSessionPanel";
 import { ProjectTicketBoard } from "@/projectHome/ProjectTicketBoard";
 import { ProjectTicketPanel } from "@/projectHome/ProjectTicketPanel";
 import { ProjectOrchestrator } from "@/projectHome/ProjectOrchestrator";
-import { useProjectTicketsEnabled } from "@/projectHome/useProjectTickets";
+import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
+import { useProjectTicketsEnabled, useTicketProject } from "@/projectHome/useProjectTickets";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 
 const SESSION_PANEL_DEFAULT_WIDTH_VW = 40;
@@ -54,6 +55,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
   const hideBoard = (isMobile && hasPanel) || ticketFillsPage;
   useEffect(() => setTicketExpanded(false), [projectName, panelTicketId]);
   const replaceSearchParams = useReplaceSearchParams();
+  const { projectId } = useTicketProject(projectName);
   const closePanel = useCallback(() => {
     setTicketExpanded(false);
     const next = new URLSearchParams(searchParams);
@@ -108,6 +110,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
+      <ProjectFileViewerHost projectId={projectId} />
       {/* Only the lanes and the panel scroll; the page stays put. */}
       <PageScroll
         className="overflow-hidden"

@@ -395,8 +395,16 @@ const INLINE_FILE_TYPES = new Set([
   "text/plain",
 ]);
 
-/** Fetch a project file with the viewer's credentials, then preview or download it. */
+/** Dispatched on `window` to open a project file in the project page's viewer. */
+export const OPEN_PROJECT_FILE_EVENT = "omnigent:open-project-file";
+
+/** Open a project file in the project page's viewer, else preview or download it. */
 export async function openProjectFile(contentPath: string, filename: string): Promise<void> {
+  const openRequest = new CustomEvent(OPEN_PROJECT_FILE_EVENT, {
+    cancelable: true,
+    detail: { contentPath },
+  });
+  if (!window.dispatchEvent(openRequest)) return;
   const response = await authenticatedFetch(contentPath);
   if (!response.ok) throw await apiErrorFromResponse(response);
   const blob = await response.blob();

@@ -10,17 +10,21 @@ same rows.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, Form, Request, Response, UploadFile
 
+from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.entities import StoredFile
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import AuthProvider
-from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._auth_helpers import attribution_user, require_user
+from omnigent.server.routes.comments import AddCommentRequest, UpdateCommentRequest
 from omnigent.server.routes.project_ticket_attachments import PROJECT_METADATA_KEY
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
@@ -78,8 +82,10 @@ def create_project_files_router(
     file_store: FileStore,
     artifact_store: ArtifactStore,
     *,
+    comment_store: CommentStore | None = None,
     auth_provider: AuthProvider | None = None,
 ) -> APIRouter:
+    """Project file routes. A file's review comments use the file ID as their conversation key."""
     router = APIRouter(prefix="/projects/{project_id}/files")
 
     async def require_project(request: Request, project_id: str) -> str:
@@ -175,9 +181,85 @@ def create_project_files_router(
         project = await require_project(request, project_id)
         stored = await project_file(project, file_id)
         await asyncio.to_thread(file_store.delete, stored.id)
+        if comment_store is not None:
+            await asyncio.to_thread(comment_store.remove_conversation, stored.id)
         blob_key = stored.blob_key or stored.id
         if await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key):
             await asyncio.to_thread(artifact_store.delete, blob_key)
         return Response(status_code=204)
 
+    if comment_store is not None:
+        _add_comment_routes(router, comment_store, require_project, project_file, auth_provider)
     return router
+
+
+def _add_comment_routes(
+    router: APIRouter,
+    comments: CommentStore,
+    require_project: Any,
+    project_file: Any,
+    auth_provider: AuthProvider | None,
+) -> None:
+    """Review comments on a project file, in the session comments wire format."""
+
+    async def owned_file(request: Request, project_id: str, file_id: str) -> str:
+        project = await require_project(request, project_id)
+        return (await project_file(project, file_id)).id
+
+    @router.get("/{file_id}/comments")
+    async def list_project_file_comments(
+        request: Request, project_id: str, file_id: str, path: str | None = None
+    ) -> dict[str, Any]:
+        key = await owned_file(request, project_id, file_id)
+        rows = await asyncio.to_thread(comments.list_for_conversation, key, path=path)
+        return {"comments": [asdict(row) for row in rows], "next_cursor": None}
+
+    @router.post("/{file_id}/comments")
+    async def add_project_file_comment(
+        request: Request, project_id: str, file_id: str, body: AddCommentRequest
+    ) -> dict[str, Any]:
+        key = await owned_file(request, project_id, file_id)
+        if body.anchor_metadata is not None:
+            raise OmnigentError(
+                "Project files take text comments only", code=ErrorCode.INVALID_INPUT
+            )
+        comment = await asyncio.to_thread(
+            comments.add,
+            conversation_id=key,
+            path=body.path,
+            body=body.body,
+            start_index=body.start_index,
+            end_index=body.end_index,
+            anchor_content=body.anchor_content,
+            created_by=attribution_user(require_user(request, auth_provider)),
+        )
+        return asdict(comment)
+
+    @router.patch("/{file_id}/comments/{comment_id}")
+    async def update_project_file_comment(
+        request: Request,
+        project_id: str,
+        file_id: str,
+        comment_id: str,
+        body: UpdateCommentRequest,
+    ) -> dict[str, Any]:
+        key = await owned_file(request, project_id, file_id)
+        if body.status is not None and body.status not in COMMENT_STATUS:
+            raise OmnigentError(
+                f"status must be one of {sorted(COMMENT_STATUS)}", code=ErrorCode.INVALID_INPUT
+            )
+        updated = await asyncio.to_thread(
+            comments.update_comment, comment_id, key, status=body.status, body=body.body
+        )
+        if updated is None:
+            raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
+        return asdict(updated)
+
+    @router.delete("/{file_id}/comments/{comment_id}", status_code=204)
+    async def delete_project_file_comment(
+        request: Request, project_id: str, file_id: str, comment_id: str
+    ) -> Response:
+        key = await owned_file(request, project_id, file_id)
+        if await asyncio.to_thread(comments.delete, comment_id, key) is None:
+            raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
+        return Response(status_code=204)

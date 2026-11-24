@@ -27,7 +27,7 @@ import {
   subscribeCodeFont,
 } from "@/lib/codeFontPreferences";
 import type { Comment } from "@/hooks/useComments";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment, useCanEdit } from "@/hooks/usePermissions";
 import { detectLang, type ActiveSelection, type SaveStatus } from "./codeViewerHelpers";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useMonacoFilePosition } from "./useMonacoFilePosition";
@@ -251,6 +251,7 @@ function MonacoCodeEditorInner({
   pendingBodyRef,
   attachToAgent,
 }: InnerProps) {
+  const canComment = useCanComment(conversationId) && !truncated;
   const lang = detectLang(path);
   const monacoTheme = resolvedThemeToMonaco(useResolvedThemeMode());
 
@@ -481,7 +482,7 @@ function MonacoCodeEditorInner({
     comments,
     activeSelection,
     onSetActiveSelection,
-    canComment: canEdit && !isDirty,
+    canComment: canComment && !isDirty,
     pendingBodyRef,
     path,
     attachToAgent,

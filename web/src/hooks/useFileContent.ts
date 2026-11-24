@@ -16,6 +16,11 @@ import { readFileViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
+  parseProjectFileScope,
+  projectFileApiPath,
+  type ProjectFileScope,
+} from "@/lib/projectFileScope";
+import {
   browseLocationBase,
   browseLocationSegment,
   useWorkspaceServeable,
@@ -191,7 +196,10 @@ function clickDownloadLink(href: string, filename: string): void {
  * :param path: Workspace-relative file path, e.g. ``"src/main.py"``.
  */
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
-  const url = workspaceFileUrl(conversationId, path, { download: "true" });
+  const projectFile = parseProjectFileScope(conversationId);
+  const url = projectFile
+    ? `${projectFileApiPath(projectFile)}/content`
+    : workspaceFileUrl(conversationId, path, { download: "true" });
   const filename = path.split("/").pop() ?? path;
   if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell()) {
     // A direct anchor navigation, so it must carry the deployment subpath the
@@ -205,6 +213,41 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
   const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   triggerBrowserDownload(await res.blob(), filename);
+}
+
+const TEXT_CONTENT_TYPES = new Set(["application/json", "application/xml", "image/svg+xml"]);
+
+/** A project file's bytes in the viewer's file-content envelope. */
+export async function fetchProjectFileContent(
+  scope: ProjectFileScope,
+  path: string,
+  signal?: AbortSignal,
+): Promise<FileContentResponse> {
+  const res = await authenticatedFetch(`${projectFileApiPath(scope)}/content`, { signal });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const contentType = res.headers.get("Content-Type")?.split(";", 1)[0].trim() || null;
+  const buffer = await res.arrayBuffer();
+  const isText =
+    !!contentType && (contentType.startsWith("text/") || TEXT_CONTENT_TYPES.has(contentType));
+  let content: string;
+  if (isText) {
+    content = new TextDecoder().decode(buffer);
+  } else {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+    }
+    content = btoa(binary);
+  }
+  return {
+    object: "session.environment.filesystem.file_content",
+    path,
+    content_type: contentType,
+    encoding: isText ? "utf-8" : "base64",
+    content,
+    bytes: buffer.byteLength,
+  };
 }
 
 /** How often an on-screen text file is re-read to show other writers' edits. */
@@ -274,6 +317,7 @@ export function useFileContent(
   // asleep. `false` only when neither source can answer.
   const serveable = useWorkspaceServeable(serverId);
   const queryClient = useQueryClient();
+  const projectFile = parseProjectFileScope(conversationId);
 
   const prevRef = useRef<{ id: string | undefined; active: boolean; visible: boolean }>({
     id: serverId,
@@ -294,20 +338,23 @@ export function useFileContent(
   }, [serverId, path, sessionActive, visible, queryClient]);
 
   return useQuery({
-    queryKey: ["file-content", serverId, path],
+    queryKey: ["file-content", serverId ?? conversationId, path],
     queryFn: async ({ signal }) => {
+      // Project files are immutable uploads, so they skip the workspace's write and poll cycle.
+      if (projectFile) return fetchProjectFileContent(projectFile, path!, signal);
       await fileWritesSettled(serverId!, path!);
       // Cancelled while waiting (a newer write started): don't send the read.
       signal.throwIfAborted();
       return fetchFileContent(serverId!, path!, signal, { sshTarget: options.sshTarget });
     },
-    enabled: !!serverId && !!path && serveable !== false,
-    staleTime: 5_000,
-    refetchInterval: visible
-      ? (query) => fileContentPollInterval(query.state.data, query.state.status === "error")
-      : false,
+    enabled: (!!projectFile || (!!serverId && serveable !== false)) && !!path,
+    staleTime: projectFile ? Infinity : 5_000,
+    refetchInterval:
+      visible && !projectFile
+        ? (query) => fileContentPollInterval(query.state.data, query.state.status === "error")
+        : false,
     // Catch up as soon as the browser tab returns, even within staleTime.
-    refetchOnWindowFocus: visible ? "always" : false,
+    refetchOnWindowFocus: visible && !projectFile ? "always" : false,
     ...(options.retry === undefined ? {} : { retry: options.retry }),
   });
 }

@@ -1,4 +1,5 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { parseProjectFileScope } from "@/lib/projectFileScope";
 /**
  * TanStack Query hooks for session and automation permissions CRUD.
  * Wraps the fetch functions in `permissionsApi.ts`.
@@ -165,8 +166,15 @@ export function useCanEdit(conversationId: string): boolean {
       conversationId,
       conversationsData !== undefined,
     );
+    // Project files open read-only; their review comments are kept separately.
+    if (parseProjectFileScope(conversationId)) return false;
     return permissionLevel == null || permissionLevel >= 2;
   }, [conversationsData, conversationId, activeSession, sessionLoading]);
+}
+
+/** Whether the viewer can comment on a file: editors can, and so can a project file's owner. */
+export function useCanComment(conversationId: string): boolean {
+  return useCanEdit(conversationId) || parseProjectFileScope(conversationId) !== null;
 }
 
 /**
