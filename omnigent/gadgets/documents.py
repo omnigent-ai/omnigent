@@ -388,6 +388,10 @@ def _validate_actor(value: Any) -> str:
     return value
 
 
+def _is_timestamp(value: Any) -> bool:
+    return isinstance(value, str) and _TIMESTAMP_RE.fullmatch(value) is not None
+
+
 def _normalize_root(root_path: Any) -> str:
     if not isinstance(root_path, str) or not root_path or len(root_path) > _MAX_ROOT_PATH_LENGTH:
         raise InvalidInput("root_path must be a non-empty path")
@@ -578,8 +582,9 @@ class ImmutableDocumentStore:
             head = self._load_head(ref)
             if head is not None:
                 raise Conflict("document changed while it was removed", reason="concurrent_write")
+        claim = None
         if head is None:
-            self._ensure_record_capacity(collection, id)
+            claim = self._ensure_record_capacity(collection, id)
         else:
             replay = self._find_operation(ref, head, operation_id, 2)
             if replay is not None:
@@ -603,7 +608,7 @@ class ImmutableDocumentStore:
             if replay is not None:
                 return _expect_document(self._replay(ref, replay, digest))
         return _expect_document(
-            self._append(ref, head, _CREATE, clean, operation_id, actor, digest)
+            self._append(ref, head, _CREATE, clean, operation_id, actor, digest, claim=claim)
         )
 
     def replace(
@@ -729,11 +734,43 @@ class ImmutableDocumentStore:
         operation_id: str,
         actor: str,
         digest: str,
+        *,
+        claim: str | None = None,
+    ) -> Document | DeleteResult:
+        """Write the revision after *head* (the first one when ``None``).
+
+        Under the record's lock (:meth:`_record_lock`), which removing a record and
+        releasing an abandoned capacity claim also hold, it checks that *head* is still the
+        record's newest revision, and for a first revision that its capacity *claim* is
+        still held, before it writes anything: a writer that read the record before it was
+        removed and created again never adds a revision to the new record, even when it
+        stops right after writing.
+        """
+        with self._record_lock(ref) as held:
+            if not held:
+                raise Conflict("document is busy; retry shortly", reason="concurrent_write")
+            return self._append_locked(ref, head, kind, value, operation_id, actor, digest, claim)
+
+    def _append_locked(
+        self,
+        ref: _Ref,
+        head: _Head | None,
+        kind: str,
+        value: Any,
+        operation_id: str,
+        actor: str,
+        digest: str,
+        claim: str | None,
     ) -> Document | DeleteResult:
         now = self._now()
         if head is None:
             number, generation, prev_digest = 1, 1, None
             created_at, created_by = now, actor
+            if claim is not None and not self._holds_claim(claim, ref):
+                raise Conflict(
+                    "the record's capacity reservation expired; retry",
+                    reason="concurrent_write",
+                )
         else:
             number = head.count + 1
             if number > self._limits.max_revisions_per_record:
@@ -743,16 +780,16 @@ class ImmutableDocumentStore:
                 )
             previous = head.latest
             prev_digest = previous.digest
+            # A removal can't run while this lock is held, so the record that is chained
+            # now is the one this revision is written into.
+            if not self._still_chained(ref, number, prev_digest):
+                raise Conflict(
+                    "document was removed while it was written", reason="concurrent_write"
+                )
             if (
                 self._segment_of(number) > 1
                 and (number - 1) % self._limits.revisions_per_segment == 0
             ):
-                # mkdirs makes missing ancestors: never let it recreate a record that a
-                # reclaim removed after this writer read it.
-                if not self._still_chained(ref, number, prev_digest):
-                    raise Conflict(
-                        "document was removed while it was written", reason="concurrent_write"
-                    )
                 self._files.mkdirs(self._segment_directory(ref, self._segment_of(number)))
             if kind == _CREATE:
                 generation, created_at, created_by = previous.generation + 1, now, actor
@@ -791,15 +828,13 @@ class ImmutableDocumentStore:
             raise Conflict(
                 "document was removed while it was written", reason="concurrent_write"
             ) from None
-        if prev_digest is not None and not self._still_chained(ref, number, prev_digest):
-            # The slot was free because the record this writer read was removed (a purge
-            # revision would otherwise hold it): the write landed in an emptied or new
-            # record. Take it back before anyone counts it, and report the conflict.
-            self._take_back(ref, number, path)
-            raise Conflict("document was removed while it was written", reason="concurrent_write")
         if kind == _CREATE:
             self._index_create(ref, operation_id, number)
         return self._result(ref, self._parse_revision(ref, body, number))
+
+    def _record_lock(self, ref: _Ref) -> contextlib.AbstractContextManager[bool]:
+        """The lock every writer, remover and claim release of the record holds."""
+        return self._files.exclusive(f"{self._root}/.removing/{ref.collection}/{ref.doc_id}")
 
     def _still_chained(self, ref: _Ref, number: int, prev_digest: str) -> bool:
         """Whether revision ``number - 1`` is still the one with *prev_digest*."""
@@ -808,19 +843,6 @@ class ImmutableDocumentStore:
         except (NotFound, CorruptData):
             return False
         return isinstance(raw, dict) and raw.get("digest") == prev_digest
-
-    def _take_back(self, ref: _Ref, number: int, path: str) -> None:
-        """Remove a revision written into a record that was removed meanwhile, and the
-        segment directory it needed when that is now empty."""
-        if not self._files.supports_delete:
-            return  # Such a store never reclaims records, so this cannot happen there.
-        self._files.delete_tree(path)
-        segment = self._segment_of(number)
-        if segment > 1:
-            directory = self._segment_directory(ref, segment)
-            with contextlib.suppress(NotFound):
-                if not self._files.list_paths(directory):
-                    self._files.delete_tree(directory)
 
     def _create_index_path(self, ref: _Ref, operation_id: str) -> str:
         key = hashlib.sha256(operation_id.encode()).hexdigest()[:32]
@@ -1102,13 +1124,16 @@ class ImmutableDocumentStore:
                 ref, f"revision {current.revision} is inconsistent with its predecessor"
             )
 
-    def _ensure_record_capacity(self, collection: str, doc_id: str) -> None:
+    def _ensure_record_capacity(self, collection: str, doc_id: str) -> str:
+        """Claim a capacity slot for *doc_id*, or find its claim; the slot's path."""
         try:
-            self._claim_capacity(collection, doc_id)
+            return self._claim_capacity(collection, doc_id)
         except CapacityExceeded:
-            if not self._reclaim(collection, doc_id):
+            if not self._reclaim(collection, doc_id) and not self._release_abandoned_claims(
+                collection, doc_id
+            ):
                 raise
-            self._claim_capacity(collection, doc_id)
+            return self._claim_capacity(collection, doc_id)
 
     def _probe_slots(self, collection: str, doc_id: str) -> Sequence[str]:
         """The capacity slots *doc_id* may claim: a short run from its hash, in order."""
@@ -1118,57 +1143,122 @@ class ImmutableDocumentStore:
         probes = min(capacity, _CAPACITY_PROBES)
         return [f"{directory}/{(start + offset) % capacity:08d}.json" for offset in range(probes)]
 
-    def _claim_capacity(self, collection: str, doc_id: str) -> None:
+    def _read_claim(self, path: str, collection: str) -> dict[str, Any] | None:
+        """The claim in slot *path*, or ``None`` when the slot is free."""
+        try:
+            owner = self._files.read_json(path)
+        except NotFound:
+            return None
+        if (
+            not isinstance(owner, dict)
+            or set(owner) - {"at"} != {"collection", "id"}
+            or owner["collection"] != collection
+            or not isinstance(owner["id"], str)
+            or _IDENTIFIER_RE.fullmatch(owner["id"]) is None
+            or ("at" in owner and not _is_timestamp(owner["at"]))
+        ):
+            raise CorruptData("Invalid record capacity claim", collection=collection)
+        return owner
+
+    def _holds_claim(self, path: str, ref: _Ref) -> bool:
+        try:
+            owner = self._read_claim(path, ref.collection)
+        except CorruptData:
+            return False
+        return owner is not None and owner["id"] == ref.doc_id
+
+    def _claim_capacity(self, collection: str, doc_id: str) -> str:
         """Claim one of the collection's record slots for *doc_id*, or find its claim.
 
         Slots are create-only files in a table of ``max_records_per_collection``, so admitted
         records never exceed it, and a record probes only a short run of slots from its
         hash: a create costs bounded work, and a collection may fill up a little before
         every slot is taken. Claims survive failed appends and tombstones, and a retry of
-        that ID reuses its claim.
+        that ID reuses its claim; a claim whose record was never written is released after
+        ``purge_abandon_s`` (:meth:`_release_abandoned_claims`). Returns the slot's path.
         """
         directory = f"{self._root}/.capacity/{collection}"
         self._files.mkdirs(directory)
-        claim = {"collection": collection, "id": doc_id}
         free: list[str] = []
         for path in self._probe_slots(collection, doc_id):
-            try:
-                owner = self._files.read_json(path)
-            except NotFound:
+            owner = self._read_claim(path, collection)
+            if owner is None:
                 free.append(path)
-                continue
-            if owner == claim:
-                return
-            if (
-                not isinstance(owner, dict)
-                or set(owner) != {"collection", "id"}
-                or owner["collection"] != collection
-                or not isinstance(owner["id"], str)
-                or _IDENTIFIER_RE.fullmatch(owner["id"]) is None
-            ):
-                raise CorruptData("Invalid record capacity claim", collection=collection)
+            elif owner["id"] == doc_id:
+                return path
         for path in free:
             try:
-                self._files.create_json(path, claim)
-                return
+                self._files.create_json(
+                    path, {"collection": collection, "id": doc_id, "at": self._now()}
+                )
+                return path
             except Conflict:
-                if self._files.read_json(path) == claim:
-                    return
+                owner = self._read_claim(path, collection)
+                if owner is not None and owner["id"] == doc_id:
+                    return path
         raise CapacityExceeded(
             f"collection is full: it holds at most {self._limits.max_records_per_collection} "
             "records"
         )
 
-    def _claim_path(self, collection: str, doc_id: str) -> str | None:
-        """The capacity slot *doc_id* holds, or ``None`` if it holds none."""
-        claim = {"collection": collection, "id": doc_id}
+    def _release_abandoned_claims(self, collection: str, doc_id: str) -> bool:
+        """Free the slots in *doc_id*'s probe run whose record was never written.
+
+        A create claims its slot before it writes the record's first revision, so one that
+        stopped in between leaves a claim with no record. A claim older than
+        ``purge_abandon_s`` whose record has no revision is released under that record's
+        lock, which its writer also takes before the first revision and which makes the
+        writer check its claim is still held: a slow writer is refused rather than adding a
+        record without a slot. Looks only at this create's probe run, so it costs bounded
+        work, and stops at the first slot it frees. Returns whether it freed one.
+        """
+        if not self._files.supports_delete:
+            return False
         for path in self._probe_slots(collection, doc_id):
             try:
-                owner = self._files.read_json(path)
-            except NotFound:
-                # Released slots leave holes, so keep probing; claims never move.
+                owner = self._read_claim(path, collection)
+            except CorruptData:
                 continue
-            if owner == claim:
+            if (
+                owner is None
+                or owner["id"] == doc_id
+                or "at" not in owner
+                or self._seconds_since(owner["at"]) < self._limits.purge_abandon_s
+            ):
+                continue
+            ref = self._ref(collection, owner["id"])
+            if self._has_revisions(ref):
+                continue
+            with self._record_lock(ref) as held:
+                if not held or self._has_revisions(ref):
+                    continue
+                try:
+                    if self._read_claim(path, collection) != owner:
+                        continue
+                except CorruptData:
+                    continue
+                self._files.delete_tree(ref.directory)
+                self._files.delete_tree(path)
+                return True
+        return False
+
+    def _has_revisions(self, ref: _Ref) -> bool:
+        """Whether the record's directory holds anything; a record's first entry is its
+        first revision, so an empty or missing directory is a record never written."""
+        try:
+            return bool(self._files.list_paths(ref.directory))
+        except NotFound:
+            return False
+
+    def _claim_path(self, collection: str, doc_id: str) -> str | None:
+        """The capacity slot *doc_id* holds, or ``None`` if it holds none."""
+        for path in self._probe_slots(collection, doc_id):
+            # Released slots leave holes, so keep probing; claims never move.
+            try:
+                owner = self._read_claim(path, collection)
+            except CorruptData:
+                continue
+            if owner is not None and owner["id"] == doc_id:
                 return path
         return None
 
@@ -1271,9 +1361,7 @@ class ImmutableDocumentStore:
         gone or created again, leaves it alone.
         """
         tickets = f"{self._root}/.removals/{ref.collection}/{ref.doc_id}/{marker.digest[:32]}"
-        with self._files.exclusive(
-            f"{self._root}/.removing/{ref.collection}/{ref.doc_id}"
-        ) as held:
+        with self._record_lock(ref) as held:
             if not held:
                 return
             ticket = self._take_removal_ticket(tickets)

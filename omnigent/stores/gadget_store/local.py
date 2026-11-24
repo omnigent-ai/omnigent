@@ -66,6 +66,8 @@ _OWNER_SEGMENT = re.compile(r"s[0-9]{8}")
 _OWNER_SEGMENT_SIZE = 1000
 # How long a remover waits for another to finish with the same record before leaving it.
 _EXCLUSIVE_WAIT_S = 5
+# Lock files behind GadgetFiles.exclusive; two names in one stripe just wait for each other.
+_LOCK_STRIPES = 1024
 # A page cursor: the segment, and the last gadget ID read in it (none: start of the segment).
 _OWNER_CURSOR = re.compile(rf"({_OWNER_SEGMENT.pattern})/((?:{GADGET_ID_PATTERN.pattern})?)")
 _METADATA_FILE = "gadget.json"
@@ -138,11 +140,17 @@ class LocalGadgetFiles(GadgetFiles):
 
     @contextlib.contextmanager
     def exclusive(self, name: str) -> Iterator[bool]:
-        # Lock files sit beside the store's staging directory, named for the scope and *name*.
-        key = hashlib.sha256(f"{self._root}\n{name}".encode()).hexdigest()[:32]
-        locks = self._tmp_dir.parent / ".locks"
+        # Lock files sit beside the store's staging directory. The key is the scope's path
+        # within the store, not its absolute path, so stores opened through different
+        # paths to the same directory (a symlink, another mount point) share each lock.
+        # Locks are striped over a fixed set of files so they don't pile up per record.
+        store_root = self._tmp_dir.parent
+        scope = os.path.relpath(self._root, store_root)
+        digest = hashlib.sha256(f"{scope}\n{name}".encode()).digest()
+        stripe = int.from_bytes(digest[:4], "big") % _LOCK_STRIPES
+        locks = store_root / ".locks"
         locks.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(str(locks / f"{key}.lock"), timeout=_EXCLUSIVE_WAIT_S)
+        lock = FileLock(str(locks / f"x{stripe:04d}.lock"), timeout=_EXCLUSIVE_WAIT_S)
         try:
             lock.acquire()
         except Timeout:

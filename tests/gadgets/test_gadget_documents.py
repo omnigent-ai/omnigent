@@ -219,30 +219,14 @@ def _tombstone_ending_a_segment(env: Env) -> None:
     env.clock.advance(61)
 
 
-@pytest.mark.parametrize("pause", ["before_segment", "after_check"])
-def test_a_stale_writer_never_revives_a_record_reclaimed_meanwhile(
-    env: Env, monkeypatch: pytest.MonkeyPatch, pause: str
-) -> None:
+def test_a_stale_writer_never_revives_a_record_reclaimed_meanwhile(env: Env) -> None:
     _tombstone_ending_a_segment(env)
     ref = env.docs._ref("cards", "a")
     stale = env.docs._load_head(ref)
     assert stale is not None and stale.count == 3
-    if pause == "after_check":
-        # The race the check alone can't close: the reclaim runs after the writer checked
-        # the record and before it makes the next segment's directory.
-        real_mkdirs = type(env.files).mkdirs
-
-        def mkdirs_after_a_reclaim(self, path: str) -> None:
-            if path.endswith("cards/a/s00000002"):
-                monkeypatch.setattr(type(env.files), "mkdirs", real_mkdirs)
-                env.docs._purge(ref, env.docs._load_head(ref))
-            real_mkdirs(self, path)
-
-        monkeypatch.setattr(type(env.files), "mkdirs", mkdirs_after_a_reclaim)
-    else:
-        # The writer read the tombstone, then paused while another create reclaimed it.
-        env.docs._purge(ref, stale)
-    assert pause == "after_check" or env.docs.verify_record("cards", "a") is None
+    # The writer read the tombstone, then paused while another create reclaimed it.
+    env.docs._purge(ref, stale)
+    assert env.docs.verify_record("cards", "a") is None
     with pytest.raises(Conflict):
         env.docs._append(ref, stale, "create", {"n": 9}, "op-stale", ACTOR, "d" * 64)
     # Nothing acknowledged is left unreadable, and the record starts again from scratch.
@@ -251,6 +235,120 @@ def test_a_stale_writer_never_revives_a_record_reclaimed_meanwhile(
     again = env.docs.create("cards", "a", {"n": 3}, "op-a3", ACTOR)
     assert env.docs.get("cards", "a") == again
     assert env.docs.verify_record("cards", "a").revisions == 1  # type: ignore[union-attr]
+
+
+def test_a_stale_writer_that_stops_after_writing_leaves_the_new_record_usable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = Env(tmp_path)
+    a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
+    env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
+    env.clock.advance(61)
+    ref = env.docs._ref("cards", "a")
+    stale = env.docs._load_head(ref)
+    assert stale is not None and stale.count == 2
+    # While the writer is paused, the record is removed and created again.
+    env.docs._purge(ref, stale)
+    fresh = env.docs.create("cards", "a", {"n": 2}, "op-a2", ACTOR)
+    # The writer resumes and would stop (crash) right after writing its revision.
+    real_create = env.files.create_json
+
+    def create_then_crash(path: str, value: dict) -> None:
+        real_create(path, value)
+        if path.endswith("cards/a/00000003.json"):
+            raise RuntimeError("stopped right after writing")
+
+    monkeypatch.setattr(env.files, "create_json", create_then_crash)
+    with pytest.raises(Conflict):
+        env.docs._append(ref, stale, "create", {"n": 9}, "op-stale", ACTOR, "d" * 64)
+    # Reopened, the new record is intact and still writable.
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    docs = ImmutableDocumentStore(
+        store.gadget_files(env.gadget.id), "data", limits=SMALL, clock=env.clock
+    )
+    assert docs.get("cards", "a") == fresh
+    assert docs.verify_record("cards", "a").revisions == 1  # type: ignore[union-attr]
+    assert docs.replace("cards", "a", {"n": 3}, fresh.version, "op-a3", ACTOR).value == {"n": 3}
+
+
+def test_a_reclaim_racing_a_writer_waits_for_it(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(local_module, "_EXCLUSIVE_WAIT_S", 10)
+    _tombstone_ending_a_segment(env)
+    ref = env.docs._ref("cards", "a")
+    head = env.docs._load_head(ref)
+    assert head is not None
+    # A reclaim starts while the writer is between its check and its write.
+    real_mkdirs = type(env.files).mkdirs
+    raced: list[BaseException | None] = []
+
+    def reclaim() -> None:
+        try:
+            env.docs._purge(ref, head)
+            raced.append(None)
+        except Conflict as error:
+            raced.append(error)
+
+    thread = threading.Thread(target=reclaim)
+
+    def mkdirs_while_a_reclaim_starts(self, path: str) -> None:
+        if path.endswith("cards/a/s00000002") and not thread.is_alive() and not raced:
+            thread.start()
+            thread.join(0.5)
+            assert thread.is_alive()  # It waits for the writer's lock.
+        real_mkdirs(self, path)
+
+    monkeypatch.setattr(type(env.files), "mkdirs", mkdirs_while_a_reclaim_starts)
+    created = env.docs._append(ref, head, "create", {"n": 9}, "op-new", ACTOR, "d" * 64)
+    thread.join(10)
+    # The writer won; the reclaim found the record changed and left it alone.
+    assert isinstance(raced[0], Conflict)
+    assert env.docs.get("cards", "a") == created
+    assert env.docs.verify_record("cards", "a").revisions == 4  # type: ignore[union-attr]
+
+
+def test_a_create_that_stopped_after_claiming_capacity_gives_it_back(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
+    # A create of "b" claims its slot, then stops before writing the record.
+    env.docs._ensure_record_capacity("cards", "b")
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    docs = ImmutableDocumentStore(
+        store.gadget_files(env.gadget.id), "data", limits=SMALL, clock=env.clock
+    )
+    # Until it is older than the abandon time, the slot stays the stopped create's.
+    env.clock.advance(10)
+    with pytest.raises(CapacityExceeded):
+        docs.create("cards", "c", {"n": 1}, "op-c", ACTOR)
+    env.clock.advance(21)
+    assert docs.create("cards", "c", {"n": 1}, "op-c", ACTOR).id == "c"
+    assert [item.id for item in docs.list("cards").items] == ["a", "c"]
+    # The collection is full again with readable records; "b" is now refused.
+    with pytest.raises(CapacityExceeded):
+        docs.create("cards", "b", {"n": 1}, "op-b", ACTOR)
+
+
+def test_a_slow_create_whose_claim_was_released_is_refused(env: Env) -> None:
+    env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
+    claim = env.docs._ensure_record_capacity("cards", "b")
+    env.clock.advance(31)
+    # Another create frees the slow create's claim and takes the slot.
+    env.docs.create("cards", "c", {"n": 1}, "op-c", ACTOR)
+    ref = env.docs._ref("cards", "b")
+    with pytest.raises(Conflict):
+        env.docs._append(ref, None, "create", {"n": 1}, "op-b", ACTOR, "d" * 64, claim=claim)
+    assert env.docs.get("cards", "b") is None
+    assert sorted(item.id for item in env.docs.list("cards").items) == ["a", "c"]
+
+
+def test_a_live_create_keeps_its_claim(env: Env) -> None:
+    env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
+    claim = env.docs._ensure_record_capacity("cards", "b")
+    env.clock.advance(20)
+    with pytest.raises(CapacityExceeded):
+        env.docs.create("cards", "c", {"n": 1}, "op-c", ACTOR)
+    ref = env.docs._ref("cards", "b")
+    created = env.docs._append(ref, None, "create", {"n": 1}, "op-b", ACTOR, "d" * 64, claim=claim)
+    assert env.docs.get("cards", "b") == created
 
 
 def test_a_late_remover_never_deletes_the_record_created_again(env: Env) -> None:
@@ -276,10 +374,19 @@ def test_a_late_remover_never_deletes_the_record_created_again(env: Env) -> None
     assert env.docs.verify_record("cards", "a").revisions == 1  # type: ignore[union-attr]
 
 
+@pytest.mark.parametrize("through", ["the same path", "a symlink"])
 def test_a_remover_paused_just_before_deleting_never_deletes_the_record_created_again(
-    env: Env, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, through: str
 ) -> None:
     monkeypatch.setattr(local_module, "_EXCLUSIVE_WAIT_S", 0.2)
+    env = Env(tmp_path)
+    if through == "a symlink":
+        # Another server process opened the same storage through a different path.
+        alias = tmp_path / "alias"
+        alias.symlink_to(tmp_path / "gadgets")
+        other_files = LocalGadgetStore(str(alias)).gadget_files(env.gadget.id)
+    else:
+        other_files = env.files
     a = env.docs.create("cards", "a", {"n": 1}, "op-a", ACTOR)
     env.docs.delete("cards", "a", a.version, "del-a", ACTOR)
     env.clock.advance(61)
@@ -311,7 +418,7 @@ def test_a_remover_paused_just_before_deleting_never_deletes_the_record_created_
     # Its ticket is old enough to take over, but it still holds the record: the next
     # remover leaves the record alone, and nothing can create it again meanwhile.
     env.clock.advance(31)
-    taker = ImmutableDocumentStore(env.files, "data", limits=SMALL, clock=env.clock)
+    taker = ImmutableDocumentStore(other_files, "data", limits=SMALL, clock=env.clock)
     taker._finish_purge(ref, marker)
     assert taker._load_head(ref) is not None
     with pytest.raises(Conflict):
