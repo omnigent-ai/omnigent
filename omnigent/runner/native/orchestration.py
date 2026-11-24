@@ -42,6 +42,7 @@ if TYPE_CHECKING:
         CodexAppServerClient,
         CodexNativeAppServer,
     )
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
     from omnigent.harnesses.opencode_native.client import OpenCodeClient
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
@@ -470,6 +471,34 @@ def codex_native_bridge_dir(session_id: str) -> Path:
     from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id
 
     return _AUTO_CODEX_BRIDGE_DIRS.get(session_id) or bridge_dir_for_bridge_id(session_id)
+
+
+def _codex_backend_key_for_session(
+    session_id: str, bridge_state: CodexNativeBridgeState | None
+) -> str:
+    """Return the registry key of the Codex backend a session's bridge points at.
+
+    A forwarder rotation moves the bridge onto a new session while its app-server and
+    forwarder stay registered under the session that launched them.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_new"``.
+    :param bridge_state: The session's current bridge state, if any.
+    :returns: The launching session's id for a rotated session, else *session_id*.
+    """
+    if (
+        session_id in _AUTO_CODEX_APP_SERVERS
+        or bridge_state is None
+        or bridge_state.session_id != session_id
+    ):
+        return session_id
+    return next(
+        (
+            key
+            for key, app_server in _AUTO_CODEX_APP_SERVERS.items()
+            if app_server.listen_url == bridge_state.socket_path
+        ),
+        session_id,
+    )
 
 
 # Background OpenCode ``opencode serve`` instances for host-spawned
@@ -5376,8 +5405,8 @@ async def _relaunch_codex_native_tui_on_thread(
     :param bridge_dir: Native Codex bridge directory.
     :param agent_spec: Agent spec for the terminal's OS environment.
     :returns: None.
-    :raises Exception: If the replacement fails to launch, after retracting the closed
-        pane so the native-terminal ensure path can recreate it.
+    :raises Exception: If the replacement fails to launch; the native-terminal ensure
+        path can then recreate the pane on the same app-server.
     """
     from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
 
@@ -5386,26 +5415,24 @@ async def _relaunch_codex_native_tui_on_thread(
         workspace=str(launch_config.workspace), app_server=app_server, resume=True
     )
     await resource_registry.close_terminal(session_id, terminal_resource_id("codex", "main"))
-    try:
-        await _launch_codex_native_tui(
-            session_id,
-            resource_registry,
-            publish_event,
-            app_server=app_server,
-            launch_config=launch_config,
-            bridge_dir=bridge_dir,
-            thread_id=thread_id,
-            agent_spec=agent_spec,
-            terminal_cli=terminal_cli,
-        )
-    except Exception:
-        _publish_terminal_deleted_event(
-            conversation_id=session_id,
-            terminal_name="codex",
-            session_key="main",
-            publish_event=publish_event,
-        )
-        raise
+    # The replacement reuses the terminal id; viewers remount only after seeing it removed.
+    _publish_terminal_deleted_event(
+        conversation_id=session_id,
+        terminal_name="codex",
+        session_key="main",
+        publish_event=publish_event,
+    )
+    await _launch_codex_native_tui(
+        session_id,
+        resource_registry,
+        publish_event,
+        app_server=app_server,
+        launch_config=launch_config,
+        bridge_dir=bridge_dir,
+        thread_id=thread_id,
+        agent_spec=agent_spec,
+        terminal_cli=terminal_cli,
+    )
 
 
 #: Waits between ``thread/resume`` retries when codex finds no rollout for a
@@ -5512,9 +5539,10 @@ async def _auto_create_codex_terminal(
     bridge_dir = prepare_bridge_dir(launch_config.bridge_id or session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
-    app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
-    forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
     bridge_state = read_bridge_state(bridge_dir)
+    backend_key = _codex_backend_key_for_session(session_id, bridge_state)
+    app_server = _AUTO_CODEX_APP_SERVERS.get(backend_key)
+    forwarder = _AUTO_FORWARDER_TASKS.get(backend_key)
     process = getattr(app_server, "proc", None)
     if (
         app_server is not None
@@ -5712,6 +5740,8 @@ async def _auto_create_codex_terminal(
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
+    if backend_key != session_id:
+        await _cancel_auto_forwarder_task(backend_key)
     clear_bridge_state(bridge_dir)
     # Only a resume can conflict with a stale writer for the same Codex thread.
     # Fresh sessions have no thread writer to recover and must not pay for a

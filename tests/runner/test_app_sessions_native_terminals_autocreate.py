@@ -6134,7 +6134,7 @@ async def test_codex_tui_relaunch_on_thread_replaces_the_pane_on_its_app_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Moving a session's TUI to another thread closes its pane, then resumes that thread."""
+    """Moving a session's TUI to another thread retracts its pane, then resumes that thread."""
     from omnigent.runner.native.orchestration import _relaunch_codex_native_tui_on_thread
 
     workspace = tmp_path / "workspace"
@@ -6168,7 +6168,10 @@ async def test_codex_tui_relaunch_on_thread_replaces_the_pane_on_its_app_server(
         "ws://127.0.0.1:9876",
         "thread_fresh",
     ]
-    assert published == [("conv_new", "session.resource.created")]
+    assert published == [
+        ("conv_new", "session.resource.deleted"),
+        ("conv_new", "session.resource.created"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -6176,7 +6179,7 @@ async def test_codex_tui_relaunch_failure_retracts_the_closed_pane(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed replacement launch tells the UI the closed pane is gone, then re-raises."""
+    """A failed replacement launch re-raises with the closed pane already retracted."""
     from omnigent.runner.native.orchestration import _relaunch_codex_native_tui_on_thread
 
     workspace = tmp_path / "workspace"

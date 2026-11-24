@@ -172,7 +172,6 @@ def test_plan_clear_context_terminal_follows_new_session(
             + "\n".join(failures)
         )
     finally:
-        page.close()
         if new_session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
                 httpx.delete(f"{base_url}/v1/sessions/{new_session_id}", timeout=10.0)
