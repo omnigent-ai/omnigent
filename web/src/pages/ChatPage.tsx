@@ -293,7 +293,7 @@ import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWa
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { useGadgetComposerQuotes } from "@/lib/gadgetComposerQuotes";
+import { type GadgetComposerQuote, useGadgetComposerQuotes } from "@/lib/gadgetComposerQuotes";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { modelPickerKindForConv, type NativeModelPickerKind } from "@/lib/composerCapabilities";
 
@@ -1807,25 +1807,16 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
   // A gadget's Reply and Ask in side chat land here like the transcript's own; the
   // terminal view switches to chat first.
-  useGadgetComposerQuotes(conversationId ?? null, (quote) => {
-    // While the session loads its permissions read as unknown; wait rather than drop the quote.
-    if (permissionLevel === null) return false;
-    if (composerReadOnly) return true;
-    if (showTerminal) {
-      terminalFirst?.setView("chat");
-      return false;
-    }
-    const composer = composerRef.current;
-    // The composer restores this session's saved draft first, which would replace the quote.
-    if (!composer?.canTakeQuote()) return false;
-    if (quote.kind === "side_chat" && supportsSideChat(selectionSessionHarness, canStartSideChat)) {
-      composer.startSideChat(quote.text);
-    } else {
-      // A composer that can't take it yet (offline, read-only) keeps the quote queued.
-      return composer.appendReplyQuote(quote.text);
-    }
-    return true;
-  });
+  useGadgetComposerQuotes(conversationId ?? null, (quote) =>
+    takeGadgetComposerQuote(quote, {
+      permissionPending: !!permissionPending,
+      composerReadOnly,
+      showTerminal,
+      showChat: () => terminalFirst?.setView("chat"),
+      composer: composerRef.current,
+      sideChat: supportsSideChat(selectionSessionHarness, canStartSideChat),
+    }),
+  );
 
   // Single return so both surfaces keep stable fragment positions across
   // view flips — an early return would change the tree shape and remount
@@ -1985,6 +1976,36 @@ export function ConversationLoadError({
   );
 }
 
+/**
+ * Adds a quote a gadget queued for this session's composer, as Reply and Ask in side chat do
+ * for a transcript selection. False keeps it queued, to be tried on a later render.
+ */
+export function takeGadgetComposerQuote(
+  quote: GadgetComposerQuote,
+  page: {
+    /** The session's permissions are still loading; a loaded session without any isn't. */
+    permissionPending: boolean;
+    composerReadOnly: boolean;
+    showTerminal: boolean;
+    showChat: () => void;
+    composer: Pick<ComposerHandle, "appendReplyQuote" | "canTakeQuote" | "startSideChat"> | null;
+    sideChat: boolean;
+  },
+): boolean {
+  if (page.permissionPending) return false;
+  // A read-only session can't use the quote, so it isn't kept.
+  if (page.composerReadOnly) return true;
+  if (page.showTerminal) {
+    page.showChat();
+    return false;
+  }
+  // The composer restores this session's saved draft first, which would replace the quote.
+  if (!page.composer?.canTakeQuote()) return false;
+  // A composer that can't take it yet (offline, read-only) keeps the quote queued.
+  if (quote.kind === "side_chat" && page.sideChat) return page.composer.startSideChat(quote.text);
+  return page.composer.appendReplyQuote(quote.text);
+}
+
 interface ComposerHandle {
   /** Whether the quote went in; a blocked composer refuses it. */
   appendReplyQuote: (text: string) => boolean;
@@ -1992,7 +2013,8 @@ interface ComposerHandle {
   canTakeQuote: () => boolean;
   /** Load a sent message into the composer, confirming before replacing a draft. */
   editSentMessage: (message: SentMessage) => void;
-  startSideChat: (selectedText: string) => void;
+  /** Quote in a side chat; whether the quote was taken (not while offline or read-only). */
+  startSideChat: (selectedText: string) => boolean;
   /** Take keyboard focus for typing (not on phones, or while a /btw answer holds it). */
   focus: () => void;
 }
@@ -3893,7 +3915,7 @@ function ComposerImpl(
       // A pending tab creates its fork only when the user sends.
       const sourceId = useChatStore.getState().conversationId;
       if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
-        return;
+        return false;
       }
       const store = useChatStore.getState();
       const target = store.sideChatSelectionTarget;
@@ -3905,6 +3927,7 @@ function ComposerImpl(
       } else {
         store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
       }
+      return true;
     },
   }));
 

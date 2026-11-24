@@ -38,7 +38,7 @@ import { insertComposerText } from "@/lib/composerText";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
+import { createRef, StrictMode, useRef, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setSessionHost } from "@/lib/sessionHost";
@@ -286,7 +286,12 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, computeIsWorking } from "./ChatPage";
+import { Composer, computeIsWorking, takeGadgetComposerQuote } from "./ChatPage";
+import {
+  queueGadgetComposerQuote,
+  resetGadgetComposerQuotes,
+  useGadgetComposerQuotes,
+} from "@/lib/gadgetComposerQuotes";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { withSessionMentionHint } from "@/lib/composerMentions";
@@ -7975,6 +7980,81 @@ describe("Composer workflow entry point", () => {
     renderWithWorkflows(<Composer {...composerProps()} />);
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     expect(screen.queryByTestId("composer-workflow-action")).toBeNull();
+  });
+});
+
+// The page's gadget quote consumer, wired as ChatPage wires it, with the real composer.
+function GadgetQuoteHarness({
+  composer,
+  permissionPending,
+}: {
+  composer: Parameters<typeof Composer>[0];
+  permissionPending: boolean;
+}) {
+  const ref = useRef<ComponentRef<typeof Composer>>(null);
+  useGadgetComposerQuotes("conv_test", (quote) =>
+    takeGadgetComposerQuote(quote, {
+      permissionPending,
+      composerReadOnly: false,
+      showTerminal: false,
+      showChat: () => {},
+      composer: ref.current,
+      sideChat: true,
+    }),
+  );
+  return <Composer {...composer} ref={ref} />;
+}
+
+describe("gadget quotes in the composer", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    localStorage.clear();
+    resetGadgetComposerQuotes();
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      queuedMessages: [],
+      sessionHarness: "codex-native",
+      sideChatToOpen: null,
+      sideChatDrafts: {},
+      sideChatComposers: {},
+      sideChatSelectionTarget: null,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    resetGadgetComposerQuotes();
+    vi.restoreAllMocks();
+  });
+
+  it("waits while permissions load, then takes a quote in a session that has none", () => {
+    // A server with permissions off loads every session with no level at all.
+    const composer = composerProps({ permissionLevel: null });
+    const view = render(<GadgetQuoteHarness composer={composer} permissionPending />);
+    act(() => queueGadgetComposerQuote("conv_test", "reply", "Quoted from a gadget"));
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+
+    view.rerender(<GadgetQuoteHarness composer={composer} permissionPending={false} />);
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted from a gadget");
+  });
+
+  it("keeps a side-chat quote while offline and opens one side chat once reachable", () => {
+    const offline = composerProps({ unreachable: true });
+    const view = render(<GadgetQuoteHarness composer={offline} permissionPending={false} />);
+    act(() => queueGadgetComposerQuote("conv_test", "side_chat", "Ask about this"));
+    expect(useChatStore.getState().sideChatToOpen).toBeNull();
+
+    const openSideChat = vi.spyOn(useChatStore.getState(), "openSideChatWithDraft");
+    view.rerender(<GadgetQuoteHarness composer={composerProps()} permissionPending={false} />);
+    const { sideChatToOpen, sideChatDrafts } = useChatStore.getState();
+    expect(sideChatDrafts[sideChatToOpen!.childId]).toBe("Ask about this");
+    // Later renders find nothing left to add.
+    view.rerender(<GadgetQuoteHarness composer={composerProps()} permissionPending={false} />);
+    expect(openSideChat).toHaveBeenCalledTimes(1);
   });
 });
 
