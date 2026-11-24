@@ -234,7 +234,28 @@ export function isSharedAutomationRun(
 }
 
 /**
- * Sidebar folder membership: {@link sessionBelongsToProject}, and with
+ * Another member's Lead or persona session filed in this project. Project
+ * members share these, so they list in the folder like the viewer's own.
+ */
+export function isSharedProjectPersona(
+  conversation: Conversation,
+  projectId: string | null,
+  viewerId: string | null,
+  mainSessionIds: ReadonlySet<string>,
+): boolean {
+  return (
+    projectId !== null &&
+    conversation.project_id === projectId &&
+    !isOwnedByViewer(conversation, viewerId) &&
+    (mainSessionIds.has(conversation.id) || Boolean(conversation.labels?.[PROJECT_IDENTITY_LABEL_KEY]))
+  );
+}
+
+const NO_SESSION_IDS: ReadonlySet<string> = new Set();
+
+/**
+ * Sidebar folder membership: {@link sessionBelongsToProject}, other members'
+ * persona sessions ({@link isSharedProjectPersona}), and with
  * `includeSharedRuns` other users' automation runs shared with the viewer go
  * in the default automation folder, wherever their owner filed them.
  */
@@ -243,9 +264,12 @@ export function sessionInSidebarFolder(
   project: { id: string | null; name: string },
   viewerId: string | null,
   includeSharedRuns: boolean,
+  /** Every accessible project's Lead session. */
+  mainSessionIds: ReadonlySet<string> = NO_SESSION_IDS,
 ): boolean {
   return (
     sessionBelongsToProject(conversation, project, viewerId) ||
+    isSharedProjectPersona(conversation, project.id, viewerId, mainSessionIds) ||
     (includeSharedRuns &&
       project.name === DEFAULT_AUTOMATION_PROJECT &&
       isSharedAutomationRun(conversation, viewerId))

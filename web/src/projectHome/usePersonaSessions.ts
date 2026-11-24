@@ -1,7 +1,9 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { fetchConversationById } from "@/hooks/useOpenSessionRow";
+import { fetchSharedProjectSessions, type Conversation } from "@/hooks/useConversations";
 import { listProjects } from "@/lib/projectsApi";
+import { isSharedProjectPersona } from "@/shell/sidebarNav";
 import { findCachedListRow } from "@/lib/sessionListCache";
 import { PROJECT_IDENTITY_LABEL_KEY } from "@/lib/personaAvatar";
 import { useProjectIdentities } from "./useProjectIdentities";
@@ -24,6 +26,40 @@ export function useOrchestratorSessionIds(): ReadonlySet<string> {
         ),
       ),
     [query.data],
+  );
+}
+
+/**
+ * Other members' persona sessions (the Lead and identities) in a project
+ * shared with the viewer, which members can open. Polled while `enabled`.
+ */
+export function useSharedProjectPersonaRows(
+  project: { id: string | null; name: string },
+  enabled: boolean,
+  viewerId: string | null,
+): Conversation[] | undefined {
+  const projects = useQuery({
+    queryKey: ["projects", "main-sessions"],
+    queryFn: listProjects,
+    staleTime: 30_000,
+  });
+  const shared = projects.data?.some(
+    (candidate) => candidate.id === project.id && candidate.shared === true,
+  );
+  const mainSessionIds = useOrchestratorSessionIds();
+  const rows = useQuery({
+    queryKey: ["project-shared-personas", project.name],
+    queryFn: ({ signal }) => fetchSharedProjectSessions(project.name, signal),
+    enabled: enabled && shared === true,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  }).data;
+  return useMemo(
+    () =>
+      rows?.filter((row) =>
+        isSharedProjectPersona(row, project.id, viewerId, mainSessionIds),
+      ),
+    [rows, project.id, viewerId, mainSessionIds],
   );
 }
 

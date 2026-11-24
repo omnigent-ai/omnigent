@@ -2792,6 +2792,29 @@ async function fetchProjectSessionsPage(
 }
 
 /**
+ * One page of a project's live, non-worker sessions, including other members'.
+ * The folder's own list holds only the viewer's sessions.
+ */
+export async function fetchSharedProjectSessions(
+  project: string,
+  signal?: AbortSignal,
+): Promise<Conversation[]> {
+  const params = new URLSearchParams({
+    order: "desc",
+    sort_by: "updated_at",
+    limit: "100",
+    // The server's shared+project path lists nothing; all+project resolves shared projects.
+    visibility: "all",
+    project,
+    exclude_agent_created: "true",
+  });
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  const fetched = (await res.json()) as ConversationsPage;
+  return applySessionTombstones(fetched, true, fetched, project).data;
+}
+
+/**
  * Cursor-paginated list of the sessions filed under one project, fetched
  * server-side via `?project=` so a folder shows ALL its members regardless of
  * how far the global sidebar list has been scrolled. `archived` selects the

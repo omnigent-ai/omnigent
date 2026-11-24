@@ -198,7 +198,11 @@ import {
   useAutomationsEnabled,
 } from "@/hooks/useConversations";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
-import { sidebarPersonaName, useOrchestratorSessionIds } from "@/projectHome/usePersonaSessions";
+import {
+  sidebarPersonaName,
+  useOrchestratorSessionIds,
+  useSharedProjectPersonaRows,
+} from "@/projectHome/usePersonaSessions";
 import { fetchConversationById, useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
@@ -1808,6 +1812,12 @@ function ProjectFolder({
     archived,
     hideWorkers && !archived,
   );
+  const mainSessionIds = useOrchestratorSessionIds();
+  const sharedPersonaRows = useSharedProjectPersonaRows(
+    { id: projectId, name },
+    expanded && !archived && !placeholder,
+    viewerId,
+  );
   const watchedRows = useMemo(
     () => query.data?.pages.flatMap((page) => page.data) ?? [],
     [query.data],
@@ -1826,6 +1836,8 @@ function ProjectFolder({
     const byId = new Map<string, Conversation>();
     for (const row of applyLocalResolutions(query.data?.pages.flatMap((page) => page.data) ?? []))
       byId.set(row.id, row);
+    // Other members' persona sessions aren't in the viewer's own folder pages.
+    for (const row of sharedPersonaRows ?? []) byId.set(row.id, row);
     for (const c of windowConversations) byId.set(c.id, c);
     // Pins take precedence over live folders.
     return orderSessionFamilies(
@@ -1833,7 +1845,13 @@ function ProjectFolder({
         [...byId.values()].filter(
           (c) =>
             (c.archived === true) === archived &&
-            sessionInSidebarFolder(c, { id: projectId, name }, viewerId, includeSharedRuns) &&
+            sessionInSidebarFolder(
+              c,
+              { id: projectId, name },
+              viewerId,
+              includeSharedRuns,
+              mainSessionIds,
+            ) &&
             (archived || !isSessionPinned(c, pinnedSet)) &&
             (!hideWorkers || c.id === activeConversationId || !isAgentCreatedWorker(c)),
         ),
@@ -1847,6 +1865,7 @@ function ProjectFolder({
     hideWorkers,
     activeConversationId,
     query.data,
+    sharedPersonaRows,
     windowConversations,
     applyLocalResolutions,
     pinnedSet,
@@ -1859,6 +1878,7 @@ function ProjectFolder({
     name,
     viewerId,
     includeSharedRuns,
+    mainSessionIds,
   ]);
   // Each expansion, archive switch or re-sort restarts the page count and auto-load
   // budget; when paginated, the open session is never left hidden.
@@ -2588,6 +2608,7 @@ function ConversationList({
   // Other users' automation runs join the default automation folder. My sessions
   // takes them from the shared rows already loaded, so none show when those aren't.
   const includeSharedRuns = activeTab !== "mine" || sharedActive;
+  const mainSessionIds = useOrchestratorSessionIds();
   const mineSharedRuns = useMemo(
     () =>
       activeTab === "mine" && includeSharedRuns
@@ -2670,7 +2691,7 @@ function ConversationList({
       // and (filing being owner-only) the viewer owns it.
       const inProject = folderCandidates.filter(
         (c) =>
-          sessionInSidebarFolder(c, { id, name }, viewerId, includeSharedRuns) &&
+          sessionInSidebarFolder(c, { id, name }, viewerId, includeSharedRuns, mainSessionIds) &&
           !pinnedIdSet.has(c.id),
       );
       // Hidden workers stay filed, so they never fall through to the flat list.
@@ -2791,6 +2812,7 @@ function ConversationList({
     activeTab,
     includeSharedRuns,
     mineSharedRuns,
+    mainSessionIds,
     viewerId,
     groupingUi,
     grouped,

@@ -20,6 +20,7 @@ import {
   orderByPinnedTimestamp,
   pinOrderWrites,
   resolveSidebarDrop,
+  isSharedProjectPersona,
   sessionInSidebarFolder,
   sessionsListAcceptsDrop,
   sortConversations,
@@ -1057,6 +1058,38 @@ describe("Custom order", () => {
     ]);
     expect(moveCustomOrder(order, rows, "s1", "s1", null, null)).toBeNull();
     expect(moveCustomOrder(order, rows, "s1", "deleted", null, null)).toBeNull();
+  });
+});
+
+describe("persona sessions of a shared project", () => {
+  const IDENTITY = "omnigent.project_identity_id";
+  const project = { id: "p_1", name: "Alpha" };
+  const session = (
+    id: string,
+    labels: Record<string, string> = {},
+    owner: string | null = "alice@example.com",
+    projectId: string | null = "p_1",
+  ) =>
+    ({
+      ...conversation(id, "Chat", new Date(0), { labels }),
+      owner,
+      project_id: projectId,
+    }) as Conversation;
+  const leads = new Set(["lead"]);
+
+  it.each([
+    ["the project's Lead", session("lead"), true],
+    ["an identity session", session("pm", { [IDENTITY]: "id_pm" }), true],
+    ["another member's worker", session("worker"), false],
+    ["a Lead filed in another project", session("lead", {}, "alice@example.com", "p_2"), false],
+  ])("lists %s in the folder", (_label, row, expected) => {
+    expect(sessionInSidebarFolder(row, project, "bob@example.com", false, leads)).toBe(expected);
+  });
+
+  it("leaves the viewer's own sessions to the ordinary rule", () => {
+    const own = session("lead", {}, "bob@example.com");
+    expect(isSharedProjectPersona(own, "p_1", "bob@example.com", leads)).toBe(false);
+    expect(sessionInSidebarFolder(own, project, "bob@example.com", false, leads)).toBe(true);
   });
 });
 
