@@ -151,6 +151,17 @@ function composerCard({
   );
 }
 
+/** A native edit of a textarea: the value is set, then the input event carries its type. */
+function nativeInput(field: HTMLTextAreaElement, value: string, inputType: string) {
+  act(() => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+      field,
+      value,
+    );
+    field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType }));
+  });
+}
+
 const progress = () => screen.getByTestId("ask-user-question-progress").textContent;
 const pressOnPage = (init: KeyboardEventInit) => fireEvent.keyDown(document.body, init);
 const keyHints = () => document.querySelectorAll('[data-slot="shortcut-keys"]');
@@ -1019,7 +1030,28 @@ describe("AskUserQuestionForm — prompt editor", () => {
       askUserQuestionSignature([framework, secret]),
     );
     expect(draft?.currentIndex).toBe(1);
-    expect(draft?.sessionMentions).toEqual([]);
+    expect(draft?.sessionMentions).toEqual({});
+  });
+
+  it("keeps the textarea until an IME composition ends", async () => {
+    let finishLoad = () => {};
+    const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
+      finishLoad = () => resolve(CodeMirrorModule);
+    });
+    resetCodeMirrorComposerLoadForTests(() => loaded);
+    renderForm([framework], { codeMirror: true });
+    const textarea = screen.getByTestId("ask-user-question-custom-input");
+    fireEvent.compositionStart(textarea);
+
+    await act(async () => {
+      finishLoad();
+      await loaded;
+    });
+    expect(textarea.tagName).toBe("TEXTAREA");
+    expect(document.querySelector('[data-composer-engine="codemirror"]')).toBeNull();
+
+    fireEvent.compositionEnd(textarea);
+    await promptEditor();
   });
 
   it("keeps the caret and focus when the editor replaces the textarea", async () => {
@@ -1078,6 +1110,9 @@ describe("AskUserQuestionForm — prompt editor", () => {
       return field as HTMLTextAreaElement;
     });
     expect(textarea.value).toBe("Use @Fix CI ");
+    // Deleting part of the token releases it; the browser's undo brings it back.
+    nativeInput(textarea, "Use @Fix ", "deleteContentBackward");
+    nativeInput(textarea, "Use @Fix CI ", "historyUndo");
 
     resize(false);
     const restored = await promptEditor();
@@ -1085,6 +1120,29 @@ describe("AskUserQuestionForm — prompt editor", () => {
     fireEvent.keyDown(restored, { key: "Enter" });
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+    });
+  });
+
+  it("keeps a session tag to the answer it was picked in", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const notes: ClaudeQuestion = {
+      id: "notes",
+      question: "Any notes?",
+      multiSelect: false,
+      options: [{ label: "None" }],
+    };
+    const { onSubmit } = renderForm([framework, notes], { codeMirror: true });
+    const first = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(first)!, "Use @Fix"));
+    fireEvent.keyDown(first, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    // The second answer types the same words as plain text, so it stays literal.
+    const second = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(second)!, "Ship @Fix CI"));
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+      notes: "Ship @Fix CI",
     });
   });
 

@@ -1,12 +1,23 @@
-// The custom-answer field on the CodeMirror prompt editor, with the chat composer's @-session
-// menu. The form owns the mention state; this field only lists sessions and reports them up.
+// The custom answer of one question: the chat composer's @-session menu, tracked per question.
+// AnswerMentionScope runs on both engines, so a textarea edit is tracked like an editor edit.
 
-import { type Dispatch, type SetStateAction, useEffect, type RefObject } from "react";
+import {
+  type Dispatch,
+  type ReactNode,
+  type RefObject,
+  type SetStateAction,
+  useEffect,
+  useState,
+} from "react";
 import { ComposerEngineContext, ComposerEngineInput } from "@/components/composer/ChatComposer";
 import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
-import type { MentionBrowser } from "@/hooks/useMentionBrowser";
-import { useSessionMentionEntries } from "@/hooks/useSessionMentionEntries";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { type MentionBrowser, useMentionBrowser } from "@/hooks/useMentionBrowser";
+import {
+  MENTION_SEARCH_DEBOUNCE_MS,
+  useSessionMentionEntries,
+} from "@/hooks/useSessionMentionEntries";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import {
   composerInlineMentions,
@@ -22,36 +33,102 @@ export const NO_FILE_ENTRIES: WorkspaceFile[] = [];
 
 /**
  * An answer's text as the agent receives it: each tagged session becomes the marker the chat
- * composer sends, with its tool hint. Answers are plain text, so files are not tagged here.
+ * composer sends, with its tool hint. Only the tags of that answer are considered.
  */
 export function expandAnswerMentions(text: string, sessions: readonly SessionMention[]): string {
   const mentions = presentMentions(composerInlineMentions([], sessions, null), [text]);
   return withSessionMentionHint(expandMentionTokens(text, mentions), mentions.length > 0);
 }
 
+/** One question's mention state, handed to its editor. */
+export interface AnswerMentions {
+  browser: MentionBrowser;
+  mention: MentionState | null;
+  setMention: (next: MentionState | null) => void;
+  debouncedQuery: string;
+  sessionEntries: readonly SessionMention[];
+  onSessionEntries: Dispatch<SetStateAction<readonly SessionMention[]>>;
+}
+
+/**
+ * Holds one question's session tags on both engines. It is keyed to the question, so it starts from
+ * that question's current tags, and it writes the tags back to the form's per-question record.
+ */
+export function AnswerMentionScope({
+  currentKey,
+  customText,
+  onCustomTextChange,
+  initialSessions,
+  onSessionsChange,
+  isMobile,
+  inputRef,
+  children,
+}: {
+  currentKey: string;
+  customText: string;
+  onCustomTextChange: (text: string) => void;
+  /** This question's tags as the form holds them now. */
+  initialSessions: SessionMention[];
+  onSessionsChange: Dispatch<SetStateAction<Record<string, SessionMention[]>>>;
+  isMobile: boolean;
+  inputRef: RefObject<ComposerTextTarget | null>;
+  children: (mentions: AnswerMentions) => ReactNode;
+}) {
+  const [typedMention, setTypedMention] = useState<{ key: string; state: MentionState } | null>(
+    null,
+  );
+  const mention = typedMention?.key === currentKey ? typedMention.state : null;
+  const setMention = (next: MentionState | null) =>
+    setTypedMention(next ? { key: currentKey, state: next } : null);
+  const debouncedQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
+  // The editor lists sessions and reports them here; the listing is empty off the editor path.
+  const [sessionEntries, setSessionEntries] = useState<readonly SessionMention[]>([]);
+  // The hook releases a tag once its token is gone from this answer, and an undo brings it back.
+  const browser = useMentionBrowser({
+    mention,
+    setMention,
+    mentionEntries: NO_FILE_ENTRIES,
+    sessionEntries,
+    text: customText,
+    setText: onCustomTextChange,
+    textareaRef: inputRef,
+    isMobile,
+    initialMentions: { files: [], sessions: initialSessions },
+    segments: [customText],
+  });
+  const sessions = browser.mentionedSessions;
+  useEffect(
+    () => onSessionsChange((prev) => ({ ...prev, [currentKey]: sessions })),
+    [currentKey, sessions, onSessionsChange],
+  );
+  return (
+    <>
+      {children({
+        browser,
+        mention,
+        setMention,
+        debouncedQuery,
+        sessionEntries,
+        onSessionEntries: setSessionEntries,
+      })}
+    </>
+  );
+}
+
 interface AskUserQuestionAnswerEditorProps {
   inputRef: RefObject<ComposerTextTarget | null>;
   value: string;
   onValueChange: (text: string) => void;
-  mention: MentionState | null;
-  setMention: (next: MentionState | null) => void;
-  /** The mention query after the form's debounce; the session search runs on it. */
-  debouncedQuery: string;
-  /** Reports this editor's session rows so the form's mention browser can navigate them. */
-  onSessionEntries: Dispatch<SetStateAction<readonly SessionMention[]>>;
-  browser: MentionBrowser;
+  mentions: AnswerMentions;
 }
 
 export function AskUserQuestionAnswerEditor({
   inputRef,
   value,
   onValueChange,
-  mention,
-  setMention,
-  debouncedQuery,
-  onSessionEntries,
-  browser,
+  mentions,
 }: AskUserQuestionAnswerEditorProps) {
+  const { browser, mention, setMention, debouncedQuery, onSessionEntries } = mentions;
   // The session search needs the app's query client, so it runs only while the editor is mounted.
   const sessionEntries = useSessionMentionEntries({
     mention,

@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { isDraftingTarget } from "@/hooks/useApproveHotkey";
 import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
+import { useComposerEngineHandoff } from "@/components/composer/engine/useComposerEngineHandoff";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 import {
@@ -33,22 +34,15 @@ import {
   isTextEntry,
 } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import {
-  presentTaggedMentions,
-  type MentionState,
-  type SessionMention,
-} from "@/lib/composerMentions";
-import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import { useDebouncedValue } from "@/hooks/useDebouncedValue";
-import { MENTION_SEARCH_DEBOUNCE_MS } from "@/hooks/useSessionMentionEntries";
+import { presentTaggedMentions, type SessionMention } from "@/lib/composerMentions";
 import {
   type ComposerTextTarget,
   isComposerInput,
 } from "@/components/composer/engine/composerInput";
 import {
+  AnswerMentionScope,
   AskUserQuestionAnswerEditor,
   expandAnswerMentions,
-  NO_FILE_ENTRIES,
 } from "./AskUserQuestionAnswerEditor";
 
 /**
@@ -123,7 +117,7 @@ function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft,
     selections: {},
     customSelected: {},
     customInputs: {},
-    sessionMentions: [],
+    sessionMentions: {},
   };
   for (const q of questions) {
     const key = questionKey(q);
@@ -161,7 +155,10 @@ export function AskUserQuestionForm({
   const focusQuestionOnMoveRef = useRef(false);
   const isMobileViewport = useIsMobileViewport();
   // The prompt editor only where the chat composer uses it (flag on, desktop, chunk loaded).
-  const engine = useRequestedComposerEngine();
+  // The editor replaces the textarea once its chunk loads, but not while the user is composing.
+  const engine = useComposerEngineHandoff(useRequestedComposerEngine(), rootRef, {
+    draftKey: elicitationId,
+  });
   // The mobile layout keeps Enter as the newline key, as the composer does.
   const preventsKeyboardSubmit = isMobileViewport;
   const showKeyHints = !preventsKeyboardSubmit;
@@ -192,31 +189,11 @@ export function AskUserQuestionForm({
     draft?.customSelected ?? initial.customSelected,
   );
   const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
-  // The custom answers' @-mention state, shared by every question. It lives in the form, not the
-  // editor, so tags and their undo history survive the editor unmounting (a narrow viewport).
+  // Session tags per question: each question's scope reads its entry and writes it back here.
   const currentQuestionKey = questions[currentIndex] ? questionKey(questions[currentIndex]) : "";
-  const [typedMention, setTypedMention] = useState<{ key: string; state: MentionState } | null>(
-    null,
-  );
-  const mention = typedMention?.key === currentQuestionKey ? typedMention.state : null;
-  const setMention = (next: MentionState | null) =>
-    setTypedMention(next ? { key: currentQuestionKey, state: next } : null);
-  const debouncedMentionQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
-  // The editor lists sessions and reports them here; it is mounted only on the editor path.
-  const [sessionEntries, setSessionEntries] = useState<readonly SessionMention[]>([]);
-  const mentionBrowser = useMentionBrowser({
-    mention,
-    setMention,
-    mentionEntries: NO_FILE_ENTRIES,
-    sessionEntries,
-    text: customInputs[currentQuestionKey] ?? "",
-    setText: (text) => setCustomInputs((prev) => ({ ...prev, [currentQuestionKey]: text })),
-    textareaRef: customInputRef,
-    isMobile: isMobileViewport,
-    initialMentions: { files: [], sessions: draft?.sessionMentions ?? [] },
-    segments: questions.map((q) => customInputs[questionKey(q)] ?? ""),
-  });
-  const sessionMentions = mentionBrowser.mentionedSessions;
+  const [sessionMentionsByKey, setSessionMentionsByKey] = useState<
+    Record<string, SessionMention[]>
+  >(draft?.sessionMentions ?? {});
   const rememberTextareaCaret = (element: HTMLTextAreaElement) => {
     textareaHandoffRef.current = {
       key: currentQuestionKey,
@@ -241,23 +218,24 @@ export function AskUserQuestionForm({
       selections: { ...selections },
       customSelected: { ...customSelected },
       customInputs: { ...customInputs },
-      sessionMentions: [] as SessionMention[],
+      sessionMentions: {} as Record<string, SessionMention[]>,
     };
     // Answers to a secret question are never kept past this mount, nor their session tags.
-    const savedTexts: string[] = [];
     for (const q of draftQuestions) {
       const key = questionKey(q);
       if (!q.isSecret) {
-        savedTexts.push(customInputs[key] ?? "");
+        // Only tags whose token still shows in their own answer are kept.
+        const kept = presentTaggedMentions(
+          { files: [], sessions: sessionMentionsByKey[key] ?? [] },
+          [customInputs[key] ?? ""],
+        )?.sessions;
+        if (kept) answers.sessionMentions[key] = kept;
         continue;
       }
       answers.selections[key] = initial.selections[key]!;
       answers.customSelected[key] = initial.customSelected[key]!;
       answers.customInputs[key] = initial.customInputs[key]!;
     }
-    // Only tags whose token still shows in a saved answer are kept.
-    answers.sessionMentions =
-      presentTaggedMentions({ files: [], sessions: sessionMentions }, savedTexts)?.sessions ?? [];
     // Untouched cards keep no draft, so they cannot evict real ones.
     if (currentIndex === 0 && JSON.stringify(answers) === JSON.stringify(initial)) {
       clearAskUserQuestionDraft(elicitationId, signature);
@@ -273,7 +251,7 @@ export function AskUserQuestionForm({
     selections,
     customSelected,
     customInputs,
-    sessionMentions,
+    sessionMentionsByKey,
   ]);
 
   useEffect(() => {
@@ -367,7 +345,7 @@ export function AskUserQuestionForm({
         q,
         selections[key] ?? "",
         customSelected[key] ?? false,
-        expandAnswerMentions(customInputs[key] ?? "", sessionMentions),
+        expandAnswerMentions(customInputs[key] ?? "", sessionMentionsByKey[key] ?? []),
       );
       if (answer === null) return; // unreachable while ``allAnswered`` gates the button
       finalAnswers[key] = answer;
@@ -643,41 +621,50 @@ export function AskUserQuestionForm({
                   data-testid="ask-user-question-custom-toggle"
                 />
               </label>
-              {engine === "codemirror" ? (
-                <AskUserQuestionAnswerEditor
-                  inputRef={customInputRef}
-                  value={customRowValue}
-                  onValueChange={(text) => handleCustomInput(currentKey, text)}
-                  mention={mention}
-                  setMention={setMention}
-                  debouncedQuery={debouncedMentionQuery}
-                  onSessionEntries={setSessionEntries}
-                  browser={mentionBrowser}
-                />
-              ) : (
-                /* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
+              <AnswerMentionScope
+                currentKey={currentKey}
+                customText={customRowValue}
+                onCustomTextChange={(text) => handleCustomInput(currentKey, text)}
+                initialSessions={sessionMentionsByKey[currentKey] ?? []}
+                onSessionsChange={setSessionMentionsByKey}
+                isMobile={isMobileViewport}
+                inputRef={customInputRef}
+              >
+                {(mentions) =>
+                  engine === "codemirror" ? (
+                    <AskUserQuestionAnswerEditor
+                      inputRef={customInputRef}
+                      value={customRowValue}
+                      onValueChange={(text) => handleCustomInput(currentKey, text)}
+                      mentions={mentions}
+                    />
+                  ) : (
+                    /* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
                   the textarea to fit its content, so typing past the
                   first line wraps and expands downward instead of
                   scrolling within a fixed single row. */
-                <textarea
-                  ref={(element) => {
-                    customInputRef.current = element;
-                  }}
-                  rows={1}
-                  placeholder="Type something"
-                  value={customRowValue}
-                  onChange={(e) => {
-                    handleCustomInput(currentKey, e.target.value);
-                    rememberTextareaCaret(e.currentTarget);
-                  }}
-                  onFocus={(e) => rememberTextareaCaret(e.currentTarget)}
-                  onSelect={(e) => rememberTextareaCaret(e.currentTarget)}
-                  onBlur={(e) => rememberTextareaCaret(e.currentTarget)}
-                  data-testid="ask-user-question-custom-input"
-                  aria-label="Custom answer"
-                  className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
-                />
-              )}
+                    <textarea
+                      ref={(element) => {
+                        customInputRef.current = element;
+                      }}
+                      rows={1}
+                      placeholder="Type something"
+                      value={customRowValue}
+                      onChange={(e) => {
+                        mentions.browser.noteTextChange(e);
+                        handleCustomInput(currentKey, e.target.value);
+                        rememberTextareaCaret(e.currentTarget);
+                      }}
+                      onFocus={(e) => rememberTextareaCaret(e.currentTarget)}
+                      onSelect={(e) => rememberTextareaCaret(e.currentTarget)}
+                      onBlur={(e) => rememberTextareaCaret(e.currentTarget)}
+                      data-testid="ask-user-question-custom-input"
+                      aria-label="Custom answer"
+                      className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+                    />
+                  )
+                }
+              </AnswerMentionScope>
               {showKeyHints && current.options.length < DIGIT_SHORTCUT_COUNT && (
                 <CompactShortcutKeys
                   keys={[String(current.options.length + 1)]}

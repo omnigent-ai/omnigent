@@ -7,8 +7,8 @@ export interface AskUserQuestionDraft {
   selections: Record<string, string | string[]>;
   customSelected: Record<string, boolean>;
   customInputs: Record<string, string>;
-  /** Sessions @-tagged in the custom answers; their tokens may still be in the text. */
-  sessionMentions?: SessionMention[];
+  /** Session tags per question id, for the custom answers whose tokens are still in the text. */
+  sessionMentions?: Record<string, SessionMention[]>;
 }
 
 const MAX_DRAFTS = 20;
