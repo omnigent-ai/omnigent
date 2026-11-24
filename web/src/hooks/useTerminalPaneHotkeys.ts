@@ -348,7 +348,7 @@ export function useTerminalPaneHotkeys({
     zoomedKey,
     paneKey: targetKey,
     sizing: () => focus.sizing(),
-    root: panesRef.current,
+    rootRef: panesRef,
   });
 
   const splitAvailability = availability(

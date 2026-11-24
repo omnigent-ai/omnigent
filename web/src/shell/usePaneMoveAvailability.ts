@@ -2,7 +2,7 @@
 // the split, its maximized pane or the panes' size change, and as their terminals fit, so a split
 // with no room to move a pane lists the command greyed with why, as the drag offers no spot there.
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { type RefObject, useLayoutEffect, useRef, useState } from "react";
 
 import type { TerminalLayout } from "@/lib/paneSplitLayout";
 import type { CommandAvailability } from "@/store/paletteCommands";
@@ -17,8 +17,11 @@ export interface PaneMoveAvailabilityOptions {
   paneKey: string | null;
   /** The panes' size rule, measured now. */
   sizing: () => PaneSizing | null;
-  /** The element the panes are laid out in, watched for size changes and terminals fitting. */
-  root: HTMLElement | null;
+  /**
+   * The element the panes are laid out in, watched for size changes and terminals fitting. Read
+   * after each commit, so one that attaches later or is replaced is watched in its turn.
+   */
+  rootRef: RefObject<HTMLElement | null>;
 }
 
 /** A session terminal's fitted grid, which its pane's size rule reads. */
@@ -34,7 +37,7 @@ export function usePaneMoveAvailability({
   zoomedKey,
   paneKey,
   sizing,
-  root,
+  rootRef,
 }: PaneMoveAvailabilityOptions): CommandAvailability | null {
   const measure = () => movePaneAvailability({ layout, zoomedKey, key: paneKey, sizing: sizing() });
   const latest = useRef(measure);
@@ -42,6 +45,11 @@ export function usePaneMoveAvailability({
   const [measured, setMeasured] = useState(measure);
   const movable = paneMoveLayout(layout, zoomedKey);
   const shape = movable === null ? null : JSON.stringify(movable);
+  // The ref's element as of the last commit; setting the same one again renders nothing.
+  const [root, setRoot] = useState<HTMLElement | null>(null);
+  // After every commit, since nothing tells the hook when the ref's element changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => setRoot(rootRef.current));
   useLayoutEffect(() => {
     if (shape === null) return;
     const update = () =>

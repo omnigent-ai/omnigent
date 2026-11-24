@@ -1,26 +1,54 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { toast } from "sonner";
+
+import { isPinnedTab } from "./pinnedTabs";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type { PullRequest, PullRequestAssociation } from "@/hooks/usePullRequests";
+import type * as PanesViewGateModule from "../panesViewGate";
+import { resetPaneSplitsCache, updatePaneSplit } from "../paneSplitStore";
+import type { TerminalGroup } from "@/lib/terminalGroups";
+
+import { resetTerminalGroupsCache, updateTerminalGroups } from "../terminalGroupsStore";
+import { requestTerminalOpen, resetTerminalOpenRequestsForTests } from "../terminalOpenRequest";
+import { resetTerminalPlacement, usePublishMainTerminalKeys } from "../terminalPlacement";
+import { MOUNTED_SHELL_TAB_LIMIT } from "./shellTabBudget";
 import { LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ } from "@/lib/permissionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
 import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/ReconnectSessionDialog";
-import { isCommandListed, usePaletteCommandsStore } from "@/store/paletteCommands";
+import {
+  isCommandAvailable,
+  isCommandListed,
+  usePaletteCommandsStore,
+} from "@/store/paletteCommands";
 import { usePullRequestListCounts } from "@/store/pullRequestListCounts";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import type { WorkspacePlaceViewProps } from "./placeViews/WorkspacePlaceView";
+import type { RecentPullRequestFacts } from "./recentPullRequestRow";
 import { SHELL_LIST_LIMIT_MS } from "./terminalTabConnection";
 import { OWNER_RECONNECT_HINT, VIEWER_RESUME_HINT } from "./TerminalTabStatus";
+import type * as UseRecentPullRequestFacts from "./useRecentPullRequestFacts";
 import { resetSessionResumes } from "./useTerminalTabConnection";
 import { WorkspaceTabsPanel, type WorkspaceTabsPanelProps } from "./WorkspaceTabsPanel";
 import {
   openWorkspaceFile,
+  openWorkspaceNewTab,
   resetWorkspaceTabsSessionsForTests,
   workspaceTabsSession,
 } from "./workspaceTabsSessions";
@@ -53,6 +81,19 @@ vi.mock("../ContentSearchPanel", () => ({
     return <input aria-label="Search text in workspace" ref={props.inputRef} />;
   },
 }));
+// Pull request facts a test knows already, as if the session had read them; null reads the cache.
+const knownPullRequests = vi.hoisted(() => ({
+  facts: null as null | RecentPullRequestFacts,
+}));
+vi.mock("./useRecentPullRequestFacts", async (importOriginal) => {
+  const original = await importOriginal<typeof UseRecentPullRequestFacts>();
+  return {
+    useRecentPullRequestFacts: (conversationId: string, urls: readonly string[]) => {
+      const real = original.useRecentPullRequestFacts(conversationId, urls);
+      return knownPullRequests.facts ?? real;
+    },
+  };
+});
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: () => <div data-testid="browser-pane-stub" />,
 }));
@@ -73,7 +114,23 @@ vi.mock("@/components/blocks/TerminalView", () => ({
   ),
 }));
 
+// Whether the session's main area shows the panes view; off unless a case turns it on.
+const panesGate = vi.hoisted(() => ({ shown: false }));
+vi.mock("../panesViewGate", async (importOriginal) => ({
+  ...(await importOriginal<typeof PanesViewGateModule>()),
+  usePanesView: () => panesGate.shown,
+  usePanesSplitsAllowed: (readOnly: boolean) => panesGate.shown && !readOnly,
+}));
+
+const floatingPanes = vi.hoisted(() => ({ on: false, wide: true }));
+vi.mock("../useFloatingPanes", () => ({
+  useFloatingPanes: () => floatingPanes.on,
+  useFloatingPanesShown: () => floatingPanes.on && floatingPanes.wide,
+}));
+
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+// A shell that couldn't end is still running, so its toast stays until the person dismisses it.
+const STAYS_UNTIL_DISMISSED = { duration: Number.POSITIVE_INFINITY, closeButton: true };
 
 type PanelOverrides = Partial<WorkspaceTabsPanelProps> & { conversationId: string };
 
@@ -94,6 +151,7 @@ function panel(overrides: PanelOverrides) {
       terminalKeys={[]}
       openTerminalTab={vi.fn()}
       confirmCloseShell={vi.fn(async () => true)}
+      confirmCloseShells={vi.fn(async () => true)}
       endShell={vi.fn(async () => true)}
       maximized={false}
       onToggleMaximized={vi.fn()}
@@ -151,6 +209,8 @@ beforeEach(() => {
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
   placeViews.latest.clear();
   placeViews.bySession.clear();
+  floatingPanes.on = false;
+  floatingPanes.wide = true;
 });
 
 afterEach(() => {
@@ -161,6 +221,13 @@ afterEach(() => {
   usePullRequestListCounts.setState({ counts: {} });
   queryClient.clear();
   resetSessionResumes();
+  knownPullRequests.facts = null;
+  panesGate.shown = false;
+  resetPaneSplitsCache();
+  resetTerminalPlacement();
+  resetTerminalOpenRequestsForTests();
+  resetTerminalGroupsCache();
+  window.localStorage.clear();
 });
 
 describe("WorkspaceTabsPanel keyboard target", () => {
@@ -310,6 +377,104 @@ describe("the panel's placement", () => {
     expect(
       screen.queryByRole("button", { name: "Full screen", hidden: true }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("the gutter beside floating panes", () => {
+  const gutter = () => document.querySelector<HTMLElement>("[data-workspace-rail-gutter-handle]");
+  const rail = () => document.querySelector<HTMLElement>('aside[aria-label="Workspace"]')!;
+
+  it("drags the docked rail from a band beside it, placed by the rail's width", () => {
+    floatingPanes.on = true;
+    const onMouseDown = vi.fn();
+    renderPanels([
+      { conversationId: "conv_a", open: true, handleProps: { tabIndex: 0, onMouseDown } },
+    ]);
+    expect(rail().nextElementSibling).toBe(gutter());
+    expect(gutter()!.style.right).toBe("355px");
+    fireEvent.mouseDown(gutter()!);
+    expect(onMouseDown).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["without floating panes", { floating: false }],
+    ["full screen", { floating: true, maximized: true }],
+    ["in a grid cell", { floating: true, contained: true }],
+  ])("has no band %s", (_case, { floating, ...overrides }) => {
+    floatingPanes.on = floating;
+    renderPanels([{ conversationId: "conv_a", open: true, ...overrides }]);
+    expect(gutter()).toBeNull();
+  });
+});
+
+describe("All tabs' place in the strip", () => {
+  const button = (name: string) => screen.getByRole("button", { name, hidden: true });
+  const precedes = (first: Element, second: Element) =>
+    Boolean(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const firstTab = () => screen.getAllByRole("tab", { hidden: true })[0]!;
+  const stripDividers = () =>
+    document.querySelectorAll('aside[aria-label="Workspace"] [data-slot="separator"]');
+
+  it("leads the strip as layers before the tabs, with the divider after New tab", () => {
+    renderPanels([{ conversationId: "conv_a", open: true }]);
+    const allTabs = button("All tabs");
+    expect(precedes(allTabs, firstTab())).toBe(true);
+    expect(allTabs.querySelector(".lucide-layers")).not.toBeNull();
+    expect(stripDividers()).toHaveLength(1);
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+    expect(precedes(stripDividers()[0]!, button("Full screen"))).toBe(true);
+  });
+
+  it("with floating panes, opens from a chevron beside Full screen, after the divider", () => {
+    floatingPanes.on = true;
+    renderPanels([{ conversationId: "conv_a", open: true }]);
+    const allTabs = button("All tabs");
+    expect(precedes(firstTab(), allTabs)).toBe(true);
+    expect(precedes(button("New tab"), allTabs)).toBe(true);
+    expect(precedes(allTabs, button("Full screen"))).toBe(true);
+    expect(allTabs.querySelector(".lucide-chevron-down")).not.toBeNull();
+    // One divider, between New tab and All tabs.
+    expect(stripDividers()).toHaveLength(1);
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+    expect(precedes(stripDividers()[0]!, allTabs)).toBe(true);
+  });
+
+  it("keeps the classic place in a grid cell, which floating panes leave as it is", () => {
+    floatingPanes.on = true;
+    renderPanels([{ conversationId: "conv_a", open: true, contained: true }]);
+    const allTabs = button("All tabs");
+    expect(precedes(allTabs, firstTab())).toBe(true);
+    expect(allTabs.querySelector(".lucide-layers")).not.toBeNull();
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+  });
+
+  // The drawer holds the tabs below the desktop breakpoint, past 48rem too, where the panes float.
+  it.each([
+    ["a narrow window's", false],
+    ["a wider window's", true],
+  ])("in %s drawer, stays before the tabs as layers with the flag on", async (_, wide) => {
+    floatingPanes.on = true;
+    floatingPanes.wide = wide;
+    renderPanels([{ conversationId: "conv_a", open: true, placement: "drawer" }]);
+    const allTabs = button("All tabs");
+    expect(precedes(allTabs, firstTab())).toBe(true);
+    expect(allTabs.querySelector(".lucide-layers")).not.toBeNull();
+    expect(allTabs.querySelector(".lucide-chevron-down")).toBeNull();
+    expect(stripDividers()).toHaveLength(1);
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+    await userEvent.click(allTabs);
+    expect(await screen.findByRole("dialog", { hidden: true })).toHaveAttribute(
+      "data-align",
+      "start",
+    );
+  });
+
+  it("with floating panes, lines its list up with the button's end", async () => {
+    floatingPanes.on = true;
+    renderPanels([{ conversationId: "conv_a", open: true }]);
+    await userEvent.click(button("All tabs"));
+    const list = await screen.findByRole("dialog", { hidden: true });
+    expect(list).toHaveAttribute("data-align", "end");
   });
 });
 
@@ -616,6 +781,635 @@ describe("a shell's tab", () => {
     ).toBeNull();
   });
 
+  /** Listed shells, each open in its own tab, the last selected; returns each shell's tab. */
+  async function openShells(
+    conversationId: string,
+    ids: readonly string[],
+    overrides: Partial<PanelOverrides> = {},
+  ) {
+    const { useTerminals } = await import("@/hooks/useTerminals");
+    vi.mocked(useTerminals).mockReturnValue({
+      terminals: ids.map((id) => ({
+        id,
+        name: `${id}:s`,
+        terminalName: "zsh",
+        sessionKey: "s",
+        running: true,
+      })),
+      isLoading: false,
+      isFetching: false,
+      error: null,
+      listCompleteAt: 1,
+    } as unknown as ReturnType<typeof useTerminals>);
+    const panels = [
+      { conversationId, terminalKeys: ids.map((id) => `terminal:${id}`), ...overrides },
+    ];
+    const view = renderPanels(panels);
+    const { store } = workspaceTabsSession(conversationId);
+    const tabOf = new Map<string, string>();
+    await act(async () => {
+      for (const id of ids) {
+        // oxlint-disable-next-line no-await-in-loop -- each tab opens after the one before
+        const opened = await store.open(
+          { place: { kind: "terminal", key: `terminal:${id}` } },
+          { opener: "user", disposition: "new" },
+        );
+        if (opened.ok) tabOf.set(id, opened.tabId);
+      }
+    });
+    const select = (id: string) => act(() => void store.select(tabOf.get(id)!));
+    return { view, panels, store, select };
+  }
+
+  const shownTerminals = () =>
+    screen
+      .queryAllByTestId("terminal-view-stub")
+      .map((stub) => stub.dataset.terminal)
+      .sort();
+  const stubOf = (id: string) =>
+    screen.queryAllByTestId("terminal-view-stub").find((stub) => stub.dataset.terminal === id) ??
+    null;
+
+  it("keeps a shown shell tab's terminal attached while another tab shows, and back", async () => {
+    const { select } = await openShells("s-two-shells", ["term_a", "term_b"]);
+    select("term_a");
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_a", "term_b"]));
+    const attached = screen.getAllByTestId("terminal-view-stub");
+    act(() => void openWorkspaceNewTab("s-two-shells"));
+    select("term_a");
+    // The same two terminals, never remounted.
+    expect(attached.every((stub) => stub.isConnected)).toBe(true);
+    expect(shownTerminals()).toEqual(["term_a", "term_b"]);
+  });
+
+  it(`keeps the ${MOUNTED_SHELL_TAB_LIMIT} most recently shown shells attached, and reconnects an older one`, async () => {
+    const ids = Array.from({ length: MOUNTED_SHELL_TAB_LIMIT + 2 }, (_, index) => `term_${index}`);
+    const { select } = await openShells("s-many-shells", ids);
+    for (const id of ids) select(id);
+    await waitFor(() => expect(shownTerminals()).toHaveLength(MOUNTED_SHELL_TAB_LIMIT));
+    // The two shown longest ago let their terminals go.
+    expect(stubOf("term_0")).toBeNull();
+    expect(stubOf("term_1")).toBeNull();
+    const newest = stubOf(ids.at(-1)!);
+
+    select("term_0");
+    await waitFor(() => expect(stubOf("term_0")).not.toBeNull());
+    expect(shownTerminals()).toHaveLength(MOUNTED_SHELL_TAB_LIMIT);
+    // It takes the place of the next oldest; the newest stays as it was.
+    expect(stubOf("term_2")).toBeNull();
+    expect(stubOf(ids.at(-1)!)).toBe(newest);
+  });
+
+  it("counts a selected split's every shell against the budget, though it joins an evicted one", async () => {
+    panesGate.shown = true;
+    const ids = Array.from({ length: MOUNTED_SHELL_TAB_LIMIT + 1 }, (_, index) => `term_${index}`);
+    const { select } = await openShells("s-split-budget", ids, { permissionLevel: LEVEL_OWNER });
+    for (const id of ids) select(id);
+    await waitFor(() => expect(stubOf("term_0")).toBeNull());
+    // The newest shell and the evicted oldest become one sidebar split, which then shows.
+    act(() =>
+      updateTerminalGroups("s-split-budget", () => [
+        {
+          id: "g_newest_oldest",
+          split: {
+            layout: {
+              axis: "columns",
+              ratio: 0.5,
+              children: ["terminal:term_8", "terminal:term_0"],
+            },
+            focusedKey: "terminal:term_8",
+          },
+        },
+      ]),
+    );
+    await waitFor(() => expect(stubOf("term_0")).not.toBeNull());
+    expect(shownTerminals()).toHaveLength(MOUNTED_SHELL_TAB_LIMIT);
+  });
+
+  it("keeps only the selected split's shells attached while the sidebar is closed", async () => {
+    panesGate.shown = true;
+    const { view, panels, select } = await openShells(
+      "s-closed-split",
+      ["term_a", "term_b", "term_c"],
+      { permissionLevel: LEVEL_OWNER },
+    );
+    act(() =>
+      updateTerminalGroups("s-closed-split", () => [
+        {
+          id: "g_ab",
+          split: {
+            layout: {
+              axis: "columns",
+              ratio: 0.5,
+              children: ["terminal:term_a", "terminal:term_b"],
+            },
+            focusedKey: "terminal:term_a",
+          },
+        },
+      ]),
+    );
+    select("term_c");
+    select("term_a");
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_a", "term_b", "term_c"]));
+    view.rerender(panels.map((current) => ({ ...current, open: false })));
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_a", "term_b"]));
+  });
+
+  it("selects a split shell's tab as its pane takes focus, in place of the current step", async () => {
+    panesGate.shown = true;
+    const { store, select } = await openShells("s-split-focus", ["term_a", "term_b", "term_c"], {
+      permissionLevel: LEVEL_OWNER,
+    });
+    act(() =>
+      updateTerminalGroups("s-split-focus", () => [
+        {
+          id: "g_ab",
+          split: {
+            layout: {
+              axis: "columns",
+              ratio: 0.5,
+              children: ["terminal:term_a", "terminal:term_b"],
+            },
+            focusedKey: "terminal:term_a",
+          },
+        },
+      ]),
+    );
+    select("term_c");
+    select("term_a");
+    const tabA = store.selectedTabId();
+    await waitFor(() => expect(stubOf("term_b")).not.toBeNull());
+    fireEvent.focusIn(stubOf("term_b")!);
+    const tabB = store.selectedTab();
+    expect(tabB?.binding).toEqual({ kind: "terminal", key: "terminal:term_b" });
+    // The step a's selection made is b's now, so Back goes where it would have from a.
+    expect(store.history.canGoForward()).toBe(false);
+    await act(async () => void (await store.go("back")));
+    expect(store.selectedTab()?.binding).toEqual({ kind: "terminal", key: "terminal:term_c" });
+    expect(store.selectedTabId()).not.toBe(tabA);
+    // A shell outside the shown split taking focus selects nothing.
+    select("term_a");
+    fireEvent.focusIn(stubOf("term_c")!);
+    expect(store.selectedTabId()).toBe(tabA);
+  });
+
+  it.each<[string, () => readonly TerminalGroup[]]>([
+    ["goes", () => []],
+    [
+      "becomes a/c",
+      () => [
+        {
+          id: "g_ac",
+          split: {
+            layout: {
+              axis: "columns",
+              ratio: 0.5,
+              children: ["terminal:term_a", "terminal:term_c"],
+            },
+            focusedKey: "terminal:term_a",
+          },
+        },
+      ],
+    ],
+  ])(
+    "selects nothing for focus from a split that %s before the sidebar rerenders",
+    async (_change, nextGroups) => {
+      const conversationId = `s-split-stale-${nextGroups().length}`;
+      panesGate.shown = true;
+      const { store, select } = await openShells(conversationId, ["term_a", "term_b", "term_c"], {
+        permissionLevel: LEVEL_OWNER,
+      });
+      act(() =>
+        updateTerminalGroups(conversationId, () => [
+          {
+            id: "g_ab",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_b"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      select("term_a");
+      const tabA = store.selectedTabId();
+      await waitFor(() => expect(stubOf("term_b")).not.toBeNull());
+      const paneB = stubOf("term_b")!;
+      const visits = store.history.state.visits;
+      // The split changes and b's focus lands in one batch, before the panel renders again.
+      act(() => {
+        updateTerminalGroups(conversationId, nextGroups);
+        paneB.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+      });
+      expect(store.selectedTabId()).toBe(tabA);
+      expect(store.history.state.visits).toEqual(visits);
+    },
+  );
+
+  describe("a sidebar split's strip entry", () => {
+    /** Shells a, b and c with a and b split, a focused and selected. */
+    async function splitAB(conversationId: string, overrides: Partial<PanelOverrides> = {}) {
+      panesGate.shown = true;
+      const opened = await openShells(conversationId, ["term_a", "term_b", "term_c"], {
+        permissionLevel: LEVEL_OWNER,
+        ...overrides,
+      });
+      act(() =>
+        updateTerminalGroups(conversationId, () => [
+          {
+            id: "g_ab",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_b"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      opened.select("term_a");
+      return opened;
+    }
+    const stripNames = () => screen.getAllByRole("tab").map((tab) => tab.textContent);
+
+    it("shows the split once, named for its focused shell, and follows focus", async () => {
+      await splitAB("s-group-entry");
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s +1", "term_c:s"]));
+      const entry = screen.getByRole("tab", { name: /term_a:s \+1/ });
+      expect(entry).toHaveAttribute("aria-selected", "true");
+      await waitFor(() => expect(stubOf("term_b")).not.toBeNull());
+      fireEvent.focusIn(stubOf("term_b")!);
+      await waitFor(() => expect(stripNames()).toEqual(["term_b:s +1", "term_c:s"]));
+      expect(screen.getByRole("tab", { name: /term_b:s \+1/ })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+    });
+
+    it("keeps each shell's own tab where splits aren't allowed", async () => {
+      await splitAB("s-group-editor", { permissionLevel: LEVEL_EDIT });
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s", "term_b:s", "term_c:s"]));
+    });
+
+    it("closes the split whole from its ×, asking once, and keeps it on Cancel", async () => {
+      const confirmCloseShells = vi.fn(async () => false);
+      const endShell = vi.fn(async () => true);
+      const { store } = await splitAB("s-group-close", { confirmCloseShells, endShell });
+      const close = await screen.findByRole("button", { name: "Close term_a:s +1" });
+      await userEvent.click(close);
+      await waitFor(() =>
+        expect(confirmCloseShells).toHaveBeenCalledExactlyOnceWith([
+          "terminal:term_a",
+          "terminal:term_b",
+        ]),
+      );
+      expect(endShell).not.toHaveBeenCalled();
+      expect(store.tabs()).toHaveLength(3);
+
+      confirmCloseShells.mockResolvedValue(true);
+      await userEvent.click(screen.getByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() => expect(store.tabs()).toHaveLength(1));
+      expect(endShell.mock.calls).toEqual([["terminal:term_a"], ["terminal:term_b"]]);
+      expect(confirmCloseShells).toHaveBeenCalledTimes(2);
+    });
+
+    it("closes the split whole from Close tab's chord and from its menu", async () => {
+      const confirmCloseShells = vi.fn(async () => true);
+      const confirmCloseShell = vi.fn(async () => true);
+      const endShell = vi.fn(async () => true);
+      const { store } = await splitAB("s-group-chord", {
+        confirmCloseShells,
+        confirmCloseShell,
+        endShell,
+      });
+      await screen.findByRole("tab", { name: /term_a:s \+1/ });
+      act(pressCloseTab);
+      await waitFor(() => expect(store.tabs()).toHaveLength(1));
+      expect(confirmCloseShells).toHaveBeenCalledOnce();
+      expect(confirmCloseShell).not.toHaveBeenCalled();
+
+      cleanup();
+      const second = await splitAB("s-group-menu", { confirmCloseShells, endShell });
+      const entry = await screen.findByRole("tab", { name: /term_a:s \+1/ });
+      fireEvent.contextMenu(entry.closest("[data-tab-strip-entry]")!);
+      expect(screen.queryByRole("menuitem", { name: /^Pin tab/ })).toBeNull();
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Close split" }));
+      await waitFor(() => expect(second.store.tabs()).toHaveLength(1));
+    });
+
+    it("keeps a shell that won't end in a consistent strip, and says which", async () => {
+      const failed = vi.spyOn(toast, "error").mockImplementation(() => "");
+      const endShell = vi.fn(async (key: string) => key !== "terminal:term_b");
+      const { store } = await splitAB("s-group-partial", { endShell });
+      await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() =>
+        expect(failed).toHaveBeenCalledExactlyOnceWith(
+          "Couldn't close term_b:s. It's still running.",
+          STAYS_UNTIL_DISMISSED,
+        ),
+      );
+      // a's tab went; b's and c's stay, with the selection on one of them and history agreeing.
+      const remaining = store.tabs().map((tab) => ("binding" in tab ? tab.binding : undefined));
+      expect(remaining).toEqual([
+        { kind: "terminal", key: "terminal:term_b" },
+        { kind: "terminal", key: "terminal:term_c" },
+      ]);
+      const selected = store.selectedTabId();
+      expect(store.tabs().some((tab) => tab.id === selected)).toBe(true);
+      expect(store.history.state.visits[store.history.state.cursor]?.tabId).toBe(selected);
+      failed.mockRestore();
+    });
+
+    it("names every shell that kept running in one message", async () => {
+      const failed = vi.spyOn(toast, "error").mockImplementation(() => "");
+      onTestFinished(() => failed.mockRestore());
+      const endShell = vi.fn(async () => false);
+      const { store } = await splitAB("s-group-all-fail", { endShell });
+      await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() => expect(endShell).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(failed).toHaveBeenCalledExactlyOnceWith(
+          "Couldn't close term_a:s and term_b:s. They're still running.",
+          STAYS_UNTIL_DISMISSED,
+        ),
+      );
+      expect(store.tabs()).toHaveLength(3);
+    });
+
+    it("ends every shell the split names, though a member has no tab", async () => {
+      const endShell = vi.fn(async () => true);
+      const { store } = await splitAB("s-group-tabless", { endShell });
+      const tabB = store
+        .tabs()
+        .find(
+          (tab) =>
+            "binding" in tab &&
+            tab.binding?.kind === "terminal" &&
+            tab.binding.key === "terminal:term_b",
+        )!.id;
+      // A restored split whose second shell's tab is gone; closing that tab ends nothing.
+      await act(async () => void (await store.close(tabB)));
+      await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() => expect(endShell).toHaveBeenCalledTimes(2));
+      expect(endShell.mock.calls).toEqual([["terminal:term_a"], ["terminal:term_b"]]);
+    });
+
+    it("ends nothing when the split changes while its close is asking", async () => {
+      let answer!: (confirmed: boolean) => void;
+      const confirmCloseShells = vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      const endShell = vi.fn(async () => true);
+      const { store } = await splitAB("s-group-changed", { confirmCloseShells, endShell });
+      await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() => expect(confirmCloseShells).toHaveBeenCalledOnce());
+      act(() =>
+        updateTerminalGroups("s-group-changed", () => [
+          {
+            id: "g_ab",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_c"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      await act(async () => answer(true));
+      await act(async () => {});
+      expect(endShell).not.toHaveBeenCalled();
+      expect(store.tabs()).toHaveLength(3);
+    });
+
+    it("moves a split's tabs together with ⌥⇧→, and a tab past them whole", async () => {
+      const { store } = await splitAB("s-group-move");
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s +1", "term_c:s"]));
+      fireEvent.keyDown(screen.getByRole("tab", { name: /term_a:s \+1/ }), {
+        key: "ArrowRight",
+        altKey: true,
+        shiftKey: true,
+      });
+      expect(stripNames()).toEqual(["term_c:s", "term_a:s +1"]);
+      const keys = () =>
+        store
+          .tabs()
+          .map((tab) =>
+            "binding" in tab && tab.binding?.kind === "terminal" ? tab.binding.key : "",
+          );
+      expect(keys()).toEqual(["terminal:term_c", "terminal:term_a", "terminal:term_b"]);
+      // c moving right past the split lands after it, not between its tabs.
+      fireEvent.keyDown(screen.getByRole("tab", { name: "term_c:s" }), {
+        key: "ArrowRight",
+        altKey: true,
+        shiftKey: true,
+      });
+      expect(stripNames()).toEqual(["term_a:s +1", "term_c:s"]);
+      expect(keys()).toEqual(["terminal:term_a", "terminal:term_b", "terminal:term_c"]);
+    });
+
+    it("keeps a split at the strip's end where it is, its tabs in their order", async () => {
+      const { store, select } = await splitAB("s-group-edge");
+      // b, the split's second tab, has its focus, so the split goes by b's tab.
+      fireEvent.focusIn((await waitFor(() => stubOf("term_b")))!);
+      select("term_b");
+      await waitFor(() => expect(stripNames()).toEqual(["term_b:s +1", "term_c:s"]));
+      // ⌘K goes by the strip's entries: the split is the first, though b is the second tab.
+      const moveLeft = registeredPaletteCommands().find(
+        (command) => command.label === "Move workspace tab left",
+      );
+      expect(isCommandAvailable(moveLeft?.availability)).toBe(false);
+      const keys = () =>
+        store
+          .tabs()
+          .map((tab) =>
+            "binding" in tab && tab.binding?.kind === "terminal" ? tab.binding.key : "",
+          );
+      fireEvent.keyDown(screen.getByRole("tab", { name: /term_b:s \+1/ }), {
+        key: "ArrowLeft",
+        altKey: true,
+        shiftKey: true,
+      });
+      expect(stripNames()).toEqual(["term_b:s +1", "term_c:s"]);
+      expect(keys()).toEqual(["terminal:term_a", "terminal:term_b", "terminal:term_c"]);
+    });
+
+    it("moves a tab past a whole entry when the split's tabs aren't side by side", async () => {
+      panesGate.shown = true;
+      const { store, select } = await openShells(
+        "s-group-scattered",
+        ["term_a", "term_b", "term_c", "term_d"],
+        { permissionLevel: LEVEL_OWNER },
+      );
+      // a and c split, with b between their tabs: the strip shows the split, b, then d.
+      act(() =>
+        updateTerminalGroups("s-group-scattered", () => [
+          {
+            id: "g_ac",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_c"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      select("term_b");
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s +1", "term_b:s", "term_d:s"]));
+      fireEvent.keyDown(screen.getByRole("tab", { name: "term_b:s" }), {
+        key: "ArrowRight",
+        altKey: true,
+        shiftKey: true,
+      });
+      expect(stripNames()).toEqual(["term_a:s +1", "term_d:s", "term_b:s"]);
+      expect(store.tabs()).toHaveLength(4);
+    });
+
+    it("offers Move right in a tab's menu by its place among the entries, past a split", async () => {
+      panesGate.shown = true;
+      const { store } = await openShells(
+        "s-group-menu-move",
+        ["term_a", "term_b", "term_c", "term_d"],
+        {
+          permissionLevel: LEVEL_OWNER,
+        },
+      );
+      act(() =>
+        updateTerminalGroups("s-group-menu-move", () => [
+          {
+            id: "g_ab",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_a", "terminal:term_b"],
+              },
+              focusedKey: "terminal:term_a",
+            },
+          },
+        ]),
+      );
+      await waitFor(() => expect(stripNames()).toEqual(["term_a:s +1", "term_c:s", "term_d:s"]));
+      // c is the third tab but the second entry: d still follows it.
+      fireEvent.contextMenu(
+        screen.getByRole("tab", { name: "term_c:s" }).closest("[data-tab-strip-entry]")!,
+      );
+      const moveRight = await screen.findByRole("menuitem", { name: /^Move right/ });
+      expect(moveRight).not.toHaveAttribute("data-disabled");
+      fireEvent.click(moveRight);
+      expect(stripNames()).toEqual(["term_a:s +1", "term_d:s", "term_c:s"]);
+      expect(store.tabs()).toHaveLength(4);
+    });
+
+    it("unpins a pinned shell as it joins a split", async () => {
+      const { store } = await openShells("s-group-pin", ["term_a", "term_b", "term_c"], {
+        permissionLevel: LEVEL_OWNER,
+      });
+      const tabOf = (key: string) =>
+        store
+          .tabs()
+          .find(
+            (tab) =>
+              "binding" in tab && tab.binding?.kind === "terminal" && tab.binding.key === key,
+          )!.id;
+      act(() => store.setPinned([tabOf("terminal:term_b")], true));
+      expect(isPinnedTab(store.findTab(tabOf("terminal:term_b"))!)).toBe(true);
+      panesGate.shown = true;
+      act(() =>
+        updateTerminalGroups("s-group-pin", () => [
+          {
+            id: "g_bc",
+            split: {
+              layout: {
+                axis: "columns",
+                ratio: 0.5,
+                children: ["terminal:term_b", "terminal:term_c"],
+              },
+              focusedKey: "terminal:term_b",
+            },
+          },
+        ]),
+      );
+      await waitFor(() =>
+        expect(isPinnedTab(store.findTab(tabOf("terminal:term_b"))!)).toBe(false),
+      );
+    });
+  });
+
+  it("keeps a shell's tab that won't end, and says so once, naming it", async () => {
+    const failed = vi.spyOn(toast, "error").mockImplementation(() => "");
+    onTestFinished(() => failed.mockRestore());
+    const endShell = vi.fn(async () => false);
+    const { store, select } = await openShells("s-shell-close-fails", ["term_a", "term_b"], {
+      endShell,
+    });
+    select("term_a");
+    await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s" }));
+    await waitFor(() =>
+      expect(failed).toHaveBeenCalledExactlyOnceWith(
+        "Couldn't close term_a:s. It's still running.",
+        STAYS_UNTIL_DISMISSED,
+      ),
+    );
+    expect(endShell).toHaveBeenCalledExactlyOnceWith("terminal:term_a");
+    expect(store.tabs()).toHaveLength(2);
+  });
+
+  it("keeps only the selected shell attached while the sidebar is closed", async () => {
+    const { view, panels, select } = await openShells("s-closed", ["term_a", "term_b"]);
+    select("term_a");
+    select("term_b");
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_a", "term_b"]));
+    view.rerender(panels.map((current) => ({ ...current, open: false })));
+    await waitFor(() => expect(shownTerminals()).toEqual(["term_b"]));
+  });
+
+  it("leaves out a shell the main view shows, and says where it is", async () => {
+    renderHook(() => usePublishMainTerminalKeys("s-main-shows", ["terminal:term_b"]));
+    await openShells("s-main-shows", ["term_a", "term_b"]);
+    expect(await screen.findByText("This shell is open in the Terminal view.")).toBeVisible();
+    expect(stubOf("term_b")).toBeNull();
+  });
+
+  it("mounts a saved split's shell while no view shows that split", async () => {
+    // The panes view is on, but the main view fell back and shows no split.
+    panesGate.shown = true;
+    updatePaneSplit("s-split-unshown", () => ({
+      layout: { axis: "columns", ratio: 0.5, children: ["terminal:agent", "terminal:term_b"] },
+      focusedKey: "terminal:term_b",
+    }));
+    await openShells("s-split-unshown", ["term_a", "term_b"]);
+    await waitFor(() => expect(stubOf("term_b")).not.toBeNull());
+    expect(screen.queryByText("This shell is open in the Terminal view.")).toBeNull();
+  });
+
+  it("opens a shell's tab when a pane asks, as its own open does", async () => {
+    const openTerminalTab = vi.fn();
+    await openShells("s-open-request", ["term_a", "term_b"], { openTerminalTab });
+    act(() => requestTerminalOpen("s-open-request", { key: "terminal:term_a", focus: false }));
+    expect(openTerminalTab).toHaveBeenCalledExactlyOnceWith("terminal:term_a", { focus: false });
+  });
+
+  it("leaves a pane's open request to the session's own sidebar, not a grid cell's", async () => {
+    const openTerminalTab = vi.fn();
+    await openShells("s-open-grid", ["term_a", "term_b"], { openTerminalTab, contained: true });
+    act(() => requestTerminalOpen("s-open-grid", { key: "terminal:term_a", focus: true }));
+    expect(openTerminalTab).not.toHaveBeenCalled();
+  });
+
   /** The session's shell list as the panel reads it. */
   async function listShells(state: {
     error?: Error;
@@ -829,4 +1623,128 @@ describe("a shell's tab", () => {
       await waitFor(() => expect(resume).not.toBeDisabled());
     },
   );
+});
+
+describe("closing a group of tabs", () => {
+  it("closes every file tab from ⌘K and every page from the All tabs heading", async () => {
+    const conversationId = "s-close-groups";
+    renderPanels([{ conversationId }]);
+    const { store } = workspaceTabsSession(conversationId);
+    await act(async () => {
+      await store.open({ place: { kind: "files", path: "a.md" } }, { opener: "user" });
+      await store.open({ place: { kind: "files", path: "b.md" } }, { opener: "user" });
+      await store.open({ place: { kind: "web", url: "https://example.com" } }, { opener: "user" });
+      await store.open({ place: { kind: "agents" } }, { opener: "user" });
+    });
+    const kinds = () => store.tabs().map((tab) => ("place" in tab ? tab.place.kind : "unknown"));
+    expect(kinds()).toEqual(expect.arrayContaining(["files", "files", "web", "agents"]));
+
+    const closeFiles = await waitFor(() => {
+      const command = listedPaletteCommands().find(
+        (candidate) => candidate.id === `workspace:${conversationId}:tab-action:close-file-tabs`,
+      );
+      expect(command?.label).toBe("Close all file tabs");
+      return command!;
+    });
+    act(() => closeFiles.run());
+    await waitFor(() => expect(kinds()).not.toContain("files"));
+    expect(kinds()).toEqual(expect.arrayContaining(["web", "agents"]));
+
+    await userEvent.click(screen.getByRole("button", { name: "All tabs" }));
+    expect(await screen.findByRole("group", { name: /^Pages 1/ })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Close all page tabs" }));
+    await waitFor(() => expect(kinds()).not.toContain("web"));
+    // The list stays open on what's left: the tab on screen, which leads outside any group.
+    expect(screen.getByRole("option", { name: /Current/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Close all/ })).toBeNull();
+  });
+
+  it("closes the merged pull requests' tabs, PR files too, but keeps open and pinned ones", async () => {
+    const conversationId = "s-close-merged";
+    const merged = "https://github.example.com/acme/repo/pull/1";
+    const open = "https://github.example.com/acme/repo/pull/2";
+    const pinnedMerged = "https://github.example.com/acme/repo/pull/3";
+    const pr = (url: string, number: number, state: string) =>
+      ({ url, number, title: `Change ${number}`, state, is_draft: false }) as PullRequest;
+    knownPullRequests.facts = {
+      linked: [],
+      details: new Map([
+        [merged, pr(merged, 1, "MERGED")],
+        [open, pr(open, 2, "OPEN")],
+        [pinnedMerged, pr(pinnedMerged, 3, "MERGED")],
+      ]),
+    };
+    renderPanels([{ conversationId }]);
+    const { store } = workspaceTabsSession(conversationId);
+    await act(async () => {
+      // One at a time, so the tabs open in this order.
+      await store.open(
+        { place: { kind: "pull", url: merged, view: "summary" } },
+        { opener: "user" },
+      );
+      await store.open({ place: { kind: "pull", url: open, view: "summary" } }, { opener: "user" });
+      await store.open(
+        { place: { kind: "pull", url: pinnedMerged, view: "summary" } },
+        { opener: "user" },
+      );
+      await store.open(
+        { place: { kind: "pull", url: merged, view: "changes", path: "a.ts" } },
+        { opener: "user", disposition: "new" },
+      );
+      await store.open({ place: { kind: "agents" } }, { opener: "user" });
+    });
+    const pinned = store
+      .tabs()
+      .find((tab) => "place" in tab && "url" in tab.place && tab.place.url === pinnedMerged)!;
+    act(() => store.setPinned([pinned.id], true));
+    const urls = () =>
+      store
+        .tabs()
+        .flatMap((tab) => ("place" in tab && tab.place.kind === "pull" ? [tab.place.url] : []));
+
+    await userEvent.click(screen.getByRole("button", { name: "All tabs" }));
+    const pulls = await screen.findByRole("group", { name: /^Pull requests 4/ });
+    expect(within(pulls).getByRole("option", { name: /#2 Change 2/ })).toHaveTextContent("Open");
+    await userEvent.click(screen.getByRole("button", { name: "Close merged pull request tabs" }));
+    await waitFor(() => expect(urls()).toEqual([pinnedMerged, open]));
+    // Nothing merged is left to close but the pinned tab, which stays.
+    expect(screen.queryByRole("button", { name: "Close merged pull request tabs" })).toBeNull();
+  });
+
+  it("counts a PR as merged when the session saw it merge after its details were read", async () => {
+    const conversationId = "s-close-merged-later";
+    const url = "https://github.example.com/acme/repo/pull/7";
+    knownPullRequests.facts = {
+      linked: [
+        {
+          url,
+          host: "github.example.com",
+          repository: "acme/repo",
+          number: 7,
+          title: "Change 7",
+          relationship: "created",
+          state: "MERGED",
+          state_checked_at: Date.UTC(2026, 0, 1, 10, 5) / 1000,
+        } as PullRequestAssociation,
+      ],
+      details: new Map([
+        [url, { url, number: 7, title: "Change 7", state: "OPEN", is_draft: false } as PullRequest],
+      ]),
+      detailsUpdatedAt: new Map([[url, Date.UTC(2026, 0, 1, 10, 0)]]),
+    };
+    renderPanels([{ conversationId }]);
+    const { store } = workspaceTabsSession(conversationId);
+    await act(async () => {
+      await store.open({ place: { kind: "pull", url, view: "summary" } }, { opener: "user" });
+      await store.open({ place: { kind: "agents" } }, { opener: "user" });
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "All tabs" }));
+    const pulls = await screen.findByRole("group", { name: /^Pull requests 1/ });
+    expect(within(pulls).getByRole("option", { name: /#7 Change 7/ })).toHaveTextContent("Merged");
+    await userEvent.click(screen.getByRole("button", { name: "Close merged pull request tabs" }));
+    await waitFor(() =>
+      expect(store.tabs().some((tab) => "place" in tab && tab.place.kind === "pull")).toBe(false),
+    );
+  });
 });

@@ -42,6 +42,7 @@ if TYPE_CHECKING:
         CodexAppServerClient,
         CodexNativeAppServer,
     )
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
     from omnigent.harnesses.opencode_native.client import OpenCodeClient
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
@@ -470,6 +471,34 @@ def codex_native_bridge_dir(session_id: str) -> Path:
     from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id
 
     return _AUTO_CODEX_BRIDGE_DIRS.get(session_id) or bridge_dir_for_bridge_id(session_id)
+
+
+def _codex_backend_key_for_session(
+    session_id: str, bridge_state: CodexNativeBridgeState | None
+) -> str:
+    """Return the registry key of the Codex backend a session's bridge points at.
+
+    A forwarder rotation moves the bridge onto a new session while its app-server and
+    forwarder stay registered under the session that launched them.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_new"``.
+    :param bridge_state: The session's current bridge state, if any.
+    :returns: The launching session's id for a rotated session, else *session_id*.
+    """
+    if (
+        session_id in _AUTO_CODEX_APP_SERVERS
+        or bridge_state is None
+        or bridge_state.session_id != session_id
+    ):
+        return session_id
+    return next(
+        (
+            key
+            for key, app_server in _AUTO_CODEX_APP_SERVERS.items()
+            if app_server.listen_url == bridge_state.socket_path
+        ),
+        session_id,
+    )
 
 
 # Background OpenCode ``opencode serve`` instances for host-spawned
@@ -5353,6 +5382,59 @@ async def _launch_codex_native_tui(
     return _CodexNativeTuiLaunch(terminal_view, terminal_instance, thread_start_timeout_seconds)
 
 
+async def _relaunch_codex_native_tui_on_thread(
+    session_id: str,
+    thread_id: str,
+    *,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    app_server: CodexNativeAppServer,
+    launch_config: _CodexNativeLaunchConfig,
+    bridge_dir: Path,
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> None:
+    """
+    Replace a session's Codex TUI with one resuming *thread_id* on the same app-server.
+
+    :param session_id: Session now owning the TUI, e.g. ``"conv_new"``.
+    :param thread_id: Codex thread the TUI should show, e.g. ``"thread_fresh"``.
+    :param resource_registry: Registry holding the session's terminal.
+    :param publish_event: The runner's per-session SSE emitter.
+    :param app_server: Live app-server the TUI attaches to.
+    :param launch_config: The original launch's configuration.
+    :param bridge_dir: Native Codex bridge directory.
+    :param agent_spec: Agent spec for the terminal's OS environment.
+    :returns: None.
+    :raises Exception: If the replacement fails to launch; the native-terminal ensure
+        path can then recreate the pane on the same app-server.
+    """
+    from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+
+    # Resolve before closing so the session spends as little time as possible without a TUI.
+    terminal_cli = await _resolve_codex_terminal_cli(
+        workspace=str(launch_config.workspace), app_server=app_server, resume=True
+    )
+    await resource_registry.close_terminal(session_id, terminal_resource_id("codex", "main"))
+    # The replacement reuses the terminal id; viewers remount only after seeing it removed.
+    _publish_terminal_deleted_event(
+        conversation_id=session_id,
+        terminal_name="codex",
+        session_key="main",
+        publish_event=publish_event,
+    )
+    await _launch_codex_native_tui(
+        session_id,
+        resource_registry,
+        publish_event,
+        app_server=app_server,
+        launch_config=launch_config,
+        bridge_dir=bridge_dir,
+        thread_id=thread_id,
+        agent_spec=agent_spec,
+        terminal_cli=terminal_cli,
+    )
+
+
 #: Waits between ``thread/resume`` retries when codex finds no rollout for a
 #: thread whose rollout the runner just wrote.
 _CODEX_MISSING_ROLLOUT_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0, 2.0)
@@ -5457,9 +5539,10 @@ async def _auto_create_codex_terminal(
     bridge_dir = prepare_bridge_dir(launch_config.bridge_id or session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
-    app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
-    forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
     bridge_state = read_bridge_state(bridge_dir)
+    backend_key = _codex_backend_key_for_session(session_id, bridge_state)
+    app_server = _AUTO_CODEX_APP_SERVERS.get(backend_key)
+    forwarder = _AUTO_FORWARDER_TASKS.get(backend_key)
     process = getattr(app_server, "proc", None)
     if (
         app_server is not None
@@ -5657,6 +5740,8 @@ async def _auto_create_codex_terminal(
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
+    if backend_key != session_id:
+        await _cancel_auto_forwarder_task(backend_key)
     clear_bridge_state(bridge_dir)
     # Only a resume can conflict with a stale writer for the same Codex thread.
     # Fresh sessions have no thread writer to recover and must not pay for a
@@ -6232,6 +6317,15 @@ async def _auto_create_codex_terminal(
                 exc_info=True,
             )
 
+    relaunch_terminal = functools.partial(
+        _relaunch_codex_native_tui_on_thread,
+        resource_registry=resource_registry,
+        publish_event=publish_event,
+        app_server=app_server,
+        launch_config=launch_config,
+        bridge_dir=bridge_dir,
+        agent_spec=agent_spec,
+    )
     # Adopt the thread the fresh TUI creates and run the forwarder in the
     # background, so session creation never blocks on TUI startup.
     _forwarder_task = asyncio.create_task(
@@ -6251,6 +6345,7 @@ async def _auto_create_codex_terminal(
                 apply_plan_mode=apply_plan_mode,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
+                relaunch_terminal=relaunch_terminal,
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -6262,6 +6357,7 @@ async def _auto_create_codex_terminal(
                 app_server=app_server,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
+                relaunch_terminal=relaunch_terminal,
             )
         ),
         name=f"codex-forwarder-{session_id}",
@@ -6423,24 +6519,28 @@ async def _record_agent_startup_pending(
     terminal_instance: TerminalInstance,
     routing_summary: str,
     waited_seconds: float,
-) -> None:
+) -> bool:
     """
     Record that Codex is still starting behind a live pane, noting a sign-in prompt it shows.
 
     A launcher wrapper can park the pane on a sign-in prompt. The wait records
-    this as soon as the prompt is stable on screen, or at the thread-start
-    budget when the pane shows something else. Chat turns read the record and
-    fail fast with the next step instead of the generic "thread never
-    started"; the discovery wait then continues without a deadline and clears
-    the record once the thread starts.
+    this as soon as the prompt is stable on screen, including after the
+    thread-start budget, and records a still-starting cause at the budget when
+    the pane shows something else. Chat turns fail fast on a sign-in record with
+    the next step, and wait on a still-starting one; the discovery wait then
+    continues without a deadline and clears the record once the thread starts.
 
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Codex bridge directory for this session.
     :param terminal_instance: The live TUI pane, read once for its screen text.
     :param routing_summary: One-line description of the resolved launch routing.
     :param waited_seconds: How long discovery has waited for the thread so far.
+    :returns: ``True`` when the pane showed a sign-in prompt and that was recorded.
     """
-    from omnigent.harnesses.codex_native.bridge import write_bridge_startup_error
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_STARTUP_PENDING_CODE,
+        write_bridge_startup_error,
+    )
     from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
 
     prompt = detect_sign_in_prompt(await _codex_pane_screen(terminal_instance))
@@ -6450,14 +6550,16 @@ async def _record_agent_startup_pending(
         message = "Codex is waiting for a sign-in in this session's terminal."
         remediation = sign_in_next_step("Codex")
     else:
-        code = "agent_startup_pending"
+        # Nothing on screen asks for a sign-in, so report a slow start rather than a login wait.
+        code = CODEX_STARTUP_PENDING_CODE
         title = "Codex is still starting"
         message = (
-            "Codex is still starting in this session's terminal and may be waiting "
-            "for a sign-in there."
+            "Codex hasn't finished starting in this session's terminal after "
+            f"{waited_seconds:.0f}s."
         )
         remediation = (
-            "Finish any sign-in shown in the session terminal, then send your message again."
+            "Your message is sent once Codex is ready. If the session terminal is "
+            "waiting for input, answer it there."
         )
     write_bridge_startup_error(
         bridge_dir,
@@ -6483,6 +6585,7 @@ async def _record_agent_startup_pending(
         " (a sign-in prompt is on screen)" if prompt is not None else "",
         extra=pending_event,
     )
+    return prompt is not None
 
 
 async def _apply_codex_launch_plan_mode(
@@ -6534,6 +6637,7 @@ async def _codex_discover_thread_and_forward(
     apply_plan_mode: Callable[[str], Awaitable[None]] | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
+    relaunch_terminal: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -6577,8 +6681,9 @@ async def _codex_discover_thread_and_forward(
         default. While *terminal_instance* is running, a stable sign-in
         prompt on its screen, or the budget expiring, records a pending
         cause (see :func:`_record_agent_startup_pending`) and the wait
-        continues without a deadline; only a pane exit or an ended event
-        stream tears down.
+        continues without a deadline, still watching for a sign-in prompt
+        until one is recorded; only a pane exit or an ended event stream
+        tears down.
     :param apply_plan_mode: Switches the discovered thread into Plan mode, or
         ``None``. Awaited before the bridge state is written, because the
         executor gates the first queued web turn on that state.
@@ -6587,11 +6692,13 @@ async def _codex_discover_thread_and_forward(
         endpoint a re-created terminal has since installed.
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
+    :param relaunch_terminal: Forwarded to :func:`supervise_forwarder`.
     """
     from omnigent.harnesses.codex_native.bridge import (
         CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
         CodexNativeBridgeState,
         clear_bridge_startup_error,
+        end_startup_pending,
         record_app_server_stopped,
         write_bridge_startup_error,
         write_bridge_state,
@@ -6632,6 +6739,7 @@ async def _codex_discover_thread_and_forward(
 
     discovery_started_at = time.monotonic()
     startup_pending_recorded = False
+    sign_in_recorded = False
     cancelled = False
     try:
         while True:
@@ -6658,26 +6766,26 @@ async def _codex_discover_thread_and_forward(
                             if login_required or startup_pending_recorded
                             else _TERMINAL_INTERACTIVE_POLL_INTERVAL_S
                         ),
-                        # Once the cause is recorded there is nothing more to
-                        # learn from the pane until the thread starts.
-                        watch_sign_in=not (login_required or startup_pending_recorded),
+                        # Turns wait on a still-starting record, so a sign-in prompt
+                        # shown later must still replace it with the sign-in step.
+                        watch_sign_in=not (login_required or sign_in_recorded),
                     )
                 )
                 break
             except (TimeoutError, RuntimeError) as exc:
-                if (
-                    terminal_instance is not None
-                    and not startup_pending_recorded
-                    and (
-                        isinstance(exc, _CodexSignInPromptSeen)
-                        or (isinstance(exc, TimeoutError) and await terminal_instance.is_alive())
+                if terminal_instance is not None and (
+                    isinstance(exc, _CodexSignInPromptSeen)
+                    or (
+                        not startup_pending_recorded
+                        and isinstance(exc, TimeoutError)
+                        and await terminal_instance.is_alive()
                     )
                 ):
                     # The pane is still running: parked on a launcher sign-in
                     # prompt, or slow past its budget. Record why chat turns
                     # cannot run yet and keep listening; a pane exit still ends
                     # discovery below.
-                    await _record_agent_startup_pending(
+                    sign_in_recorded = await _record_agent_startup_pending(
                         session_id=session_id,
                         bridge_dir=bridge_dir,
                         terminal_instance=terminal_instance,
@@ -6824,9 +6932,8 @@ async def _codex_discover_thread_and_forward(
                     )
                 return
 
-        if login_required or startup_pending_recorded:
-            # The user signed in (or the TUI otherwise started a thread):
-            # the pre-recorded fail-fast cause no longer applies.
+        if login_required or sign_in_recorded:
+            # The sign-in is done: a turn arriving during Plan setup waits for the state.
             clear_bridge_startup_error(bridge_dir)
         if apply_plan_mode is not None:
             await apply_plan_mode(thread_id)
@@ -6842,6 +6949,10 @@ async def _codex_discover_thread_and_forward(
                 cwd=workspace,
             ),
         )
+        if startup_pending_recorded:
+            # A still-starting record goes only once the state is up, so a turn held on it
+            # sees one or the other.
+            clear_bridge_startup_error(bridge_dir)
 
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = await asyncio.to_thread(_make_auth_token_factory)
@@ -6899,6 +7010,7 @@ async def _codex_discover_thread_and_forward(
             thread_id=thread_id,
             client=event_client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            relaunch_terminal=relaunch_terminal,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -6923,6 +7035,8 @@ async def _codex_discover_thread_and_forward(
         leftover_app_server = app_server
         if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
             leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            # A turn waiting on a still-starting record must not outlive this launch.
+            end_startup_pending(bridge_dir)
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)
@@ -6945,6 +7059,7 @@ async def _codex_forward_known_thread(
     app_server: CodexNativeAppServer | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
+    relaunch_terminal: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> None:
     """
     Forward a runner-owned Codex terminal that resumes an existing thread.
@@ -6965,6 +7080,7 @@ async def _codex_forward_known_thread(
         endpoint a re-created terminal has since installed.
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
+    :param relaunch_terminal: Forwarded to :func:`supervise_forwarder`.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -6990,6 +7106,7 @@ async def _codex_forward_known_thread(
             thread_id=thread_id,
             client=client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            relaunch_terminal=relaunch_terminal,
         )
     except asyncio.CancelledError:
         cancelled = True

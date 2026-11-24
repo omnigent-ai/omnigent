@@ -246,31 +246,35 @@ describe("an external send that stops short", () => {
     const beforePost = vi.fn(async (): Promise<string | null> => "Another account is signed in");
     const onError = vi.fn();
     const uploads = () => fetchMock.mock.calls.filter(([url]) => String(url).endsWith(FILES));
-    const sendHeld = async (stableId: string) => {
-      const before = uploads().length;
-      const sending = useChatStore.getState().send("design request", "agent_xyz", shot(), {
+    const posts = () =>
+      fetchMock.mock.calls.filter(
+        ([url, init]) => String(url).endsWith(EVENTS) && init?.method === "POST",
+      ).length;
+    // The same Files on the refusal and on the retry: the owner's retry reuses their upload.
+    const files = shot();
+    const send = () =>
+      useChatStore.getState().send("design request", "agent_xyz", files, {
         external: true,
-        stableId,
+        stableId: "6".repeat(32),
         onError,
         beforePost,
       });
-      await vi.waitFor(() => expect(uploads().length).toBe(before + 1));
-      expect(beforePost).not.toHaveBeenCalled();
-      finishUpload();
-      await sending;
-    };
-    await sendHeld("6".repeat(32));
+    const first = send();
+    await vi.waitFor(() => expect(uploads().length).toBe(1));
+    expect(beforePost).not.toHaveBeenCalled();
+    finishUpload();
+    await first;
     expect(beforePost).toHaveBeenCalledOnce();
     expect(onError).toHaveBeenCalledWith("Another account is signed in", true);
-    expect(posted()).toBe(false);
+    expect(posts()).toBe(0);
     expect(useChatStore.getState().status).toBe("idle");
-    // Once nothing holds it back, the same request posts.
-    beforePost.mockClear();
+    // Once nothing holds it back, the same request posts, with no second upload.
     beforePost.mockResolvedValue(null);
     onError.mockClear();
-    await sendHeld("6".repeat(32));
+    await send();
     expect(onError).not.toHaveBeenCalled();
-    expect(posted()).toBe(true);
+    expect(uploads().length).toBe(1);
+    expect(posts()).toBe(1);
   });
 
   it.each(["held back", "its upload fails", "its upload is stopped"] as const)(

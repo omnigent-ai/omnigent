@@ -209,6 +209,21 @@ async def test_session_get_info_keeps_only_the_live_status_probe() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_session_get_info_loads_usage_only_when_asked() -> None:
+    """``include_usage`` is the one extra part ``sys_session_get_info`` may request."""
+    client = _RecordingClient()
+
+    await tool_dispatch._session_get_info_via_rest({"include_usage": True}, _SESSION_ID, client)
+
+    assert client.get_calls == [
+        (
+            f"/v1/sessions/{_SESSION_ID}",
+            {**_EXPECTED_TRIM_PARAMS, "include_usage": "true", "include_live_status": "true"},
+        )
+    ]
+
+
 def test_session_metadata_params_includes_live_status() -> None:
     """``_SESSION_METADATA_PARAMS`` must include ``include_live_status`` false.
 

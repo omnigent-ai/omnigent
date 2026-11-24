@@ -10,6 +10,7 @@ const {
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerLaunchMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 } = require("../src/floating_composer_window");
@@ -372,6 +373,56 @@ test("only a session route may be opened from the panel", () => {
     null,
   ]) {
     assert.equal(floatingComposerSessionPath(bad), null, String(bad));
+  }
+});
+
+test("a launch's first message is rebuilt from its checked fields, and capped in total", () => {
+  const file = (size) => ({ name: "a.txt", type: "text/plain", bytes: new Uint8Array(size) });
+  const rebuilt = floatingComposerLaunchMessage({
+    text: "Read this",
+    skill: null,
+    files: [{ ...file(3), extra: "dropped" }],
+    extra: "dropped",
+  });
+  assert.deepEqual(rebuilt, { text: "Read this", skill: null, files: [file(3)] });
+  // A skill launch carries its name and arguments, never attachments.
+  assert.deepEqual(
+    floatingComposerLaunchMessage({
+      text: "/review 1",
+      skill: { name: "review", args: "1", extra: true },
+      files: [file(3)],
+    }),
+    { text: "/review 1", skill: { name: "review", args: "1" }, files: [] },
+  );
+  // A blank skill launch has nothing a page could send, so it is never offered.
+  assert.equal(
+    floatingComposerLaunchMessage({ text: " ", skill: { name: "review", args: "" }, files: [] }),
+    null,
+  );
+  const cap = 25 * 1024 * 1024;
+  assert.notEqual(
+    floatingComposerLaunchMessage({ text: "x", skill: null, files: [file(cap)] }),
+    null,
+  );
+  assert.equal(
+    floatingComposerLaunchMessage({
+      text: "x",
+      skill: null,
+      files: [file(cap / 2), file(cap / 2 + 1)],
+    }),
+    null,
+    "one byte past the cap across files",
+  );
+  for (const bad of [
+    null,
+    "text",
+    { text: 1, skill: null, files: [] },
+    { text: "x", skill: "review", files: [] },
+    { text: "x", skill: null, files: "a.txt" },
+    { text: "x", skill: null, files: [{ name: "a", type: "t", bytes: "xx" }] },
+    { text: "  ", skill: null, files: [] },
+  ]) {
+    assert.equal(floatingComposerLaunchMessage(bad), null, JSON.stringify(bad));
   }
 });
 

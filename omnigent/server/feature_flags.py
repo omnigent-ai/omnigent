@@ -65,6 +65,7 @@ class Feature(StrEnum):
     WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
     SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
     FLOATING_PANES = "floating_panes"
+    SHARED_SESSION_UPDATES_SOCKET = "shared_session_updates_socket"
 
 
 class FeatureIntent(StrEnum):
@@ -380,6 +381,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.27.0",
         follows=Feature.WORKSPACE_SIDEBAR_V2,
     ),
+    FeatureDefinition(
+        feature=Feature.SHARED_SESSION_UPDATES_SOCKET,
+        description="Share one session-updates WebSocket between a browser's tabs",
+        owner="web",
+        review_by_release="0.28.0",
+    ),
 )
 
 
@@ -519,7 +526,8 @@ def resolve_effective_features(
     A feature on Automatic takes the resolved value of the feature it ``follows``, else its
     ``default_enabled``.
 
-    :raises ValueError: If a feature follows one without a definition, or follows form a cycle.
+    :raises ValueError: If a feature on Automatic follows one without a definition, or its follows
+        form a cycle. A feature with an explicit intent doesn't read what it follows.
     """
     by_feature = {definition.feature: definition for definition in definitions}
     resolved: dict[Feature, bool] = {}

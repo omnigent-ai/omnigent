@@ -67,6 +67,7 @@ const {
   sanitizeServerName,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy, acceptCliDeepLink } = require("./deepLink");
+const { startDesktopOpenServer } = require("./desktopOpenServer");
 const {
   parseServerLabels,
   serverLabel,
@@ -83,11 +84,14 @@ const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
+const { isTrustedRemoteContext, readTrustedRemoteHosts } = require("./trustedRemoteHosts");
+const { normalizedServerTarget } = require("./hostStatusIdentity");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const {
   createHostThisMachineChecker,
   SESSION_HOST_PROTOCOL,
   SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
 } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
@@ -143,9 +147,11 @@ const {
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
+  floatingComposerLaunchMessage,
   floatingComposerSessionPath,
   floatingComposerWindowOptions,
 } = require("./floating_composer_window");
+const { createFloatingLaunchOffers } = require("./floating_launch_offers");
 const {
   createFloatingComposerSupport,
   floatingComposerTarget,
@@ -156,6 +162,12 @@ const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
+const {
+  SESSION_WINDOW_SIZE,
+  findSessionWindow,
+  sessionWindowPath,
+  withoutSessionWindowQuery,
+} = require("./sessionWindows");
 const omnigentCli = require("./omnigent_cli");
 const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
@@ -1474,6 +1486,8 @@ function applyDockIcon() {
  * @property {import("./desktopCommands").DesktopCommandState | null} [desktopCommands]
  *   Menu commands this window's SPA last reported it can act on (see
  *   desktopCommands.js); absent until a supporting web bundle reports.
+ * @property {string | null} [shownConversationId] The conversation this window's
+ *   page reported it has loaded; absent or null until it does.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -1859,6 +1873,8 @@ const rightSidebarWindow = createRightSidebarWindow({
 
 // Main-window documents that can render the floating New Agent panel (see registerIpc).
 const floatingComposerSupport = createFloatingComposerSupport();
+// Launch messages a routed main window may send itself (see the open-in-main-window handler).
+const floatingLaunchOffers = createFloatingLaunchOffers();
 
 // "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
 // come forward from another app. The floating panel's ⇧⌘Space is held only while a
@@ -2017,6 +2033,18 @@ function openFloatingComposerFromShortcut() {
 function serverPageShown(win) {
   if (win.isDestroyed()) return null;
   return serverPageOf(win.webContents.getURL(), windows.get(win)?.serverUrl);
+}
+
+/**
+ * The window a panel route for `serverUrl` goes to: the most recent one showing its app.
+ *
+ * @param {string | null | undefined} serverUrl
+ * @returns {BrowserWindow | undefined}
+ */
+function appWindowOfServer(serverUrl) {
+  return mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
+    (win) => windows.get(win)?.serverUrl === serverUrl && serverPageShown(win) === "app",
+  );
 }
 
 /**
@@ -2978,6 +3006,7 @@ function registerNavigationFallbacks(win) {
  *   path?: string,
  *   role?: string,
  *   windowOptions?: Electron.BrowserWindowConstructorOptions,
+ *   sessionWindowId?: string,
  * }} [opts]
  *   ``ephemeral: true`` creates a debug multi-server window: it opens on the
  *   setup page (ignoring the saved server) and a URL connected from it is
@@ -2986,16 +3015,21 @@ function registerNavigationFallbacks(win) {
  *   A ``role`` other than ``"main"`` builds a panel from ``windowOptions``: it
  *   loads and signs in like any window, but skips the main window's saved
  *   bounds, placement and update overlay, and app-level actions skip it.
+ *   ``sessionWindowId`` marks a main window popped out for one session: it
+ *   opens at the session-window size and never saves its bounds as the main
+ *   window's.
  * @returns {BrowserWindow}
  */
 function createWindow(targetUrl, opts = {}) {
   const ephemeral = opts.ephemeral === true;
   const role = opts.role ?? "main";
   const isMain = role === "main";
-  const savedBounds = isMain ? loadSavedWindowBounds() : null;
+  const sessionWindowId = isMain ? opts.sessionWindowId : undefined;
+  const savedBounds = isMain && !sessionWindowId ? loadSavedWindowBounds() : null;
+  const defaultSize = sessionWindowId ? SESSION_WINDOW_SIZE : { width: 1280, height: 860 };
   const mainWindowOptions = {
-    width: savedBounds?.width ?? 1280,
-    height: savedBounds?.height ?? 860,
+    width: savedBounds?.width ?? defaultSize.width,
+    height: savedBounds?.height ?? defaultSize.height,
     // Without saved coordinates Electron centers the window.
     ...(savedBounds ? { x: savedBounds.x, y: savedBounds.y } : {}),
     minWidth: 720,
@@ -3091,6 +3125,7 @@ function createWindow(targetUrl, opts = {}) {
     serverUrl: destination ? serverUrl : null,
     ephemeral,
     role,
+    ...(sessionWindowId ? { sessionWindowId } : {}),
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
@@ -3224,6 +3259,7 @@ function createWindow(targetUrl, opts = {}) {
 
   registerNavigationFallbacks(win);
   registerBrowserViewDetachOnNavigate(win);
+  registerConversationShownReset(win);
   registerDesktopCommandStateReset(win.webContents, () => {
     const state = windows.get(win);
     if (!state?.desktopCommands) return;
@@ -3270,7 +3306,7 @@ function createWindow(targetUrl, opts = {}) {
   if (isMain) {
     cascadeIfCovering(win);
     if (savedBounds?.maximized) win.maximize();
-    trackWindowBounds(win);
+    if (!sessionWindowId) trackWindowBounds(win);
     closePanelsOnSignIn(win);
   }
   return win;
@@ -3546,7 +3582,7 @@ function isFindBarSender(event) {
  */
 function newWindow() {
   const win = activeWindow();
-  const current = win?.webContents.getURL();
+  const current = withoutSessionWindowQuery(win?.webContents.getURL());
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
   // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).
@@ -4729,6 +4765,12 @@ function createBrowserRegistryForWindow(win) {
             isDatabricksManagedServerUrl(target),
           serverTarget: target,
         }) ||
+        (context?.hostIsTrustedRemotePreview === true &&
+          isTrustedRemoteContext(
+            readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+            context,
+            windows.get(win)?.serverUrl,
+          )) ||
         context?.hostIsThisMachine === true ||
         (context?.hostIsSshPreview === true &&
           sshPreviewHosts.allows(windows.get(win)?.serverUrl, context?.sourceHostId))
@@ -5369,10 +5411,40 @@ function registerIpc() {
     if (BrowserWindow.getFocusedWindow() === win) buildMenu();
   });
 
+  // The conversation this window's page has loaded for its signed-in user. A
+  // browser's hand-off waits for this rather than for the address alone.
+  ipcMain.on("omnigent:conversation-shown", (event, conversationId) => {
+    if (!isPinnedOriginSender(event)) return;
+    const state = windows.get(BrowserWindow.fromWebContents(event.sender));
+    if (state)
+      state.shownConversationId = typeof conversationId === "string" ? conversationId : null;
+  });
+
   // Close (⌘W) on the new-session page, once the page's own dialog confirmed it.
   ipcMain.handle("omnigent:close-window", (event) => {
     if (!isPinnedOriginSender(event)) return false;
     BrowserWindow.fromWebContents(event.sender)?.close();
+    return true;
+  });
+
+  // "Open in new window": the session in its own window on the sender's server. The server
+  // comes from main's window state, never the page; a session already popped out comes forward.
+  ipcMain.handle("omnigent:open-session-window", (event, sessionId) => {
+    if (!isPinnedOriginSender(event)) return false;
+    const routePath = sessionWindowPath(sessionId);
+    const state = windows.get(BrowserWindow.fromWebContents(event.sender));
+    if (routePath === null || !state?.serverUrl) return false;
+    const existing = findSessionWindow(windows, { serverUrl: state.serverUrl, sessionId });
+    if (existing) {
+      focusAndRestore(existing);
+      return true;
+    }
+    createWindow(undefined, {
+      serverUrl: state.serverUrl,
+      path: routePath,
+      ephemeral: state.ephemeral === true,
+      sessionWindowId: sessionId,
+    });
     return true;
   });
 
@@ -5412,7 +5484,10 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("get-global-shortcut is only available to a connected server page");
     }
-    return requireSettingsShortcut(id).current();
+    const shortcut = requireSettingsShortcut(id);
+    // Opening Settings is the user's cue to retry a chord another app may have released.
+    shortcut.refresh();
+    return shortcut.current();
   });
   ipcMain.handle("omnigent:set-global-shortcut", (event, setting, id = "show") => {
     if (!isPinnedOriginSender(event)) {
@@ -5485,6 +5560,8 @@ function registerIpc() {
       contents.removeListener("render-process-gone", revoke);
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
+      // Offers to this document end now, so the panel delivers without waiting out the timeout.
+      floatingLaunchOffers.forgetTaker(contents);
       // A panel built ahead goes once its server has had no supporting page for a while; a
       // reload announces again within moments, which calls the release off.
       if (!floatingComposerSupport.serves(serverUrl)) {
@@ -5531,35 +5608,89 @@ function registerIpc() {
 
   // From the panel: a session it launched, or an app page it links to, in a main window of
   // its server. The panel then hides.
-  ipcMain.handle("omnigent:floating-composer:open-in-main-window", (event, routePath) => {
+  ipcMain.handle(
+    "omnigent:floating-composer:open-in-main-window",
+    (event, routePath, launchMessage) => {
+      const panel = BrowserWindow.fromWebContents(event.sender);
+      if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
+        return { ok: false, error: "not-composer" };
+      }
+      const sessionPath = floatingComposerSessionPath(routePath);
+      const openPath = sessionPath ?? floatingComposerAppPagePath(routePath);
+      if (openPath === null) return { ok: false, error: "bad-path" };
+      // Bound by main when it built the panel; never taken from the page.
+      const serverUrl = floatingComposerController.serverUrlFor(panel);
+      // Only a window showing its server's app hears the route, not one on setup or sign-in.
+      const target = appWindowOfServer(serverUrl);
+      // A window still connecting would drop the route when its page loads; the panel stays.
+      if (target && connectionAttempts.get(target)?.pending === true) {
+        return { ok: false, error: "window-loading" };
+      }
+      // A launched session or a linked page comes forward, over the app the user was in.
+      let offer = null;
+      if (target) {
+        sendOpenPath(target, openPath);
+        focusAndRestore(target);
+        const message = sessionPath === null ? null : floatingComposerLaunchMessage(launchMessage);
+        if (message !== null && floatingLaunchOffers.isTaker(target.webContents)) {
+          offer = floatingLaunchOffers.offer(target.webContents, {
+            sessionId: sessionPath.slice("/c/".length),
+            message,
+          });
+        }
+      } else {
+        createWindow(undefined, { serverUrl, path: openPath });
+      }
+      // focusAndRestore already brought the app forward on macOS.
+      if (!target || process.platform !== "darwin") app.focus({ steal: true });
+      // After a launch the next open starts at the default placement again.
+      floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
+      if (offer === null) return { ok: true };
+      // Only the offer's outcome is awaited, and no window is focused after it, so a reopened panel keeps focus.
+      return offer.then((confirmed) => (confirmed ? { ok: true, delivery: "page" } : { ok: true }));
+    },
+  );
+
+  // From the panel: whether a launch's first message would go to a window that can send it.
+  ipcMain.handle("omnigent:floating-composer:can-hand-off", (event) => {
     const panel = BrowserWindow.fromWebContents(event.sender);
-    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
-      return { ok: false, error: "not-composer" };
-    }
-    const sessionPath = floatingComposerSessionPath(routePath);
-    const openPath = sessionPath ?? floatingComposerAppPagePath(routePath);
-    if (openPath === null) return { ok: false, error: "bad-path" };
-    // Bound by main when it built the panel; never taken from the page.
-    const serverUrl = floatingComposerController.serverUrlFor(panel);
-    // Only a window showing its server's app hears the route, not one on setup or sign-in.
-    const target = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
-      (win) => windows.get(win)?.serverUrl === serverUrl && serverPageShown(win) === "app",
+    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return false;
+    const target = appWindowOfServer(floatingComposerController.serverUrlFor(panel));
+    return (
+      target !== undefined &&
+      connectionAttempts.get(target)?.pending !== true &&
+      floatingLaunchOffers.isTaker(target.webContents)
     );
-    // A window still connecting would drop the route when its page loads; the panel stays.
-    if (target && connectionAttempts.get(target)?.pending === true) {
-      return { ok: false, error: "window-loading" };
+  });
+
+  // From a main window's top document: whether it sends the first messages of launches offered
+  // to it, for its server. Its unsubscribe sends false.
+  ipcMain.on("omnigent:floating-composer:launch-takers", (event, subscribed) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !isMainWindow(win)) return;
+    if (event.senderFrame !== event.sender.mainFrame) return;
+    if (subscribed !== true) floatingLaunchOffers.forgetTaker(event.sender);
+    else if (floatingComposerSupport.supports(event.sender.id, windows.get(win).serverUrl)) {
+      floatingLaunchOffers.addTaker(event.sender);
     }
-    // A launched session or a linked page comes forward, over the app the user was in.
-    if (target) {
-      sendOpenPath(target, openPath);
-      focusAndRestore(target);
-    } else {
-      createWindow(undefined, { serverUrl, path: openPath });
-    }
-    app.focus({ steal: true });
-    // After a launch the next open starts at the default placement again.
-    floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
-    return { ok: true };
+  });
+
+  // From a main window's top document: the message of a launch offered to it, once.
+  ipcMain.handle("omnigent:floating-composer:launch-take", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return null;
+    return floatingLaunchOffers.take(event.sender, offerId);
+  });
+
+  // From a main window's top document: it has rebuilt the offered message and will send it.
+  ipcMain.handle("omnigent:floating-composer:launch-confirm", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return false;
+    return floatingLaunchOffers.confirm(event.sender, offerId);
+  });
+
+  // From a main window's top document: it won't send the offered message, so the panel delivers.
+  ipcMain.handle("omnigent:floating-composer:launch-decline", (event, offerId) => {
+    if (!isPinnedOriginSender(event) || event.senderFrame !== event.sender.mainFrame) return false;
+    return floatingLaunchOffers.decline(event.sender, offerId);
   });
 
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the
@@ -5965,6 +6096,7 @@ function registerIpc() {
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
       sshLocalhostPreview: process.platform !== "win32",
+      trustedRemoteLocalhostPreview: true,
       // The floating New Agent panel is a macOS panel window.
       floatingComposer: process.platform === "darwin",
       // Settings can read and change the panel's shortcut by id.
@@ -6213,10 +6345,21 @@ function registerIpc() {
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
+      // Explicit grants follow the resolved server, including sign-in redirects.
+      const serverTarget = normalizedServerTarget(senderServerUrl(event));
       // Page supplies the session host ID; main verifies this machine's identity and live enrollment.
       return {
         serverTarget: arcaTarget(windowArcaServerUrl(win)),
         sourceHostId,
+        ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+        opts?.trustedRemotePreviewProtocol === TRUSTED_REMOTE_PREVIEW_PROTOCOL &&
+        isTrustedRemoteContext(
+          readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+          { serverTarget, sourceHostId },
+          serverTarget,
+        )
+          ? { hostIsTrustedRemotePreview: true, serverTarget }
+          : {}),
         ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
         opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
         sshPreviewHosts.allows(windows.get(win)?.serverUrl, sourceHostId)
@@ -6299,13 +6442,24 @@ function registerIpc() {
       sourceHostId,
       rememberedArcaHostId,
       sourceIsArcaHost,
+      localhostBlocked = false,
+      trustedRemotePreviewProtocol,
     ) => {
       const previewHint = isLoopbackPreviewUrl(url)
         ? sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)
         : null;
       if (previewHint) return previewHint;
       const targetContext = previewRecoveryTargetForEvent(event, url);
-      if (!targetContext) return null;
+      if (!targetContext) {
+        if (!localhostBlocked || !isLoopbackPreviewUrl(url) || !sourceHostId) return null;
+        if (trustedRemotePreviewProtocol !== TRUSTED_REMOTE_PREVIEW_PROTOCOL) {
+          return "This server's web app does not support settings-based localhost previews. Update it, then retry.";
+        }
+        const serverUrl = normalizedServerTarget(senderServerUrl(event));
+        if (!serverUrl) return null;
+        const entry = JSON.stringify({ server_url: serverUrl, host_id: sourceHostId });
+        return `To allow localhost previews from this session's host, add ${entry} to trusted_remote_hosts in the desktop settings.json, then retry the preview.`;
+      }
       if (typeof rememberedArcaHostId !== "string") {
         return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";
       }
@@ -6411,14 +6565,18 @@ function rememberServerUrl(serverUrl) {
 }
 
 /**
- * Restore (if minimized) and focus a window. No-op when absent/destroyed.
+ * Restore (if minimized) and bring a window in front of other apps. No-op when
+ * absent/destroyed.
  *
  * @param {BrowserWindow | null | undefined} win
  */
 function focusAndRestore(win) {
   if (!win || win.isDestroyed()) return;
   if (win.isMinimized()) win.restore();
+  win.show();
   win.focus();
+  // A request from a browser page doesn't activate the app the way an OS link does.
+  if (process.platform === "darwin") app.focus({ steal: true });
 }
 
 /**
@@ -6607,6 +6765,93 @@ async function confirmOpenDeepLink(parent, targetOrigin) {
     noLink: true,
   });
   return response === 1;
+}
+
+/**
+ * The loopback listener a server's web page uses to hand a conversation to this
+ * app (see README "Opening a conversation from the browser"); null until ready,
+ * and when every port is taken.
+ *
+ * @type {{ port: number, close: () => Promise<void> } | null}
+ */
+let desktopOpenServer = null;
+
+/** How long a browser's hand-off waits for a window to show the conversation, and how often it looks. */
+let browserHandoffTimeoutMs = 8000;
+const BROWSER_HANDOFF_POLL_MS = 100;
+
+/**
+ * Forget the conversation a window's page reported once that page is gone: a
+ * new document, or a crashed one, hasn't shown anything yet.
+ *
+ * @param {BrowserWindow} win
+ */
+function registerConversationShownReset(win) {
+  const forget = () => {
+    const state = windows.get(win);
+    if (state) state.shownConversationId = null;
+  };
+  win.webContents.on("did-navigate", forget);
+  win.webContents.on("render-process-gone", forget);
+}
+
+/**
+ * Whether a main window on this deep link's server reported that its page has
+ * loaded the conversation. The address alone doesn't say so: a signed-out page
+ * sits on the conversation's address before it goes to sign-in. A page too old
+ * to report never counts.
+ *
+ * @param {{ origin: string, path: string }} target A parsed deep link.
+ * @returns {boolean}
+ */
+function showsConversation(target) {
+  const conversationId = /^\/c\/([^/?]+)/.exec(target.path)?.[1];
+  if (!conversationId) return false;
+  return mainWindows().some(
+    (win) =>
+      pinnedOrigin(win) === target.origin &&
+      serverPageShown(win) === "app" &&
+      windows.get(win)?.shownConversationId === conversationId,
+  );
+}
+
+/**
+ * Open a conversation a browser page handed over, and report whether a window
+ * ended up showing it, so the page stays put when the app could not.
+ *
+ * @param {string} link e.g. ``"omnigent://localhost:8000/c/conv_abc"``.
+ * @returns {Promise<boolean>}
+ */
+async function openConversationFromBrowser(link) {
+  const target = parseOmnigentDeepLink(link);
+  if (!target) return false;
+  enqueueDeepLink(link);
+  const deadline = Date.now() + browserHandoffTimeoutMs;
+  while (!showsConversation(target)) {
+    if (Date.now() >= deadline) return false;
+    // oxlint-disable-next-line no-await-in-loop -- polling until the window has navigated
+    await new Promise((resolve) => {
+      setTimeout(resolve, BROWSER_HANDOFF_POLL_MS);
+    });
+  }
+  return true;
+}
+
+/**
+ * Listen for conversations handed over by the web page of a server the user
+ * has connected this app to. Other origins are refused, so a page can never
+ * make the app connect to a new server or show a prompt.
+ */
+async function startDesktopOpenListener() {
+  desktopOpenServer = await startDesktopOpenServer({
+    isKnownOrigin: (origin) => knownOrigins().includes(origin) || isPinnedServerUrl(origin),
+    openLink: openConversationFromBrowser,
+  });
+  console.log(
+    desktopOpenServer
+      ? `[omnigent] desktop-open: listening on 127.0.0.1:${desktopOpenServer.port}`
+      : "[omnigent] desktop-open: no free port; pages can't hand conversations to this app",
+  );
 }
 
 /** Deep links awaiting handling, in arrival order. */
@@ -6855,6 +7100,7 @@ if (!gotLock) {
     // (`electron .`) clicks route to the running dev instance too. No-op
     // (returns false) when another app is already the default handler.
     app.setAsDefaultProtocolClient("omnigent");
+    void startDesktopOpenListener();
     // If a deep link arrived before ready (macOS open-url, or Windows/Linux
     // argv), open it instead of the default launch window; the drain's
     // fallback opens a default window if a consent is cancelled. Otherwise
@@ -6892,6 +7138,7 @@ if (!gotLock) {
 
   app.on("will-quit", () => {
     globalShortcut.unregisterAll();
+    void desktopOpenServer?.close();
     workspaceSshForwards.closeAll();
   });
   app.on("window-all-closed", () => {

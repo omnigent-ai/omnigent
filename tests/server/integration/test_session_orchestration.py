@@ -30,6 +30,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
 from tests.server.integration.test_managed_startup_inputs import (
@@ -257,6 +258,74 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
     assert not captured.get("posts")
 
 
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        pytest.param(
+            "archived",
+            "Session {receiver} is archived; unarchive it or use another session",
+            id="archived",
+        ),
+        pytest.param("closed", "Session {receiver} is closed; use another session", id="closed"),
+        pytest.param(
+            "archived_parent",
+            "Session {receiver} belongs to an archived session; "
+            "unarchive that session or use another one",
+            id="archived_parent",
+        ),
+        pytest.param(
+            "closed_parent",
+            "Session {receiver} belongs to a closed session; use another session",
+            id="closed_parent",
+        ),
+        pytest.param(
+            "archived_sender",
+            "Session {sender} is archived; unarchive it or use another session",
+            id="archived_sender",
+        ),
+        pytest.param(
+            "archived_other_owner",
+            "Session is not owned or available",
+            id="archived_other_owner",
+        ),
+    ],
+)
+async def test_archived_or_closed_session_refusal_says_why(
+    state, expected, auth_client, peers, db_uri
+):
+    source, receiver, captured = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    if state in {"archived_parent", "closed_parent"}:
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={"agent_id": receiver["agent_id"], "parent_session_id": receiver["id"]},
+        )
+        assert response.status_code == 201, response.text
+        if state == "archived_parent":
+            store.update_conversation(receiver["id"], archived=True)
+        else:
+            store.set_labels(receiver["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+        receiver = response.json()
+    elif state == "archived_other_owner":
+        receiver = await _create_session_as(auth_client, "", "bob")
+        SqlAlchemyPermissionStore(db_uri).grant("alice", receiver["id"], LEVEL_EDIT)
+        store.update_conversation(receiver["id"], archived=True)
+    elif state == "closed":
+        store.set_labels(receiver["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    else:
+        archived = source if state == "archived_sender" else receiver
+        store.update_conversation(archived["id"], archived=True)
+    captured.clear()
+    response = await auth_client.post(
+        f"/v1/sessions/{receiver['id']}/events",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"type": "session_message", "data": {"message": "DO_NOT_DELIVER"}},
+    )
+    assert response.status_code == 403, response.text
+    assert expected.format(sender=source["id"], receiver=receiver["id"]) in response.text
+    assert not captured.get("posts")
+
+
 @pytest.mark.parametrize("manager_kind", ["root", "child", "side_chat"])
 async def test_view_only_sharing_keeps_new_controls(auth_client, peers, db_uri, manager_kind):
     source, target, captured = peers
@@ -413,8 +482,11 @@ async def test_side_chat_inherits_sharing_for_new_controls(
     assert (await _send(auth_client, manager, target)).get("queued") is True
 
 
-@pytest.mark.parametrize("source_link", ["missing", "cycle", "absent"])
-async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, source_link):
+@pytest.mark.parametrize("side_state", ["live", "archived", "closed"])
+@pytest.mark.parametrize("source_link", ["missing", "cycle", "absent", "foreign"])
+async def test_side_chat_requires_resolvable_source(
+    auth_client, peers, db_uri, source_link, side_state
+):
     source, target, captured = peers
     response = await auth_client.post(
         f"/v1/sessions/{source['id']}/fork", json={"side_chat": True}
@@ -426,10 +498,16 @@ async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, 
     if source_link == "absent":
         store.delete_label(side["id"], SIDE_CHAT_SOURCE_LABEL_KEY)
     else:
-        store.set_labels(
-            side["id"],
-            {SIDE_CHAT_SOURCE_LABEL_KEY: side["id"] if source_link == "cycle" else uuid4().hex},
-        )
+        if source_link == "foreign":
+            linked = (await _create_session_as(auth_client, "", "bob"))["id"]
+        else:
+            linked = side["id"] if source_link == "cycle" else uuid4().hex
+        store.set_labels(side["id"], {SIDE_CHAT_SOURCE_LABEL_KEY: linked})
+    # Unarchiving wouldn't make the side chat usable, so its state isn't reported.
+    if side_state == "archived":
+        store.update_conversation(side["id"], archived=True)
+    elif side_state == "closed":
+        store.set_labels(side["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
     captured.clear()
     assert (
         "Session is not owned or available" in (await _send(auth_client, side, target))["detail"]

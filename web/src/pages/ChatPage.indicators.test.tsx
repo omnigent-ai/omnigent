@@ -222,7 +222,7 @@ describe("WorkingIndicatorRow", () => {
 });
 
 describe("WorkingIndicator", () => {
-  it("shows a background-task spinner after the turn ends and the shimmer for foreground work", () => {
+  it("shows a static background-task icon after the turn and the shimmer during it", () => {
     useChatStore.setState({
       backgroundTaskCount: 2,
       blockedOn: null,
@@ -231,10 +231,11 @@ describe("WorkingIndicator", () => {
     });
     const { rerender } = render(<WorkingIndicator />);
     expect(screen.queryByTestId("working-indicator")).toBeNull();
-    expect(screen.getByTestId("background-tasks-indicator")).toHaveTextContent(
-      "2 background tasks running",
-    );
-    expect(screen.getByTestId("running-dot")).toBeInTheDocument();
+    const background = screen.getByTestId("background-tasks-indicator");
+    expect(background).toHaveTextContent("2 background tasks running");
+    // A dev server left running must not read as the agent still answering.
+    expect(screen.queryByTestId("running-dot")).toBeNull();
+    expect(background.querySelector("svg.lucide-square-terminal")).not.toBeNull();
     // The composer pill owns the announcement; the transcript log must not repeat it.
     expect(screen.getByTestId("background-tasks-indicator")).toHaveAttribute("aria-hidden", "true");
     expect(screen.queryByRole("status")).toBeNull();

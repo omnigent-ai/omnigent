@@ -54,6 +54,7 @@ const SHOWN: SettingsAvailability = {
   floatingComposerShortcut: true,
   widenWindowForRightSidebar: true,
   inAppBrowser: true,
+  desktopAppHandoff: true,
   adminView: true,
   accountsEnabled: true,
   archiveWorktreeCleanup: true,
@@ -68,6 +69,7 @@ const HIDDEN: SettingsAvailability = {
   floatingComposerShortcut: false,
   widenWindowForRightSidebar: false,
   inAppBrowser: false,
+  desktopAppHandoff: false,
   adminView: false,
   accountsEnabled: false,
   archiveWorktreeCleanup: false,
@@ -252,6 +254,7 @@ describe("availability", () => {
   // gate: turning off only that gate hides it, and turning on only that gate shows it.
   it.each([
     ["browser-agent-tools", "inAppBrowser"],
+    ["open-in-desktop-app", "desktopAppHandoff"],
     ["project-kanban-board", "projectKanban"],
     ["session-title-instructions", "sessionTitleInstructions"],
     ["proactive-agent", "proactiveAgent"],

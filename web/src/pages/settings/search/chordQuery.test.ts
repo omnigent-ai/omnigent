@@ -287,6 +287,7 @@ const SHOWN: SettingsAvailability = {
   floatingComposerShortcut: true,
   widenWindowForRightSidebar: true,
   inAppBrowser: true,
+  desktopAppHandoff: true,
   adminView: true,
   accountsEnabled: true,
   archiveWorktreeCleanup: true,

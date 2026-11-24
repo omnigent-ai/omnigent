@@ -374,6 +374,7 @@ export function SideChatPane({
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -504,12 +505,14 @@ export function SideChatPane({
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
+      failedUploads,
     );
   }, [
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -1161,11 +1164,7 @@ function SideChatComposer({
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
   const sendContext: ComposerSendContext = {
-    mentions: composerInlineMentions(
-      sharedTags?.files ?? [],
-      sharedTags?.sessions ?? [],
-      harness ?? null,
-    ),
+    mentions: composerInlineMentions(sharedTags ?? { files: [], sessions: [] }, harness ?? null),
     reviewComments,
   };
   const addFiles = (incoming: File[]) => {
