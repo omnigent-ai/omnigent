@@ -24,8 +24,10 @@ unique `arca_type arca` label selects `arca.ssh`. For `arca_type arclet`, it
 uses the validated canonical Arclet name for `arclet_<name>.ssh`. Display names,
 including IP-based hostnames and custom names, do not determine the machine
 type. Other types, including `isaac-arca`, are not treated as personal Arcas.
-Discovery is cached per session and host for five minutes and shared by the
-folder and file controls. Clicking Open performs no metadata request.
+Discovery is read once per host and shared by every session on it and by the
+folder and file controls, the file menus and ⌘K. It happens when a control
+that offers an editor is shown or a file menu or ⌘K opens; clicking Open
+performs no metadata request.
 Remote links currently support POSIX paths, including Arca and Arclet workspaces.
 
 Other remote providers, custom aliases, missing or offline host rows, invalid

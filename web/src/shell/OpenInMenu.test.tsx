@@ -240,7 +240,7 @@ it.each([404, textFile(""), textFile("arclet_duplicate"), textFile("two\nnames")
   },
 );
 
-it("gates cached discovery on host availability and keeps it scoped to the session and host", async () => {
+it("gates cached discovery on host availability and shares it across the host's sessions", async () => {
   serverHosts = [host("remote", "custom name"), host("other", "another host")];
   metadata.set(labelsUrl, textFile("arca_type arca\n"));
   const { changeTarget } = await renderMenu("/workspace", "remote", true);
@@ -252,11 +252,13 @@ it("gates cached discovery on host availability and keeps it scoped to the sessi
   await act(() => client.invalidateQueries({ queryKey: ["hosts"] }));
   expect(await screen.findByRole("button", { name: "Open in VS Code" })).toBeVisible();
   expect(fetchHost.mock.calls.filter(([input]) => input === labelsUrl)).toHaveLength(1);
+  // Another session on the same host names the same machine, so it reads nothing again.
   changeTarget("/workspace", "remote", true, "conv_2");
   await waitFor(() => expect(client.isFetching()).toBe(0));
-  expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Open in VS Code" })).toBeVisible();
+  expect(fetchHost.mock.calls.filter(([input]) => input.includes("metric_proxy"))).toHaveLength(1);
   metadata.set(labelsUrl, 404);
-  changeTarget("/workspace", "other");
+  changeTarget("/workspace", "other", true, "conv_1");
   await waitFor(() => expect(client.isFetching()).toBe(0));
   expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
   expect(fetchHost.mock.calls.filter(([input]) => input === labelsUrl)).toHaveLength(2);
@@ -274,8 +276,8 @@ it("does not discover an offline host until it comes online", async () => {
   expect(await screen.findByRole("button", { name: "Open in VS Code" })).toBeVisible();
 });
 
-it("ignores late discovery after switching sessions and clears a failed refresh", async () => {
-  serverHosts = [host("remote", "custom name")];
+it("ignores late discovery after switching hosts and clears a failed refresh", async () => {
+  serverHosts = [host("remote", "custom name"), host("other", "another host")];
   let finishRead!: (response: Response) => void;
   const fetchResponse = fetchHost.getMockImplementation()!;
   fetchHost.mockImplementation((input: string) =>
@@ -288,14 +290,18 @@ it("ignores late discovery after switching sessions and clears a failed refresh"
   const { changeTarget } = await renderMenu("/workspace", "remote", true);
   await waitFor(() => expect(finishRead).toBeDefined());
   expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
-  changeTarget("/workspace", "remote", true, "conv_2");
+  // The first host's answer arrives after the menu moved to another host, which it doesn't name.
+  fetchHost.mockImplementation(fetchResponse);
+  metadata.set(labelsUrl, 404);
+  changeTarget("/workspace", "other");
   await act(async () => finishRead(new Response(JSON.stringify(textFile("arca_type arca\n")))));
   await waitFor(() => expect(client.isFetching()).toBe(0));
   expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
-  fetchHost.mockImplementation(fetchResponse);
-  metadata.set(labelsUrl, textFile("arca_type arca\n"));
+  // Back on the first host, its late answer is the one shown, without reading again.
+  const reads = fetchHost.mock.calls.filter(([input]) => input === labelsUrl).length;
   changeTarget("/workspace", "remote");
   expect(await screen.findByRole("button", { name: "Open in VS Code" })).toBeVisible();
+  expect(fetchHost.mock.calls.filter(([input]) => input === labelsUrl)).toHaveLength(reads);
   metadata.set(labelsUrl, 403);
   await act(() => client.invalidateQueries({ queryKey: ["hostSshTarget"] }));
   await waitFor(() => expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull());
