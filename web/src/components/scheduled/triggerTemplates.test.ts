@@ -22,6 +22,7 @@ import {
   readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
   LEGACY_MAX_INSTRUCTIONS_CHARS,
+  LEGACY_SESSION_MESSAGE_MAX_CHARS,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerConfigPrompt,
   renderTriggerPrompt,
@@ -874,17 +875,21 @@ describe("Slack thread replies", () => {
     // A worker's own thread posts (bot replies, or the owner's account with the attribution
     // line) must not come back to it as new replies.
     expect(prompt).toContain(
-      'messages with a system subtype, posts that end with a "Sent with Omnigent" line, which Omnigent sessions add to what they post, and posts by bots.',
+      'messages with a system subtype or the bot_message subtype, posts that end with a "Sent with Omnigent" line, which Omnigent sessions add to what they post, and posts by bots.',
     );
     // Slack sets bot_id on what a person posts through an app (such as a Slack MCP), so a
     // bot_id alone mustn't drop a person's follow-up.
     expect(prompt).toContain(
-      "A reply with a bot_id and no user is a bot's. A person can post through an app, so a reply with a bot_id and a user is a bot's only when that user is a bot: check each such user with users.info",
+      "A person can post through an app, so a reply with a bot_id is a bot's only when its user is a bot: check each such user with users.info",
     );
     // Only a confirmed bot is left out: a failed lookup defers the thread rather than moving
     // through past what may be a person's reply.
     expect(prompt).toContain(
       "leave the reply out only when is_bot is true. If a lookup fails, keep that thread's through and send nothing for it in this run, so the next run checks again.",
+    );
+    // A privacy filter can hide the user of a person's app-posted reply; skipping it would lose it.
+    expect(prompt).toContain(
+      "A reply whose user is missing or hidden counts as a person's, since a filter can hide the user of a person's reply",
     );
     expect(prompt).toContain(
       "The conditions above apply only to the message that starts a thread, so every other reply counts.",
@@ -893,7 +898,7 @@ describe("Slack thread replies", () => {
       "send its session one message under 32000 characters with sys_session_message, with session_id set to the thread's session",
     );
     expect(prompt).toContain(
-      '"Slack <channel> <thread ts> replies through <ts of its newest reply>"',
+      '"Slack <channel> <thread ts> replies through <ts of the newest reply it carries>"',
     );
     expect(prompt).toContain("following the instructions it already has");
     // Every channel trigger follows its threads, so the session stays quiet unless a reply needs it.
@@ -904,10 +909,14 @@ describe("Slack thread replies", () => {
       "to name the message that started the thread, not a reply, wherever a Slack tool asks which message to reply to",
     );
     expect(prompt).toContain("between <slack-replies> and </slack-replies> lines");
+    // A backlog too big for one message is sent oldest first, and through covers only what went.
+    expect(prompt).toContain(
+      "If the replies still don't fit, the message carries only the oldest ones that do, and the rest wait for the next run.",
+    );
     // Dedupe: an accepted or uncertain send, or a thread whose new replies were all left out,
     // moves the thread past those replies for good.
     expect(prompt).toContain(
-      "Once a send is accepted, or when you left out every new reply in a thread, set the thread's through to the ts of the newest reply you read in it that was posted by the time you noted, so no reply is read twice and none posted later is skipped.",
+      "Once a send is accepted, set the thread's through to the ts of the newest reply that message carried; when you left out every new reply in a thread, set it to the ts of the newest reply you read in it.",
     );
     expect(prompt).toContain(
       "If a send times out or its result is unclear, don't retry it: set the thread's through as for an accepted send, so those replies are never sent twice, say in your reply that they may not have reached that session",
@@ -954,6 +963,19 @@ describe("Slack thread replies", () => {
     expect(prompt).toContain(
       "Stopping means sending no more matches in this run; still send new thread replies and write your reply.",
     );
+  });
+
+  it("sizes thread messages to the server's message budget in both modes", () => {
+    for (const taskSessionMode of ["new", "continue"] as const) {
+      const prompt = renderTriggerPrompt("slack", channel(), {
+        ...CTX,
+        taskSessionMode,
+        messageMaxChars: LEGACY_SESSION_MESSAGE_MAX_CHARS,
+      });
+      expect(prompt).toContain(
+        `send its session one message under ${LEGACY_SESSION_MESSAGE_MAX_CHARS} characters with sys_session_message`,
+      );
+    }
   });
 
   it("leaves DM and group DM triggers without a thread step", () => {
