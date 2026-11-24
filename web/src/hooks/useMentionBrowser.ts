@@ -168,8 +168,8 @@ export interface MentionBrowser {
   /** Backspace at or inside a token deletes it whole; returns true when it did. */
   handleTokenBackspace: (e: ComposerKeyboardEvent) => boolean;
   /**
-   * Adds the space that keeps a tag matched when an insert lands against its token. Pass it to
-   * every input whose text the tags are read from.
+   * Adds the space that keeps a tag matched when an insert lands against its token. Only the
+   * CodeMirror engine applies it; the textarea inserts as it always has.
    */
   adjustInsert: ComposerInsertAdjuster;
   /** Handle a key event for the open menu; returns true when it consumed it. */

@@ -1,3 +1,4 @@
+import { EditorView } from "@codemirror/view";
 import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
 import {
   codeMirrorComposerLoad,
@@ -10408,7 +10409,13 @@ describe("NewChatLandingScreen @-file-mention", () => {
     fireEvent.click(screen.getByTitle("Attach README.md"));
     expect(composerTargetOf(input())!.value).toBe("@README.md ");
 
-    act(() => insertComposerText(composerTargetOf(input())!, "x", 10, 10));
+    act(() => {
+      EditorView.findFromDOM(input())!.dispatch({
+        changes: { from: 10, insert: "x" },
+        selection: { anchor: 11 },
+        userEvent: "input.type",
+      });
+    });
     expect(composerTargetOf(input())!.value).toBe("@README.md x ");
     expect(screen.getByTestId("composer-mention-token").textContent).toBe("@README.md");
   });

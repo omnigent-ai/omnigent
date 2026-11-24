@@ -111,11 +111,15 @@ function adjustedInsertTransaction(
   const adjusted = adjust(transaction.startState.doc.toString(), insert);
   if (!adjusted) return transaction;
   const isolation = transaction.annotation(isolateHistory);
+  const addToHistory = transaction.annotation(Transaction.addToHistory);
   return {
     changes: { from: insert.start, to: insert.end, insert: adjusted.text },
     selection: EditorSelection.cursor(insert.start + adjusted.caret),
     userEvent: transaction.annotation(Transaction.userEvent),
-    annotations: isolation === undefined ? undefined : isolateHistory.of(isolation),
+    annotations: [
+      ...(isolation === undefined ? [] : [isolateHistory.of(isolation)]),
+      ...(addToHistory === undefined ? [] : [Transaction.addToHistory.of(addToHistory)]),
+    ],
     effects: transaction.effects,
     scrollIntoView: transaction.scrollIntoView,
   };

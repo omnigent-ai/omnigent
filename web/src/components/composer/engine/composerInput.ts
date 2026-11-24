@@ -177,7 +177,10 @@ export interface ComposerInputProps {
   value?: string;
   /** The starting text of an uncontrolled input. */
   defaultValue?: string;
-  /** Adjusts typed or pasted text before it lands, e.g. to keep a mention tag matched. */
+  /**
+   * Adjusts typed or pasted text before it lands, e.g. to keep a mention tag matched. Only the
+   * CodeMirror engine applies it; the textarea inserts as it always has.
+   */
   adjustInsert?: ComposerInsertAdjuster;
   placeholder?: string;
   disabled?: boolean;

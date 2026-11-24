@@ -11,12 +11,14 @@ import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
+import { separateMentionEdges } from "@/lib/composerMentions";
 import { insertComposerText } from "@/lib/composerText";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
   isComposerInput,
   isHistoryInput,
+  type ComposerInsert,
   type ComposerInputEvent,
   type ComposerKeyboardEvent,
   type ComposerPasteEvent,
@@ -356,6 +358,38 @@ describe("CodeMirrorComposerInput change events", () => {
 
     expect(target().value).toBe("x");
     expect([target().selectionStart, target().selectionEnd]).toEqual([0, 0]);
+  });
+});
+
+describe("CodeMirrorComposerInput mention edges", () => {
+  const tokens = ["@readme.md"];
+  const adjustInsert = (value: string, insert: ComposerInsert) =>
+    separateMentionEdges(value, insert, tokens);
+
+  it("adds the space to a typed insert beside a token", () => {
+    const { content } = mount({ value: "Read @readme.md", mentionTokens: tokens, adjustInsert });
+    const editor = EditorView.findFromDOM(content)!;
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 15, insert: "x" },
+          userEvent: "input.type",
+        }),
+    );
+    expect(editor.state.doc.toString()).toBe("Read @readme.md x");
+  });
+
+  it("leaves an IME composition insert beside a token unchanged", () => {
+    const { content } = mount({ value: "Read @readme.md", mentionTokens: tokens, adjustInsert });
+    const editor = EditorView.findFromDOM(content)!;
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from: 15, insert: "x" },
+          userEvent: "input.type.compose",
+        }),
+    );
+    expect(editor.state.doc.toString()).toBe("Read @readme.mdx");
   });
 });
 
