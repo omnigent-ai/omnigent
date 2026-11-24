@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import dataclasses
 import uuid
+from datetime import UTC, datetime, timedelta
+
+import httpx
 
 from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.server import session_live_state
@@ -18,6 +21,11 @@ from omnigent.server.project_status_spend import ProjectSpend, build_source, usd
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from tests.server.routes.test_projects_crud import (  # noqa: F401 - pytest fixtures
+    project_agents,
+    project_app,
+    project_client,
+)
 
 # 2026-06-10T12:00:00Z
 NOW = 1781092800
@@ -113,3 +121,26 @@ def test_usd_to_cents_rounds_to_the_nearest_cent() -> None:
         100,
         5378,
     ]
+
+
+async def test_header_cost_matches_the_summary_including_sub_agents(
+    project_client: httpx.AsyncClient,  # noqa: F811 - imported fixture
+    db_uri: str,
+) -> None:
+    created = (await project_client.post("/v1/projects", json={"name": "zz-header"})).json()
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation(project_id=created["id"])
+    sub_agent = conversations.create_conversation(parent_conversation_id=root.id)
+    today = datetime.now(UTC).date()
+    conversations.add_session_daily_cost(root.id, today.isoformat(), 1.771)
+    conversations.add_session_daily_cost(sub_agent.id, today.isoformat(), 2.004)
+    old_day = (today - timedelta(days=7)).isoformat()
+    conversations.add_session_daily_cost(root.id, old_day, 50.0)
+
+    project = f"/v1/projects/{created['id']}"
+    header = (await project_client.get(f"{project}/tickets/cost", params={"days": 7})).json()
+    summary = (
+        await project_client.get(f"{project}/status/summary", params={"window": "7d"})
+    ).json()
+    assert header["cost_usd"] == 3.78
+    assert round(header["cost_usd"] * 100) == summary["totals"]["spend_cents"] == 378

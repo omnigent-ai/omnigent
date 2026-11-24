@@ -49,6 +49,7 @@ from omnigent.server.persona_mentions import (
     find_mentions,
 )
 from omnigent.server.project_landing import RISK_OK_LABEL
+from omnigent.server.project_status_spend import project_total_cents
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
 from omnigent.server.routes._sessions.helpers import (
@@ -772,10 +773,12 @@ def create_project_tickets_router(
         # Reading the stages checks the caller can see this project.
         await asyncio.to_thread(store.stages, project_id, user_id=who.user_id)
         since = trailing_window_start(days)
-        cost = await asyncio.to_thread(
-            conversations.sum_project_daily_cost, uuid_to_bytes(project_id).hex(), since
+        today = trailing_window_start(1)
+        # The status summary's spend definition, so sub-agents count for their root's project.
+        cents = await asyncio.to_thread(
+            project_total_cents, conversations, project_id, since, today
         )
-        return {"cost_usd": cost, "days": days, "since_day_utc": since}
+        return {"cost_usd": cents / 100, "days": days, "since_day_utc": since}
 
     @router.get("/{ticket_id}")
     async def get_ticket(

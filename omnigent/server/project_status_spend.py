@@ -16,6 +16,7 @@ differ from the sum of its parts by a cent.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -92,21 +93,17 @@ class ProjectSpend:
         conversations = self._conversations
         if conversations is None:
             return None
-        rows = conversations.list_project_root_daily_costs(
-            uuid_to_bytes(project.id).hex(), period.since_day_utc
-        )
         members: dict[str, MemberKey] = {}
         total = 0
         member_micros: dict[MemberKey, int] = defaultdict(int)
         day_micros: dict[str, int] = defaultdict(int)
         member_day_micros: dict[MemberKey, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for root_id, day_utc, cost_usd in rows:
-            if cost_usd <= 0 or not period.contains_day(day_utc):
-                continue
+        for root_id, day_utc, micros in _window_rows(
+            conversations, project.id, period.since_day_utc, period.today_utc
+        ):
             if root_id not in members:
                 members[root_id] = _member_for_root(conversations, project, root_id)
             member = members[root_id]
-            micros = usd_to_micros(cost_usd)
             total += micros
             member_micros[member] += micros
             day_micros[day_utc] += micros
@@ -120,6 +117,38 @@ class ProjectSpend:
                 for key, days in member_day_micros.items()
             },
         )
+
+
+def _window_rows(
+    conversations: ConversationStore,
+    project_id: str,
+    since_day_utc: str | None,
+    until_day_utc: str,
+) -> Iterator[tuple[str, str, int]]:
+    """A project's positive spend rows in the day window, as ``(root_id, day_utc, micros)``."""
+    rows = conversations.list_project_root_daily_costs(
+        uuid_to_bytes(project_id).hex(), since_day_utc
+    )
+    for root_id, day_utc, cost_usd in rows:
+        if cost_usd > 0 and day_utc <= until_day_utc:
+            yield root_id, day_utc, usd_to_micros(cost_usd)
+
+
+def project_total_cents(
+    conversations: ConversationStore,
+    project_id: str,
+    since_day_utc: str | None,
+    until_day_utc: str,
+) -> int:
+    """A project's spend in cents over UTC days ``since..until``; the rows ``breakdown`` sums."""
+    return micros_to_cents(
+        sum(
+            micros
+            for _, _, micros in _window_rows(
+                conversations, project_id, since_day_utc, until_day_utc
+            )
+        )
+    )
 
 
 def _member_for_root(
