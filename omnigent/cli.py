@@ -8234,7 +8234,8 @@ _SESSION_SERVER_HELP = "Omnigent server URL. Defaults to the configured server, 
     type=click.FloatRange(min=0, min_open=True),
     default=None,
     metavar="SECONDS",
-    help="With --wait, stop waiting after SECONDS. Waits as long as the turn takes by default.",
+    help="With --wait, give up after SECONDS, counting the send. Waits as long as the turn "
+    "takes by default.",
 )
 @click.option("--server", default=None, help=_SESSION_SERVER_HELP)
 @click.option("--json", "json_output", is_flag=True, help="Print the result as JSON.")
@@ -8264,12 +8265,7 @@ def session_send(
     """
     import asyncio
 
-    from omnigent.session_cli import (
-        latest_message_id,
-        open_session_client,
-        send_message,
-        wait_for_reply,
-    )
+    from omnigent.session_cli import open_session_client, send_and_wait, send_message
 
     if message is not None and message_file is not None:
         raise click.UsageError("Pass --message or --message-file, not both.")
@@ -8284,15 +8280,13 @@ def session_send(
 
     async def _send() -> None:
         async with open_session_client(base_url) as client:
-            # The cursor comes first: replies are the messages after it.
-            after = await latest_message_id(client, session_id) if wait else None
-            message_id = await send_message(client, session_id, text)
             if not wait:
+                message_id = await send_message(client, session_id, text)
                 if json_output:
                     sent = {"session_id": session_id, "message_id": message_id}
                     click.echo(json.dumps({**sent, "message_queued": True}))
                 return
-            result = await wait_for_reply(client, session_id, after=after, timeout_s=timeout)
+            message_id, result = await send_and_wait(client, session_id, text, timeout_s=timeout)
         if json_output:
             report = {
                 "session_id": session_id,

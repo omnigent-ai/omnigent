@@ -49,10 +49,12 @@ MCP independent creation.
   `tests/e2e/test_session_create_cli_e2e.py`).
 - `cli-messaging`: `omnigent session send <id>` queues a message like a web composer
   send. With `--wait` it returns once the session is idle, no input still waits for
-  its terminal, and an assistant message follows the newest user message, so an idle
-  read before the turn starts doesn't end the wait. It prints the final reply
-  (`--json` adds every message after the sent one) and stops early, with the status
-  shown, when the turn fails (exit 1) or a prompt waits for a person.
+  its terminal, and an assistant message follows the newest user message, with the
+  turn seen first (as `running` or a reply in an earlier read), so an idle read from
+  before the turn doesn't end the wait. It prints the final reply (`--json` adds every
+  message after the sent one) and stops early, with the status shown, when a prompt
+  waits for a person or the turn fails (exit 1). A failure already on the session
+  before the send doesn't count. `--timeout` bounds the whole exchange, send included.
   `omnigent session get <id>` prints the fields `sys_session_get_info` returns plus
   the URL, with cost and tokens under `--usage`. `omnigent session read <id>` prints
   the newest messages oldest first, without tool calls (`--last N`, `--after <message

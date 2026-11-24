@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -30,6 +31,10 @@ def _message(item_id: str, role: str, text: str) -> dict:
     }
 
 
+def _tool_call(item_id: str) -> dict:
+    return {"id": item_id, "type": "function_call", "name": "shell", "arguments": "{}"}
+
+
 def _shown(item: dict) -> dict:
     """What the CLI prints for *item*."""
     return {
@@ -40,12 +45,9 @@ def _shown(item: dict) -> dict:
     }
 
 
-_TOOL_CALL = {"id": "call_1", "type": "function_call", "name": "shell", "arguments": "{}"}
-
-
 @dataclass
 class _FakeSession:
-    """A session whose state and transcript move one step per state read."""
+    """A session whose state and transcript move one step per state read after the send."""
 
     items: list[dict] = field(
         default_factory=lambda: [
@@ -53,14 +55,22 @@ class _FakeSession:
             _message("msg_2", "assistant", "Old answer"),
         ]
     )
-    # Each state read serves the next snapshot and stores the items that arrived with it.
+    # What a state read returns before the message is posted.
+    baseline: dict = field(default_factory=lambda: {"status": "idle"})
+    # Each state read after the post serves the next snapshot. Its items arrive with
+    # it, so the transcript read that follows already sees them.
     states: list[tuple[dict, list[dict]]] = field(
         default_factory=lambda: [({"status": "idle"}, [])]
     )
     ack: tuple[int, dict] = (202, {"queued": True, "item_id": "msg_sent"})
     # A native terminal still starting holds the message as a pending input instead.
     stores_sent_message: bool = True
+    # Older servers ignore the items API's type filter.
+    filters_by_type: bool = True
+    state_delay_s: float = 0.0
+    post_delay_s: float = 0.0
     calls: list[tuple[str, dict]] = field(default_factory=list)
+    _posted: bool = False
     _served: int = 0
 
     def install(self, router: respx.MockRouter) -> None:
@@ -68,26 +78,27 @@ class _FakeSession:
         router.get(f"{_STATE_URL}/items").mock(side_effect=self._items)
         router.post(f"{_STATE_URL}/events").mock(side_effect=self._post)
 
-    def _state(self, request: httpx.Request) -> httpx.Response:
+    async def _state(self, request: httpx.Request) -> httpx.Response:
+        self.calls.append(("state", dict(request.url.params)))
+        await asyncio.sleep(self.state_delay_s)
+        if not self._posted:
+            return httpx.Response(200, json={"id": _SESSION, **self.baseline})
         index = min(self._served, len(self.states) - 1)
         snapshot, arriving = self.states[index]
         if self._served < len(self.states):
             self.items.extend(arriving)
         self._served += 1
-        self.calls.append(("state", dict(request.url.params)))
         return httpx.Response(200, json={"id": _SESSION, **snapshot})
 
     def _items(self, request: httpx.Request) -> httpx.Response:
         params = dict(request.url.params)
         self.calls.append(("items", params))
-        items = self.items
+        items = list(reversed(self.items)) if params.get("order") == "desc" else self.items
         if "after" in params:
             ids = [item["id"] for item in items]
             items = items[ids.index(params["after"]) + 1 :]
-        if "type" in params:
+        if "type" in params and self.filters_by_type:
             items = [item for item in items if item["type"] == params["type"]]
-        if params.get("order") == "desc":
-            items = list(reversed(items))
         limit = int(params.get("limit", 100))
         page = items[:limit]
         return httpx.Response(
@@ -100,9 +111,11 @@ class _FakeSession:
             },
         )
 
-    def _post(self, request: httpx.Request) -> httpx.Response:
+    async def _post(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.calls.append(("post", body))
+        await asyncio.sleep(self.post_delay_s)
+        self._posted = True
         status, ack = self.ack
         if status < 400 and ack.get("queued") and self.stores_sent_message:
             self.items.append(_message("msg_sent", "user", body["data"]["content"][0]["text"]))
@@ -174,36 +187,37 @@ def test_send_reports_why_the_message_was_not_queued(
     assert reason in result.stderr
 
 
+_LOOKING = _message("msg_3", "assistant", "Looking at the tests")
+_FIXED = _message("msg_4", "assistant", "Fixed the flaky test")
+# Idle reads that predate the turn: first before it starts, then with its progress
+# message already written by the time the transcript is read.
+_TURN_AFTER_STALE_IDLE_READS = [
+    ({"status": "idle"}, []),
+    ({"status": "idle"}, [_LOOKING]),
+    ({"status": "running"}, []),
+    ({"status": "idle"}, [_tool_call("call_1"), _FIXED]),
+]
+
+
 def test_wait_prints_the_final_reply_once_the_turn_ends(router: respx.MockRouter) -> None:
-    """A stale idle read before the turn starts must not end the wait."""
-    looking = _message("msg_3", "assistant", "Looking at the tests")
-    fixed = _message("msg_4", "assistant", "Fixed the flaky test")
-    session = _FakeSession(
-        states=[
-            ({"status": "idle"}, []),
-            ({"status": "running"}, [looking]),
-            ({"status": "idle"}, [_TOOL_CALL, fixed]),
-        ]
-    )
+    session = _FakeSession(states=list(_TURN_AFTER_STALE_IDLE_READS))
     session.install(router)
 
     result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
 
     assert result.exit_code == 0, result.output
     assert result.stdout == "Fixed the flaky test\n"
-    # The newest message is read before the send, so the old answer is never a reply.
-    first_read, post = session.calls[0], session.calls[1]
-    assert first_read == ("items", {"limit": "1", "order": "desc", "type": "message"})
-    assert post[0] == "post"
-    assert [kind for kind, _ in session.calls].count("state") == 3
+    # The state and the newest message are read before the post, so the old
+    # answer is never a reply.
+    assert session.calls[:3] == [
+        ("state", session.calls[0][1]),
+        ("items", {"limit": "1", "order": "desc", "type": "message"}),
+        ("post", message_event("Fix it")),
+    ]
 
 
 def test_wait_json_lists_every_message_after_the_sent_one(router: respx.MockRouter) -> None:
-    looking = _message("msg_3", "assistant", "Looking at the tests")
-    fixed = _message("msg_4", "assistant", "Fixed the flaky test")
-    _FakeSession(
-        states=[({"status": "running"}, [looking]), ({"status": "idle"}, [_TOOL_CALL, fixed])]
-    ).install(router)
+    _FakeSession(states=list(_TURN_AFTER_STALE_IDLE_READS)).install(router)
 
     result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--json"])
 
@@ -215,21 +229,40 @@ def test_wait_json_lists_every_message_after_the_sent_one(router: respx.MockRout
         "pending_approvals": 0,
         "reply": "Fixed the flaky test",
         # Tool calls are left out.
-        "messages": [_shown(looking), _shown(fixed)],
+        "messages": [_shown(_LOOKING), _shown(_FIXED)],
     }
+
+
+def test_wait_returns_a_fast_turn_seen_only_by_its_reply(router: respx.MockRouter) -> None:
+    """A turn that starts and ends between two polls never reads as running."""
+    _FakeSession(states=[({"status": "idle"}, [_FIXED])]).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == "Fixed the flaky test\n"
 
 
 def test_wait_holds_while_a_terminal_still_owes_the_message(router: respx.MockRouter) -> None:
     """A starting native terminal holds the message as a pending input with no id."""
-    done = _message("msg_5", "assistant", "Done")
+    done = _message("msg_7", "assistant", "Done")
+    pending = {"pending_inputs": [{"pending_id": "pending_1"}]}
     session = _FakeSession(
         ack=(202, {"queued": True, "pending_id": "pending_1"}),
         stores_sent_message=False,
         states=[
-            ({"status": "idle", "pending_inputs": [{"pending_id": "pending_1"}]}, []),
-            # Stored now, but idle before its turn starts: still no reply.
-            ({"status": "idle"}, [_message("msg_sent", "user", "Fix it")]),
-            ({"status": "running"}, []),
+            # Someone else's exchange lands first: a reply the wait would take if
+            # it ignored the input still waiting for the terminal.
+            (
+                {"status": "idle", **pending},
+                [
+                    _message("msg_5", "user", "Other"),
+                    _message("msg_6", "assistant", "Other reply"),
+                ],
+            ),
+            ({"status": "running", **pending}, []),
+            ({"status": "idle", **pending}, []),
+            ({"status": "running"}, [_message("msg_sent", "user", "Fix it")]),
             ({"status": "idle"}, [done]),
         ],
     )
@@ -258,8 +291,41 @@ def test_wait_stops_when_the_session_waits_for_an_approval(router: respx.MockRou
     assert "is waiting for you" in result.stderr
 
 
-def test_wait_reports_a_failed_turn(router: respx.MockRouter) -> None:
-    _FakeSession(states=[({"status": "failed"}, [])]).install(router)
+_OLD_ERROR = {"code": "executor_error", "message": "rate limited"}
+
+
+@pytest.mark.parametrize(
+    ("baseline", "states"),
+    [
+        pytest.param({"status": "idle"}, [({"status": "failed"}, [])], id="fails-after-idle"),
+        pytest.param(
+            {"status": "failed", "last_task_error": _OLD_ERROR},
+            [
+                ({"status": "failed", "last_task_error": _OLD_ERROR}, []),
+                ({"status": "running"}, []),
+                ({"status": "failed", "last_task_error": _OLD_ERROR}, []),
+            ],
+            id="fails-again-after-running",
+        ),
+        pytest.param(
+            {"status": "failed", "last_task_error": _OLD_ERROR},
+            [
+                (
+                    {
+                        "status": "failed",
+                        "last_task_error": {"code": "executor_error", "message": "crashed"},
+                    },
+                    [],
+                )
+            ],
+            id="fails-with-a-new-error",
+        ),
+    ],
+)
+def test_wait_reports_a_failed_turn(
+    router: respx.MockRouter, baseline: dict, states: list[tuple[dict, list[dict]]]
+) -> None:
+    _FakeSession(baseline=baseline, states=states).install(router)
 
     result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--json"])
 
@@ -268,14 +334,50 @@ def test_wait_reports_a_failed_turn(router: respx.MockRouter) -> None:
     assert "The turn failed" in result.stderr
 
 
+def test_wait_retrying_a_failed_session_ignores_its_old_failure(
+    router: respx.MockRouter,
+) -> None:
+    """The last turn's failure stays on the session until the new turn starts."""
+    old_failure = {"status": "failed", "last_task_error": _OLD_ERROR}
+    _FakeSession(
+        baseline=old_failure,
+        states=[(old_failure, []), ({"status": "running"}, []), ({"status": "idle"}, [_FIXED])],
+    ).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Try again", "--wait"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == "Fixed the flaky test\n"
+
+
 def test_wait_gives_up_after_the_timeout(router: respx.MockRouter) -> None:
     _FakeSession(states=[({"status": "running"}, [])]).install(router)
 
     result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.05"])
 
     assert result.exit_code == 1
-    assert "Timed out after 0.05s" in result.stderr
+    assert "Timed out after 0.05s waiting for session conv_worker to reply" in result.stderr
     assert result.stdout == ""
+
+
+def test_wait_timeout_bounds_slow_reads(router: respx.MockRouter) -> None:
+    """A reply that would arrive after the deadline is not reported as a success."""
+    _FakeSession(state_delay_s=0.1, states=[({"status": "idle"}, [_FIXED])]).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.25"])
+
+    assert result.exit_code == 1
+    assert "Timed out after 0.25s waiting for session conv_worker to reply" in result.stderr
+
+
+def test_wait_timeout_covers_a_send_the_server_holds(router: respx.MockRouter) -> None:
+    """An approval policy can hold the POST itself."""
+    _FakeSession(post_delay_s=5.0).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.05"])
+
+    assert result.exit_code == 1
+    assert "Timed out after 0.05s before the server confirmed the message" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -371,7 +473,9 @@ def test_get_prints_a_readable_summary(router: respx.MockRouter) -> None:
     assert "tokens:          1,200 input, 40 output" in lines
     assert f"url:             {_BASE}/c/{_SESSION}" in lines
     # Cost is opt-in: the default read skips the usage aggregate.
+    assert without_usage.exit_code == 0, without_usage.output
     assert state.calls.last.request.url.params["include_usage"] == "false"
+    assert "status:" in without_usage.stdout
     assert "cost:" not in without_usage.stdout
 
 
@@ -384,57 +488,75 @@ def test_get_reports_an_unknown_session(router: respx.MockRouter) -> None:
     assert f"Session {_SESSION} was not found." in result.stderr
 
 
-def _long_transcript() -> list[dict]:
-    return [
-        _message("msg_1", "user", "Task"),
-        _TOOL_CALL,
-        _message("msg_2", "assistant", "First pass"),
-        _message("msg_3", "user", "Now add a test"),
-        _message("msg_4", "assistant", "Added tests/test_x.py"),
-    ]
+def _transcript(count: int) -> list[dict]:
+    """*count* messages, alternating user and assistant, with a tool call after each reply."""
+    items: list[dict] = []
+    for number in range(1, count + 1):
+        role = "user" if number % 2 else "assistant"
+        items.append(_message(f"msg_{number}", role, f"Message {number}"))
+        if role == "assistant":
+            items.append(_tool_call(f"call_{number}"))
+    return items
+
+
+def _ids(result: Result) -> list[str]:
+    return [message["id"] for message in json.loads(result.stdout)["messages"]]
 
 
 def test_read_shows_the_newest_messages_oldest_first(router: respx.MockRouter) -> None:
-    session = _FakeSession(items=_long_transcript())
+    session = _FakeSession(items=_transcript(4))
     session.install(router)
 
     result = _invoke(["read", _SESSION, "--last", "2"])
 
     assert result.exit_code == 0, result.output
-    assert result.stdout == (
-        "── user · msg_3 ──\nNow add a test\n\n── assistant · msg_4 ──\nAdded tests/test_x.py\n"
-    )
+    assert result.stdout == "── user · msg_3 ──\nMessage 3\n\n── assistant · msg_4 ──\nMessage 4\n"
     assert session.calls == [("items", {"limit": "2", "order": "desc", "type": "message"})]
 
 
 def test_read_defaults_to_the_last_ten_messages(router: respx.MockRouter) -> None:
-    session = _FakeSession(items=_long_transcript())
+    session = _FakeSession(items=_transcript(12))
     session.install(router)
 
     result = _invoke(["read", _SESSION, "--json"])
 
     assert result.exit_code == 0, result.output
+    assert _ids(result) == [f"msg_{number}" for number in range(3, 13)]
     assert session.calls == [("items", {"limit": "10", "order": "desc", "type": "message"})]
-    assert [message["id"] for message in json.loads(result.stdout)["messages"]] == [
-        "msg_1",
-        "msg_2",
-        "msg_3",
-        "msg_4",
-    ]
 
 
-def test_read_after_a_message_returns_only_newer_ones(router: respx.MockRouter) -> None:
-    transcript = _long_transcript()
-    session = _FakeSession(items=transcript)
+def test_read_pages_past_tool_calls_on_a_server_without_the_message_filter(
+    router: respx.MockRouter,
+) -> None:
+    items = [*_transcript(2), _tool_call("call_a"), _tool_call("call_b"), _tool_call("call_c")]
+    session = _FakeSession(items=items, filters_by_type=False)
     session.install(router)
 
-    result = _invoke(["read", _SESSION, "--after", "msg_2", "--json"])
+    result = _invoke(["read", _SESSION, "--last", "2", "--json"])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout) == {
-        "session_id": _SESSION,
-        "messages": [_shown(transcript[3]), _shown(transcript[4])],
-    }
-    assert session.calls == [
-        ("items", {"limit": "1000", "order": "asc", "type": "message", "after": "msg_2"})
+    assert _ids(result) == ["msg_1", "msg_2"]
+    assert [params for _, params in session.calls] == [
+        {"limit": "2", "order": "desc", "type": "message"},
+        {"limit": "1000", "order": "desc", "type": "message", "after": "call_b"},
     ]
+
+
+def test_read_after_a_message_follows_every_page(
+    router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.session_cli._ITEMS_PAGE_LIMIT", 2)
+    session = _FakeSession(items=_transcript(7))
+    session.install(router)
+
+    everything = _invoke(["read", _SESSION, "--after", "msg_2", "--json"])
+    newest = _invoke(["read", _SESSION, "--after", "msg_2", "--last", "2", "--json"])
+
+    assert everything.exit_code == 0, everything.output
+    assert _ids(everything) == ["msg_3", "msg_4", "msg_5", "msg_6", "msg_7"]
+    assert newest.exit_code == 0, newest.output
+    assert _ids(newest) == ["msg_6", "msg_7"]
+    assert session.calls[0] == (
+        "items",
+        {"limit": "2", "order": "asc", "type": "message", "after": "msg_2"},
+    )

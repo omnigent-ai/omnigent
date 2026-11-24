@@ -142,36 +142,56 @@ async def list_messages(
     :returns: Messages shaped by :func:`project_message`.
     :raises click.ClickException: When the session or *after* can't be read.
     """
-    items_url = f"/v1/sessions/{session_id}/items"
-    items: list[object] = []
     if after is None and last is not None:
-        page = await _read_json(
-            client,
-            session_id,
-            items_url,
-            {"limit": last, "order": "desc", "type": "message"},
-        )
-        data = page.get("data")
-        items = list(reversed(data)) if isinstance(data, list) else []
-    else:
-        cursor = after
-        while True:
-            params: dict[str, str | int] = {
-                "limit": _ITEMS_PAGE_LIMIT,
-                "order": "asc",
-                "type": "message",
-            }
-            if cursor is not None:
-                params["after"] = cursor
-            page = await _read_json(client, session_id, items_url, params)
-            data = page.get("data")
-            items.extend(data if isinstance(data, list) else [])
-            last_id = page.get("last_id")
-            if page.get("has_more") is not True or not isinstance(last_id, str):
-                break
-            cursor = last_id
-    messages = [message for item in items if (message := project_message(item)) is not None]
+        return await _newest_messages(client, session_id, last)
+    messages = await _messages_after(client, session_id, after)
     return messages[-last:] if last is not None else messages
+
+
+async def _newest_messages(
+    client: httpx.AsyncClient, session_id: str, last: int
+) -> list[JsonObject]:
+    """
+    Return the newest *last* messages, oldest first.
+
+    Pages newest-first until it has *last* messages: older servers ignore the
+    ``type`` filter, so a page can hold tool calls instead.
+    """
+    newest_first: list[JsonObject] = []
+    params: dict[str, str | int] = {"limit": last, "order": "desc", "type": "message"}
+    while len(newest_first) < last:
+        page = await _read_json(client, session_id, f"/v1/sessions/{session_id}/items", params)
+        newest_first.extend(_page_messages(page))
+        last_id = page.get("last_id")
+        if page.get("has_more") is not True or not isinstance(last_id, str):
+            break
+        params = {**params, "after": last_id, "limit": _ITEMS_PAGE_LIMIT}
+    return list(reversed(newest_first[:last]))
+
+
+async def _messages_after(
+    client: httpx.AsyncClient, session_id: str, after: str | None
+) -> list[JsonObject]:
+    """
+    Return every message after *after* (or every message), oldest first.
+    """
+    messages: list[JsonObject] = []
+    params: dict[str, str | int] = {"limit": _ITEMS_PAGE_LIMIT, "order": "asc", "type": "message"}
+    if after is not None:
+        params["after"] = after
+    while True:
+        page = await _read_json(client, session_id, f"/v1/sessions/{session_id}/items", params)
+        messages.extend(_page_messages(page))
+        last_id = page.get("last_id")
+        if page.get("has_more") is not True or not isinstance(last_id, str):
+            return messages
+        params = {**params, "after": last_id}
+
+
+def _page_messages(page: JsonObject) -> list[JsonObject]:
+    data = page.get("data")
+    items = data if isinstance(data, list) else []
+    return [message for item in items if (message := project_message(item)) is not None]
 
 
 def project_message(item: object) -> JsonObject | None:
@@ -216,53 +236,104 @@ async def latest_message_id(client: httpx.AsyncClient, session_id: str) -> str |
     return message_id if isinstance(message_id, str) else None
 
 
-async def wait_for_reply(
+async def send_and_wait(
+    client: httpx.AsyncClient,
+    session_id: str,
+    text: str,
+    *,
+    timeout_s: float | None,
+) -> tuple[str | None, TurnResult]:
+    """
+    Send *text* and wait for the session's reply, all within *timeout_s*.
+
+    The session's state and newest message are read before the send, so neither
+    a failure nor a reply from before it is taken as this message's outcome.
+
+    :param client: Client from :func:`open_session_client`.
+    :param session_id: The session, e.g. ``"conv_abc123"``.
+    :param text: The message.
+    :param timeout_s: Seconds for the whole exchange, including the send, or
+        ``None`` to wait as long as the turn takes.
+    :returns: The stored message id (see :func:`send_message`) and the outcome.
+    :raises click.ClickException: When the send fails, the session can't be read,
+        or time runs out.
+    """
+    sent = False
+    try:
+        async with asyncio.timeout(timeout_s):
+            baseline = await _read_json(
+                client, session_id, f"/v1/sessions/{session_id}", _STATE_PARAMS
+            )
+            after = await latest_message_id(client, session_id)
+            message_id = await send_message(client, session_id, text)
+            sent = True
+            result = await _wait_for_reply(client, session_id, after=after, baseline=baseline)
+    except TimeoutError:
+        if not sent:
+            raise click.ClickException(
+                f"Timed out after {timeout_s:g}s before the server confirmed the message. "
+                "Check the session before sending it again."
+            ) from None
+        raise click.ClickException(
+            f"Timed out after {timeout_s:g}s waiting for session {session_id} to reply. "
+            "The message stays with the session."
+        ) from None
+    return message_id, result
+
+
+async def _wait_for_reply(
     client: httpx.AsyncClient,
     session_id: str,
     *,
     after: str | None,
-    timeout_s: float | None,
+    baseline: JsonObject,
 ) -> TurnResult:
     """
-    Wait until the message sent after *after* has its reply, or the turn stops early.
+    Poll until the sent message's turn ends, fails, or waits for a person.
 
-    The reply has arrived once the session is idle, no input is still waiting for
-    its terminal, and an assistant message follows the newest user message. An idle
-    status alone isn't enough: right after a send the session can still read idle
-    before its turn starts. A failed turn, or a prompt waiting for a person, ends
-    the wait early.
+    A status read can predate the turn: a session reads idle, or still reads its
+    last turn's failure, until the runner reports the new turn. So the turn has
+    ended only when the session is idle, nothing waits for its terminal, and an
+    assistant message follows the newest user message past *after*, with the turn
+    seen first, as ``running`` or as a reply in an earlier read. A failure counts
+    once it can't be the old one: the session wasn't failed before the send, has
+    shown another status since, or reports a different error.
 
-    :param client: Client from :func:`open_session_client`.
-    :param session_id: The session, e.g. ``"conv_abc123"``.
-    :param after: The newest message id before the send, or ``None`` for a session
-        that had none.
-    :param timeout_s: Seconds to wait, or ``None`` to wait as long as the turn takes.
-    :returns: The session's state and the messages after the one sent.
-    :raises click.ClickException: On timeout, or when the session can't be read.
+    :param after: The newest message id before the send, or ``None``.
+    :param baseline: The session's state read before the send.
     """
-    loop = asyncio.get_running_loop()
-    deadline = None if timeout_s is None else loop.time() + timeout_s
     interval = _WAIT_FIRST_INTERVAL_S
+    turn_seen = False
+    left_failed = False
     while True:
         state = await _read_json(client, session_id, f"/v1/sessions/{session_id}", _STATE_PARAMS)
         raw_status = state.get("status")
         status = raw_status if isinstance(raw_status, str) else None
         prompts = state.get("pending_elicitations")
         approvals = len(prompts) if isinstance(prompts, list) else 0
-        if approvals or status == "failed":
+        if approvals:
             replies = await _messages_after_send(client, session_id, after)
             return TurnResult(status, approvals, replies or [])
+        if status == "failed":
+            if (
+                baseline.get("status") != "failed"
+                or left_failed
+                or state.get("last_task_error") != baseline.get("last_task_error")
+            ):
+                replies = await _messages_after_send(client, session_id, after)
+                return TurnResult(status, 0, replies or [])
+        else:
+            left_failed = True
+        turn_seen = turn_seen or status == "running"
         if status == "idle" and not state.get("pending_inputs"):
             replies = await _messages_after_send(client, session_id, after)
-            if replies and any(message.get("role") == "assistant" for message in replies):
+            replied = bool(replies) and any(message["role"] == "assistant" for message in replies)
+            if replied and turn_seen:
                 return TurnResult(status, 0, replies)
-        if deadline is not None and loop.time() >= deadline:
-            raise click.ClickException(
-                f"Timed out after {timeout_s:g}s waiting for session {session_id} to reply. "
-                "The message stays with the session."
-            )
-        delay = interval if deadline is None else min(interval, max(0.0, deadline - loop.time()))
-        await asyncio.sleep(delay)
+            # A reply read after this idle status shows the turn had started, so the
+            # next idle read is current; without one, wait to see the turn again.
+            turn_seen = replied
+        await asyncio.sleep(interval)
         interval = min(interval * 1.5, _WAIT_MAX_INTERVAL_S)
 
 
