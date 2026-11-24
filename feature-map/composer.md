@@ -24,9 +24,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   window focus, at most once a minute. In this editor a paste of files becomes one
   chip per file at the caret, named after the file it sends as. A plain-text
   paste of 40 lines or 4,000 characters becomes a `pasted-text.txt` chip. Chips
-  show in the main chat, New Chat and side chats; a draft that leaves the editor
-  (switching sessions, a new-session handoff, a recovered send) keeps each chip's
-  file as a tray attachment with its `@name` text unchanged.
+  show in the main chat and New Chat; side-chat pastes stay in the tray. A draft
+  that leaves the editor (switching sessions, a new-session handoff, a recovered
+  send) keeps each chip's file as a tray attachment with its `@name` text
+  unchanged.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain

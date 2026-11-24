@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import {
+  attachmentAccept,
+  attachmentFilename,
+  clipboardFiles,
+  validateAttachments,
+} from "@/lib/attachments";
 import { nameAttachmentFile } from "@/lib/composerMentions";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { insertPastedText } from "@/lib/composerText";
 import { largePasteAsFile } from "@/lib/pastedAttachments";
+import { isComposerTextarea } from "@/components/composer/engine/composerInput";
 import type {
   ComposerPasteEvent,
   ComposerTextTarget,
@@ -125,7 +131,6 @@ export function useComposerAttachments({
   // renamed. Files that clash only with each other keep their names, as they do with no chips.
   const nameIncoming = useCallback((incoming: File[]): File[] => {
     const tokens = chipTokensRef.current?.() ?? [];
-    // A name changes only to avoid a chip, so with no chips a pick keeps the name it came with.
     if (tokens.length === 0) return incoming;
     return incoming.map((file) => nameAttachmentFile(file, { tokens, trayNames: [] }));
   }, []);
@@ -156,19 +161,23 @@ export function useComposerAttachments({
     setFiles(restored);
   }, []);
 
-  // Adds files a composer's chips leave behind, as they are: they were validated when pasted. A File
-  // the tray already holds is kept once, so a restored draft and a reset can both report it.
+  // Keep a File once: a restored draft and a reset may both report it.
   const appendFiles = useCallback((demoted: File[]) => {
     setFiles((prev) => [...prev, ...demoted.filter((file) => !prev.includes(file))]);
   }, []);
 
   const onPaste = useCallback(
     (e: ComposerPasteEvent) => {
-      const insertChips = onPasteChipsRef.current;
+      // Chips need the editor that is mounted: a paste into a textarea still rendered during a
+      // handoff takes the tray path, as the textarea always does.
+      const insertChips = isComposerTextarea(e.currentTarget) ? undefined : onPasteChipsRef.current;
       const pasted = clipboardFiles(e.clipboardData);
       if (pasted.length === 0) {
         // A large text the file policy rejects stays inline, so the text is never lost.
-        const largeText = insertChips ? largePasteAsFile(e.clipboardData) : null;
+        // A large paste the tray takes must not repeat a file name already there.
+        const largeText = insertChips
+          ? largePasteAsFile(e.clipboardData, filesRef.current.map(attachmentFilename))
+          : null;
         if (
           insertChips === undefined ||
           largeText === null ||

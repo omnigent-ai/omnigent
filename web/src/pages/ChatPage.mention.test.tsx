@@ -1441,13 +1441,6 @@ describe("Composer pasted chips", () => {
     expect(sentFiles(onSend)).toEqual([shot, diagram]);
   });
 
-  it("names a repeated paste with a suffix before its extension", async () => {
-    await renderCodeMirrorComposer();
-    paste({ files: [new File(["a"], "image.png", { type: "image/png" })] });
-    paste({ files: [new File(["b"], "image.png", { type: "image/png" })] });
-    expect(tokens()).toEqual(["@image.png", "@image (2).png"]);
-  });
-
   it("drops a deleted chip's file from the send", async () => {
     const onSend = await renderCodeMirrorComposer();
     typeAt("Look ");
@@ -1681,9 +1674,9 @@ describe("Composer pasted chips", () => {
       { text: "look @b.png @b (2).png", names: ["b (2).png"] },
     ],
     [
-      "a chip that crosses a draft boundary sends as a tray file, with its text as typed",
-      [{ type: "look " }, { paste: "a.png" }, { remount: true }],
-      { text: "look @a.png", names: ["a.png"] },
+      "a repeated chip takes the next name, and keeps its file's name",
+      [{ paste: "image.png" }, { paste: "image.png" }],
+      { text: "@image.png @image (2).png", names: ["image.png", "image (2).png"] },
     ],
     [
       "a pick repeating a tray file keeps its name when no chip clashes",

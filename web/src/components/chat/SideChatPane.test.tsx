@@ -1774,15 +1774,6 @@ describe("grid cell composer shares its session's draft", () => {
     );
   });
 
-  it("keeps a tray file's name when the text refers to it, in a grid cell", () => {
-    const notes = new File(["n"], "notes.txt", { type: "text/plain" });
-    bridgedCell({ text: "Summarize @notes.txt", files: [notes] });
-    fireEvent.click(screen.getByTestId("side-chat-send"));
-    const sent = send.mock.calls[0]!;
-    expect(sent[0]).toBe("Summarize @notes.txt");
-    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt"]);
-  });
-
   it("keeps an ordinary side chat's tray file name when the text refers to it", () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     renderPane(<SideChatPane childId={childId} />);
@@ -1799,16 +1790,21 @@ describe("grid cell composer shares its session's draft", () => {
   });
 
   it("keeps a grid cell's text and file names, including a file pasted into it", () => {
+    const notes = new File(["n"], "notes.txt", { type: "text/plain" });
     const shot = new File(["c"], "image.png", { type: "image/png" });
     const pasted = new File(["t"], "image.png", { type: "image/png" });
-    bridgedCell({ text: "Look @image.png", files: [shot] });
+    bridgedCell({ text: "Summarize @notes.txt and @image.png", files: [notes, shot] });
     fireEvent.paste(screen.getByTestId("side-chat-input"), {
       clipboardData: { items: [{ kind: "file", type: pasted.type, getAsFile: () => pasted }] },
     });
     fireEvent.click(screen.getByTestId("side-chat-send"));
     const sent = send.mock.calls[0]!;
-    expect(sent[0]).toBe("Look @image.png");
-    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["image.png", "image.png"]);
+    expect(sent[0]).toBe("Summarize @notes.txt and @image.png");
+    expect((sent[2] as File[]).map((file) => file.name)).toEqual([
+      "notes.txt",
+      "image.png",
+      "image.png",
+    ]);
   });
 
   it("sends a tagged skill command as an ordinary message, not as a local command", () => {

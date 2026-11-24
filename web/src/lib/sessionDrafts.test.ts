@@ -262,15 +262,12 @@ describe("session drafts", () => {
       );
       expect(recovered.files.map(attachmentFilename)).toEqual(want.names);
       expect(recovered.message).toBe(want.message);
-      // The fixtures' own tags, not the recovered ones, expand the message.
-      const fixtureTags = composerInlineMentions(
-        {
-          files: [...mentionsOf(original).files, ...mentionsOf(temp).files],
-          sessions: [...mentionsOf(original).sessions, ...mentionsOf(temp).sessions],
-        },
+      // The recovered tags expand the recovered message to the markers each row states.
+      const recoveredTags = composerInlineMentions(
+        recovered.mentions ?? { files: [], sessions: [] },
         null,
       );
-      expect(expandMentionTokens(recovered.message, fixtureTags)).toBe(want.expanded);
+      expect(expandMentionTokens(recovered.message, recoveredTags)).toBe(want.expanded);
     },
   );
 

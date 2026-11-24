@@ -7,7 +7,10 @@
 export const PASTE_ATTACHMENT_THRESHOLD = { lines: 40, characters: 4000 } as const;
 
 /** The `.txt` attachment a large plain-text paste becomes, or `null` when it stays inline. */
-export function largePasteAsFile(data: Pick<DataTransfer, "getData">): File | null {
+export function largePasteAsFile(
+  data: Pick<DataTransfer, "getData">,
+  trayNames: readonly string[] = [],
+): File | null {
   const text = data.getData("text/plain").replace(/\r\n?/g, "\n");
   const lines = text.replace(/\n$/, "").split("\n").length;
   if (
@@ -16,7 +19,10 @@ export function largePasteAsFile(data: Pick<DataTransfer, "getData">): File | nu
   ) {
     return null;
   }
-  return new File([text], "pasted-text.txt", { type: "text/plain" });
+  const name = uniqueAttachmentName("pasted-text.txt", (candidate) =>
+    trayNames.includes(candidate),
+  );
+  return new File([text], name, { type: "text/plain" });
 }
 
 /**

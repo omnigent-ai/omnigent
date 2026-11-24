@@ -218,11 +218,10 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const [localSessions, setLocalSessions] = useState<SessionMention[]>(
     () => initialMentions?.sessions ?? [],
   );
-  // Pasted chips live only in this composer: a draft that leaves it carries their files as tray files.
-  const [localAttachments, setLocalAttachments] = useState<PastedAttachment[]>([]);
+  // Pasted chips live only in this composer; a draft that leaves it carries their files as tray files.
+  const [mentionedAttachments, setMentionedAttachments] = useState<PastedAttachment[]>([]);
   const mentionedItems = tags ? tags.mentions.files : localItems;
   const mentionedSessions = tags ? tags.mentions.sessions : localSessions;
-  const mentionedAttachments = localAttachments;
   const setMentionedItems: React.Dispatch<React.SetStateAction<MentionItem[]>> = tags
     ? (update) =>
         tags.updateMentions((current) => ({
@@ -237,8 +236,6 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
           sessions: resolveUpdate(update, current.sessions),
         }))
     : setLocalSessions;
-  // Pasted chips live in this hook, not in a caller's tags, so they are kept here in both modes.
-  const setMentionedAttachments = setLocalAttachments;
   // An opened list stays open for the "@" token it was opened from.
   const [browse, setBrowse] = useState<{ start: number; level: SessionMenuLevel } | null>(null);
   if (browse !== null && mention?.start !== browse.start) setBrowse(null);
@@ -432,9 +429,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   };
 
   const resetMentions = (mentions?: TaggedMentions) => {
-    // Every reset goes through here: a live chip leaves as a tray file, so its File is kept.
-    if (mentionedAttachments.length > 0) {
-      onDemoteChips?.(mentionedAttachments.map((attachment) => attachment.file));
+    // Every reset goes through here: a live chip leaves as a tray file, so its File is kept. The
+    // latest chips come from activeRef, which a paste updates before the next render.
+    const liveChips = attachmentsOf(activeRef.current);
+    if (liveChips.length > 0) {
+      onDemoteChips?.(liveChips.map((attachment) => attachment.file));
+      activeRef.current = { ...activeRef.current, attachments: [] };
       setMentionedAttachments([]);
     }
     releasedRef.current = NO_TAGS;
@@ -510,7 +510,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     target: ComposerTextTarget,
     trayFiles: readonly File[],
   ): File[] => {
-    // A target that is not live cannot take the chip's text, so every file is refused.
+    // Detached input: hand every file back.
     if (!target.isConnected) return [...files];
     const added: PastedAttachment[] = [];
     const addedNames: string[] = [];

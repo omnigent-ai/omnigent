@@ -50,3 +50,10 @@ describe("uniqueAttachmentName", () => {
     expect(uniqueAttachmentName("notes", takenFrom(["@notes"]))).toBe("notes (2)");
   });
 });
+
+describe("largePasteAsFile names", () => {
+  it("keeps the name clear of tray names", () => {
+    const file = largePasteAsFile(clipboard("x".repeat(4000)), ["pasted-text.txt"]);
+    expect(file?.name).toBe("pasted-text (2).txt");
+  });
+});
