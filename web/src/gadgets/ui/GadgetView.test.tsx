@@ -291,6 +291,7 @@ describe("a gadget with nothing published", () => {
   it.each([
     ["running", "Building your gadget…"],
     ["needs_input", "Your gadget session is waiting for you."],
+    ["unknown", /may still be working on it; not all of its sessions could be checked/],
     ["interrupted", "Your gadget session stopped"],
     ["idle", "Tell this session what it should build."],
   ])("shows a %s gadget session's state", async (status, text) => {

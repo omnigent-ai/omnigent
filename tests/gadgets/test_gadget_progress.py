@@ -210,6 +210,32 @@ def test_a_session_bound_to_a_runner_that_never_reported_in_is_not_online(
     assert status(service, app, action_id) == ("interrupted", "runner_offline")
 
 
+def test_an_independent_worker_does_not_borrow_its_creators_heartbeat(
+    gadgets: Fixture, clock: dict
+) -> None:
+    conversations = FakeConversations()
+    conversations.add("s_gadget", seen=NOW)
+    service = progress_service(gadgets, conversations)
+    app = publish_actions_board(service)
+    service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
+    action_id = request_and_deliver(service, app, "c1")
+    # Started by the gadget session but bound to its own runner, which never reported in.
+    conversations.add(
+        "s_worker",
+        created=NOW + 1,
+        status="running",
+        updated=NOW + 1,
+        seen=None,
+        bound=True,
+        labels={"omnigent.created_by_session_id": "s_gadget"},
+    )
+    conversations.set("s_gadget", status="idle", updated=NOW + 2, seen=NOW + 11 * 60)
+
+    clock["now"] = NOW + 11 * 60
+    # The healthy creator says nothing about the worker's own runner.
+    assert status(service, app, action_id) == ("interrupted", "runner_offline")
+
+
 def test_an_action_stays_running_while_not_every_session_could_be_read(
     gadgets: Fixture, clock: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -575,6 +601,45 @@ def test_the_gadget_session_status_follows_the_session_and_its_children(
     }
     conversations.set("s_gadget", status="running", seen=NOW - 600)
     assert service.gadget_session_status(app["id"])["status"] == "interrupted"
+
+
+def test_the_gadget_session_status_is_unknown_when_its_tree_was_not_all_read(
+    gadgets: Fixture, clock: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(progress_module, "MAX_CHILD_SESSIONS", 2)
+    conversations = FakeConversations()
+    service = progress_service(gadgets, conversations)
+    app = publish_actions_board(service)
+    conversations.add("s_gadget", status="idle", updated=NOW)
+    service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
+    # An older, running child past the listing limit; the newer children read are idle.
+    conversations.add(
+        "s_old", parent="s_gadget", created=NOW + 1, status="running", updated=NOW + 2
+    )
+    for n in range(3):
+        conversations.add(f"s_new{n}", parent="s_gadget", created=NOW + 10 + n, updated=NOW + 12)
+    clock["now"] = NOW + 30
+    assert service.gadget_session_status(app["id"]) == {
+        "session_id": "s_gadget",
+        "status": "unknown",
+        "reason": "sessions_not_all_read",
+    }
+
+
+def test_the_gadget_session_status_ignores_the_owners_other_sessions(
+    gadgets: Fixture, clock: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A viewer with more sessions than the recent-session listing holds still gets an answer.
+    monkeypatch.setattr(progress_module, "MAX_RECENT_SESSIONS", 2)
+    conversations = FakeConversations()
+    service = progress_service(gadgets, conversations)
+    app = publish_actions_board(service)
+    conversations.add("s_gadget", status="idle", updated=NOW)
+    for n in range(4):
+        conversations.add(f"s_other{n}", created=NOW + n, updated=NOW + n)
+    service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
+    clock["now"] = NOW + 30
+    assert service.gadget_session_status(app["id"])["status"] == "idle"
 
 
 def test_the_reader_follows_a_real_conversation_store(db_uri: str) -> None:

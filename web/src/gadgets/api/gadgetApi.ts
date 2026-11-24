@@ -486,7 +486,8 @@ export async function renameGadget(appId: string, name: string): Promise<Gadget>
 
 /**
  * Whether the viewer's gadget session (with the sessions it started) is working, as the server
- * derives it: `none`, `running`, `needs_input`, `idle`, `interrupted` or `unavailable`.
+ * derives it: `none`, `running`, `needs_input`, `idle`, `interrupted`, `unavailable`, or
+ * `unknown` when not every session in its tree could be read.
  */
 export async function getGadgetGadgetSessionStatus(
   appId: string,

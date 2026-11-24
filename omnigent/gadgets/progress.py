@@ -100,9 +100,12 @@ class SessionStates(dict[str, SessionState]):
 
     ``complete`` is ``False`` when a listing reached its limit, so a session doing the work
     may be missing; progress then never concludes that the work stopped.
+    ``truncated_trees`` names the session trees (by root ID) whose own listing reached its
+    limit, so a session in one of them may be missing.
     """
 
     complete: bool = True
+    truncated_trees: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -271,6 +274,9 @@ def session_tree_status(
         return {"status": "interrupted", "reason": "runner_offline" if offline else "no_activity"}
     if root.status == "failed":
         return {"status": "interrupted", "reason": root.error_code or "session_failed"}
+    # A session past the tree's listing limit may still be working: don't call it idle.
+    if any(state.root_id in getattr(sessions, "truncated_trees", ()) for state in states):
+        return {"status": "unknown", "reason": "sessions_not_all_read"}
     return {"status": "idle", "reason": None}
 
 
@@ -362,6 +368,7 @@ class SessionStateReader:
             return SessionStates()
         conversations = dict(self._store.get_conversations(roots))
         complete = True
+        truncated: set[str] = set()
         for conversation in list(conversations.values()):
             page = self._store.list_conversations(
                 limit=MAX_CHILD_SESSIONS,
@@ -370,6 +377,8 @@ class SessionStateReader:
                 include_archived=True,
             )
             complete = complete and not page.has_more
+            if page.has_more:
+                truncated.add(conversation.root_conversation_id)
             for child in page.data:
                 conversations.setdefault(child.id, child)
         # Independent sessions have no parent link, only a label naming the session that started
@@ -395,6 +404,8 @@ class SessionStateReader:
                 include_archived=True,
             )
             complete = complete and not page.has_more
+            if page.has_more:
+                truncated.add(conversation.root_conversation_id)
             for child in page.data:
                 conversations.setdefault(child.id, child)
         connectivity = self._store.get_session_connectivity(list(conversations))
@@ -412,6 +423,8 @@ class SessionStateReader:
             # Children run in their parent's runner and may carry no stamp of their own. A
             # tree with no stamp is online only when nothing in it is bound to a runner or
             # host, which means it runs in-process; the silent-running limit still applies.
+            # Only the parent link is followed: a session another one started (the creation
+            # label) runs on its own runner, so its creator's heartbeat says nothing about it.
             seen: set[str] = set()
             chain: list[str] = []
             current: str | None = session_id
@@ -421,18 +434,12 @@ class SessionStateReader:
                 seen.add(current)
                 chain.append(current)
                 parent = conversations.get(current)
-                current = (
-                    (
-                        parent.parent_conversation_id
-                        or (parent.labels or {}).get(CREATED_BY_SESSION_LABEL)
-                    )
-                    if parent is not None
-                    else None
-                )
+                current = parent.parent_conversation_id if parent is not None else None
             return not any(link in hosted for link in chain)
 
         states = SessionStates()
         states.complete = complete
+        states.truncated_trees = frozenset(truncated)
         for conversation in conversations.values():
             status = _session_status_from_cache(conversation.id, conversation.live_status)
             if conversation.live_status == "waiting" and status == "running":

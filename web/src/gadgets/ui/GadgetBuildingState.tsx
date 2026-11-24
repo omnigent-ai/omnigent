@@ -10,8 +10,9 @@ import { GADGETS_KEY } from "./gadgetQueries";
 const BUSY_POLL_MS = 3_000;
 const IDLE_POLL_MS = 10_000;
 
+// `unknown`: some of its sessions weren't all checked, so it may still be working.
 function isBusy(status: string | undefined): boolean {
-  return status === "running" || status === "needs_input";
+  return status === "running" || status === "needs_input" || status === "unknown";
 }
 
 /** A centered status block in the gadget's place. */
@@ -94,7 +95,9 @@ export function GadgetBuildingState({
       >
         {status === "needs_input"
           ? "Your gadget session is waiting for you."
-          : "Your gadget session is working on it. It shows up here once it’s published."}
+          : status === "unknown"
+            ? "Your gadget session may still be working on it; not all of its sessions could be checked. It shows up here once it’s published."
+            : "Your gadget session is working on it. It shows up here once it’s published."}
       </StateBlock>
     );
   }
