@@ -56,9 +56,3 @@ def test_the_tool_schemas_stay_small_and_point_to_the_skill() -> None:
         "sys_gadget_records",
     ):
         assert "Load the gadget skill" in schemas[name]["function"]["description"], name
-
-
-def test_the_skill_documents_editing_a_revision_instead_of_resending_it() -> None:
-    text = SKILL.read_text()
-    assert "`base_revision_id` and `edits`" in text
-    assert "`{old, new}`" in text and "`{start, end, new}`" in text

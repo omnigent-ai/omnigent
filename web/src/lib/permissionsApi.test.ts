@@ -25,6 +25,7 @@ import {
   isOwnerLevel,
   isPermissionLevelPending,
   listAutomationPermissions,
+  listGadgetPermissions,
   listPermissions,
   listWorkflowPermissions,
   revokePermission,
@@ -166,6 +167,51 @@ describe("grantPermission", () => {
       ensure_minimum: true,
     });
     expect(result.level).toBe(3);
+  });
+
+  it("follows every page of a gadget's grants", async () => {
+    const grant = (userId: string) => ({
+      user_id: userId,
+      gadget_id: "app-1",
+      level: 2,
+      display_name: userId,
+    });
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ permissions: [grant("a@example.com")], next_cursor: "c1" }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({ permissions: [grant("b@example.com")], next_cursor: null }),
+      );
+
+    const grants = await listGadgetPermissions("app-1");
+
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls[0]).toMatch(/\/v1\/gadgets\/app-1\/permissions$/);
+    expect(urls[1]).toMatch(/\/v1\/gadgets\/app-1\/permissions\?after=c1$/);
+    expect(grants.permissions.map((item) => item.user_id)).toEqual([
+      "a@example.com",
+      "b@example.com",
+    ]);
+  });
+
+  it("grants and revokes access to a gadget", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ user_id: "team", gadget_id: "app-1", level: 1, display_name: "Team" }),
+      )
+      .mockResolvedValueOnce(mockResponse(null, { status: 204 }));
+
+    const granted = await grantSharePermission({ kind: "gadget", id: "app-1" }, "team", 1);
+    await revokeSharePermission({ kind: "gadget", id: "app-1" }, "a b");
+
+    expect(granted.level).toBe(1);
+    const [, put] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(put.method).toBe("PUT");
+    expect(JSON.parse(put.body as string)).toEqual({ user_id: "team", level: 1 });
+    const [deleteUrl, del] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(String(deleteUrl)).toMatch(/\/v1\/gadgets\/app-1\/permissions\/a%20b$/);
+    expect(del.method).toBe("DELETE");
   });
 
   it("PUTs /v1/sessions/{id}/permissions with user_id and level", async () => {

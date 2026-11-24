@@ -8,12 +8,9 @@ import {
   getGadget,
   getGadgetShelf,
   getSessionGadgets,
-  grantGadgetPermission,
   listGadgetComments,
   listGadgets,
   listSharedGadgets,
-  listGadgetPermissions,
-  revokeGadgetPermission,
 } from "./gadgetApi";
 
 const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>();
@@ -179,43 +176,5 @@ describe("gadget API", () => {
     expect(fetchMock.mock.calls[1][0]).toBe("/v1/gadgets/app-1/comments?limit=100&cursor=k");
     expect(listed.items.map((item) => item.id)).toEqual(["z", "a"]);
     expect(listed.canComment).toBe(true);
-  });
-
-  it("follows every page of a gadget's grants", async () => {
-    const grant = (userId: string) => ({
-      user_id: userId,
-      gadget_id: "app-1",
-      level: 2,
-      display_name: userId,
-    });
-    fetchMock
-      .mockResolvedValueOnce(json({ permissions: [grant("a@example.com")], next_cursor: "c1" }))
-      .mockResolvedValueOnce(json({ permissions: [grant("b@example.com")], next_cursor: null }));
-
-    const grants = await listGadgetPermissions("app-1");
-
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "/v1/gadgets/app-1/permissions",
-      "/v1/gadgets/app-1/permissions?after=c1",
-    ]);
-    expect(grants.map((item) => item.user_id)).toEqual(["a@example.com", "b@example.com"]);
-  });
-
-  it("grants and revokes access to a gadget", async () => {
-    fetchMock
-      .mockResolvedValueOnce(
-        json({ user_id: "team", gadget_id: "app-1", level: 1, display_name: "Team" }),
-      )
-      .mockResolvedValueOnce(new Response(null, { status: 204 }));
-
-    expect(await grantGadgetPermission("app-1", "team", 1)).toMatchObject({ level: 1 });
-    await revokeGadgetPermission("app-1", "a b");
-
-    expect(fetchMock.mock.calls[0][1]).toMatchObject({
-      method: "PUT",
-      body: JSON.stringify({ user_id: "team", level: 1 }),
-    });
-    expect(fetchMock.mock.calls[1][0]).toBe("/v1/gadgets/app-1/permissions/a%20b");
-    expect(fetchMock.mock.calls[1][1]?.method).toBe("DELETE");
   });
 });

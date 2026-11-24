@@ -339,7 +339,9 @@ the header menu), and each place is a separate entry point.
   `workspace_sidebar_v2` is on, because gadget tabs and full screen live only in
   it. A gadget's toolbar renames it in place from its name, and has **Comments**
   (where **Address all** sends the open comments to its session), **Share**, and a
-  **⋯** menu with **Gadget details** and **Delete gadget**.
+  **⋯** menu with **Gadget details** and **Delete gadget**. A gadget that asks to
+  read the viewer's sessions waits for **Allow** / **Don’t allow** first; a gadget
+  that navigated itself stops with **Reload gadget**, after which it asks again.
 
 ## How to get to it (user POV)
 
