@@ -8,7 +8,10 @@ import type * as IdentityModule from "@/lib/identity";
 import { authenticatedFetch } from "@/lib/identity";
 import type * as WorkspaceApiModule from "@/lib/workspaceApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { workspaceDirectoryQuery } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  FOLDER_PICKER_ENTRY_LIMIT,
+  workspaceFolderListingQuery,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { FileBreadcrumbs } from "./FileBreadcrumbs";
 import { WorkspaceFolderTree } from "./WorkspaceFolderTree";
 
@@ -101,13 +104,22 @@ function serveListings(listings: Listings) {
     if (listing === undefined || listing instanceof Error) {
       return new Response("unavailable", { status: 503, statusText: "Service Unavailable" });
     }
-    const data = listing.map((entry) => ({
+    // Pages as the server does: `limit` entries after the `after` cursor, in the given order.
+    const params = new URL(url, "http://localhost").searchParams;
+    const after = params.get("after");
+    const start = after ? listing.findIndex((entry) => entry.path === after) + 1 : 0;
+    const limit = Number(params.get("limit") ?? listing.length);
+    const page = listing.slice(start, start + limit);
+    const data = page.map((entry) => ({
       id: entry.path,
       bytes: null,
       modified_at: null,
       ...entry,
     }));
-    return new Response(JSON.stringify({ object: "list", data, has_more: false }));
+    const hasMore = start + limit < listing.length;
+    return new Response(
+      JSON.stringify({ object: "list", data, has_more: hasMore, last_id: data.at(-1)?.id ?? null }),
+    );
   });
 }
 
@@ -135,8 +147,12 @@ function cacheStaleListing(
   subfolder: string,
   entries: ReturnType<typeof cachedEntry>[],
 ) {
-  const { queryKey } = workspaceDirectoryQuery("conv_1", subfolder, location);
-  queryClient.setQueryData(queryKey, entries, { updatedAt: Date.now() - 60_000 });
+  const { queryKey } = workspaceFolderListingQuery("conv_1", subfolder, location);
+  queryClient.setQueryData(
+    queryKey,
+    { entries, hasMore: false },
+    { updatedAt: Date.now() - 60_000 },
+  );
 }
 
 function renderTree(folder: string, revealPath: string, queryClient = testQueryClient()) {
@@ -287,18 +303,6 @@ describe("WorkspaceFolderTree", () => {
     expect(tree.model.focusPath).not.toHaveBeenCalledWith("pkg/inner/");
   });
 
-  it("opens nothing when only the selection changes", async () => {
-    serveListings(SRC_LISTINGS);
-    const { onOpenFile } = renderTree("src", "shell/viewer.ts");
-    await screen.findByTestId("file-tree");
-
-    // The clicks and keys that open a file are in WorkspaceFolderTree.selection.test.tsx.
-    tree.options?.onSelectionChange(["lib/"]);
-    tree.options?.onSelectionChange(["app.ts"]);
-    tree.options?.onSelectionChange(["app.ts", "lib/", "shell/"]);
-    expect(onOpenFile).not.toHaveBeenCalled();
-  });
-
   it("loads a folder's contents the first time it expands", async () => {
     serveListings(SRC_LISTINGS);
     renderTree("src", "shell/viewer.ts");
@@ -398,11 +402,45 @@ describe("WorkspaceFolderTree", () => {
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
     await waitFor(() =>
       expect(
-        queryClient.getQueryState(workspaceDirectoryQuery("conv_1", "", "src").queryKey)?.status,
+        queryClient.getQueryState(workspaceFolderListingQuery("conv_1", "", "src").queryKey)
+          ?.status,
       ).toBe("error"),
     );
     expect(screen.getByTestId("file-tree")).toBeInTheDocument();
     expect(screen.queryByText("Couldn’t load this folder.")).toBeNull();
+  });
+});
+
+describe("WorkspaceFolderTree in a large folder", () => {
+  const siblings = (count: number, last: string) => ({
+    src: [
+      ...Array.from({ length: count }, (_, index) => {
+        const name = `a${String(index).padStart(4, "0")}.ts`;
+        return { name, path: `src/${name}`, type: "file" as const };
+      }),
+      { name: last, path: `src/${last}`, type: "file" as const },
+    ],
+  });
+
+  it("reads past the first page to select the file shown", async () => {
+    serveListings(siblings(1000, "zz-last.ts"));
+    renderTree("src", "zz-last.ts");
+
+    await screen.findByTestId("file-tree");
+    expect(tree.options?.initialSelectedPaths).toEqual(["zz-last.ts"]);
+    expect(tree.options?.paths).toHaveLength(1001);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("says where it stopped when the folder is longer than it reads", async () => {
+    serveListings(siblings(FOLDER_PICKER_ENTRY_LIMIT, "zz-last.ts"));
+    renderTree("src", "zz-last.ts");
+
+    await screen.findByTestId("file-tree");
+    expect(tree.options?.paths).toHaveLength(FOLDER_PICKER_ENTRY_LIMIT);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Showing the first 5,000 entries of src, which don’t include zz-last.ts.",
+    );
   });
 });
 

@@ -1201,6 +1201,70 @@ export function workspaceDirectoryQuery(
   };
 }
 
+/** How many entries of one folder the breadcrumb picker reads, a page at a time. */
+export const FOLDER_PICKER_ENTRY_LIMIT = 5_000;
+const FOLDER_PAGE_SIZE = 1000;
+
+/** A folder's entries in name order, and whether more lie past them. */
+export interface WorkspaceFolderListing {
+  entries: WorkspaceFile[];
+  hasMore: boolean;
+}
+
+/**
+ * Read a folder page by page, up to `limit` entries, keeping whether more remain.
+ *
+ * :param dirPath: The folder, relative to `location`; ``""`` for `location` itself.
+ * :param location: The browse location entries are addressed from, ``""`` for the root.
+ */
+export async function fetchWorkspaceFolderListing(
+  conversationId: string,
+  dirPath: string,
+  location = "",
+  limit = FOLDER_PICKER_ENTRY_LIMIT,
+): Promise<WorkspaceFolderListing> {
+  const target = joinBrowseLocation(location, dirPath);
+  const viaApi = await listViaWorkspaceApi(conversationId, target, limit);
+  if (viaApi) {
+    return { entries: mapFilesystemEntries(viaApi, target, dirPath), hasMore: viaApi.has_more };
+  }
+  const params = new URLSearchParams({ order: "asc" });
+  const base = browseLocationBase(target);
+  if (base) params.set("base", base);
+  const url = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${browseLocationSegment(target)}`;
+  const entries: WorkspaceFile[] = [];
+  let after: string | null = null;
+  // Each page needs the cursor the previous one returned.
+  /* oxlint-disable no-await-in-loop */
+  while (entries.length < limit) {
+    params.set("limit", String(Math.min(FOLDER_PAGE_SIZE, limit - entries.length)));
+    if (after) params.set("after", after);
+    const res = await authenticatedFetch(`${url}?${params}`);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const body = (await res.json()) as FilesystemListResponse;
+    entries.push(...mapFilesystemEntries(body, target, dirPath));
+    if (!body.has_more) return { entries, hasMore: false };
+    // A cursor that doesn't move would loop; say more remain instead.
+    if (!body.data.length || !body.last_id || body.last_id === after) break;
+    after = body.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return { entries, hasMore: true };
+}
+
+/** The breadcrumb picker's query for one folder, read to {@link FOLDER_PICKER_ENTRY_LIMIT}. */
+export function workspaceFolderListingQuery(
+  conversationId: string,
+  dirPath: string,
+  location = "",
+) {
+  return {
+    queryKey: ["workspace-folder-listing", conversationId, dirPath, location],
+    queryFn: () => fetchWorkspaceFolderListing(conversationId, dirPath, location),
+    staleTime: 5_000,
+  };
+}
+
 /** One expanded lazy directory's fetched children + load/error state. */
 export interface DirectoryResult {
   data: WorkspaceFile[] | undefined;

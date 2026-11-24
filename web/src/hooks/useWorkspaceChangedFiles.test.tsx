@@ -45,6 +45,7 @@ import {
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
   useWorkspaceServeable,
+  fetchWorkspaceFolderListing,
   workspaceDirectoryQuery,
 } from "./useWorkspaceChangedFiles";
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
@@ -958,6 +959,76 @@ describe("workspaceDirectoryQuery", () => {
       2,
     ]);
     expect(workspaceDirectoryQuery("conv", "src").staleTime).toBe(5_000);
+  });
+});
+
+describe("fetchWorkspaceFolderListing", () => {
+  const page = (names: string[], hasMore: boolean, lastId: string | null = names.at(-1) ?? null) =>
+    new Response(
+      JSON.stringify({
+        object: "list",
+        data: names.map((name) => ({
+          id: name,
+          name,
+          path: `src/${name}`,
+          type: "file",
+          bytes: null,
+          modified_at: null,
+        })),
+        has_more: hasMore,
+        last_id: lastId,
+      }),
+    );
+
+  it("reads each page after the last, and says more remain at the limit", async () => {
+    fetchMock.mockResolvedValueOnce(page(["a.ts", "b.ts"], true));
+    fetchMock.mockResolvedValueOnce(page(["c.ts", "d.ts"], true));
+
+    const listed = await fetchWorkspaceFolderListing("conv", "src", "", 4);
+
+    // Paths are relative to the location the folder is read from.
+    expect(listed.entries.map((entry) => entry.path)).toEqual([
+      "src/a.ts",
+      "src/b.ts",
+      "src/c.ts",
+      "src/d.ts",
+    ]);
+    expect(listed.hasMore).toBe(true);
+    const asked = fetchMock.mock.calls.map(([input]) => new URL(String(input), "http://x"));
+    expect(asked.map((url) => url.searchParams.get("after"))).toEqual([null, "b.ts"]);
+    expect(asked.map((url) => url.searchParams.get("limit"))).toEqual(["4", "2"]);
+  });
+
+  it("stops at a cursor that doesn't move, rather than asking again", async () => {
+    fetchMock.mockResolvedValueOnce(page(["a.ts"], true));
+    fetchMock.mockResolvedValueOnce(page(["a.ts"], true));
+
+    const listed = await fetchWorkspaceFolderListing("conv", "src", "", 10);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(listed.hasMore).toBe(true);
+  });
+
+  it("asks the workspace API for the whole limit and keeps whether more remain", async () => {
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+      data: [
+        { id: "src/a.ts", name: "a.ts", path: "src/a.ts", type: "file", bytes: 1, modified_at: 0 },
+      ],
+      hasMore: true,
+    });
+
+    const listed = await fetchWorkspaceFolderListing("conv", "src", "", 5000);
+
+    expect(vi.mocked(listDirectoryViaWorkspaceApi).mock.calls.at(-1)?.slice(0, 3)).toEqual([
+      "conv",
+      "src",
+      5000,
+    ]);
+    expect(listed).toEqual({
+      entries: [expect.objectContaining({ path: "src/a.ts" })],
+      hasMore: true,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

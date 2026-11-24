@@ -8,9 +8,10 @@ import { FILE_TREE_THEME, WORKSPACE_FILE_TREE_CLASS } from "@/components/file-tr
 import { Button } from "@/components/ui/button";
 import { useDelayedFlag } from "@/hooks/useDelayedFlag";
 import {
+  FOLDER_PICKER_ENTRY_LIMIT,
   type WorkspaceFile,
   useWorkspaceServeable,
-  workspaceDirectoryQuery,
+  workspaceFolderListingQuery,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { folderTreePath, revealedFolders } from "./breadcrumbPaths";
 import { visibleTreeRow } from "./folderTreeSync";
@@ -38,7 +39,7 @@ export function WorkspaceFolderTree(props: WorkspaceFolderTreeProps) {
   const folders = useMemo(() => revealedFolders(revealPath), [revealPath]);
   const listings = useQueries({
     queries: folders.map((subfolder) => ({
-      ...workspaceDirectoryQuery(conversationId, subfolder, folder),
+      ...workspaceFolderListingQuery(conversationId, subfolder, folder),
       enabled: serveable !== false,
     })),
   });
@@ -72,7 +73,7 @@ export function WorkspaceFolderTree(props: WorkspaceFolderTreeProps) {
       key={`${conversationId}\0${folder}\0${revealPath}`}
       {...props}
       folders={folders}
-      listings={listings.map((listing) => listing.data ?? [])}
+      listings={listings.map((listing) => listing.data?.entries ?? [])}
     />
   );
 }
@@ -127,14 +128,16 @@ function LoadedFolderTree({
   );
   const watched = useQueries({
     queries: watchedFolders.map((subfolder) =>
-      workspaceDirectoryQuery(conversationId, subfolder, folder),
+      workspaceFolderListingQuery(conversationId, subfolder, folder),
     ),
   });
   // Changes whenever any watched listing receives data, refetches included.
   const listingVersion = watched.map((listing) => listing.dataUpdatedAt).join(",");
   const watchedListings = watched.flatMap(({ data }, index) =>
-    data ? [{ folder: watchedFolders[index], entries: data }] : [],
+    data ? [{ folder: watchedFolders[index], entries: data.entries }] : [],
   );
+  // A folder past the picker's limit lists its first entries and says so.
+  const cutOffFolder = watchedFolders.find((_, index) => watched[index].data?.hasMore);
   const { wantedFolders, isEmpty, present } = useLazyFolderTree(
     model,
     initial,
@@ -230,6 +233,14 @@ function LoadedFolderTree({
           ...(isEmpty ? { display: "none" } : {}),
         }}
       />
+      {!isEmpty && !(failedLoad ?? pendingLoad) && cutOffFolder !== undefined && (
+        <div
+          role="status"
+          className="shrink-0 truncate border-t border-border px-3 py-1.5 text-ui text-muted-foreground"
+        >
+          {cutOffMessage(cutOffFolder === "" ? folder : cutOffFolder, revealPath, present)}
+        </div>
+      )}
       {!isEmpty && (failedLoad ?? pendingLoad) && (
         <div
           role="status"
@@ -254,6 +265,16 @@ function LoadedFolderTree({
       )}
     </div>
   );
+}
+
+/** Why a folder's list stops short, naming the revealed entry when it lies past the limit. */
+function cutOffMessage(cutOff: string, revealPath: string, present: ReadonlySet<string>): string {
+  const limit = FOLDER_PICKER_ENTRY_LIMIT.toLocaleString("en-US");
+  const name = baseName(cutOff) || "this folder";
+  const missing = visibleTreeRow(present, revealPath) === undefined ? baseName(revealPath) : null;
+  return missing
+    ? `Showing the first ${limit} entries of ${name}, which don’t include ${missing}.`
+    : `Showing the first ${limit} entries of ${name}.`;
 }
 
 function baseName(path: string): string {
