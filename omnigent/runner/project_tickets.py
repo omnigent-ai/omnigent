@@ -136,6 +136,7 @@ async def execute_ticket_tool(
                 "sys_ticket_update": ("PATCH", ""),
                 "sys_ticket_stages_update": ("PUT", "/stages"),
                 "sys_ticket_comment": ("POST", "/comments"),
+                "sys_ticket_land": ("POST", "/land"),
                 "sys_session_link_ticket": ("POST", "/sessions"),
                 "sys_ticket_link": ("POST", "/related"),
             }[name]

@@ -324,3 +324,13 @@ class TicketActor:
     user_id: str | None
     session_id: str | None = None
     agent_id: str | None = None
+
+
+class LandTicketRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sha: str = Field(
+        min_length=40,
+        max_length=40,
+        description="The full 40-character commit SHA the Reviewer approved.",
+    )

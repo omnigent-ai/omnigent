@@ -91,6 +91,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_ticket_update",
         "sys_ticket_stages_update",
         "sys_ticket_comment",
+        "sys_ticket_land",
         "sys_session_link_ticket",
         "sys_ticket_link",
         "sys_project_mandate_propose",
@@ -1784,6 +1785,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
             "sys_ticket_update",
             "sys_ticket_stages_update",
             "sys_ticket_comment",
+            "sys_ticket_land",
             "sys_session_link_ticket",
             "sys_ticket_link",
             "sys_project_mandate_propose",
@@ -1830,7 +1832,7 @@ def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 33
+    assert len(gated) == 34
     assert not (gated & names)
     assert {
         "sys_session_list",

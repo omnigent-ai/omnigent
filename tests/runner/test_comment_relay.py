@@ -491,6 +491,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_ticket_update",
         "sys_ticket_stages_update",
         "sys_ticket_comment",
+        "sys_ticket_land",
         "sys_session_link_ticket",
         "sys_ticket_link",
         "sys_project_mandate_propose",

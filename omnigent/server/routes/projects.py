@@ -133,6 +133,19 @@ def _is_throwaway_project_name(name: str) -> bool:
     return name.startswith("zz-") or "throwaway" in name.lower()
 
 
+def _refuse_agent_landing_write(
+    request: Request, requested: dict[str, Any] | None, current: dict[str, Any] | None
+) -> None:
+    """The landing queue lands and restarts on its own, so only the owner configures it."""
+    if requested is None or ORCHESTRATION_SOURCE_HEADER not in request.headers:
+        return
+    if requested.get("landing") != (current or {}).get("landing"):
+        raise OmnigentError(
+            "Only the project owner can change the landing queue settings",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+
 def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
     """Keep the mandate owner-written: agents it bounds may only propose additions.
 
@@ -204,6 +217,7 @@ def create_projects_router(
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
         _refuse_agent_mandate_write(request, body.mandate)
+        _refuse_agent_landing_write(request, body.config, None)
         key = creation_key(request) if "Idempotency-Key" in request.headers else None
         project_id = creation_id("project", user_id, key) if key else uuid.uuid4().hex
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
@@ -355,6 +369,9 @@ def create_projects_router(
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
         _refuse_agent_mandate_write(request, body.mandate)
+        if body.config is not None and ORCHESTRATION_SOURCE_HEADER in request.headers:
+            stored = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+            _refuse_agent_landing_write(request, body.config, stored.config if stored else None)
         session_id = None
         if body.main_session_id is not None:
             current = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)

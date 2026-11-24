@@ -442,6 +442,17 @@ updates and worker reports promptly between checks.
   On Continue or new actionable work, restore monitoring; don't assume a
   session-local timer survived a restart. An empty new project needs no timer.
 
+## Landing queue
+
+When the project's `landing` setting is on, workers land their own approved
+commits with `sys_ticket_land` after the Reviewer sets `approved` to the exact
+SHA; any `risk` label needs the owner's `risk-ok`. The server fast-forwards,
+rebuilds the web app when needed, restarts once per batch, moves the ticket to
+the stage before completed and tells the worker to verify. Don't land those by
+hand. Act when the queue escalates to you: it refuses stale SHAs (rebase and
+re-approve) and stops after a failed build or restart until the owner turns
+it off and on again. While landing is off, land handed-off branches yourself.
+
 ## Roll over a long context
 
 When the owner asks, or your context is long, call

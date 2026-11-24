@@ -11,6 +11,7 @@ from omnigent.entities.project import (
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
+    LandTicketRequest,
     LinkRelatedTicket,
     TicketEventKind,
     TicketSessionLinkOptions,
@@ -291,6 +292,25 @@ class SysTicketCommentTool(_TicketTool):
     arguments = AddTicketComment
 
 
+class LandTicket(LandTicketRequest):
+    ticket_id: str
+
+
+class SysTicketLandTool(_TicketTool):
+    tool_name = "sys_ticket_land"
+    help_text = (
+        "Submit a Reviewer-approved commit to the project's landing queue. The server lands "
+        "it only if the ticket's `approved` label is exactly this full SHA, any `risk` label "
+        "has an owner `risk-ok`, and the SHA fast-forwards the integration branch; otherwise "
+        "it refuses and says why (for example, rebase and get re-approval). Accepted lands "
+        "are batched: fast-forward, web rebuild if needed, one server restart. The ticket "
+        "then moves to the stage before completed and you're told to verify live. Never "
+        "pushes. Refused when the project's landing queue is off; then hand the branch and "
+        "SHA to your coordinator."
+    )
+    arguments = LandTicket
+
+
 class SysSessionLinkTicketTool(_TicketTool):
     tool_name = "sys_session_link_ticket"
     help_text = (
@@ -406,6 +426,7 @@ TICKET_TOOL_CLASSES = (
     SysTicketUpdateTool,
     SysTicketStagesUpdateTool,
     SysTicketCommentTool,
+    SysTicketLandTool,
     SysSessionLinkTicketTool,
     SysTicketLinkTool,
     SysProjectMandateProposeTool,

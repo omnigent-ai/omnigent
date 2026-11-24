@@ -16,6 +16,7 @@ from sqlalchemy.exc import StatementError
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
+    LandTicketRequest,
     LinkRelatedTicket,
     LinkTicketSession,
     MarkTicketSeen,
@@ -649,6 +650,26 @@ def create_project_tickets_router(
         return await asyncio.to_thread(
             store.mark_seen, project_id, ticket_id, body, user_id=who.user_id
         )
+
+    @router.post("/{ticket_id}/land", include_in_schema=False)
+    async def land(
+        request: Request, project_id: str, ticket_id: str, body: LandTicketRequest
+    ) -> dict[str, Any]:
+        """Queue a Reviewer-approved commit for the landing queue; refusals are 409s."""
+        who = await actor(request, project_id)
+        queue = getattr(request.app.state, "project_landing", None)
+        notifications = getattr(request.app.state, "project_ticket_notifications", None)
+        if queue is None or notifications is None:
+            raise OmnigentError(
+                "The landing queue is unavailable", code=ErrorCode.RUNNER_UNAVAILABLE
+            )
+        project = await asyncio.to_thread(
+            notifications.projects.get, uuid_to_bytes(project_id).hex(), user_id=who.user_id
+        )
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        with _storage_errors():
+            return await queue.submit(project, ticket_id, body.sha, who)
 
     @router.post("/{ticket_id}/comments", status_code=201)
     async def comment(

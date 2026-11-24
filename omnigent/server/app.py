@@ -2594,6 +2594,9 @@ def create_app(
             from omnigent.server import project_reliability
 
             reliability_loop = project_reliability.start(app_inst)
+            from omnigent.server import project_landing
+
+            project_landing.start(app_inst)
         try:
             with monitor_event_loop():
                 yield
