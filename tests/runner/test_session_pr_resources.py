@@ -883,27 +883,29 @@ def test_panel_polls_share_a_recent_read_and_refresh_an_older_one_in_the_backgro
 
     monkeypatch.setattr(github, "_gh", gh)
     SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
-    read = functools.partial(pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B)
-    first = read()
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    first = poll()
     assert first["pr"]["body"] == "Read 1"
     assert "cache_age_s" not in first
-    again = read()
+    again = poll()
     assert again["pr"]["body"] == "Read 1"
     assert again["cache_age_s"] >= 0
     assert views == [1]
 
     monkeypatch.setattr(pr_resource, "_PANEL_READ_FRESH_SECONDS", 0.0)
     # Older results answer at once while one background read replaces them.
-    assert read()["pr"]["body"] == "Read 1"
+    assert poll()["pr"]["body"] == "Read 1"
     poll_until(lambda: views == [1, 2], timeout_s=budget(5), interval_s=0.01)
-    assert read()["pr"]["body"] == "Read 1"
+    assert poll()["pr"]["body"] == "Read 1"
     assert views == [1, 2]
     second_read_may_finish.set()
-    poll_until(lambda: read()["pr"]["body"] != "Read 1", timeout_s=budget(5), interval_s=0.01)
+    poll_until(lambda: poll()["pr"]["body"] != "Read 1", timeout_s=budget(5), interval_s=0.01)
 
     # An expired result is never served: the request waits for the newest read.
     monkeypatch.setattr(pr_resource, "_PANEL_READ_STALE_SECONDS", 0.0)
-    assert read()["pr"]["body"] == f"Read {len(views)}"
+    assert poll()["pr"]["body"] == f"Read {len(views)}"
 
 
 def test_concurrent_identical_panel_reads_share_one_forge_read(
@@ -923,7 +925,13 @@ def test_concurrent_identical_panel_reads_share_one_forge_read(
     monkeypatch.setattr(github, "_gh", gh)
     with ThreadPoolExecutor(max_workers=3) as pool:
         reads = [
-            pool.submit(pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B)
+            pool.submit(
+                pr_resource.cached_pr_info,
+                tracked,
+                session_id="session",
+                pr_url=B,
+                allow_cached=True,
+            )
             for _ in range(3)
         ]
         assert read_started.wait(budget(5))
@@ -945,58 +953,89 @@ def test_panel_writes_and_new_tracked_prs_make_the_next_poll_read_again(
 
     monkeypatch.setattr(github, "_gh", gh)
     SessionPrRegistry("session").update_titles({A: "Tracked", B: "Tracked"})
-    read = functools.partial(pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B)
-    read()
-    read()
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    poll()
+    poll()
     assert len(views) == 1
     # A failed write may still have changed the PR.
     with suppress(ValueError, KeyError):
         pr_resource.create_pr_comment(tracked, session_id="session", pr_url=B, body="Done")
-    read()
+    poll()
     assert len(views) == 2
     SessionPrRegistry("session").record(
         [PullRequestRef.from_url("https://github.com/example/three/pull/7")],
         relationship="worked_on",
         source="test",
     )
-    assert len(read()["prs"]) == 3
+    assert len(poll()["prs"]) == 3
     assert len(views) == 3
 
 
-def test_panel_setup_states_are_read_again_on_every_poll(
+def test_a_read_without_allow_cached_reads_the_forge_even_while_a_poll_runs(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Signing in or opening a PR happens outside the app, so the next poll must see it."""
-    branch_reads: list[list[str]] = []
-
-    def git(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
-        branch_reads.append(argv)
-        return 128, "", "not a git repository"
-
-    monkeypatch.setattr(github, "_git", git)
-    read = functools.partial(pr_resource.cached_pr_info, tracked, session_id="untracked")
-    assert read()["reason"] == "not_a_git_repo"
-    assert read()["reason"] == "not_a_git_repo"
-    assert len(branch_reads) == 2
-
-
-def test_a_failed_panel_read_is_read_again_on_refresh(
-    tracked: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    views: list[list[str]] = []
+    """Refresh and the other one-shot reads never take an earlier read, finished or running."""
+    views: list[int] = []
+    first_read_started = threading.Event()
+    first_read_may_finish = threading.Event()
 
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
         if _is_panel_view(args):
-            views.append(args)
-            if len(views) == 1:
-                raise RuntimeError("forge unavailable")
-        return 0, json.dumps({"number": 42, "title": "Recovered"}), ""
+            views.append(number := len(views) + 1)
+            if number == 1:
+                first_read_started.set()
+                first_read_may_finish.wait(budget(5))
+            body = f"Read {number}"
+            return 0, json.dumps({"number": 42, "title": "Selected", "body": body}), ""
+        return 0, json.dumps({"title": "Listed"}), ""
 
     monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
     read = functools.partial(pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B)
-    assert read()["warnings"] == ["Could not load this pull request. Refresh to retry."]
-    assert read()["pr"]["title"] == "Recovered"
-    assert len(views) == 2
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        poll = pool.submit(read, allow_cached=True)
+        assert first_read_started.wait(budget(5))
+        fresh = read()
+        first_read_may_finish.set()
+        assert poll.result(timeout=budget(5))["pr"]["body"] == "Read 1"
+    assert fresh["pr"]["body"] == "Read 2"
+    assert "cache_age_s" not in fresh
+    assert read()["pr"]["body"] == "Read 3"
+
+
+def test_a_poll_after_a_pr_is_tracked_does_not_take_an_earlier_read(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll that starts after the agent links a PR lists it, and so do the polls after it."""
+    monkeypatch.setattr(github, "_gh", _forge({"value": "OPEN"}))
+    listed = threading.Event()
+    release = threading.Event()
+    list_prs = pr_resource._session_prs_with_titles
+
+    def held_first_listing(*args: Any, **kwargs: Any) -> Any:
+        if not listed.is_set():
+            listed.set()
+            release.wait(budget(5))
+        return list_prs(*args, **kwargs)
+
+    monkeypatch.setattr(pr_resource, "_session_prs_with_titles", held_first_listing)
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    linked = "https://github.com/example/three/pull/7"
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        earlier = pool.submit(poll)
+        assert listed.wait(budget(5))
+        SessionPrRegistry("session").record(
+            [PullRequestRef.from_url(linked)], relationship="created", source="test"
+        )
+        later = poll()
+        release.set()
+        assert {pr["url"] for pr in earlier.result(timeout=budget(5))["prs"]} == {A, B}
+    assert linked in {pr["url"] for pr in later["prs"]}
+    assert linked in {pr["url"] for pr in poll()["prs"]}
 
 
 def _forge(state: dict[str, str]) -> object:

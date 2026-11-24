@@ -39,6 +39,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 // same way as the workspace filesystem hooks — reusing their helpers.
 
 import {
+  type Query,
   queryOptions,
   skipToken,
   useMutation,
@@ -446,9 +447,13 @@ export async function fetchPullRequestInfo(
   conversationId: string,
   prUrl?: string,
   signal?: AbortSignal,
+  allowCached = false,
 ): Promise<PullRequestInfo> {
+  const params = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
+  if (allowCached) params.set("allow_cached", "true");
+  const search = params.toString();
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${search ? `?${search}` : ""}`,
     { signal },
   );
   if (res.status === 404) {
@@ -483,6 +488,32 @@ export async function fetchPullRequestInfo(
  *  `gh` API call but only while the panel is actually focused. */
 const PULL_REQUEST_POLL_MS = 5_000;
 const PULL_REQUEST_LIST_POLL_MS = 30_000;
+/** Timer drift allowed when telling an interval poll from other refetches. */
+const POLL_SCHEDULE_SLACK_MS = 5_000;
+
+/**
+ * Whether a fetch of `query` is a poll on schedule, which may take the runner's
+ * previous read: the answer is at most one read old, and the next poll corrects it.
+ * Invalidations (Refresh, turn end, edits), first loads and refetches of data
+ * older than the poll interval read the forge now.
+ */
+export function pollAcceptsCachedAnswer(
+  query: Query<PullRequestInfo> | undefined,
+  now = Date.now(),
+): boolean {
+  if (!query || query.state.data === undefined || query.state.isInvalidated) return false;
+  const intervals = query.observers.flatMap((observer) => {
+    const interval = observer.options.refetchInterval;
+    const value = typeof interval === "function" ? interval(query) : interval;
+    return observer.options.enabled !== false && typeof value === "number" && value > 0
+      ? [value]
+      : [];
+  });
+  return (
+    intervals.length > 0 &&
+    now - query.state.dataUpdatedAt < Math.min(...intervals) + POLL_SCHEDULE_SLACK_MS
+  );
+}
 
 /**
  * The panel's poll interval for the current GitHub info, or `false` to stop.
@@ -678,12 +709,15 @@ function pullRequestInfoQueryOptions(
   const prUrl = options?.prUrl;
   return queryOptions({
     queryKey: pullRequestInfoQueryKey(conversationId, prUrl),
-    queryFn: prUrl
-      ? ({ signal }) =>
-          pullRequestReads.run(pullRequestReadKey(conversationId!, prUrl), signal, () =>
-            fetchPullRequestInfo(conversationId!, prUrl, signal),
+    queryFn: ({ client, queryKey, signal }) => {
+      const query = client.getQueryCache().find<PullRequestInfo>({ queryKey, exact: true });
+      const allowCached = pollAcceptsCachedAnswer(query);
+      return prUrl
+        ? pullRequestReads.run(pullRequestReadKey(conversationId!, prUrl), signal, () =>
+            fetchPullRequestInfo(conversationId!, prUrl, signal, allowCached),
           )
-      : () => fetchPullRequestInfo(conversationId!),
+        : fetchPullRequestInfo(conversationId!, undefined, undefined, allowCached);
+    },
     enabled,
     retry,
     retryDelay: runnerOfflineRetryDelay,

@@ -189,6 +189,8 @@ class _RunnerStreamResponse(StreamingResponse):
 # budget for all of its ``gh`` calls, so a slow edit that GitHub applied is not
 # reported as failed.
 _PR_EDIT_PROXY_TIMEOUT_S = 20.0
+# The most a PR panel poll waits for the runner, on every runner transport.
+_PR_INFO_RUNNER_TIMEOUT_S = 10.0
 # Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
 _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
@@ -581,6 +583,7 @@ def register_resources_routes(
         unsupported_endpoint_message: str | None = None,
         *,
         for_control: bool = False,
+        enforce_timeout: bool = False,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
@@ -592,6 +595,8 @@ def register_resources_routes(
         :param timeout: Seconds to wait for the runner response.
         :param unsupported_endpoint_message: Upgrade guidance for an unregistered runner route.
         :param for_control: Read registry metadata without admitting execution.
+        :param enforce_timeout: Also end the wait after ``timeout`` over transports
+            that ignore httpx timeouts, such as the runner's WebSocket tunnel.
         :returns: Parsed JSON response body.
         :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
             typed ``not_found`` (404) or
@@ -612,9 +617,13 @@ def register_resources_routes(
                 status_code=502,
                 detail="no runner available for resource access",
             )
+        deadline = asyncio.timeout(timeout if enforce_timeout else None)
         try:
-            resp = await runner_client.get(path, params=params, timeout=timeout)
-        except (httpx.HTTPError, ConnectionError) as exc:
+            async with deadline:
+                resp = await runner_client.get(path, params=params, timeout=timeout)
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
+            if isinstance(exc, TimeoutError) and not deadline.expired():
+                raise
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
@@ -673,6 +682,7 @@ def register_resources_routes(
         runner_params: dict[str, str] | None = None,
         host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
         runner_timeout: float = 10.0,
+        enforce_runner_timeout: bool = False,
     ) -> dict[str, Any]:
         """Serve a filesystem read, falling back to the host when offline.
 
@@ -705,6 +715,7 @@ def register_resources_routes(
             would refuse absolute browsing on exactly those sessions even
             though the online runner can serve them.
         :param runner_timeout: Seconds to wait for the runner's response.
+        :param enforce_runner_timeout: Hold every runner transport to ``runner_timeout``.
         :returns: The runner-shaped filesystem result.
         :raises OmnigentError: Re-raised runner-offline error when the
             host cannot serve the read either.
@@ -717,6 +728,7 @@ def register_resources_routes(
                 conversation,
                 params=runner_params,
                 timeout=runner_timeout,
+                enforce_timeout=enforce_runner_timeout,
             )
         except OmnigentError as exc:
             # Only the runner-offline case is a candidate for the host
@@ -3621,9 +3633,22 @@ def register_resources_routes(
         session_id: str,
         conv: Conversation,
         pr_url: str | None = None,
+        *,
+        allow_cached: bool = False,
     ) -> dict[str, Any]:
-        """Read PR context through the runner or host and store what it reports."""
-        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        """Read PR context through the runner or host and store what it reports.
+
+        :param allow_cached: The client polls again soon, so the runner may answer
+            from its previous read and a slow read ends after
+            :data:`_PR_INFO_RUNNER_TIMEOUT_S`; the next poll gets its result.
+        """
+        params = await _github_params(
+            session_id,
+            {
+                **({"pr_url": pr_url} if pr_url else {}),
+                **({"allow_cached": True} if allow_cached else {}),
+            },
+        )
         requested_at = time.time()
         info = await _fs_get_with_host_fallback(
             session_id,
@@ -3632,6 +3657,8 @@ def register_resources_routes(
             host_params=params,
             runner_params=params or None,
             runner_path=f"/v1/sessions/{session_id}/resources/github",
+            runner_timeout=_PR_INFO_RUNNER_TIMEOUT_S,
+            enforce_runner_timeout=allow_cached,
         )
         # A runner or host may answer from a read that began before this request.
         age = info.pop("cache_age_s", 0)
@@ -3878,6 +3905,7 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         pr_url: str | None = None,
+        allow_cached: bool = False,
     ) -> dict[str, Any]:
         """
         Return GitHub context (repo, branch, base ref, PR) for a session.
@@ -3888,10 +3916,14 @@ def register_resources_routes(
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
+        :param allow_cached: Set by a client that polls again soon: the answer may
+            come from the runner's previous read, at most a minute old, and a
+            runner slower than 10 seconds gets a 502 while its read finishes for
+            the next poll.
         :returns: The ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        return await _github_info(session_id, conv, pr_url)
+        return await _github_info(session_id, conv, pr_url, allow_cached=allow_cached)
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",

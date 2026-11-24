@@ -3572,6 +3572,62 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
     ) in fake_runner.calls
 
 
+@pytest.mark.asyncio
+async def test_a_github_info_poll_stops_waiting_for_a_tunnelled_runner_after_its_timeout(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tunnel ignores httpx timeouts, so a PR panel poll bounds its own wait.
+
+    Only a poll is bounded: the runner keeps the read it abandons for the next poll.
+    A one-shot read still waits, as it did before.
+    """
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.server.routes.sessions import routes_resources
+
+    class _SilentRunnerSocket:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    registry = TunnelRegistry()
+    hello = HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+    registry.register("runner_one", _SilentRunnerSocket(), hello)
+    runner_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"),
+        base_url="http://runner",
+        timeout=httpx.Timeout(5.0, read=None),
+    )
+    set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
+    monkeypatch.setattr(routes_resources, "_PR_INFO_RUNNER_TIMEOUT_S", 0.2)
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github"
+    resp = await asyncio.wait_for(
+        client.get(path, params={"allow_cached": "true"}), timeout=budget(5)
+    )
+    session = registry.get("runner_one")
+    assert session is not None
+    assert not session.in_flight
+    one_shot = asyncio.create_task(client.get(path))
+    await asyncio.sleep(0.5)
+    one_shot_waited = not one_shot.done()
+    one_shot.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await one_shot
+    await runner_client.aclose()
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "runner resource endpoint unavailable"
+    assert one_shot_waited
+    queries = []
+    while not session.outbound_queue.empty():
+        queries.append(json.loads(session.outbound_queue.get_nowait().data)["query_string"])
+    assert queries == ["allow_cached=true", ""]
+
+
 def _pr_app(db_uri: str, **router_options: Any) -> FastAPI:
     """App whose sessions keep their pull requests in a real SQLite store."""
     SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)

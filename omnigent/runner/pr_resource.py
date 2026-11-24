@@ -131,8 +131,6 @@ class _PanelRead:
     registry_version: object
     started_at: float
     result: Future[dict[str, Any]]
-    # The session's tracked PRs changed during the read, so it may have missed the change.
-    registry_changed: bool = False
 
 
 _PANEL_READS: OrderedDict[tuple[object, ...], _PanelRead] = OrderedDict()
@@ -736,6 +734,20 @@ def pr_info(
     return info
 
 
+def _lists_tracked_prs(payload: dict[str, Any], registry: SessionPrRegistry) -> bool:
+    """Whether ``payload`` lists the session's tracked PRs as the registry holds them now."""
+    try:
+        tracked = [(entry.url, entry.relationship) for entry in registry.list()]
+    except ValueError:
+        return False
+    listed = payload.get("prs")
+    return isinstance(listed, list) and tracked == [
+        (entry.get("url"), entry.get("relationship"))
+        for entry in listed
+        if isinstance(entry, dict)
+    ]
+
+
 def _run_panel_read(
     key: tuple[object, ...], read: _PanelRead, root: str, session_id: str, pr_url: str | None
 ) -> None:
@@ -747,24 +759,22 @@ def _run_panel_read(
         read.result.set_exception(exc)
     else:
         read.result.set_result(payload)
-    version = SessionPrRegistry(session_id).version()
+    registry = SessionPrRegistry(session_id)
+    version = registry.version()
+    # The read's own title cache writes change the files; a PR linked meanwhile must show.
+    current = payload is not None and (
+        version == read.registry_version or _lists_tracked_prs(payload, registry)
+    )
     with _PANEL_READ_LOCK:
         if _RUNNING_PANEL_READS.get(key) is read:
             del _RUNNING_PANEL_READS[key]
         latest = _PANEL_READS.get(key)
-        # Setup states and warnings change through user actions, so the next poll reads again.
         if (
-            payload is not None
-            and isinstance(payload.get("pr"), dict)
-            and not payload.get("warnings")
+            current
             and read.generation == _panel_read_generation
             and (latest is None or latest.started_at <= read.started_at)
         ):
-            _PANEL_READS[key] = dataclasses.replace(
-                read,
-                registry_version=version,
-                registry_changed=version != read.registry_version,
-            )
+            _PANEL_READS[key] = dataclasses.replace(read, registry_version=version)
             _PANEL_READS.move_to_end(key)
             while len(_PANEL_READS) > _PANEL_READ_LIMIT:
                 _PANEL_READS.popitem(last=False)
@@ -783,19 +793,22 @@ def cached_pr_info(
     *,
     session_id: str | None = None,
     pr_url: str | None = None,
+    allow_cached: bool = False,
 ) -> dict[str, Any]:
-    """Serve :func:`pr_info` to panel polls, sharing forge reads between them.
+    """Serve :func:`pr_info`, letting panel polls share forge reads.
 
-    Identical concurrent requests share one read. A result showing a pull
-    request is kept: under :data:`_PANEL_READ_FRESH_SECONDS` old it is served
-    as is, and under :data:`_PANEL_READ_STALE_SECONDS` old it is served while
+    Without ``allow_cached`` the request reads the forge now, as :func:`pr_info`
+    does, and its result is kept for polls. A poll joins a running read of the
+    same tracked PRs; a result under :data:`_PANEL_READ_FRESH_SECONDS` old answers
+    it as is, and one under :data:`_PANEL_READ_STALE_SECONDS` old answers it while
     one background read replaces it. After a panel write or a change to the
-    session's tracked PRs, requests wait for a new read. A payload from a read
-    that began before the request carries ``cache_age_s``, the seconds between.
+    session's tracked PRs, polls wait for a new read. A payload from a read that
+    began before the request carries ``cache_age_s``, the seconds between.
 
     :param root: Absolute workspace path.
     :param session_id: Session whose tracked PRs to list; ``None`` reads uncached.
     :param pr_url: The selected PR, which must be tracked by the session.
+    :param allow_cached: The caller polls again soon, so an answer one read old will be corrected.
     :returns: A ``session.github.info`` payload.
     """
     if session_id is None:
@@ -804,7 +817,7 @@ def cached_pr_info(
     version = SessionPrRegistry(session_id).version()
     requested_at = time.monotonic()
     with _PANEL_READ_LOCK:
-        done = _PANEL_READS.get(key)
+        done = _PANEL_READS.get(key) if allow_cached else None
         if done is not None and (
             done.generation != _panel_read_generation
             or done.registry_version != version
@@ -812,14 +825,15 @@ def cached_pr_info(
         ):
             del _PANEL_READS[key]
             done = None
-        if (
-            done is not None
-            and not done.registry_changed
-            and requested_at - done.started_at < _PANEL_READ_FRESH_SECONDS
-        ):
+        if done is not None and requested_at - done.started_at < _PANEL_READ_FRESH_SECONDS:
             return _served(done, requested_at)
         running = _RUNNING_PANEL_READS.get(key)
-        start = running is None or running.generation != _panel_read_generation
+        start = (
+            not allow_cached
+            or running is None
+            or running.generation != _panel_read_generation
+            or running.registry_version != version
+        )
         if start:
             running = _PanelRead(_panel_read_generation, version, requested_at, Future())
             _RUNNING_PANEL_READS[key] = running
