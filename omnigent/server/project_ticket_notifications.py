@@ -29,7 +29,7 @@ from omnigent.server.project_router import (
 from omnigent.server.session_delivery import deliver_to_session
 from omnigent.server.startup_inputs import ManagedStartupInputs
 from omnigent.server.ticket_responder import ROUTER, assignee_name, responder_order
-from omnigent.server.ticket_review import REVIEWER_NAME
+from omnigent.server.ticket_review import REVIEW_STAGE_ID, REVIEWER_NAME
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 
@@ -207,6 +207,7 @@ class ProjectTicketNotifications:
             assignee=assignee.active_session_id if assignee else None,
             asker=context["asker"],
             commenters=context["commenters"],
+            in_review=context["stage_id"] == REVIEW_STAGE_ID,
         )
         text = ticket_comment_for_worker_message(project.id, event)
         for session_id in order:

@@ -28,6 +28,13 @@ def test_answers_go_to_the_asker_or_latest_commenter_even_the_router() -> None:
     assert _order(commenters=["pm"])[0] == "pm"
 
 
+def test_the_reviewers_latest_comment_counts_only_in_review() -> None:
+    assert _order(commenters=["reviewer", "old-worker"])[0] == "old-worker"
+    assert _order(commenters=["reviewer", "old-worker"], in_review=True)[0] == "reviewer"
+    # An open ask from the Reviewer is still answered to it.
+    assert _order(asker="reviewer", commenters=["reviewer"])[0] == "reviewer"
+
+
 def test_assignee_outranks_the_worker_heuristic() -> None:
     assert _order(assignee="old-worker", commenters=[])[0] == "old-worker"
 

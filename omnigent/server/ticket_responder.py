@@ -25,6 +25,7 @@ def responder_order(
     assignee: str | None,
     asker: str | None,
     commenters: Sequence[str],
+    in_review: bool = False,
 ) -> list[str | None]:
     """Sessions to try, best first, ending with :data:`ROUTER`.
 
@@ -34,6 +35,7 @@ def responder_order(
     :param assignee: The session of the identity named by the ``assignee`` label.
     :param asker: The session that raised the ticket's open needs-human ask.
     :param commenters: Sessions that commented on the ticket, most recent first.
+    :param in_review: Whether the ticket is in the Review stage.
     :returns: Candidates in order; the caller delivers to the first that accepts.
     """
     router_ids = set(routers)
@@ -42,8 +44,13 @@ def responder_order(
         return ROUTER if session_id in router_ids else session_id
 
     order: list[str | None] = []
+    # Outside Review, the Reviewer's approval is rarely what a person is answering.
+    latest = next(
+        (s for s in commenters if in_review or s != reviewer),
+        None,
+    )
     # Answering an ask or the latest agent comment goes back to whoever wrote it.
-    for session_id in (asker, commenters[0] if commenters else None, assignee):
+    for session_id in (asker, latest, assignee):
         if session_id:
             order.append(as_candidate(session_id))
     workers = [s for s in linked if s not in router_ids and s != reviewer]
