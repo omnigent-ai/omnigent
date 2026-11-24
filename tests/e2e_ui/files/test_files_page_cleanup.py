@@ -52,13 +52,14 @@ def test_a_seeding_that_fails_partway_removes_what_it_wrote(
         return httpx.Response(200, request=request)
 
     monkeypatch.setattr(_files_page.httpx, "put", put)
+    # README.md is planned after the write that fails, and was already in the workspace.
+    seeds = {"src/first.ts": "x", "src/second.ts": "x", "README.md": "seeded"}
     with pytest.raises(httpx.HTTPStatusError):
-        with seeded_workspace(
-            ("http://example.test", "conv_1"), {"src/first.ts": "x", "src/second.ts": "x"}
-        ):
+        with seeded_workspace(("http://example.test", "conv_1"), seeds):
             pass
 
     assert sorted(path.name for path in tmp_path.iterdir()) == ["README.md"]
+    assert (tmp_path / "README.md").read_text() == "keep"
 
 
 def _shell_in(workspace: Path):
