@@ -368,7 +368,7 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 13
+    assert len(TICKET_TOOLS) == 16
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (
@@ -497,3 +497,151 @@ async def test_identity_session_reuses_the_named_identitys_session_and_messages_
     }
     assert "not a project identity" in missing["error"]
     assert ("POST", f"/v1/sessions/{live}/events") in requests
+
+
+class _FakeTeam:
+    """A project's identity routes: unique names, one session each, injectable faults."""
+
+    def __init__(self, roles=()):
+        self.roles = [dict(role) for role in roles]
+        self.inserts = 0
+        self.session_failures = 0
+
+    def handler(self, request):
+        path = request.url.path
+        base = f"/v1/projects/{PROJECT}/identities"
+        if path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        if path == base and request.method == "GET":
+            lead = {"id": "orchestrator", "name": "Lead", "builtin": True}
+            return httpx.Response(200, json={"data": [lead, *self.roles]})
+        if path == base and request.method == "POST":
+            body = json.loads(request.content)
+            if any(role["name"].casefold() == body["name"].casefold() for role in self.roles):
+                return httpx.Response(409, json={"error": {"code": "already_exists"}})
+            self.inserts += 1
+            role = {
+                "id": f"{self.inserts:032x}",
+                "name": body["name"],
+                "builtin": False,
+                "instructions": body["instructions"],
+                "created_by_session_id": SOURCE,
+                "active_session_id": f"{self.inserts + 100:032x}",
+                "active_session_state": "idle",
+            }
+            self.roles.append(role)
+            return httpx.Response(200, json=role)
+        role = next(role for role in self.roles if path == f"{base}/{role['id']}/session")
+        if self.session_failures:
+            self.session_failures -= 1
+            return httpx.Response(503, json={"error": {"message": "No host online"}})
+        created = role["active_session_state"] in ("archived", "missing")
+        if created:
+            role["active_session_id"] = "f" * 32
+            role["active_session_state"] = "idle"
+        return httpx.Response(
+            200, json={"session_id": role["active_session_id"], "created": created}
+        )
+
+    async def call(self, name, args):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(self.handler), base_url="http://server.test"
+        ) as client:
+            return json.loads(await execute_ticket_tool(name, args, client, SOURCE))
+
+
+_MCP_PERSONA = "You are the project's MCP Engineer. You own MCP servers."
+
+
+async def test_fresh_project_staffs_a_specialist_that_the_team_list_then_shows():
+    team = _FakeTeam()
+    assert await team.call("sys_project_identity_list", {}) == {"data": []}
+    created = await team.call(
+        "sys_project_identity_create", {"name": "MCP Engineer", "instructions": _MCP_PERSONA}
+    )
+    assert created["existing"] is False
+    [listed] = (await team.call("sys_project_identity_list", {}))["data"]
+    assert listed["name"] == "MCP Engineer"
+    assert listed["instructions"] == _MCP_PERSONA
+    assert listed["created_by"] == "agent"
+    assert listed["session_state"] == "idle"
+
+
+@pytest.mark.parametrize(
+    "persona,creator,differ,hint",
+    [
+        (_MCP_PERSONA, SOURCE, False, "matches"),
+        ("You are an MCP Engineer. Different text.", SOURCE, True, "sys_project_identity_update"),
+        ("You are an MCP Engineer. Different text.", None, True, "only they can edit"),
+    ],
+)
+async def test_create_on_an_existing_name_reuses_it_and_reports_persona_drift(
+    persona, creator, differ, hint
+):
+    # A retried or rolled-over orchestrator re-creating a role must converge on it.
+    team = _FakeTeam(
+        [
+            {
+                "id": "d" * 32,
+                "name": "MCP Engineer",
+                "builtin": False,
+                "instructions": _MCP_PERSONA,
+                "created_by_session_id": creator,
+                "active_session_id": "e" * 32,
+                "active_session_state": "busy",
+            }
+        ]
+    )
+    result = await team.call(
+        "sys_project_identity_create", {"name": "mcp engineer", "instructions": persona}
+    )
+    assert team.inserts == 0
+    assert len(team.roles) == 1
+    assert team.roles[0]["instructions"] == _MCP_PERSONA
+    assert result["existing"] is True
+    assert result["instructions_differ"] is differ
+    assert result["identity"]["id"] == "d" * 32
+    assert result["identity"]["session_id"] == "e" * 32
+    assert hint in result["note"]
+
+
+async def test_concurrent_workstreams_get_separate_specialists_and_sessions():
+    import asyncio
+
+    team = _FakeTeam()
+    names = ("MCP Engineer", "Docs Writer")
+    await asyncio.gather(
+        *(
+            team.call("sys_project_identity_create", {"name": name, "instructions": f"You {name}"})
+            for name in names
+        )
+    )
+    opened = await asyncio.gather(
+        *(team.call("sys_project_identity_session", {"identity": name}) for name in names)
+    )
+    assert {result["identity"]["name"] for result in opened} == set(names)
+    assert len({result["session_id"] for result in opened}) == 2
+    assert team.inserts == 2
+
+
+async def test_failed_startup_is_reported_and_a_retry_resumes_the_archived_session():
+    team = _FakeTeam(
+        [
+            {
+                "id": "d" * 32,
+                "name": "MCP Engineer",
+                "builtin": False,
+                "instructions": _MCP_PERSONA,
+                "active_session_id": "e" * 32,
+                "active_session_state": "archived",
+            }
+        ]
+    )
+    team.session_failures = 1
+    failed = await team.call("sys_project_identity_session", {"identity": "MCP Engineer"})
+    assert "HTTP 503" in failed["error"]
+    resumed = await team.call("sys_project_identity_session", {"identity": "MCP Engineer"})
+    assert resumed["created"] is True
+    assert resumed["previous_state"] == "archived"
+    assert resumed["session_id"] == "f" * 32
+    assert team.inserts == 0

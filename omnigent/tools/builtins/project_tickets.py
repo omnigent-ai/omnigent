@@ -158,6 +158,10 @@ class UpdateIdentity(BaseModel):
         return self
 
 
+class ListIdentities(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class OpenIdentitySession(BaseModel):
     model_config = ConfigDict(extra="forbid")
     identity: str = Field(
@@ -371,9 +375,11 @@ class SysProjectIdentityCreateTool(_TicketTool):
         "persona is added to every session working as it. Create one when it is useful, for "
         "example when the user asks you to set up roles or a recurring workstream needs an "
         "owner. Give it a clear name and complete persona text. It takes effect at once and "
-        "appears in the project's Team dialog; tell the user what you created. Names are unique "
-        "and 'Lead' and 'Orchestrator' are reserved. Start its session with "
-        "sys_project_identity_session."
+        "appears in the project's Team dialog; tell the user what you created. Check "
+        "sys_project_identity_list first and reuse a suitable role. Names are unique and 'Lead' "
+        "and 'Orchestrator' are reserved; if the name is taken it returns the existing identity "
+        "with existing=true and instructions_differ, and changes nothing. Start its session "
+        "with sys_project_identity_session."
     )
     arguments = CreateIdentity
 
@@ -386,6 +392,17 @@ class SysProjectIdentityUpdateTool(_TicketTool):
         "identities. Running sessions keep the old persona until they restart."
     )
     arguments = UpdateIdentity
+
+
+class SysProjectIdentityListTool(_TicketTool):
+    tool_name = "sys_project_identity_list"
+    help_text = (
+        "List this project's identities (the Team, excluding the built-in Lead): each one's "
+        "name, ID, persona, whether an agent or the owner created it, and its session ID and "
+        "state. Read it before creating an identity or staffing a workstream, so you reuse a "
+        "suitable role instead of creating a duplicate."
+    )
+    arguments = ListIdentities
 
 
 class SysProjectIdentitySessionTool(_TicketTool):
@@ -448,6 +465,7 @@ TICKET_TOOL_CLASSES = (
     SysSessionLinkTicketTool,
     SysTicketLinkTool,
     SysProjectMandateProposeTool,
+    SysProjectIdentityListTool,
     SysProjectIdentityCreateTool,
     SysProjectIdentityUpdateTool,
     SysProjectIdentitySessionTool,

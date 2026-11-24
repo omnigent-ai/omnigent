@@ -73,15 +73,13 @@ async def execute_ticket_tool(
                 },
                 ensure_ascii=False,
             )
-        if name == "sys_project_identity_create":
-            created = await request("POST", f"/v1/projects/{project_id}/identities", json=body)
+        if name == "sys_project_identity_list":
+            roles = await _list_roles(f"/v1/projects/{project_id}/identities", request)
             return json.dumps(
-                {
-                    "identity": {key: created[key] for key in ("id", "name", "instructions")},
-                    "note": "Created; it appears in the project's Team dialog.",
-                },
-                ensure_ascii=False,
+                {"data": [_role_summary(role) for role in roles]}, ensure_ascii=False
             )
+        if name == "sys_project_identity_create":
+            return await _create_identity(body, project_id, request)
         if name == "sys_project_identity_update":
             return await _update_identity(body, project_id, request)
         if name == "sys_project_identity_session":
@@ -187,6 +185,68 @@ def _compact_page(page: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+async def _list_roles(base: str, request: Any) -> list[dict[str, Any]]:
+    """The project's identities other than the built-in Lead."""
+    return [entry for entry in (await request("GET", base))["data"] if not entry["builtin"]]
+
+
+def _role_summary(role: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": role["id"],
+        "name": role["name"],
+        "instructions": role.get("instructions", ""),
+        "created_by": "agent" if role.get("created_by_session_id") else "owner",
+        "session_id": role.get("active_session_id"),
+        "session_state": role.get("active_session_state"),
+    }
+
+
+async def _create_identity(body: dict[str, Any], project_id: str, request: Any) -> str:
+    """Create a role, or return the same-named one so retries and rollovers never duplicate."""
+    base = f"/v1/projects/{project_id}/identities"
+    try:
+        created = await request("POST", base, json=body)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 409:
+            raise
+        folded = body["name"].strip().casefold()
+        existing = next(
+            (
+                role
+                for role in await _list_roles(base, request)
+                if role["name"].casefold() == folded
+            ),
+            None,
+        )
+        if existing is None:
+            raise
+        differ = existing.get("instructions", "").strip() != body["instructions"].strip()
+        note = "An identity with this name already exists; nothing was created or changed. "
+        if not differ:
+            note += "Its persona matches yours."
+        elif existing.get("created_by_session_id"):
+            note += "Its persona differs from yours; sys_project_identity_update can replace it."
+        else:
+            note += "Its persona differs from yours; the owner made it, so only they can edit it."
+        return json.dumps(
+            {
+                "identity": _role_summary(existing),
+                "existing": True,
+                "instructions_differ": differ,
+                "note": note,
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "identity": {key: created[key] for key in ("id", "name", "instructions")},
+            "existing": False,
+            "note": "Created; it appears in the project's Team dialog.",
+        },
+        ensure_ascii=False,
+    )
+
+
 async def _resolve_identity(
     wanted: str, base: str, request: Any
 ) -> tuple[dict[str, Any] | None, str]:
@@ -197,7 +257,7 @@ async def _resolve_identity(
         wanted_id = uuid_to_bytes(wanted).hex()
     except ValueError:
         wanted_id = None
-    roles = [entry for entry in (await request("GET", base))["data"] if not entry["builtin"]]
+    roles = await _list_roles(base, request)
     identity = next(
         (
             entry

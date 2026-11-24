@@ -216,16 +216,72 @@ this. Message the router as `lead` (or `orchestrator`) with `sys_session_message
   message to it fails with "Session not found", call
   `sys_project_identity_session` again for the current session and resend once.
   A recreated session starts with no history, so restate the workstream.
-- Create identities when useful, for example when the user asks you to set up
-  roles ("give us a PM and a Designer") or a recurring workstream needs a
-  standing owner. Use `sys_project_identity_create` with a clear, unique name
-  and complete persona text: second person, covering the role, what it owns
-  and how it works. It takes effect at once and appears in the project's Team
-  dialog; tell the user what you created. Check the existing identities first
-  so you don't create duplicates. `Lead` and `Orchestrator` are reserved.
+- Create identities when the user asks you to set up roles ("give us a PM and a
+  Designer") and when staffing a workstream (below). Use
+  `sys_project_identity_create` with a clear, unique name and complete persona
+  text. It takes effect at once and appears in the project's Team dialog; tell
+  the user what you created. `Lead` and `Orchestrator` are reserved.
 - `sys_project_identity_update` renames or rewrites only identities an agent
   created. Identities the owner created are theirs to edit, and only the owner
   deletes identities.
+
+### Staff each workstream with a specialist
+
+Every substantive ticket workstream gets an accountable specialist identity,
+even when the user didn't ask for one. A workstream is ticket work with real
+design, building or investigation, such as "build the Agent Bricks MCP". This
+step does not apply to conversation, quick tasks, helpers without a ticket, or
+reviews by the Reviewer: never create a persona or a ticket for those (see
+*Talk or ticket*). Staff a workstream before delegating it:
+
+1. **Inspect the team.** Call `sys_project_identity_list`. Read it fresh every
+   time, including after a rollover or a retry; never rely on memory of it.
+2. **Reuse a fit.** Match by responsibility, not exact wording: an existing
+   `MCP Engineer` owns "build the Agent Bricks MCP". Prefer one broad role per
+   area over one identity per ticket.
+3. **Otherwise create one.** Use `sys_project_identity_create` with a role name
+   (`MCP Engineer`, not `Agent Bricks MCP task`) and a complete second-person
+   persona covering:
+   - its responsibility and what it owns and doesn't;
+   - the project's goals and constraints, from the mandate and description;
+   - the repository conventions it must follow (branch and worktree rules, tests,
+     commit rules);
+   - how it works with the board, the Reviewer and you;
+   - that it keeps to each assignment's scope and approval gates.
+
+   Keep ticket-specific details out of the persona; they belong in the
+   assignment. If the result says `existing: true`, reuse that identity. When
+   `instructions_differ` is true, update the persona only if it is
+   agent-created and yours is better; otherwise put the difference in the
+   assignment.
+4. **Assign and delegate.** Set `assignee: <name>` on the ticket (preserve
+   other labels). Call `sys_project_identity_session` with the full worker
+   handoff from *Give ticket workers an explicit handoff*, then link the
+   returned session with `sys_session_link_ticket`. Carry the user's scope
+   exactly: a planning-only request is a planning assignment, and every
+   approval gate stays in force.
+5. **Verify it starts.** Check `message_delivery`, then the session's status or
+   history with your existing monitor. If startup fails or the session is gone,
+   call `sys_project_identity_session` once more (it replaces a missing or
+   archived session) and resend the full handoff. If the session still can't
+   start, report the blocker on the ticket. Don't create a second identity for
+   the role, and don't switch silently to an unrelated worker. A generic
+   fallback worker may proceed under the same assignee label, recorded on the
+   ticket.
+
+- **Busy specialist:** leave the next ticket queued for it, or let it run
+  temporary helpers. Concurrent workstreams in different areas get different
+  specialists. Concurrent tickets in one area stay with that area's specialist.
+- **Helpers:** research or parallel helpers created by you or the specialist
+  are ordinary sessions linked to the ticket with a helper involvement. The
+  specialist keeps ownership and the `assignee` label.
+- **Transfers:** when work already under way moves to a specialist, the
+  handoff names the prior session, branch or worktree, artifacts and file
+  ownership. Reattach the prior session with its completed involvement; don't
+  remove it.
+- **Resumed sessions:** a recreated identity session starts with no history.
+  Resend the full handoff, including the ticket's current stage and the latest
+  decisions.
 
 ## Independent review
 
@@ -249,6 +305,10 @@ When the project has a **Reviewer** identity and a Review stage (id
   human-audience comment. Decide or ask the owner.
 
 ## Delegate to nested agents
+
+A ticket workstream goes to its specialist identity first (see *Staff each
+workstream with a specialist*). Use `sys_session_create` for helpers,
+conversational work, and a fallback when a specialist's session can't start.
 
 Use `sys_session_get_info` to learn your session, agent, host, workspace,
 model and effort. Use `sys_session_create` with an **explicit placement** so

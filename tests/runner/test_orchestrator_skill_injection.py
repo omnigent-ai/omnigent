@@ -129,3 +129,32 @@ def test_orchestrator_skill_is_available_without_workflows_and_respects_project_
         tmp_path, AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=False))
     )
     assert not (tmp_path / "skills" / "orchestrator").exists()
+
+
+def test_orchestrator_skill_staffs_workstreams_with_reused_specialist_identities():
+    source = Path(omnigent.__file__).resolve().parent / "resources" / "skills" / "orchestrator"
+    skill = (source / "SKILL.md").read_text()
+    start = skill.index("### Staff each workstream with a specialist")
+    section = skill[start : skill.index("\n## ", start)]
+    for required in (
+        "even when the user didn't ask for one",
+        "never create a persona or a ticket",
+        "`sys_project_identity_list`",
+        "including after a rollover or a retry",
+        "Match by responsibility",
+        "`sys_project_identity_create`",
+        "repository conventions",
+        "`existing: true`",
+        "`instructions_differ`",
+        "`assignee: <name>`",
+        "`sys_project_identity_session`",
+        "`sys_session_link_ticket`",
+        "planning-only request is a planning assignment",
+        "Verify it starts",
+        "Don't create a second identity",
+        "specialist keeps ownership",
+        "file\n  ownership",
+        "Resumed sessions",
+    ):
+        assert required in section, required
+    assert "specialist identity first" in skill
