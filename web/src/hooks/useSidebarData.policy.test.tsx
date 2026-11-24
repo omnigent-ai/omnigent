@@ -1,3 +1,4 @@
+import type * as TicketRequestsApi from "@/lib/ticketRequestsApi";
 import {
   QueryClient,
   QueryClientProvider,
@@ -40,6 +41,12 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: () => true }));
 const fetchMock = vi.fn();
+// Ticket requests are a separate Inbox source; nothing waits, so the counts below
+// cover only the session-list requests this policy is about.
+vi.mock("@/lib/ticketRequestsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof TicketRequestsApi>()),
+  listTicketRequests: async () => ({ data: [], has_more: false, is_complete: true }),
+}));
 const row = (id: string, shared = false): Conversation => ({
   id,
   object: "conversation",

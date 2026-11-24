@@ -1,4 +1,5 @@
 import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
+import type * as HostsModule from "@/hooks/useHosts";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,7 +25,9 @@ const mocks = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@/hooks/useHosts", () => ({
+// No hosts; the other host hooks keep their real (host-less, disabled) behavior.
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostsModule>()),
   useHosts: () => ({ data: [] }),
 }));
 

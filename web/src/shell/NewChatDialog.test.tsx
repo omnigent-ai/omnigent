@@ -2877,10 +2877,14 @@ describe("NewChatLandingScreen cached picker preview", () => {
           mockModelQueries(() => pendingModels);
           useHostModelOptionsMock.mockClear();
           renderLanding();
+          const catalogCalls = useHostModelOptionsMock.mock.calls;
+          // Nothing loads while the host isn't ready, including the session
+          // picker's host probe, which has no session (or harness) yet.
+          expect(catalogCalls.every(([, , enabled]) => !enabled)).toBe(true);
           expect(
-            useHostModelOptionsMock.mock.calls.every(
-              ([id, , enabled]) => id === "host_1" && !enabled,
-            ),
+            catalogCalls
+              .filter(([, catalogHarness]) => catalogHarness !== "")
+              .every(([id]) => id === "host_1"),
           ).toBe(true);
           const picker = screen.getByTestId("new-chat-landing-agent-select");
           expect(picker).toBeEnabled();

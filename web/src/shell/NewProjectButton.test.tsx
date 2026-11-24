@@ -233,6 +233,7 @@ describe("NewProjectButton", () => {
         {
           name: "Garden",
           idempotencyKey: expect.any(String),
+          description: "",
           config: {
             agent_id: "claude-id",
             host_id: "host_1",
@@ -297,6 +298,7 @@ describe("NewProjectButton", () => {
       {
         name: "Garden",
         idempotencyKey: expect.any(String),
+        description: "",
         config: {
           agent_id: "claude-id",
           host_id: "host_1",
@@ -457,6 +459,7 @@ describe("NewProjectButton", () => {
             host_id: "host_1",
           },
           idempotencyKey: expect.any(String),
+          description: "",
         },
         expect.any(Object),
       ),
@@ -666,6 +669,7 @@ describe("NewProjectButton project repositories", () => {
       {
         name: "Garden",
         idempotencyKey: expect.any(String),
+        description: "",
         config: {
           agent_id: "claude-id",
           host_id: "host_1",
@@ -921,6 +925,7 @@ describe("NewProjectButton project repositories", () => {
       {
         name: "Garden",
         idempotencyKey: expect.any(String),
+        description: "",
         config: {
           agent_id: "claude-id",
           host_id: "__sandbox__",
@@ -946,6 +951,7 @@ describe("NewProjectButton project repositories", () => {
         name: "Garden",
         config: { agent_id: "claude-id", host_id: "host_2" },
         idempotencyKey: expect.any(String),
+        description: "",
       },
       expect.any(Object),
     );
@@ -964,6 +970,7 @@ describe("NewProjectButton project repositories", () => {
         name: "Garden",
         config: { agent_id: "claude-id", host_id: "host_1" },
         idempotencyKey: expect.any(String),
+        description: "",
       },
       expect.any(Object),
     );
@@ -985,6 +992,7 @@ describe("NewProjectButton project repositories", () => {
         name: "Garden",
         config: { agent_id: "claude-id", host_id: "host_2" },
         idempotencyKey: expect.any(String),
+        description: "",
       },
       expect.any(Object),
     );
