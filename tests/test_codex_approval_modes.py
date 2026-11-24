@@ -175,6 +175,23 @@ def test_preset_from_thread_settings_follows_the_sandbox(
     assert codex_permission_preset_from_thread_settings(settings) == expected
 
 
+@pytest.mark.parametrize(
+    ("profile_id", "expected"),
+    [(":danger-full-access", "full-access"), (":read-only", "read-only"), (":workspace", None)],
+)
+def test_preset_from_thread_settings_reads_the_profile_without_a_sandbox(
+    profile_id: str, expected: str | None
+) -> None:
+    """Without a sandbox field, the permission profile decides a ``never`` policy's preset."""
+    settings = {
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "activePermissionProfile": {"id": profile_id, "extends": None},
+    }
+
+    assert codex_permission_preset_from_thread_settings(settings) == expected
+
+
 def test_preset_from_thread_settings_none_for_unmapped() -> None:
     """A non-mapping / custom payload resolves to None rather than guessing."""
     assert codex_permission_preset_from_thread_settings(None) is None
