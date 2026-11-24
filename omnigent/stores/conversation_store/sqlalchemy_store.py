@@ -177,6 +177,7 @@ from omnigent.stores.session_journal_store import (
     reserve_fork_journal,
 )
 from omnigent.util.session_lifecycle import title_without_closed_marker
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -2265,7 +2266,8 @@ class SqlAlchemyConversationStore(ConversationStore):
     def set_session_nest(
         self, session_id: str, source_id: str | None, *, user_id: str | None
     ) -> None:
-        if source_id == session_id:
+        # Ids arrive in any accepted spelling (bare, dashed or legacy-prefixed).
+        if source_id is not None and normalize_uuid(source_id) == normalize_uuid(session_id):
             raise OmnigentError(
                 "A session can't be nested under itself", code=ErrorCode.INVALID_INPUT
             )

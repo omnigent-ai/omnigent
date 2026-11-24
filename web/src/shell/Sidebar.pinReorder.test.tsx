@@ -245,10 +245,17 @@ it("starts a nest at a standalone row's center, but not over the dragged row its
       sibling_sessions: true,
       session_nest_moves: true,
       session_nest_standalone_destinations: true,
+      features: { sidebar_grouping_ui: true },
     },
   });
   await dropOnto("conv_c", "conv_c", { expectTarget: false });
-  await dropOnto("conv_c", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 - 2 });
+  // A row's edge still reorders, starting a Custom order.
+  await dropOnto("conv_c", "conv_d", {
+    expectTarget: false,
+    offsetY: ROW_HEIGHT / 2 - 2,
+    whileOver: () => expect(screen.getByTestId("session-order-insertion")).toBeInTheDocument(),
+  });
+  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view") ?? "{}").ordering).toBe("custom");
   // A standalone pin's center still pins into that slot instead of nesting.
   mocks.pinFn.mockResolvedValue({});
   await dropOnto("conv_c", "conv_a");
