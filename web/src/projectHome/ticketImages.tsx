@@ -1,6 +1,7 @@
 import { useRef, useState, type ClipboardEvent, type DragEvent, type ReactNode } from "react";
 import { PaperclipIcon } from "lucide-react";
 import { ProseMarkdown } from "@/components/blocks/ChatMarkdown";
+import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { SessionImage } from "@/components/SessionImage";
 import { Button } from "@/components/ui/button";
 import { clipboardFiles } from "@/lib/attachments";
@@ -58,53 +59,67 @@ function imageFiles(files: File[]): File[] {
   return files.filter((file) => TICKET_IMAGE_TYPES.has(file.type));
 }
 
+/** An image picked for a ticket or comment, shown as a thumbnail until it's sent. */
+export interface PendingTicketImage {
+  id: number;
+  file: File;
+  /** The image's markdown link once uploaded, e.g. ``![shot.png](/v1/.../content)``. */
+  markdown: string | null;
+}
+
 /**
- * Paste/drop handlers that upload images and insert their markdown at the caret.
- * `resolveProjectId` may create the project first, as a new ticket does.
+ * Uploads pasted, dropped or picked images and keeps them as thumbnails beside the
+ * text. {@link withImages} appends their markdown when the text is sent, so stored
+ * tickets and comments keep the same format. `resolveProjectId` may create the
+ * project first, as a new ticket does.
  */
-export function useTicketImageUpload(
-  resolveProjectId: () => Promise<string>,
-  setValue: (update: (previous: string) => string) => void,
-) {
-  const [uploading, setUploading] = useState(0);
+export function useTicketImageUpload(resolveProjectId: () => Promise<string>) {
+  const [images, setImages] = useState<PendingTicketImage[]>([]);
   const [error, setError] = useState<Error | null>(null);
   const resolveRef = useRef(resolveProjectId);
   resolveRef.current = resolveProjectId;
+  const nextId = useRef(0);
 
-  // Without a target (the attach button), images go at the end of the text.
-  const upload = (files: File[], target?: HTMLTextAreaElement) => {
-    const caret = target ? (target.selectionEnd ?? target.value.length) : Number.MAX_SAFE_INTEGER;
+  const upload = (files: File[]) => {
+    const added = files.map((file) => ({ id: nextId.current++, file, markdown: null }));
     setError(null);
-    setUploading((count) => count + files.length);
+    setImages((previous) => [...previous, ...added]);
     void (async () => {
+      let projectId: string;
       try {
-        const projectId = await resolveRef.current();
-        for (const file of files) {
-          try {
-            const image = await uploadTicketImage(projectId, file);
-            const markdown = ticketImageMarkdown(image.filename, image.url);
-            setValue((previous) => {
-              const at = Math.min(caret, previous.length);
-              const before = previous.slice(0, at);
-              const after = previous.slice(at);
-              const lead = before && !before.endsWith("\n") ? "\n" : "";
-              const trail = after.startsWith("\n") ? "" : "\n";
-              return `${before}${lead}${markdown}${trail}${after}`;
-            });
-          } finally {
-            setUploading((count) => count - 1);
-          }
-        }
+        projectId = await resolveRef.current();
       } catch (caught) {
         setError(caught instanceof Error ? caught : new Error(String(caught)));
-        setUploading(0);
+        setImages((previous) => previous.filter((image) => !added.includes(image)));
+        return;
+      }
+      for (const pending of added) {
+        try {
+          const uploaded = await uploadTicketImage(projectId, pending.file);
+          const markdown = ticketImageMarkdown(uploaded.filename, uploaded.url);
+          setImages((previous) =>
+            previous.map((image) => (image.id === pending.id ? { ...image, markdown } : image)),
+          );
+        } catch (caught) {
+          setError(caught instanceof Error ? caught : new Error(String(caught)));
+          setImages((previous) => previous.filter((image) => image.id !== pending.id));
+        }
       }
     })();
   };
 
   return {
-    uploading: uploading > 0,
+    images,
+    uploading: images.some((image) => image.markdown === null),
     error,
+    remove: (index: number) => setImages((previous) => previous.filter((_, at) => at !== index)),
+    clear: () => setImages([]),
+    /** *text* with the uploaded images' markdown appended, one per line. */
+    withImages: (text: string) => {
+      const links = images.flatMap((image) => (image.markdown ? [image.markdown] : []));
+      if (!links.length) return text;
+      return text.trim() ? `${text.trimEnd()}\n\n${links.join("\n")}` : links.join("\n");
+    },
     attach: (files: File[]) => {
       const accepted = imageFiles(files);
       if (accepted.length) upload(accepted);
@@ -113,7 +128,7 @@ export function useTicketImageUpload(
       const files = imageFiles(clipboardFiles(event.clipboardData));
       if (!files.length) return;
       event.preventDefault();
-      upload(files, event.currentTarget);
+      upload(files);
     },
     onDragOver: (event: DragEvent<HTMLTextAreaElement>) => {
       if ([...event.dataTransfer.items].some((item) => item.kind === "file"))
@@ -123,9 +138,26 @@ export function useTicketImageUpload(
       const files = imageFiles([...event.dataTransfer.files]);
       if (!files.length) return;
       event.preventDefault();
-      upload(files, event.currentTarget);
+      upload(files);
     },
   };
+}
+
+/** Thumbnails of a {@link useTicketImageUpload}'s images, as the chat composer shows them. */
+export function TicketImagePreviews({
+  upload,
+  className,
+}: {
+  upload: Pick<ReturnType<typeof useTicketImageUpload>, "images" | "remove">;
+  className?: string;
+}) {
+  return (
+    <ComposerAttachments
+      files={upload.images.map((image) => image.file)}
+      onRemove={upload.remove}
+      className={className}
+    />
+  );
 }
 
 /** Picks images from disk for {@link useTicketImageUpload}, beside paste and drop. */
@@ -158,7 +190,7 @@ export function TicketImageAttachButton({
         size="sm"
         className="text-muted-foreground"
         disabled={disabled}
-        title="Attach images. You can also paste or drop them into the text."
+        title="Attach images. You can also paste or drop them into the text box."
         onClick={() => input.current?.click()}
       >
         <PaperclipIcon aria-hidden />

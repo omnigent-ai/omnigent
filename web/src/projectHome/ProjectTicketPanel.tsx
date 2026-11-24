@@ -65,7 +65,12 @@ import { usePersonaForSession, useProjectPersonaLookup } from "./usePersonaSessi
 import { payloadMentions } from "./personaMentions";
 import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketFileLinks } from "./TicketFileLinks";
-import { TicketImageAttachButton, TicketMarkdown, useTicketImageUpload } from "./ticketImages";
+import {
+  TicketImageAttachButton,
+  TicketImagePreviews,
+  TicketMarkdown,
+  useTicketImageUpload,
+} from "./ticketImages";
 import { TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
@@ -86,6 +91,10 @@ import {
   useTicketLifecycleEnabled,
   useTicketStages,
 } from "./useProjectTickets";
+
+// The server's limits for a ticket description and a comment, images included.
+const TICKET_DESCRIPTION_MAX_CHARS = 3000;
+const TICKET_COMMENT_MAX_CHARS = 2000;
 
 interface TicketExpansionProps {
   expanded?: boolean;
@@ -285,7 +294,8 @@ function TicketEditor({
     ticket?.description ?? "",
   );
   const mobile = useIsMobileViewport();
-  const images = useTicketImageUpload(resolveProjectId, setDescription);
+  const images = useTicketImageUpload(resolveProjectId);
+  const [tooLong, setTooLong] = useState<Error | null>(null);
   return (
     <form
       className="space-y-4"
@@ -293,7 +303,16 @@ function TicketEditor({
       onSubmit={(event) => {
         event.preventDefault();
         if (!title.trim() || pending || disabled || images.uploading) return;
-        onSave({ title: title.trim(), description });
+        const body = images.withImages(description);
+        setTooLong(
+          body.length > TICKET_DESCRIPTION_MAX_CHARS
+            ? new Error(
+                "The description and its images are too long; remove an image or shorten the text.",
+              )
+            : null,
+        );
+        if (body.length > TICKET_DESCRIPTION_MAX_CHARS) return;
+        onSave({ title: title.trim(), description: body });
       }}
     >
       <label className="grid gap-2 text-sm">
@@ -319,7 +338,7 @@ function TicketEditor({
           name="description"
           className="focus-visible:ring-0"
           rows={6}
-          maxLength={3000}
+          maxLength={TICKET_DESCRIPTION_MAX_CHARS}
           value={description}
           onChange={(event) => setDescription(event.target.value)}
           onPaste={images.onPaste}
@@ -328,9 +347,11 @@ function TicketEditor({
           placeholder="What should change? Done when…"
           disabled={pending}
         />
+        <TicketImagePreviews upload={images} className="px-0 pb-0" />
       </label>
       {images.uploading && <p className="text-xs text-muted-foreground">Uploading image…</p>}
       <TicketError error={images.error} />
+      <TicketError error={tooLong} />
       <TicketError error={error} />
       <div className="flex justify-end gap-2">
         <TicketImageAttachButton onFiles={images.attach} disabled={pending} />
@@ -624,20 +645,31 @@ function TicketCommentComposer({
   const [attaching, setAttaching] = useState(false);
   const [outputUrl, setOutputUrl] = useState("");
   const [outputType, setOutputType] = useState<TicketOutput["type"]>("pull_request");
-  const images = useTicketImageUpload(async () => projectId, setText);
+  const images = useTicketImageUpload(async () => projectId);
+  const [tooLong, setTooLong] = useState<Error | null>(null);
+  const hasContent = Boolean(text.trim()) || images.images.length > 0;
   return (
     <form
       className="space-y-2"
       onKeyDown={submitOnCommandEnter}
       onSubmit={(event) => {
         event.preventDefault();
-        if (!text.trim() || comment.isPending || images.uploading) return;
+        if (!hasContent || comment.isPending || images.uploading) return;
+        const body = images.withImages(text).trim();
+        setTooLong(
+          body.length > TICKET_COMMENT_MAX_CHARS
+            ? new Error(
+                "The comment and its images are too long; remove an image or shorten the text.",
+              )
+            : null,
+        );
+        if (body.length > TICKET_COMMENT_MAX_CHARS) return;
         // The promise settles even if the user navigates away, so the posted draft still clears.
         comment
           .mutateAsync({
             id: ticketId,
             body: {
-              text: text.trim(),
+              text: body,
               outputs:
                 attaching && outputUrl.trim() ? [{ type: outputType, url: outputUrl.trim() }] : [],
             },
@@ -646,6 +678,7 @@ function TicketCommentComposer({
             () => {
               writeTicketDraft(draftKey, "");
               setText("");
+              images.clear();
               setOutputUrl("");
               setAttaching(false);
             },
@@ -658,8 +691,8 @@ function TicketCommentComposer({
           projectId={projectId}
           name="comment"
           aria-label="Add a comment"
-          required
-          maxLength={2000}
+          required={!images.images.length}
+          maxLength={TICKET_COMMENT_MAX_CHARS}
           rows={2}
           className="max-h-36 min-h-16 resize-none rounded-none border-0 px-3 shadow-none focus-visible:ring-0"
           value={text}
@@ -670,6 +703,7 @@ function TicketCommentComposer({
           onDrop={images.onDrop}
           placeholder="Add a comment… type @ to cc a persona"
         />
+        <TicketImagePreviews upload={images} className="px-3" />
         {attaching && (
           <div className="flex flex-wrap items-center gap-2 border-t border-border/60 p-2">
             <Select
@@ -734,7 +768,7 @@ function TicketCommentComposer({
             type="submit"
             size="sm"
             loading={comment.isPending}
-            disabled={!text.trim() || images.uploading}
+            disabled={!hasContent || images.uploading}
           >
             Comment
           </Button>
@@ -742,6 +776,7 @@ function TicketCommentComposer({
       </div>
       {images.uploading && <p className="text-xs text-muted-foreground">Uploading image…</p>}
       <TicketError error={images.error} />
+      <TicketError error={tooLong} />
       <TicketError error={comment.error} />
       <span role="status" className="sr-only">
         {comment.isSuccess ? "Comment added" : ""}
