@@ -335,21 +335,26 @@ class _SessionModelComposer(_EditableComposer):
                     f"   {'❯' if index == self.highlight else ' '} {index + 1}.  "
                     f"{label}{' ✔' if current else ''}  Managed by your organization ({model})"
                 )
-            return (
+            pane = (
                 "   Select model\n" + "\n".join(rows) + "\n"
                 "   Enter to set as default · s to use this session only · Esc to cancel\n"
             )
-        if self.overlay == "status":
-            return (
+        elif self.overlay == "status":
+            pane = (
                 "   Settings  Status  Config  Usage  Stats\n"
                 f"   Version: {self.version}\n"
                 f"   Session ID: {self.session}\n"
                 f"   Model: {self.model}\n"
                 "   Esc to cancel\n"
             )
-        pane = super()._capture_pane(socket_path, tmux_target, join_wrapped=join_wrapped)
-        pane = pane.replace("\n❯ ", f"\n❯{self.prompt_separator}", 1)
-        return ("Working…\n" if self.busy else "") + pane
+        else:
+            pane = super()._capture_pane(socket_path, tmux_target, join_wrapped=join_wrapped)
+            pane = pane.replace("\n❯ ", f"\n❯{self.prompt_separator}", 1)
+            return ("Working…\n" if self.busy else "") + pane
+        if self.busy:
+            composer = super()._capture_pane(socket_path, tmux_target, join_wrapped=join_wrapped)
+            return f"{self._RULE}\n{pane}\n{composer}\n  ⏸ manual mode on\n"
+        return pane
 
 
 def _session_model_bridge(tmp_path: Path, composer: _SessionModelComposer) -> Path:

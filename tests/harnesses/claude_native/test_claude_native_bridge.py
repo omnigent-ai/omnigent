@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shlex
 import shutil
 import socket
@@ -13451,12 +13452,15 @@ def test_wrapped_draft_with_an_extra_hard_newline_is_still_foreign(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cache_cost", [False, True], ids=["immediate", "cache-cost"])
+@pytest.mark.parametrize("busy", [False, True], ids=["idle", "active-turn"])
 async def test_model_command_selects_session_only_then_reads_fresh_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cache_cost: bool,
+    busy: bool,
 ) -> None:
     composer = _SessionModelComposer(
+        busy=busy,
         prompt_separator="\u00a0",
         cache_cost_label="Choice 1" if cache_cost else None,
     )
@@ -15828,15 +15832,40 @@ def test_model_command_does_not_continue_into_a_replacement_session_or_pane(
 
 
 @pytest.mark.parametrize("overlay", ["picker", "status"])
-@pytest.mark.parametrize("damage", ["missing-footer", "duplicate", "replacement-composer"])
+@pytest.mark.parametrize(
+    ("layout", "damage"),
+    [
+        ("standalone", "missing-footer"),
+        ("standalone", "duplicate"),
+        ("standalone", "replacement-composer"),
+        ("active-turn", "missing-footer"),
+        ("active-turn", "duplicate"),
+        ("active-turn", "replacement-composer"),
+        ("active-turn", "missing-panel-frame"),
+        ("active-turn", "occupied-composer"),
+        ("active-turn", "unknown-composer-footer"),
+        ("active-turn", "text-before-composer"),
+    ],
+)
 def test_model_control_parsers_refuse_partial_duplicate_and_closed_overlays(
-    overlay: str, damage: str
+    overlay: str, layout: str, damage: str
 ) -> None:
     from omnigent.harnesses.claude_native import model_switch
 
     composer = _SessionModelComposer()
     composer.overlay = overlay
     pane = composer._capture_pane("ignored", "ignored")
+    if layout == "active-turn":
+        captured = json.loads(
+            (Path(__file__).parent / "fixtures" / "claude-status-active-turn.json").read_text()
+        )["pane"]
+        if overlay == "status":
+            pane = captured
+        else:
+            # The picker uses the captured active panel's surrounding geometry.
+            frame = captured.splitlines()[0]
+            tail = captured[captured.index("  Esc to cancel") + len("  Esc to cancel") :]
+            pane = f"{frame}\n{pane}{tail}"
     parse = model_switch._picker if overlay == "picker" else model_switch._status
     assert parse(pane) is not None
     if damage == "missing-footer":
@@ -15844,10 +15873,18 @@ def test_model_control_parsers_refuse_partial_duplicate_and_closed_overlays(
     elif damage == "replacement-composer":
         composer.overlay = None
         pane += composer._capture_pane("ignored", "ignored")
+    elif damage == "missing-panel-frame":
+        pane = pane[pane.index("\n") + 1 :]
+    elif damage == "occupied-composer":
+        pane = pane.replace("❯\u00a0", "❯ unrelated draft")
+    elif damage == "unknown-composer-footer":
+        pane = pane.replace("manual mode on", "unknown footer")
+    elif damage == "text-before-composer":
+        pane = pane.replace("Esc to cancel\n", "Esc to cancel\nUnrecognized content\n")
     elif overlay == "picker":
         pane = pane.replace("     2.", "   ❯ 2.")
     else:
-        pane = pane.replace("   Model:", "   Model: other-model\n   Model:")
+        pane = re.sub(r"(?m)^(\s*)Model:", r"\1Model: other-model\n\1Model:", pane, count=1)
     assert parse(pane) is None
 
 

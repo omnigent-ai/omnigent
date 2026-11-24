@@ -142,13 +142,35 @@ _MIN_PICKER_VERSION = (2, 1, 323)
 _IMMEDIATE_PICKER_TIMEOUT_S = 2.0
 
 
+def _control_tail_matches(pane: str, title_start: int, footer_end: int) -> bool:
+    tail = pane[footer_end:]
+    if not tail.strip():
+        return True
+    from omnigent.harnesses.claude_native import bridge
+
+    # Active turns keep a framed control panel above the empty composer.
+    before_title = pane[:title_start].rstrip().splitlines()
+    lines = tail.splitlines()
+    rules = bridge._composer_frame_rule_indices(lines)
+    return bool(
+        before_title
+        and bridge._is_box_rule(before_title[-1])
+        and len(rules) == 2
+        and not any(line.strip() for line in lines[: rules[0]])
+        and _draft(tail) == ""
+        and bridge._permission_mode_from_pane(tail) is not None
+    )
+
+
 def _picker(pane: str) -> _Picker | None:
     titles = list(_PICKER_TITLE.finditer(pane))
     if not titles:
         return None
     region = pane[titles[-1].end() :]
     footer = _PICKER_FOOTER.search(region)
-    if footer is None or region[footer.end() :].strip():
+    if footer is None or not _control_tail_matches(
+        pane, titles[-1].start(), titles[-1].end() + footer.end()
+    ):
         return None
     rows: list[_PickerRow] = []
     for line in region[: footer.start()].splitlines():
@@ -179,7 +201,9 @@ def _status(pane: str) -> dict[str, str] | None:
         return None
     region = pane[tabs[-1].end() :]
     footer = _STATUS_ESCAPE.search(region)
-    if footer is None or region[footer.end() :].strip():
+    if footer is None or not _control_tail_matches(
+        pane, tabs[-1].start(), tabs[-1].end() + footer.end()
+    ):
         return None
     fields: dict[str, str] = {}
     for line in region[: footer.start()].splitlines():
