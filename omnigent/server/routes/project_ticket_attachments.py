@@ -1,4 +1,4 @@
-"""Owner-private image attachments for project ticket comments and descriptions."""
+"""Owner-private image and video attachments for project ticket comments and descriptions."""
 
 from __future__ import annotations
 
@@ -16,7 +16,10 @@ from omnigent.stores.project_ticket_store import ProjectTicketStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 TICKET_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+TICKET_VIDEO_TYPES = frozenset({"video/mp4", "video/webm", "video/quicktime"})
 MAX_TICKET_IMAGE_BYTES = 10 * 1024 * 1024
+# Videos share the project file limit.
+MAX_TICKET_VIDEO_BYTES = 50 * 1024 * 1024
 # Rows carry no session; this metadata key scopes them to their project.
 PROJECT_METADATA_KEY = "ticket_project_id"
 
@@ -45,19 +48,25 @@ def create_project_ticket_attachments_router(
     ) -> dict[str, Any]:
         project = await require_project(request, project_id)
         content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
-        if content_type not in TICKET_IMAGE_TYPES:
+        video = content_type in TICKET_VIDEO_TYPES
+        if content_type not in TICKET_IMAGE_TYPES and not video:
             raise OmnigentError(
-                "Ticket attachments must be PNG, JPEG, GIF or WebP images",
+                "Ticket attachments must be PNG, JPEG, GIF or WebP images, "
+                "or MP4, WebM or MOV videos",
                 code=ErrorCode.INVALID_INPUT,
             )
-        content = await file.read(MAX_TICKET_IMAGE_BYTES + 1)
-        if len(content) > MAX_TICKET_IMAGE_BYTES:
+        limit = MAX_TICKET_VIDEO_BYTES if video else MAX_TICKET_IMAGE_BYTES
+        kind = "Videos" if video else "Images"
+        content = await file.read(limit + 1)
+        if len(content) > limit:
             raise OmnigentError(
-                f"Images must be at most {MAX_TICKET_IMAGE_BYTES // (1024 * 1024)} MB",
+                f"{kind} must be at most {limit // (1024 * 1024)} MB",
                 code=ErrorCode.INVALID_INPUT,
             )
         if not content:
-            raise OmnigentError("The image is empty", code=ErrorCode.INVALID_INPUT)
+            raise OmnigentError(
+                f"The {'video' if video else 'image'} is empty", code=ErrorCode.INVALID_INPUT
+            )
         filename = (file.filename or "image").strip()[:200] or "image"
         stored = await asyncio.to_thread(
             file_store.create,
@@ -92,7 +101,7 @@ def create_project_ticket_attachments_router(
             stored is None
             or stored.session_id is not None
             or metadata.get(PROJECT_METADATA_KEY) != project
-            or stored.content_type not in TICKET_IMAGE_TYPES
+            or stored.content_type not in TICKET_IMAGE_TYPES | TICKET_VIDEO_TYPES
         ):
             raise OmnigentError("Attachment not found", code=ErrorCode.NOT_FOUND)
         content = await asyncio.to_thread(artifact_store.get, stored.blob_key or stored.id)

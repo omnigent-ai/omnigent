@@ -396,9 +396,11 @@ export interface TicketImage {
   id: string;
   filename: string;
   url: string;
+  /** The stored type, e.g. ``"image/png"`` or ``"video/mp4"``; missing from older servers. */
+  content_type?: string;
 }
 
-/** Upload a pasted or dropped image for use in a ticket comment or description. */
+/** Upload a pasted, dropped or picked image or video for a ticket comment or description. */
 export async function uploadTicketImage(projectId: string, file: File): Promise<TicketImage> {
   const form = new FormData();
   form.append("file", file, attachmentFilename(file));

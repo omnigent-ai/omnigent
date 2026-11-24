@@ -59,6 +59,25 @@ describe("ticket image attachments", () => {
     expect(screen.getByTestId("body").textContent).toBe(`Steps\n\n![two.png](${url("c")})`);
   });
 
+  it("accepts videos and appends a video link", async () => {
+    uploadTicketImage.mockResolvedValue({
+      filename: "clip.webm",
+      url: url("f"),
+      content_type: "video/webm",
+    });
+    const { container } = render(<Harness />);
+    const user = userEvent.setup({ applyAccept: false });
+    await user.upload(container.querySelector<HTMLInputElement>("input[type=file]")!, [
+      new File(["webm"], "clip.webm", { type: "video/webm" }),
+    ]);
+    await waitFor(() =>
+      expect(screen.getByTestId("body").textContent).toBe(
+        `Steps\n\n![clip.webm](${url("f")}?type=video)`,
+      ),
+    );
+    expect(screen.getByText("clip.webm")).toBeTruthy();
+  });
+
   it("treats a pasted image like an attached one", async () => {
     uploadTicketImage.mockResolvedValue({ filename: "pasted.png", url: url("d") });
     render(<Harness />);

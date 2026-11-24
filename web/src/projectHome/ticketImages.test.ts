@@ -17,3 +17,19 @@ describe("splitTicketImages", () => {
     expect(splitTicketImages(body)).toEqual([{ kind: "markdown", text: body }]);
   });
 });
+
+describe("ticket videos", () => {
+  it("marks an uploaded video's link and splits it out as a video", () => {
+    const markdown = ticketImageMarkdown("clip.mp4", url, "video/mp4");
+    expect(markdown).toBe(`![clip.mp4](${url}?type=video)`);
+    expect(splitTicketImages(`Look:\n${markdown}`)).toEqual([
+      { kind: "markdown", text: "Look:\n" },
+      { kind: "video", alt: "clip.mp4", path: url },
+    ]);
+  });
+
+  it("keeps images unmarked, whatever their name", () => {
+    expect(ticketImageMarkdown("clip.mp4.png", url, "image/png")).toBe(`![clip.mp4.png](${url})`);
+    expect(ticketImageMarkdown("shot.png", url)).toBe(`![shot.png](${url})`);
+  });
+});

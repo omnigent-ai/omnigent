@@ -1,19 +1,31 @@
-import { useRef, useState, type ClipboardEvent, type DragEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type DragEvent,
+  type ReactNode,
+} from "react";
 import { PaperclipIcon } from "lucide-react";
 import { ProseMarkdown } from "@/components/blocks/ChatMarkdown";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { SessionImage } from "@/components/SessionImage";
 import { Button } from "@/components/ui/button";
 import { clipboardFiles } from "@/lib/attachments";
+import { authenticatedFetch } from "@/lib/identity";
+import { readVideoResponse } from "@/lib/videoFetch";
 import { uploadTicketImage } from "@/lib/projectTicketsApi";
 
 const TICKET_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-// Only images uploaded to this server's ticket attachments render inline.
+const TICKET_VIDEO_TYPES = new Set(["video/mp4", "video/webm", "video/quicktime"]);
+// Marks an attachment link as a video, since the content path alone doesn't say.
+const VIDEO_MARKER = "?type=video";
+// Only images and videos uploaded to this server's ticket attachments render inline.
 const TICKET_IMAGE_PATTERN =
-  /!\[([^\]\n]*)\]\((\/v1\/projects\/[0-9a-f]{32}\/ticket-attachments\/[0-9a-f]{32}\/content)\)/g;
+  /!\[([^\]\n]*)\]\((\/v1\/projects\/[0-9a-f]{32}\/ticket-attachments\/[0-9a-f]{32}\/content)(\?type=video)?\)/g;
 
 export type TicketBodySegment =
-  { kind: "markdown"; text: string } | { kind: "image"; alt: string; path: string };
+  { kind: "markdown"; text: string } | { kind: "image" | "video"; alt: string; path: string };
 
 /** Split ticket markdown around uploaded-image references, keeping their order. */
 export function splitTicketImages(body: string): TicketBodySegment[] {
@@ -22,7 +34,11 @@ export function splitTicketImages(body: string): TicketBodySegment[] {
   for (const match of body.matchAll(TICKET_IMAGE_PATTERN)) {
     const before = body.slice(last, match.index);
     if (before.trim()) segments.push({ kind: "markdown", text: before });
-    segments.push({ kind: "image", alt: match[1] || "Image", path: match[2] });
+    segments.push(
+      match[3]
+        ? { kind: "video", alt: match[1] || "Video", path: match[2] }
+        : { kind: "image", alt: match[1] || "Image", path: match[2] },
+    );
     last = match.index + match[0].length;
   }
   const rest = body.slice(last);
@@ -30,9 +46,56 @@ export function splitTicketImages(body: string): TicketBodySegment[] {
   return segments;
 }
 
-export function ticketImageMarkdown(filename: string, url: string): string {
-  const alt = filename.replace(/[[\]\n]/g, " ").trim() || "image";
-  return `![${alt}](${url})`;
+export function ticketImageMarkdown(filename: string, url: string, contentType?: string): string {
+  const video = contentType !== undefined && TICKET_VIDEO_TYPES.has(contentType);
+  const alt = filename.replace(/[[\]\n]/g, " ").trim() || (video ? "video" : "image");
+  return `![${alt}](${url}${video ? VIDEO_MARKER : ""})`;
+}
+
+/** A ticket video, fetched with the viewer's credentials and played inline. */
+export function TicketVideo({ path, alt }: { path: string; alt: string }) {
+  const [source, setSource] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    let objectUrl: string | null = null;
+    setSource(null);
+    setFailed(false);
+    void (async () => {
+      try {
+        const response = await authenticatedFetch(path, { signal: controller.signal });
+        if (!response.ok) throw new Error(`${response.status}`);
+        const blob = await readVideoResponse(response, alt, { signal: controller.signal });
+        objectUrl = URL.createObjectURL(blob);
+        setSource(objectUrl);
+      } catch {
+        if (!controller.signal.aborted) setFailed(true);
+      }
+    })();
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [path, alt]);
+  if (failed)
+    return <p className="text-sm text-muted-foreground">The video {alt} can't be played.</p>;
+  if (!source)
+    return (
+      <div
+        role="status"
+        aria-label={`Loading video ${alt}`}
+        className="h-40 w-64 max-w-full animate-pulse rounded-lg bg-muted"
+      />
+    );
+  return (
+    <video
+      src={source}
+      controls
+      preload="metadata"
+      aria-label={alt}
+      className="max-h-80 max-w-full rounded-lg border border-border bg-black"
+    />
+  );
 }
 
 /** Ticket markdown with uploaded images rendered through the authenticated image path. */
@@ -43,7 +106,8 @@ export function TicketMarkdown({ children, className }: { children: string; clas
   // Each segment's text or path plus its position keeps keys unique and stable.
   const seen = new Map<string, number>();
   const keyed = segments.map((segment) => {
-    const base = segment.kind === "markdown" ? `text:${segment.text}` : `image:${segment.path}`;
+    const base =
+      segment.kind === "markdown" ? `text:${segment.text}` : `${segment.kind}:${segment.path}`;
     const repeat = seen.get(base) ?? 0;
     seen.set(base, repeat + 1);
     return { segment, key: `${base}#${repeat}` };
@@ -55,6 +119,8 @@ export function TicketMarkdown({ children, className }: { children: string; clas
           <ProseMarkdown key={key} className={className}>
             {segment.text}
           </ProseMarkdown>
+        ) : segment.kind === "video" ? (
+          <TicketVideo key={key} path={segment.path} alt={segment.alt} />
         ) : (
           <SessionImage key={key} path={segment.path} alt={segment.alt} />
         ),
@@ -64,7 +130,9 @@ export function TicketMarkdown({ children, className }: { children: string; clas
 }
 
 function imageFiles(files: File[]): File[] {
-  return files.filter((file) => TICKET_IMAGE_TYPES.has(file.type));
+  return files.filter(
+    (file) => TICKET_IMAGE_TYPES.has(file.type) || TICKET_VIDEO_TYPES.has(file.type),
+  );
 }
 
 /** An image picked for a ticket or comment, shown as a thumbnail until it's sent. */
@@ -110,7 +178,11 @@ export function useTicketImageUpload(resolveProjectId: () => Promise<string>) {
         await previousUpload;
         try {
           const uploaded = await uploadTicketImage(projectId, pending.file);
-          const markdown = ticketImageMarkdown(uploaded.filename, uploaded.url);
+          const markdown = ticketImageMarkdown(
+            uploaded.filename,
+            uploaded.url,
+            uploaded.content_type ?? pending.file.type,
+          );
           setImages((previous) =>
             previous.map((image) => (image.id === pending.id ? { ...image, markdown } : image)),
           );
@@ -188,7 +260,7 @@ export function TicketImageAttachButton({
       <input
         ref={input}
         type="file"
-        accept={[...TICKET_IMAGE_TYPES].join(",")}
+        accept={[...TICKET_IMAGE_TYPES, ...TICKET_VIDEO_TYPES].join(",")}
         multiple
         hidden
         aria-hidden
@@ -204,11 +276,11 @@ export function TicketImageAttachButton({
         size="sm"
         className="text-muted-foreground"
         disabled={disabled}
-        title="Attach images. You can also paste or drop them into the text box."
+        title="Attach images or videos. You can also paste or drop them into the text box."
         onClick={() => input.current?.click()}
       >
         <PaperclipIcon aria-hidden />
-        Attach image
+        Attach media
       </Button>
     </>
   );
