@@ -26,6 +26,7 @@ import { showToast } from "@/components/ui/toast";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { formatVideoTime } from "@/lib/video";
+import { parseProjectFileScope } from "@/lib/projectFileScope";
 import { parseVideoChapters, type VideoChapter } from "@/lib/videoChapters";
 import { VideoTooLargeError } from "@/lib/videoFetch";
 
@@ -72,7 +73,10 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   const cardRef = useRef<HTMLSpanElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const pendingSeek = useRef<number | null>(null);
-  const chapterQuery = useFileContent(conversationId, path ? `${path}.chapters.vtt` : null, {
+  // A project file is a single blob with no sibling chapters file to read.
+  const chapterPath =
+    path && !parseProjectFileScope(conversationId) ? `${path}.chapters.vtt` : null;
+  const chapterQuery = useFileContent(conversationId, chapterPath, {
     retry: false,
   });
   const chapterContent = chapterQuery.isError ? undefined : chapterQuery.data;

@@ -83,6 +83,8 @@ function workspaceFileUrl(
  * :param path: Workspace-relative or host-absolute file path.
  */
 export function workspaceFileMediaUrl(conversationId: string, path: string): string | null {
+  // A project file has no session host; its bytes come through `fetchWorkspaceVideoBlob`.
+  if (parseProjectFileScope(conversationId)) return null;
   const query: Record<string, string> = { download: "true" };
   const hostId = getSessionHost(conversationId);
   if (isHostRoutingEnabled() && hostId === null) return null;
@@ -99,10 +101,11 @@ export async function fetchWorkspaceVideoBlob(
   path: string,
   signal?: AbortSignal,
 ): Promise<Blob> {
-  const res = await authenticatedFetch(
-    workspaceFileUrl(conversationId, path, { download: "true" }),
-    { signal },
-  );
+  const projectFile = parseProjectFileScope(conversationId);
+  const url = projectFile
+    ? `${projectFileApiPath(projectFile)}/content`
+    : workspaceFileUrl(conversationId, path, { download: "true" });
+  const res = await authenticatedFetch(url, { signal });
   if (!res.ok) {
     void res.body?.cancel().catch(() => {});
     throw new Error(`${res.status} ${res.statusText}`);

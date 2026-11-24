@@ -32,7 +32,16 @@ from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 MAX_PROJECT_FILE_BYTES = 50 * 1024 * 1024
 # Types a browser may render inline. Anything else, notably HTML and SVG, downloads.
 _INLINE_TYPES = frozenset(
-    {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf", "text/plain"}
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "application/pdf",
+        "text/plain",
+        "video/mp4",
+        "video/webm",
+    }
 )
 # Text formats served as plain text so they preview without executing.
 _TEXT_TYPES = frozenset({"text/markdown", "text/csv", "application/json", "text/x-log"})

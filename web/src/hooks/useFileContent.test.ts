@@ -40,7 +40,13 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/store/chatStore", () => ({ useChatStore: () => undefined }));
 
 import { clearHostKeyless, markHostKeyless, setSessionHost } from "@/lib/sessionHost";
-import { downloadWorkspaceFile, fetchFileContent, workspaceFileMediaUrl } from "./useFileContent";
+import { projectFileScopeId } from "@/lib/projectFileScope";
+import {
+  downloadWorkspaceFile,
+  fetchFileContent,
+  fetchWorkspaceVideoBlob,
+  workspaceFileMediaUrl,
+} from "./useFileContent";
 
 const RAW_URL =
   "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py?download=true";
@@ -149,5 +155,25 @@ describe("workspaceFileMediaUrl", () => {
     setSessionHost("sess_abc", "host_1");
     markHostKeyless("host_1");
     expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBe(`https://ws.example${MEDIA_URL}`);
+  });
+});
+
+describe("project file videos", () => {
+  const scope = projectFileScopeId("proj_1", "file_1");
+
+  it("has no direct session media URL", () => {
+    expect(workspaceFileMediaUrl(scope, "demo.webm")).toBeNull();
+  });
+
+  it("fetches the bytes from the project file content route", async () => {
+    authenticatedFetch.mockResolvedValue(
+      new Response(new Uint8Array([1, 2, 3]), { headers: { "Content-Type": "video/webm" } }),
+    );
+
+    const blob = await fetchWorkspaceVideoBlob(scope, "demo.webm");
+
+    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/projects/proj_1/files/file_1/content");
+    expect(blob.type).toBe("video/webm");
+    expect(blob.size).toBe(3);
   });
 });
