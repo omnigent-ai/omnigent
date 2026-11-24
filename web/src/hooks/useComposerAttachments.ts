@@ -60,6 +60,8 @@ export interface ComposerAttachmentsApi {
    * could silently drop them. Leaves the notice untouched.
    */
   restoreFiles: (files: File[]) => void;
+  /** Append files a composer's chips leave behind, verbatim: they were validated when pasted. */
+  appendFiles: (files: File[]) => void;
   /**
    * Attach file-kind clipboard items instead of letting them insert as
    * text. Without a usable file, plain text is inserted as typed input
@@ -165,6 +167,11 @@ export function useComposerAttachments({
     setFiles(restored);
   }, []);
 
+  // Adds files a composer's chips leave behind, as they are: they were validated when pasted.
+  const appendFiles = useCallback((demoted: File[]) => {
+    setFiles((prev) => [...prev, ...demoted]);
+  }, []);
+
   const onPaste = useCallback(
     (e: ComposerPasteEvent) => {
       const insertChips = onPasteChipsRef.current;
@@ -187,13 +194,16 @@ export function useComposerAttachments({
       }
       e.preventDefault();
       if (insertChips) {
-        const accepted = validateIncoming(pasted);
+        // Insert first: the insert is a text change, which clears the error. Publish this batch's
+        // rejections after it.
+        const { accepted, errors } = validateAttachments(pasted, policyRef.current);
         if (accepted.length > 0) insertChips(accepted, e.currentTarget, filesRef.current);
+        setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
         return;
       }
       addFiles(pasted);
     },
-    [addFiles, validateIncoming],
+    [addFiles],
   );
 
   const clearError = useCallback(() => setAttachmentError(null), []);
@@ -213,6 +223,7 @@ export function useComposerAttachments({
     removeFile,
     replaceFiles,
     restoreFiles,
+    appendFiles,
     onPaste,
     clearError,
     clear,

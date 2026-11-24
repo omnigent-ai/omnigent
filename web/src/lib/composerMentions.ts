@@ -596,8 +596,6 @@ export function tagTokensOf(tags: LiveMentions | undefined): string[] {
  *
  * :param first: The draft whose tokens win, e.g. the launcher draft.
  * :param second: The draft merged in, e.g. a failed temporary session's draft.
- * :param options.texts: The typed text of ``first``, which a renamed chip must not capture.
- * :param options.trayNames: Tray filenames of both drafts, which a chip must not take.
  * :returns: ``second.text`` with renamed tokens, and the combined tags.
  */
 export function mergeTaggedDrafts(

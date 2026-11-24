@@ -121,6 +121,8 @@ export interface MentionBrowserParams {
    * own state. The caller's draft drops a tag once its token leaves the text,
    * so the release pass is skipped.
    */
+  /** Takes the Files of chips a reset drops, so they go out as tray files. */
+  onDemoteChips?: (files: File[]) => void;
   tags?: {
     mentions: TaggedMentions;
     /** Applies ``update`` to the latest stored tags, not the rendered ones. */
@@ -214,6 +216,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     initialMentions,
     segments,
     tags,
+    onDemoteChips,
   } = params;
   const [mentionIndex, setMentionIndex] = useState(-1);
   const [localItems, setLocalItems] = useState<MentionItem[]>(() => initialMentions?.files ?? []);
@@ -426,6 +429,10 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   };
 
   const resetMentions = (mentions?: TaggedMentions) => {
+    // Every reset goes through here: a live chip leaves as a tray file, so its File is kept.
+    if (mentionedAttachments.length > 0) {
+      onDemoteChips?.(mentionedAttachments.map((attachment) => attachment.file));
+    }
     releasedRef.current = NO_TAGS;
     restorePointsRef.current.clear();
     setMentionedItems(mentions?.files ?? []);

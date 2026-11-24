@@ -2812,6 +2812,7 @@ function ComposerImpl(
     removeFile,
     replaceFiles,
     restoreFiles,
+    appendFiles,
     onPaste,
     clearError,
     clear: clearAttachments,
@@ -3172,6 +3173,7 @@ function ComposerImpl(
     },
     textareaRef,
     isMobile,
+    onDemoteChips: appendFiles,
     segments: [draft.text, ...draft.quotes.map((quote) => quote.before)],
   });
 
@@ -4125,8 +4127,9 @@ function ComposerImpl(
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
-    clearAttachments();
+    // Reset first: a chip the reset drops goes to the tray, which the clear then empties.
     resetMentions();
+    clearAttachments();
     if (conversationId) clearLocalReviewContexts(conversationId);
     setMention(null);
   };

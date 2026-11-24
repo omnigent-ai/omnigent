@@ -2760,6 +2760,7 @@ function NewChatLandingContent({
     addFiles,
     removeFile,
     restoreFiles,
+    appendFiles,
     onPaste,
     clearError,
   } = useComposerAttachments({
@@ -5640,6 +5641,7 @@ function NewChatLandingContent({
     setText: setMessage,
     textareaRef,
     initialMentions: restoresDraftText ? restoredDraft?.mentions : undefined,
+    onDemoteChips: appendFiles,
   });
   clearTaggedMentionsRef.current = resetMentions;
   // The draft snapshot is built above the hook; add the tags it owns.

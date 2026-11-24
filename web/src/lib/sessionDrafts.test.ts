@@ -197,13 +197,13 @@ describe("session drafts", () => {
       { message: "see @a.png", names: ["a.png", "a (2).png"] },
     ],
     [
-      "a file from each draft that repeats a name keeps the names distinct",
+      "a tray file from each draft that repeats a name is renamed, and the typed text stays as typed",
       { message: "use @image (2).png", files: [new File(["a"], "image.png")] },
       { message: "look @image.png", files: [new File(["b"], "image.png")] },
       { message: "use @image (2).png\n\nlook @image.png", names: ["image.png", "image (2).png"] },
     ],
     [
-      "two incoming files collide, and each reference keeps its own file",
+      "two incoming files collide: the incoming one is renamed, and the typed text stays as typed",
       { message: "", files: [new File(["a"], "a.png")] },
       {
         message: "First @a.png then second @a (2).png",

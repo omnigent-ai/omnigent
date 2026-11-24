@@ -1457,6 +1457,40 @@ describe("Composer pasted chips", () => {
     expect(valueOf()).toBe("");
     expect(tokens()).toEqual([]);
     expect(screen.getByText(/"setup.exe" can't be attached/)).toBeInTheDocument();
+
+    // A mixed paste inserts its accepted file as a chip, and its rejection stays visible: the insert
+    // itself must not clear the batch's error, and the earlier error is replaced.
+    paste({
+      files: [
+        new File(["s"], "shot.png", { type: "image/png" }),
+        new File(["x"], "setup2.exe", { type: "application/x-msdownload" }),
+      ],
+    });
+    expect(valueOf()).toBe("@shot.png ");
+    expect(tokens()).toEqual(["@shot.png"]);
+    expect(screen.getByText(/"setup2.exe" can't be attached/)).toBeInTheDocument();
+    expect(screen.queryByText(/"setup.exe"/)).toBeNull();
+  });
+
+  it("keeps a newer chip's file when a failed send merges into newer input", async () => {
+    const onSend = await renderCodeMirrorComposer();
+    typeAt("first ");
+    const newer = new File(["n"], "shot.png", { type: "image/png" });
+    paste({ files: [newer] });
+    // A failed send recovers while the newer chip is still in the composer.
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: useChatStore.getState().conversationId!,
+          text: "Ask again",
+          files: [],
+          recovered: true,
+        },
+      }),
+    );
+    fireEvent.submit(composerInput().closest("form")!);
+    expect(sentFiles(onSend)).toHaveLength(1);
+    expect(sentFiles(onSend)![0]).toBe(newer);
   });
 
   it("keeps a chip's file as a tray file when the composer remounts with the saved draft", async () => {
