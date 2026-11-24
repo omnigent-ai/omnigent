@@ -553,3 +553,17 @@ def test_a_deleted_gadgets_files_are_removed_a_bounded_number_at_a_time(
         before = left()
         store.delete(store.create(ALICE, "Scratch").id)
         assert left() < before
+
+
+def test_a_store_opened_without_maintenance_touches_nothing_until_written(tmp_path: Path) -> None:
+    location = tmp_path / "gadgets"
+    (location / ".trash" / "left").mkdir(parents=True)
+    store = LocalGadgetStore(str(location / "absent"), maintain=False)
+    assert not (location / "absent").exists()
+    LocalGadgetStore(str(location), maintain=False)
+    # Its trash is left for a store that maintains it.
+    assert (location / ".trash" / "left").exists()
+    files = store.user_files("alice")
+    files.mkdirs("pending")
+    files.create_json("pending/note.json", {"user_id": "alice"})
+    assert files.read_json("pending/note.json") == {"user_id": "alice"}

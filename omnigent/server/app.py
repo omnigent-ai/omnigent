@@ -2471,6 +2471,14 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        # A deleted account's gadget cleanup noted while gadgets were off goes on once they
+        # are on, without waiting for the next account deletion or registration.
+        deleted_account_gadgets = getattr(app_inst.state, "deleted_account_gadgets", None)
+        if deleted_account_gadgets is not None and app_inst.state.gadgets_available():
+            try:
+                await asyncio.to_thread(deleted_account_gadgets.resume)
+            except Exception:
+                _logger.exception("Gadget cleanup of deleted accounts deferred at startup")
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -4639,11 +4647,10 @@ def create_app(
         )
         # Deleting an account deletes its gadgets, which live outside the database.
         if account_store is not None and hasattr(account_store, "attach_gadgets"):
-            account_store.attach_gadgets(
-                DeletedAccountGadgets(
-                    gadget_store, resolved_gadget_access, enabled=app.state.gadgets_available
-                )
+            app.state.deleted_account_gadgets = DeletedAccountGadgets(
+                gadget_store, resolved_gadget_access, enabled=app.state.gadgets_available
             )
+            account_store.attach_gadgets(app.state.deleted_account_gadgets)
         app.include_router(
             gadgets.create_gadgets_router(
                 gadget_store,

@@ -5033,13 +5033,12 @@ def server(
     gadget_location = cfg.get("gadget_location") or _default_gadget_location()
     if config_path and not Path(gadget_location).is_absolute():
         gadget_location = str(Path(config_path).parent / gadget_location)
-    # Built only when gadgets are on: opening the store runs its cleanup.
+    # With gadgets off the store does no cleanup and touches nothing until a deleted account
+    # notes its gadgets' cleanup, which waits until gadgets are on again.
     from omnigent.server.feature_flags import Feature, resolve_feature_flags
 
-    gadget_store = (
-        LocalGadgetStore(gadget_location)
-        if resolve_feature_flags().enabled(Feature.GADGETS)
-        else None
+    gadget_store = LocalGadgetStore(
+        gadget_location, maintain=resolve_feature_flags().enabled(Feature.GADGETS)
     )
 
     # Initialize the runtime with store references so workflow code

@@ -303,21 +303,25 @@ class LocalGadgetFiles(GadgetFiles):
 class LocalGadgetStore(GadgetStore):
     """Gadgets as JSON files under a local directory (see module docstring)."""
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(self, storage_location: str, *, maintain: bool = True) -> None:
         """
         :param storage_location: The root directory, e.g.
             ``"/home/alice/.omnigent/gadgets"``; created if missing.
+        :param maintain: Create the root and run a cleanup step now. ``False`` for a server
+            with gadgets off, which only notes deleted accounts' cleanups: it touches
+            nothing until something is written.
         """
         super().__init__(storage_location)
         self._root = Path(storage_location)
-        self._root.mkdir(parents=True, exist_ok=True)
         self._tmp_dir = self._root / ".tmp"
         # Renames read and rewrite the metadata file, and a deletion moves it away;
         # serialize them in this process.
         self._metadata_lock = threading.Lock()
         # With the owner's lock file, serializes changes to an owner's head (_owner_index).
         self._owner_lock = threading.Lock()
-        self._sweep()
+        if maintain:
+            self._root.mkdir(parents=True, exist_ok=True)
+            self._sweep()
 
     def _sweep(self) -> None:
         """One bounded step of cleanup: some of the trash, and gadgets whose creation

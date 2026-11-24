@@ -10,7 +10,9 @@ them is bookkeeping that can take several calls.
 
 Each call does bounded work (:data:`GADGETS_PER_CLEANUP` gadgets). A registration with
 more left behind keeps a note in the gadget store, and later calls (another account
-deletion, a registration of that or another name) go on with it.
+deletion, a registration of that or another name, a server start) go on with it. The note
+is written even while gadgets are off, before a later registration of the name replaces
+the deleted one, so the cleanup only waits until gadgets are on again.
 """
 
 from __future__ import annotations
@@ -47,7 +49,8 @@ class DeletedAccountGadgets:
         :param store: Where the gadgets are kept.
         :param access: Forgets each deleted gadget's grants.
         :param enabled: Whether the server has gadgets on; while off, deleting an account
-            leaves the gadget store alone (what it holds stays shared with no one).
+            only notes the cleanup, and deletes nothing until gadgets are on again (what
+            the gadget store holds stays shared with no one meanwhile).
         """
         self._store = store
         self._access = access
@@ -64,9 +67,11 @@ class DeletedAccountGadgets:
 
         :returns: Whether nothing of *registration* is left.
         """
+        # Noted first, even with gadgets off: once the name is registered again nothing else
+        # remembers the deleted registration.
+        self._note(user_id, registration)
         if not self._enabled():
             return False
-        self._note(user_id, registration)
         done = self._step(user_id, registration)
         self.resume(skip=(user_id, registration))
         return done

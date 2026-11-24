@@ -1677,7 +1677,7 @@ def test_a_password_change_needs_nothing_from_the_gadget_store(
     assert [pin["id"] for pin in after.shelf()["pinned"]] == [board["id"]]
 
 
-def test_with_gadgets_off_deleting_an_account_leaves_the_gadget_store_alone(
+def test_with_gadgets_off_deleting_an_account_only_notes_its_gadgets_cleanup(
     db_uri: str, tmp_path, monkeypatch
 ) -> None:
     from omnigent.gadgets.access import PermissionStoreGadgetAccess
@@ -1685,19 +1685,60 @@ def test_with_gadgets_off_deleting_an_account_leaves_the_gadget_store_alone(
     from omnigent.stores.gadget_store.local import LocalGadgetStore
 
     accounts = SqlAlchemyAccountStore(db_uri)
-    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    store = LocalGadgetStore(str(tmp_path / "gadgets"), maintain=False)
     access = PermissionStoreGadgetAccess(store, SqlAlchemyPermissionStore(db_uri))
     accounts.attach_gadgets(DeletedAccountGadgets(store, access, enabled=lambda: False))
 
     def untouched(*_args, **_kwargs):  # type: ignore[no-untyped-def]
-        raise AssertionError("the gadget store was used")
+        raise AssertionError("the gadget store's gadgets were used")
 
-    for name in ("user_files", "iter_owned", "delete", "delete_user_files"):
+    for name in ("list_owned_page", "iter_owned", "delete", "delete_user_files", "get"):
         monkeypatch.setattr(store, name, untouched)
     accounts.create_user_with_password("alice", "alice-hash")
     accounts.update_password("alice", "hash-1", revoke_sessions=True)
     assert accounts.delete_user("alice") is True
     assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+    # Only the cleanup note was written: no gadgets were listed or deleted, and opening the
+    # store with gadgets off ran no cleanup of its own.
+    root = tmp_path / "gadgets"
+    written = {path.relative_to(root).parts[0] for path in root.rglob("*") if path.is_file()}
+    assert written == {"users"}
+
+
+def test_a_cleanup_noted_while_gadgets_were_off_finishes_once_they_are_on(
+    db_uri: str, tmp_path
+) -> None:
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    gadgets_on = {"value": True}
+    cleanup = DeletedAccountGadgets(store, access, enabled=lambda: gadgets_on["value"])
+    accounts.attach_gadgets(cleanup)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    old_board = service("alice").create("Old board")
+    service("alice").pin(old_board["id"], {"pinned": True})
+    permissions.grant_for_gadget("bob", old_board["id"], 1)
+
+    # Off: the deletion and a registration of the name again delete nothing.
+    gadgets_on["value"] = False
+    assert accounts.delete_user("alice") is True
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert store.get(old_board["id"]) is not None
+    # The new account owns nothing of the old one's, even before the cleanup runs.
+    assert service("alice").list_owned() == {"items": [], "next_cursor": None}
+    gadgets_on["value"] = True
+    new_board = service("alice").create("New board")
+
+    # On again: the next cleanup call (a server start, another deletion or registration)
+    # finishes the old registration's, and leaves the new account's alone.
+    cleanup.resume()
+    assert store.get(old_board["id"]) is None
+    assert permissions.list_for_gadget(old_board["id"]) == ([], None)
+    assert [item["id"] for item in service("alice").list_owned()["items"]] == [new_board["id"]]
+    assert service("alice").shelf()["pinned"] == []
 
 
 def test_deleting_an_account_after_password_changes_removes_its_gadgets_for_good(
