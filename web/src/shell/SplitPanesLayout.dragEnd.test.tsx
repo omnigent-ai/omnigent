@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } fr
 import type { TerminalSplitState } from "@/lib/terminalSplitLayout";
 import { SplitPanesLayout } from "@/shell/SplitPanesLayout";
 
-import { formatDividerDragEnd } from "./paneDividerDragEnd";
+import { type DividerDragEnd, formatDividerDragEnd } from "./paneDividerDragEnd";
 
 const SPLIT: TerminalSplitState = {
   layout: { axis: "columns", ratio: 0.5, children: ["a", "b"] },
@@ -61,8 +61,7 @@ function pressDivider() {
 
 let info: MockInstance<typeof console.info>;
 const logged = () => info.mock.calls.map(([line]) => line);
-const ended = (reason: string) =>
-  formatDividerDragEnd("c1", "divider", reason as Parameters<typeof formatDividerDragEnd>[2]);
+const ended = (reason: DividerDragEnd) => formatDividerDragEnd("c1", "divider", reason);
 
 beforeEach(() => {
   info = vi.spyOn(console, "info").mockImplementation(() => {});
@@ -84,7 +83,7 @@ describe("a divider drag that ends unsaved", () => {
     layout: { axis: "rows", ratio: 0.5, children: ["a", "b"] },
     focusedKey: "a",
   };
-  it.each<[string, TerminalSplitState | undefined, string | null]>([
+  it.each<[DividerDragEnd, TerminalSplitState | undefined, string | null]>([
     ["split-hidden", undefined, null],
     ["pane-maximized", SPLIT, "b"],
     ["divider-gone", ROWS, null],
@@ -115,6 +114,7 @@ describe("a divider drag that ends unsaved", () => {
         fireEvent.pointerMove(document.body, { pointerId: 1, buttons: 0 });
       },
     ],
+    ["window-blurred", () => fireEvent.blur(window)],
   ] as const)("names %s when the pointer is taken away", (reason, takeAway) => {
     render(<View split={SPLIT} />);
     const divider = pressDivider();

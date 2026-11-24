@@ -1,7 +1,7 @@
 // A pointer drag on a split's divider or corner: it holds the pointer from press to release,
 // reports the pointer as percent of the panes' view, and marks the window's divider drag.
 
-import { type PointerEvent, type RefObject, useEffect, useRef } from "react";
+import { type PointerEvent, type RefObject, useEffect, useLayoutEffect, useRef } from "react";
 
 import { paneDividerDrag } from "@/shell/paneDividerDrag";
 import type { PointerDragEnd } from "@/shell/paneDividerDragEnd";
@@ -33,13 +33,15 @@ export function usePaneDividerPointer({
   // The pointer this handle holds, and the call that ends the window's drag marker, once.
   const held = useRef<{ element: HTMLElement; pointerId: number } | null>(null);
   const endDrag = useRef<(() => void) | null>(null);
-  // Removes the window's listeners that follow a pointer whose capture ended before its release.
+  // Removes the document's listeners that follow a pointer whose capture ended before its release.
   const unfollow = useRef<(() => void) | null>(null);
   // Removes the window's blur listener, which drops the drag from its press to its end.
   const unwatchBlur = useRef<(() => void) | null>(null);
-  // The latest callbacks, for those listeners, which outlive the render that added them.
+  // The latest committed callbacks, for those listeners, which outlive the render that added them.
   const latest = useRef({ onMove, onCommit, onAbort });
-  latest.current = { onMove, onCommit, onAbort };
+  useLayoutEffect(() => {
+    latest.current = { onMove, onCommit, onAbort };
+  });
   const finishDrag = () => {
     held.current = null;
     unfollow.current?.();
@@ -58,7 +60,7 @@ export function usePaneDividerPointer({
     const view = element.ownerDocument.defaultView;
     const onBlur = () => {
       if (element.hasPointerCapture?.(pointerId)) element.releasePointerCapture?.(pointerId);
-      lose("pointer-lost");
+      lose("window-blurred");
     };
     view?.addEventListener("blur", onBlur);
     unwatchBlur.current = () => view?.removeEventListener("blur", onBlur);
@@ -136,7 +138,7 @@ export function usePaneDividerPointer({
       if (event.currentTarget.hasPointerCapture(event.pointerId)) moveTo(event);
     },
     onPointerUp: end(onCommit),
-    // After a release the drag is already over, so these drop nothing more.
+    // A cancel after the release finds no drag held and drops nothing.
     onPointerCancel: end(() => onAbort("pointer-cancelled")),
     onLostPointerCapture: (event: PointerEvent<HTMLElement>) => {
       const pointer = held.current;

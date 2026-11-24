@@ -5,6 +5,8 @@ import { paneDividerDrag } from "@/shell/paneDividerDrag";
 import { PaneSplitDivider } from "@/shell/PaneSplitDivider";
 
 describe("PaneSplitDivider drags", () => {
+  // Each test's spies, such as the body's mocked bounds, end with it.
+  afterEach(() => vi.restoreAllMocks());
   const divider = {
     axis: "columns" as const,
     area: { left: 0, top: 0, width: 100, height: 100 },
@@ -79,7 +81,7 @@ describe("PaneSplitDivider drags", () => {
     fireEvent.pointerUp(document.body, { pointerId: 1 });
     fireEvent.pointerUp(element, { pointerId: 1 });
     fireEvent.blur(window);
-    expect(onAbort).toHaveBeenCalledExactlyOnceWith("pointer-lost");
+    expect(onAbort).toHaveBeenCalledExactlyOnceWith("window-blurred");
     expect(onCommit).not.toHaveBeenCalled();
     expect(paneDividerDrag.dragging()).toBe(false);
   });
@@ -140,7 +142,7 @@ describe("PaneSplitDivider drags", () => {
         () => fireEvent.pointerMove(document.body, { pointerId: 1, buttons: 0 }),
         "pointer-lost",
       ],
-      ["the window's blur", () => fireEvent.blur(window), "pointer-lost"],
+      ["the window's blur", () => fireEvent.blur(window), "window-blurred"],
       [
         "a cancel",
         () => fireEvent.pointerCancel(document.body, { pointerId: 1 }),

@@ -2,8 +2,8 @@
 // that snapped back names the cause. The line carries the session id, the handle and the reason
 // only; the renderer-console capture saves it.
 
-/** The pointer was taken away from the handle before its release. */
-export type PointerDragEnd = "pointer-cancelled" | "pointer-lost";
+/** The pointer was taken away from the handle before its release, or the window lost focus. */
+export type PointerDragEnd = "pointer-cancelled" | "pointer-lost" | "window-blurred";
 
 /** The layout ended the drag: it stopped showing the split, a pane, or the held divider. */
 export type LayoutDragEnd = "split-hidden" | "pane-maximized" | "divider-gone" | "panes-unmounted";
