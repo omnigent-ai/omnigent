@@ -1,9 +1,19 @@
+/// <reference types="vitest/jsdom" />
+
 import "@testing-library/jest-dom/vitest";
 import { configure } from "@testing-library/react";
 import type * as ReactVirtualModule from "@tanstack/react-virtual";
 import { afterEach, vi } from "vitest";
 
 import { abortInFlightXhrs, FetchBackedXhr, sentXhrs } from "@/test/fetchBackedXhr";
+
+// Vitest leaves Node's own localStorage in place when it exists. Use the
+// browser's isolated storage even on Node versions that expose a native one.
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  writable: true,
+  value: jsdom.window.localStorage,
+});
 
 // Tooltip surfaces intentionally wait 1s; leave enough margin for async queries
 // to observe them without racing Testing Library's matching default timeout.
