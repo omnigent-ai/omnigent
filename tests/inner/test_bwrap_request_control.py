@@ -328,13 +328,13 @@ def test_lost_or_wrong_request_results_cannot_report_success_or_replay(
 
 @pytest.mark.parametrize(
     ("flags", "expected"),
-    [(0, False), (select.POLLIN, True), (select.POLLHUP, True), (select.POLLNVAL, None)],
+    [(None, False), ("POLLIN", True), ("POLLHUP", True), ("POLLNVAL", None)],
 )
 def test_kernel_exit_observation_rejects_invalid_descriptors(
-    monkeypatch: pytest.MonkeyPatch, flags: int, expected: bool | None
+    monkeypatch: pytest.MonkeyPatch, flags: str | None, expected: bool | None
 ) -> None:
     poller = MagicMock()
-    poller.poll.return_value = [(2048, flags)] if flags else []
+    poller.poll.return_value = [(2048, getattr(select, flags))] if flags else []
     monkeypatch.setattr(request_control.select, "poll", lambda: poller)
     if expected is None:
         with pytest.raises(OSError):
