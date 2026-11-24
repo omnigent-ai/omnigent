@@ -320,15 +320,17 @@ class ReliabilityLoop:
         updated = int(ticket.get("updated_at") or 0)
         workers = await self._workers(project, ticket_id, excluded)
         running = [w for w in workers if w.status in _MID_TURN]
-        progressed = ladder is not None and (
-            updated > ladder.ticket_mark
-            or any(w.position > ladder.worker_marks.get(w.id, w.position) for w in workers)
-        )
-        if running or progressed:
-            if ladder is not None:
-                state.tickets.pop(ticket_id, None)
-                state.escalated.discard(ticket_id)
+        # Only ticket activity counts as progress: a worker that just replies to a
+        # nudge without moving the ticket still escalates.
+        if ladder is not None and updated > ladder.ticket_mark:
+            state.tickets.pop(ticket_id, None)
+            state.escalated.discard(ticket_id)
             return
+        if running:
+            return
+        replied = ladder is not None and any(
+            w.position > ladder.worker_marks.get(w.id, w.position) for w in workers
+        )
         if ladder is None:
             last = max([updated, *(w.activity_at for w in workers)])
             idle_s = now - last
@@ -345,7 +347,8 @@ class ReliabilityLoop:
         next_step = ladder.step + 1
         if next_step == NUDGE and not alive:
             next_step = RESTART if dead else ESCALATE
-        if next_step == RESTART and not workers:
+        if next_step == RESTART and (not workers or replied):
+            # Nothing to restart, or the worker is alive and answered.
             next_step = ESCALATE
         if next_step > ESCALATE:
             return
@@ -387,7 +390,13 @@ class ReliabilityLoop:
                     ", ".join(f"{w.id[:8]} {'dead' if w.dead else w.status}" for w in workers)
                     or "none linked"
                 )
-                + ("; the loop already nudged and restarted them." if ladder.step else ".")
+                + (
+                    "; a worker replied to the nudge but the ticket didn't move."
+                    if replied
+                    else "; the loop already nudged or restarted them."
+                    if ladder.step
+                    else "."
+                )
                 + " Please check it and decide the next step."
             )
             await self._send(project.main_session_id, summary, project.user_id)

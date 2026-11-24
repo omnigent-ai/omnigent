@@ -134,10 +134,18 @@ async def test_stalled_worker_is_nudged_restarted_then_escalated(world: SimpleNa
     ]
 
 
-async def test_worker_reply_resets_the_ladder(world: SimpleNamespace) -> None:
+async def test_a_reply_without_ticket_progress_skips_the_restart(world: SimpleNamespace) -> None:
     await world.loop.check_project("p1", None, now=11 * MINUTE)
     world.conversations.convs["worker"].next_position += 3
     world.conversations.convs["worker"].updated_at = int(12 * MINUTE)
+    await world.loop.check_project("p1", None, now=17 * MINUTE)
+    assert world.restarts == [] and world.inputs.sent[-1][0] == "lead"
+    assert "replied to the nudge" in world.inputs.sent[-1][1]
+
+
+async def test_ticket_activity_resets_the_ladder(world: SimpleNamespace) -> None:
+    await world.loop.check_project("p1", None, now=11 * MINUTE)
+    world.tickets.tickets[0]["updated_at"] = 10_000_001
     await world.loop.check_project("p1", None, now=17 * MINUTE)
     assert world.restarts == [] and "t1" not in world.loop.state["p1"].tickets
 
