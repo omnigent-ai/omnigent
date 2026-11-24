@@ -3,6 +3,7 @@ import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { Toaster } from "@/components/ui/sonner";
+import { WhatsNew } from "@/components/WhatsNew";
 import type { Conversation } from "@/hooks/useConversations";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
@@ -57,6 +58,8 @@ export function AppShellOverlays({
       {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
           ⌘/Ctrl+/ opener); ungated so it works on every route. */}
       <KeyboardShortcutsDialog />
+      {/* Release-notes pill for entries newer than this browser last saw. */}
+      {!isEmbedded && <WhatsNew />}
       {/* Opens the import modal once per newly connected host. */}
       {!isEmbedded && <ImportReviewGate />}
       {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}
