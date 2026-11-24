@@ -1145,68 +1145,73 @@ class CodexNativeExecutor(Executor):
         cancelled the way the Codex TUI does — ``turn/interrupt`` with an
         empty turn id (its ``startup_interrupt``). Either alone also works:
         no recorded turn cancels just the startup; no pending startup
-        interrupts just the turn.
+        interrupts just the turn. It waits for a submission in flight, so the
+        turn that submission started is the one interrupted.
 
         :param session_key: Adapter session key. Unused because the
             bridge is per conversation.
         :returns: ``True`` when an interrupt or a startup cancel was sent.
         """
         del session_key
-        state = read_bridge_state(self._bridge_dir)
-        if state is None:
-            return False
-        # Flip the local map first: the cancelled record is what the web
-        # band and turn-error text read, even if Codex never acknowledges.
-        # Unlike the runner's Stop handler, the flipped map is not
-        # published here — the inner process has no server client; web
-        # Stop routes through the runner handler, which does publish.
-        pending = cancel_pending_mcp_startup(self._bridge_dir)
-        if state.active_turn_id is None and not pending:
-            return False
-        client = client_for_transport(
-            state.socket_path,
-            client_name="omnigent-codex-native",
-        )
-        await client.connect()
-        try:
-            if pending:
-                # Startup interrupt first and best-effort: the local
-                # cancel above already updated what Omnigent shows, and a
-                # failure here must not block the active-turn interrupt.
-                try:
-                    await client.request(
-                        "turn/interrupt",
-                        {"threadId": state.thread_id, "turnId": ""},
-                    )
-                except Exception:  # the local cancel above already took effect.
-                    _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
-                _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
-            if state.active_turn_id is not None:
-                try:
-                    await client.request(
-                        "turn/interrupt",
-                        {
-                            "threadId": state.thread_id,
-                            "turnId": state.active_turn_id,
-                        },
-                    )
-                except CodexAppServerResponseError as error:
-                    # The recorded turn already ended or was replaced by a
-                    # newer one, so there is nothing left to interrupt — not a
-                    # failure. The local cancel map was already flipped above.
-                    if not is_stale_active_turn_error(error):
-                        raise
-                    # Drop the stale record unless a newer turn/started already
-                    # replaced it.
-                    clear_active_turn_id_if_matches(self._bridge_dir, state.active_turn_id)
-                    _logger.info(
-                        "Codex native interrupt skipped: recorded turn %s already superseded (%s)",
-                        state.active_turn_id,
-                        error.message,
-                    )
-        finally:
-            await client.close()
-        return True
+        # A submission in flight holds this lock until Codex's turn id is recorded,
+        # so a Stop that races it interrupts the turn Codex accepted.
+        async with self._inject_lock:
+            state = read_bridge_state(self._bridge_dir)
+            if state is None:
+                return False
+            # Flip the local map first: the cancelled record is what the web
+            # band and turn-error text read, even if Codex never acknowledges.
+            # Unlike the runner's Stop handler, the flipped map is not
+            # published here — the inner process has no server client; web
+            # Stop routes through the runner handler, which does publish.
+            pending = cancel_pending_mcp_startup(self._bridge_dir)
+            if state.active_turn_id is None and not pending:
+                return False
+            client = client_for_transport(
+                state.socket_path,
+                client_name="omnigent-codex-native",
+            )
+            await client.connect()
+            try:
+                if pending:
+                    # Startup interrupt first and best-effort: the local
+                    # cancel above already updated what Omnigent shows, and a
+                    # failure here must not block the active-turn interrupt.
+                    try:
+                        await client.request(
+                            "turn/interrupt",
+                            {"threadId": state.thread_id, "turnId": ""},
+                        )
+                    except Exception:  # the local cancel above already took effect.
+                        _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
+                    _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
+                if state.active_turn_id is not None:
+                    try:
+                        await client.request(
+                            "turn/interrupt",
+                            {
+                                "threadId": state.thread_id,
+                                "turnId": state.active_turn_id,
+                            },
+                        )
+                    except CodexAppServerResponseError as error:
+                        # The recorded turn already ended or was replaced by a
+                        # newer one, so there is nothing left to interrupt — not a
+                        # failure. The local cancel map was already flipped above.
+                        if not is_stale_active_turn_error(error):
+                            raise
+                        # Drop the stale record unless a newer turn/started already
+                        # replaced it.
+                        clear_active_turn_id_if_matches(self._bridge_dir, state.active_turn_id)
+                        _logger.info(
+                            "Codex native interrupt skipped: recorded turn %s already "
+                            "superseded (%s)",
+                            state.active_turn_id,
+                            error.message,
+                        )
+            finally:
+                await client.close()
+            return True
 
     async def run_turn(
         self,

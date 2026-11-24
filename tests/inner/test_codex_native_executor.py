@@ -4559,6 +4559,65 @@ def test_run_turn_waits_for_the_state_when_the_record_clears_first(
     assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
 
 
+@pytest.mark.asyncio
+async def test_interrupt_during_submission_stops_the_turn_codex_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A Stop that races ``turn/start`` interrupts the turn Codex accepts, once its id is known.
+
+    Codex can accept a message before its turn id is recorded. The interrupt
+    waits for the submission in flight instead of finding no recorded turn and
+    stopping nothing, then interrupts the accepted turn.
+    """
+    accept_turn = asyncio.Event()
+    submitting = asyncio.Event()
+
+    class _SlowAckClient(_FakeCodexNativeClient):
+        requests: list[tuple[str, dict[str, Any]]] = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/start":
+                submitting.set()
+                await accept_turn.wait()
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _SlowAckClient
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def _run() -> list[object]:
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}], [], ""
+            )
+        ]
+
+    turn = asyncio.create_task(_run())
+    await asyncio.wait_for(submitting.wait(), timeout=5)
+    interrupt = asyncio.create_task(executor.interrupt_session("session"))
+    await asyncio.sleep(0)
+    assert not interrupt.done()
+    accept_turn.set()
+
+    assert await asyncio.wait_for(interrupt, timeout=5) is True
+    assert [type(event) for event in await turn] == [TurnComplete]
+    accepted = read_bridge_state(tmp_path)
+    assert accepted is not None
+    assert [method for method, _params in _SlowAckClient.requests] == [
+        "turn/start",
+        "turn/interrupt",
+    ]
+    assert _SlowAckClient.requests[1][1] == {
+        "threadId": "thread_123",
+        "turnId": accepted.active_turn_id,
+    }
+
+
 def test_stop_as_codex_finishes_starting_submits_nothing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
