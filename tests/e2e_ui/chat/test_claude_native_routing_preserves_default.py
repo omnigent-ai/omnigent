@@ -5,8 +5,12 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import subprocess
+import threading
+import time
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -57,6 +61,84 @@ pytestmark = [pytest.mark.nightly, pytest.mark.timeout(420)]
 
 _JUDGE_MODEL = "mock-claude-routing-judge"
 _TARGET_MODEL = _PINNED_CLAUDE_MODELS["opus"]
+
+
+@contextlib.contextmanager
+def _record_reflow_observations(bridge_dir: Path, destination: Path) -> Iterator[None]:
+    """Retain read-only dimension changes and stable captures around the first replay."""
+    stopped = threading.Event()
+    observations: list[dict] = []
+
+    def observe() -> None:
+        started = time.monotonic()
+        previous = ""
+        baseline = ""
+        info = bridge.read_tmux_target(bridge_dir)
+        if info is None:
+            return
+
+        def dimensions() -> str:
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "-S",
+                    info["socket_path"],
+                    "display-message",
+                    "-p",
+                    "-t",
+                    info["tmux_target"],
+                    "#{pane_width} #{pane_height} #{window_width} #{window_height} #{window-size}",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=0.5,
+            )
+            return result.stdout.strip()
+
+        while time.monotonic() - started < 5 and not stopped.is_set():
+            try:
+                current = dimensions()
+                if not baseline:
+                    baseline = current
+                if current != previous or current != baseline:
+                    pane = bridge._capture_pane(info["socket_path"], info["tmux_target"])
+                    joined = bridge._capture_pane(
+                        info["socket_path"], info["tmux_target"], join_wrapped=True
+                    )
+                    after = dimensions()
+                    observations.append(
+                        {
+                            "after_s": time.monotonic() - started,
+                            "dimensions": current,
+                            "dimensions_after": after,
+                            "stable_dimensions": current == after,
+                            "pane": pane,
+                            "joined_pane": joined,
+                            "physical_draft": _draft(pane),
+                            "joined_draft": _draft(joined),
+                        }
+                    )
+                    if current == after:
+                        previous = current
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                observations.append({"error": str(exc)})
+            stopped.wait(0.1)
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        recording = worker.submit(observe)
+        try:
+            yield
+        finally:
+            stopped.set()
+            try:
+                recording.result()
+            except Exception as exc:
+                observations.append({"observer_error": str(exc)})
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "routing-reflow-observations.json").write_text(
+                json.dumps(observations, indent=2)
+            )
 
 
 @pytest.fixture
@@ -196,23 +278,32 @@ def test_claude_routing_preserves_default_and_delivers_once(
             set_fallback_mock_llm(
                 mock_llm_server_url, _native_claude_wire_model(_TARGET_MODEL), reply
             )
-            if entry == "terminal":
-                _open_terminal_view(page)
-                _wait_terminal_connected(page)
-                _type_into_tui(page, prompt)
-            else:
-                _ensure_chat_view(page)
-                _send(page, prompt)
-            _wait_for_transcript_message(
-                page,
-                base_url,
-                session_id,
-                reply,
-                role="assistant",
-                timeout_s=(
-                    180 if entry == "terminal" and index == 1 else _TRANSCRIPT_SETTLE_TIMEOUT_S
-                ),
-            )
+            observation: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
+            if entry == "terminal" and index == 1:
+                snapshot = _live_claude_snapshot(base_url, session_id)
+                bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
+                observation = _record_reflow_observations(
+                    bridge.bridge_dir_for_bridge_id(bridge_id),
+                    Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path))),
+                )
+            with observation:
+                if entry == "terminal":
+                    _open_terminal_view(page)
+                    _wait_terminal_connected(page)
+                    _type_into_tui(page, prompt)
+                else:
+                    _ensure_chat_view(page)
+                    _send(page, prompt)
+                _wait_for_transcript_message(
+                    page,
+                    base_url,
+                    session_id,
+                    reply,
+                    role="assistant",
+                    timeout_s=(
+                        180 if entry == "terminal" and index == 1 else _TRANSCRIPT_SETTLE_TIMEOUT_S
+                    ),
+                )
             (tmp_path / f"routing-{entry}-turn-{index}.txt").write_text(
                 _pane_text(base_url, session_id)
             )
