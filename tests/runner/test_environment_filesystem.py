@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -38,6 +39,8 @@ from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.workspace_file_search import walk_search
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
 
@@ -1800,6 +1803,232 @@ async def test_multi_repo_routes_bind_session_git_and_preserve_repository_metada
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "git_status_failed"
     assert "Repository 'broken'" in response.json()["error"]["message"]
+
+
+# ── Concurrent /changes listings ─────────────────────────────────────────────
+
+
+def _changed_repository(root: Path) -> None:
+    """Create a repository at *root* whose committed ``same.txt`` is modified."""
+    root.mkdir()
+    (root / "same.txt").write_text("original\n")
+    for argv in (["init"], ["add", "."], ["commit", "-m", "initial"]):
+        subprocess.run(["git", *argv], cwd=root, env=_git_env(), check=True, capture_output=True)
+    (root / "same.txt").write_text("changed\n")
+
+
+def _observe_listing_arrivals(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record each /changes listing as it joins or starts a shared scan."""
+    from omnigent.util.fresh_call_coalescer import FreshCallCoalescer
+
+    arrivals: list[object] = []
+    coalesced_run = FreshCallCoalescer.run
+
+    async def observed_run(self: Any, key: Any, call: Any) -> Any:
+        arrivals.append(key)
+        return await coalesced_run(self, key, call)
+
+    monkeypatch.setattr(FreshCallCoalescer, "run", observed_run)
+    return arrivals
+
+
+async def test_concurrent_listings_for_two_sessions_each_see_only_their_own_edits(
+    client: httpx.AsyncClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sessions sharing one workspace never wait on, or read, each other's listing.
+
+    Both sessions here use the runner's non-Git registry, which answers per
+    session; a listing for one must not be served by, or queue behind, the other's.
+    """
+    from omnigent.runtime.filesystem_registry import MultiRepositoryFilesystemRegistry
+
+    fs_registry = app.state.filesystem_registry
+    fs_registry.record_change("hello.txt", "modified", "conv_test")
+    fs_registry.record_change("src/main.py", "modified", "conv_other")
+    first_listing = threading.Event()
+    release = threading.Event()
+    list_changed_files = MultiRepositoryFilesystemRegistry.list_changed_files
+
+    def held_first_listing(self: Any, conversation_id: str, *, limit: int) -> Any:
+        if not first_listing.is_set():
+            first_listing.set()
+            release.wait(budget(10))
+        return list_changed_files(self, conversation_id, limit=limit)
+
+    monkeypatch.setattr(
+        MultiRepositoryFilesystemRegistry, "list_changed_files", held_first_listing
+    )
+    path = f"resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    held = asyncio.create_task(client.get(f"/v1/sessions/conv_test/{path}"))
+    try:
+        await poll_until_async(first_listing.is_set, timeout_s=budget(5))
+        other = await asyncio.wait_for(
+            client.get(f"/v1/sessions/conv_other/{path}"), timeout=budget(5)
+        )
+        assert not held.done()
+    finally:
+        release.set()
+    assert other.status_code == 200, other.text
+    assert [entry["path"] for entry in other.json()["data"]] == ["src/main.py"]
+    response = await held
+    assert response.status_code == 200, response.text
+    assert [entry["path"] for entry in response.json()["data"]] == ["hello.txt"]
+
+
+async def test_a_missing_environment_still_404s_while_the_default_one_scans(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """An unknown environment answers 404 at once, even mid-scan for its session."""
+    _changed_repository(workspace / "alpha")
+    environment = registry._primary_envs["conv_test"]
+    request.addfinalizer(environment.close)
+    run_git = environment.run_git
+    status_started = threading.Event()
+    release = threading.Event()
+
+    def held_first_status(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        if argv[0] == "status" and not status_started.is_set():
+            status_started.set()
+            release.wait(budget(10))
+        return run_git(argv, cwd, timeout)
+
+    monkeypatch.setattr(environment, "run_git", held_first_status)
+    base = "/v1/sessions/conv_test/resources/environments"
+    listing = asyncio.create_task(client.get(f"{base}/{DEFAULT_ENVIRONMENT_ID}/changes"))
+    try:
+        await poll_until_async(status_started.is_set, timeout_s=budget(5))
+        missing = await asyncio.wait_for(
+            client.get(f"{base}/missing-terminal/changes"), timeout=budget(5)
+        )
+        assert not listing.done()
+    finally:
+        release.set()
+    assert missing.status_code == 404, missing.text
+    assert missing.json()["error"]["code"] == "not_found"
+    response = await listing
+    assert response.status_code == 200, response.text
+    assert [entry["path"] for entry in response.json()["data"]] == ["alpha/same.txt"]
+
+
+async def test_listings_sharing_a_failed_scan_each_report_it_and_the_next_listing_rescans(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A scan's Git failure reaches each listing sharing it, and is not reused afterwards."""
+    _changed_repository(workspace / "alpha")
+    environment = registry._primary_envs["conv_test"]
+    request.addfinalizer(environment.close)
+    run_git = environment.run_git
+    status_started = threading.Event()
+    release = threading.Event()
+
+    def held_first_status(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        if argv[0] == "status" and not status_started.is_set():
+            status_started.set()
+            release.wait(budget(10))
+        return run_git(argv, cwd, timeout)
+
+    monkeypatch.setattr(environment, "run_git", held_first_status)
+    arrivals = _observe_listing_arrivals(monkeypatch)
+    path = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    first = asyncio.create_task(client.get(path))
+    late: list[asyncio.Task[httpx.Response]] = []
+    try:
+        await poll_until_async(status_started.is_set, timeout_s=budget(5))
+        # Breaks the next scan; the running one already chose its repositories.
+        (workspace / "broken" / ".git").mkdir(parents=True)
+        late = [asyncio.create_task(client.get(path)) for _ in range(3)]
+        await poll_until_async(lambda: len(arrivals) == 4, timeout_s=budget(5))
+    finally:
+        release.set()
+
+    first_response = await first
+    assert first_response.status_code == 200, first_response.text
+    assert [entry["path"] for entry in first_response.json()["data"]] == ["alpha/same.txt"]
+    for response in await asyncio.gather(*late):
+        assert response.status_code == 500, response.text
+        assert response.json()["error"]["code"] == "git_status_failed"
+        assert "Repository 'broken'" in response.json()["error"]["message"]
+
+    shutil.rmtree(workspace / "broken")
+    response = await client.get(path)
+    assert response.status_code == 200, response.text
+    assert [entry["path"] for entry in response.json()["data"]] == ["alpha/same.txt"]
+
+
+class _SteppedClock:
+    """Stands in for a module's ``time``; ``monotonic`` runs ``offset`` seconds ahead."""
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.offset
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+async def test_a_listing_queued_behind_a_long_scan_gets_a_full_repository_budget(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """The eight-second multi-repository budget starts when a scan starts, not on arrival.
+
+    A listing that waits out a slow scan must not fail with the budget already spent.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+
+    _changed_repository(workspace / "alpha")
+    clock = _SteppedClock()
+    monkeypatch.setattr(filesystem_registry_mod, "time", clock)
+    environment = registry._primary_envs["conv_test"]
+    request.addfinalizer(environment.close)
+    run_git = environment.run_git
+    diff_started = threading.Event()
+    release = threading.Event()
+
+    def long_first_diff(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        result = run_git(argv, cwd, timeout)
+        if argv[0] == "diff" and not diff_started.is_set():
+            diff_started.set()
+            release.wait(budget(10))
+            # The first scan's last Git call outlasts any budget set while it ran.
+            clock.offset += 9
+        return result
+
+    monkeypatch.setattr(environment, "run_git", long_first_diff)
+    arrivals = _observe_listing_arrivals(monkeypatch)
+    path = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    first = asyncio.create_task(client.get(path))
+    queued: asyncio.Task[httpx.Response] | None = None
+    try:
+        await poll_until_async(diff_started.is_set, timeout_s=budget(5))
+        queued = asyncio.create_task(client.get(path))
+        await poll_until_async(lambda: len(arrivals) == 2, timeout_s=budget(5))
+    finally:
+        release.set()
+
+    assert queued is not None
+    for response in await asyncio.gather(first, queued):
+        assert response.status_code == 200, response.text
+        assert [entry["path"] for entry in response.json()["data"]] == ["alpha/same.txt"]
 
 
 # ── _require_os_env guard: all Phase-3 endpoints ────────────────────────────
