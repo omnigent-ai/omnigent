@@ -15,14 +15,22 @@ The eight uniform interrupt harnesses and seven uniform stop harnesses differ
 only by bridge module, control-function name, and error label; they collapse to
 two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
 :data:`_UNIFORM_STOP`. claude interrupt (bridge-id resolution), codex interrupt
-(MCP-startup + app-server ``turn/interrupt``), and opencode interrupt (native
-``POST /api/session/{id}/interrupt``) keep dedicated methods; claude stop is likewise
-special-cased and codex/pi alias stop to their interrupt handler.
+(MCP-startup + app-server ``turn/interrupt``), opencode interrupt (native
+``POST /api/session/{id}/interrupt``), and antigravity interrupt (WAITING ->
+deny through the interaction bridge, RUNNING -> connect-RPC
+``CancelCascadeSteps``, falling back to a TUI ``Escape``) keep dedicated
+methods; claude stop and antigravity stop are likewise special-cased and
+codex/pi alias stop to their interrupt handler.
 
-Coverage note: antigravity-native has no handler here and :meth:`interrupt` /
-:meth:`stop` return ``None`` for it, so the caller falls through to the
-in-process turn cancel. opencode-native interrupts through its server's
+Coverage note: opencode-native interrupts through its server's
 ``POST /api/session/{id}/interrupt`` and aliases stop to interrupt.
+antigravity-native interrupt first checks whether the cascade is WAITING on a
+user interaction (``CancelCascadeSteps`` is a no-op there even though it
+returns HTTP 200) and, if so, denies that interaction through the same RPC the
+interaction bridge uses; otherwise it cancels a RUNNING cascade via
+``CancelCascadeSteps`` directly, falling back to a TUI ``Escape`` keystroke
+only when the connect-RPC path is unreachable. Stop hard-kills the tmux
+session, like claude/cursor.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from fastapi.responses import JSONResponse, Response
 
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.native.orchestration import (
+    _antigravity_native_bridge_id_for_session,
     _cancel_auto_forwarder_task,
     _claude_native_bridge_id_for_session,
 )
@@ -310,9 +319,10 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
     Mirrors :meth:`NativeInterruptRunner.stop` instead of comparing one Claude
     wrapper label:
 
-    * ``"stop"`` — Claude's dedicated stop, or a key in :data:`_UNIFORM_STOP`
+    * ``"stop"`` — Claude's or Antigravity's dedicated stop, or a key in
+      :data:`_UNIFORM_STOP`
     * ``"best_effort"`` — remaining native agents (Codex/Pi/OpenCode alias
-      stop to interrupt; Antigravity has no stop handler)
+      stop to interrupt and have no runner-side hard-stop)
     * ``"inprocess"`` — no native agent for this label
 
     :param wrapper_label: The work entry's ``omnigent.wrapper`` value.
@@ -321,7 +331,7 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
     agent = native_agent_for_cancel(wrapper_label)
     if agent is None:
         return "inprocess"
-    if agent.key == "claude" or agent.key in _UNIFORM_STOP:
+    if agent.key in ("claude", "antigravity") or agent.key in _UNIFORM_STOP:
         return "stop"
     return "best_effort"
 
@@ -386,6 +396,8 @@ class NativeInterruptRunner:
             return await self._codex_interrupt(conv_id)
         if key == "opencode":
             return await self._opencode_interrupt(conv_id)
+        if key == "antigravity":
+            return await self._antigravity_interrupt(conv_id)
         spec = _UNIFORM_INTERRUPT.get(key)
         if spec is None:
             return None
@@ -406,6 +418,8 @@ class NativeInterruptRunner:
         key = agent.key
         if key == "claude":
             return await self._claude_stop(conv_id)
+        if key == "antigravity":
+            return await self._antigravity_stop(conv_id)
         if key in ("codex", "pi", "opencode"):
             return await self.interrupt(harness_name, conv_id)
         spec = _UNIFORM_STOP.get(key)
@@ -703,6 +717,167 @@ class NativeInterruptRunner:
         ):
             self._logger.warning(
                 "Claude-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
+    async def _antigravity_interrupt(self, conv_id: str) -> Response:
+        """Deny a pending interaction before cancelling the cascade; Escape is
+        only a last-resort fallback when connect-RPC control is unavailable.
+        """
+        from omnigent.harnesses.antigravity_native.bridge import (
+            bridge_dir_for_bridge_id,
+            is_placeholder_conversation_id,
+            read_bridge_state,
+            send_interaction_keys_via_tui,
+        )
+        from omnigent.harnesses.antigravity_native.rpc import (
+            AntigravityRpcError,
+            cancel_cascade_steps,
+            get_trajectory_steps,
+            handle_user_interaction,
+            resolve_language_server_port,
+        )
+        from omnigent.harnesses.antigravity_native.steps import pending_interaction
+        from omnigent.server.routes._antigravity_elicitation import (
+            to_interaction_payload,
+            to_tui_selection_keys,
+        )
+        from omnigent.server.schemas import ElicitationResult
+
+        bridge_id = await _antigravity_native_bridge_id_for_session(
+            server_client=self._server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+
+        cascade_id: str | None = None
+        port: int | None = None
+        if state is not None and not is_placeholder_conversation_id(state.conversation_id):
+            cascade_id = state.conversation_id
+            port = await asyncio.to_thread(resolve_language_server_port, cascade_id)
+
+        if port is not None and cascade_id is not None:
+            try:
+                steps = await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
+            except (httpx.HTTPError, ValueError):
+                steps = None
+
+            if steps is not None:
+                candidates = [
+                    candidate
+                    for candidate in (pending_interaction(step) for step in steps)
+                    if candidate is not None
+                ]
+                waiting = max(candidates, key=lambda c: c["step_index"], default=None)
+
+                if waiting is not None:
+                    payload = to_interaction_payload(
+                        waiting["kind"], ElicitationResult(action="decline"), waiting["spec"]
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            handle_user_interaction,
+                            port,
+                            cascade_id,
+                            trajectory_id=waiting["trajectory_id"],
+                            step_index=waiting["step_index"],
+                            payload=payload,
+                        )
+                    except AntigravityRpcError as exc:
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": "antigravity_native_interrupt_failed",
+                                "detail": self._client_safe_error_detail(
+                                    exc, context="antigravity-native interrupt"
+                                ),
+                            },
+                        )
+                    # Some agy versions leave the attended TUI prompt open after
+                    # RPC delivery; dismiss it best-effort, same as bridge_interaction.
+                    keys = to_tui_selection_keys(
+                        waiting["kind"], ElicitationResult(action="decline"), waiting["spec"]
+                    )
+                    if keys:
+                        try:
+                            await asyncio.to_thread(
+                                send_interaction_keys_via_tui, bridge_dir, *keys
+                            )
+                        except RuntimeError as exc:
+                            self._logger.warning(
+                                "agy interrupt: TUI prompt dismissal failed: %r", exc
+                            )
+                    # Denial may resume the cascade; best-effort cancel (never masks the denial).
+                    await asyncio.to_thread(cancel_cascade_steps, port, cascade_id)
+                    self._defer_parent_wake_after_native_interrupt(conv_id)
+                    return Response(status_code=204)
+
+                # Not WAITING: a genuinely RUNNING (or idle) cascade is safe to
+                # cancel directly.
+                if await asyncio.to_thread(cancel_cascade_steps, port, cascade_id):
+                    self._defer_parent_wake_after_native_interrupt(conv_id)
+                    return Response(status_code=204)
+
+        try:
+            await asyncio.to_thread(send_interaction_keys_via_tui, bridge_dir, "Escape")
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_interrupt_failed",
+                    "detail": self._client_safe_error_detail(
+                        exc, context="antigravity-native interrupt"
+                    ),
+                },
+            )
+        self._defer_parent_wake_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _antigravity_stop(self, conv_id: str) -> Response:
+        """Kill the agy tmux session, cancel its reader, and publish cancellation."""
+        from omnigent.harnesses.antigravity_native.bridge import (
+            bridge_dir_for_bridge_id,
+            kill_session,
+        )
+
+        bridge_id = await _antigravity_native_bridge_id_for_session(
+            server_client=self._server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        try:
+            await asyncio.to_thread(kill_session, bridge_dir, timeout_s=1.0)
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_stop_failed",
+                    "detail": self._client_safe_error_detail(
+                        exc, context="antigravity-native stop"
+                    ),
+                },
+            )
+        await self._teardown_session_terminals(conv_id)
+        await _cancel_auto_forwarder_task(conv_id)
+        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        # The kill is confirmed, so this ``cancelled`` is truthful and settles
+        # any interrupt still waiting on its outcome.
+        self.clear_pending_interrupt(conv_id)
+        delivery_ack = self._mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output=None,
+            confirmed_cancellation=True,
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
+        ):
+            self._logger.warning(
+                "Antigravity-native stop succeeded but sub-agent delivery was "
                 "not confirmed; session=%s reason=%s",
                 conv_id,
                 delivery_ack.reason,
