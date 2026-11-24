@@ -1534,6 +1534,83 @@ describe("Composer pasted chips", () => {
     expect(sentFiles(onSend)![0]).toBe(shot);
   });
 
+  // Every name a sequence sends is unique, and the text keeps each reference it typed, with each
+  // chip's reference naming its own file. The rows are explicit, so each failure is one sequence.
+  type AttachmentStep =
+    | { paste: string }
+    | { pick: string }
+    | { type: string }
+    | { backspace: string }
+    | "undo"
+    | "redo";
+  const attachmentSequences: [string, AttachmentStep[], { text: string; names: string[] }][] = [
+    [
+      "a chip, then a picked file with its name",
+      [{ paste: "a.png" }, { pick: "a.png" }],
+      { text: "@a.png", names: ["a (2).png", "a.png"] },
+    ],
+    [
+      "a picked file, then a chip with its name",
+      [{ pick: "a.png" }, { paste: "a.png" }],
+      { text: "@a (2).png", names: ["a.png", "a (2).png"] },
+    ],
+    [
+      "a deleted chip's name stays reserved for undo, so a picked file takes the next name",
+      [{ paste: "a.png" }, { backspace: "@a.png" }, { pick: "a.png" }],
+      { text: "", names: ["a (2).png"] },
+    ],
+    [
+      "an undone chip's name is kept, so a picked file avoids it until redo",
+      [{ paste: "a.png" }, "undo", { pick: "a.png" }, "redo"],
+      { text: "@a.png", names: ["a (2).png", "a.png"] },
+    ],
+    [
+      "a typed spelling is kept literal and a chip takes the next name",
+      [{ type: "look @b.png " }, { paste: "b.png" }],
+      { text: "look @b.png @b (2).png", names: ["b (2).png"] },
+    ],
+    [
+      "a deleted first chip leaves the second chip's name as it was",
+      [{ paste: "a.png" }, { paste: "a.png" }, { backspace: "@a.png" }],
+      { text: " @a (2).png", names: ["a (2).png"] },
+    ],
+  ];
+
+  function assertUniqueNames(names: string[]) {
+    expect(new Set(names).size).toBe(names.length);
+  }
+
+  it.each(attachmentSequences)(
+    "keeps attachment names unique across %s",
+    async (_, steps, want) => {
+      const onSend = await renderCodeMirrorComposer();
+      for (const step of steps) {
+        if (step === "undo") act(() => void undo(editorView()));
+        else if (step === "redo") act(() => void redo(editorView()));
+        else if ("paste" in step)
+          paste({ files: [new File(["x"], step.paste, { type: "image/png" })] });
+        else if ("pick" in step) {
+          const picker = document.querySelector('input[type="file"]') as HTMLInputElement;
+          fireEvent.change(picker, {
+            target: { files: [new File(["y"], step.pick, { type: "image/png" })] },
+          });
+        } else if ("type" in step) typeAt(step.type);
+        else {
+          const token = step.backspace;
+          caretAt(valueOf().indexOf(token) + token.length);
+          fireEvent.keyDown(composerInput(), { key: "Backspace" });
+        }
+      }
+      fireEvent.submit(composerInput().closest("form")!);
+      const sent = onSend.mock.calls.at(-1)!;
+      const files = (sent[1] as File[] | undefined) ?? [];
+      const names = files.map((file) => file.name);
+      assertUniqueNames(names);
+      expect(names).toEqual(want.names);
+      expect(sent[0]).toBe(want.text);
+    },
+  );
+
   it("leaves a large text paste inline on the textarea engine", () => {
     render(<Composer {...composerProps()} />);
     const log = "line\n".repeat(49) + "line";

@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import {
+  attachmentAccept,
+  attachmentFilename,
+  clipboardFiles,
+  validateAttachments,
+} from "@/lib/attachments";
+import { nameAttachmentFile } from "@/lib/composerMentions";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { insertPastedText } from "@/lib/composerText";
 import { largePasteAsFile } from "@/lib/pastedAttachments";
@@ -28,6 +34,11 @@ export interface UseComposerAttachmentsOptions {
    * attach to the tray as before.
    */
   onPasteChips?: (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void;
+  /**
+   * The tag tokens of the draft, live and released. An accepted file takes a name none of them
+   * uses, so the tray never names a file the same as a chip.
+   */
+  tagTokens?: () => readonly string[];
 }
 
 export interface ComposerAttachmentsApi {
@@ -71,6 +82,7 @@ export function useComposerAttachments({
   onAccepted,
   onRemoved,
   onPasteChips,
+  tagTokens,
 }: UseComposerAttachmentsOptions = {}): ComposerAttachmentsApi {
   const [files, setFiles] = useState<File[]>(() => initialFiles ?? []);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -82,6 +94,8 @@ export function useComposerAttachments({
   onRemovedRef.current = onRemoved;
   const onPasteChipsRef = useRef(onPasteChips);
   onPasteChipsRef.current = onPasteChips;
+  const tagTokensRef = useRef(tagTokens);
+  tagTokensRef.current = tagTokens;
   // The server's filesystem attachment policy, read through a ref for the same reason.
   const info = useServerInfo();
   const policy = info === "loading" ? null : (info.filesystem_attachments ?? null);
@@ -110,15 +124,30 @@ export function useComposerAttachments({
     return accepted;
   }, []);
 
+  // Accepted files take names free in the draft: no tag's, and no earlier tray file's. Chips
+  // keep theirs, so a tray file is the one renamed.
+  const nameIncoming = useCallback((incoming: File[], tray: File[]): File[] => {
+    const named: File[] = [];
+    for (const file of incoming) {
+      named.push(
+        nameAttachmentFile(file, {
+          tokens: tagTokensRef.current?.() ?? [],
+          trayNames: [...tray, ...named].map(attachmentFilename),
+        }),
+      );
+    }
+    return named;
+  }, []);
+
   const addFiles = useCallback(
     (incoming: File[]) => {
       const accepted = validateIncoming(incoming);
       if (accepted.length > 0) {
-        setFiles((prev) => [...prev, ...accepted]);
+        setFiles((prev) => [...prev, ...nameIncoming(accepted, prev)]);
         onAcceptedRef.current?.(accepted);
       }
     },
-    [validateIncoming],
+    [validateIncoming, nameIncoming],
   );
 
   const removeFile = useCallback((index: number) => {
@@ -128,8 +157,8 @@ export function useComposerAttachments({
   }, []);
 
   const replaceFiles = useCallback(
-    (incoming: File[]) => setFiles(validateIncoming(incoming)),
-    [validateIncoming],
+    (incoming: File[]) => setFiles(nameIncoming(validateIncoming(incoming), [])),
+    [validateIncoming, nameIncoming],
   );
 
   const restoreFiles = useCallback((restored: File[]) => {

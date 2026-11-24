@@ -7,7 +7,6 @@ import {
 } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
 import { attachmentFilename } from "@/lib/attachments";
-import { uniqueAttachmentName } from "@/lib/pastedAttachments";
 
 import {
   detectMentionAt,
@@ -23,6 +22,7 @@ import {
   type SessionMention,
   sessionMentionToken,
   type TaggedMentions,
+  nameAttachmentFile,
 } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -507,22 +507,19 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     target: ComposerTextTarget,
     trayFiles: readonly File[],
   ) => {
-    const owned = ownedMentionTokens();
-    const trayNames = trayFiles.map(attachmentFilename);
     const added: PastedAttachment[] = [];
+    const addedNames: string[] = [];
     for (const file of files) {
-      // Taken: an owned tag, a tray file, a chip from this paste, or a spelling already in the text.
-      const isTaken = (candidate: string) =>
-        owned.includes(`@${candidate}`) ||
-        trayNames.includes(candidate) ||
-        added.some((it) => it.token === `@${candidate}`) ||
-        findMentionTokens(draftSegments.join("\n"), [`@${candidate}`]).length > 0;
-      // The chip's name is the filename the attachment is sent with, so it is also its token.
-      const name = uniqueAttachmentName(attachmentFilename(file), isTaken);
-      const token = `@${name}`;
-      const named = name === file.name ? file : new File([file], name, { type: file.type });
+      // A chip is the composer's own reference, so it also avoids the spellings already typed.
+      const named = nameAttachmentFile(file, {
+        tokens: [...ownedMentionTokens(), ...added.map((it) => it.token)],
+        trayNames: [...trayFiles.map(attachmentFilename), ...addedNames],
+        text: [liveText(target), ...draftSegments],
+      });
+      const token = `@${named.name}`;
       if (!insertTokenAt(target, target.selectionStart, target.selectionEnd, token)) break;
       added.push({ token, file: named });
+      addedNames.push(named.name);
     }
     if (added.length === 0) return;
     setMention(null);

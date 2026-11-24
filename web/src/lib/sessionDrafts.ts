@@ -1,5 +1,12 @@
 import { useSyncExternalStore } from "react";
-import { mergeTaggedDrafts, readTaggedMentions, type TaggedMentions } from "./composerMentions";
+import {
+  mergeTaggedDrafts,
+  nameAttachmentFile,
+  readTaggedMentions,
+  tagTokensOf,
+  type TaggedMentions,
+} from "./composerMentions";
+import { attachmentFilename } from "./attachments";
 import { readComposerDraft, type ComposerDraft } from "./replyDraft";
 import type { Comment } from "@/hooks/useComments";
 import { isLocalReviewComment } from "./localReviewComments";
@@ -159,14 +166,29 @@ export function recoverFailedSessionDraft<
   if (temporaryDraft === undefined) return originalDraft;
   // The two composers allocate tokens independently; reconcile them so a shared
   // token can't make one draft's tag expand to the other's target.
-  const merged = mergeTaggedDrafts(originalDraft.mentions, temporaryDraft);
+  const trayNames = [...originalDraft.files, ...temporaryDraft.files].map(attachmentFilename);
+  const merged = mergeTaggedDrafts(originalDraft.mentions, temporaryDraft, {
+    texts: [originalDraft.message],
+    trayNames,
+  });
+  // The temporary draft's tray files are the incoming ones: each takes a name no tag or earlier
+  // tray file uses.
+  const incoming: File[] = [];
+  for (const file of temporaryDraft.files) {
+    incoming.push(
+      nameAttachmentFile(file, {
+        tokens: tagTokensOf(merged.mentions),
+        trayNames: [...originalDraft.files, ...incoming].map(attachmentFilename),
+      }),
+    );
+  }
   const message = [originalDraft.message, merged.text]
     .filter((part) => part.trim() !== "")
     .join("\n\n");
   return {
     ...originalDraft,
     message,
-    files: [...originalDraft.files, ...temporaryDraft.files],
+    files: [...originalDraft.files, ...incoming],
     ...(merged.mentions ? { mentions: merged.mentions } : {}),
   };
 }

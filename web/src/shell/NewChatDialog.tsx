@@ -2744,6 +2744,7 @@ function NewChatLandingContent({
   const attachPastedFilesRef = useRef<
     (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void
   >(() => {});
+  const tagTokensRef = useRef<() => readonly string[]>(() => []);
 
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
@@ -2767,6 +2768,7 @@ function NewChatLandingContent({
       composerEngine === "codemirror"
         ? (pasted, target, trayFiles) => attachPastedFilesRef.current(pasted, target, trayFiles)
         : undefined,
+    tagTokens: () => tagTokensRef.current(),
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
   // The panel's prompt takes the keyboard each time the panel does, after any kept draft.
@@ -5623,6 +5625,7 @@ function NewChatLandingContent({
     attachPastedFiles,
     mentionedAttachments,
     mentionTokens,
+    ownedMentionTokens,
     resetMentions,
     noteTextChange: noteMentionTextChange,
     handleTokenBackspace,
@@ -5646,6 +5649,7 @@ function NewChatLandingContent({
     attachments: mentionedAttachments,
   };
   attachPastedFilesRef.current = attachPastedFiles;
+  tagTokensRef.current = ownedMentionTokens;
   // Pasted chips send their files with the tray's; a chip's file goes only while its token is in the message.
   const attachedFiles = [
     ...files,

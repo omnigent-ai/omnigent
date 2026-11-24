@@ -2801,6 +2801,7 @@ function ComposerImpl(
   const attachPastedFilesRef = useRef<
     (files: File[], target: ComposerTextTarget, trayFiles: File[]) => void
   >(() => {});
+  const tagTokensRef = useRef<() => readonly string[]>(() => []);
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the
   // callbacks so the hook never learns about sessions or focus.
@@ -2829,6 +2830,7 @@ function ComposerImpl(
       composerEngine === "codemirror"
         ? (pasted, target, trayFiles) => attachPastedFilesRef.current(pasted, target, trayFiles)
         : undefined,
+    tagTokens: () => tagTokensRef.current(),
   });
   const filesRef = useRef(files);
   filesRef.current = files;
@@ -3186,6 +3188,7 @@ function ComposerImpl(
   );
   const hasMentions = liveMentions.length > 0;
   attachPastedFilesRef.current = attachPastedFiles;
+  tagTokensRef.current = ownedMentionTokens;
   // Pasted chips send their files with the tray's; a chip's file goes only while its token is in the draft.
   const attachedFiles = [
     ...files,

@@ -1,6 +1,7 @@
 import type { ComposerAttachment } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { uniqueAttachmentName } from "@/lib/pastedAttachments";
+import { attachmentFilename } from "@/lib/attachments";
 
 /**
  * Pure ``@``-mention utilities (workspace files and other sessions) shared by the in-session composer
@@ -552,6 +553,58 @@ function mentionItemIdentity(item: MentionItem): string {
 }
 
 /**
+ * Every name an attachment must avoid, so chip tokens stay unique and each one names its own
+ * file. ``tokens`` are the draft's tag tokens (live and released); ``trayNames`` are the filenames
+ * already in a tray. ``text`` is the typed text a *new chip* must not capture: a chip is the
+ * composer's own reference, so a spelling the user typed must not start resolving to it. A tray
+ * file is referenced by the literal name the user typed, so tray files pass no ``text``.
+ */
+export interface AttachmentNamespace {
+  tokens: readonly string[];
+  trayNames: readonly string[];
+  text?: readonly string[];
+}
+
+/**
+ * ``file`` under a name the namespace leaves free: its own name when that is free, else a
+ * suffixed one. Returns ``file`` itself when its name is kept. Every creation or rename of an
+ * attachment name goes through here.
+ */
+export function nameAttachmentFile(file: File, namespace: AttachmentNamespace): File {
+  const spelled = namespace.text?.join("\n") ?? null;
+  const name = uniqueAttachmentName(
+    attachmentFilename(file),
+    (candidate) =>
+      namespace.tokens.includes(`@${candidate}`) ||
+      namespace.trayNames.includes(candidate) ||
+      (spelled !== null && findMentionTokens(spelled, [`@${candidate}`]).length > 0),
+  );
+  return name === file.name ? file : new File([file], name, { type: file.type });
+}
+
+/** The tag tokens of ``tags``, live and released alike, for an allocation namespace. */
+export function tagTokensOf(tags: TaggedMentions | undefined): string[] {
+  return [
+    ...(tags?.files ?? []).map(fileMentionToken),
+    ...(tags?.sessions ?? []).map(sessionTokenOf),
+    ...(tags?.attachments ?? []).map((it) => it.token),
+  ];
+}
+
+// ``text`` with every occurrence of ``token`` blanked out, so a chip's own reference is not
+// mistaken for a typed spelling of its name.
+function withoutToken(text: string, token: string): string {
+  let blanked = text;
+  for (const range of findMentionTokens(text, [token]).reverse()) {
+    blanked =
+      blanked.slice(0, range.start) +
+      " ".repeat(range.end - range.start) +
+      blanked.slice(range.end);
+  }
+  return blanked;
+}
+
+/**
  * Combine two drafts' text and tags without letting a shared token retarget a
  * mention. A tag already in ``first`` keeps its token; a ``second`` tag reuses
  * it for the same target, or gets a new unique token (rewritten in
@@ -559,13 +612,18 @@ function mentionItemIdentity(item: MentionItem): string {
  *
  * :param first: The draft whose tokens win, e.g. the launcher draft.
  * :param second: The draft merged in, e.g. a failed temporary session's draft.
+ * :param options.texts: The typed text of ``first``, which a renamed chip must not capture.
+ * :param options.trayNames: Tray filenames of both drafts, which a chip must not take.
  * :returns: ``second.text`` with renamed tokens, and the combined tags.
  */
 export function mergeTaggedDrafts(
   first: TaggedMentions | undefined,
   second: { text: string; mentions?: TaggedMentions },
+  options: { texts?: readonly string[]; trayNames?: readonly string[] } = {},
 ): { text: string; mentions: TaggedMentions | undefined } {
   if (!second.mentions) return { text: second.text, mentions: first };
+  const trayNames = options.trayNames ?? [];
+  const firstTexts = options.texts ?? [];
   const files = [...(first?.files ?? [])];
   const sessions = [...(first?.sessions ?? [])];
   const attachments = [...(first?.attachments ?? [])];
@@ -616,14 +674,13 @@ export function mergeTaggedDrafts(
       claim(token, same.token);
       continue;
     }
-    // A renamed chip's file takes the new name too, so the sent filename still matches its token.
-    const next = taken.includes(token)
-      ? `@${uniqueAttachmentName(token.slice(1), (candidate) => avoid(token).includes(`@${candidate}`))}`
-      : token;
-    const file =
-      next === token
-        ? attachment.file
-        : new File([attachment.file], next.slice(1), { type: attachment.file.type });
+    // The chip's file keeps or takes a name the namespace allows; the token follows the name.
+    const file = nameAttachmentFile(attachment.file, {
+      tokens: avoid(token),
+      trayNames,
+      text: [...firstTexts, withoutToken(second.text, token)],
+    });
+    const next = `@${file.name}`;
     attachments.push({ token: next, file });
     claim(token, next);
   }

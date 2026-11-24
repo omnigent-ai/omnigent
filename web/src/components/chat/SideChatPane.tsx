@@ -86,7 +86,12 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
-import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import {
+  attachmentAccept,
+  attachmentFilename,
+  clipboardFiles,
+  validateAttachments,
+} from "@/lib/attachments";
 import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -136,10 +141,12 @@ import {
   detectMentionAt,
   harnessSupportsFileMentions,
   mergeTaggedDrafts,
+  nameAttachmentFile,
   presentTaggedMentions,
   recallFileMentions,
   recallSessionMentions,
   type MentionState,
+  tagTokensOf,
   type TaggedMentions,
 } from "@/lib/composerMentions";
 import { clearLocalReviewContexts } from "@/lib/localReviewContext";
@@ -1177,7 +1184,20 @@ function SideChatComposer({
   const addFiles = (incoming: File[]) => {
     const { accepted, errors } = validateAttachments(incoming, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
-    if (accepted.length) setFiles((current) => [...current, ...accepted]);
+    if (!accepted.length) return;
+    // An accepted file takes a name no tag of the draft uses, and no earlier tray file's.
+    setFiles((current) => {
+      const named: File[] = [];
+      for (const file of accepted) {
+        named.push(
+          nameAttachmentFile(file, {
+            tokens: tagTokensOf(sharedTags),
+            trayNames: [...current, ...named].map(attachmentFilename),
+          }),
+        );
+      }
+      return [...current, ...named];
+    });
   };
   const onPaste = (event: ComposerPasteEvent) => {
     const pasted = clipboardFiles(event.clipboardData);

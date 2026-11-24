@@ -1811,19 +1811,24 @@ describe("grid cell composer shares its session's draft", () => {
     expect((sent[2] as File[]).map((file) => file.name)).toEqual(["notes.txt"]);
   });
 
-  it("sends a chip's file under its own name when a later tray file has the same name", () => {
-    // shortcut: a tray file added after a chip with the same name sends under it too; renaming would rewrite the typed @name reference.
+  it("renames a tray file pasted into a cell when a chip already has its name", () => {
     const chipShot = new File(["c"], "image.png", { type: "image/png" });
-    const trayShot = new File(["t"], "image.png", { type: "image/png" });
+    const traySource = new File(["t"], "image.png", { type: "image/png" });
     bridgedCell({
       text: "Look @image.png",
-      files: [trayShot],
+      files: [],
       mentions: { files: [], sessions: [], attachments: [{ token: "@image.png", file: chipShot }] },
+    });
+    fireEvent.paste(screen.getByTestId("side-chat-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: traySource.type, getAsFile: () => traySource }],
+      },
     });
     fireEvent.click(screen.getByTestId("side-chat-send"));
     const sent = send.mock.calls[0]!;
     expect(sent[0]).toBe("Look @image.png");
-    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["image.png", "image.png"]);
+    expect((sent[2] as File[]).map((file) => file.name)).toEqual(["image (2).png", "image.png"]);
+    expect((sent[2] as File[])[1]).toBe(chipShot);
   });
 
   it("sends a tagged skill command as an ordinary message, not as a local command", () => {

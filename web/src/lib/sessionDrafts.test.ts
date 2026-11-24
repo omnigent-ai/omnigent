@@ -202,6 +202,67 @@ describe("session drafts", () => {
     expect(sessionDraftRevision("conversation")).toBe(0);
   });
 
+  // Failed-draft recovery merges two drafts' chips and tray files. Each row states the exact
+  // result: unique filenames in send order (tray, then chips), chips that name their own file, and
+  // typed text that keeps its meaning.
+  type Chips = [string, File][];
+  const recoveryRows: [
+    string,
+    { message: string; files: File[]; chips: Chips },
+    { text: string; files: File[]; chips: Chips },
+    { message: string; names: string[]; chipTokens: string[] },
+  ][] = [
+    [
+      "a tray file that repeats a chip's name is renamed",
+      { message: "", files: [], chips: [["@a.png", new File(["a"], "a.png")]] },
+      { text: "see @a.png", files: [new File(["b"], "a.png")], chips: [] },
+      { message: "see @a.png", names: ["a (2).png", "a.png"], chipTokens: ["@a.png"] },
+    ],
+    [
+      "a chip that repeats another chip's name avoids a spelling already typed",
+      {
+        message: "use @image (2).png",
+        files: [],
+        chips: [["@image.png", new File(["a"], "image.png")]],
+      },
+      { text: "look @image.png", files: [], chips: [["@image.png", new File(["b"], "image.png")]] },
+      {
+        message: "use @image (2).png\n\nlook @image (3).png",
+        names: ["image.png", "image (3).png"],
+        chipTokens: ["@image.png", "@image (3).png"],
+      },
+    ],
+  ];
+
+  it.each(recoveryRows)(
+    "recovers a failed draft with unique names: %s",
+    async (_, original, temp, want) => {
+      const { recoverFailedSessionDraft, setSessionDraft } = await import("./sessionDrafts");
+      const { attachmentFilename } = await import("./attachments");
+      const mentionsOf = (chips: Chips) => ({
+        files: [],
+        sessions: [],
+        attachments: chips.map(([token, file]) => ({ token, file })),
+      });
+      setSessionDraft("temp:rows", {
+        text: temp.text,
+        files: temp.files,
+        mentions: temp.chips.length > 0 ? mentionsOf(temp.chips) : undefined,
+      });
+      const recovered = recoverFailedSessionDraft(
+        { message: original.message, files: original.files, mentions: mentionsOf(original.chips) },
+        "temp:rows",
+      );
+      const chips = recovered.mentions?.attachments ?? [];
+      const names = [...recovered.files, ...chips.map((chip) => chip.file)].map(attachmentFilename);
+      expect(new Set(names).size).toBe(names.length);
+      expect(names).toEqual(want.names);
+      expect(chips.map((chip) => chip.token)).toEqual(want.chipTokens);
+      for (const chip of chips) expect(chip.file.name).toBe(chip.token.slice(1));
+      expect(recovered.message).toBe(want.message);
+    },
+  );
+
   it("recovers a failed temporary draft and ignores its late cleanup write", async () => {
     const { getSessionDraft, recoverFailedSessionDraft, setSessionDraft } =
       await import("./sessionDrafts");
