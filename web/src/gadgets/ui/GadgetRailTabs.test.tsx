@@ -32,6 +32,9 @@ import {
   resetGadgetTabOrders,
   useGadgetRailTabState,
 } from "./GadgetRailTabs";
+import { QueryClient } from "@tanstack/react-query";
+import { ApiError } from "@/lib/sessionsApi";
+import { gadgetKey } from "./gadgetQueries";
 import { GADGETS_INFO, renderWithGadgets, gadgetFixture } from "./testUtils";
 import { useLocation, useNavigate } from "@/lib/routing";
 import { resetGadgetDrafts } from "./gadgetDrafts";
@@ -513,6 +516,33 @@ describe("the gadget beside New session", () => {
 
     fireEvent.click(within(panel).getByRole("button", { name: "Open session" }));
     expect(panel).not.toHaveAttribute("data-maximized");
+  });
+
+  it("keeps a running gadget through a failed poll, and gives way once it is gone", async () => {
+    vi.mocked(getGadget).mockResolvedValue(BOARD);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
+    renderWithGadgets(<GadgetNewSessionPanel active />, {
+      path: "/?gadget_start=1",
+      queryClient,
+    });
+    expect(await screen.findByText("shows Board")).toBeInTheDocument();
+
+    vi.mocked(getGadget).mockRejectedValue(new ApiError("Service unavailable", 503, null));
+    await act(async () => {
+      await queryClient.refetchQueries();
+      // The query notifies its observers after a tick.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(queryClient.getQueryState(gadgetKey("1"))?.status).toBe("error");
+    expect(screen.getByText("shows Board")).toBeInTheDocument();
+
+    vi.mocked(getGadget).mockRejectedValue(new ApiError("Not found", 404, null));
+    await act(async () => {
+      await queryClient.refetchQueries();
+    });
+    await waitFor(() => expect(screen.queryByText("shows Board")).toBeNull());
   });
 
   it("opens full screen when gadget code asks, and shows nothing without a gadget", async () => {

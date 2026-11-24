@@ -1,7 +1,10 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { toast } from "sonner";
+
 import { getGadgetShelf, pinGadget, renameGadget } from "@/gadgets/api/gadgetApi";
+import { copyText } from "@/lib/clipboard";
 import { GadgetActions, GadgetName, GadgetPinButton } from "./GadgetToolbar";
 import { GADGETS_INFO, renderWithGadgets, gadgetFixture } from "./testUtils";
 import type * as GadgetApiModule from "@/gadgets/api/gadgetApi";
@@ -13,6 +16,9 @@ vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
   renameGadget: vi.fn(),
 }));
 // The share dialog has its own tests; here it only says it opened.
+vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
+vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
+
 vi.mock("@/components/PermissionsModal", () => ({
   PermissionsModal: ({ open, gadget }: { open: boolean; gadget: { name: string } }) =>
     open ? <div role="dialog" aria-label={`Share ${gadget.name}`} /> : null,
@@ -112,6 +118,12 @@ describe("Share and the ⋯ menu", () => {
     expect(within(details).getByText("Published")).toBeInTheDocument();
     expect(within(details).getByText("You")).toBeInTheDocument();
     expect(within(details).getByText(/\/gadget\/board$/)).toBeInTheDocument();
+    expect(within(details).getByRole("button", { name: "Copy link" })).toBeInTheDocument();
+
+    // A copy the browser refuses says so instead of failing quietly.
+    vi.mocked(copyText).mockRejectedValueOnce(new Error("denied"));
+    fireEvent.click(within(details).getByRole("button", { name: "Copy link" }));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Couldn’t copy the link"));
     expect(within(details).getByRole("button", { name: "Copy link" })).toBeInTheDocument();
   });
 

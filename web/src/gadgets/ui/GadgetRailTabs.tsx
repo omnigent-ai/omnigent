@@ -60,6 +60,7 @@ import {
 } from "./gadgetNavigation";
 import {
   invalidateGadgets,
+  isGadgetUnavailable,
   useLinkedGadgetsSync,
   useSessionGadgetsQuery,
   useShowGadgetInSession,
@@ -775,7 +776,9 @@ function GadgetNewSessionPane({
 }) {
   const gadget = useGadget(gadgetId, { watch: true });
   if (gadget.isPending) return null;
-  if (gadget.isError) {
+  // A poll that fails for a while (the network, the server restarting) keeps the gadget running
+  // on what was loaded; only a gadget that is gone or no longer readable gives way.
+  if (gadget.isError && (gadget.data === undefined || isGadgetUnavailable(gadget.error))) {
     return (
       <GadgetUnavailable
         className="m-3"

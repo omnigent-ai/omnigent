@@ -9,6 +9,7 @@ import {
   PinIcon,
   UserPlusIcon,
 } from "lucide-react";
+import { toast } from "sonner";
 
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { Button } from "@/components/ui/button";
@@ -236,7 +237,12 @@ function GadgetLinkField({ gadgetId }: { gadgetId: string }) {
             aria-label={copied ? "Link copied" : "Copy link"}
             className={TOOLBAR_ICON_BUTTON}
             componentId="gadgets.details.copy_link"
-            onClick={() => void copyText(link).then(() => setCopied(true))}
+            onClick={() =>
+              void copyText(link).then(
+                () => setCopied(true),
+                () => toast.error("Couldn’t copy the link"),
+              )
+            }
           >
             {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
           </Button>
