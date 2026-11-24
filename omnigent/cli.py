@@ -8286,14 +8286,15 @@ def session_send(
     base_url = _session_command_server(server)
 
     async def _send() -> None:
-        async with open_session_client(base_url) as client:
-            if not wait:
+        if not wait:
+            async with open_session_client(base_url) as client:
                 message = await send_message(client, session_id, text)
-                if json_output:
-                    sent = {"session_id": session_id, "message_id": message.item_id}
-                    click.echo(json.dumps({**sent, "message_queued": True}))
-                return
-            message, result = await send_and_wait(client, session_id, text, timeout_s=timeout)
+            if json_output:
+                sent = {"session_id": session_id, "message_id": message.item_id}
+                click.echo(json.dumps({**sent, "message_queued": True}))
+            return
+        # The --timeout deadline covers opening the client, including a login renewal.
+        message, result = await send_and_wait(base_url, session_id, text, timeout_s=timeout)
         if json_output:
             report = {
                 "session_id": session_id,

@@ -45,6 +45,20 @@ _SETTLE_S = 2.0
 _ITEMS_PAGE_LIMIT = 1000
 #: Page size for the read that looks for a tool call after the sent message.
 _ACTIVITY_PAGE_LIMIT = 20
+#: Items a turn writes as it runs. Metadata such as resource events doesn't count.
+_TURN_OUTPUT_TYPES = frozenset(
+    {
+        "function_call",
+        "function_call_output",
+        "reasoning",
+        "native_tool",
+        "error",
+        "compaction",
+        "terminal_command",
+    }
+)
+#: The longest a stored-login refresh may take, when no deadline is shorter.
+_REFRESH_TIMEOUT_S = 10.0
 _STATE_PARAMS = {
     "include_items": "false",
     "include_usage": "false",
@@ -98,11 +112,15 @@ class TurnResult:
 
 
 @asynccontextmanager
-async def open_session_client(base_url: str) -> AsyncIterator[httpx.AsyncClient]:
+async def open_session_client(
+    base_url: str, *, deadline: float | None = None
+) -> AsyncIterator[httpx.AsyncClient]:
     """
     Open a client that sends each session request to the replica holding its host.
 
     :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param deadline: Event-loop time the caller must finish by, which also bounds
+        each login refresh, or ``None``.
     :yields: An authenticated client. A stored ``omnigent login`` token is renewed
         from its refresh grant before it lapses, so a long reply wait outlives it.
     """
@@ -110,45 +128,56 @@ async def open_session_client(base_url: str) -> AsyncIterator[httpx.AsyncClient]
     from omnigent.cli_auth import open_server_client
 
     # An already-expired login must be renewed before choosing how to authenticate.
-    await asyncio.to_thread(_renew_stored_login, base_url)
+    await asyncio.to_thread(_renew_stored_login, base_url, _remaining(deadline))
     auth = _server_auth(server_url=base_url)
     async with open_server_client(
         base_url,
-        auth=_RenewingAuth(auth, base_url) if auth is not None else None,
+        auth=_RenewingAuth(auth, base_url, deadline) if auth is not None else None,
         headers=_server_headers(),
         timeout=_READ_TIMEOUT,
     ) as client:
         yield client
 
 
-def _renew_stored_login(server_url: str) -> None:
+def _remaining(deadline: float | None) -> float | None:
+    """:returns: Seconds left before *deadline* on the running loop, or ``None``."""
+    if deadline is None:
+        return None
+    return max(0.0, deadline - asyncio.get_running_loop().time())
+
+
+def _renew_stored_login(server_url: str, budget_s: float | None = None) -> None:
     """
     Renew the stored ``omnigent login`` token for *server_url* if it is about to lapse.
 
     Does nothing with an ``OMNIGENT_REMOTE_AUTH_TOKEN`` override, a token with
-    enough life left, or no refresh grant to renew it with.
+    enough life left, no refresh grant to renew it with, or no time left.
+
+    :param budget_s: Seconds the refresh may take, or ``None`` for its own limit.
     """
     from omnigent.chat import _REMOTE_AUTH_TOKEN_ENV
     from omnigent.cli_auth import REFRESH_MIN_REMAINING_SECONDS, load_token, refresh_stored_token
 
-    if os.environ.get(_REMOTE_AUTH_TOKEN_ENV, "").strip():
+    if os.environ.get(_REMOTE_AUTH_TOKEN_ENV, "").strip() or budget_s == 0:
         return
     if load_token(server_url, min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS) is None:
-        refresh_stored_token(server_url)
+        limit = _REFRESH_TIMEOUT_S if budget_s is None else min(_REFRESH_TIMEOUT_S, budget_s)
+        refresh_stored_token(server_url, timeout=limit)
 
 
 class _RenewingAuth(httpx.Auth):
     """The CLI's server auth, with the stored login renewed before each request."""
 
-    def __init__(self, inner: httpx.Auth, server_url: str) -> None:
+    def __init__(self, inner: httpx.Auth, server_url: str, deadline: float | None) -> None:
         self._inner = inner
         self._server_url = server_url
+        self._deadline = deadline
 
     async def async_auth_flow(
         self, request: httpx.Request
     ) -> AsyncGenerator[httpx.Request, httpx.Response]:
         """Renew the login off the event loop, then authenticate as the CLI does."""
-        await asyncio.to_thread(_renew_stored_login, self._server_url)
+        await asyncio.to_thread(_renew_stored_login, self._server_url, _remaining(self._deadline))
         flow = self._inner.async_auth_flow(request)
         outgoing = await anext(flow)
         while True:
@@ -199,6 +228,8 @@ async def send_message(client: httpx.AsyncClient, session_id: str, text: str) ->
         ) from exc
     if resp.status_code == 404:
         raise command_error(f"Session {session_id} was not found.")
+    if resp.is_redirect:
+        raise command_error(_redirect_error(resp))
     refusal = message_refusal(resp, "the message")
     if refusal is not None:
         raise command_error(f"{refusal[:1].upper()}{refusal[1:]}.")
@@ -247,7 +278,7 @@ async def _newest_messages(
     params: dict[str, str | int] = {"limit": last, "order": "desc", "type": "message"}
     while len(newest_first) < last:
         page = await _read_json(client, session_id, f"/v1/sessions/{session_id}/items", params)
-        newest_first.extend(_page_messages(page))
+        newest_first.extend(_page_messages(page, session_id))
         last_id = page.get("last_id")
         if page.get("has_more") is not True or not isinstance(last_id, str):
             break
@@ -279,20 +310,30 @@ async def _items_after(
         params["after"] = after
     while True:
         page = await _read_json(client, session_id, f"/v1/sessions/{session_id}/items", params)
-        data = page.get("data")
-        for item in data if isinstance(data, list) else []:
-            if isinstance(item, dict) and item.get("type") == item_type:
-                found.append(cast(JsonObject, item))
+        found.extend(
+            item for item in _page_items(page, session_id) if item.get("type") == item_type
+        )
         last_id = page.get("last_id")
         if page.get("has_more") is not True or not isinstance(last_id, str):
             return found
         params = {**params, "after": last_id}
 
 
-def _page_messages(page: JsonObject) -> list[JsonObject]:
-    data = page.get("data")
-    items = data if isinstance(data, list) else []
+def _page_messages(page: JsonObject, session_id: str) -> list[JsonObject]:
+    items = _page_items(page, session_id)
     return [message for item in items if (message := project_message(item)) is not None]
+
+
+def _page_items(page: JsonObject, session_id: str) -> list[JsonObject]:
+    """
+    Return a page's items, refusing a page with no item list.
+
+    :raises click.ClickException: When the page isn't an items page.
+    """
+    data = page.get("data")
+    if not isinstance(data, list):
+        raise command_error(f"The server sent an unexpected item page for session {session_id}.")
+    return [cast(JsonObject, item) for item in data if isinstance(item, dict)]
 
 
 def project_message(item: object) -> JsonObject | None:
@@ -338,7 +379,7 @@ async def latest_message_id(client: httpx.AsyncClient, session_id: str) -> str |
 
 
 async def send_and_wait(
-    client: httpx.AsyncClient,
+    base_url: str,
     session_id: str,
     text: str,
     *,
@@ -350,21 +391,24 @@ async def send_and_wait(
     The session's state and newest message are read before the send, so neither
     a failure nor a reply from before it is taken as this message's outcome.
 
-    :param client: Client from :func:`open_session_client`.
+    :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
     :param session_id: The session, e.g. ``"conv_abc123"``.
     :param text: The message.
-    :param timeout_s: Seconds for the whole exchange, including the send, or
-        ``None`` to wait as long as the turn takes.
+    :param timeout_s: Seconds for the whole exchange, from opening the client
+        through the reply, or ``None`` to wait as long as the turn takes.
     :returns: The queued message (see :func:`send_message`) and the outcome.
     :raises click.ClickException: When the send fails, the session can't be read,
         or time runs out.
     """
+    loop = asyncio.get_running_loop()
+    deadline = None if timeout_s is None else loop.time() + timeout_s
     posting = sent = False
     try:
-        async with asyncio.timeout(timeout_s):
-            baseline = await _read_json(
-                client, session_id, f"/v1/sessions/{session_id}", _STATE_PARAMS
-            )
+        async with (
+            asyncio.timeout(timeout_s),
+            open_session_client(base_url, deadline=deadline) as client,
+        ):
+            baseline = await _read_state(client, session_id)
             after = await latest_message_id(client, session_id)
             posting = True
             message = await send_message(client, session_id, text)
@@ -421,9 +465,8 @@ async def _wait_for_reply(
     turn_seen = left_failed = False
     settling: tuple[list[object], float] | None = None
     while True:
-        state = await _read_json(client, session_id, f"/v1/sessions/{session_id}", _STATE_PARAMS)
-        raw_status = state.get("status")
-        status = raw_status if isinstance(raw_status, str) else None
+        state = await _read_state(client, session_id)
+        status = cast(str, state["status"])
         prompts = state.get("pending_elicitations")
         approvals = len(prompts) if isinstance(prompts, list) else 0
         if approvals:
@@ -454,11 +497,13 @@ async def _wait_for_reply(
         elif status == "idle" and not state.get("pending_inputs"):
             found = await _messages_after_sent(client, session_id, after, sent)
             replies = found[1] if found is not None else None
-            # Read after this idle status, a reply or tool call shows the turn had started.
+            # Read after this idle status, a reply or turn output shows the turn had started.
             if found is not None and not turn_seen:
-                turn_seen = any(
-                    message["role"] == "assistant" for message in found[1]
-                ) or await _turn_activity_after(client, session_id, found[0])
+                turn_seen = (
+                    found[2]
+                    or any(message["role"] == "assistant" for message in found[1])
+                    or await _turn_activity_after(client, session_id, found[0])
+                )
             if turn_seen and replies is not None:
                 tail = [message["id"] for message in replies]
                 now = loop.time()
@@ -474,47 +519,95 @@ async def _wait_for_reply(
 
 async def _messages_after_sent(
     client: httpx.AsyncClient, session_id: str, after: str | None, sent: SentMessage
-) -> tuple[str, list[JsonObject]] | None:
+) -> tuple[str, list[JsonObject], bool] | None:
     """
     Find the sent message after *after* and return its id and every message after it.
 
     The ack's item id finds it. A held message has none until its turn records it,
-    so the user message with the same text (ignoring whitespace) is taken; nobody
-    else's message stands in for it.
+    so the user message with the same text (ignoring whitespace) is taken, or, for a
+    ``/command`` or ``!command``, the command item a native terminal records instead.
+    Nobody else's message stands in for it.
 
-    :returns: ``(message id, later messages)``, or ``None`` while it isn't stored.
-    :raises click.ClickException: When more than one message has the held text.
+    :returns: ``(anchor id, later messages, already ran)``, where *already ran* is
+        ``True`` for a built-in command that ran when it was recorded, or ``None``
+        while the message isn't stored.
+    :raises click.ClickException: When more than one item matches the held text.
     """
     messages = await _messages_after(client, session_id, after)
     if sent.item_id is not None:
-        matches = [
+        positions = [
             index for index, message in enumerate(messages) if message["id"] == sent.item_id
         ]
-    else:
-        words = sent.text.split()
-        matches = [
-            index
-            for index, message in enumerate(messages)
-            if message["role"] == "user" and str(message["text"]).split() == words
-        ]
-    if not matches:
-        return None
-    if len(matches) > 1:
+        if not positions:
+            return None
+        return _anchored(messages, positions[0], ran=False)
+    words = sent.text.split()
+    positions = [
+        index
+        for index, message in enumerate(messages)
+        if message["role"] == "user" and str(message["text"]).split() == words
+    ]
+    commands = await _sent_commands(client, session_id, after, words)
+    if len(positions) + len(commands) > 1:
         raise command_error(
-            f"Session {session_id} has more than one message with the text sent, so its "
+            f"Session {session_id} has more than one item matching the text sent, so its "
             f"reply can't be told apart. `{cli_invocation()} session read {session_id}` "
             "shows them."
         )
-    position = matches[0]
+    if positions:
+        return _anchored(messages, positions[0], ran=False)
+    if not commands:
+        return None
+    command = commands[0]
+    command_id = command.get("id")
+    if not isinstance(command_id, str):
+        return None
+    later = await _messages_after(client, session_id, command_id)
+    # A built-in such as /model runs as Claude records it; it starts no turn.
+    built_in = command.get("type") == "slash_command" and command.get("kind") == "command"
+    return command_id, later, built_in
+
+
+def _anchored(
+    messages: list[JsonObject], position: int, *, ran: bool
+) -> tuple[str, list[JsonObject], bool] | None:
     message_id = messages[position]["id"]
     if not isinstance(message_id, str):
         return None
-    return (message_id, messages[position + 1 :])
+    return message_id, messages[position + 1 :], ran
+
+
+async def _sent_commands(
+    client: httpx.AsyncClient, session_id: str, after: str | None, words: list[str]
+) -> list[JsonObject]:
+    """
+    Return the command items a native terminal recorded for a held ``/`` or ``!`` input.
+
+    :param words: The sent text split on whitespace, e.g. ``["/compact"]``.
+    """
+    if not words:
+        return []
+    if words[0].startswith("/"):
+        items = await _items_after(client, session_id, after, "slash_command")
+        return [
+            item
+            for item in items
+            if [f"/{item.get('name')}", *str(item.get("arguments") or "").split()] == words
+        ]
+    if words[0].startswith("!"):
+        items = await _items_after(client, session_id, after, "terminal_command")
+        return [
+            item
+            for item in items
+            if item.get("kind") == "input" and f"!{item.get('input')}".split() == words
+        ]
+    return []
 
 
 async def _turn_activity_after(client: httpx.AsyncClient, session_id: str, item_id: str) -> bool:
     """
-    Report whether a tool call, error or assistant message follows the sent message.
+    Report whether turn output (a tool call, reasoning, an error, an assistant
+    message, ...) follows the sent message.
 
     A turn that only calls tools can start and end between two polls, so this is
     its only trace.
@@ -526,10 +619,9 @@ async def _turn_activity_after(client: httpx.AsyncClient, session_id: str, item_
     }
     while True:
         page = await _read_json(client, session_id, f"/v1/sessions/{session_id}/items", params)
-        data = page.get("data")
-        for item in data if isinstance(data, list) else []:
-            if isinstance(item, dict) and (
-                item.get("type") != "message" or item.get("role") == "assistant"
+        for item in _page_items(page, session_id):
+            if item.get("type") in _TURN_OUTPUT_TYPES or (
+                item.get("type") == "message" and item.get("role") == "assistant"
             ):
                 return True
         last_id = page.get("last_id")
@@ -656,6 +748,18 @@ def _format_tokens(usage: JsonObject) -> str | None:
     return ", ".join(parts) or None
 
 
+async def _read_state(client: httpx.AsyncClient, session_id: str) -> JsonObject:
+    """
+    Read the session's state for a reply wait.
+
+    :raises click.ClickException: When the read fails or the state has no status.
+    """
+    state = await _read_json(client, session_id, f"/v1/sessions/{session_id}", _STATE_PARAMS)
+    if not isinstance(state.get("status"), str):
+        raise command_error(f"The server sent an unexpected state for session {session_id}.")
+    return state
+
+
 async def _read_json(
     client: httpx.AsyncClient,
     session_id: str,
@@ -666,7 +770,7 @@ async def _read_json(
     GET *url* for *session_id* and decode its JSON object.
 
     :raises click.ClickException: When the request fails, the session is missing,
-        or the server refuses the read.
+        the server refuses or redirects the read, or the body isn't a JSON object.
     """
     try:
         resp = await client.get(url, params=params)
@@ -674,8 +778,34 @@ async def _read_json(
         raise command_error(f"Could not read session {session_id} ({exc}).") from exc
     if resp.status_code == 404:
         raise command_error(f"Session {session_id} was not found.")
+    if resp.is_redirect:
+        raise command_error(_redirect_error(resp))
     if resp.status_code >= 400:
         raise command_error(
             f"Could not read session {session_id} ({resp.status_code}): {server_error(resp)}"
         )
-    return response_object(resp)
+    try:
+        payload: object = resp.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        raise command_error(
+            f"The server sent an unreadable response for session {session_id} "
+            f"({resp.status_code})."
+        )
+    return cast(JsonObject, payload)
+
+
+def _redirect_error(resp: httpx.Response) -> str:
+    """
+    Explain a redirect, which a sign-in page in front of the server sends.
+
+    :param resp: The ``3xx`` response.
+    :returns: The error message, naming where the server redirected.
+    """
+    location = resp.headers.get("location")
+    where = f" to {location}" if location else ""
+    return (
+        f"The server redirected the request ({resp.status_code}{where}); sign in again with "
+        f"`{cli_invocation()} login`."
+    )

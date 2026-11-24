@@ -14,7 +14,9 @@ import pytest
 import respx
 from click.testing import CliRunner, Result
 
+from omnigent.chat import _server_auth
 from omnigent.cli import cli
+from omnigent.session_cli import _renew_stored_login
 from omnigent.session_create_cli import message_event
 
 _BASE = "http://localhost:6767"
@@ -141,7 +143,9 @@ def router(monkeypatch: pytest.MonkeyPatch) -> Iterator[respx.MockRouter]:
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr("omnigent.cli._resolve_attach_server", lambda server, configured: _BASE)
     monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None: None)
-    monkeypatch.setattr("omnigent.session_cli._renew_stored_login", lambda server_url: None)
+    monkeypatch.setattr(
+        "omnigent.session_cli._renew_stored_login", lambda server_url, budget_s=None: None
+    )
     # No local-server pidfile, so the printed URL has no --base-path prefix.
     monkeypatch.setattr("omnigent.host.local_server._read_local_server_pid_file", lambda: None)
     monkeypatch.setattr("omnigent.session_cli._WAIT_FIRST_INTERVAL_S", 0.001)
@@ -364,8 +368,82 @@ def test_wait_refuses_to_guess_between_identical_held_messages(router: respx.Moc
     result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
 
     assert result.exit_code == 1
-    assert "more than one message with the text sent" in result.stderr
+    assert "more than one item matching the text sent" in result.stderr
     assert result.stdout == ""
+
+
+def _slash_command(item_id: str, name: str, arguments: str = "", kind: str = "command") -> dict:
+    return {
+        "id": item_id,
+        "type": "slash_command",
+        "model": "claude-native-ui",
+        "kind": kind,
+        "name": name,
+        "arguments": arguments,
+    }
+
+
+def _terminal_command(item_id: str, kind: str, **fields: str) -> dict:
+    return {"id": item_id, "type": "terminal_command", "kind": kind, **fields}
+
+
+@pytest.mark.parametrize(
+    ("text", "states"),
+    [
+        pytest.param(
+            "/compact",
+            [
+                ({"status": "running"}, [_slash_command("slash_1", "compact")]),
+                ({"status": "idle"}, []),
+            ],
+            id="slash-command-turn",
+        ),
+        pytest.param(
+            "!ls",
+            [
+                (
+                    {"status": "running"},
+                    [
+                        _terminal_command("term_1", "input", input="ls"),
+                        _terminal_command("term_2", "output", stdout="README.md"),
+                    ],
+                ),
+                ({"status": "idle"}, []),
+            ],
+            id="shell-command",
+        ),
+        pytest.param(
+            "/model opus",
+            [({"status": "idle"}, [_slash_command("slash_1", "model", "opus")])],
+            id="built-in-without-a-turn",
+        ),
+    ],
+)
+def test_wait_ends_on_a_native_command_recorded_instead_of_a_message(
+    router: respx.MockRouter, text: str, states: list[tuple[dict, list[dict]]]
+) -> None:
+    """A native terminal records /commands and !commands as their own items, not messages."""
+    _FakeSession(
+        ack=(202, {"queued": True, "pending_id": "pending_1"}),
+        stores_sent_message=False,
+        states=states,
+    ).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", text, "--wait"])
+
+    assert result.exit_code == 0, result.output
+    assert "turn ended without a reply" in result.stderr
+
+
+def test_wait_ignores_metadata_written_before_the_turn_starts(router: respx.MockRouter) -> None:
+    """A finished child's resource event isn't the sent message's turn running."""
+    resource_event = {"id": "res_1", "type": "resource_event", "event": "child_completed"}
+    _FakeSession(states=[({"status": "idle"}, [resource_event])]).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.2"])
+
+    assert result.exit_code == 1
+    assert "Timed out after 0.2s waiting for session conv_worker to reply" in result.stderr
 
 
 def test_wait_reports_a_held_message_the_session_never_delivered(
@@ -557,6 +635,63 @@ def test_wait_timeout_before_the_send_says_nothing_was_sent(router: respx.MockRo
     assert result.exit_code == 1
     assert "reading session conv_worker; the message was not sent" in result.stderr
     assert [kind for kind, _ in session.calls] == ["state"]
+
+
+def test_wait_timeout_covers_renewing_an_expired_login(
+    router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Renewing the login while the client opens counts against --timeout."""
+    refresh_timeouts: list[float] = []
+
+    def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | None:
+        refresh_timeouts.append(timeout)
+        time.sleep(timeout)
+        return None
+
+    monkeypatch.setattr("omnigent.session_cli._renew_stored_login", _renew_stored_login)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda server_url, **_: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_stored_token)
+    session = _FakeSession()
+    session.install(router)
+
+    started = time.monotonic()
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "0.1"])
+
+    assert result.exit_code == 1
+    assert "Timed out after 0.1s" in result.stderr
+    assert refresh_timeouts and all(timeout <= 0.1 for timeout in refresh_timeouts)
+    assert time.monotonic() - started < 2
+    assert session.calls == []
+
+
+def test_wait_gives_each_login_renewal_only_the_time_left(
+    router: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A renewal during the exchange may take no longer than what's left of --timeout."""
+    refresh_timeouts: list[float] = []
+
+    def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | None:
+        refresh_timeouts.append(timeout)
+        return None
+
+    def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | None:
+        # Still valid, but too close to lapsing to skip a renewal.
+        return None if min_remaining_seconds > 0 else "token"
+
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.session_cli._renew_stored_login", _renew_stored_login)
+    monkeypatch.setattr("omnigent.chat._server_auth", _server_auth)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", load_token)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_stored_token)
+    _FakeSession(states=[({"status": "idle"}, [_FIXED])]).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait", "--timeout", "5"])
+
+    assert result.exit_code == 0, result.output
+    # Each request renews with what's left: under the 5s budget, never the 10s default.
+    assert len(refresh_timeouts) > 2
+    assert all(0 < timeout <= 5 for timeout in refresh_timeouts)
+    assert refresh_timeouts == sorted(refresh_timeouts, reverse=True)
 
 
 def test_wait_timeout_covers_a_send_the_server_holds(router: respx.MockRouter) -> None:
@@ -758,6 +893,49 @@ def _transcript(count: int) -> list[dict]:
 
 def _ids(result: Result) -> list[str]:
     return [message["id"] for message in json.loads(result.stdout)["messages"]]
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        pytest.param(
+            httpx.Response(302, headers={"location": "/login"}),
+            "redirected the request (302 to /login); sign in again with `omnigent login`",
+            id="login-redirect",
+        ),
+        pytest.param(
+            httpx.Response(200, text="<html>Sign in</html>"),
+            "unreadable response for session conv_worker (200)",
+            id="html-page",
+        ),
+        pytest.param(
+            httpx.Response(200, json={"items": []}),
+            "unexpected item page for session conv_worker",
+            id="not-an-items-page",
+        ),
+    ],
+)
+def test_read_reports_a_response_that_isnt_history(
+    router: respx.MockRouter, response: httpx.Response, error: str
+) -> None:
+    """A sign-in redirect or a stray page is an error, not an empty transcript."""
+    router.get(f"{_STATE_URL}/items").mock(return_value=response)
+
+    result = _invoke(["read", _SESSION, "--json"])
+
+    assert result.exit_code == 1
+    assert error in result.stderr
+    assert result.stdout == ""
+
+
+def test_wait_reports_a_state_without_a_status(router: respx.MockRouter) -> None:
+    """An unreadable state ends the wait instead of polling forever."""
+    _FakeSession(states=[({"unexpected": True}, [])]).install(router)
+
+    result = _invoke(["send", _SESSION, "-m", "Fix it", "--wait"])
+
+    assert result.exit_code == 1
+    assert "unexpected state for session conv_worker" in result.stderr
 
 
 def test_read_shows_the_newest_messages_oldest_first(router: respx.MockRouter) -> None:

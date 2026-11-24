@@ -53,8 +53,11 @@ MCP independent creation.
   input waiting for its terminal, confirmed by a second transcript read 2s later, since
   a native terminal can report the end before its last reply is mirrored. An idle read
   from before the turn doesn't end the wait. The sent message is found by the ack's
-  item id, or by its text for a held input, never by someone else's message; a held
-  text that more than one message matches is refused (exit 1). A stored `omnigent
+  item id, or by its text for a held input, never by someone else's message; a
+  native terminal's `/command` or `!command` is found by the command item it records
+  instead. A held text that more than one item matches is refused (exit 1). Turn
+  output means tool calls, reasoning, errors, compaction, terminal output or assistant
+  messages, not metadata such as resource events. A stored `omnigent
   login` token is renewed from its refresh grant during the wait. It prints
   the final reply, or nothing with a stderr note when the turn left none; `--json` adds
   every message after the sent one. It stops early, with the status shown, when a
@@ -287,8 +290,11 @@ user; each request goes to the replica holding the session's host:
   absolute `--workspace` for another owned host, `--project-id` to file it) and prints
   its id; `--json` adds its URL.
 - `omnigent session send <id> -m "..." --wait` hands it the next task and prints the
-  final reply when the turn ends; `--json` gives `status`, `pending_approvals`, `reply`
+  final reply when the turn ends; `--message-file FILE` (or `-` for stdin) reads the
+  message instead. `--json` gives `delivered`, `status`, `pending_approvals`, `reply`
   and every message after the sent one, and `--timeout SECONDS` bounds it.
+- `send`, `get` and `read` use the configured server, or a local one; `--server URL`
+  overrides it.
 - `omnigent session get <id>` shows its status, approvals waiting, host, workspace
   and last activity (`--usage` adds cost and tokens, `--json` the
   `sys_session_get_info` fields plus the URL).
