@@ -38,14 +38,15 @@ def seeded_workspace(
 ) -> Iterator[tuple[str, str]]:
     """Write ``files`` (path to text) into the session's workspace, and remove them after."""
     base_url, session_id = session
-    for path, content in files.items():
-        httpx.put(
-            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
-            json={"content": content, "encoding": "utf-8"},
-            timeout=10.0,
-        ).raise_for_status()
     workspace = session_workspace(base_url, session_id)
+    # Inside the cleanup, so a write that fails partway still removes the ones before it.
     try:
+        for path, content in files.items():
+            httpx.put(
+                f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
+                json={"content": content, "encoding": "utf-8"},
+                timeout=10.0,
+            ).raise_for_status()
         yield session
     finally:
         remove_seeded(workspace, files)

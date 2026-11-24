@@ -7,9 +7,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
-from tests.e2e_ui.files._files_page import remove_seeded
+from tests.e2e_ui.files import _files_page
+from tests.e2e_ui.files._files_page import remove_seeded, seeded_workspace
 from tests.e2e_ui.files.test_files_tree_reveal import seeded_large_tree
 
 
@@ -32,6 +34,31 @@ def test_cleanup_removes_the_seeded_files_and_their_empty_folders_only(tmp_path:
         "src",
         "src/keep.ts",
     ]
+
+
+def test_a_seeding_that_fails_partway_removes_what_it_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "README.md").write_text("keep")
+    monkeypatch.setattr(_files_page, "session_workspace", lambda _base, _session: tmp_path)
+
+    def put(url: str, **_: object) -> httpx.Response:
+        path = url.split("/filesystem/", 1)[1]
+        request = httpx.Request("PUT", url)
+        if path == "src/second.ts":
+            return httpx.Response(500, request=request)
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text("x")
+        return httpx.Response(200, request=request)
+
+    monkeypatch.setattr(_files_page.httpx, "put", put)
+    with pytest.raises(httpx.HTTPStatusError):
+        with seeded_workspace(
+            ("http://example.test", "conv_1"), {"src/first.ts": "x", "src/second.ts": "x"}
+        ):
+            pass
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["README.md"]
 
 
 def _shell_in(workspace: Path):
