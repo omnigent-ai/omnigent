@@ -51,9 +51,11 @@ ensure: _ensure-uv _ensure-hooks _ensure-ios _ensure-omnidev
 
 # --- Local dev ---
 
+# Local dev pod; `just dev ui` runs only the UI against a remote server.
 [group('dev')]
-dev: _ensure-omnidev
-    omnidev
+[positional-arguments]
+dev *args: _ensure-omnidev
+    omnidev "$@"
 
 [group('dev')]
 dev-mobile: _ensure-omnidev
