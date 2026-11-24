@@ -449,3 +449,47 @@ async def test_screenshot_normalizes_base64_without_changing_image_bytes() -> No
         == "data:image/png;base64," + _TINY_PNG_BASE64
     )
     assert body["data_url"] == "data:image/png;base64," + wrapped
+
+
+@pytest.mark.asyncio
+async def test_screenshot_save_path_writes_png_and_is_not_forwarded(tmp_path) -> None:
+    """save_path stays runner-side and writes the decoded PNG into the workspace."""
+    import base64
+
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    body = {"ok": True, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}"}
+    client = _RecordingClient(_RecordingResponse(body=body))
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {"save_path": "evidence/shot.png"},
+        server_client=client,
+        conversation_id="image-session",
+        workspace=tmp_path,
+    )
+    assert client.calls[0][1] == {"action": "screenshot", "args": {}}
+    saved = tmp_path / "evidence" / "shot.png"
+    assert saved.read_bytes() == base64.b64decode(_TINY_PNG_BASE64)
+    metadata = json.loads(json.loads(output)["content"][0]["text"])
+    assert metadata == {"ok": True, "saved_path": str(saved)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("save_path", "workspace_needed", "error"),
+    [("../outside.png", True, "escapes workspace"), ("shot.png", False, "needs a session")],
+)
+async def test_screenshot_save_path_rejected_before_capture(
+    tmp_path, save_path: str, workspace_needed: bool, error: str
+) -> None:
+    """Bad save paths fail without driving the browser."""
+    client = _RecordingClient()
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {"save_path": save_path},
+        server_client=client,
+        conversation_id="image-session",
+        workspace=tmp_path if workspace_needed else None,
+    )
+    assert error in json.loads(output)["error"]
+    assert client.calls == []

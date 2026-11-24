@@ -5079,6 +5079,7 @@ async def _execute_browser_tool(
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
+    workspace: Path | None = None,
 ) -> str:
     """
     Runner-local handler for the ``browser_*`` embedded-browser tools.
@@ -5106,12 +5107,26 @@ async def _execute_browser_tool(
         ``{"url": "https://example.com"}``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: Current session id, e.g. ``"conv_abc123"``.
+    :param workspace: Session workspace that a screenshot ``save_path`` resolves in.
     :returns: The server action-result JSON string, or a timeout/error JSON.
     """
     if server_client is None:
         return json.dumps({"error": f"{tool_name} requires server access"})
     if conversation_id is None:
         return json.dumps({"error": f"{tool_name} requires a session id"})
+    save_target: Path | None = None
+    if tool_name == "browser_screenshot" and "save_path" in args:
+        # The renderer doesn't know save_path; the runner writes the file itself.
+        save_path = args["save_path"]
+        args = {key: value for key, value in args.items() if key != "save_path"}
+        if not isinstance(save_path, str) or not save_path.strip():
+            return json.dumps({"error": "save_path must be a non-empty workspace-relative path"})
+        if workspace is None:
+            return json.dumps({"error": "save_path needs a session workspace"})
+        try:
+            save_target = safe_resolve(save_path, workspace)
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
 
     # Strip the ``browser_`` prefix so the wire ``action`` matches the
     # frozen contract (navigate / snapshot / click / type / screenshot).
@@ -5132,12 +5147,15 @@ async def _execute_browser_tool(
     if resp.status_code >= 400:
         return json.dumps({"error": f"{tool_name} returned {resp.status_code}: {resp.text[:200]}"})
     if tool_name == "browser_screenshot":
-        return _browser_screenshot_output(resp.text)
+        return _browser_screenshot_output(resp.text, save_target)
     return resp.text
 
 
-def _browser_screenshot_output(output: str) -> str:
-    """Carry a successful browser data URL through the shared image transport."""
+def _browser_screenshot_output(output: str, save_target: Path | None = None) -> str:
+    """Carry a successful browser data URL through the shared image transport.
+
+    With ``save_target``, also write the decoded image there and report its path.
+    """
     try:
         result = json.loads(output)
     except ValueError:
@@ -5159,6 +5177,13 @@ def _browser_screenshot_output(output: str) -> str:
     if canonical is None:
         return output
     metadata = {key: value for key, value in result.items() if key != "data_url"}
+    if save_target is not None:
+        try:
+            save_target.parent.mkdir(parents=True, exist_ok=True)
+            save_target.write_bytes(base64.b64decode(canonical))
+            metadata["saved_path"] = str(save_target)
+        except OSError as exc:
+            metadata["save_error"] = f"Couldn't save the screenshot: {exc}"
     return encode_mcp_image_result(
         [
             {"type": "text", "text": json.dumps(metadata)},
@@ -8485,11 +8510,18 @@ async def execute_tool(
                 conversation_id=conversation_id,
             )
         elif tool_name in _BROWSER_TOOLS:
+            browser_workspace = None
+            if tool_name == "browser_screenshot" and args.get("save_path"):
+                os_spec = _effective_runner_os_env_spec(
+                    agent_spec, conversation_id, runner_workspace
+                )
+                browser_workspace = Path(os_spec.cwd) if os_spec.cwd else None
             output = await _execute_browser_tool(
                 tool_name,
                 args,
                 server_client=server_client,
                 conversation_id=conversation_id,
+                workspace=browser_workspace,
             )
         elif _is_spec_local_python_tool(tool_name, agent_spec):
             output = await _execute_local_python_tool(

@@ -55,6 +55,7 @@ import { ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCostSection } from "./ProjectCost";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
+import { SessionImage } from "@/components/SessionImage";
 import { MentionTextarea } from "./MentionTextarea";
 import { usePersonaForSession, useProjectPersonaLookup } from "./usePersonaSessions";
 import { payloadMentions } from "./personaMentions";
@@ -797,6 +798,7 @@ function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: s
               {group.map((output) => (
                 <li key={output.url}>
                   <TicketOutputLink output={output} />
+                  <TicketArtifactImage output={output} className="px-3 pb-3" />
                 </li>
               ))}
             </ul>
@@ -818,12 +820,31 @@ function TicketOutputs({ projectId, ticketId }: { projectId: string; ticketId: s
   );
 }
 
-function TicketArtifactLink({ output, inline }: { output: TicketOutput; inline: boolean }) {
-  const file = useQuery({
-    queryKey: ["project-file", output.url],
-    queryFn: () => getProjectFile(output.url),
+function useProjectFileInfo(url: string) {
+  return useQuery({
+    queryKey: ["project-file", url],
+    queryFn: () => getProjectFile(url),
     staleTime: Infinity,
   });
+}
+
+// Raster types the content route serves inline; SVG stays a download.
+const PREVIEW_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+/** Inline preview for an image project file, such as a screenshot of a change working. */
+function TicketArtifactImage({ output, className }: { output: TicketOutput; className?: string }) {
+  const file = useProjectFileInfo(output.url);
+  const type = file.data?.content_type?.split(";", 1)[0].trim().toLowerCase();
+  if (output.type !== "artifact" || !type || !PREVIEW_IMAGE_TYPES.has(type)) return null;
+  return (
+    <div className={cn("w-fit max-w-full", className)}>
+      <SessionImage path={output.url} alt={file.data?.title || file.data?.filename || "Screenshot"} />
+    </div>
+  );
+}
+
+function TicketArtifactLink({ output, inline }: { output: TicketOutput; inline: boolean }) {
+  const file = useProjectFileInfo(output.url);
   const [error, setError] = useState<string | null>(null);
   const name = file.data?.title ?? file.data?.filename ?? "Project file";
   return (
@@ -1153,6 +1174,8 @@ function TicketActivityItem({
 }) {
   const note = event.kind === "comment" || event.kind === "execution";
   const body = typeof event.payload.text === "string" ? event.payload.text : null;
+  const outputImage =
+    event.kind === "output" && event.payload.type === "artifact" ? ticketOutputs([event])[0] : null;
   const involvement =
     typeof event.payload.session_id === "string" && typeof event.payload.involvement === "string"
       ? event.payload.involvement
@@ -1234,6 +1257,7 @@ function TicketActivityItem({
             {involvement}
           </p>
         )}
+        {outputImage && <TicketArtifactImage output={outputImage} />}
         {body && (
           <TicketFileLinks sessionId={event.session_id ?? fallbackSessionId}>
             <TicketCommentBody body={body} mentions={payloadMentions(event.payload)} />

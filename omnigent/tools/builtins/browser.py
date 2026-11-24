@@ -292,7 +292,9 @@ class BrowserScreenshotTool(Tool):
             "browser_snapshot for picking elements to act on, since "
             "screenshots can't carry ref ids and you can't click a "
             "pixel location. Use this when you need to verify what "
-            "something looks like, not to plan an interaction."
+            "something looks like, not to plan an interaction. "
+            "Pass save_path to also write the PNG into your workspace, "
+            "e.g. to attach it to a ticket with sys_project_artifact_save."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -309,7 +311,15 @@ class BrowserScreenshotTool(Tool):
                 "description": BrowserScreenshotTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "save_path": {
+                            "type": "string",
+                            "description": (
+                                "Optional workspace-relative path to also save the PNG "
+                                "to, e.g. 'evidence/copy-url.png'."
+                            ),
+                        },
+                    },
                     "additionalProperties": False,
                 },
             },
