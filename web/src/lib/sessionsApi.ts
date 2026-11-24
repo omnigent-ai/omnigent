@@ -1922,6 +1922,14 @@ export function stopSession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "stop_session", data: {} });
 }
 
+/**
+ * Restart the session's runner once it is idle so it loads the current tools.
+ * The server waits for a running turn and queued input; the conversation is kept.
+ */
+export function reloadSessionTools(sessionId: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, { type: "reload_tools", data: {} });
+}
+
 /** Send *text* to a session as a plain user message, e.g. from a page other than its chat. */
 export function sendUserMessage(
   sessionId: string,

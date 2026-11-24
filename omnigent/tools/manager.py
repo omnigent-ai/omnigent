@@ -525,6 +525,9 @@ class ToolManager:
 
         if peer_session_messaging_enabled():
             self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
+        from omnigent.tools.builtins.session_reload import SysSessionReloadToolsTool
+
+        self._tools[SysSessionReloadToolsTool.name()] = SysSessionReloadToolsTool()
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()

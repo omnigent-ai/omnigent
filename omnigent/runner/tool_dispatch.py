@@ -116,6 +116,7 @@ from omnigent.tools.builtins.session_projects import (
     SysSessionLinkPrTool,
     SysSessionUpdateTool,
 )
+from omnigent.tools.builtins.session_reload import SysSessionReloadToolsTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -544,7 +545,7 @@ _BROWSER_TIMEOUT_ERROR = (
 # shell and file tools, and a relayed copy would be a second route to the
 # workspace that a same-uid caller holding the relay token could use.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
-    {SysSessionMessageTool.name()}
+    {SysSessionMessageTool.name(), SysSessionReloadToolsTool.name()}
     | _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
@@ -693,6 +694,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetInfoTool,
             SysSessionRenameTool,
             SysSessionMessageTool,
+            SysSessionReloadToolsTool,
             SysProjectListTool,
             SysSessionLinkPrTool,
             SysSessionUpdateTool,
@@ -1051,7 +1053,7 @@ async def _fitted_discovery_result(
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
-    {SysSessionMessageTool.name()}
+    {SysSessionMessageTool.name(), SysSessionReloadToolsTool.name()}
     | _OS_ENV_TOOLS
     | _REST_TOOLS
     | _FILE_TOOLS
@@ -8281,6 +8283,10 @@ async def execute_tool(
             from omnigent.runner.session_message import execute_message_tool
 
             output = await execute_message_tool(args, server_client, conversation_id)
+        elif tool_name == SysSessionReloadToolsTool.name():
+            from omnigent.runner.session_reload import execute_reload_tools_tool
+
+            output = await execute_reload_tools_tool(args, server_client, conversation_id)
         elif tool_name == SysSessionLinkPrTool.name():
             from omnigent.runner.session_link_pr import execute_link_pr_tool
 

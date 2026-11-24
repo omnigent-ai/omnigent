@@ -89,6 +89,7 @@ import {
   PinIcon,
   PinOffIcon,
   PlusIcon,
+  RefreshCwIcon,
   SearchIcon,
   Settings2Icon,
   ShareIcon,
@@ -211,6 +212,7 @@ import { useProjectKanbanEnabled } from "@/lib/projectKanbanPreferences";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
+import { reloadSessionTools } from "@/lib/sessionsApi";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
@@ -5362,6 +5364,30 @@ export function ConversationMenuItems({
           divider: lifecycle-ending actions separated from the everyday
           ones above. */}
       <C.Separator />
+      {/* Reload tools restarts the runner between turns; the conversation is kept. */}
+      {canStop && isOwner && conversation.host_id && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="reload-session-tools"
+          onSelect={() => {
+            reloadSessionTools(conversation.id).then(
+              () =>
+                showToast(
+                  conversation.status === "idle"
+                    ? "Reloading tools…"
+                    : "Tools will reload when the current turn ends",
+                ),
+              (err: unknown) => {
+                const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+                showToast(`Couldn't reload tools${detail}`);
+              },
+            );
+          }}
+        >
+          <RefreshCwIcon className="size-3.5" />
+          Reload tools
+        </C.Item>
+      )}
       {/* Stop session — only on stoppable sessions whose runner isn't
         already known-offline (canStop). Owner-gated like Delete:
         non-owners see it disabled with an explanatory tooltip. */}

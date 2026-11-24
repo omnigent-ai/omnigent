@@ -181,6 +181,7 @@ from omnigent.server.routes._sessions.common import (
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     _INTERRUPT_TYPE,
     _MCP_ELICITATION_TYPE,
+    _RELOAD_TOOLS_TYPE,
     _RETRY_SESSION_TYPE,
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
@@ -1505,6 +1506,27 @@ def register_events_routes(
         from omnigent.server.session_journal import require_current_workflow_run
 
         await require_current_workflow_run(conversation_store, session_id, body.workflow_run_id)
+        if body.type == _RELOAD_TOOLS_TYPE:
+            from omnigent.server.routes._sessions import tool_reload
+
+            await asyncio.to_thread(
+                tool_reload.authorize_tool_reload,
+                request,
+                user_id,
+                conv,
+                conversation_store,
+                permission_store,
+            )
+            await tool_reload.require_reloadable(conv, conversation_store)
+            tool_reload.schedule_tool_reload(
+                request,
+                session_id,
+                user_id=user_id,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                permission_store=permission_store,
+            )
+            return {"queued": True, "reload": "scheduled"}
         native_harness = (
             await asyncio.to_thread(
                 _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
@@ -1698,6 +1720,7 @@ def register_events_routes(
             _SLASH_COMMAND_TYPE,
             _STOP_SESSION_TYPE,
             _RETRY_SESSION_TYPE,
+            _RELOAD_TOOLS_TYPE,
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
