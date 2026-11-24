@@ -1,10 +1,10 @@
-"""A shared session's editor reads its pull request but can't change it through the owner's login.
+"""A shared session's collaborator reads its PR but can't change it through the owner's login.
 
 The session's host runs ``gh`` as the owner, so the server lets only the owner change the
 session's PRs. This test owns its server and runner, with a PATH-shimmed ``gh`` serving the
-branch's PR. The owner sees the panel's change controls. An editor, granted the strongest
-level short of ownership, sees the same PR with a note instead, and the server refuses the
-editor's comment before ``gh`` is ever run for it.
+branch's PR. The owner sees the panel's change controls. A collaborator granted manage, the
+strongest level short of ownership, sees the same PR with a note instead, and the server
+refuses the collaborator's comment before ``gh`` is ever run for it.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ PR = {
     "comments": [],
     "statusCheckRollup": [],
 }
-_LEVEL_EDIT = 2
+_LEVEL_MANAGE = 3
 _OWNER_ONLY_NOTE = re.compile(r"Only the session.s owner can change its pull requests here")
 
 
@@ -78,11 +78,11 @@ def _gh_calls(binary: Path) -> list[list[str]]:
     ]
 
 
-def test_an_editor_reads_the_pr_but_only_the_owner_changes_it(
+def test_a_collaborator_reads_the_pr_but_only_the_owner_changes_it(
     browser: Browser, pr_session: tuple[str, str, Path], tmp_path: Path
 ) -> None:
     base_url, session_id, binary = pr_session
-    editor = f"editor-{uuid.uuid4().hex[:6]}@ui.test"
+    collaborator = f"collaborator-{uuid.uuid4().hex[:6]}@ui.test"
 
     # The owner (the server's default identity) gets the change controls.
     owner_context = browser.new_context()
@@ -96,14 +96,16 @@ def test_an_editor_reads_the_pr_but_only_the_owner_changes_it(
 
     granted = httpx.put(
         f"{base_url}/v1/sessions/{session_id}/permissions",
-        json={"user_id": editor, "level": _LEVEL_EDIT},
+        json={"user_id": collaborator, "level": _LEVEL_MANAGE},
         timeout=30,
     )
     assert granted.status_code in (200, 201, 204), granted.text
 
-    editor_context = browser.new_context(extra_http_headers={"X-Forwarded-Email": editor})
+    collaborator_context = browser.new_context(
+        extra_http_headers={"X-Forwarded-Email": collaborator}
+    )
     try:
-        page = editor_context.new_page()
+        page = collaborator_context.new_page()
         rail = open_pull_requests_tab(page, base_url, session_id)
         # The PR itself still renders, so the missing controls below aren't a failed load.
         expect(_pr_header(rail)).to_be_visible(timeout=30_000)
@@ -111,7 +113,7 @@ def test_an_editor_reads_the_pr_but_only_the_owner_changes_it(
         expect(rail.get_by_role("button", name="Link a PR")).to_have_count(0)
         expect(rail.get_by_role("button", name="Unlink PR")).to_have_count(0)
         expect(rail.get_by_role("button", name="Merge")).to_have_count(0)
-        page.screenshot(path=str(tmp_path / "editor-pr.png"), animations="disabled")
+        page.screenshot(path=str(tmp_path / "collaborator-pr.png"), animations="disabled")
 
         refused = page.request.post(
             f"{base_url}/v1/sessions/{session_id}/resources/github/comments",
@@ -124,4 +126,4 @@ def test_an_editor_reads_the_pr_but_only_the_owner_changes_it(
             any(arg.endswith("/issues/42/comments") for arg in call) for call in _gh_calls(binary)
         )
     finally:
-        editor_context.close()
+        collaborator_context.close()

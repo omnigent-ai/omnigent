@@ -17,7 +17,7 @@ from omnigent.runner.git_providers import ProviderCapabilities
 
 OWNER_ONLY_CHANGES_MESSAGE = (
     "Only the session's owner can change its pull requests. "
-    "Open the pull request on GitHub to make changes there."
+    "Open the pull request on its code host to make changes there."
 )
 # Capabilities that change the pull request, or the host's account and checkout.
 OWNER_CAPABILITIES = frozenset(

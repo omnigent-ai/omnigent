@@ -20,7 +20,13 @@ from fastapi.routing import APIRoute
 from omnigent.errors import OmnigentError
 from omnigent.runtime import set_runner_router
 from omnigent.server import session_pull_requests as server_prs
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    UnifiedAuthProvider,
+)
 from omnigent.server.pull_request_viewers import OWNER_ONLY_CHANGES_MESSAGE, READ_CAPABILITIES
 from omnigent.server.routes import _host_filesystem
 from omnigent.server.routes.sessions import create_sessions_router
@@ -44,6 +50,8 @@ _WORKSPACE = "/workspace/project"
 _OWNER = "owner@example.com"
 _EDITOR = "editor@example.com"
 _VIEWER = "viewer@example.com"
+# The strongest grant short of ownership.
+_MANAGER = "manager@example.com"
 # The admin flag with a read grant, with no grant at all, and with the owner grant.
 _ADMIN = "admin@example.com"
 _ADMIN_NO_GRANT = "admin-no-grant@example.com"
@@ -125,6 +133,7 @@ def _permissions() -> _StubPermissionStore:
     permissions = _StubPermissionStore()
     permissions.add_grant(_OWNER, _ROOT, LEVEL_OWNER)
     permissions.add_grant(_EDITOR, _ROOT, LEVEL_EDIT)
+    permissions.add_grant(_MANAGER, _ROOT, LEVEL_MANAGE)
     permissions.add_grant(_VIEWER, _ROOT, LEVEL_READ)
     permissions.add_grant(_ADMIN, _ROOT, LEVEL_READ)
     permissions.add_grant(_ADMIN_OWNER, _ROOT, LEVEL_OWNER)
@@ -270,7 +279,7 @@ def test_every_pull_request_route_is_owner_only_or_a_listed_read(db_uri: str) ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("method", "path", "options"), _OWNER_ONLY_ROUTES, ids=_ROUTE_IDS)
-@pytest.mark.parametrize("caller", [_EDITOR, _ADMIN, _ADMIN_NO_GRANT])
+@pytest.mark.parametrize("caller", [_EDITOR, _MANAGER, _ADMIN, _ADMIN_NO_GRANT])
 async def test_a_change_from_anyone_but_the_owner_is_refused_before_the_host(
     client: httpx.AsyncClient,
     host: _RecordingHost,
@@ -325,8 +334,21 @@ async def test_the_owner_s_change_reaches_the_host(
         assert len(host.calls) == 1, host.calls
 
 
+# One route per way a change reaches the host: a read, a host write, and the stored unlink.
+_REPRESENTATIVE_ROUTES = [
+    route
+    for route in _OWNER_ONLY_ROUTES
+    if route[:2]
+    in {
+        ("GET", "/resources/github/labels"),
+        ("POST", "/resources/github/merge"),
+        ("DELETE", "/pull-requests"),
+    }
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("method", "path", "options"), _OWNER_ONLY_ROUTES, ids=_ROUTE_IDS)
+@pytest.mark.parametrize(("method", "path", "options"), _REPRESENTATIVE_ROUTES)
 async def test_with_permissions_off_everyone_is_the_owner(
     db_uri: str, host: _RecordingHost, method: str, path: str, options: dict[str, Any]
 ) -> None:
@@ -405,6 +427,7 @@ async def test_a_refused_link_never_checks_the_session_s_room(
     ("caller", "selected"),
     [
         (_EDITOR, "owner-login"),
+        (_MANAGER, "owner-login"),
         (_ADMIN, "owner-login"),
         (_ADMIN_NO_GRANT, "owner-login"),
         (_VIEWER, None),
