@@ -5,7 +5,11 @@ orchestrator and:
 
 - finds tickets in a working stage (any stage between the first and the
   completed one) whose ticket and linked workers have shown no activity for the
-  stage's threshold, while no linked worker is running;
+  stage's threshold, while no linked worker is running. When a review stage
+  comes before the last stage before completion (like Verified after Review),
+  that last stage holds finished work waiting to ship: its tickets get no
+  ladder, only one reminder to the lead after ``ship_wait_hours`` without
+  activity;
 - walks an escalation ladder for each such ticket: nudge the worker, then
   restart its runner (the Reload tools path), then escalate to the lead with a
   one-line summary. Each step waits ``step_minutes`` and is recorded on the
@@ -68,11 +72,30 @@ _DEFAULTS: dict[str, Any] = {
     "review_hours": 4.0,
     "max_wait_hours": 72.0,
     "owner_wait_hours": 24.0,
+    "ship_wait_hours": 24.0,
 }
 WAITING_LABEL = "waiting"
 # The loop writes as an agent, not a person: its notes and label edits must not
 # start worker turns or wake the orchestrator the way a person's comment does.
 LOOP_AGENT_ID = uuid.uuid5(uuid.NAMESPACE_URL, "omnigent:project-reliability-loop").hex
+
+
+# Stage ids that mean code review: this project's Review stage, and the default board's.
+REVIEW_STAGE_IDS = ("code_review", "review")
+
+
+def _ship_stage(stages: list[dict[str, Any]]) -> str | None:
+    """The stage holding finished work waiting to ship, or ``None``.
+
+    That is the last stage before completion when a review stage comes before it,
+    like Verified after Review; it's a worker's job nowhere else, including on the
+    default board, where the stage before Done is Review itself.
+    """
+    if len(stages) < 3:
+        return None
+    candidate = stages[-2]["id"]
+    earlier = [stage["id"] for stage in stages[1:-2]]
+    return candidate if any(stage_id in REVIEW_STAGE_IDS for stage_id in earlier) else None
 
 
 def _loop_actor(project: Any) -> TicketActor:
@@ -95,6 +118,7 @@ class Settings:
     review_s: float
     max_wait_s: float
     owner_wait_s: float
+    ship_wait_s: float
 
     def threshold(self, stage_id: str) -> float:
         return self.stage_s.get(stage_id, self.stall_s)
@@ -131,6 +155,7 @@ def settings(config: dict[str, Any]) -> Settings:
         review_s=number("review_hours") * 3600,
         max_wait_s=number("max_wait_hours") * 3600,
         owner_wait_s=number("owner_wait_hours") * 3600,
+        ship_wait_s=number("ship_wait_hours") * 3600,
     )
 
 
@@ -320,6 +345,8 @@ class ProjectState:
     last_review_at: float = 0.0
     reviewed_mark: int = 0
     escalated: set[str] = field(default_factory=set)
+    # Ticket id -> the ticket's updated_at when the Lead was last reminded it's waiting to ship.
+    ship_reminded: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -344,9 +371,10 @@ def _dump_ladders(state: dict[str, ProjectState]) -> dict[str, Any]:
                 ticket_id: asdict(ladder) for ticket_id, ladder in project.tickets.items()
             },
             "escalated": sorted(project.escalated),
+            "ship_reminded": dict(project.ship_reminded),
         }
         for project_id, project in state.items()
-        if project.tickets or project.escalated
+        if project.tickets or project.escalated or project.ship_reminded
     }
 
 
@@ -370,10 +398,17 @@ def _load_ladders(now: float) -> dict[str, ProjectState]:
                 for ticket_id, ladder in entry["tickets"].items()
             }
             escalated = {str(ticket_id) for ticket_id in entry["escalated"]}
+            ship_reminded = {
+                str(ticket_id): int(mark)
+                for ticket_id, mark in (entry.get("ship_reminded") or {}).items()
+            }
         except (AttributeError, KeyError, TypeError, ValueError):
             continue
         loaded[str(project_id)] = ProjectState(
-            tickets=tickets, escalated=escalated & set(tickets), started_at=now
+            tickets=tickets,
+            escalated=escalated & set(tickets),
+            started_at=now,
+            ship_reminded=ship_reminded,
         )
     return loaded
 
@@ -557,6 +592,7 @@ class ReliabilityLoop:
         if len(stages) < 2:
             return
         working = {stage["id"]: stage["name"] for stage in stages[1:-1]}
+        ship_stage = _ship_stage(stages)
         excluded = await router_session_ids(self.app, project)
         seen: set[str] = set()
         newest = 0
@@ -567,11 +603,15 @@ class ReliabilityLoop:
             seen.add(ticket["id"])
             if await self._check_wait(project, state, config, ticket, now):
                 continue
-            if ticket["stage_id"] in config.unwatched_stages:
+            if ticket["stage_id"] in config.unwatched_stages or ticket["stage_id"] == ship_stage:
                 # A `waiting` wake-up still fires above; no stall ladder or owner-wait park.
                 state.tickets.pop(ticket["id"], None)
                 state.escalated.discard(ticket["id"])
                 state.owner_waits.pop(ticket["id"], None)
+                if ticket["stage_id"] == ship_stage:
+                    await self._check_ship_wait(
+                        project, state, config, ticket, working[ticket["stage_id"]], now
+                    )
                 continue
             if await self._check_owner_wait(project, state, config, ticket, excluded, now):
                 continue
@@ -584,6 +624,8 @@ class ReliabilityLoop:
             state.parks.pop(ticket_id, None)
         for ticket_id in set(state.waits) - seen:
             state.waits.pop(ticket_id, None)
+        for ticket_id in set(state.ship_reminded) - seen:
+            state.ship_reminded.pop(ticket_id, None)
         for ticket_id in set(state.tickets) - seen:
             state.tickets.pop(ticket_id, None)
             state.escalated.discard(ticket_id)
@@ -1134,6 +1176,33 @@ class ReliabilityLoop:
                 ladder.step = RESTART
 
     # -- periodic review -----------------------------------------------------
+
+    async def _check_ship_wait(
+        self,
+        project: Any,
+        state: ProjectState,
+        config: Settings,
+        ticket: dict[str, Any],
+        stage_name: str,
+        now: float,
+    ) -> None:
+        """Remind the Lead once when finished work has waited to ship for a long time."""
+        updated = int(ticket.get("updated_at") or 0)
+        if state.ship_reminded.get(ticket["id"]) == updated or now - updated < config.ship_wait_s:
+            return
+        router = await router_session_id(self.app, project)
+        if router is None:
+            return
+        hours = int((now - updated) // 3600)
+        title = (ticket.get("title") or "")[:80]
+        await self._send(
+            router,
+            f'[{NOTE_PREFIX}] "{title}" (`{ticket["id"]}`) has waited in {stage_name} for '
+            f"{hours} h. It looks finished and waiting to ship: push it, or move it back if work "
+            "remains. Reply in one line.",
+            project.user_id,
+        )
+        state.ship_reminded[ticket["id"]] = updated
 
     async def _maybe_review(
         self,

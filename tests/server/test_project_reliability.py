@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.entities.project_ticket import DEFAULT_STAGE_NAMES
 from omnigent.server import project_reliability as reliability
 
 STAGES = [
@@ -512,3 +513,67 @@ async def test_a_park_on_a_question_ignores_mere_worker_activity(world) -> None:
     world.conversations.convs["worker"].live_status = "running"
     await world.loop.check_project("p1", None, now=20 * MINUTE)
     assert _keys(world) == ["needs-human"]
+
+
+# A board like this project's: Verified comes after Review, before Merged.
+SHIP_STAGES = [
+    {"id": "open", "name": "Pending"},
+    {"id": "in_progress", "name": "Working"},
+    {"id": "code_review", "name": "Review"},
+    {"id": "verified", "name": "Verified"},
+    {"id": "merged", "name": "Merged"},
+]
+# The shipped default board, where the stage before Done is Review itself.
+DEFAULT_STAGES = [{"id": stage_id, "name": name} for stage_id, name in DEFAULT_STAGE_NAMES.items()]
+
+
+async def test_work_waiting_to_ship_is_not_chased_but_the_lead_is_reminded_once(world) -> None:
+    world.tickets.list = lambda project_id, **_: {
+        "stages": SHIP_STAGES,
+        "data": world.tickets.tickets,
+    }
+    world.tickets.tickets[0]["stage_id"] = "verified"
+
+    def ship_reminders():
+        return [text for sid, text in world.inputs.sent if "waiting to ship" in text]
+
+    # No nudge, restart or park for the worker of finished work, however long it sits.
+    for minute in (11, 17, 23, 40, 23 * 60):
+        await world.loop.check_project("p1", None, now=minute * MINUTE)
+    assert [sid for sid, _ in world.inputs.sent if sid != "lead"] == []
+    assert world.tickets.notes == [] and world.restarts == [] and ship_reminders() == []
+    assert world.tickets.tickets[0].get("labels") is None
+    # After a day the Lead hears about it once, and not again until the ticket moves.
+    await world.loop.check_project("p1", None, now=24 * 60 * MINUTE + 60)
+    await world.loop.check_project("p1", None, now=30 * 60 * MINUTE)
+    assert len(ship_reminders()) == 1 and "Alpha" in ship_reminders()[0]
+    world.tickets.tickets[0]["updated_at"] = int(31 * 60 * MINUTE)
+    await world.loop.check_project("p1", None, now=40 * 60 * MINUTE)
+    assert len(ship_reminders()) == 1
+    await world.loop.check_project("p1", None, now=56 * 60 * MINUTE)
+    assert len(ship_reminders()) == 2
+    assert [sid for sid, _ in world.inputs.sent if sid != "lead"] == []
+
+
+@pytest.mark.parametrize("stage_id", ["in_progress", "code_review"])
+async def test_the_other_working_stages_on_a_longer_board_are_still_chased(
+    world, stage_id
+) -> None:
+    world.tickets.list = lambda project_id, **_: {
+        "stages": SHIP_STAGES,
+        "data": world.tickets.tickets,
+    }
+    world.tickets.tickets[0]["stage_id"] = stage_id
+    await world.loop.check_project("p1", None, now=11 * MINUTE)
+    assert [sid for sid, _ in world.inputs.sent] == ["worker"]
+
+
+async def test_review_on_the_default_board_is_still_chased(world) -> None:
+    assert [stage["id"] for stage in DEFAULT_STAGES][-2] == "review"
+    world.tickets.list = lambda project_id, **_: {
+        "stages": DEFAULT_STAGES,
+        "data": world.tickets.tickets,
+    }
+    world.tickets.tickets[0]["stage_id"] = "review"
+    await world.loop.check_project("p1", None, now=11 * MINUTE)
+    assert [sid for sid, _ in world.inputs.sent] == ["worker"]
