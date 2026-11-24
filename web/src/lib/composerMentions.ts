@@ -375,6 +375,31 @@ function stripTrailingHint(text: string): string | null {
   return end.slice(0, start).trimEnd();
 }
 
+/** A piece of a sent answer: literal text, or a session marker. */
+export type SentSessionPart = string | { id: string; title: string; isSubagent: boolean };
+
+/**
+ * A sent answer split into its text and its session markers, with the tool hint removed. Only a
+ * hint that follows at least one session marker counts, so every other character, attachment-like
+ * text included, stays as typed.
+ */
+export function splitSentSessionMentions(text: string): SentSessionPart[] {
+  const withoutHint = stripTrailingHint(text);
+  if (withoutHint === null) return [text];
+  const parts: SentSessionPart[] = [];
+  let last = 0;
+  for (const match of withoutHint.matchAll(SENT_SESSION_RE)) {
+    const [whole, title, id, subagent] = match;
+    const at = match.index;
+    if (at > last) parts.push(withoutHint.slice(last, at));
+    parts.push({ id, title, isSubagent: subagent === "yes" });
+    last = at + whole.length;
+  }
+  if (parts.length === 0) return [text];
+  if (last < withoutHint.length) parts.push(withoutHint.slice(last));
+  return parts;
+}
+
 /**
  * Rewrite the markers in a sent message with ``render``: drops the trailing tool
  * hint, drops absolute-path upload markers, and passes each relative file marker

@@ -1,9 +1,3 @@
-// These suites render question cards without the app's QueryClient; the card's @-menu
-// listing is not under test here, so it lists nothing.
-vi.mock("@/hooks/useSessionMentionEntries", async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  useSessionMentionEntries: () => [],
-}));
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -1867,6 +1861,35 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     // ("wants to call AskUserQuestion") would read as if the prompt
     // were still outstanding.
     expect(screen.queryByText(/wants to call/)).toBeNull();
+  });
+
+  it("shows attachment-like answers as typed, single and multi-select", () => {
+    const { container } = render(
+      <ApprovalCard
+        elicitationId="elic_literal"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview=""
+        requestedSchema={{}}
+        status="responded"
+        response={{
+          action: "accept",
+          content: {
+            "Which framework?": "[Attached: /tmp/report.txt]",
+            "Pick snacks": ["[Attached: /tmp/a.txt]", "plain"],
+          },
+        }}
+        askUserQuestion={{
+          questions: [
+            { question: "Which framework?", multiSelect: false, options: [{ label: "React" }] },
+            { question: "Pick snacks", multiSelect: true, options: [{ label: "Popcorn" }] },
+          ],
+        }}
+      />,
+    );
+    expect(container.textContent).toContain("[Attached: /tmp/report.txt]");
+    expect(container.textContent).toContain("[Attached: /tmp/a.txt], plain");
   });
 
   describe("unsent answers across a remount", () => {
