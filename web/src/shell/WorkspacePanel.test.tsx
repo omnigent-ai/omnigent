@@ -10,7 +10,7 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
-import type { ReactNode, RefObject } from "react";
+import { type ReactNode, type RefObject, useEffect } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -143,6 +143,8 @@ vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 // Tabs the gadget rail reports, for the cases that keep a gadget open; null uses the real hook.
 const gadgetRailTabs = vi.hoisted(() => ({
   value: null as { key: string; label: string }[] | null,
+  // More of the rail's state, for cases that pick which gadget is selected and shown.
+  state: null as Partial<GadgetRailTabsModule.GadgetRailTabState> | null,
 }));
 vi.mock("@/gadgets/ui/GadgetRailTabs", async (importOriginal) => {
   const actual = await importOriginal<typeof GadgetRailTabsModule>();
@@ -150,7 +152,8 @@ vi.mock("@/gadgets/ui/GadgetRailTabs", async (importOriginal) => {
     ...actual,
     useGadgetRailTabState: (...args: Parameters<typeof actual.useGadgetRailTabState>) => {
       const state = actual.useGadgetRailTabState(...args);
-      return gadgetRailTabs.value === null ? state : { ...state, tabs: gadgetRailTabs.value };
+      const tabs = gadgetRailTabs.value === null ? state.tabs : gadgetRailTabs.value;
+      return { ...state, tabs, ...gadgetRailTabs.state };
     },
   };
 });
@@ -543,6 +546,53 @@ describe("WorkspacePanel surface presentation", () => {
       expect(onHide).not.toHaveBeenCalled();
     } finally {
       gadgetRailTabs.value = null;
+    }
+  });
+
+  it("runs a gadget once: in the rail on a desktop, only in its drawer on a phone", () => {
+    let mounted = 0;
+    function CountedGadget() {
+      useEffect(() => {
+        mounted += 1;
+        return () => {
+          mounted -= 1;
+        };
+      }, []);
+      return <div data-testid="counted-gadget" />;
+    }
+    const rail = (mobileOpen: boolean) => ({
+      tabs: [{ key: "gadget:g1", label: "Board" }],
+      selected: "gadget:g1",
+      loading: false,
+      mobileOpen,
+      render: () => <CountedGadget />,
+    });
+    gadgetRailTabs.state = rail(false);
+    try {
+      const { rerender } = renderWorkspace({
+        rightRailTab: "gadget",
+        openFiles: [],
+        selectedFilePath: null,
+      });
+      expect(mounted).toBe(1);
+
+      // On a phone the hidden rail keeps the selection but not a second runtime.
+      isMobileMock.mockReturnValue(true);
+      rerender({});
+      expect(mounted).toBe(0);
+      gadgetRailTabs.state = rail(true);
+      rerender({});
+      expect(mounted).toBe(1);
+      gadgetRailTabs.state = rail(false);
+      rerender({});
+      expect(mounted).toBe(0);
+
+      // Back on a desktop, the selected gadget shows in the rail again.
+      isMobileMock.mockReturnValue(false);
+      rerender({});
+      expect(mounted).toBe(1);
+    } finally {
+      gadgetRailTabs.state = null;
     }
   });
 

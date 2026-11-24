@@ -2576,10 +2576,14 @@ function WorkspacePanelImpl({
                 />
               </ResponsiveViewerSlot>
             ) : scopeView === "gadget" && gadgetRail.selected !== null ? (
-              gadgetRail.render(gadgetRail.selected, {
-                fullScreen: gadgetFullScreen,
-                toolbar: gadgetFullScreen ? gadgetToolbar : null,
-              })
+              // Phones show the gadget in its drawer; the hidden rail keeps only the
+              // selection for a return to desktop, so the gadget never runs twice.
+              isMobile ? null : (
+                gadgetRail.render(gadgetRail.selected, {
+                  fullScreen: gadgetFullScreen,
+                  toolbar: gadgetFullScreen ? gadgetToolbar : null,
+                })
+              )
             ) : scopeView === "sidechat" ? (
               // A side chat: a forked child conversation streamed here in its own
               // scoped surface, beside the still-active main chat. Phones show it
