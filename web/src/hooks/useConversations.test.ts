@@ -61,6 +61,7 @@ import {
 } from "./useUnseenConversations";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
+import { sessionFamilyGroups } from "@/lib/sessionFamilies";
 import { useScopeCache } from "./useScopeCache";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
@@ -3254,6 +3255,32 @@ describe("useMoveToNest", () => {
       expect(withMoveTombstone(row)).toEqual(row);
     },
   );
+
+  it("keeps a head's former nest apart from the new one while the move is pending", async () => {
+    const head = conversation({ id: "head", title: "Head" });
+    // The head left this nest, which keeps the head's id until the server re-keys it.
+    const leftBehind = conversation({
+      id: "left",
+      family: { id: "head", representative_id: "left", pinned: false },
+    });
+    const row = conversation({ id: "moved" });
+    fetchMock.mockReturnValue(new Promise<Response>(() => {}));
+    const queryClient = new QueryClient();
+    const key = ["conversations", "", false];
+    queryClient.setQueryData(key, infinitePage([head, leftBehind, row]));
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToNest(), { wrapper });
+    result.current.mutate({ id: row.id, destination: head });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const rows = queryClient.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data;
+    expect(
+      sessionFamilyGroups(rows)
+        .get("head")
+        ?.map((member) => member.id),
+    ).toEqual(["left"]);
+    expect(withMoveTombstone(row).family ?? null).toBeNull();
+  });
 
   it("leaves a head's own in-flight move tombstone in place", async () => {
     const row = conversation({ id: "moved" });

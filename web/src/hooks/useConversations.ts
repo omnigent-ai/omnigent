@@ -2655,14 +2655,18 @@ export function useMoveToNest() {
           ?.name ??
         projectLabel ??
         null;
+      // A nest a standalone head left keeps its id until the server re-keys it, so the
+      // new nest then shows once the refetch lands instead of merging with that one.
+      const staleNest =
+        !!destination && !destination.family && isCachedFamilyId(queryClient, destination.id);
       const move: MoveTombstone = {
         project,
         projectId,
         projectLabel,
-        family: destination ? nestFamilyUnder(destination) : null,
+        family: staleNest ? undefined : destination ? nestFamilyUnder(destination) : null,
       };
       markSessionMoving(id, move);
-      const head = paintNestHead(queryClient, destination, move);
+      const head = staleNest ? null : paintNestHead(queryClient, destination, move);
       const moved = withMoveTombstone(row);
       const tombstoned = new Map([[id, moved]]);
       if (head) tombstoned.set(head.row.id, head.row);
@@ -2719,7 +2723,7 @@ export function useMoveToNest() {
     },
     onSuccess: (updated, _variables, previous) => {
       if (!previous) return;
-      previous.move.family = updated.family ?? null;
+      if (previous.move.family !== undefined) previous.move.family = updated.family ?? null;
       previous.move.projectId = updated.project_id ?? null;
       previous.move.projectLabel = updated.labels?.[PROJECT_LABEL_KEY] || undefined;
       previous.move.project =
@@ -2745,6 +2749,18 @@ export function useMoveToNest() {
       if (previous.head?.markedId) unmarkSessionMoving(previous.head.markedId, previous.move);
     },
   });
+}
+
+/** Whether a cached list or pinned row still belongs to the family keyed `familyId`. */
+function isCachedFamilyId(queryClient: QueryClient, familyId: string): boolean {
+  const inFamily = (row: Conversation) => row.family?.id === familyId;
+  const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+  if (pinned?.conversations.some(inFamily)) return true;
+  return ["conversations", "project-sessions"].some((key) =>
+    queryClient
+      .getQueriesData<ConversationsInfiniteData>({ queryKey: [key] })
+      .some(([, data]) => data?.pages.some((page) => page.data.some(inFamily))),
+  );
 }
 
 /** A standalone nest destination, painted as the head of the nest a move creates. */
