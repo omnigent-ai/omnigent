@@ -4110,7 +4110,9 @@ describe("useArchiveConversation", () => {
 
 describe("useDeleteProject", () => {
   it("rejects a project containing tickets before touching any sessions", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse({ data: [{ id: "ticket" }], has_more: false }));
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [{ id: "ticket", stage_id: "open" }], has_more: false }),
+    );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(
