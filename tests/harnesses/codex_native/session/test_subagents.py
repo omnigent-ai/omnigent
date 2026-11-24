@@ -1359,6 +1359,7 @@ def test_forwarder_collab_snapshot_posts_status_for_child_without_own_lifecycle(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_stage", ["in-flight", "queued"])
 @pytest.mark.parametrize(
     ("snapshot", "child_event", "snapshot_status", "child_status"),
     [
@@ -1375,6 +1376,7 @@ async def test_forwarder_in_flight_parent_snapshot_cannot_overwrite_the_child_st
     child_event: dict[str, Any],
     snapshot_status: str,
     child_status: str,
+    snapshot_stage: str,
 ) -> None:
     posted: list[tuple[str, dict[str, Any]]] = []
     state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch)
@@ -1390,12 +1392,22 @@ async def test_forwarder_in_flight_parent_snapshot_cannot_overwrite_the_child_st
             and body.get("type") == "external_session_status"
             and body["data"]["status"] == snapshot_status
             and not snapshot_started.is_set()
+            and snapshot_stage == "in-flight"
         ):
             snapshot_started.set()
             await release_snapshot.wait()
         return handler(request)
 
-    token = codex_native_forwarder._conversation_item_locks.set({})
+    snapshot_task: asyncio.Task[None] | None = None
+
+    class ObservedLock(codex_native_forwarder._ReentrantAsyncLock):
+        async def __aenter__(self) -> None:
+            if asyncio.current_task() is snapshot_task:
+                snapshot_started.set()
+            await super().__aenter__()
+
+    locks = {"conv_child": ObservedLock()} if snapshot_stage == "queued" else {}
+    token = codex_native_forwarder._conversation_item_locks.set(locks)
     tasks: list[asyncio.Task[None]] = []
     try:
         async with httpx.AsyncClient(
@@ -1416,11 +1428,20 @@ async def test_forwarder_in_flight_parent_snapshot_cannot_overwrite_the_child_st
             try:
                 async with asyncio.timeout(5):
                     await deliver(_subagent_activity_started_event())
-                    tasks.append(asyncio.create_task(deliver(snapshot)))
-                    await snapshot_started.wait()
-                    tasks.append(asyncio.create_task(deliver(child_event)))
-                    await child_started.wait()
-                    release_snapshot.set()
+                    if snapshot_stage == "queued":
+                        async with codex_native_forwarder._conversation_item_delivery_scope(
+                            "conv_child"
+                        ):
+                            snapshot_task = asyncio.create_task(deliver(snapshot))
+                            tasks.append(snapshot_task)
+                            await snapshot_started.wait()
+                            await deliver(child_event)
+                    else:
+                        tasks.append(asyncio.create_task(deliver(snapshot)))
+                        await snapshot_started.wait()
+                        tasks.append(asyncio.create_task(deliver(child_event)))
+                        await child_started.wait()
+                        release_snapshot.set()
                     await asyncio.gather(*tasks)
             finally:
                 release_snapshot.set()
@@ -1431,7 +1452,9 @@ async def test_forwarder_in_flight_parent_snapshot_cannot_overwrite_the_child_st
     finally:
         codex_native_forwarder._conversation_item_locks.reset(token)
 
-    assert _child_statuses(posted) == [snapshot_status, child_status]
+    assert _child_statuses(posted) == (
+        [child_status] if snapshot_stage == "queued" else [snapshot_status, child_status]
+    )
     assert state.child_turn_status("thread_child") == child_status
 
 
