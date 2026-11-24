@@ -17,9 +17,12 @@ vi.mock("sonner", () => ({ toast: vi.fn() }));
 
 const CONVERSATION_ID = "e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
 
-/** The ports, in order, that `fetch` was called with. */
+/** The ports, in order, that were asked whether the app is there. */
 function portsAsked(fetchMock: ReturnType<typeof vi.fn>): number[] {
-  return fetchMock.mock.calls.map(([url]) => Number(new URL(String(url)).port));
+  return fetchMock.mock.calls
+    .map(([url]) => new URL(String(url)))
+    .filter((url) => url.pathname === "/status")
+    .map((url) => Number(url.port));
 }
 
 /** The app's own answer: every one carries the listener's header. */
@@ -34,7 +37,8 @@ function appAnswer(status: number): Response {
 function appOn(port: number | null, status = 204, otherPrograms: number[] = []) {
   const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
     const asked = Number(new URL(url).port);
-    if (asked === port) return appAnswer(status);
+    // The app says it is there; `status` is its answer to opening a conversation.
+    if (asked === port) return appAnswer(url.endsWith("/status") ? 204 : status);
     if (otherPrograms.includes(asked)) return new Response("Not Found", { status: 404 });
     throw new TypeError("Failed to fetch");
   });
@@ -85,14 +89,16 @@ afterEach(() => {
 });
 
 describe("openInDesktopApp", () => {
-  it("asks each port in turn and stops at the app's answer", async () => {
+  it("finds the app's port, then asks it to open the conversation", async () => {
     const fetchMock = appOn(DESKTOP_OPEN_PORTS[1]);
 
     expect(await openInDesktopApp(CONVERSATION_ID)).toBe(true);
 
     expect(portsAsked(fetchMock)).toEqual(DESKTOP_OPEN_PORTS.slice(0, 2));
-    const [url, init] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
-    expect(url).toBe(`http://127.0.0.1:${DESKTOP_OPEN_PORTS[1]}/open-conversation`);
+    expect(openRequests(fetchMock)).toEqual([
+      `http://127.0.0.1:${DESKTOP_OPEN_PORTS[1]}/open-conversation`,
+    ]);
+    const [, init] = fetchMock.mock.calls.at(-1) as unknown as [string, RequestInit];
     expect(init.method).toBe("POST");
     // Only the id travels; the app takes the server from the browser's Origin header.
     expect(JSON.parse(String(init.body))).toEqual({ conversationId: CONVERSATION_ID });
@@ -105,11 +111,7 @@ describe("openInDesktopApp", () => {
 
     expect(await openInDesktopApp(CONVERSATION_ID)).toBe(true);
     expect(portsAsked(fetchMock)).toEqual([taken, appPort]);
-
-    // The "is the app running" probe looks past it the same way.
-    fetchMock.mockClear();
     expect(await desktopAppRunning()).toBe(true);
-    expect(portsAsked(fetchMock)).toEqual([taken, appPort]);
 
     // Another program's success is not the app's.
     vi.stubGlobal(
@@ -120,15 +122,64 @@ describe("openInDesktopApp", () => {
     expect(await desktopAppRunning()).toBe(false);
   });
 
-  it("reports no hand-off when nothing answers, or the app declines the request", async () => {
-    const silent = appOn(null);
-    expect(await openInDesktopApp(CONVERSATION_ID)).toBe(false);
-    expect(portsAsked(silent)).toEqual(DESKTOP_OPEN_PORTS);
+  it("waits for the app past the time it gives a port to answer, then gives up", async () => {
+    vi.useFakeTimers();
+    // The platform's own timeout signal doesn't run on the fake clock.
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), ms);
+      return controller.signal;
+    });
+    try {
+      let answer: (response: Response) => void = () => {};
+      const slowApp = () =>
+        vi.stubGlobal(
+          "fetch",
+          vi.fn((url: string, init?: RequestInit) => {
+            if (url.endsWith("/status")) return Promise.resolve(appAnswer(204));
+            // The app holds its answer until a window shows the conversation.
+            return new Promise<Response>((resolve, reject) => {
+              answer = resolve;
+              init?.signal?.addEventListener("abort", () => reject(new Error("timed out")));
+            });
+          }),
+        );
 
-    // Declining (here: asked again too soon) is the app's answer, so no other port is asked.
-    const refusing = appOn(DESKTOP_OPEN_PORTS[0], 429);
+      slowApp();
+      const opened = openInDesktopApp(CONVERSATION_ID);
+      // Well past the 1.5 s a port gets to say the app is there.
+      await vi.advanceTimersByTimeAsync(5000);
+      answer(appAnswer(204));
+      expect(await opened).toBe(true);
+
+      slowApp();
+      const abandoned = openInDesktopApp(CONVERSATION_ID);
+      await vi.advanceTimersByTimeAsync(13_000);
+      expect(await abandoned).toBe(false);
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens nothing when no app answers", async () => {
+    const silent = appOn(null);
+
     expect(await openInDesktopApp(CONVERSATION_ID)).toBe(false);
-    expect(portsAsked(refusing)).toEqual([DESKTOP_OPEN_PORTS[0]]);
+
+    expect(portsAsked(silent)).toEqual(DESKTOP_OPEN_PORTS);
+    expect(openRequests(silent)).toEqual([]);
+  });
+
+  it.each([
+    ["could not bring the conversation up", 504],
+    ["was asked again too soon", 429],
+  ])("reports no hand-off when the app %s", async (_label, status) => {
+    const fetchMock = appOn(DESKTOP_OPEN_PORTS[0], status);
+
+    expect(await openInDesktopApp(CONVERSATION_ID)).toBe(false);
+    // That is the app's answer, so it is asked once.
+    expect(openRequests(fetchMock)).toHaveLength(1);
   });
 });
 
@@ -228,6 +279,18 @@ describe("handOffToDesktopApp", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("leaves the conversation in the tab when the app couldn't bring it up", async () => {
+    writeOpenInDesktopApp(true);
+    browserPermission("granted");
+    const fetchMock = appOn(DESKTOP_OPEN_PORTS[0], 504);
+
+    await handOffToDesktopApp(CONVERSATION_ID);
+
+    expect(openRequests(fetchMock)).toHaveLength(1);
+    expect(handedOverConversationId()).toBeNull();
+    expect(toast).not.toHaveBeenCalled();
+  });
+
   it("opens at once after the user has accepted, and not again on reload", async () => {
     writeOpenInDesktopApp(true);
     browserPermission("granted");
@@ -235,7 +298,7 @@ describe("handOffToDesktopApp", () => {
 
     await handOffToDesktopApp(CONVERSATION_ID);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(openRequests(fetchMock)).toHaveLength(1);
     // The page says so in place of the conversation, not with a toast.
     expect(handedOverConversationId()).toBe(CONVERSATION_ID);
     expect(toast).not.toHaveBeenCalled();
@@ -243,7 +306,7 @@ describe("handOffToDesktopApp", () => {
     // Staying in the browser holds across a reload of the tab.
     continueInBrowser();
     await handOffToDesktopApp(CONVERSATION_ID);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(openRequests(fetchMock)).toHaveLength(1);
     expect(handedOverConversationId()).toBeNull();
   });
 
@@ -273,17 +336,21 @@ describe("handOffToDesktopApp", () => {
     ).toHaveLength(2);
   });
 
-  it("says so when the user accepts the offer but the app can't be reached", async () => {
+  it.each([
+    ["can't be reached", () => appOn(null)],
+    ["couldn't bring the conversation up", () => appOn(DESKTOP_OPEN_PORTS[0], 504)],
+  ])("says so when the user accepts the offer but the app %s", async (_label, appThen) => {
     browserPermission("granted");
     appOn(DESKTOP_OPEN_PORTS[0]);
     await handOffToDesktopApp(CONVERSATION_ID);
 
-    appOn(null);
+    appThen();
     offer()?.action.onClick();
 
     await vi.waitFor(() =>
-      expect(toast).toHaveBeenCalledWith(expect.stringContaining("Couldn't reach")),
+      expect(toast).toHaveBeenCalledWith(expect.stringContaining("Couldn't open")),
     );
+    expect(handedOverConversationId()).toBeNull();
   });
 
   it.each([

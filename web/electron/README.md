@@ -1396,9 +1396,14 @@ is running without opening anything. Every answer carries an
 `X-Omnigent-Desktop` header: an answer without it is another program holding
 that port, and the page moves on to the next. The app turns an accepted request into the
 `omnigent://<host>/c/<id>` link for the page's own server and queues it like any
-other deep link, so window selection is exactly as described above. A `204`
-means the app took the conversation; the page then says so and stays where it
-is.
+other deep link, so window selection is exactly as described above. The app
+answers only once the page in one of its windows reports that the conversation
+is on screen (its details and its messages both loaded, for its signed-in
+user): `204` then, or `504` when none does
+within eight seconds (the window needed a sign-in, or failed to load). The
+address alone doesn't count, since a signed-out page sits on the conversation's
+address before it goes to sign-in. The page says the conversation moved only after a `204`;
+otherwise it stays in the browser.
 
 **What the app accepts.** Any website can send a request to a loopback port, so
 the listener trusts nothing in the request body:

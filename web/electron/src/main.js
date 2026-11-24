@@ -1475,6 +1475,8 @@ function applyDockIcon() {
  * @property {import("./desktopCommands").DesktopCommandState | null} [desktopCommands]
  *   Menu commands this window's SPA last reported it can act on (see
  *   desktopCommands.js); absent until a supporting web bundle reports.
+ * @property {string | null} [shownConversationId] The conversation this window's
+ *   page reported it has loaded; absent or null until it does.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -3225,6 +3227,7 @@ function createWindow(targetUrl, opts = {}) {
 
   registerNavigationFallbacks(win);
   registerBrowserViewDetachOnNavigate(win);
+  registerConversationShownReset(win);
   registerDesktopCommandStateReset(win.webContents, () => {
     const state = windows.get(win);
     if (!state?.desktopCommands) return;
@@ -5370,6 +5373,15 @@ function registerIpc() {
     if (BrowserWindow.getFocusedWindow() === win) buildMenu();
   });
 
+  // The conversation this window's page has loaded for its signed-in user. A
+  // browser's hand-off waits for this rather than for the address alone.
+  ipcMain.on("omnigent:conversation-shown", (event, conversationId) => {
+    if (!isPinnedOriginSender(event)) return;
+    const state = windows.get(BrowserWindow.fromWebContents(event.sender));
+    if (state)
+      state.shownConversationId = typeof conversationId === "string" ? conversationId : null;
+  });
+
   // Close (⌘W) on the new-session page, once the page's own dialog confirmed it.
   ipcMain.handle("omnigent:close-window", (event) => {
     if (!isPinnedOriginSender(event)) return false;
@@ -6624,6 +6636,67 @@ async function confirmOpenDeepLink(parent, targetOrigin) {
  */
 let desktopOpenServer = null;
 
+/** How long a browser's hand-off waits for a window to show the conversation, and how often it looks. */
+let browserHandoffTimeoutMs = 8000;
+const BROWSER_HANDOFF_POLL_MS = 100;
+
+/**
+ * Forget the conversation a window's page reported once that page is gone: a
+ * new document, or a crashed one, hasn't shown anything yet.
+ *
+ * @param {BrowserWindow} win
+ */
+function registerConversationShownReset(win) {
+  const forget = () => {
+    const state = windows.get(win);
+    if (state) state.shownConversationId = null;
+  };
+  win.webContents.on("did-navigate", forget);
+  win.webContents.on("render-process-gone", forget);
+}
+
+/**
+ * Whether a main window on this deep link's server reported that its page has
+ * loaded the conversation. The address alone doesn't say so: a signed-out page
+ * sits on the conversation's address before it goes to sign-in. A page too old
+ * to report never counts.
+ *
+ * @param {{ origin: string, path: string }} target A parsed deep link.
+ * @returns {boolean}
+ */
+function showsConversation(target) {
+  const conversationId = /^\/c\/([^/?]+)/.exec(target.path)?.[1];
+  if (!conversationId) return false;
+  return mainWindows().some(
+    (win) =>
+      pinnedOrigin(win) === target.origin &&
+      serverPageShown(win) === "app" &&
+      windows.get(win)?.shownConversationId === conversationId,
+  );
+}
+
+/**
+ * Open a conversation a browser page handed over, and report whether a window
+ * ended up showing it, so the page stays put when the app could not.
+ *
+ * @param {string} link e.g. ``"omnigent://localhost:8000/c/conv_abc"``.
+ * @returns {Promise<boolean>}
+ */
+async function openConversationFromBrowser(link) {
+  const target = parseOmnigentDeepLink(link);
+  if (!target) return false;
+  enqueueDeepLink(link);
+  const deadline = Date.now() + browserHandoffTimeoutMs;
+  while (!showsConversation(target)) {
+    if (Date.now() >= deadline) return false;
+    // oxlint-disable-next-line no-await-in-loop -- polling until the window has navigated
+    await new Promise((resolve) => {
+      setTimeout(resolve, BROWSER_HANDOFF_POLL_MS);
+    });
+  }
+  return true;
+}
+
 /**
  * Listen for conversations handed over by the web page of a server the user
  * has connected this app to. Other origins are refused, so a page can never
@@ -6632,7 +6705,7 @@ let desktopOpenServer = null;
 async function startDesktopOpenListener() {
   desktopOpenServer = await startDesktopOpenServer({
     isKnownOrigin: (origin) => knownOrigins().includes(origin) || isPinnedServerUrl(origin),
-    openLink: enqueueDeepLink,
+    openLink: openConversationFromBrowser,
   });
   console.log(
     desktopOpenServer

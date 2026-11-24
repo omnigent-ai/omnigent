@@ -24,7 +24,10 @@ async function start(t, options = {}) {
   const clock = { now: 0 };
   const server = await startDesktopOpenServer({
     isKnownOrigin: (origin) => origin === KNOWN_ORIGIN,
-    openLink: (link) => opened.push(link),
+    openLink: (link) => {
+      opened.push(link);
+      return true;
+    },
     ports: [0],
     now: () => clock.now,
     ...options,
@@ -204,6 +207,41 @@ describe("startDesktopOpenServer", () => {
     assert.deepEqual(opened, []);
   });
 
+  it("answers only once the app shows the conversation, and says when it could not", async (t) => {
+    let finish;
+    let opening;
+    const started = new Promise((resolve) => {
+      opening = resolve;
+    });
+    const { server } = await start(t, {
+      openLink: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+          opening();
+        }),
+    });
+
+    let answered = false;
+    const pending = send(server.port).then((response) => {
+      answered = true;
+      return response;
+    });
+    await started;
+    // Give an early answer the chance to arrive: none may.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    assert.equal(answered, false);
+    finish(true);
+    assert.equal((await pending).status, 204);
+
+    const failing = await start(t, { openLink: async () => false });
+    const refused = await send(failing.server.port);
+    assert.equal(refused.status, 504);
+    // Still the app's own answer, so the page doesn't go looking on another port.
+    assert.equal(refused.headers["x-omnigent-desktop"], "1");
+  });
+
   it("limits how often a page can raise the app", async (t) => {
     const { server, opened, clock } = await start(t);
 
@@ -231,7 +269,7 @@ describe("startDesktopOpenServer", () => {
     assert.equal(
       await startDesktopOpenServer({
         isKnownOrigin: () => true,
-        openLink: () => {},
+        openLink: () => true,
         ports: [taken],
       }),
       null,
