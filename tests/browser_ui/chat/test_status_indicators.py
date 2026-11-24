@@ -61,16 +61,22 @@ def _background_status(
     chat.emit({"event": "session.status", "data": data})
 
 
-def _pill(page: Page, count: int) -> Locator:
+def _pill(page: Page, count: int, *, working: bool = False) -> Locator:
+    """The compact badge, located by its accessible name.
+
+    The visible text is the bare count; the sentence form is the accessible
+    name, prefixed with "Agent working —" while the agent's turn is active.
+    """
     plural = "" if count == 1 else "s"
-    return page.get_by_role(
-        "button", name=f"{count} background task{plural} still running", exact=True
-    )
+    name = f"{count} background task{plural} still running"
+    if working:
+        name = f"Agent working — {name}"
+    return page.get_by_role("button", name=name, exact=True)
 
 
 @pytest.mark.browser_context_args(has_touch=True)
-@pytest.mark.parametrize("width", [320, 390, 1024])
-def test_touch_screens_reveal_timestamps_and_pending_steering(
+@pytest.mark.parametrize("width", [320, 390])
+def test_mobile_layout_reveals_timestamps_and_pending_steering(
     page: Page, chat_session_contract: ChatSessionContract, width: int
 ) -> None:
     chat = chat_session_contract
@@ -122,10 +128,11 @@ def test_touch_screens_reveal_timestamps_and_pending_steering(
     assert notice_box["x"] + notice_box["width"] <= timestamp_box["x"] + 1
 
 
-def test_attachment_only_steering_explanation_stays_visible_on_desktop(
-    page: Page, chat_session_contract: ChatSessionContract
+@pytest.mark.parametrize("message", ["text", "attachment"])
+def test_steering_explanation_stays_visible_on_desktop(
+    page: Page, chat_session_contract: ChatSessionContract, message: str
 ) -> None:
-    """A text-less steer has no focusable footer control, so it must not hide."""
+    """An unread steer must not look delivered until the pointer hovers it."""
     chat = chat_session_contract
     chat.harness = "codex-native"
     chat.update_session(status="running", labels={"omnigent.wrapper": "codex-native-ui"})
@@ -138,17 +145,17 @@ def test_attachment_only_steering_explanation_stays_visible_on_desktop(
     expect(page.get_by_test_id("working-indicator")).to_be_visible()
     page.evaluate("localStorage.setItem('omnigent:always-steer', 'true')")
     chat.event_ack = {"queued": True, "pending_id": "steer"}
-    page.locator('form.chat-composer-form input[type="file"]').set_input_files(
-        [{"name": "notes.txt", "mimeType": "text/plain", "buffer": b"Notes"}]
-    )
+    if message == "text":
+        page.get_by_label("Message the agent").fill("Read this after your current step")
+    else:
+        page.locator('form.chat-composer-form input[type="file"]').set_input_files(
+            [{"name": "notes.txt", "mimeType": "text/plain", "buffer": b"Notes"}]
+        )
     send = page.get_by_role("button", name="Send", exact=True)
     expect(send).to_be_enabled()
     send.click()
     notice = page.get_by_test_id("message-awaiting-agent")
     expect(notice).to_be_visible()
-    footer = notice.locator("..")
-    expect(footer.get_by_role("button", name="Copy", exact=True)).to_have_count(0)
-    expect(footer.get_by_test_id("copy-message-link")).to_be_disabled()
     page.mouse.move(0, 0)
     opacity = """element => {
       let value = 1;
@@ -246,6 +253,7 @@ def test_turn_end_eases_a_transcript_at_its_end_down(
     page.wait_for_function("() => window.__paragraphTops.length >= 5")
     row = page.get_by_test_id("working-indicator").bounding_box()
     assert row
+    page.evaluate(_RECORD_CLOSING_ROW)
 
     answer = message_item("turn-end-answer", "assistant", text, response_id=response_id)
     chat.emit({"event": "response.output_item.done", "data": {"item": answer}})
@@ -270,11 +278,26 @@ def test_turn_end_eases_a_transcript_at_its_end_down(
     ]
     steps = [step for _, step in moves]
     assert sum(steps) > 20, f"the transcript didn't move when the turn ended: {steps}"
-    # Timed rather than counted per frame: a slow runner paints few frames of the 180 ms
-    # ease, and the sampler only records frames whose layout changed, so the slow tail can
-    # go unrecorded (84 ms was seen). Removing the row at once moves it in one frame (0 ms).
-    span = moves[-1][0] - moves[0][0]
-    assert span >= 40, f"the transcript moved within {span:.0f} ms ({steps}), not eased"
+    # The frame sampler drops frames on a loaded runner, so its timing can't show the ease.
+    # The close animation's own duration can: removing the row at once runs no animation.
+    durations = page.evaluate("() => window.__closingDurations")
+    assert durations and max(durations) >= 40, (
+        f"the Working row closed at once, not eased: durations {durations}, steps {steps}"
+    )
+
+
+# Records the duration of each animation the Working row runs when it closes.
+_RECORD_CLOSING_ROW = """(() => {
+    window.__closingDurations = [];
+    const animate = Element.prototype.animate;
+    Element.prototype.animate = function (...args) {
+        const animation = animate.apply(this, args);
+        if (this.querySelector('[data-testid="working-indicator"]')) {
+            window.__closingDurations.push(animation.effect.getComputedTiming().duration);
+        }
+        return animation;
+    };
+})()"""
 
 
 # Pauses the indicator's animations and steps them through 3.4s, recording what moves.
@@ -350,6 +373,48 @@ def test_blocked_reason_reaches_the_live_working_indicator(
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)
+
+
+@pytest.mark.parametrize(
+    "width",
+    [1280, pytest.param(375, marks=pytest.mark.browser_context_args(has_touch=True))],
+)
+def test_background_task_pill_carries_the_working_state(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """While a turn runs the pill shows a spinner and says so; once idle it is plain again.
+
+    The narrow case is the phone header mount, where the end-of-thread shimmer is
+    usually scrolled out of view and the badge is the only working cue left.
+    """
+    chat = chat_session_contract
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    working = page.get_by_test_id("working-indicator")
+    spinner = page.get_by_test_id("background-task-working")
+
+    _background_status(chat, 1, [_MONITOR_TASK])
+    expect(_pill(page, 1)).to_have_text("1", timeout=10_000)
+    expect(working).to_have_count(0)
+    expect(spinner).to_have_count(0)
+
+    # A running edge carries no count: the sticky tally must survive it.
+    chat.emit_busy("browser-turn")
+    expect(working).to_be_visible(timeout=10_000)
+    expect(_pill(page, 1, working=True)).to_have_text("1")
+    expect(spinner).to_be_visible()
+
+    _background_status(chat, 1, [_MONITOR_TASK])
+    expect(working).to_be_hidden(timeout=10_000)
+    expect(_pill(page, 1)).to_have_text("1")
+    expect(spinner).to_have_count(0)
+
+    _background_status(chat, 0)
+    expect(page.get_by_test_id("background-task-pill")).to_have_count(0)
 
 
 def test_action_banner_follows_the_launch(
@@ -464,7 +529,7 @@ def test_background_task_popover_stays_interactive_and_within_viewport(
     _background_status(chat, 1, [_MONITOR_TASK])
 
     def activate(control: Locator) -> None:
-        if width < 768:
+        if width < 1181:
             control.tap()
         else:
             control.click()

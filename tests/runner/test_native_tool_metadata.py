@@ -64,19 +64,27 @@ def test_metadata_survives_deleted_cwd(
         assert tool_dispatch.build_native_relay_tool_schemas(None) == fallback_schemas
         schema_names = [schema["name"] for schema in schemas]
         assert len(schema_names) == len(set(schema_names))
-        assert set(schema_names) >= tool_dispatch._OS_ENV_TOOLS
+        assert set(schema_names).isdisjoint(tool_dispatch._OS_ENV_TOOLS)
         for tool_name in ("sys_call_async", "sys_session_create", "sys_terminal_launch"):
             assert (tool_name in schema_names) is enabled
 
-        for harness in ("claude-sdk", "claude-native", "codex-native", "pi-native"):
+        for harness in (
+            "claude-sdk",
+            "claude-native",
+            "codex-native",
+            "pi-native",
+            "cursor-native",
+        ):
             native = harness.endswith("-native")
+            # A native harness never gets sys_os_*, matching its relay; only an
+            # SDK harness follows os_env.
             granted = tool_dispatch._granted_tool_names(spec, harness)
-            assert granted == registered | (tool_dispatch._OS_ENV_TOOLS if native else set())
+            assert granted == (registered - tool_dispatch._OS_ENV_TOOLS if native else registered)
             for tool_name in ("sys_call_async", "sys_timer_set", "sys_session_create"):
                 assert (tool_name in granted) is enabled
             for tool_name in tool_dispatch._OS_ENV_TOOLS:
                 reason = tool_dispatch._ungranted_tool_reason(tool_name, spec, harness)
-                assert (reason is None) is (os_env is not None or native)
+                assert (reason is None) is (not native and os_env is not None)
             assert tool_dispatch._ungranted_tool_reason("unknown_tool", spec, harness) is not None
     finally:
         os.fchdir(original_cwd)

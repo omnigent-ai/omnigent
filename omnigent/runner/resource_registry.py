@@ -24,10 +24,11 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 
 from cachetools import TTLCache
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
@@ -61,10 +62,14 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-_DEFAULT_WORKSPACE_ROOT = os.path.join(
-    os.environ.get("TMPDIR", "/tmp"),
-    "omnigent-sessions",
-)
+
+class _ProgramStatusLaunchArgs(TypedDict, total=False):
+    """Optional program-status arguments accepted by the terminal registry."""
+
+    program_status_app: str
+
+
+_DEFAULT_WORKSPACE_PARENT = os.environ.get("TMPDIR", None if IS_WINDOWS else "/tmp")
 
 CODEX_NATIVE_TERMINAL_ROLE = "codex-native"
 CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
@@ -558,10 +563,12 @@ def _session_workspace(session_id: str) -> str:
     :returns: Absolute path to the session workspace directory.
     :raises ValueError: If the session id escapes the workspace root.
     """
-    root = os.environ.get(
-        "OMNIGENT_RUNNER_OS_ENV_ROOT",
-        _DEFAULT_WORKSPACE_ROOT,
-    )
+    root = os.environ.get("OMNIGENT_RUNNER_OS_ENV_ROOT")
+    if root is None:
+        workspace_parent = _DEFAULT_WORKSPACE_PARENT
+        if workspace_parent is None:
+            workspace_parent = tempfile.gettempdir()
+        root = os.path.join(workspace_parent, "omnigent-sessions")
     return os.path.join(_contained_session_dir(root, session_id), "workspace")
 
 
@@ -1676,7 +1683,7 @@ class SessionResourceRegistry:
         from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
         spec = replace(spec, env={**spec.env, **self.client_surface_env(session_id)})
-        program_status_args = (
+        program_status_args: _ProgramStatusLaunchArgs = (
             {"program_status_app": "claude-code"}
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             and self._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS)

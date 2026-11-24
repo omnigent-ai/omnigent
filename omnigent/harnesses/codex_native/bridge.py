@@ -43,6 +43,10 @@ CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS = 120.0
 # Give the runner time to publish bridge state or its startup error at the end
 # of the configured-command watchdog before the executor reports a generic miss.
 CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS = 5.0
+# Startup-record code for a live pane that is still starting past its budget.
+# Chat turns wait on it rather than fail; the thread start or the launch's end
+# replaces it.
+CODEX_STARTUP_PENDING_CODE = "agent_startup_pending"
 
 _CODEX_COMPOSER_GLYPH = "›"
 _CODEX_DISABLED_COMPOSER_TEXT = frozenset(
@@ -1414,6 +1418,31 @@ def record_app_server_stopped(bridge_dir: Path) -> None:
     :returns: None.
     """
     if not bridge_dir.is_dir() or read_bridge_startup_error(bridge_dir) is not None:
+        return
+    failure = CODEX_APP_SERVER_STOPPED
+    write_bridge_startup_error(
+        bridge_dir,
+        failure.message,
+        code=failure.code,
+        title=failure.title,
+        remediation=failure.remediation,
+    )
+
+
+def end_startup_pending(bridge_dir: Path) -> None:
+    """
+    Replace a still-starting record once the launch behind it has ended.
+
+    A chat turn waits while the record says Codex is still starting. Only the
+    thread start clears that record, so a launch that ends without one (its
+    pane closed, the session torn down) records that its app-server stopped,
+    and the waiting turn fails with that cause instead of waiting on.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: None.
+    """
+    recorded = read_bridge_startup_failure(bridge_dir)
+    if recorded is None or recorded.code != CODEX_STARTUP_PENDING_CODE:
         return
     failure = CODEX_APP_SERVER_STOPPED
     write_bridge_startup_error(

@@ -8,6 +8,7 @@ import {
   type SavedWorkflow,
   useDeleteWorkflow,
   useSavedWorkflows,
+  useSharedWorkflows,
 } from "@/hooks/useSavedWorkflows";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -23,6 +24,7 @@ vi.mock("@/hooks/useWorkflow", () => ({
 
 vi.mock("@/hooks/useSavedWorkflows", () => ({
   useSavedWorkflows: vi.fn(),
+  useSharedWorkflows: vi.fn(),
   useDeleteWorkflow: vi.fn(),
 }));
 // The dialog has its own tests; here it only shows what it would start a session for.
@@ -72,7 +74,27 @@ function mockWorkflows(state: Partial<ReturnType<typeof useSavedWorkflows>>) {
     isLoading: false,
     isError: false,
     refresh,
+    reload: vi.fn(),
     pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
+    ...state,
+  });
+  return refresh;
+}
+
+function mockShared(
+  workflows: SavedWorkflow[],
+  loadMore = vi.fn(),
+  hasMore = false,
+  state: Partial<ReturnType<typeof useSharedWorkflows>> = {},
+) {
+  const refresh = vi.fn();
+  vi.mocked(useSharedWorkflows).mockReturnValue({
+    workflows,
+    isLoading: false,
+    isError: false,
+    refresh,
+    reload: vi.fn(),
+    pagination: { hasMore, loadingMore: false, loadMore },
     ...state,
   });
   return refresh;
@@ -102,8 +124,115 @@ describe("WorkflowsPage", () => {
     vi.mocked(useDeleteWorkflow).mockReturnValue({
       mutate: deleteWorkflow,
     } as unknown as ReturnType<typeof useDeleteWorkflow>);
+    mockShared([]);
   });
   afterEach(cleanup);
+
+  it("lists workflows shared with the viewer apart, offering Run and Clone only", () => {
+    const shared: SavedWorkflow = {
+      ...workflow("Weekly report", "Summarizes the week's changes."),
+      viewer_role: "viewer",
+      owner_display_name: "Alice",
+    };
+    const loadMore = vi.fn();
+    mockWorkflows({ workflows: WORKFLOWS });
+    mockShared([shared], loadMore, true);
+    render(<WorkflowsPage />);
+
+    const section = within(screen.getByTestId("workflows-shared"));
+    expect(section.getByRole("heading", { name: "Shared with you" })).toBeInTheDocument();
+    const [row] = section.getAllByTestId("workflow-row");
+    expect(within(row!).getByText("Weekly report")).toBeInTheDocument();
+    expect(within(row!).getByTestId("workflow-row-owner")).toHaveTextContent("Shared by Alice");
+    expect(within(screen.getByTestId("workflows-list")).queryByText("Weekly report")).toBeNull();
+
+    openMenu(row!);
+    expect(screen.queryByTestId("workflow-delete")).toBeNull();
+    expect(screen.queryByTestId("workflow-create-automation")).toBeNull();
+    fireEvent.click(screen.getByTestId("workflow-clone"));
+    expect(cloneWorkflow).toHaveBeenCalledWith("weekly-report", expect.anything());
+    fireEvent.click(section.getByRole("button", { name: "Load more shared workflows" }));
+    expect(loadMore).toHaveBeenCalledOnce();
+
+    // The search covers both lists.
+    fireEvent.change(screen.getByTestId("workflows-search"), { target: { value: "weekly" } });
+    expect(screen.queryByTestId("workflows-list")).toBeNull();
+    expect(
+      within(screen.getByTestId("workflows-shared")).getAllByTestId("workflow-row"),
+    ).toHaveLength(1);
+  });
+
+  it("keeps loading more shared workflows reachable while no loaded one shows", () => {
+    const loadMore = vi.fn();
+    const shared = {
+      ...workflow("Weekly report", "Summarizes."),
+      viewer_role: "viewer" as const,
+    };
+    // A page of only deleted workflows comes back empty, with a cursor.
+    mockWorkflows({ workflows: [] });
+    mockShared([], loadMore, true);
+    const { unmount } = render(<WorkflowsPage />);
+    expect(screen.queryByTestId("workflows-empty-state")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Load more shared workflows" }));
+    expect(loadMore).toHaveBeenCalledOnce();
+    unmount();
+
+    // A search that matches nothing loaded yet.
+    mockWorkflows({ workflows: WORKFLOWS });
+    mockShared([shared], loadMore, true);
+    render(<WorkflowsPage />);
+    fireEvent.change(screen.getByTestId("workflows-search"), { target: { value: "deploy" } });
+    expect(screen.queryAllByTestId("workflow-row")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Load more shared workflows" }));
+    expect(loadMore).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows each list's own failure with a Retry for that list, keeping the other", () => {
+    const shared = {
+      ...workflow("Weekly report", "Summarizes."),
+      viewer_role: "viewer" as const,
+    };
+    const refreshOwned = mockWorkflows({ workflows: WORKFLOWS });
+    const refreshShared = mockShared([], vi.fn(), false, { isError: true });
+    const { unmount } = render(<WorkflowsPage />);
+    expect(rows()).toHaveLength(2);
+    expect(screen.queryByTestId("workflows-empty-state")).toBeNull();
+    const failed = screen.getByTestId("workflows-shared-load-error");
+    expect(failed).toHaveTextContent("Couldn’t load the workflows shared with you.");
+    fireEvent.click(within(failed).getByRole("button", { name: "Retry" }));
+    expect(refreshShared).toHaveBeenCalledOnce();
+    expect(refreshOwned).not.toHaveBeenCalled();
+    unmount();
+
+    const refreshOwnedAgain = mockWorkflows({ workflows: [], isError: true });
+    const refreshSharedAgain = mockShared([shared]);
+    render(<WorkflowsPage />);
+    expect(
+      within(screen.getByTestId("workflows-shared")).getAllByTestId("workflow-row"),
+    ).toHaveLength(1);
+    fireEvent.click(
+      within(screen.getByTestId("workflows-load-error")).getByRole("button", { name: "Retry" }),
+    );
+    expect(refreshOwnedAgain).toHaveBeenCalledOnce();
+    expect(refreshSharedAgain).not.toHaveBeenCalled();
+  });
+
+  it("waits for the shared list before saying there are no workflows", () => {
+    mockWorkflows({ workflows: [] });
+    mockShared([], vi.fn(), false, { isLoading: true });
+    render(<WorkflowsPage />);
+    expect(screen.queryByTestId("workflows-empty-state")).toBeNull();
+  });
+
+  it("shows only what is shared when the viewer has no workflows of their own", () => {
+    mockWorkflows({ workflows: [] });
+    mockShared([{ ...workflow("Weekly report", "Summarizes."), viewer_role: "viewer" }]);
+    render(<WorkflowsPage />);
+    expect(screen.queryByTestId("workflows-empty-state")).toBeNull();
+    expect(
+      within(screen.getByTestId("workflows-shared")).getAllByTestId("workflow-row"),
+    ).toHaveLength(1);
+  });
 
   it("lists workflows with their descriptions", () => {
     const loadMore = vi.fn();

@@ -42,4 +42,36 @@ final class ManagedServersUITests: XCTestCase {
       app.webViews.staticTexts[marker].waitForExistence(timeout: 30),
       "Expected tapping a preset server to load it (marker \(marker)).")
   }
+
+  /// A long server list scrolls under the URL field without hiding it, and the
+  /// keyboard toolbar's Hide Keyboard button ends editing.
+  func testServerListScrollsUnderFieldAndKeyboardHides() throws {
+    let servers = (1...8).map { "https://team\($0).example.com" }.joined(separator: ",")
+    let app = XCUIApplication(bundleIdentifier: "ai.omnigent.ios")
+    app.launchArguments += ["--omnigent-managed-servers", servers, "--omnigent-reset-state"]
+    app.launch()
+
+    let field = app.textFields["server-url-field"]
+    XCTAssertTrue(field.waitForExistence(timeout: 15))
+    let fieldY = field.frame.minY
+    let firstRow = app.buttons["https://team1.example.com"]
+    let firstRowY = firstRow.frame.minY
+    app.buttons.matching(identifier: "managed-servers-row").element(boundBy: 2).swipeUp()
+    XCTAssertLessThan(firstRow.frame.minY, firstRowY, "The server list should have scrolled.")
+    XCTAssertTrue(app.buttons["https://team8.example.com"].isHittable)
+    XCTAssertEqual(
+      field.frame.minY, fieldY, accuracy: 0.5,
+      "The URL field must stay pinned while the list scrolls.")
+
+    // Rotating flips the size class; the field must keep focus across it.
+    field.tap()
+    XCUIDevice.shared.orientation = .landscapeLeft
+    XCTAssertEqual(field.value(forKey: "hasKeyboardFocus") as? Bool, true)
+    XCUIDevice.shared.orientation = .portrait
+
+    let hideKeyboard = app.buttons["Hide Keyboard"]
+    XCTAssertTrue(hideKeyboard.waitForExistence(timeout: 5))
+    hideKeyboard.tap()
+    XCTAssertEqual(field.value(forKey: "hasKeyboardFocus") as? Bool, false)
+  }
 }

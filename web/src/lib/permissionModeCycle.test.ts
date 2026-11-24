@@ -3,7 +3,13 @@ import { describe, expect, it } from "vitest";
 import { CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES } from "./claudePermissionMode";
 import { CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS } from "./codexApprovalMode";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "./nativeHarnessModes";
-import { isPermissionModeCycleKey, nextCycledPermissionMode } from "./permissionModeCycle";
+import {
+  isPermissionModeCycleKey,
+  nextCycledPermissionMode,
+  nextPermissionModePress,
+  permissionChip,
+  permissionChipKind,
+} from "./permissionModeCycle";
 
 const key = (overrides: Partial<Parameters<typeof isPermissionModeCycleKey>[0]> = {}) => ({
   key: "Tab",
@@ -101,5 +107,59 @@ describe("nextCycledPermissionMode", () => {
     ).toBe(null);
     expect(nextCycledPermissionMode([{ value: "default" }], "default")).toBe(null);
     expect(nextCycledPermissionMode([], "default")).toBe(null);
+  });
+});
+
+describe("nextPermissionModePress", () => {
+  const miss = { sessionId: "session-a", from: "default", past: "auto" };
+
+  it("continues past the mode a missed press tried, on the same session only", () => {
+    const options = CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES;
+    expect(nextPermissionModePress(options, "default", "session-a", miss)).toBe("acceptEdits");
+    expect(nextPermissionModePress(options, "default", "session-b", miss)).toBe("auto");
+    expect(nextPermissionModePress(options, "plan", "session-a", miss)).toBe("default");
+  });
+
+  it("retries the missed mode when it is the only one reachable", () => {
+    const options = [{ value: "default" }, { value: "auto" }];
+    expect(nextPermissionModePress(options, "default", "session-a", miss)).toBe("auto");
+  });
+});
+
+describe("permissionChipKind", () => {
+  it.each([
+    ["claude-code-native-ui", "claude"],
+    ["devin-native-ui", "devin"],
+    ["codex-native-ui", "codex"],
+    ["cursor-native-ui", null],
+  ])("maps the %s wrapper to %s", (wrapper, kind) => {
+    expect(permissionChipKind({ labels: { "omnigent.wrapper": wrapper } })).toBe(kind);
+  });
+
+  it("has no chip without a wrapper", () => {
+    expect(permissionChipKind({ labels: {} })).toBeNull();
+  });
+});
+
+describe("permissionChip", () => {
+  it("uses each harness's vocabulary and labels its current mode", () => {
+    expect(permissionChip("claude", "plan", "")).toEqual({
+      options: CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+      value: "plan",
+      label: "Plan",
+    });
+    expect(permissionChip("codex", "", "approve-for-me")).toEqual({
+      options: CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+      value: "approve-for-me",
+      label: "Approve for me",
+    });
+    expect(permissionChip("devin", "smart", "")).toMatchObject({
+      options: DEVIN_NATIVE_PERMISSION_MODES,
+      value: "smart",
+    });
+  });
+
+  it("shows an unknown Devin mode as its raw value", () => {
+    expect(permissionChip("devin", "custom", "").label).toBe("custom");
   });
 });

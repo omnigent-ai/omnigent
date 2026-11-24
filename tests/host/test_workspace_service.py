@@ -13,11 +13,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import shutil
 import signal
 import socket
 import stat
+import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -36,11 +38,22 @@ from omnigent.api.workspace.v1alpha1.workspace_connect import (
     WorkspaceServiceClient,
 )
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
+    CHANGE_STATUS_MODIFIED,
     CONTENT_ENCODING_UTF8,
     ENTRY_TYPE_DIRECTORY,
+    FILE_SEARCH_MODE_SUBSTRING,
     GetCapabilitiesRequest,
     ListDirectoryRequest,
+    ListRepositoryRefsRequest,
+    ListWorkingCopyChangesRequest,
+    ReadBaseFileRequest,
     ReadFileRequest,
+    ReadLinkTextRequest,
+    ResolveRepositoryContextRequest,
+    SearchFilesRequest,
+    SearchTextRequest,
+    SearchTextResponse,
+    StatPathRequest,
 )
 from omnigent.host.frames import (
     CAP_WORKSPACE_API,
@@ -50,20 +63,27 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.workspace_git.ignored import DirectoryIgnores
+from omnigent.host.workspace_git.runner import Deadline, GitError, GitProblem, GitRepository
 from omnigent.host.workspace_service import (
+    _SERVED,
     WorkspaceService,
+    _Served,
     serve_tunnel_call,
     start_workspace_socket,
 )
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
-from omnigent.workspace_fs import WorkspaceReader
+from omnigent.workspace_fs import WorkspaceReader, single_child_chain
 from tests._helpers.polling import poll_until_async
+from tests.host.test_workspace_git_runner import _git, _repository
 from tests.server.routes.test_shell_permission_gate import _StubAgentStore, _StubConversationStore
 
 pytestmark = pytest.mark.asyncio
 
+_RG_METHODS = {"SearchText", "text_search_priority"}
+_WITH_RG = _RG_METHODS if shutil.which("rg") else set()
 PROTOCOLS = pytest.mark.parametrize("protocol", [ProtocolType.CONNECT, ProtocolType.GRPC_WEB])
 _SESSION = "conv_ws"
 _SERVER_BASE = f"http://server/v1/sessions/{_SESSION}/workspace"
@@ -101,6 +121,7 @@ def _server_app(
     flag: bool = True,
     side_chat: bool = False,
     remote_host: bool = False,
+    content_search: bool = False,
 ) -> FastAPI:
     """The sessions API, with the session's host answering over an in-memory tunnel.
 
@@ -174,7 +195,10 @@ def _server_app(
             lambda _host: WrongReplicaError("host is on another replica", host_id="host_ws"),
         )
     if flag:
-        app.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_API_SERVER_ACCESS}))
+        features = {Feature.WORKSPACE_API_SERVER_ACCESS}
+        if content_search:
+            features.add(Feature.WORKSPACE_CONTENT_SEARCH)
+        app.state.feature_flags = FeatureFlags(frozenset(features))
     router = create_sessions_router(
         store,  # type: ignore[arg-type]
         _StubAgentStore(),  # type: ignore[arg-type]
@@ -202,7 +226,8 @@ def client_for(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) 
 
     def make(root: Path) -> WorkspaceServiceClient:
         if route == "server":
-            return _connect(_server_app(root, monkeypatch), _SERVER_BASE, protocol)
+            app = _server_app(root, monkeypatch, content_search=True)
+            return _connect(app, _SERVER_BASE, protocol)
         reader = WorkspaceReader(root)
         app = WorkspaceServiceASGIApplication(WorkspaceService(lambda _ctx: reader))
         return _connect(app, "http://workspace.test", protocol)
@@ -228,6 +253,7 @@ async def test_list_directory_matches_rest_listing_across_pages(
                 "directory" if e.type == ENTRY_TYPE_DIRECTORY else "file",
                 e.size if e.HasField("size") else None,
                 e.modify_time.seconds,
+                e.is_symlink,
             )
             for e in page.entries
         ]
@@ -237,9 +263,259 @@ async def test_list_directory_matches_rest_listing_across_pages(
 
     rest = reader.list_or_read("", limit=1000, order="asc")["data"]
     assert listed == [
-        (e["name"], e["path"], e["type"], e["bytes"], e["modified_at"])
+        (
+            e["name"],
+            e["path"],
+            e["type"],
+            e["bytes"],
+            e["modified_at"],
+            (tmp_path / str(e["path"])).is_symlink(),
+        )
         for e in cast("list[dict[str, object]]", rest)
     ]
+
+
+def _ignoring_workspace(root: Path) -> Path:
+    """A repository where Git ignores a folder and a pattern, beside a tracked match."""
+    _repository(root)
+    (root / ".gitignore").write_text("build/\n*.log\n")
+    (root / "build").mkdir()
+    (root / "build" / "out.o").write_text("x")
+    for name in ("debug.log", "main.py", "tracked.log", "zeta.md"):
+        (root / name).write_text("x")
+    _git(root, "add", "-f", "tracked.log")
+    return root
+
+
+def _listed(entries: Any) -> dict[str, bool]:
+    """Each listed path and whether it's marked ignored, leaving out Git's own folder."""
+    return {entry.path: entry.ignored for entry in entries if entry.path != ".git"}
+
+
+async def test_list_directory_marks_what_git_ignores_and_hides_it_when_asked(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    listed = await client.list_directory(ListDirectoryRequest())
+    hidden = await client.list_directory(ListDirectoryRequest(hide_ignored=True))
+
+    assert _listed(listed.entries) == {
+        ".gitignore": False,
+        "a.txt": False,
+        "build": True,
+        "debug.log": True,
+        "main.py": False,
+        "tracked.log": False,
+        "zeta.md": False,
+    }
+    assert _listed(hidden.entries) == {
+        ".gitignore": False,
+        "a.txt": False,
+        "main.py": False,
+        "tracked.log": False,
+        "zeta.md": False,
+    }
+
+
+async def test_list_directory_reads_past_hidden_entries_so_no_page_is_empty_before_the_end(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    pages: list[list[str]] = []
+    token = ""
+    while True:
+        page = await client.list_directory(
+            ListDirectoryRequest(page_size=1, page_token=token, hide_ignored=True)
+        )
+        pages.append([entry.path for entry in page.entries])
+        token = page.next_page_token
+        if not token:
+            break
+
+    # `build` and `debug.log` sit between `a.txt` and `main.py`; the page holding
+    # `main.py` read past them.
+    assert all(len(page) == 1 for page in pages[:-1])
+    listed = [path for page in pages for path in page if path != ".git"]
+    assert listed == [".gitignore", "a.txt", "main.py", "tracked.log", "zeta.md"]
+
+
+async def test_list_directory_answers_with_nothing_marked_when_git_cant_say(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def time_out(*_args: object) -> set[str]:
+        raise GitError(GitProblem.TIMEOUT)
+
+    monkeypatch.setattr(DirectoryIgnores, "ignored", time_out)
+    reader = WorkspaceReader(_ignoring_workspace(tmp_path / "repo"))
+    app = WorkspaceServiceASGIApplication(WorkspaceService(lambda _ctx: reader))
+    client = _connect(app, "http://workspace.test", ProtocolType.CONNECT)
+
+    listed = await client.list_directory(ListDirectoryRequest(hide_ignored=True))
+
+    assert "build" in _listed(listed.entries)
+    assert not any(_listed(listed.entries).values())
+
+
+async def test_list_directory_lists_plainly_where_git_cant_run(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a host whose Git runner can't own processes, as on native Windows, nothing asks Git."""
+
+    async def unusable_runner(*_args: object) -> None:
+        raise AttributeError("module 'os' has no attribute 'killpg'")
+
+    # No POSIX process groups, and discovery fails as it does there.
+    monkeypatch.delattr(os, "killpg")
+    monkeypatch.setattr(DirectoryIgnores, "for_directory", unusable_runner)
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    listed = await client.list_directory(ListDirectoryRequest(hide_ignored=False))
+    capabilities = await client.get_capabilities(GetCapabilitiesRequest())
+
+    assert "build" in _listed(listed.entries)
+    assert not any(_listed(listed.entries).values())
+    assert "gitignore" not in capabilities.capabilities
+
+
+async def test_list_directory_resumes_after_the_last_entry_it_returned(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    # The second source page fills the response at `main.py`, ahead of the page's end.
+    first = await client.list_directory(ListDirectoryRequest(page_size=4, hide_ignored=True))
+    rest = await client.list_directory(
+        ListDirectoryRequest(page_size=4, page_token=first.next_page_token, hide_ignored=True)
+    )
+
+    assert [entry.path for entry in first.entries] == [".git", ".gitignore", "a.txt", "main.py"]
+    assert [entry.path for entry in rest.entries] == ["tracked.log", "zeta.md"]
+    assert rest.next_page_token == ""
+
+
+async def test_list_directory_stops_where_git_stopped_answering(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer = DirectoryIgnores.ignored
+    calls = 0
+
+    async def answer_once(self: DirectoryIgnores, *args: Any) -> set[str]:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise GitError(GitProblem.TIMEOUT)
+        return await answer(self, *args)
+
+    monkeypatch.setattr(DirectoryIgnores, "ignored", answer_once)
+    client = client_for(_ignoring_workspace(tmp_path / "repo"))
+
+    listed = await client.list_directory(ListDirectoryRequest(page_size=4, hide_ignored=True))
+
+    # No unfiltered `debug.log` after the filtered first page; the token resumes there.
+    assert [entry.path for entry in listed.entries] == [".git", ".gitignore", "a.txt"]
+    assert listed.next_page_token == "build"
+
+
+@pytest.mark.parametrize("hide_ignored", [True, False])
+async def test_list_directory_ends_a_folder_chain_before_an_ignored_folder(
+    tmp_path: Path, client_for: ClientFor, hide_ignored: bool
+) -> None:
+    root = _ignoring_workspace(tmp_path / "repo")
+    (root / ".gitignore").write_text("build/\n*.log\nsrc/generated/\napp/deep/out/\n")
+    (root / "src" / "generated" / "leaf").mkdir(parents=True)
+    (root / "src" / "generated" / "leaf" / "output.txt").write_text("x")
+    (root / "app" / "deep" / "out").mkdir(parents=True)
+    # An ignored folder holding a tracked file stays in the chain, as it lists too.
+    (root / "lib" / "vendor" / "pkg").mkdir(parents=True)
+    (root / "lib" / "vendor" / "pkg" / "kept.txt").write_text("x")
+    _git(root, "add", "-f", "lib/vendor/pkg/kept.txt")
+    client = client_for(root)
+
+    listed = await client.list_directory(
+        ListDirectoryRequest(collapse_single_child_directories=True, hide_ignored=hide_ignored)
+    )
+
+    leaves = {entry.path: entry.leaf_directory_path for entry in listed.entries}
+    assert leaves["src"] == ""
+    assert leaves["app"] == "app/deep"
+    assert leaves["lib"] == "lib/vendor/pkg"
+
+
+async def test_list_directory_drops_folder_chains_git_couldnt_check(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer = DirectoryIgnores.ignored
+
+    async def fail_on_inner_folders(self: DirectoryIgnores, names: Any, *args: Any) -> set[str]:
+        if any("/" in name for name in names):
+            raise GitError(GitProblem.TIMEOUT)
+        return await answer(self, names, *args)
+
+    monkeypatch.setattr(DirectoryIgnores, "ignored", fail_on_inner_folders)
+    root = _ignoring_workspace(tmp_path / "repo")
+    (root / "app" / "deep" / "out").mkdir(parents=True)
+    client = client_for(root)
+
+    listed = await client.list_directory(
+        ListDirectoryRequest(collapse_single_child_directories=True, hide_ignored=True)
+    )
+
+    # The entries still list; only the hint Git couldn't check is left out.
+    leaves = {entry.path: entry.leaf_directory_path for entry in listed.entries}
+    assert leaves["app"] == ""
+    assert "main.py" in leaves and "debug.log" not in leaves
+
+
+async def test_list_directory_marks_ignored_entries_of_a_subfolder(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    root = _ignoring_workspace(tmp_path / "repo")
+    (root / "src").mkdir()
+    (root / "src" / ".gitignore").write_text("generated.py\n")
+    for name in ("main.py", "generated.py", "debug.log"):
+        (root / "src" / name).write_text("x")
+    client = client_for(root)
+
+    listed = await client.list_directory(ListDirectoryRequest(path="src"))
+
+    assert _listed(listed.entries) == {
+        "src/.gitignore": False,
+        "src/debug.log": True,
+        "src/generated.py": True,
+        "src/main.py": False,
+    }
+
+
+async def test_list_directory_reads_ignore_rules_where_the_listing_is_read(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _ignoring_workspace(tmp_path / "repo")
+    (root / "allowed").mkdir()
+    (root / "allowed" / "main.py").write_text("x")
+    # Outside the workspace, a repository whose rules would hide the same name.
+    outside = _repository(tmp_path / "outside")
+    (outside / "inner").mkdir()
+    (outside / "allowed").mkdir()
+    (outside / "allowed" / ".gitignore").write_text("main.py\n")
+    (root / "link").symlink_to(outside / "inner")
+    discovered: list[Path] = []
+    discover = GitRepository.discover
+
+    async def record(directory: Path, deadline: Deadline) -> GitRepository | None:
+        discovered.append(directory)
+        return await discover(directory, deadline)
+
+    monkeypatch.setattr(GitRepository, "discover", record)
+    client = client_for(root)
+
+    # The listing reads "link/../allowed" as "allowed", so Git must look there too.
+    direct = await client.list_directory(ListDirectoryRequest(path="allowed"))
+    through_link = await client.list_directory(ListDirectoryRequest(path="link/../allowed"))
+
+    assert _listed(through_link.entries) == _listed(direct.entries) == {"allowed/main.py": False}
+    assert discovered == [root.resolve() / "allowed"] * 2
 
 
 async def test_read_file_matches_rest_file_content(tmp_path: Path, client_for: ClientFor) -> None:
@@ -290,6 +566,74 @@ async def test_list_directory_resumes_after_the_cursor_entry_is_removed(
     assert sorted(names) == sorted({e.name for e in first.entries} | set(os.listdir(tmp_path)))
 
 
+async def test_list_directory_reports_single_child_directory_chains(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    """A tree shows "com/example/app" on one row; only asked-for listings carry the leaf."""
+    (tmp_path / "com" / "example" / "app").mkdir(parents=True)
+    (tmp_path / "com" / "example" / "app" / "Main.java").write_text("")
+    for name in ("one", "two"):
+        (tmp_path / "split" / name).mkdir(parents=True)
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "src" / "lib").mkdir(parents=True)
+    client = client_for(tmp_path)
+
+    collapsed = await client.list_directory(
+        ListDirectoryRequest(collapse_single_child_directories=True)
+    )
+    nested = await client.list_directory(
+        ListDirectoryRequest(path="com", collapse_single_child_directories=True)
+    )
+    plain = await client.list_directory(ListDirectoryRequest())
+
+    leaves = {e.name: e.leaf_directory_path for e in collapsed.entries}
+    assert leaves == {"com": "com/example/app", "split": "", "empty": "", "src": "src/lib"}
+    assert [(e.path, e.leaf_directory_path) for e in nested.entries] == [
+        ("com/example", "com/example/app")
+    ]
+    assert all(e.leaf_directory_path == "" for e in plain.entries)
+
+
+def test_single_child_chains_stop_where_the_helper_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file, a second entry, a symlink or the depth cap ends a chain; a listed link has none."""
+    (tmp_path / "file_inside" / "a").mkdir(parents=True)
+    (tmp_path / "file_inside" / "a" / "x.txt").write_text("")
+    (tmp_path / "only_file").mkdir()
+    (tmp_path / "only_file" / "x.txt").write_text("")
+    (tmp_path / "hidden" / ".git").mkdir(parents=True)
+    (tmp_path / "linked" / "a").mkdir(parents=True)
+    (tmp_path / "linked" / "a" / "to_src").symlink_to(tmp_path / "file_inside")
+    (tmp_path / "link_to_chain").symlink_to(tmp_path / "file_inside")
+    (tmp_path / "deep" / "1" / "2" / "3" / "4").mkdir(parents=True)
+    monkeypatch.setattr("omnigent.workspace_fs._MAX_DIRECTORY_CHAIN", 2)
+    reader = WorkspaceReader(tmp_path)
+
+    page = reader.list_directory("", limit=100, after=None, collapse_single_child_directories=True)
+
+    leaves = {e["name"]: e.get("leaf_directory_path") for e in page.data}
+    assert leaves == {
+        "file_inside": "file_inside/a",
+        "only_file": None,
+        "hidden": "hidden/.git",
+        "linked": "linked/a",
+        "link_to_chain": None,
+        "deep": "deep/1/2",
+    }
+
+
+def test_a_single_child_chain_stops_at_an_unreadable_directory(tmp_path: Path) -> None:
+    (tmp_path / "top" / "locked" / "inner").mkdir(parents=True)
+    (tmp_path / "top" / "locked").chmod(0)
+    try:
+        if os.access(tmp_path / "top" / "locked", os.R_OK):
+            pytest.skip("running as a user that reads any directory")
+        assert single_child_chain(tmp_path / "top") == ["locked"]
+    finally:
+        (tmp_path / "top" / "locked").chmod(0o755)
+
+
 async def test_read_file_flags_a_truncated_stream_like_rest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_for: ClientFor
 ) -> None:
@@ -305,6 +649,89 @@ async def test_read_file_flags_a_truncated_stream_like_rest(
     assert metadata.truncated is rest["truncated"] is True
     assert metadata.encoding == CONTENT_ENCODING_UTF8
     assert b"".join(m.data for m in messages) == str(rest["content"]).encode() == b"h"
+
+
+def _workspace_with_escapes(tmp_path: Path) -> Path:
+    """A workspace with symlinks that lead out of it, and a FIFO."""
+    (tmp_path / "workspace").mkdir()
+    root = _workspace(tmp_path / "workspace")
+    (tmp_path / "outside.txt").write_text("secret")
+    (tmp_path / "outside-link").symlink_to("outside.txt")
+    (root / "escape").symlink_to("../outside.txt")
+    (root / "up").symlink_to("..")
+    os.mkfifo(root / "fifo")
+    return root
+
+
+async def test_stat_path_describes_a_path_as_its_parents_listing_does(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    root = _workspace_with_escapes(tmp_path)
+    (root / "src" / "inner").symlink_to("main.py")
+    client = client_for(root)
+
+    for parent in ("", "src"):
+        listed = (await client.list_directory(ListDirectoryRequest(path=parent))).entries
+        assert listed
+        for entry in listed:
+            described = (await client.stat_path(StatPathRequest(path=entry.path))).entry
+            assert described == entry, entry.path
+
+    workspace = (await client.stat_path(StatPathRequest(path=""))).entry
+    assert (workspace.name, workspace.path, workspace.type) == (
+        "workspace",
+        "",
+        ENTRY_TYPE_DIRECTORY,
+    )
+    assert not workspace.is_symlink
+
+
+async def test_read_link_text_returns_a_links_own_text_wherever_it_points(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    """Outward and dangling links answer with their text; nothing is followed."""
+    root = _workspace_with_escapes(tmp_path)
+    client = client_for(root)
+
+    texts = {
+        path: (await client.read_link_text(ReadLinkTextRequest(path=path))).target
+        for path in ("link.md", "broken", "escape", "up")
+    }
+
+    assert texts == {
+        "link.md": b"notes.md",
+        "broken": b"gone",
+        "escape": b"../outside.txt",
+        "up": b"..",
+    }
+
+
+@pytest.mark.parametrize(
+    ("call", "path", "code"),
+    [
+        ("stat", "missing.txt", Code.NOT_FOUND),
+        ("stat", "../outside.txt", Code.INVALID_ARGUMENT),
+        ("stat", "up/outside.txt", Code.INVALID_ARGUMENT),
+        ("link", "notes.md", Code.FAILED_PRECONDITION),
+        ("link", "src", Code.FAILED_PRECONDITION),
+        ("link", "missing", Code.NOT_FOUND),
+        ("link", "", Code.INVALID_ARGUMENT),
+        ("link", "../outside.txt", Code.INVALID_ARGUMENT),
+        # The leaf may point outside, but the path to it may not.
+        ("link", "up/outside-link", Code.INVALID_ARGUMENT),
+    ],
+)
+async def test_stat_and_link_refusals_map_to_connect_codes(
+    tmp_path: Path, client_for: ClientFor, call: str, path: str, code: Code
+) -> None:
+    client = client_for(_workspace_with_escapes(tmp_path))
+
+    with pytest.raises(ConnectError) as excinfo:
+        if call == "stat":
+            await client.stat_path(StatPathRequest(path=path))
+        else:
+            await client.read_link_text(ReadLinkTextRequest(path=path))
+    assert excinfo.value.code == code
 
 
 @pytest.mark.parametrize(
@@ -346,12 +773,236 @@ async def test_reader_for_refusal_reaches_the_client(
     assert excinfo.value.code == Code.PERMISSION_DENIED
 
 
+@pytest.mark.parametrize(
+    ("query", "fields"),
+    [
+        ("main", {}),
+        ("src", {}),
+        ("o", {"include": ["*.{py,md}"]}),
+        ("x", {"exclude": ["big.*"]}),
+    ],
+)
+async def test_search_files_matches_the_rest_file_search(
+    tmp_path: Path, client_for: ClientFor, query: str, fields: dict[str, Any]
+) -> None:
+    """With ignored files included, a tree within the walk budget answers as REST does."""
+    root = _workspace(tmp_path)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "notes.md", "src"], check=True)
+    (root / ".gitignore").write_text("big.txt\n")
+    reader = WorkspaceReader(root)
+    client = client_for(root)
+
+    response = await client.search_files(
+        SearchFilesRequest(
+            query=query, mode=FILE_SEARCH_MODE_SUBSTRING, include_git_ignored=True, **fields
+        )
+    )
+
+    rest = reader.search(
+        query,
+        include=",".join(fields.get("include", [])) or None,
+        exclude=",".join(fields.get("exclude", [])) or None,
+    )
+    assert [
+        (
+            r.entry.path,
+            "directory" if r.entry.type == ENTRY_TYPE_DIRECTORY else "file",
+            r.entry.size if r.entry.HasField("size") else None,
+        )
+        for r in response.results
+    ] == [(e["path"], e["type"], e["bytes"]) for e in cast("list[dict[str, Any]]", rest["data"])]
+    assert response.truncated is bool(rest["has_more"])
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep")
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"case_sensitive": True},
+        {"include": "*.{py,md}", "exclude": "big.txt"},
+        {"maximum_results": 1},
+    ],
+)
+async def test_search_text_matches_the_rest_content_search(
+    tmp_path: Path, client_for: ClientFor, fields: dict[str, Any]
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.runner.content_search import search_content
+
+    root = _workspace(tmp_path)
+    (root / "src" / "more.py").write_text("Title = 'title'\nnothing\n")
+    client = client_for(root)
+    # Unconfined, as the host's workspaces are.
+    spec = OSEnvSpec(type="caller_process", cwd=str(root), sandbox=OSEnvSandboxSpec(type="none"))
+    environment = create_os_environment(spec)
+    assert environment is not None
+
+    try:
+        responses = [
+            m async for m in client.search_text(SearchTextRequest(query="title", **fields))
+        ]
+        rest = await search_content(
+            environment,
+            "title",
+            case_sensitive=fields.get("case_sensitive", False),
+            include=fields.get("include", ""),
+            exclude=fields.get("exclude", ""),
+            limit=fields.get("maximum_results", 500),
+        )
+    finally:
+        environment.close()
+
+    matches = [
+        {
+            "path": m.path,
+            "line": m.line,
+            "column": m.column,
+            "text": m.text,
+            "match_start": m.match_start,
+            "match_end": m.match_end,
+        }
+        for response in responses
+        for m in response.matches
+    ]
+    assert rest["matches"]
+    if "maximum_results" in fields:
+        # ripgrep searches files in parallel, so which match comes first varies.
+        assert len(matches) == len(rest["matches"])
+    else:
+        assert sorted(matches, key=str) == sorted(rest["matches"], key=str)
+    assert responses[-1].done and not any(r.done for r in responses[:-1])
+    assert responses[-1].truncated is rest["truncated"]
+    assert (responses[-1].warning or None) == rest["warning"]
+
+
+async def test_base_reads_match_file_reads_and_changes_list_on_every_route(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    """An unchanged file reads the same at HEAD as from the disk; a change lists with its blob."""
+    root = _workspace(tmp_path)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Dev",
+        "GIT_AUTHOR_EMAIL": "dev@example.com",
+        "GIT_COMMITTER_NAME": "Dev",
+        "GIT_COMMITTER_EMAIL": "dev@example.com",
+    }
+    for argv in (
+        ["init", "-qb", "main"],
+        ["add", "notes.md", "big.txt", "src"],
+        ["commit", "-qm", "c"],
+    ):
+        subprocess.run(["git", "-C", str(root), *argv], check=True, env=env)
+    (root / "src" / "main.py").write_text("print('changed')\n")
+    client = client_for(root)
+
+    changes = await client.list_working_copy_changes(ListWorkingCopyChangesRequest())
+    modified = next(f for f in changes.files if f.path == "src/main.py")
+    listed = await client.list_repository_refs(ListRepositoryRefsRequest())
+    head = changes.base.head
+    tree = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "--object-only", head, "big.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    base = [
+        m
+        async for m in client.read_base_file(
+            ReadBaseFileRequest(commit=head, path="big.txt", object=tree)
+        )
+    ]
+    disk = [m async for m in client.read_file(ReadFileRequest(path="big.txt"))]
+
+    # Untracked files are listed as added; the committed ones that didn't change aren't.
+    assert {"src/main.py", "café.txt"} <= {f.path for f in changes.files}
+    assert not {"notes.md", "big.txt"} & {f.path for f in changes.files}
+    assert modified.status == CHANGE_STATUS_MODIFIED
+    assert modified.base_object and modified.HasField("working")
+    assert listed.refs and not listed.truncated
+    context = await client.resolve_repository_context(ResolveRepositoryContextRequest())
+    assert context.branch == "main" and context.head_sha == head
+    assert b"".join(m.data for m in base) == b"".join(m.data for m in disk)
+    assert base[0].metadata.size == disk[0].metadata.size
+    assert base[0].metadata.encoding == disk[0].metadata.encoding
+    assert base[0].metadata.content_type == disk[0].metadata.content_type
+
+
 async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: ClientFor) -> None:
     client = client_for(tmp_path)
 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
-    assert set(response.capabilities) == {"ListDirectory", "ReadFile"}
+    # SearchText is listed exactly where ripgrep is installed. The server's route passes
+    # the host's list on unchanged, optional features included.
+    assert set(response.capabilities) ^ (_RG_METHODS - _WITH_RG) == {
+        "ListDirectory",
+        "list_directory.collapse_single_child_directories",
+        "gitignore",
+        "ReadFile",
+        "StatPath",
+        "ReadLinkText",
+        "SearchFiles",
+        "search_files.substring",
+        "search_files.fuzzy",
+        "search_files.browse",
+        "SearchText",
+        "text_search_priority",
+        "ResolveWorkingCopyBase",
+        "revision_comparison",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+        "branch_commits",
+        "ResolveRepositoryContext",
+    }
+
+
+async def test_capabilities_leave_out_methods_whose_tool_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.host.workspace_service.shutil.which", lambda _name: None)
+    app = WorkspaceServiceASGIApplication(WorkspaceService(lambda _ctx: WorkspaceReader(tmp_path)))
+    client = _connect(app, "http://workspace.test", ProtocolType.CONNECT)
+
+    response = await client.get_capabilities(GetCapabilitiesRequest())
+
+    assert set(response.capabilities) == {
+        "ListDirectory",
+        "list_directory.collapse_single_child_directories",
+        "ReadFile",
+        "StatPath",
+        "ReadLinkText",
+    }
+
+
+async def test_capabilities_leave_out_fuzzy_search_where_paths_cant_be_ranked(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.host.workspace_fuzzy._frizbee", lambda: None)
+    client = client_for(tmp_path)
+
+    response = await client.get_capabilities(GetCapabilitiesRequest())
+
+    assert "search_files.substring" in response.capabilities
+    assert not {"search_files.fuzzy", "search_files.browse"} & set(response.capabilities)
+
+
+async def test_a_search_mode_not_served_answers_unimplemented(
+    tmp_path: Path, client_for: ClientFor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client that skips GetCapabilities still gets a code it can fall back on."""
+    monkeypatch.setattr("omnigent.host.workspace_fuzzy._frizbee", lambda: None)
+    client = client_for(tmp_path)
+
+    with pytest.raises(ConnectError) as fuzzy:
+        await client.search_files(SearchFilesRequest(query="main"))  # fuzzy, the default
+
+    assert fuzzy.value.code == Code.UNIMPLEMENTED
 
 
 @PROTOCOLS
@@ -392,6 +1043,54 @@ async def test_server_route_serves_a_side_chat_from_its_source_session(
     assert "notes.md" in {e.name for e in page.entries}
 
 
+@pytest.mark.parametrize("content_search", [True, False], ids=["flag-on", "flag-off"])
+async def test_server_route_serves_text_search_only_with_its_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content_search: bool
+) -> None:
+    """With its flag off, SearchText is refused and unlisted even when the host serves it."""
+    reached: list[str] = []
+
+    async def search_text(
+        _self: WorkspaceService, _request: SearchTextRequest, _ctx: object
+    ) -> AsyncIterator[SearchTextResponse]:
+        reached.append("SearchText")
+        yield SearchTextResponse(done=True)
+
+    monkeypatch.setitem(_SERVED, "SearchText", _Served())
+    monkeypatch.setattr(WorkspaceService, "search_text", search_text)
+    app = _server_app(_workspace(tmp_path), monkeypatch, content_search=content_search)
+    client = _connect(app, _SERVER_BASE, ProtocolType.CONNECT)
+
+    capabilities = set((await client.get_capabilities(GetCapabilitiesRequest())).capabilities)
+    if content_search:
+        searched = [m async for m in client.search_text(SearchTextRequest(query="q"))]
+        assert searched[-1].done
+    else:
+        with pytest.raises(ConnectError) as refused:
+            [m async for m in client.search_text(SearchTextRequest(query="q"))]
+        assert refused.value.code == Code.UNIMPLEMENTED
+
+    assert ("SearchText" in capabilities) is content_search
+    assert reached == (["SearchText"] if content_search else [])
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["Bogus", "list_directory", "__init__", "_reader_for", "GetInfo", "OpenWorkspace"],
+)
+async def test_tunnel_dispatches_only_methods_in_the_table(tmp_path: Path, method: str) -> None:
+    """A method name from the wire never selects an attribute the table doesn't list."""
+    frame = HostWorkspaceCallFrame(
+        request_id="r1", workspace=str(tmp_path), method=method, request=b""
+    )
+
+    replies = [
+        reply async for reply in serve_tunnel_call(lambda ws: WorkspaceReader(Path(ws)), frame)
+    ]
+
+    assert [(r.done, r.error_code) for r in replies] == [(True, Code.UNIMPLEMENTED.value)]
+
+
 async def test_server_route_readdresses_a_host_on_another_replica(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -417,7 +1116,7 @@ async def test_host_disconnect_ends_a_waiting_call(tmp_path: Path) -> None:
     hello = HostHelloFrame(version="t", frame_protocol_version=1, name="ws")
     conn = registry.register("host_ws", object(), hello, owner=None)  # type: ignore[arg-type]
     registry.send_text = lambda *_: None  # type: ignore[method-assign]
-    service = HostWorkspaceService(HostTarget(registry, conn, str(tmp_path)))
+    service = HostWorkspaceService(HostTarget(registry, conn, str(tmp_path)), content_search=False)
 
     call = asyncio.create_task(service.list_directory(ListDirectoryRequest(), None))  # type: ignore[arg-type]
     await poll_until_async(lambda: conn.pending_workspace_calls, timeout_s=5)

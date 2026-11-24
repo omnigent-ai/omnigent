@@ -54,6 +54,11 @@ _logger = logging.getLogger(__name__)
 # the idle clock.
 PANE_OUTPUT_BUSY_WINDOW_S = 120.0
 
+# A background shell that outlives its turn emits nothing, so it alone spares the
+# pane for at most this long after the pane's other work, as a human wait does
+# for the runner: a long build survives, a forgotten server cannot pin the pane.
+BACKGROUND_SHELL_PANE_HOLD_S = 24 * 60 * 60.0
+
 # Native CLI panes are keyed (conversation_id, <harness short name>, "main") in
 # the terminal registry. These short names match the ``terminal_name`` the
 # per-harness ``_auto_create_<harness>_terminal`` paths launch with. This is the

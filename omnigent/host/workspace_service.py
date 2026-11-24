@@ -18,12 +18,15 @@ an owner-only Unix socket, admitting calls that carry a server-issued token
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import shutil
 import socket
 import tempfile
 from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ParamSpec, TypeVar
 
@@ -34,6 +37,9 @@ from connectrpc.request import RequestContext
 from google.protobuf.message import Message
 from google.protobuf.timestamp_pb2 import Timestamp
 
+from omnigent.api.workspace.v1alpha1.workspace_connect import (
+    WorkspaceService as WorkspaceServiceMethods,
+)
 from omnigent.api.workspace.v1alpha1.workspace_connect import WorkspaceServiceASGIApplication
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     CONTENT_ENCODING_BINARY,
@@ -44,28 +50,115 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FileMetadata,
     GetCapabilitiesRequest,
     GetCapabilitiesResponse,
+    ListBranchCommitsRequest,
+    ListBranchCommitsResponse,
     ListDirectoryRequest,
     ListDirectoryResponse,
+    ListRepositoryRefsRequest,
+    ListRepositoryRefsResponse,
+    ListWorkingCopyChangesRequest,
+    ListWorkingCopyChangesResponse,
+    ReadBaseFileRequest,
+    ReadBaseFileResponse,
     ReadFileRequest,
     ReadFileResponse,
+    ReadLinkTextRequest,
+    ReadLinkTextResponse,
+    ResolveRepositoryContextRequest,
+    ResolveRepositoryContextResponse,
+    ResolveWorkingCopyBaseRequest,
+    ResolveWorkingCopyBaseResponse,
+    SearchFilesRequest,
+    SearchFilesResponse,
+    SearchTextRequest,
+    SearchTextResponse,
+    StatPathRequest,
+    StatPathResponse,
 )
+from omnigent.entities.pagination import PagedList
+from omnigent.host import workspace_fuzzy
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
+from omnigent.host.workspace_git import comparison, context, working_copy
+from omnigent.host.workspace_git.ignored import DirectoryIgnores
+from omnigent.host.workspace_git.runner import Deadline, GitError, runs_on_this_host
+from omnigent.host.workspace_methods import WORKSPACE_METHODS
+from omnigent.host.workspace_search import search_files, search_text
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.util.uvicorn_server import NoSignalServer
-from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+from omnigent.workspace_fs import ListedEntry, WorkspaceReader, WorkspaceReaderError
 
 _logger = logging.getLogger(__name__)
 
 # Matches the largest page the web Files tree asks for.
 _MAX_PAGE_SIZE = 1000
+# How long ListDirectory may ask Git which entries it ignores, across its pages.
+_IGNORED_DEADLINE_S = 10.0
 # Small enough to keep a stream responsive, large enough to keep framing cheap.
 _READ_CHUNK_BYTES = 64 * 1024
-_CAPABILITIES = ("ListDirectory", "ReadFile")
-_ERROR_CODES = {400: Code.INVALID_ARGUMENT, 404: Code.NOT_FOUND}
+_ERROR_CODES = {
+    400: Code.INVALID_ARGUMENT,
+    404: Code.NOT_FOUND,
+    412: Code.FAILED_PRECONDITION,
+}
 # A local socket bind; seconds means something is wrong, and the host goes on without it.
 _SOCKET_STARTUP_TIMEOUT_S = 5.0
 _SOCKET_SHUTDOWN_TIMEOUT_S = 2.0
+
+
+@dataclass(frozen=True)
+class _Served:
+    """How this host serves one method.
+
+    :param features: Optional features it offers, e.g. ``"search_files.substring"``.
+    :param tool: A program it needs on ``PATH``; without it, the method isn't listed.
+    :param optional_features: Returns the features this host can offer only when
+        what they need is there, such as a library that loads or a program on ``PATH``.
+    """
+
+    features: tuple[str, ...] = ()
+    tool: str | None = None
+    optional_features: Callable[[], tuple[str, ...]] | None = None
+
+
+# The methods this host answers. Only these, and GetCapabilities, are dispatched.
+_SERVED: dict[str, _Served] = {
+    "ListDirectory": _Served(
+        features=("list_directory.collapse_single_child_directories",),
+        optional_features=lambda: ("gitignore",) if _reads_ignore_rules() else (),
+    ),
+    "ReadFile": _Served(),
+    "StatPath": _Served(),
+    "ReadLinkText": _Served(),
+    "SearchFiles": _Served(
+        features=("search_files.substring",),
+        tool="git",
+        optional_features=workspace_fuzzy.features,
+    ),
+    "SearchText": _Served(features=("text_search_priority",), tool="rg"),
+    "ResolveWorkingCopyBase": _Served(features=("revision_comparison",), tool="git"),
+    "ListWorkingCopyChanges": _Served(tool="git"),
+    "ReadBaseFile": _Served(tool="git"),
+    "ListRepositoryRefs": _Served(tool="git"),
+    "ListBranchCommits": _Served(features=("branch_commits",), tool="git"),
+    "ResolveRepositoryContext": _Served(tool="git"),
+}
+
+
+def _reads_ignore_rules() -> bool:
+    """Whether listings can ask Git what it ignores: ``git`` is on ``PATH`` and can run here."""
+    return bool(shutil.which("git")) and runs_on_this_host()
+
+
+def capabilities() -> list[str]:
+    """The method and feature names GetCapabilities lists on this host."""
+    names: list[str] = []
+    for name, served in _SERVED.items():
+        if served.tool is None or shutil.which(served.tool):
+            optional = served.optional_features() if served.optional_features else ()
+            names += [name, *served.features, *optional]
+    return names
+
 
 # The context is ``None`` for calls that arrive over the host tunnel.
 ReaderForCall = Callable[[RequestContext | None], WorkspaceReader]
@@ -81,8 +174,11 @@ async def _read(fn: Callable[_Params, _T], *args: _Params.args, **kwargs: _Param
         raise ConnectError(_ERROR_CODES.get(exc.status, Code.INTERNAL), exc.message) from exc
 
 
-class WorkspaceService:
+class WorkspaceService(WorkspaceServiceMethods):
     """Implements ``WorkspaceService`` from ``workspace.proto``.
+
+    Methods it doesn't define answer UNIMPLEMENTED, and GetCapabilities
+    doesn't list them.
 
     :param reader_for: Returns the reader for the workspace a call may read.
         It must raise :class:`ConnectError` when the call isn't authorized.
@@ -96,7 +192,7 @@ class WorkspaceService:
         _request: GetCapabilitiesRequest,
         _ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse] | None,
     ) -> GetCapabilitiesResponse:
-        return GetCapabilitiesResponse(capabilities=_CAPABILITIES)
+        return GetCapabilitiesResponse(capabilities=capabilities())
 
     async def list_directory(
         self,
@@ -106,25 +202,61 @@ class WorkspaceService:
         if request.page_size < 0:
             raise ConnectError(Code.INVALID_ARGUMENT, "page_size must not be negative")
         reader = await _read(self._reader_for, ctx)
-        page = await _read(
-            reader.list_directory,
-            request.path,
-            limit=min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE),
-            after=request.page_token or None,
-        )
-        entries = [
-            Entry(
-                name=item["name"],
-                path=item["path"],
-                type=ENTRY_TYPE_DIRECTORY if item["type"] == "directory" else ENTRY_TYPE_FILE,
-                size=item["bytes"],
-                modify_time=Timestamp(seconds=item["modified_at"]),
+        limit = min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE)
+        deadline = Deadline(_IGNORED_DEADLINE_S)
+        entries: list[Entry] = []
+        # The cursor is the last consumed entry's id; the proto keeps it opaque.
+        after = request.page_token or None
+
+        async def read_page(after: str | None) -> PagedList[ListedEntry]:
+            return await _read(
+                reader.list_directory,
+                request.path,
+                limit=limit,
+                after=after,
+                collapse_single_child_directories=request.collapse_single_child_directories,
             )
-            for item in page.data
-        ]
-        # The cursor is the last entry's id; the proto keeps it opaque.
-        next_page_token = page.last_id if page.has_more and page.last_id else ""
-        return ListDirectoryResponse(entries=entries, next_page_token=next_page_token)
+
+        page = await read_page(after)
+        # Git reads the confined directory the listing read; one repository answers for it all.
+        directory = await _read(reader.resolve_directory, request.path)
+        ignores = await _directory_ignores(directory, deadline)
+        while True:
+            paths = [item["path"] for item in page.data]
+            # The REST listing has no symlink flag, so look at each entry itself.
+            links = await _read(_symlinks, reader.root, paths)
+            ignored = await _ignored(ignores, [item["name"] for item in page.data], deadline)
+            if ignored is None and entries:
+                # Git stopped answering partway: end here rather than mix in unfiltered pages.
+                return ListDirectoryResponse(entries=entries, next_page_token=after or "")
+            ignored = ignored or set()
+            leaves = await _leaves_short_of_ignored(ignores, page.data, ignored, deadline)
+            for index, item in enumerate(page.data):
+                after = item["id"]
+                hidden = request.hide_ignored and item["name"] in ignored
+                if not hidden:
+                    entries.append(
+                        _entry(
+                            {**item, "leaf_directory_path": leaves[item["path"]]}
+                            if item["path"] in leaves
+                            else item,
+                            is_symlink=item["path"] in links,
+                            ignored=item["name"] in ignored,
+                        )
+                    )
+                if len(entries) == limit:
+                    more = page.has_more or index < len(page.data) - 1
+                    return ListDirectoryResponse(
+                        entries=entries, next_page_token=after if more else ""
+                    )
+            # Hidden entries leave room, so read on: a page comes back empty only at the end.
+            if not (request.hide_ignored and page.has_more and page.last_id):
+                return ListDirectoryResponse(
+                    entries=entries,
+                    next_page_token=page.last_id if page.has_more and page.last_id else "",
+                )
+            after = page.last_id
+            page = await read_page(after)
 
     async def read_file(
         self,
@@ -146,6 +278,179 @@ class WorkspaceService:
         for start in range(0, len(file.data), _READ_CHUNK_BYTES):
             yield ReadFileResponse(data=file.data[start : start + _READ_CHUNK_BYTES])
 
+    async def stat_path(
+        self,
+        request: StatPathRequest,
+        ctx: RequestContext[StatPathRequest, StatPathResponse] | None,
+    ) -> StatPathResponse:
+        reader = await _read(self._reader_for, ctx)
+        item, is_symlink = await _read(reader.stat_entry, request.path)
+        return StatPathResponse(entry=_entry(item, is_symlink=is_symlink))
+
+    async def resolve_working_copy_base(
+        self,
+        request: ResolveWorkingCopyBaseRequest,
+        ctx: RequestContext[ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse] | None,
+    ) -> ResolveWorkingCopyBaseResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await working_copy.resolve_working_copy_base(reader.root, request)
+
+    async def list_working_copy_changes(
+        self,
+        request: ListWorkingCopyChangesRequest,
+        ctx: RequestContext[ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse] | None,
+    ) -> ListWorkingCopyChangesResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await working_copy.list_working_copy_changes(reader.root, request)
+
+    async def read_base_file(
+        self,
+        request: ReadBaseFileRequest,
+        ctx: RequestContext[ReadBaseFileRequest, ReadBaseFileResponse] | None,
+    ) -> AsyncIterator[ReadBaseFileResponse]:
+        reader = await _read(self._reader_for, ctx)
+        async with aclosing(working_copy.read_base_file(reader.root, request)) as responses:
+            async for response in responses:
+                yield response
+
+    async def list_repository_refs(
+        self,
+        request: ListRepositoryRefsRequest,
+        ctx: RequestContext[ListRepositoryRefsRequest, ListRepositoryRefsResponse] | None,
+    ) -> ListRepositoryRefsResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await comparison.list_repository_refs(reader.root, request)
+
+    async def list_branch_commits(
+        self,
+        request: ListBranchCommitsRequest,
+        ctx: RequestContext[ListBranchCommitsRequest, ListBranchCommitsResponse] | None,
+    ) -> ListBranchCommitsResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await comparison.list_branch_commits(reader.root, request)
+
+    async def resolve_repository_context(
+        self,
+        request: ResolveRepositoryContextRequest,
+        ctx: RequestContext[ResolveRepositoryContextRequest, ResolveRepositoryContextResponse]
+        | None,
+    ) -> ResolveRepositoryContextResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await context.resolve_repository_context(reader.root, request)
+
+    async def search_files(
+        self,
+        request: SearchFilesRequest,
+        ctx: RequestContext[SearchFilesRequest, SearchFilesResponse] | None,
+    ) -> SearchFilesResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await search_files(reader.root, request)
+
+    async def search_text(
+        self,
+        request: SearchTextRequest,
+        ctx: RequestContext[SearchTextRequest, SearchTextResponse] | None,
+    ) -> AsyncIterator[SearchTextResponse]:
+        reader = await _read(self._reader_for, ctx)
+        # Closing this stream early must stop ripgrep, not leave it to the GC.
+        async with aclosing(search_text(reader.root, request)) as responses:
+            async for response in responses:
+                yield response
+
+    async def read_link_text(
+        self,
+        request: ReadLinkTextRequest,
+        ctx: RequestContext[ReadLinkTextRequest, ReadLinkTextResponse] | None,
+    ) -> ReadLinkTextResponse:
+        if not request.path:
+            raise ConnectError(Code.INVALID_ARGUMENT, "path is required")
+        reader = await _read(self._reader_for, ctx)
+        # The link may point anywhere; only its parent must be in the workspace.
+        return ReadLinkTextResponse(target=await _read(reader.read_link_text, request.path))
+
+
+async def _directory_ignores(directory: Path, deadline: Deadline) -> DirectoryIgnores | None:
+    """The listed directory's ignore rules; none without Git, so the listing still answers."""
+    if not _reads_ignore_rules():
+        return None
+    try:
+        return await DirectoryIgnores.for_directory(directory, deadline)
+    except GitError as exc:
+        _logger.info("Listing without ignored files: %s", exc.problem.name)
+        return None
+
+
+async def _ignored(
+    ignores: DirectoryIgnores | None, names: list[str], deadline: Deadline
+) -> set[str] | None:
+    """The ``names`` Git ignores, empty without a repository, or ``None`` when Git failed."""
+    if ignores is None:
+        return set()
+    try:
+        return await ignores.ignored(names, deadline)
+    except GitError as exc:
+        _logger.info("Listing without ignored files: %s", exc.problem.name)
+        return None
+
+
+async def _leaves_short_of_ignored(
+    ignores: DirectoryIgnores | None,
+    items: list[ListedEntry],
+    ignored: set[str],
+    deadline: Deadline,
+) -> dict[str, str]:
+    """Folder chains cut before the first folder Git ignores, so a hint never shows one.
+
+    :returns: Each changed entry's path and its new ``leaf_directory_path``, ``""`` for none.
+    """
+    if ignores is None:
+        return {}
+    leaves: dict[str, str] = {}
+    # Each chain's inner folders, as paths below the listed directory.
+    inner: dict[str, list[str]] = {}
+    for item in items:
+        leaf = item.get("leaf_directory_path")
+        if not leaf:
+            continue
+        if item["name"] in ignored:
+            # Everything below an ignored folder is ignored too; it lists folder by folder.
+            leaves[item["path"]] = ""
+            continue
+        below = leaf.removeprefix(item["path"] + "/").split("/")
+        inner[item["path"]] = [
+            "/".join([item["name"], *below[: depth + 1]]) for depth in range(len(below))
+        ]
+    if not inner:
+        return leaves
+    hit = await _ignored(ignores, [path for paths in inner.values() for path in paths], deadline)
+    for path, folders in inner.items():
+        if hit is None:
+            # Git stopped answering: leave out the hint rather than risk an ignored folder.
+            leaves[path] = ""
+            continue
+        kept = len(list(itertools.takewhile(lambda folder: folder not in hit, folders)))
+        if kept < len(folders):
+            leaves[path] = "/".join([path, *folders[kept - 1].split("/")[1:]]) if kept else ""
+    return leaves
+
+
+def _entry(item: ListedEntry, *, is_symlink: bool, ignored: bool = False) -> Entry:
+    return Entry(
+        name=item["name"],
+        path=item["path"],
+        type=ENTRY_TYPE_DIRECTORY if item["type"] == "directory" else ENTRY_TYPE_FILE,
+        size=item["bytes"],
+        modify_time=Timestamp(seconds=item["modified_at"]),
+        is_symlink=is_symlink,
+        leaf_directory_path=item.get("leaf_directory_path", ""),
+        ignored=ignored,
+    )
+
+
+def _symlinks(root: Path, paths: list[str]) -> set[str]:
+    """The ``paths`` under ``root`` that are symlinks themselves."""
+    return {path for path in paths if (root / path).is_symlink()}
+
 
 def _reader_at(
     reader_for_workspace: Callable[[str], WorkspaceReader], workspace: str
@@ -158,16 +463,23 @@ def _reader_at(
 
 
 async def _call(service: WorkspaceService, method: str, request: bytes) -> AsyncIterator[Message]:
-    """Run one serialized call against ``service``, yielding its responses."""
-    if method == "GetCapabilities":
-        yield await service.get_capabilities(GetCapabilitiesRequest.FromString(request), None)
-    elif method == "ListDirectory":
-        yield await service.list_directory(ListDirectoryRequest.FromString(request), None)
-    elif method == "ReadFile":
-        async for response in service.read_file(ReadFileRequest.FromString(request), None):
-            yield response
-    else:
+    """Run one serialized call against ``service``, yielding its responses.
+
+    The handler comes from the method table, never from an attribute the
+    caller names, so only served methods can run.
+    """
+    if method != "GetCapabilities" and method not in _SERVED:
         raise ConnectError(Code.UNIMPLEMENTED, f"Unknown workspace method {method!r}")
+    served = WORKSPACE_METHODS[method]
+    handler = getattr(service, served.python_name)
+    parsed = served.request_type.FromString(request)
+    if not served.streaming:
+        yield await handler(parsed, None)
+        return
+    # Closing this call early must stop the stream's work, not leave it to the GC.
+    async with aclosing(handler(parsed, None)) as responses:
+        async for response in responses:
+            yield response
 
 
 async def serve_tunnel_call(

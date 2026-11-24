@@ -223,11 +223,17 @@ and both start with a saved selection:
   be loaded to check, or the worker's host or runner lacks registry support.
   Child sessions and named sub-agents keep their own configuration.
 
-A deployment that records selections differently passes its own
-[`SessionMcpSelection`](../omnigent/server/session_mcp_selection.py) with
-`create_app(session_mcp_selection=...)`. It validates a list when an owner saves
-it, turns a list into labels, and reads a list back from labels; the default,
-`RegistryMcpSelection`, uses the registry labels above.
+A sandbox provider that configures MCP servers inside the sandbox at launch,
+instead of through this registry, sets its own
+[`SessionMcpSelection`](../omnigent/server/session_mcp_selection.py) as its
+`ManagedSandboxConfig.mcp_selection`. It validates a list when an owner saves
+it, turns a list into labels, and reads a list back from labels. The server
+uses it only for sessions in that provider's sandboxes: a scheduled task that
+runs in a new sandbox, and a worker in a new or existing sandbox of that
+provider. Connected hosts, and providers that set none, use
+`RegistryMcpSelection` and the registry labels above. A worker in a different
+provider from the session that starts it inherits only services its own
+selection accepts.
 
 ## Gateway requests and policy context
 
@@ -357,7 +363,7 @@ does not implement an on-behalf-of exchange.
 | [`McpPolicyAdapter`](../omnigent/server/mcp_policy_adapter.py) | Resolves trusted session context and applies existing policies around either backend. |
 | [`ConnectionHooks`, `create_connection_router`](../omnigent/server/routes/connections_base.py) | Existing provider protocol and shared OAuth route factory. `McpOAuthHooks` implements the MCP flow. |
 | [`AuthProvider`](../omnigent/server/auth.py) | Existing identity abstraction; inject with `create_app(auth_provider=...)`. |
-| [`SessionMcpSelection`, `RegistryMcpSelection`](../omnigent/server/session_mcp_selection.py) | How scheduled-task fires and workers record their MCP services; inject with `create_app(session_mcp_selection=...)`. |
+| [`SessionMcpSelection`, `RegistryMcpSelection`](../omnigent/server/session_mcp_selection.py) | How scheduled-task fires and workers record their MCP services; a sandbox provider sets its own as `ManagedSandboxConfig.mcp_selection`. |
 | [`CredentialStore`](../omnigent/stores/credential_store/sqlalchemy_store.py) | Existing encrypted grant persistence. The resolver owns refresh/exchange, the store owns persistence. |
 
 ### Execution extension point

@@ -273,12 +273,11 @@ def pending_session_ids() -> list[str]:
     """
     Return ids of every session with at least one outstanding elicitation.
 
-    Used by ``GET /v1/sessions/{id}`` as a cheap pre-check before the
-    descendant walk that mirrors child pending prompts into an ancestor
-    snapshot — that walk costs one ``list_conversations`` query per
-    session in the tree, so it should run only when some session other
-    than the one being snapshotted actually has an outstanding prompt
-    (the rare, transient case).
+    Used by ``GET /v1/sessions/{id}`` to mirror descendant sub-agents'
+    pending prompts into an ancestor snapshot: the snapshot walks up from
+    these sessions to find the ones below it, so the lookup costs one
+    batched read per tree level rather than a query per session in the
+    snapshotted session's tree.
 
     :returns: Session ids with outstanding elicitations, e.g.
         ``["conv_child123"]``. Empty when nothing is pending anywhere.

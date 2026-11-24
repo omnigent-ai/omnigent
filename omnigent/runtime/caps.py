@@ -121,3 +121,5 @@ class RuntimeCaps:
     routing_settings: RoutingSettings = field(default_factory=_default_routing_settings)
     # Per-request so a managed deployment can resolve it per workspace.
     native_hook_allow_cache_seconds: Callable[[], float] | None = None
+    # The attached server's routing availability as of the last session init.
+    remote_routing_available: bool = False

@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 import {
   resetCommentsWidthStoreForTesting,
@@ -20,6 +20,22 @@ afterEach(() => {
   localStorage.clear();
   resetCommentsWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
+  vi.unstubAllGlobals();
+});
+
+describe("useResizableCommentsPanel layout", () => {
+  it.each([
+    ["a browser", false, false],
+    ["the desktop app", true, true],
+  ])("sizes the panel inline below md only in %s", (_name, desktopApp, inline) => {
+    setInnerWidth(900);
+    if (desktopApp) vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+
+    const { result } = renderHook(() => useResizableCommentsPanel());
+
+    expect(result.current.isDesktop).toBe(inline);
+    expect(result.current.width).toBe(inline ? 240 : undefined);
+  });
 });
 
 describe("useResizableCommentsPanel persistence", () => {
