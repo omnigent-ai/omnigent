@@ -6,10 +6,26 @@
 import { Extension, type Editor, type JSONContent } from "@tiptap/core";
 import type { Slice } from "@tiptap/pm/model";
 import { Plugin, PluginKey, type Selection } from "@tiptap/pm/state";
+import { rememberedMarkdown } from "./markdownSourceBlocks";
 import { markdownKeepingSource } from "./tiptapMarkdownPatches";
 
 function trimNewlines(markdown: string): string {
   return markdown.replace(/^\n+|\n+$/g, "");
+}
+
+/** *markdown* without the line endings and edge blank lines the editor can't hold. */
+function withoutEdges(markdown: string): string {
+  return markdown.replace(/\r\n?/g, "\n").replace(/^\n+|\s+$/g, "");
+}
+
+// Unchanged, the document copies as the loaded file, byte for byte; once edited,
+// it copies as Save would write it.
+function wholeDocumentMarkdown(editor: Editor): string {
+  const markdown = trimNewlines(markdownKeepingSource(editor));
+  const loaded = rememberedMarkdown(editor);
+  if (loaded === null) return markdown;
+  if (withoutEdges(loaded) === withoutEdges(markdown)) return loaded;
+  return loaded.endsWith("\n") && markdown ? `${markdown}\n` : markdown;
 }
 
 /**
@@ -26,7 +42,7 @@ export function copiedMarkdown(editor: Editor, slice: Slice, selection: Selectio
   if (!manager) return "";
   try {
     const { doc } = selection.$from;
-    if (slice.content.eq(doc.content)) return trimNewlines(markdownKeepingSource(editor));
+    if (slice.content.eq(doc.content)) return wholeDocumentMarkdown(editor);
     const { $from, $to } = selection;
     const block = $from.parent;
     // A whole cell is still just its text; table syntax needs whole rows.

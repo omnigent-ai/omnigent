@@ -136,10 +136,33 @@ describe("copying from the Markdown editor", () => {
     expect(copy(ed, "here", "second").text).toBe("here\nsecond");
   });
 
-  it("copies the whole document as its source", () => {
+  it.each([
     // The serializer would rewrite `*` bullets and the setext heading.
-    const source = "Title\n=====\n\n* one\n* two\n\nA __strong__ word.";
+    ["rewritable syntax", "Title\n=====\n\n* one\n* two\n\nA __strong__ word."],
+    ["a final newline", "# Title\n\nBody.\n"],
+    ["blank lines at both ends", "\n\n# Title\n\nBody.\n\n\n"],
+    ["CRLF line endings", "# Title\r\n\r\n* one\r\n* two\r\n"],
+  ])("copies the whole document byte for byte with %s", (_case, source) => {
     const ed = makeEditor(source);
     expect(copySelection(ed, new AllSelection(ed.state.doc)).text).toBe(source);
+  });
+
+  it("copies the whole document with its edits, not the stale source", () => {
+    const ed = makeEditor("# Title\n\n* one\n* two\n");
+    ed.view.dispatch(ed.state.tr.insertText("Edited ", textPosition(ed, "Title")));
+    expect(copySelection(ed, new AllSelection(ed.state.doc)).text).toBe(
+      "# Edited Title\n\n* one\n* two\n",
+    );
+  });
+
+  it("falls back to plain text and keeps the HTML when serializing fails", () => {
+    const ed = makeEditor(DOC);
+    // Forces the serializer, a dependency, down its error path.
+    vi.spyOn(ed.markdown!, "serialize").mockImplementation(() => {
+      throw new Error("serializer failed");
+    });
+    const { text, html } = copy(ed, "new", "design");
+    expect(text).toBe("new viewer after the design");
+    expect(html).toContain("<strong>new viewer</strong>");
   });
 });
