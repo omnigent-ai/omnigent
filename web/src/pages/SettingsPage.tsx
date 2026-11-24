@@ -112,6 +112,7 @@ import {
   OPEN_IN_DESKTOP_APP_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  PROACTIVE_AGENT_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
@@ -2204,7 +2205,7 @@ function ProactiveAgentGroup() {
   if (!available) return null;
   return (
     <SettingsGroup title={PROACTIVE_AGENT_DISPLAY_NAME} testId="settings-group-proactive-agent">
-      <ProactiveAgentSettingControl scope="me" />
+      <ProactiveAgentSettingControl scope="me" entry={PROACTIVE_AGENT_ENTRY} />
     </SettingsGroup>
   );
 }

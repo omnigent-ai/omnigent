@@ -43,7 +43,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeAlias, TypedDict, cast
+from typing import NotRequired, TypeAlias, TypedDict, cast
 
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import PagedList, paginate_in_memory
@@ -70,6 +70,8 @@ _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
 _MAX_LINK_TEXT_BYTES = 4096
 _REPOSITORY_BRANCH_TIMEOUT_S = 3.0
 _MAX_REPOSITORY_BRANCHES = 10
+# Chains longer than this stop early; the client lists the rest on expand.
+_MAX_DIRECTORY_CHAIN = 64
 
 _WorkspacePayload: TypeAlias = dict[str, object]
 
@@ -84,6 +86,8 @@ class ListedEntry(TypedDict):
     type: str
     bytes: int | None
     modified_at: int
+    # The deepest directory of a single-child chain, when the listing was asked to collapse them.
+    leaf_directory_path: NotRequired[str]
 
 
 def _repository_branch(url: str, checkout: Path) -> _WorkspacePayload:
@@ -190,6 +194,33 @@ def is_utf8_encodable(text: str) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+def single_child_chain(directory: Path) -> list[str]:
+    """Follow ``directory`` while its only entry is a real (non-symlink) directory.
+
+    Stops at a second entry, a file, a symlink, a name that isn't UTF-8, an
+    unreadable directory, or :data:`_MAX_DIRECTORY_CHAIN` levels.
+
+    :param directory: The directory to start from, e.g. ``root / "com"``.
+    :returns: The names traversed, e.g. ``["example", "app"]``; empty when
+        ``directory`` doesn't hold exactly one directory.
+    """
+    names: list[str] = []
+    current = directory
+    while len(names) < _MAX_DIRECTORY_CHAIN:
+        try:
+            with os.scandir(current) as entries:
+                first = next(entries, None)
+                if first is None or next(entries, None) is not None:
+                    break
+                if not is_utf8_encodable(first.name) or not first.is_dir(follow_symlinks=False):
+                    break
+        except OSError:
+            break
+        names.append(first.name)
+        current = current / first.name
+    return names
 
 
 def _resolve_workspace_path(root: Path, path: str) -> Path:
@@ -306,6 +337,14 @@ class WorkspaceReader:
         """
         return _resolve_workspace_path(self._root, path)
 
+    def resolve_directory(self, path: str) -> Path:
+        """The confined directory :meth:`list_directory` reads for ``path``, symlinks resolved.
+
+        :param path: Relative directory path (``""`` for the workspace root).
+        :raises WorkspaceReaderError: 400 when the path escapes the root or is invalid.
+        """
+        return self._resolve(path)
+
     # ── Directory listing / file content ──────────────────────────
 
     def list_or_read(
@@ -333,7 +372,12 @@ class WorkspaceReader:
         return self._read_file(path, resolved)
 
     def list_directory(
-        self, path: str, *, limit: int, after: str | None
+        self,
+        path: str,
+        *,
+        limit: int,
+        after: str | None,
+        collapse_single_child_directories: bool = False,
     ) -> PagedList[ListedEntry]:
         """List a directory in ascending name order, like ``list_or_read``.
 
@@ -341,13 +385,25 @@ class WorkspaceReader:
         :param limit: Max entries to return.
         :param after: Return entries after this entry id. An id whose entry
             was removed since still resumes at its place in name order.
+        :param collapse_single_child_directories: Give each real (non-symlink)
+            directory whose only entry is a directory a ``leaf_directory_path``,
+            the deepest directory of that chain (see :func:`single_child_chain`).
         :returns: The page of entries.
         :raises WorkspaceReaderError: 404 when ``path`` is not a readable directory.
         """
-        entries = self._list_entries(path, self._resolve(path))
+        resolved = self._resolve(path)
+        entries = self._list_entries(path, resolved)
         # Ids sort like names (one shared parent), so the cursor needn't still exist.
         start = bisect.bisect_right([e["id"] for e in entries], after) if after else 0
         page = entries[start : start + limit]
+        if collapse_single_child_directories:
+            for entry in page:
+                child = resolved / entry["name"]
+                if entry["type"] != "directory" or child.is_symlink():
+                    continue
+                chain = single_child_chain(child)
+                if chain:
+                    entry["leaf_directory_path"] = "/".join([entry["path"], *chain])
         return PagedList(
             data=page,
             first_id=page[0]["id"] if page else None,

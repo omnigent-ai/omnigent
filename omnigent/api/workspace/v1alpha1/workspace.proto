@@ -110,7 +110,8 @@ message ListDirectoryRequest {
   bool hide_ignored = 4;
 
   // Fill each directory entry's `leaf_directory_path`, so a tree can show
-  // "a/b/c" on one row without a request per level. Hosts that don't support
+  // "a/b/c" on one row without a request per level. Offered with the
+  // "list_directory.collapse_single_child_directories" feature; hosts without
   // it leave `leaf_directory_path` empty.
   bool collapse_single_child_directories = 5;
 }

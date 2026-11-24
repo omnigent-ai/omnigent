@@ -646,6 +646,131 @@ async def test_subagent_batch_failure_resumes_at_first_unsent_record(tmp_path: P
     assert all(attempted_ids.count(f"sa-{index}:0:message") == 2 for index in range(100, 150))
 
 
+def _subagent_assistant_record(uuid: str, model: str) -> dict[str, Any]:
+    """Return one sub-agent assistant transcript record answered by ``model``."""
+    return {
+        "isSidechain": True,
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": uuid}],
+        },
+    }
+
+
+async def test_subagent_reports_its_own_model_to_its_child_session(tmp_path: Path) -> None:
+    """
+    A sub-agent reports the model in its own transcript on the child session.
+
+    A forwarder restarted after a failed post retries the checkpointed model
+    without re-reading it; once posted, a restart that re-reads the whole
+    transcript does not post again, and a later model change posts once. The
+    parent session never receives the child's model.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagent_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="modelchild",
+        agent_type="Explore",
+        description="cheap search",
+        tool_use_id="toolu_model",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "sa-user",
+                "message": {"role": "user", "content": "go"},
+            },
+            _subagent_assistant_record("sa-haiku", "claude-haiku-4-5"),
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "modelchild": forwarder.SubagentEntry(
+                subagent_id="modelchild",
+                child_conversation_id="conv_child_model",
+            )
+        }
+    )
+    model_posts: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if isinstance(body, list):
+            return httpx.Response(
+                202,
+                json=[
+                    {"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)
+                ],
+            )
+        if body.get("type") == "external_model_change":
+            model_posts.append((request.url.path, body["data"]["model"]))
+            if len(model_posts) == 1:
+                return httpx.Response(503, json={"error": "retry"})
+        return httpx.Response(202, json={})
+
+    status_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+
+    async def poll(
+        client: httpx.AsyncClient, current: forwarder.SubagentForwardState
+    ) -> forwarder.SubagentForwardState:
+        return await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=current,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=status_tracker,
+        )
+
+    child_path = "/v1/sessions/conv_child_model/events"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await poll(client, state)
+        assert model_posts == [(child_path, "claude-haiku-4-5")]
+
+        # The checkpoint keeps the unposted model past the transcript cursor,
+        # so a restarted forwarder retries it without reading the record again.
+        reloaded = forwarder._read_subagent_forward_state(bridge_dir).subagents["modelchild"]
+        assert reloaded.byte_offset == subagent_jsonl.stat().st_size
+        assert (reloaded.observed_model, reloaded.posted_model) == ("claude-haiku-4-5", None)
+        state = await poll(
+            client, forwarder.SubagentForwardState(subagents={"modelchild": reloaded})
+        )
+        assert model_posts[-1] == (child_path, "claude-haiku-4-5")
+        assert len(model_posts) == 2
+
+        # A restarted forwarder that re-reads the whole transcript does not re-post.
+        restarted = forwarder._read_subagent_forward_state(bridge_dir)
+        assert restarted.subagents["modelchild"].posted_model == "claude-haiku-4-5"
+        rewound = replace(restarted.subagents["modelchild"], byte_offset=0)
+        state = await poll(
+            client, forwarder.SubagentForwardState(subagents={"modelchild": rewound})
+        )
+        assert len(model_posts) == 2
+
+        with subagent_jsonl.open("a", encoding="utf-8") as handle:
+            record = _subagent_assistant_record("sa-sonnet", "claude-sonnet-4-5")
+            handle.write(json.dumps(record) + "\n")
+        state = await poll(client, state)
+
+    assert model_posts == [
+        (child_path, "claude-haiku-4-5"),
+        (child_path, "claude-haiku-4-5"),
+        (child_path, "claude-sonnet-4-5"),
+    ]
+    assert state.subagents["modelchild"].posted_model == "claude-sonnet-4-5"
+
+
 @pytest.mark.asyncio
 async def test_permanent_batch_failure_redrives_items_individually(
     tmp_path: Path,

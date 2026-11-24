@@ -121,6 +121,20 @@ describe("WorkspaceTabsHost", () => {
     expect(captured.deleteTerminal).toHaveBeenCalledWith("t1");
   });
 
+  it("asks once in the Close shells dialog before a split's shells close together", async () => {
+    const user = userEvent.setup();
+    host({ terminals: [ZSH, { ...ZSH, id: "t2", name: "bash" }] });
+    let closing!: Promise<boolean>;
+    act(() => {
+      closing = captured.panel!.confirmCloseShells(["terminal:t1", "terminal:t2"]);
+    });
+    expect(await screen.findByRole("heading", { name: "Close 2 shells?" })).toBeInTheDocument();
+    expect(screen.getByText("zsh · s1 and bash · s1")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Close shell" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Close shells" }));
+    await expect(closing).resolves.toBe(true);
+  });
+
   it("binds Back and Forward, opening the sidebar before a step", async () => {
     // Files, then Changes in a new tab, so Back lands on Files.
     const { store } = workspaceTabsSession("conv_host");

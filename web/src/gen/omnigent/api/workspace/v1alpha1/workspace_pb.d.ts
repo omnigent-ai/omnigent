@@ -94,7 +94,8 @@ export declare type ListDirectoryRequest = Message<"omnigent.api.workspace.v1alp
 
   /**
    * Fill each directory entry's `leaf_directory_path`, so a tree can show
-   * "a/b/c" on one row without a request per level. Hosts that don't support
+   * "a/b/c" on one row without a request per level. Offered with the
+   * "list_directory.collapse_single_child_directories" feature; hosts without
    * it leave `leaf_directory_path` empty.
    *
    * @generated from field: bool collapse_single_child_directories = 5;

@@ -234,6 +234,15 @@ export function SidebarTerminalPanes({
     shownPaneKeys: shownPanesOf(split, shownKey),
     panesRef,
   });
+  // A shell opened by hand takes the keyboard as it connects while focus stays where the open
+  // left it, such as in the chat composer; moving focus meanwhile cancels that.
+  const launchFocus = useRef<{ key: string; element: Element | null } | null>(null);
+  useLayoutEffect(() => {
+    launchFocus.current =
+      autoFocusKey === null ? null : { key: autoFocusKey, element: document.activeElement };
+  }, [autoFocusKey]);
+  const focusUnmovedSinceOpen = (paneKey: string) =>
+    launchFocus.current?.key === paneKey && launchFocus.current.element === document.activeElement;
 
   // The pane a request goes to: the one it names, or the focused one for the view's own.
   const focusRecipient =
@@ -358,8 +367,9 @@ export function SidebarTerminalPanes({
               active={takesFocus}
               focusOnConnect={() =>
                 takesFocus &&
-                (paneKey === autoFocusKey || (split !== undefined && takeConnectFocus(paneKey))) &&
-                focusStillHere()
+                (paneKey === autoFocusKey
+                  ? focusUnmovedSinceOpen(paneKey) || focusStillHere()
+                  : split !== undefined && takeConnectFocus(paneKey) && focusStillHere())
               }
               focusRequest={
                 pendingFocus && focusRecipient === paneKey ? pendingFocus.id : undefined

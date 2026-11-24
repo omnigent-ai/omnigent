@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 
+import { applyDesktopAppAttribute } from "@/lib/desktopAppLayout";
 import {
   continueInBrowser,
   DESKTOP_OPEN_PORTS,
@@ -86,6 +87,9 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+  delete document.documentElement.dataset.sessionWindow;
+  delete document.documentElement.dataset.sessionWindowFor;
+  delete document.documentElement.dataset.desktopApp;
 });
 
 describe("openInDesktopApp", () => {
@@ -291,22 +295,36 @@ describe("handOffToDesktopApp", () => {
     expect(toast).not.toHaveBeenCalled();
   });
 
-  it("opens at once after the user has accepted, and not again on reload", async () => {
+  it.each([
+    ["an ordinary conversation link", "", false, true],
+    ["a session pop-out", "?window=session", true, false],
+    ["a copied pop-out link", "?window=session", false, true],
+    ["an ordinary link with an opener", "", true, true],
+  ])("with handoff enabled, handles %s", async (_label, search, hasOpener, shouldHandOff) => {
+    vi.stubGlobal("location", {
+      ...window.location,
+      pathname: `/c/${CONVERSATION_ID}`,
+      search,
+    });
+    vi.stubGlobal("opener", hasOpener ? window : null);
+    applyDesktopAppAttribute();
     writeOpenInDesktopApp(true);
     browserPermission("granted");
     const fetchMock = appOn(DESKTOP_OPEN_PORTS[0]);
 
     await handOffToDesktopApp(CONVERSATION_ID);
 
-    expect(openRequests(fetchMock)).toHaveLength(1);
+    expect(portsAsked(fetchMock)).toHaveLength(shouldHandOff ? 1 : 0);
+    expect(openRequests(fetchMock)).toHaveLength(shouldHandOff ? 1 : 0);
     // The page says so in place of the conversation, not with a toast.
-    expect(handedOverConversationId()).toBe(CONVERSATION_ID);
+    expect(handedOverConversationId()).toBe(shouldHandOff ? CONVERSATION_ID : null);
     expect(toast).not.toHaveBeenCalled();
+    expect(readOpenInDesktopApp()).toBe(true);
 
     // Staying in the browser holds across a reload of the tab.
     continueInBrowser();
     await handOffToDesktopApp(CONVERSATION_ID);
-    expect(openRequests(fetchMock)).toHaveLength(1);
+    expect(openRequests(fetchMock)).toHaveLength(shouldHandOff ? 1 : 0);
     expect(handedOverConversationId()).toBeNull();
   });
 

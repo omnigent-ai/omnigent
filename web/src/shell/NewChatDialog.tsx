@@ -2740,6 +2740,12 @@ function NewChatLandingContent({
   // shared hook continues to grow from the one-row minimum.
   useAutoGrowTextarea(textareaRef, message, 9);
 
+  // The chip inserter comes from useMentionBrowser, set up further down.
+  const attachPastedFilesRef = useRef<
+    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => File[]
+  >(() => []);
+  const chipTokensRef = useRef<() => readonly string[]>(() => []);
+
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn. Validation
@@ -2754,10 +2760,16 @@ function NewChatLandingContent({
     addFiles,
     removeFile,
     restoreFiles,
+    appendFiles,
     onPaste,
     clearError,
   } = useComposerAttachments({
     initialFiles: handoff?.files ?? restoredDraft?.files ?? [],
+    onPasteChips:
+      composerEngine === "codemirror"
+        ? (pasted, target, trayFiles) => attachPastedFilesRef.current(pasted, target, trayFiles)
+        : undefined,
+    chipTokens: () => chipTokensRef.current(),
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
   // The panel's prompt takes the keyboard each time the panel does, after any kept draft.
@@ -5611,7 +5623,10 @@ function NewChatLandingContent({
     openMentionDir,
     mentionedSessions,
     attachSession,
+    attachPastedFiles,
+    mentionedAttachments,
     mentionTokens,
+    ownedChipTokens,
     resetMentions,
     noteTextChange: noteMentionTextChange,
     handleTokenBackspace,
@@ -5626,23 +5641,36 @@ function NewChatLandingContent({
     setText: setMessage,
     textareaRef,
     initialMentions: restoresDraftText ? restoredDraft?.mentions : undefined,
+    onDemoteChips: appendFiles,
   });
   clearTaggedMentionsRef.current = resetMentions;
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
+  attachPastedFilesRef.current = attachPastedFiles;
+  chipTokensRef.current = ownedChipTokens;
+  // Pasted chips send their files with the tray's; a chip's file goes only while its token is in the message.
+  const attachedFiles = [
+    ...files,
+    ...presentMentions(mentionedAttachments, [message]).map((attachment) => attachment.file),
+  ];
+  // The draft a sibling or new session picks up carries live chips as tray files.
+  draftRef.current.files = attachedFiles;
   const skillCommandNames = useMemo(() => Object.keys(skillCommands), [skillCommands]);
   const taggedMentions = useMemo(
     () =>
       presentMentions(
-        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+        composerInlineMentions(
+          { files: mentionedItems, sessions: mentionedSessions, attachments: mentionedAttachments },
+          selectedAgent?.harness ?? null,
+        ),
         [message],
       ),
-    [mentionedItems, mentionedSessions, selectedAgent?.harness, message],
+    [mentionedItems, mentionedSessions, mentionedAttachments, selectedAgent?.harness, message],
   );
   const highlight = useComposerHighlight({
     value: message,
     commandNames: skillCommandNames,
-    enabled: files.length === 0,
+    enabled: attachedFiles.length === 0,
     nativeShell: supportsNativeShellInput(skillsHarness) ? skillsHarness : null,
     classifyValue: sanitizeInitialPrompt(message),
     mentionTokens,
@@ -5841,7 +5869,7 @@ function NewChatLandingContent({
         message: "This project's configured agent is unavailable — pick an agent to continue",
       };
     }
-    if (message.trim().length === 0 && files.length === 0) {
+    if (message.trim().length === 0 && attachedFiles.length === 0) {
       return { field: "other", message: "Enter a message to get started" };
     }
     if (selectedAgent == null || creating) return { field: "other", message: null };
@@ -6200,6 +6228,7 @@ function NewChatLandingContent({
       addNestedSessionDraft(queryClient, provisional.id, siblingSource, clearNestedDraft);
       if (onScreenRef.current) setNestedProvisional(provisional);
     }
+    // The relinquished message's pasted chips go with its tray files: the temporary draft holds the same Files.
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
         ? { ...draftRef.current, message: "", files: [] }
@@ -6455,7 +6484,9 @@ function NewChatLandingContent({
         : matchSkillInvocation(initialPrompt, availableSkills);
       const serverOwnsInitialInput =
         sandboxSelected && info !== "loading" && info.durable_initial_input === true;
-      if (!serverOwnsInitialInput) undeliveredPrompt = { text: initialPrompt, skill, files };
+      if (!serverOwnsInitialInput) {
+        undeliveredPrompt = { text: initialPrompt, skill, files: attachedFiles };
+      }
       const initialInput =
         skill !== null
           ? {
@@ -6534,7 +6565,7 @@ function NewChatLandingContent({
         const bundled = await createBundledSession(
           bundle,
           metadata,
-          serverOwnsInitialInput ? files : [],
+          serverOwnsInitialInput ? attachedFiles : [],
         );
         data = { id: bundled.id };
         createdSessionId = data.id;
@@ -6557,7 +6588,7 @@ function NewChatLandingContent({
           // The floating panel delivers the first message itself; no window shows a temp chat.
           localConv = floating
             ? null
-            : beginLocalConversation(initialPrompt, files, provisional, localProject, {
+            : beginLocalConversation(initialPrompt, attachedFiles, provisional, localProject, {
                 // Seed the temp session with the NORMALIZED create identity so the
                 // optimistic composer shows the model/effort/harness/routing being
                 // created, not state projected from the previously active session.
@@ -6692,10 +6723,11 @@ function NewChatLandingContent({
           smart_routing_message:
             smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
         });
-        const createForm = serverOwnsInitialInput && files.length > 0 ? new FormData() : null;
+        const createForm =
+          serverOwnsInitialInput && attachedFiles.length > 0 ? new FormData() : null;
         if (createForm !== null) {
           createForm.append("metadata", createPayload);
-          for (const file of files) createForm.append("initial_files", file, file.name);
+          for (const file of attachedFiles) createForm.append("initial_files", file, file.name);
         }
         const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
@@ -6903,7 +6935,7 @@ function NewChatLandingContent({
           data.id,
           effectiveAgentId,
           initialPrompt,
-          files,
+          attachedFiles,
           localConv.pendingMsgTempId,
           skill,
           returnToCanvas
@@ -6926,12 +6958,12 @@ function NewChatLandingContent({
             sessionId: data.id,
             text: initialPrompt,
             skill,
-            files,
+            files: attachedFiles,
             inputAccepted: serverOwnsInitialInput,
           });
         } else {
           if (!serverOwnsInitialInput)
-            setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+            setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files: attachedFiles });
           // Only the full chat delivers a pending prompt, so the project home hands off to it.
           if (
             (!onProjectHome || !serverOwnsInitialInput) &&
@@ -7484,6 +7516,8 @@ function NewChatLandingContent({
   let composerAppearance: "panel" | "glass" | "default" = "default";
   if (floating) composerAppearance = "panel";
   else if (isMobileViewport) composerAppearance = "glass";
+  // The panel's prompt sits under the window's top edge, so suggestions open below it.
+  const suggestionPlacement = floating ? "below" : "above";
 
   return (
     // Desktop keeps the centered composition; mobile docks the composer. The
@@ -7593,7 +7627,7 @@ function NewChatLandingContent({
               onActiveInputChange={bindTextarea}
               appearance={composerAppearance}
               hasContent={
-                files.length > 0 ||
+                attachedFiles.length > 0 ||
                 mentionedItems.length > 0 ||
                 mentionedSessions.length > 0 ||
                 attachmentError !== null
@@ -7674,6 +7708,7 @@ function NewChatLandingContent({
                       <SlashCommandMenu
                         query={slashCompletion.query}
                         activeIndex={slashCompletion.index}
+                        placement={suggestionPlacement}
                         onSelect={applySlashSelection}
                         commands={slashCompletion.commands}
                         builtinNames={slashCompletion.builtinNames}
@@ -7691,6 +7726,7 @@ function NewChatLandingContent({
                         query={mention?.query ?? ""}
                         fileQuery={mentionFilter}
                         activeIndex={mentionIndex}
+                        placement={suggestionPlacement}
                         entries={mentionEntries}
                         loading={mentionListingPending}
                         onOpenDir={openMentionDir}

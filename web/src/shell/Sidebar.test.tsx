@@ -1955,7 +1955,7 @@ describe("Sidebar failed session indicator", () => {
     expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBe(badge);
   });
 
-  it("shows unread output over background work, then the background spinner once seen", () => {
+  it("shows unread output over background work, then the background icon once seen", () => {
     const session = conv("conv_background", "Claude Code", {
       status: "idle",
       background_work_running: true,
@@ -1973,10 +1973,9 @@ describe("Sidebar failed session indicator", () => {
 
     act(() => markConversationSeen(session.id, session.updated_at));
 
-    expect(within(row).getByRole("img", { name: "Working in the background" })).toHaveAttribute(
-      "data-state",
-      "running",
-    );
+    const background = within(row).getByRole("img", { name: "Working in the background" });
+    expect(background).toHaveAttribute("data-state", "running");
+    expect(within(background).queryByTestId("running-dot")).toBeNull();
 
     act(() => markConversationUnread(session.id, session.updated_at));
 
@@ -1986,7 +1985,7 @@ describe("Sidebar failed session indicator", () => {
     );
   });
 
-  it("keeps the background spinner on the open session", () => {
+  it("keeps the background icon on the open session", () => {
     const session = conv("conv_background", "Claude Code", {
       status: "idle",
       background_work_running: true,
@@ -1997,6 +1996,24 @@ describe("Sidebar failed session indicator", () => {
     renderSessionSidebar(`/c/${session.id}`);
 
     const row = screen.getByRole("link", { name: "conv_background" }).closest("li")!;
+    const background = within(row).getByRole("img", { name: "Working in the background" });
+    expect(background).toHaveAttribute("data-state", "running");
+    expect(within(background).queryByTestId("running-dot")).toBeNull();
+  });
+
+  it("shows the starting spinner over background work while a send wakes the session", () => {
+    mockConversations([
+      conv("conv_server", "Claude Code", { status: "idle", background_work_running: true }),
+    ]);
+    useChatStore.setState({ conversationId: "conv_server", status: "streaming" });
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_server/ }).closest("li")!;
+    const badge = within(row).getByTestId("session-state-badge");
+    expect(badge).toHaveAttribute("data-state", "starting");
+    expect(within(badge).getByTestId("running-dot")).toBeInTheDocument();
+
+    act(() => useChatStore.setState({ status: "idle" }));
     expect(within(row).getByRole("img", { name: "Working in the background" })).toHaveAttribute(
       "data-state",
       "running",
@@ -3876,16 +3893,45 @@ describe("Sidebar collapsed project marker", () => {
       renderSidebar();
       const expected = seen ? "running" : "unseen";
       const header = screen.getByRole("button", { name: /^Customer X/ });
-      expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
-        "data-state",
-        expected,
-      );
+      const headerMarker = within(header).getByTestId("session-state-badge");
+      expect(headerMarker).toHaveAttribute("data-state", expected);
+      // Background work alone never shows the busy-turn spinner.
+      expect(within(headerMarker).queryByTestId("running-dot")).toBeNull();
       fireEvent.click(header);
-      expect(
-        within(screen.getByTestId("project-show-more")).getByTestId("session-state-badge"),
-      ).toHaveAttribute("data-state", expected);
+      const hiddenMarker = within(screen.getByTestId("project-show-more")).getByTestId(
+        "session-state-badge",
+      );
+      expect(hiddenMarker).toHaveAttribute("data-state", expected);
+      expect(within(hiddenMarker).queryByTestId("running-dot")).toBeNull();
     },
   );
+
+  it("shows a sibling's running turn over a background row's icon", () => {
+    projectsMock.push("Customer X");
+    seedReadState([
+      { id: "conv_background", viewer_last_seen: 200 },
+      { id: "conv_running", viewer_last_seen: 200 },
+    ]);
+    mockConversations([
+      conv("conv_background", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "idle",
+        background_work_running: true,
+        updated_at: 200,
+      }),
+      conv("conv_running", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+        updated_at: 200,
+      }),
+    ]);
+    renderSidebar();
+
+    const marker = within(screen.getByRole("button", { name: /^Customer X/ })).getByRole("img", {
+      name: "Session running",
+    });
+    expect(within(marker).getByTestId("running-dot")).toBeInTheDocument();
+  });
 
   it("surfaces an error ahead of unread messages and moves it to the expanded row", () => {
     projectsMock.push("Customer X");
@@ -6059,6 +6105,8 @@ describe("sidebar_grouping_ui release flag", () => {
       screen.queryByRole("button", { name: "Project actions for Omnigent Automation" }),
     ).toBeNull();
     expect(screen.queryByRole("button", { name: "New session in Omnigent Automation" })).toBeNull();
+    fireEvent.doubleClick(screen.getByRole("button", { name: /^Omnigent Automation/ }));
+    expect(screen.queryByTestId("rename-project-inline-input")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /^Omnigent Automation/ }));
     expect(within(automationFolder()).getByText("conv_shared_run")).toBeInTheDocument();
 

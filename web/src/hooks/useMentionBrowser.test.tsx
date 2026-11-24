@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { useRef, useState } from "react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ComposerInputEvent,
   ComposerKeyboardEvent,
@@ -546,5 +546,34 @@ describe("useMentionBrowser edits on a live input", () => {
     act(() => void result.current.browser.handleTokenBackspace(backspace(input)));
     expect(input.value).toBe("Read ");
     expect(input.inserts.at(-1)).toEqual({ text: "", start: 5, end: 15, separateUndo: true });
+  });
+});
+
+describe("a reset in the same tick as a pasted chip", () => {
+  it("demotes the chip's file even before the paste re-renders", () => {
+    const surface = createFakeComposerSurface("");
+    const onDemoteChips = vi.fn();
+    const { result } = renderHook(() => {
+      const [text, setText] = useState("");
+      const [mention, setMention] = useState<MentionState | null>(null);
+      const browser = useMentionBrowser({
+        mention,
+        setMention,
+        mentionEntries: [],
+        text,
+        setText,
+        textareaRef: { current: surface },
+        segments: [text],
+        onDemoteChips,
+      });
+      return browser;
+    });
+    const shot = new File(["s"], "shot.png", { type: "image/png" });
+    // Both calls run against the same render, as a paste and a reset in one event would.
+    act(() => {
+      result.current.attachPastedFiles([shot], surface, []);
+      result.current.resetMentions();
+    });
+    expect(onDemoteChips).toHaveBeenCalledExactlyOnceWith([shot]);
   });
 });

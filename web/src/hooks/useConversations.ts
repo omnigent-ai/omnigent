@@ -82,6 +82,7 @@ import {
   deleteProject as apiDeleteProject,
   getProject as apiGetProject,
   listProjects as apiListProjects,
+  ProjectMembersNotMovedError,
   type ProjectConfig,
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
@@ -3234,7 +3235,13 @@ export function useRenameProject() {
       // omni_project label; re-file each onto project_id and clear that label so
       // the rename is coherent for both membership representations and nothing
       // is left behind in an oldName folder.
-      const members = await fetchAllProjectSessions(oldName);
+      // The name is saved by now, so callers can tell this failure from a refused rename.
+      const membersNotMoved = (error: unknown): never => {
+        throw new ProjectMembersNotMovedError(
+          error instanceof Error ? error.message : String(error),
+        );
+      };
+      const members = await fetchAllProjectSessions(oldName).catch(membersNotMoved);
       await Promise.all(
         members
           .filter(
@@ -3254,13 +3261,14 @@ export function useRenameProject() {
             // otherwise report success while leaving members behind.
             if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
           }),
-      );
+      ).catch(membersNotMoved);
       // Return the resolved id so a caller promoting a label-only folder can
       // target the just-created row for a follow-up write instead of passing
       // the stale `null` and re-creating it (which 409s on the duplicate name).
       return projectId;
     },
-    onSuccess: () => {
+    // A failed re-file can follow a successful rename, so refetch either way.
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });

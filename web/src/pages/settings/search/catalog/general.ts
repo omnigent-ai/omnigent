@@ -153,9 +153,15 @@ export const GLOBAL_SHORTCUT_ENTRY = settingsEntry({
     "bring to front",
     "window",
   ],
-  // Named by the chord it holds, or by the prompt while it records one.
-  parts: { recorder: "Shortcut" },
-  nameTemplates: { recorder: { before: "Shortcut: " } },
+  // Named by the chord it holds, or by the prompt while it records one. The suggestion names
+  // the free chord it proposes.
+  parts: { recorder: "Shortcut", suggestion: "Use suggested shortcut" },
+  nameTemplates: {
+    recorder: { before: "Shortcut: " },
+    suggestion: { before: "Use ", after: " instead" },
+  },
+  // Offered only after the shell couldn't register the chord.
+  presence: { suggestion: { states: ["shortcut taken by another app"] } },
 });
 
 /** The desktop app's shortcut that opens the New Agent panel; macOS, with `floating_composer`. */
@@ -177,9 +183,15 @@ export const FLOATING_COMPOSER_SHORTCUT_ENTRY = settingsEntry({
     "new agent",
     "panel",
   ],
-  // Named by the chord it holds, or by the prompt while it records one.
-  parts: { recorder: "New Agent shortcut" },
-  nameTemplates: { recorder: { before: "New Agent shortcut: " } },
+  // Named by the chord it holds, or by the prompt while it records one. The suggestion names
+  // the free chord it proposes.
+  parts: { recorder: "New Agent shortcut", suggestion: "Use suggested New Agent shortcut" },
+  nameTemplates: {
+    recorder: { before: "New Agent shortcut: " },
+    suggestion: { before: "Use ", after: " instead" },
+  },
+  // Offered only after the shell couldn't register the chord.
+  presence: { suggestion: { states: ["shortcut taken by another app"] } },
 });
 
 /** The desktop app's opt-in to make room for the right sidebar; a row only desktop builds show. */

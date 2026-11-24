@@ -68,6 +68,7 @@ import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { DesktopAppHandoffPage } from "@/components/DesktopAppHandoffPage";
 import { useDesktopAppHandoff } from "@/hooks/useDesktopAppHandoff";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isSessionWindow } from "@/lib/sessionWindow";
 import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
 import { useReportLocalTimezone } from "@/hooks/useReportLocalTimezone";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -126,6 +127,7 @@ import { browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
 import { agentBrowserTabId } from "@/components/BrowserPane/agentTools/agentTabs";
 import { useRevealBrowserOnAgentTabs } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
+import { startSavingBrowserPages } from "@/lib/browserTabPages";
 import {
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
@@ -1305,6 +1307,9 @@ function AppShellImpl() {
   useEffect(() => {
     resyncBrowserSuppression();
   }, []);
+
+  // Keep each browser tab's address and title after the shell destroys its view.
+  useEffect(() => startSavingBrowserPages(), []);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
@@ -3898,11 +3903,12 @@ function AppShellImpl() {
 }
 
 /**
- * Initial sidebar open state — open on desktop, closed on mobile. SSR-
- * safe (returns false when window is undefined). The threshold is
- * Tailwind's `md` breakpoint, used in the Sidebar's responsive classes.
+ * Initial sidebar open state — open on desktop, closed on mobile and in a
+ * popped-out session window, which shows just its session. SSR-safe (returns
+ * false when window is undefined). The threshold is Tailwind's `md` breakpoint,
+ * used in the Sidebar's responsive classes.
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return isDesktopLayout();
+  return isDesktopLayout() && !isSessionWindow();
 }

@@ -16,7 +16,10 @@ import { useSharing, useSetSharing } from "@/hooks/useSharing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode, type SiblingSessionDestinations } from "@/lib/capabilities";
 import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
-import { NESTED_AGENT_DESTINATIONS_ENTRY } from "@/pages/settings/search/catalog/admin";
+import {
+  NESTED_AGENT_DESTINATIONS_ENTRY,
+  PROACTIVE_AGENT_WORKSPACE_ENTRY,
+} from "@/pages/settings/search/catalog/admin";
 import { settingsControlProps } from "@/pages/settings/search/settingsControl";
 import { settingsOverlayProps } from "@/pages/settings/search/settingsOwnership";
 import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
@@ -91,10 +94,14 @@ export function AdminGeneralPage() {
               title={PROACTIVE_AGENT_DISPLAY_NAME}
               testId="settings-group-admin-proactive-agent"
             >
-              <ProactiveAgentSettingControl scope="workspace" />
-              <div className="mt-4 border-t border-border pt-4">
-                <ProactiveAgentAdminControls />
-              </div>
+              <ProactiveAgentSettingControl
+                scope="workspace"
+                entry={PROACTIVE_AGENT_WORKSPACE_ENTRY}
+              >
+                <div className="border-t border-border pt-4">
+                  <ProactiveAgentAdminControls />
+                </div>
+              </ProactiveAgentSettingControl>
             </SettingsGroup>
           )}
           {nestedAgentsEnabled && sharing && (

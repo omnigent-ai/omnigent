@@ -33,6 +33,11 @@ MCP independent creation.
   shows only when the session launched in it, since anyone who can edit the
   session can write the reported mode; `null` when the harness has no
   permission modes or the mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
+  With `include_usage`, `sys_session_get_info` adds a `usage` object: the cost so far
+  and token totals the session's cost badge shows, overall and per model, summed over
+  the session and its sub-agents. Its `total_cost_usd` is `null` when the session is
+  unpriced or the operator hides cost. The aggregate is opt-in because it reads every
+  descendant session (`tests/runner/test_runner_dispatch.py`).
 - `cli-create`: `omnigent session create` starts a session from a script with no
   terminal. It creates the session as the signed-in user on this machine's host
   (started if needed) in the current directory, or on another owned host with

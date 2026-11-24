@@ -6399,6 +6399,54 @@ async def _project_name_or_none(
         return None
 
 
+_SESSION_USAGE_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "total_tokens",
+)
+
+
+def _session_usage_projection(snap: _JsonObject) -> _JsonObject | None:
+    """
+    Project a usage-inclusive session snapshot into ``sys_session_get_info``'s ``usage``.
+
+    Token totals sum the per-model buckets the server reports; a bucket no
+    model recorded stays ``None`` rather than reading as zero.
+
+    :param snap: ``GET /v1/sessions/{id}?include_usage=true`` body, e.g.
+        ``{"total_cost_usd": 0.42, "usage_by_model": {"m": {"input_tokens": 12}}}``.
+    :returns: ``{"total_cost_usd", "cost_hidden", <token totals>, "by_model"}``,
+        or ``None`` when the server skipped the usage aggregate.
+    """
+    if snap.get("usage_included") is False:
+        return None
+    raw_by_model = snap.get("usage_by_model")
+    by_model = (
+        {model: usage for model, usage in raw_by_model.items() if isinstance(usage, dict)}
+        if isinstance(raw_by_model, dict)
+        else {}
+    )
+    token_totals: dict[str, int | None] = {}
+    for field in _SESSION_USAGE_TOKEN_FIELDS:
+        counts = [usage.get(field) for usage in by_model.values()]
+        recorded = [
+            count for count in counts if isinstance(count, int) and not isinstance(count, bool)
+        ]
+        token_totals[field] = sum(recorded) if recorded else None
+    cost = snap.get("total_cost_usd")
+    return {
+        # Null means unpriced or hidden by the operator, never a priced $0.
+        "total_cost_usd": (
+            float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) else None
+        ),
+        "cost_hidden": snap.get("cost_hidden") is True,
+        **token_totals,
+        "by_model": by_model,
+    }
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -6426,7 +6474,12 @@ async def _session_get_info_via_rest(
     (the server denied the read, so from the caller's vantage the target
     is one it may not see).
 
-    :param args: Parsed tool arguments; optional ``session_id``.
+    With ``include_usage`` the snapshot also carries the spawn-tree usage
+    aggregate, projected as ``usage``; it is opt-in because the aggregate
+    reads every descendant session.
+
+    :param args: Parsed tool arguments; optional ``session_id`` and
+        ``include_usage``.
     :param conversation_id: The caller's own session id, used as the
         default target when ``session_id`` is omitted.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -6437,10 +6490,15 @@ async def _session_get_info_via_rest(
         return json.dumps(
             {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
         )
+    include_usage = args.get("include_usage") is True
     try:
         # ``status`` is projected, so keep the live-status probe on a cache miss.
         resp = await _get_session_metadata(
-            server_client, raw_target, timeout=30.0, include_live_status=True
+            server_client,
+            raw_target,
+            timeout=30.0,
+            include_usage=include_usage,
+            include_live_status=True,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_get_info failed: {exc}"})
@@ -6461,10 +6519,13 @@ async def _session_get_info_via_rest(
         _host_harnesses_or_none(snap_host_id, server_client),
         _project_name_or_none(_optional_string(snap.get("project_id")), server_client),
     )
+    usage = {"usage": _session_usage_projection(snap)} if include_usage else {}
     return json.dumps(
         {
             "session_id": snap.get("id"),
             "status": snap.get("status"),
+            # An archived session refuses messages from other sessions until unarchived.
+            "archived": snap.get("archived"),
             # Persisted conversation activity is distinct from lifecycle
             # status: repeated polls with an unchanged value let an
             # orchestrator detect a running session that is not advancing.
@@ -6506,6 +6567,7 @@ async def _session_get_info_via_rest(
             # waiting on.
             "pending_elicitations": pending,
             "pending_elicitation_count": len(pending),
+            **usage,
         }
     )
 

@@ -152,6 +152,8 @@ the header menu), and each place is a separate entry point.
   session starts. Older servers keep the folder-only dialog.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+  Double-clicking the folder's name renames it inline instead, like a session
+  row; a rejected name shows a toast and keeps the old name.
   Agents rename projects and set their emoji with `sys_project_update`, and
   rename, pin or archive
   sessions with `sys_session_update` (see
@@ -345,6 +347,18 @@ the header menu), and each place is a separate entry point.
   links → **Open conversations in the desktop app**. Links to a file or to
   Canvas stay in the browser.
 
+**Pop out a session (desktop layouts):** open a session's header ⋯ menu, or a
+sidebar row's menu or right-click menu, and choose **Open in new window**. A
+browser opens a 960×820 popup on that session; it keeps the desktop layout and
+starts with the sidebar collapsed (the sidebar toggle reopens it). A blocked
+popup shows a toast asking to allow pop-ups. Browser pop-outs stay in the browser
+even when automatic desktop handoff is enabled. The desktop app opens another app
+window on the same server instead of the system browser; that window doesn't
+replace the main window's saved size and position. Choosing it again for a
+session that's already popped out brings its window forward. Mobile viewports,
+the iOS/Android apps, embedding host pages, and desktop builds that predate the
+feature don't offer it.
+
 **Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
@@ -452,7 +466,9 @@ Sessions outside the project, such as one coordinating it, still notify.
 The item appears only on servers that advertise `project_mute` in `/v1/info`.
 
 **Project folder:** right-click its header or open its three-dot menu, then
-choose Rename project. Start typing as soon as the dialog opens. Delete project
+choose Rename project. Start typing as soon as the dialog opens. Or double-click
+the folder's name (not its chevron) to edit it in place: Enter or blur saves,
+Escape cancels, and the dialog remains the place to change its emoji. Delete project
 archives every session in the folder; when any of them has an agent working,
 awaiting approval, or running background work, the dialog says how many and
 that deleting stops them, then asks again with Delete anyway.
@@ -1000,6 +1016,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`project-rename`, project header right-click and three-dot menus:**
   `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
   covers typing across the menu's exit animation from both menus.
+- **`project-rename`, double-click the folder name:**
+  `tests/e2e_ui/sessions/test_project_inline_rename.py` saves with Enter and
+  checks the server, cancels with Escape, and shows a duplicate name's toast.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):

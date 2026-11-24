@@ -176,6 +176,7 @@ function TranscriptImpl({
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
+  const failedUploads = useChatStore((s) => s.failedUploads);
   const failedInputs = useChatStore((s) => s.failedInputs);
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
@@ -222,12 +223,14 @@ function TranscriptImpl({
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
+      failedUploads,
     );
   }, [
     blocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -437,6 +440,8 @@ function TranscriptImpl({
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
               hasPinnedBanner ? "pt-4" : "pt-20",
+              // In a chat pane, the panes view and the pane's strip already clear the header.
+              "in-data-chat-pane-body-host:pt-4",
               CHAT_COLUMN_WIDTH,
             )}
           >
