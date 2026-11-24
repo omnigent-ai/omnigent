@@ -33,6 +33,15 @@ MCP independent creation.
   shows only when the session launched in it, since anyone who can edit the
   session can write the reported mode; `null` when the harness has no
   permission modes or the mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
+- `cli-create`: `omnigent session create` starts a session from a script with no
+  terminal. It creates the session as the signed-in user on this machine's host
+  (started if needed) in the current directory, or on another owned host with
+  `--host-id` and an absolute `--workspace`, queues the first message from
+  `--message` or `--message-file` (`-` for stdin), prints the session id (or JSON
+  with `--json`) and exits. `--project-id` files it in a project whose saved agent
+  and workspace apply unless given. A session whose message the server refused is
+  still printed, with a non-zero exit (`tests/cli/test_session_create.py`,
+  `tests/e2e/test_session_create_cli_e2e.py`).
 - `created-by`: independent workers record their creating session. The session
   header does not show it. The worker's sidebar card looks the creator up through
   an access-checked read each time it opens: its "Created by" row names the
