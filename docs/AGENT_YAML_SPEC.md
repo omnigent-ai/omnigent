@@ -148,7 +148,8 @@ an unverified empty list and can be retried; Omnigent supplies no fallback model
 choices. Use an advertised ID in `sys_session_send`'s `args.model` to select a
 model when creating a worker. Explicit IDs are preserved through `model_override`
 to `agy --model`, without gateway spelling conversions or inferred reasoning
-effort.
+effort. `databricks-` gateway IDs are rejected at dispatch because agy cannot
+launch them.
 
 When `args.model` is omitted and the worker spec has no pinned `executor.model`,
 the worker inherits the parent's model only if that exact ID appears in a fresh

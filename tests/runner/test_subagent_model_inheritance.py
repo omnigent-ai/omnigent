@@ -65,6 +65,7 @@ async def _dispatch_without_model(
     conv_id: str,
     parent_snapshot: dict[str, Any] | None,
     explicit_model: str | None = None,
+    rejections: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Drive one fresh-create ``sys_session_send`` and capture create bodies.
@@ -75,6 +76,7 @@ async def _dispatch_without_model(
     :param parent_snapshot: JSON the mock server returns for
         ``GET /v1/sessions/{conv_id}``; ``None`` serves a 404.
     :param explicit_model: Optional ``args.model`` for the dispatch.
+    :param rejections: When given, the dispatch must fail; its error is appended.
     :returns: The captured ``POST /v1/sessions`` bodies.
     """
     from omnigent.runner import app as runner_app
@@ -129,6 +131,10 @@ async def _dispatch_without_model(
         finally:
             subagent_work.unregister_subagent_work("conv_child_inherit")
             subagent_work._session_inboxes_ref.pop(conv_id, None)
+    if rejections is not None:
+        assert output.startswith("Error:"), output
+        rejections.append(output)
+        return create_bodies
     payload = json.loads(output)
     assert payload["status"] == "launching", output
     assert len(create_bodies) == 1, "fresh named send must create exactly one child"
@@ -215,7 +221,6 @@ async def test_explicit_dispatch_model_wins_over_parent_selection(
         pytest.param("gemini-3.1-pro-high", id="gemini"),
         pytest.param("claude-sonnet-4-6", id="claude"),
         pytest.param("gpt-oss-120b-medium", id="gpt-oss"),
-        pytest.param("databricks-claude-sonnet-4-6", id="opaque-cli-id"),
     ),
 )
 @pytest.mark.asyncio
@@ -244,6 +249,29 @@ async def test_antigravity_native_child_dispatch_preserves_catalog_model_overrid
     )
     assert bodies[0]["model_override"] == model
     discovery.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_antigravity_native_child_dispatch_rejects_gateway_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``databricks-`` id fails before any agy child is created."""
+    rejections: list[str] = []
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_antigravity_child_gateway_id",
+        parent_snapshot={
+            "id": "conv_antigravity_child_gateway_id",
+            "agent_id": "ag_parent",
+            "model_override": None,
+            "llm_model": None,
+        },
+        explicit_model="databricks-claude-sonnet-4-6",
+        rejections=rejections,
+    )
+    assert bodies == []
+    assert "no Databricks-gateway" in rejections[0]
 
 
 @pytest.mark.asyncio
@@ -283,13 +311,11 @@ async def test_explicit_antigravity_child_model_reaches_agy_launch_argv(
 @pytest.mark.parametrize(
     ("parent_model", "advertised_model", "inherits"),
     (
-        ("databricks-claude-sonnet-4-6", "claude-sonnet-4-6", False),
         ("claude-unavailable", "claude-sonnet-4-6", False),
         ("Claude-Sonnet-4-6", "claude-sonnet-4-6", False),
         ("claude-sonnet-4-6", "claude-sonnet-4-6", True),
         ("gemini-3.1-pro-high", "gemini-3.1-pro-high", True),
         ("gpt-oss-120b-medium", "gpt-oss-120b-medium", True),
-        ("databricks-claude-sonnet-4-6", "databricks-claude-sonnet-4-6", True),
     ),
 )
 @pytest.mark.asyncio
@@ -324,6 +350,35 @@ async def test_antigravity_native_inherits_only_exact_live_catalog_ids(
         assert bodies[0]["model_override"] == parent_model
     else:
         assert "model_override" not in bodies[0]
+
+
+@pytest.mark.parametrize("parent_field", ("model_override", "llm_model"))
+@pytest.mark.asyncio
+async def test_antigravity_native_never_inherits_gateway_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+    parent_field: str,
+) -> None:
+    """A parent's ``databricks-`` id is not inherited, even if agy advertises it."""
+    from omnigent.harnesses.antigravity_native import models
+
+    gateway_id = "databricks-claude-sonnet-4-6"
+    monkeypatch.setattr(models, "agy_binary_path", lambda: "/test/agy")
+    monkeypatch.setattr(
+        models.subprocess,
+        "run",
+        Mock(
+            return_value=subprocess.CompletedProcess(
+                ["/test/agy", "models"], 0, stdout=f"{gateway_id}\tModel\n"
+            )
+        ),
+    )
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_antigravity_inherit_gateway_id",
+        parent_snapshot={"harness": "antigravity-native", parent_field: gateway_id},
+    )
+    assert "model_override" not in bodies[0]
 
 
 @pytest.mark.parametrize(

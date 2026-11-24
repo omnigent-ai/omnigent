@@ -223,6 +223,11 @@ class TestModelFamilyMismatch:
             ("antigravity", "claude-opus-4-8", "Gemini-native"),
             ("agy", "gpt-5.4-mini", "Gemini-native"),
             ("google-antigravity", "databricks-gpt-5-4", "Gemini-native"),
+            # The native agy CLI runs Claude/GPT ids but has no gateway ids.
+            ("antigravity-native", "databricks-claude-sonnet-4-6", "no Databricks-gateway"),
+            ("native-antigravity", "databricks-gpt-5-4", "no Databricks-gateway"),
+            ("agy-native", "databricks-gemini-3-1-pro", "no Databricks-gateway"),
+            ("native-agy", "Databricks-Claude-Opus-4-8", "no Databricks-gateway"),
         ],
     )
     def test_wrong_or_unknown_family_is_rejected(
