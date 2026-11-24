@@ -123,6 +123,47 @@ it("restores newest, preserves the original external URL, and retains the same h
   expect(methods()).toEqual(["GET"]);
 });
 
+it("coalesces focus and picker refreshes while the initial collection is loading", async () => {
+  const pending = deferred<Response>();
+  fetchMock.mockImplementationOnce(() => pending.promise);
+  render(tree());
+  expect(screen.getByText("Loading session documents…")).toBeVisible();
+  await waitFor(() => expect(methods()).toEqual(["GET"]));
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("combobox", { name: "Session document" }));
+  fireEvent(window, new Event("focus"));
+  expect(methods()).toEqual(["GET"]);
+  expect(screen.getByText("Loading session documents…")).toBeVisible();
+  await act(async () => pending.resolve(response()));
+  await screen.findByTitle("Google Docs editor");
+  expect(screen.queryByText("Loading session documents…")).toBeNull();
+});
+
+it("refreshes the open picker without a loading row or requests from internal focus moves", async () => {
+  render(tree());
+  const editor = await screen.findByTitle("Google Docs editor");
+  const pending = deferred<Response>();
+  fetchMock.mockImplementationOnce(() => pending.promise);
+  const user = userEvent.setup();
+  const trigger = screen.getByRole("combobox", { name: "Session document" });
+  const add = screen.getByRole("button", { name: "Add document" });
+  await user.click(trigger);
+  await waitFor(() => expect(methods()).toEqual(["GET", "GET"]));
+  await user.keyboard("{ArrowDown}{ArrowUp}");
+  fireEvent(window, new Event("focus"));
+  expect(methods()).toEqual(["GET", "GET"]);
+  expect(screen.queryByText("Loading session documents…")).toBeNull();
+  expect(frame()).toBe(editor);
+  await act(async () => pending.resolve(response(entries.slice(0, 1))));
+  await waitFor(() => expect(screen.queryByRole("option", { name: B })).toBeNull());
+  await user.keyboard("{ArrowDown}{ArrowUp}");
+  expect(methods()).toEqual(["GET", "GET"]);
+  fireEvent.focus(add, { relatedTarget: trigger });
+  expect(methods()).toEqual(["GET", "GET"]);
+  expect(frame()).toBe(editor);
+  expect(screen.queryByText("Loading session documents…")).toBeNull();
+});
+
 it("opens linked documents through the shared seam and dropdown without writing", async () => {
   render(tree(sessionId, 1));
   await screen.findByTitle("Google Docs editor");

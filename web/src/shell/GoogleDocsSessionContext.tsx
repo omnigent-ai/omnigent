@@ -147,6 +147,7 @@ function SessionState({
       refreshPending.current = true;
       return;
     }
+    if (read.current?.isCurrent(sessionId)) return;
     const started = epoch.current;
     const request = loadSessionDocuments(sessionId);
     read.current = request;
@@ -155,7 +156,7 @@ function SessionState({
       request === read.current &&
       started === epoch.current &&
       request.isCurrent(sessionId);
-    setLoading(true);
+    setLoading(!loaded.current);
     try {
       const result = await request.result;
       if (!applies()) return;
@@ -174,6 +175,7 @@ function SessionState({
         setLoadError(reason instanceof Error ? reason.message : "Could not load documents.");
     } finally {
       if (applies()) setLoading(false);
+      if (read.current === request) read.current = null;
     }
   }, [sessionId, current]);
   useEffect(() => {

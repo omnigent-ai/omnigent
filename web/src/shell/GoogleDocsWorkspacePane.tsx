@@ -87,7 +87,13 @@ function PaneContent({ visible = true, registerLeaveGuard }: GoogleDocsWorkspace
       hidden={!visible}
       aria-label="Google Docs pane"
       className={visible ? "@container/google-docs flex h-full min-h-0 flex-1 flex-col" : "hidden"}
-      onFocusCapture={state.refresh}
+      onFocusCapture={(event) => {
+        if (
+          event.currentTarget.contains(event.target) &&
+          !event.currentTarget.contains(event.relatedTarget)
+        )
+          state.refresh();
+      }}
     >
       <div className="flex shrink-0 items-center gap-1 border-b border-border p-2">
         <Select
