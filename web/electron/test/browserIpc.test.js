@@ -45,6 +45,14 @@ function makeIpcMain() {
 
 const allowAgentNavigation = async () => ({ ok: true });
 
+// The next step appended to a refused file: or loopback navigation.
+const FILE_URL_HINT =
+  'To preview a local HTML file, open it from Files, or run "python3 -m http.server 8000"' +
+  " in its folder and open http://localhost:8000/ from a session on this computer.";
+const LOOPBACK_HINT =
+  "Localhost pages open only for sessions confirmed to run on this computer or on a host" +
+  " you've allowed. To preview an HTML file from this session's workspace, open it from Files.";
+
 describe("browser IPC pending navigation lifecycle", () => {
   it("does nothing for a call that arrives past its deadline", async () => {
     const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
@@ -826,7 +834,7 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
       requests.map(async (request) => {
         const { state, navigate } = previewSetup({ request });
         const result = await navigate({ sourceHostId: "host-1" });
-        assert.deepEqual(result, { ok: false, created: false, error: "blocked" });
+        assert.deepEqual(result, { ok: false, created: false, error: `blocked ${LOOPBACK_HINT}` });
         assert.deepEqual(state.calls, ["denied", "request"]);
       }),
     );
@@ -2646,4 +2654,66 @@ describe("browser IPC sessions on this machine", () => {
       );
     });
   }
+});
+
+describe("browser IPC hints for refused local previews", () => {
+  /** The real registry and URL policy; a refused navigation never loads. */
+  function refusingSetup(getAgentNavigationHintForEvent) {
+    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+    const registry = createBrowserViewRegistry();
+    registry.openOrNavigate = () => {
+      throw new Error("must not navigate");
+    };
+    const ipcMain = makeIpcMain();
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => registry,
+      ...(getAgentNavigationHintForEvent ? { getAgentNavigationHintForEvent } : {}),
+    });
+    return (url, opts) =>
+      ipcMain.invoke(
+        "omnigent:browser-open-or-navigate",
+        {},
+        { conversationId: "conv", url, opts },
+      );
+  }
+
+  for (const agent of [false, true]) {
+    it(`points a refused file: URL to Files or a localhost server (agent: ${agent})`, async () => {
+      const result = await refusingSetup()("file:///Users/me/site/index.html", { agent });
+      assert.equal(result.ok, false);
+      assert.equal(
+        result.error,
+        'navigation blocked: scheme "file:" is not allowed for agent navigation' +
+          ` (only http/https) ${FILE_URL_HINT}`,
+      );
+    });
+
+    it(`points a refused localhost page to Files (agent: ${agent})`, async () => {
+      const result = await refusingSetup()("http://localhost:8000/index.html", { agent });
+      assert.equal(result.ok, false);
+      assert.equal(
+        result.error,
+        `navigation blocked: host "localhost" is a loopback/internal host ${LOOPBACK_HINT}`,
+      );
+    });
+  }
+
+  it("keeps a more specific recovery hint instead", async () => {
+    const result = await refusingSetup(() => "Reconnect the host, then retry.")(
+      "http://localhost:8000/",
+      { agent: true },
+    );
+    assert.equal(
+      result.error,
+      'navigation blocked: host "localhost" is a loopback/internal host' +
+        " Reconnect the host, then retry.",
+    );
+  });
+
+  it("adds nothing to other refusals", async () => {
+    const result = await refusingSetup()("http://10.0.0.1/", { agent: true });
+    assert.equal(result.error, 'navigation blocked: host "10.0.0.1" is a loopback/internal host');
+  });
 });

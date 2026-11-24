@@ -20,6 +20,13 @@ describe("normalizeTypedUrl", () => {
     expect(normalizeTypedUrl("example.com/path?q=1")).toBe("https://example.com/path?q=1");
   });
 
+  it("leaves a file: URL as typed for the desktop policy to refuse", () => {
+    expect(normalizeTypedUrl("file:///Users/me/site/index.html")).toBe(
+      "file:///Users/me/site/index.html",
+    );
+    expect(normalizeTypedUrl(" FILE:///tmp/a.html ")).toBe("FILE:///tmp/a.html");
+  });
+
   it("treats a host:port with no dot as dotless", () => {
     expect(normalizeTypedUrl("localhost:3000/x")).toBe("http://localhost:3000/x");
   });

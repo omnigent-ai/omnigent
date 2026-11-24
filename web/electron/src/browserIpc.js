@@ -35,6 +35,29 @@ const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
 // platforms' schemes aren't wired up yet (the shell's feature flag mirrors this).
 const CHROME_COOKIE_IMPORT_PLATFORM_ERROR = "Importing Chrome cookies is only supported on macOS.";
 
+// Next steps for a refused local-file or loopback navigation. browserUrlPolicy.js
+// decides what is blocked; these only say how to preview the page another way.
+const FILE_URL_HINT =
+  'To preview a local HTML file, open it from Files, or run "python3 -m http.server 8000" ' +
+  "in its folder and open http://localhost:8000/ from a session on this computer.";
+const LOOPBACK_HINT =
+  "Localhost pages open only for sessions confirmed to run on this computer or on a host " +
+  "you've allowed. To preview an HTML file from this session's workspace, open it from Files.";
+
+/**
+ * The next step for a refused navigation that has no more specific hint.
+ *
+ * @param {unknown} url The renderer-requested URL, e.g. "file:///Users/me/site/index.html".
+ * @param {{ localhostBlocked?: true }} verdict The refused result; the URL policy sets
+ *   `localhostBlocked` when a loopback host was denied.
+ * @returns {string | null}
+ */
+function blockedNavigationHint(url, verdict) {
+  if (verdict.localhostBlocked === true) return LOOPBACK_HINT;
+  if (typeof url !== "string" || !URL.canParse(url)) return null;
+  return new URL(url).protocol === "file:" ? FILE_URL_HINT : null;
+}
+
 /**
  * Profile names come from Chrome's `Local State`, which is just a file on disk.
  * Keep them one short line so a crafted name can't add its own paragraphs to
@@ -592,7 +615,7 @@ function registerBrowserIpc({
       });
     }
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
-    const hint =
+    const recoveryHint =
       !r.ok && opts?.agent
         ? getAgentNavigationHintForEvent(
             event,
@@ -602,6 +625,7 @@ function registerBrowserIpc({
             opts?.sourceIsArcaHost,
           )
         : null;
+    const hint = r.ok ? null : (recoveryHint ?? blockedNavigationHint(url, r));
     return {
       ok: r.ok,
       created: r.created ?? false,
