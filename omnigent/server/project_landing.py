@@ -1050,6 +1050,33 @@ def start(app: Any) -> LandingQueue:
     return queue
 
 
+def could_supersede(config: dict[str, Any], approved: str, newer: str) -> bool:
+    """Whether *newer* can be a new head replacing the approved commit, as far as git can tell.
+
+    No when the approved commit is already on the landing branch, or *newer* is on it (such as
+    its tip or a base) or is an ancestor of the approved commit. Yes when git can't tell.
+    """
+    try:
+        target = resolve_target(config)
+        branch = f"refs/heads/{target.branch}"
+
+        def known(sha: str) -> bool:
+            return not _git(
+                target.checkout, "cat-file", "-e", f"{sha}^{{commit}}", check=False
+            ).returncode
+
+        if known(approved) and _is_ancestor(target.checkout, approved, branch):
+            return False
+        if known(newer):
+            if _is_ancestor(target.checkout, newer, branch):
+                return False
+            if known(approved) and _is_ancestor(target.checkout, newer, approved):
+                return False
+        return True
+    except (GitError, OmnigentError, OSError, subprocess.SubprocessError):
+        return True
+
+
 def is_pure_rebase(config: dict[str, Any], approved: str, newer: str) -> bool:
     """Whether *newer* is the approved commit re-applied onto the landing branch unchanged."""
     try:

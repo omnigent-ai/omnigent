@@ -2,7 +2,7 @@
 
 Traffic goes through server-delivered ticket turns, never agent-to-agent messages.
 Approval is bound to one commit: only the Reviewer's session may set ``approved``,
-and a later commit from anyone else clears it.
+and a new head from anyone else clears it until the approved commit has landed.
 """
 
 from __future__ import annotations
@@ -94,6 +94,20 @@ def superseding_sha(text: str | None, approved: str | None) -> str | None:
         return None
     match = _SHA.search(text)
     return match.group(0) if match and match.group(0) != approved else None
+
+
+def approval_can_be_superseded(stage_id: str | None, stage_ids: list[str]) -> bool:
+    """Whether a ticket at *stage_id* is still before landing, so a new head clears ``approved``.
+
+    That is Review or any earlier stage; without a Review stage, any stage before the last two
+    (landed and complete). An approval that has landed is a record, never superseded.
+    """
+    if stage_id is None or stage_id not in stage_ids:
+        return False
+    position = stage_ids.index(stage_id)
+    if REVIEW_STAGE_ID in stage_ids:
+        return position <= stage_ids.index(REVIEW_STAGE_ID)
+    return position < len(stage_ids) - 2
 
 
 class RouteLimiter:

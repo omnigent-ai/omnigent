@@ -47,3 +47,27 @@ def test_a_different_sha_supersedes_the_approval_and_round_three_escalates() -> 
     ticket = {"id": "t", "title": "T"}
     assert "escalate" not in to_reviewer_message(ticket, "fixed", "w", rounds=2)
     assert "round 3 without approval" in to_reviewer_message(ticket, "fixed", "w", rounds=3)
+
+
+def test_only_a_ticket_before_landing_can_have_its_approval_superseded() -> None:
+    from omnigent.server.ticket_review import approval_can_be_superseded
+
+    stages = ["open", "in_progress", "code_review", "implemented", "done", "merged"]
+    assert [approval_can_be_superseded(stage, stages) for stage in stages] == [
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert not approval_can_be_superseded(None, stages)
+    assert not approval_can_be_superseded("gone", stages)
+    # Without a Review stage, the last two stages are landed and complete.
+    plain = ["open", "in_progress", "review", "done"]
+    assert [approval_can_be_superseded(stage, plain) for stage in plain] == [
+        True,
+        True,
+        False,
+        False,
+    ]

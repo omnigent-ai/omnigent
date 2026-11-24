@@ -457,3 +457,19 @@ def test_the_safety_net_hides_the_servers_environment(world, monkeypatch) -> Non
     _, rebased = approve_then_rebase(world, {"tests/test_env.py": probe})
     tip = git(world.repo, "rev-parse", BRANCH)
     assert landing.safety_net(world.repo, rebased, tip, ["tests/test_env.py"]) is None
+
+
+def test_only_a_plausible_new_head_supersedes_an_approval(world) -> None:
+    config = world.project.config
+    approved = branch(world, "feat", {"a.txt": "a", "b.txt": "b"}, world.base)
+    first_commit = git(world.repo, "rev-parse", f"{approved}~1")
+    new_head = branch(world, "feat2", {"c.txt": "c"}, approved)
+    tip = git(world.repo, "rev-parse", BRANCH)
+    assert landing.could_supersede(config, approved, new_head)
+    assert not landing.could_supersede(config, approved, tip)  # the integration tip
+    assert not landing.could_supersede(config, approved, world.base)  # a base
+    assert not landing.could_supersede(config, approved, first_commit)  # an older commit
+    assert landing.could_supersede(config, approved, "e" * 40)  # unknown here: can't tell
+    git(world.repo, "merge", "-q", "--ff-only", approved)  # the approval landed
+    assert not landing.could_supersede(config, approved, new_head)
+    assert landing.could_supersede({"landing": {"checkout": "/nonexistent"}}, approved, new_head)

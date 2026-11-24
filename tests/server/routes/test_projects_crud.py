@@ -879,6 +879,22 @@ async def test_review_routes_worker_and_reviewer_and_binds_approval_to_a_commit(
     notes = (await project_client.get(f"{path}/events", params={"kind": "comment"})).json()
     assert any("Approval cleared" in event["payload"]["text"] for event in notes["data"])
 
+    # Once landed, a comment leading with another SHA (an upstream tip) keeps the record.
+    reapprove = [{"key": "approved", "value": third}, {"key": "risk", "value": "migration"}]
+    assert (
+        await project_client.patch(path, json={"labels": reapprove}, headers=as_reviewer)
+    ).status_code == 200
+    landed_stage = stages[2]["id"]  # the stage right after Review
+    moved = await project_client.patch(path, json={"stage_id": landed_stage}, headers=as_worker)
+    assert moved.status_code == 200, moved.text
+    upstream = "d" * 40
+    await project_client.post(
+        f"{path}/comments", json={"text": f"{upstream} is the new upstream tip"}, headers=as_worker
+    )
+    await settle()
+    kept = (await project_client.get(path)).json()
+    assert {"key": "approved", "value": third} in kept["labels"]
+
 
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     """DELETE removes the project; a second delete 404s."""

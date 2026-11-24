@@ -48,7 +48,7 @@ from omnigent.server.persona_mentions import (
     deliver_mentions,
     find_mentions,
 )
-from omnigent.server.project_landing import RISK_OK_LABEL, is_pure_rebase
+from omnigent.server.project_landing import RISK_OK_LABEL, could_supersede, is_pure_rebase
 from omnigent.server.project_status_spend import project_total_cents
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
@@ -61,6 +61,7 @@ from omnigent.server.ticket_review import (
     APPROVED_LABEL,
     REVIEW_STAGE_ID,
     RouteLimiter,
+    approval_can_be_superseded,
     check_approval_change,
     find_reviewer,
     is_reviewer_session,
@@ -487,6 +488,18 @@ def create_project_tickets_router(
         targets, project, reviewer, author_is_reviewer = context
         approved = label_value(ticket.get("labels"), APPROVED_LABEL)
         newer = None if author_is_reviewer else superseding_sha(text, approved)
+        if newer is not None:
+            assert approved is not None
+            stage_ids = [
+                stage["id"]
+                for stage in (
+                    await asyncio.to_thread(store.stages, project_id, user_id=who.user_id)
+                )["stages"]
+            ]
+            if not approval_can_be_superseded(
+                ticket.get("stage_id"), stage_ids
+            ) or not await asyncio.to_thread(could_supersede, project.config, approved, newer):
+                newer = None
         if newer is not None:
             assert approved is not None
             rebase_only = await asyncio.to_thread(is_pure_rebase, project.config, approved, newer)
