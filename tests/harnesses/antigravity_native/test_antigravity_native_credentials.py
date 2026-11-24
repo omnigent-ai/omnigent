@@ -77,6 +77,47 @@ def test_saved_provider_model_is_the_effective_launch_model(tmp_path: Path) -> N
     assert agy_argv_model(argv) == "Gemini 3.1 Pro (High)"
 
 
+def test_saved_gateway_drives_model_discovery_and_catalog_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Discovery and the catalog readout use the gateway a launch would use."""
+    import subprocess
+
+    from omnigent.harnesses.antigravity_native import models
+    from omnigent.models.model_catalog import resolve_model_provider
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    secrets.store_secret("gateway", "gateway-fake-key")
+    save_provider(tmp_path)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(models, "agy_binary_path", lambda: "/test/agy")
+
+    def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout="gemini-x\tGemini X\n", stderr="")
+
+    monkeypatch.setattr(models.subprocess, "run", _run)
+
+    assert [row["id"] for row in models.list_agy_cli_model_options()] == ["gemini-x"]
+    assert captured["argv"] == ["/test/agy", "models"]
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["GEMINI_API_KEY"] == "gateway-fake-key"
+    assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+    provider = resolve_model_provider(spec, "antigravity-native")
+    assert (provider.kind, provider.cli) == ("key", "agy")
+    assert provider.base_url == "https://gateway.example/gemini"
+    assert provider.api_key is None
+    assert "gateway-fake-key" not in repr(provider)
+
+
 def test_explicit_model_wins(tmp_path: Path) -> None:
     secrets.store_secret("gateway", "fake-key")
     save_provider(tmp_path)

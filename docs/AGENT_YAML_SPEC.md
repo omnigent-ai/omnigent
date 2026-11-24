@@ -142,8 +142,10 @@ executor:
 `harness: antigravity-native` wraps the installed `agy` CLI. For the new-task
 picker, see [Choose & switch models](../README.md#3-choose--switch-models).
 
-For delegated workers, `sys_list_models` discovers the CLI's catalog and reports
-successful listings as `source: cli`, `verified: true`. Discovery failures return
+For delegated workers, `sys_list_models` discovers the CLI's catalog with the
+same configured Gemini key, gateway or Databricks profile as a launch (agy's own
+login when none is configured) and reports successful listings as `source: cli`,
+`verified: true`. Discovery failures return
 an unverified empty list and can be retried; Omnigent supplies no fallback model
 choices. Use an advertised ID in `sys_session_send`'s `args.model` to select a
 model when creating a worker. Explicit IDs are preserved through `model_override`

@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Mapping
 from typing import TypedDict
 
+from omnigent.errors import OmnigentError
 from omnigent.harnesses.antigravity_native.launch import agy_binary_path
+
+# Discovery through the Databricks gateway also resolves a token and the
+# workspace's Gemini services before agy lists its models.
+_GATEWAY_DISCOVERY_TIMEOUT_S = 30.0
 
 # Orchestrator slugs carry a label (e.g. "Orchestrator (Carbon)") that does not
 # identify the planner model they run, so they are left out of the catalog.
@@ -66,6 +72,27 @@ def parse_agy_model_options(output: str) -> list[AntigravityModelOption]:
     return rows
 
 
+def _launch_credential_environment() -> dict[str, str]:
+    """Return the credential environment a native agy launch would inject.
+
+    :returns: Gemini key/endpoint (and Databricks profile) overrides, or ``{}``
+        when agy runs on its own login.
+    :raises ValueError: If the saved configuration needs repair through setup.
+    """
+    from omnigent.harnesses.antigravity_native.credentials import (
+        resolve_antigravity_credentials,
+    )
+
+    try:
+        credentials = resolve_antigravity_credentials()
+    except OmnigentError:
+        # The message is secret-free, but a fixed one keeps tool output stable.
+        raise ValueError(
+            "Antigravity credentials need repair; run omni setup on the host"
+        ) from None
+    return credentials.environment() if credentials is not None else {}
+
+
 def list_agy_cli_model_options(
     *,
     env: Mapping[str, str] | None = None,
@@ -73,12 +100,16 @@ def list_agy_cli_model_options(
 ) -> list[AntigravityModelOption]:
     """Discover launchable picker rows from the installed ``agy`` CLI.
 
-    :param env: Optional process environment override for tests and host probes.
+    Without *env*, discovery uses the same configured Gemini key, endpoint or
+    Databricks gateway as a native launch, so the catalog matches what agy runs.
+
+    :param env: Complete process environment override for tests and host probes.
     :param timeout_s: Maximum time to wait for the CLI to enumerate models.
-    :returns: The models currently advertised by the signed-in ``agy`` CLI.
+    :returns: The models currently advertised by the ``agy`` CLI.
     :raises FileNotFoundError: If ``agy`` cannot be resolved.
     :raises subprocess.SubprocessError: If the command fails or times out.
-    :raises ValueError: If the command emits no valid data rows.
+    :raises ValueError: If the command emits no valid data rows, or saved
+        credentials need repair.
     """
     try:
         executable = agy_binary_path()
@@ -87,12 +118,25 @@ def list_agy_cli_model_options(
         # retryable, secret-free fallback.  Keep this discovery helper inside
         # that contract instead of exposing the install command to tool output.
         raise FileNotFoundError("agy CLI is unavailable") from exc
+    argv = [executable, "models"]
+    if env is None:
+        overrides = _launch_credential_environment()
+        if overrides:
+            from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
+
+            wrapped = wrap_agy_gateway_launch(argv, overrides)
+            if wrapped != argv:
+                timeout_s = max(timeout_s, _GATEWAY_DISCOVERY_TIMEOUT_S)
+            argv = wrapped
+        run_env: dict[str, str] | None = {**os.environ, **overrides} if overrides else None
+    else:
+        run_env = dict(env)
     completed = subprocess.run(
-        [executable, "models"],
+        argv,
         check=True,
         capture_output=True,
         text=True,
         timeout=timeout_s,
-        env=dict(env) if env is not None else None,
+        env=run_env,
     )
     return parse_agy_model_options(completed.stdout)

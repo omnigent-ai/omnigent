@@ -604,6 +604,37 @@ def resolve_model_provider(spec: object, harness: str | None) -> ResolvedModelPr
         )
 
 
+def _antigravity_native_provider() -> ResolvedModelProvider:
+    """Report the credentials a native agy launch resolves, else agy's own login.
+
+    Native agy ignores spec ``auth`` and reads the setup-configured Gemini
+    provider, a legacy setup key or an ambient key, exactly as its launch does.
+    A configuration needing repair raises, so the caller reports no provider.
+
+    :returns: A provider whose ``cli`` is ``"agy"``; it never carries the key.
+    """
+    from omnigent.harnesses.antigravity_native.credentials import (
+        resolve_antigravity_credentials,
+    )
+
+    credentials = resolve_antigravity_credentials()
+    if credentials is None:
+        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="agy", detail="agy CLI login")
+    if credentials.profile is not None:
+        return ResolvedModelProvider(
+            kind=DATABRICKS_KIND,
+            profile=credentials.profile,
+            cli="agy",
+            detail="agy Databricks profile gateway",
+        )
+    return ResolvedModelProvider(
+        kind=KEY_KIND,
+        base_url=credentials.base_url,
+        cli="agy",
+        detail="agy Gemini API key",
+    )
+
+
 def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> ResolvedModelProvider:
     """Resolve the provider, propagating failures to the catch-all wrapper.
 
@@ -627,9 +658,7 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
             kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
         )
     if (harness or "") in _ANTIGRAVITY_NATIVE_HARNESSES:
-        return ResolvedModelProvider(
-            kind=SUBSCRIPTION_KIND, cli="agy", detail="Antigravity CLI authentication"
-        )
+        return _antigravity_native_provider()
     if (harness or "") in _DEVIN_HARNESSES:
         return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="devin", detail="devin CLI login")
 
@@ -1130,7 +1159,8 @@ def list_models_for_worker(
                 note="Configured ACP provider model shortlist; vendor CLI owns authentication.",
             )
     provider = resolve_model_provider(spec, harness)
-    if provider.kind == DATABRICKS_KIND:
+    # Native agy behind a Databricks gateway lists agy's own ids, not UC endpoints.
+    if provider.kind == DATABRICKS_KIND and provider.cli != "agy":
         uc_key = ("uc", *_listing_cache_key(provider))
         with _listing_cache_lock:
             uc_listing = cast(ModelListing | None, _listing_cache.get(uc_key))
@@ -1358,11 +1388,12 @@ def _listing_for_provider(
     if cached is not None:
         return cached
     try:
-        if provider.kind == SUBSCRIPTION_KIND:
+        if provider.cli == "agy":
+            # agy lists its models through the same credentials it launches with.
+            listing = _fetch_antigravity_cli_listing()
+        elif provider.kind == SUBSCRIPTION_KIND:
             listing = (
-                _fetch_antigravity_cli_listing()
-                if provider.cli == "agy"
-                else _fetch_devin_cli_listing(provider)
+                _fetch_devin_cli_listing(provider)
                 if provider.cli == "devin"
                 else _fetch_cursor_cli_listing(provider)
             )
@@ -1382,9 +1413,10 @@ def _listing_for_provider(
         _logger.debug(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
-        if provider.kind == SUBSCRIPTION_KIND:
+        if provider.kind == SUBSCRIPTION_KIND or provider.cli == "agy":
             # A failed CLI catalog probe does not prove the worker cannot run.
             # Keep dispatch available and leave model discovery retryable.
+            launch_auth = "configured credentials" if provider.cli == "agy" else "stored login"
             return ModelListing(
                 source="static",
                 verified=False,
@@ -1392,7 +1424,7 @@ def _listing_for_provider(
                 note=(
                     f"model listing failed for {provider.detail or provider.kind} "
                     f"({_redacted_failure_reason(exc)}); the CLI launches with its "
-                    "own stored login, so dispatches to this worker can still run"
+                    f"own {launch_auth}, so dispatches to this worker can still run"
                 ),
             )
         return ModelListing(

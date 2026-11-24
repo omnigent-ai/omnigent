@@ -27,6 +27,15 @@ import pytest
 from omnigent.runner import subagent_work
 
 
+@pytest.fixture(autouse=True)
+def _agy_runs_on_its_own_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep agy catalog probes independent of the host's saved Gemini setup."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.credentials.resolve_antigravity_credentials",
+        lambda: None,
+    )
+
+
 def _spec_with_worker(
     harness: str,
     *,
