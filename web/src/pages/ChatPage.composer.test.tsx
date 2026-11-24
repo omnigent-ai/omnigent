@@ -2863,7 +2863,7 @@ describe("Composer model/effort label", () => {
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
-  it("shows no effort when the session uses its default", () => {
+  it("labels an inherited effort as Default", () => {
     useChatStore.setState({
       llmModel: "opus",
       sessionReasoningEffort: null,
@@ -2881,7 +2881,8 @@ describe("Composer model/effort label", () => {
     );
     expect(label()).toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
-    expect(screen.queryByTestId("composer-agent-effort-value")).toBeNull();
+    // No saved effort: the session uses its model's default, and says so.
+    expect(screen.getByTestId("composer-agent-effort-value")).toHaveTextContent("Default");
   });
 
   it("reads 'Smart Routing' with no model/effort when routing is on", async () => {
@@ -3013,10 +3014,9 @@ describe("Composer model/effort label", () => {
     expect(label()).not.toHaveTextContent("system.ai.claude-sonnet-5");
   });
 
-  it("keeps the harness visible when model and effort are unresolved", () => {
-    // A claude-native session before the snapshot fills llmModel/sessionReasoningEffort
-    // has no model label and no effort label. The read-only label renders
-    // nothing rather than a placeholder — the gear still owns the config path.
+  it("reads Default model, not the harness, when model and effort are unresolved", () => {
+    // A claude-native session before the snapshot fills llmModel/sessionReasoningEffort.
+    // The trigger names the model setting; the agent icon carries the identity.
     useChatStore.setState({
       sessionModelOverride: null,
       sessionReasoningEffort: null,
@@ -3034,15 +3034,15 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(screen.getByTestId("composer-agent-config-value")).toHaveTextContent("Claude Code");
+    expect(label()).toHaveTextContent("Default model");
+    expect(label()).not.toHaveTextContent("Claude Code");
     // The gear is still present so the user can open the config modal.
     expect(screen.getByTestId("composer-config-gear")).toBeTruthy();
   });
 
-  it("falls back to the harness identity for an SDK/bundle agent with no model/effort", () => {
-    // Polly (claude-sdk/pi bundle) surfaces no model or effort, so the label
-    // would be empty. It falls back to the harness identity ("Polly (Pi)") so
-    // the slot isn't blank.
+  it("reads Default model for an SDK/bundle agent with no model/effort", () => {
+    // Polly (claude-sdk/pi bundle) surfaces no model or effort; the slot reads
+    // Default model instead of going blank or repeating the agent's identity.
     useChatStore.setState({
       sessionModelOverride: null,
       sessionReasoningEffort: null,
@@ -3060,10 +3060,11 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("Polly (Pi)");
+    expect(label()).toHaveTextContent("Default model");
+    expect(label()).not.toHaveTextContent("Polly (Pi)");
   });
 
-  it("shows the harness identity, not the spec pin, for an own-auth ACP session", () => {
+  it("reads Default model, not the spec pin, for an own-auth ACP session", () => {
     // Grok Build runs its own model, so the snapshot leaves llmModel null until
     // the agent reports one. The spec's pinned model must not appear.
     useChatStore.setState({
@@ -3083,16 +3084,14 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("Grok Build");
+    expect(label()).toHaveTextContent("Default model");
     expect(label()).not.toHaveTextContent("gpt-4o-mini");
   });
 
-  it("names the vendor, not the Task subagent_type, on a Claude Code sub-agent", () => {
-    // A claude-native sub-agent child has no model of its own, so the label
-    // takes the identity fallback. Its `subAgentName` is Claude's own
-    // `subagent_type` ("general-purpose") and it reuses the parent's
-    // claude-native agent row — neither names the product, so the wrapper
-    // label decides. The instance itself is named in the sub-agent tray.
+  it("never shows the Task subagent_type on a Claude Code sub-agent", () => {
+    // A claude-native sub-agent child has no model of its own. Its `subAgentName`
+    // is Claude's own `subagent_type` ("general-purpose"), which must not leak
+    // into the label; the instance itself is named in the sub-agent tray.
     useChatStore.setState({
       sessionModelOverride: null,
       sessionReasoningEffort: null,
@@ -3114,14 +3113,13 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("Claude Code");
+    expect(label()).toHaveTextContent("Default model");
     expect(label()).not.toHaveTextContent("General-purpose");
   });
 
-  it("does NOT fall back to the bare vendor name for a native wrapper with no model", () => {
+  it("does NOT fall back to the vendor name for a native wrapper with no model", () => {
     // A native wrapper's harnessLabel is the bare vendor name ("Claude"), which
-    // the gear tooltip owns now — the label must stay empty when unresolved
-    // rather than resurrecting it. Only SDK/bundle agents get the fallback.
+    // the gear tooltip owns; the unresolved label reads Default model instead.
     useChatStore.setState({
       sessionModelOverride: null,
       sessionReasoningEffort: null,
@@ -3139,7 +3137,8 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(screen.getByTestId("composer-agent-config-value")).toHaveTextContent("Claude Code");
+    expect(label()).toHaveTextContent("Default model");
+    expect(label()).not.toHaveTextContent("Claude");
   });
 
   it("surfaces a cursor-native session's model from the override", () => {
