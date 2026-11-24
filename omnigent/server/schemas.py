@@ -6477,6 +6477,10 @@ class ProjectObject(BaseModel):
     :param mandate: Owner-written guidance (markdown) loaded into every agent
         session in the project to set its bounds, or ``None`` when unset.
     :param mandate_proposals: Proposed additions awaiting the owner, oldest first.
+    :param description: The project's charter for people reading it (mission,
+        scope, out of scope, how we'll know it's working, starting roster), or
+        ``None`` when unset. Only the owner or the Lead edits it; it never
+        reaches agent instructions.
     """
 
     id: str
@@ -6487,6 +6491,7 @@ class ProjectObject(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     mandate: str | None = None
     mandate_proposals: list[MandateProposalObject] = Field(default_factory=list)
+    description: str | None = None
     main_session_id: str | None = None
     main_session_state: Literal["absent", "missing", "archived", "active", "unavailable"] = (
         "absent"
@@ -6591,6 +6596,9 @@ class CreateProjectRequest(BaseModel):
         Omitted / empty stores no defaults.
     :param mandate: Optional guidance loaded into every agent session in the
         project. Trimmed; at most 12,000 UTF-8 bytes; blank stores none.
+    :param description: Optional charter for people reading the project.
+        Trimmed; at most 8,000 UTF-8 bytes; blank stores none. People only;
+        an agent's create is refused.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -6598,6 +6606,7 @@ class CreateProjectRequest(BaseModel):
     name: str
     config: dict[str, Any] = Field(default_factory=dict)
     mandate: str | None = None
+    description: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -6628,6 +6637,10 @@ class UpdateProjectRequest(BaseModel):
         it unchanged; an empty object ``{}`` clears the stored defaults.
     :param mandate: New mandate text. ``None`` leaves it unchanged; blank text
         clears it. Trimmed; at most 12,000 UTF-8 bytes.
+    :param description: New project description (charter for people). ``None``
+        leaves it unchanged; blank text clears it. Trimmed; at most 8,000 UTF-8
+        bytes. Only the owner, or an agent tool called from the Lead's session,
+        may change it.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -6635,6 +6648,7 @@ class UpdateProjectRequest(BaseModel):
     name: str | None = None
     config: dict[str, Any] | None = None
     mandate: str | None = None
+    description: str | None = None
     main_session_id: str | None = None
     expected_main_session_id: str | None = None
 

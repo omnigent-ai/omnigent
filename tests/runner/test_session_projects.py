@@ -389,8 +389,13 @@ def _project_server(
             {"project": "Q3", "status": "updated", "icon": None},
             {"config": {"model": "fast"}},
         ),
+        (
+            {"project": "Q3", "description": "Mission: launch Q3."},
+            {"project": "Q3", "status": "updated", "description_updated": True},
+            {"description": "Mission: launch Q3."},
+        ),
     ],
-    ids=["rename-and-replace-icon", "clear-icon"],
+    ids=["rename-and-replace-icon", "clear-icon", "write-description"],
 )
 async def test_project_update_keeps_other_config_when_changing_the_icon(args, expected, body):
     requests: list[httpx.Request] = []
@@ -414,6 +419,7 @@ async def test_project_update_keeps_other_config_when_changing_the_icon(args, ex
         ({"project": "Q3"}, "nothing to update"),
         ({"project": "Q3", "name": ""}, "name must be non-blank"),
         ({"project": "Q3", "icon": "x" * 17}, "icon must be one emoji"),
+        ({"project": "Q3", "description": "x" * 8_001}, "description must be text"),
     ],
 )
 async def test_project_update_rejects_invalid_arguments_before_any_request(args, message):

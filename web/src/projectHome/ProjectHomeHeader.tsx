@@ -2,6 +2,7 @@ import {
   Columns3Icon,
   MessageCirclePlusIcon,
   ScrollTextIcon,
+  FileTextIcon,
   MoreHorizontalIcon,
   PencilIcon,
   SearchIcon,
@@ -35,6 +36,7 @@ import { projectHomePath } from "./projectHomeNavigation";
 import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTickets";
 import { ProjectBoardActions } from "./ProjectBoardActions";
 import { ProjectCostBadge } from "./ProjectCost";
+import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
 import { ProjectMandateDialog, useProjectMandate } from "./ProjectMandateDialog";
 import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
 
@@ -120,8 +122,10 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
   const tickets = useProjectTicketsEnabled();
   const info = useServerInfo();
   const mandateEnabled = info !== "loading" && info.project_mandate === true;
+  const descriptionEnabled = info !== "loading" && info.project_description === true;
   const [editingStages, setEditingStages] = useState(false);
   const [editingMandate, setEditingMandate] = useState(false);
+  const [editingDescription, setEditingDescription] = useState(false);
   const menuTrigger = useRef<HTMLButtonElement>(null);
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
@@ -193,7 +197,7 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
             isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
           )}
           onCloseAutoFocus={(event) => {
-            if (editingStages || editingMandate) event.preventDefault();
+            if (editingStages || editingMandate || editingDescription) event.preventDefault();
             else actions.onCloseAutoFocus(event);
           }}
         >
@@ -227,7 +231,17 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
               Edit mandate
             </DropdownMenuItem>
           )}
-          {(stagesEnabled || mandateEnabled) && <DropdownMenuSeparator />}
+          {descriptionEnabled && (
+            <DropdownMenuItem
+              className={itemClass}
+              data-testid="project-edit-description"
+              onSelect={() => setEditingDescription(true)}
+            >
+              <FileTextIcon className="size-3.5" />
+              Project description
+            </DropdownMenuItem>
+          )}
+          {(stagesEnabled || mandateEnabled || descriptionEnabled) && <DropdownMenuSeparator />}
           <DropdownMenuItem className={itemClass} onSelect={actions.openRename}>
             <PencilIcon className="size-3.5" />
             Rename project
@@ -248,6 +262,16 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
         <ProjectMandateDialog
           projectName={projectName}
           onClose={() => setEditingMandate(false)}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            menuTrigger.current?.focus();
+          }}
+        />
+      )}
+      {editingDescription && (
+        <ProjectDescriptionDialog
+          projectName={projectName}
+          onClose={() => setEditingDescription(false)}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
             menuTrigger.current?.focus();

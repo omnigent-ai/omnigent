@@ -2986,11 +2986,13 @@ export function useCreateProject() {
       name,
       config,
       idempotencyKey,
+      description,
     }: {
       name: string;
       config?: ProjectConfig;
       idempotencyKey?: string;
-    }) => apiCreateProject(name, config, idempotencyKey),
+      description?: string;
+    }) => apiCreateProject(name, config, idempotencyKey, description),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },

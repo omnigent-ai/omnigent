@@ -22,6 +22,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -45,7 +46,11 @@ import {
   sandboxHostChoiceProvider,
 } from "@/lib/hostPreferences";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import type { ProjectConfig } from "@/lib/projectsApi";
+import { PROJECT_DESCRIPTION_MAX_BYTES, type ProjectConfig } from "@/lib/projectsApi";
+import {
+  descriptionBytes,
+  PROJECT_DESCRIPTION_PLACEHOLDER,
+} from "@/projectHome/ProjectDescriptionDialog";
 import { useNavigate } from "@/lib/routing";
 import { projectOrchestratorPath } from "@/projectHome/projectHomeNavigation";
 import { ApiError } from "@/lib/sessionsApi";
@@ -190,6 +195,8 @@ export function NewProjectButton({
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
+  // Optional charter for people (mission, scope, roster); skippable, editable later.
+  const [description, setDescription] = useState("");
   const [icon, setIcon] = useState<string | undefined>(undefined);
   const [emojiOpen, setEmojiOpen] = useState(false);
   // Where the project runs: a host id, or a sandbox choice (see sandboxHostChoice).
@@ -243,6 +250,8 @@ export function NewProjectButton({
   const serverInfo = useServerInfo();
   const repositoryCreation =
     serverInfo !== "loading" && isFeatureEnabled(serverInfo, "project_repository_creation");
+  const descriptionEnabled = serverInfo !== "loading" && serverInfo.project_description === true;
+  const descriptionTooLarge = descriptionBytes(description) > PROJECT_DESCRIPTION_MAX_BYTES;
   const sandboxProviders =
     repositoryCreation && serverInfo.managed_sandboxes_enabled === true
       ? sandboxProviderOptions(serverInfo)
@@ -430,19 +439,27 @@ export function NewProjectButton({
       }
     }
     if (locking) config.repository = branch ? { url, branch } : { url };
+    const submittedDescription = descriptionEnabled ? description : "";
     creationAttempt.current = reuseCreationAttempt(creationAttempt.current, {
       name: trimmed,
       config,
+      description: submittedDescription.trim(),
     });
 
     createProject.mutate(
-      { name: trimmed, config, idempotencyKey: creationAttempt.current.key },
+      {
+        name: trimmed,
+        config,
+        idempotencyKey: creationAttempt.current.key,
+        description: submittedDescription,
+      },
       {
         onSuccess: (project) => {
           if (submission !== submissionGeneration.current) return;
           submissionGeneration.current += 1;
           setOpen(false);
           setName("");
+          setDescription("");
           setIcon(undefined);
           setRunOn(null);
           creationAttempt.current = undefined;
@@ -901,6 +918,46 @@ export function NewProjectButton({
               onOpenChange={onDropdownOpenChange}
             />
           </section>
+          {descriptionEnabled && (
+            <section aria-label="Description" className="border-t pt-4">
+              <Collapsible>
+                <CollapsibleTrigger
+                  data-testid="new-project-description-toggle"
+                  className={cn(
+                    PROJECT_CONTROL_CLASS,
+                    "group flex w-full cursor-pointer items-center gap-2 border border-input text-left outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
+                  )}
+                >
+                  <span>
+                    Description{" "}
+                    <span className="font-normal text-muted-foreground">(optional)</span>
+                  </span>
+                  <ChevronRightIcon className="ml-auto size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
+                </CollapsibleTrigger>
+                <CollapsibleContent className="mt-2 flex flex-col gap-1.5">
+                  <Textarea
+                    aria-label="Project description"
+                    data-testid="new-project-description"
+                    value={description}
+                    onChange={(event) => setDescription(event.target.value)}
+                    placeholder={PROJECT_DESCRIPTION_PLACEHOLDER}
+                    aria-invalid={descriptionTooLarge || undefined}
+                    className="min-h-32 text-sm"
+                  />
+                  <p
+                    className={cn(
+                      "text-xs",
+                      descriptionTooLarge ? "text-destructive" : "text-muted-foreground",
+                    )}
+                  >
+                    {descriptionTooLarge
+                      ? `Too long: keep it under ${PROJECT_DESCRIPTION_MAX_BYTES.toLocaleString()} bytes.`
+                      : "The project's charter for people. Skip it now and edit it later from the project menu, or let the Lead write it."}
+                  </p>
+                </CollapsibleContent>
+              </Collapsible>
+            </section>
+          )}
           {(submitError || createProject.isError) && (
             <p className="text-ui text-destructive" role="alert">
               {submitError ?? friendlyProjectError(createProject.error)}
@@ -924,6 +981,7 @@ export function NewProjectButton({
             loading={isPending}
             disabled={
               name.trim() === "" ||
+              descriptionTooLarge ||
               isPending ||
               repositorySubmitting ||
               orchestrator.loading ||
@@ -953,6 +1011,7 @@ export function NewProjectButton({
               e.stopPropagation();
               submissionGeneration.current += 1;
               setName("");
+              setDescription("");
               setIcon(undefined);
               setRunOn(hostId);
               creationAttempt.current = undefined;

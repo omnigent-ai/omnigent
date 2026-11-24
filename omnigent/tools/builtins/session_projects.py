@@ -3,6 +3,7 @@
 from typing import Any
 
 from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.entities.project import PROJECT_DESCRIPTION_MAX_BYTES
 from omnigent.tools.base import Tool
 
 MAX_PROJECT_NAME_LENGTH = 100
@@ -169,11 +170,13 @@ class SysProjectUpdateTool(Tool):
     @classmethod
     def description(cls) -> str:
         return (
-            "Rename one of the user's projects or change its emoji icon, the same as the "
-            "sidebar's project menu. Name the project as sys_project_list shows it, and "
-            "pass only the fields to change. Its sessions stay in it, and running "
-            "sessions keep working; status partial lists sessions_not_moved that "
-            "stayed under the old name."
+            "Rename one of the user's projects, change its emoji icon, or (from the "
+            "project's Lead session only) write its description: the charter people read "
+            "on the project's Summary, covering mission, scope, out of scope, how we'll "
+            "know it's working and the starting roster. Name the project as "
+            "sys_project_list shows it, and pass only the fields to change. Its sessions "
+            "stay in it, and running sessions keep working; status partial lists "
+            "sessions_not_moved that stayed under the old name."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -201,6 +204,15 @@ class SysProjectUpdateTool(Tool):
                             "type": "string",
                             "maxLength": MAX_PROJECT_ICON_LENGTH,
                             "description": 'One emoji to show for the project; "" removes it.',
+                        },
+                        "description": {
+                            "type": "string",
+                            "maxLength": PROJECT_DESCRIPTION_MAX_BYTES,
+                            "description": (
+                                "The project's description (charter) in markdown, for "
+                                'people. Separate from the mandate; "" clears it. Only the '
+                                "Lead may set it."
+                            ),
                         },
                     },
                     "required": ["project"],

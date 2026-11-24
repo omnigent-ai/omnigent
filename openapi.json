@@ -2569,6 +2569,18 @@
             "title": "Config",
             "type": "object"
           },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional charter for people reading the project. Trimmed; at most 8,000 UTF-8 bytes; blank stores none. People only; an agent's create is refused.",
+            "title": "Description"
+          },
           "mandate": {
             "anyOf": [
               {
@@ -7436,6 +7448,17 @@
       "ProjectStatusSummary": {
         "description": "A project's status over a UTC window; money is in integer US cents.",
         "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
           "generated_at": {
             "format": "int64",
             "title": "Generated At",
@@ -8790,6 +8813,11 @@
           "proactive_agent_available": {
             "default": false,
             "title": "Proactive Agent Available",
+            "type": "boolean"
+          },
+          "project_description": {
+            "default": false,
+            "title": "Project Description",
             "type": "boolean"
           },
           "project_mandate": {
@@ -16592,6 +16620,18 @@
             ],
             "description": "New config object to replace the stored one. `None` leaves it unchanged; an empty object `{}` clears the stored defaults.",
             "title": "Config"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New project description (charter for people). `None` leaves it unchanged; blank text clears it. Trimmed; at most 8,000 UTF-8 bytes. Only the owner, or an agent tool called from the Lead's session, may change it.",
+            "title": "Description"
           },
           "expected_main_session_id": {
             "anyOf": [

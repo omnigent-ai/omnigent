@@ -43,6 +43,10 @@ class Project:
     :param lead_removed: Whether the owner removed the built-in Lead persona.
     :param lead_charter: The owner's charter for the Lead, added to its session's
         instructions beside the orchestrator role, or ``None`` when unset.
+    :param description: The project's charter for people reading it (mission,
+        scope, out of scope, how we'll know it's working, starting roster),
+        written by the owner or the Lead, or ``None`` when unset. Unlike the
+        mandate it reaches no session's instructions.
     """
 
     id: str
@@ -58,6 +62,7 @@ class Project:
     router_identity_id: str | None = None
     lead_removed: bool = False
     lead_charter: str | None = None
+    description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,8 @@ PROJECT_MANDATE_MAX_STORED_BYTES = 16_383
 # Most UTF-8 bytes in one proposed addition, and how many may wait for review.
 MANDATE_PROPOSAL_MAX_BYTES = 2_000
 MANDATE_PROPOSALS_MAX_PENDING = 5
+# Most UTF-8 bytes a project description (its charter for people) may hold.
+PROJECT_DESCRIPTION_MAX_BYTES = 8_000
 
 
 # Most UTF-8 bytes an identity's persona may hold; added to its sessions' instructions.

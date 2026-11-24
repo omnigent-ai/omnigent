@@ -52,6 +52,7 @@ class ProjectStore(ABC):
         user_id: str | None,
         config: dict[str, Any] | None = None,
         mandate: str | None = None,
+        description: str | None = None,
     ) -> Project:
         """
         Insert a new, empty project.
@@ -63,6 +64,8 @@ class ProjectStore(ABC):
         :param config: Optional default session settings (opaque JSON object);
             ``None`` or empty stores no defaults.
         :param mandate: Optional guidance loaded into every project session;
+            trimmed, and blank stores none.
+        :param description: Optional charter for people reading the project;
             trimmed, and blank stores none.
         :returns: The newly created :class:`Project`.
         :raises OmnigentError: ``ALREADY_EXISTS`` if the owner already has a
@@ -190,6 +193,12 @@ class ProjectStore(ABC):
 
     def set_lead_charter(self, project_id: str, *, user_id: str | None, charter: str) -> Project:
         """Set the owner's charter for the built-in Lead; blank clears it (owner-only)."""
+        raise NotImplementedError
+
+    def set_description(
+        self, project_id: str, *, user_id: str | None, description: str
+    ) -> Project:
+        """Set the project's description for people; blank clears it (owner-only)."""
         raise NotImplementedError
 
     def set_lead_session_defaults(

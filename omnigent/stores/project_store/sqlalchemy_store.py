@@ -38,6 +38,7 @@ from omnigent.entities import Project
 from omnigent.entities.project import (
     MANDATE_PROPOSAL_MAX_BYTES,
     MANDATE_PROPOSALS_MAX_PENDING,
+    PROJECT_DESCRIPTION_MAX_BYTES,
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
     PROJECT_IDENTITY_MAX_COUNT,
     PROJECT_MANDATE_MAX_BYTES,
@@ -74,8 +75,11 @@ LEAD_REMOVED_CONFIG_KEY = "_omnigent_lead_removed"
 LEAD_SESSION_DEFAULT_KEYS = ("agent_id", "model", "effort")
 # Server-owned: the owner's charter for the Lead, set only through ``set_lead_charter``.
 LEAD_CHARTER_CONFIG_KEY = "_omnigent_lead_charter"
+# Server-owned: the project's description for people, set only through ``set_description``.
+DESCRIPTION_CONFIG_KEY = "_omnigent_description"
 _SERVER_CONFIG_KEYS = frozenset(
     {
+        DESCRIPTION_CONFIG_KEY,
         RETIRED_MAIN_SESSIONS_CONFIG_KEY,
         ROUTER_IDENTITY_CONFIG_KEY,
         LEAD_REMOVED_CONFIG_KEY,
@@ -109,6 +113,23 @@ def _with_retired(config: dict[str, Any], retired: list[str]) -> dict[str, Any]:
 def _lead_charter(raw: str | None) -> str | None:
     value = _decode_config(raw).get(LEAD_CHARTER_CONFIG_KEY)
     return value if isinstance(value, str) and value else None
+
+
+def _description(raw: str | None) -> str | None:
+    value = _decode_config(raw).get(DESCRIPTION_CONFIG_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def _normalize_description(description: str) -> str:
+    """Trim a project description and bound its UTF-8 size; blank clears it."""
+    trimmed = description.strip()
+    size = len(trimmed.encode("utf-8"))
+    if size > PROJECT_DESCRIPTION_MAX_BYTES:
+        raise OmnigentError(
+            f"project description too large ({size} bytes; max {PROJECT_DESCRIPTION_MAX_BYTES})",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return trimmed
 
 
 def _router_identity_id(raw: str | None) -> str | None:
@@ -288,6 +309,7 @@ def _to_entity(row: SqlProject) -> Project:
         router_identity_id=_router_identity_id(row.config),
         lead_removed=_decode_config(row.config).get(LEAD_REMOVED_CONFIG_KEY) is True,
         lead_charter=_lead_charter(row.config),
+        description=_description(row.config),
     )
 
 
@@ -418,6 +440,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         user_id: str | None,
         config: dict[str, Any] | None = None,
         mandate: str | None = None,
+        description: str | None = None,
     ) -> Project:
         """Insert a new, empty project.
 
@@ -427,7 +450,12 @@ class SqlAlchemyProjectStore(ProjectStore):
         ``SqlProject.__table_args__`` for why that is acceptable.
         """
         created_at = now_epoch()
-        encoded_config = _encode_config(_client_config(config))
+        stored_description = _normalize_description(description or "")
+        encoded_config = _encode_config(
+            {**_client_config(config), DESCRIPTION_CONFIG_KEY: stored_description}
+            if stored_description
+            else _client_config(config)
+        )
         stored_mandate = _normalize_mandate(mandate) if mandate is not None else None
 
         def write(session: Session) -> Project:
@@ -774,6 +802,37 @@ class SqlAlchemyProjectStore(ProjectStore):
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "set_project_lead_charter", write)
+
+    def set_description(
+        self, project_id: str, *, user_id: str | None, description: str
+    ) -> Project:
+        """Set the project's description (its charter for people); blank clears it.
+
+        Owner-only: members read it but can't change it. The route also lets the
+        Lead's session write it, since that session runs as the owner.
+
+        :raises OmnigentError: ``NOT_FOUND`` for an unknown project, ``FORBIDDEN``
+            for a shared member, ``INVALID_INPUT`` for oversized text.
+        """
+        stored = _normalize_description(description)
+        updated_at = now_epoch()
+
+        def write(session: Session) -> Project:
+            row = self._require_owner(
+                session, project_id, user_id, action="edit the project description"
+            )
+            config = _decode_config(row.config)
+            config.pop(DESCRIPTION_CONFIG_KEY, None)
+            if stored:
+                config[DESCRIPTION_CONFIG_KEY] = stored
+            encoded = _encode_config(config)
+            if row.config != encoded:
+                row.config = encoded
+                row.updated_at = updated_at
+            session.flush()
+            return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "set_project_description", write)
 
     def set_lead_session_defaults(
         self, project_id: str, *, user_id: str | None, values: dict[str, str | None]

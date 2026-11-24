@@ -140,6 +140,8 @@ export interface ServerInfo {
   project_ticket_summary?: boolean;
   /** Projects store a mandate loaded into every project session. */
   project_mandate?: boolean;
+  /** Projects store a description (charter) for people, written by the owner or Lead. */
+  project_description?: boolean;
   /**
    * Short name of the backing sandbox provider (e.g. ``"modal"``,
    * ``"lakebox"``) used to label the new-session sandbox option per
@@ -711,6 +713,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           project_ticket_stages: data.project_ticket_stages === true,
           project_ticket_summary: data.project_ticket_summary === true,
           project_mandate: data.project_mandate === true,
+          project_description: data.project_description === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           sandbox_providers: Array.isArray(data.sandbox_providers)

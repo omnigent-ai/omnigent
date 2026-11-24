@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.entities.project import PROJECT_DESCRIPTION_MAX_BYTES
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.session_host import normalize_session_id
@@ -681,8 +682,9 @@ async def execute_project_update(
     project's ``config``, which that PATCH replaces whole, so the other stored
     defaults are carried over.
 
-    :param args: Tool arguments: ``project`` (current name), optional ``name``
-        and ``icon`` (``""`` removes it).
+    :param args: Tool arguments: ``project`` (current name), optional ``name``,
+        ``icon`` (``""`` removes it) and ``description`` (``""`` clears it; the
+        server accepts it only from the project's Lead).
     :param client: HTTP client pointed at the Omnigent server.
     :param source_id: The calling session, sent as the orchestration source.
     :returns: JSON with ``project``, ``status`` and each requested field, or ``error``.
@@ -690,9 +692,21 @@ async def execute_project_update(
     current_name = _project_name_arg(args.get("project"))
     if current_name is None:
         return json.dumps({"error": "project must be a project name of at most 100 characters"})
-    if "name" not in args and "icon" not in args:
+    if "name" not in args and "icon" not in args and "description" not in args:
         return json.dumps(
-            {"project": current_name, "error": "nothing to update: pass name or icon"}
+            {"project": current_name, "error": "nothing to update: pass name, icon or description"}
+        )
+    description = args.get("description")
+    if "description" in args and (
+        not isinstance(description, str)
+        or len(description.strip().encode("utf-8")) > PROJECT_DESCRIPTION_MAX_BYTES
+    ):
+        return json.dumps(
+            {
+                "project": current_name,
+                "error": f"description must be text of at most {PROJECT_DESCRIPTION_MAX_BYTES} "
+                'bytes, or "" to clear it',
+            }
         )
     new_name = None
     if "name" in args:
@@ -758,6 +772,8 @@ async def execute_project_update(
             config["icon"] = icon
         if config != stored:
             payload["config"] = config
+    if isinstance(description, str) and description.strip() != (project.get("description") or ""):
+        payload["description"] = description
     status = "updated" if promoted else "unchanged"
     if payload:
         try:
@@ -782,6 +798,8 @@ async def execute_project_update(
         result: dict[str, Any] = {"project": current_name, "status": status}
         if "icon" in args:
             result["icon"] = icon or None
+        if "description" in args:
+            result["description_updated"] = "description" in payload
         return json.dumps(result)
     # Sessions that still belong through the legacy label would stay behind in a
     # folder under the old name, so file them into this project's row.

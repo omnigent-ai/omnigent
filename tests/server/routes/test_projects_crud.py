@@ -1355,3 +1355,62 @@ async def test_only_the_owner_picks_the_agent_of_sessions_that_run_as_them(
         path, json={"config": {**config, "agent_id": "owner-choice"}}, headers=owner
     )
     assert allowed.status_code == 200, allowed.text
+
+
+async def test_the_description_is_written_by_the_owner_or_the_lead_only(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """The charter round-trips trimmed; among agents only the Lead's session edits it."""
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "description": "  Ship it.  "}
+        )
+    ).json()
+    assert (created["description"], created["mandate"]) == ("Ship it.", None)
+    path = f"/v1/projects/{created['id']}"
+    lead = {ORCHESTRATION_SOURCE_HEADER: created["main_session_id"]}
+    written = await project_client.patch(
+        path, json={"description": "Mission: docs.\nOut of scope: code."}, headers=lead
+    )
+    assert written.status_code == 200
+    assert written.json()["description"] == "Mission: docs.\nOut of scope: code."
+    # A config replace keeps it, and the status summary returns it.
+    await project_client.patch(path, json={"config": {"model": "m"}})
+    summary = (await project_client.get(f"{path}/status/summary")).json()
+    assert summary["description"] == "Mission: docs.\nOut of scope: code."
+    persona = (
+        await project_client.post(f"{path}/identities", json={"name": "PM", "instructions": "y"})
+    ).json()
+    worker = {ORCHESTRATION_SOURCE_HEADER: persona["active_session_id"]}
+    refused = await project_client.patch(path, json={"description": "Mine."}, headers=worker)
+    assert refused.status_code == 403
+    refused = await project_client.post(
+        "/v1/projects", json={"name": "Q", "description": "x"}, headers=lead
+    )
+    assert refused.status_code == 403
+    too_large = await project_client.patch(path, json={"description": "x" * 8_001})
+    assert too_large.status_code == 400
+    cleared = await project_client.patch(path, json={"description": " "})
+    assert cleared.json()["description"] is None
+
+
+async def test_shared_members_read_the_description_but_cannot_edit_it(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    created = (
+        await multi_user_client.post(
+            "/v1/projects",
+            json={"name": "Shared", "description": "Mission."},
+            headers=_as_user(ALICE),
+        )
+    ).json()
+    path = f"/v1/projects/{created['id']}"
+    await multi_user_client.post(f"{path}/shares", json={"user_id": BOB}, headers=_as_user(ALICE))
+    read = await multi_user_client.get(path, headers=_as_user(BOB))
+    assert (read.json()["description"], read.json()["shared"]) == ("Mission.", True)
+    refused = await multi_user_client.patch(
+        path, json={"description": "Bob's."}, headers=_as_user(BOB)
+    )
+    assert refused.status_code == 403
+    renamed = await multi_user_client.patch(path, json={"name": "Shared 2"}, headers=_as_user(BOB))
+    assert renamed.json()["description"] == "Mission."

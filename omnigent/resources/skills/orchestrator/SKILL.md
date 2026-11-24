@@ -162,6 +162,14 @@ proposals.
 - Do not propose one-off requests, ticket-specific details, text already in the
   mandate, or anything the user did not ask to keep.
 
+## Write the project description
+
+The project description is its charter for people, separate from the mandate:
+mission, scope, out of scope, how we'll know it's working, and the starting
+roster. When a project starts without one, or its goals change, draft it from
+what the user told you and save it with `sys_project_update`'s `description`.
+Only the owner and you, the Lead, can edit it; members read it on the project.
+
 ## Capture ticket work
 
 - Read relevant tickets with `sys_ticket_list` and `sys_ticket_get` before

@@ -78,6 +78,8 @@ class ProjectStatusSummary(BaseModel):
     totals: ProjectStatusTotals
     members: list[ProjectStatusMember]
     sources: ProjectStatusSources
+    # The project's charter for people (mission, scope, roster), or None when unset.
+    description: str | None = None
 
 
 def tickets_done_by_member(
@@ -178,7 +180,7 @@ def create_project_status_router(
         prs = await asyncio.to_thread(_measure, active.prs_merged, "prs_merged", project, period)
         seen = {*tickets_done.by_member, *spend.by_member, *prs.by_member}
         roster = summary_members(project, identities, [share.user_id for share in shares], seen)
-        return build_summary(
+        summary = build_summary(
             project,
             period,
             roster=roster,
@@ -186,5 +188,6 @@ def create_project_status_router(
             spend=spend,
             prs_merged=prs,
         )
+        return {**summary, "description": project.description}
 
     return router

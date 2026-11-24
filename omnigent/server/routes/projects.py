@@ -25,7 +25,7 @@ from typing import Any
 from fastapi import APIRouter, Query, Request
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.entities import Project
+from omnigent.entities import Conversation, Project
 from omnigent.entities.project import (
     PROJECT_IDENTITY_LABEL_KEY,
     MandateProposal,
@@ -103,6 +103,7 @@ def _to_response(project: Project) -> dict[str, Any]:
         "config": project.config,
         "mandate": project.mandate,
         "mandate_proposals": [_proposal_response(entry) for entry in project.mandate_proposals],
+        "description": project.description,
         "main_session_id": project.main_session_id,
         "owner_user_id": project.user_id,
         # Deprecated response alias; remove in 0.25.0.
@@ -216,6 +217,50 @@ def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
         )
 
 
+def _is_lead_session(project: Project, session: Conversation | None) -> bool:
+    """Whether *session* (or the root it runs under) is the project's Lead."""
+    if session is None:
+        return False
+    root_id = session.root_conversation_id or session.id
+    return root_id == project.main_session_id or root_id in project.retired_main_session_ids
+
+
+def _refuse_description_write(
+    request: Request,
+    project: Project | None,
+    description: str | None,
+    *,
+    user_id: str | None,
+    conversation_store: ConversationStore | None,
+) -> None:
+    """Keep the description the owner's or the Lead's: members and other agents only read it.
+
+    :param project: The stored project, or ``None`` on create (agents may not set it then).
+    :param description: The requested description, or ``None`` when unchanged.
+    :raises OmnigentError: 403 for a shared member or an agent outside the Lead's session.
+    """
+    if description is None:
+        return
+    source_id = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+    if source_id is not None:
+        session = None
+        if conversation_store is not None and project is not None:
+            with contextlib.suppress(InvalidUuidError, ValueError):
+                session = conversation_store.get_conversation(
+                    normalize_uuid(source_id) or source_id
+                )
+        if project is None or not _is_lead_session(project, session):
+            raise OmnigentError(
+                "Only the project owner or its Lead can change the project description",
+                code=ErrorCode.FORBIDDEN,
+            )
+    if project is not None and project.user_id != user_id:
+        raise OmnigentError(
+            "Only the project owner or its Lead can change the project description",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+
 def create_projects_router(
     project_store: ProjectStore,
     auth_provider: AuthProvider | None = None,
@@ -276,6 +321,9 @@ def create_projects_router(
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
         _refuse_agent_mandate_write(request, body.mandate)
+        _refuse_description_write(
+            request, None, body.description, user_id=user_id, conversation_store=None
+        )
         _refuse_owner_config_write(request, body.config, None, is_owner=True)
         key = creation_key(request) if "Idempotency-Key" in request.headers else None
         project_id = creation_id("project", user_id, key) if key else uuid.uuid4().hex
@@ -290,6 +338,7 @@ def create_projects_router(
                     user_id,
                     body.config,
                     body.mandate,
+                    description=body.description,
                 )
                 created_here = True
             except (IntegrityError, OmnigentError) as exc:
@@ -428,6 +477,18 @@ def create_projects_router(
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
         _refuse_agent_mandate_write(request, body.mandate)
+        if body.description is not None:
+            current = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+            if current is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            await asyncio.to_thread(
+                _refuse_description_write,
+                request,
+                current,
+                body.description,
+                user_id=user_id,
+                conversation_store=conversation_store,
+            )
         if body.config is not None:
             stored = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
             is_owner = stored is None or stored.user_id == user_id
@@ -457,6 +518,15 @@ def create_projects_router(
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if body.description is not None and body.description.strip() != (
+            project.description or ""
+        ):
+            project = await asyncio.to_thread(
+                project_store.set_description,
+                project_id,
+                user_id=user_id,
+                description=body.description,
+            )
         # A rename/config change is only ever seen by other connected clients
         # (another tab, the mobile app) if it is pushed; nothing else refreshes
         # their projects cache until a full reload.

@@ -87,6 +87,11 @@ export interface Project {
   mandate?: string | null;
   /** Proposed mandate additions awaiting the owner, oldest first. */
   mandate_proposals?: MandateProposal[];
+  /**
+   * The project's charter for people (mission, scope, out of scope, how we'll know
+   * it's working, starting roster); `null` when unset. Only the owner or Lead edits it.
+   */
+  description?: string | null;
   /** The owning user; `null` in single-user mode. */
   owner_user_id?: string | null;
   /** True when another user owns the project and shared it with the caller. */
@@ -157,6 +162,9 @@ export const PROJECT_MANDATE_MAX_BYTES = 32_000;
 /** Above this size the mandate dialog notes that every project session pays for it. */
 export const PROJECT_MANDATE_LARGE_BYTES = 16_000;
 
+/** Most UTF-8 bytes a description may hold; mirrors `PROJECT_DESCRIPTION_MAX_BYTES`. */
+export const PROJECT_DESCRIPTION_MAX_BYTES = 8_000;
+
 interface ProjectListResponse {
   object: "list";
   data: Project[];
@@ -194,6 +202,7 @@ export async function createProject(
   name: string,
   config?: ProjectConfig,
   idempotencyKey?: string,
+  description?: string,
 ): Promise<Project> {
   const res = await authenticatedFetch("/v1/projects", {
     method: "POST",
@@ -201,7 +210,11 @@ export async function createProject(
       "Content-Type": "application/json",
       ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
     },
-    body: JSON.stringify(config ? { name, config } : { name }),
+    body: JSON.stringify({
+      name,
+      ...(config ? { config } : {}),
+      ...(description?.trim() ? { description } : {}),
+    }),
   });
   if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
@@ -256,6 +269,17 @@ export async function updateProjectMandate(id: string, mandate: string): Promise
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mandate }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as Project;
+}
+
+/** Replace a project's description (charter for people); blank clears it. Owner-only. */
+export async function updateProjectDescription(id: string, description: string): Promise<Project> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ description }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as Project;
