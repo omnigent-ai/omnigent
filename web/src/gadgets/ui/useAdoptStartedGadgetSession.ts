@@ -1,9 +1,4 @@
-// Links a gadget to the session this tab creates from its New session (`gadget_start`), and
-// only that one: the create that begins while that New session is open is the gadget's
-// attempt, and only the session it makes is linked. Its requests count as delivered only once
-// the session is linked and the server accepted a first message that carries them.
-// An existing session, a session another create made, or a create that failed stays unlinked.
-// A gadget made only to be built there is deleted again if New session is left unsent.
+// Links a gadget to its newly created session and discards an unbuilt gadget left unsent.
 import { useEffect } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 

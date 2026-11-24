@@ -1,5 +1,5 @@
-// Decides from host-side state alone whether a frame call that acts for the viewer follows a
-// real, unused gesture inside the gadget. designs/GADGETS.md explains each condition.
+// Allows focused-frame calls during a rate-limited activation window. designs/GADGETS.md
+// explains each condition.
 
 const MIN_CALL_INTERVAL_MS = 1000;
 // About how long browsers keep transient activation after a click.

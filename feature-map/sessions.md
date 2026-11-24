@@ -335,7 +335,9 @@ the header menu), and each place is a separate entry point.
   **Build**, or open a template's **Preview** and press **Use template**; Blank
   is made in one click. With gadgets on, sessions keep this side panel even when
   `workspace_sidebar_v2` is on, because gadget tabs and full screen live only in
-  it.
+  it. A gadget's toolbar renames it in place from its name, and has **Comments**
+  (where **Address all** sends the open comments to its session), **Share**, and a
+  **⋯** menu with **Gadget details** and **Delete gadget**.
 
 ## How to get to it (user POV)
 

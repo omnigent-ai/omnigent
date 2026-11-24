@@ -404,9 +404,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   (`web/src/components/composer/useComposerAddPaletteCommands.test.tsx`).
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
-- `gadget-quotes`: selecting text inside a gadget offers **Reply** and **Ask in
-  side chat**, which quote the selection, with where it is in the gadget, in the
-  session's composer or a side chat. New session opened from a full screen
+- `gadget-quotes`: selecting text inside a gadget offers **Reply**, **Ask in
+  side chat** and **Add comment**; the first two quote the selection, with where it
+  is in the gadget, in the session's composer or a side chat, and the third saves a
+  comment on it in the gadget's Comments. New session opened from a full screen
   gadget keeps the gadget full screen; its **Create session** menu holds the
   host, permission and harness pickers in one row and starts the session there.
 
