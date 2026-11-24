@@ -549,10 +549,8 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
             )
         else:
             effect = "keeping the specifics of the current prompt below"
-        subject = f"the saved workflow {workflow_id}" if workflow_id else "its saved workflow"
-        prompt = (
-            f"Runs {subject}. The server writes the prompt that runs it, {effect}.\n{supplied}"
-        )
+        runs = f"the saved workflow {workflow_id}" if workflow_id else "its saved workflow"
+        prompt = f"Runs {runs}. The server writes the prompt that runs it, {effect}.\n{supplied}"
     else:
         prompt = supplied
     if "workflow_details" in args:

@@ -1034,6 +1034,7 @@ def test_a_details_only_update_says_what_replaces_the_current_specifics(
             },
         }
     )
+    assert "Agent wants to update scheduled task st_1." in result["reason"]
     instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
     assert instructions.startswith("Runs its saved workflow.")
     assert effect in instructions

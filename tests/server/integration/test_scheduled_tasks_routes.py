@@ -4652,10 +4652,10 @@ async def test_an_unchanged_workflow_doesnt_block_other_edits_once_it_is_gone(
     url = f"/v1/scheduled-tasks/{task['id']}"
     deleted = await client.delete(f"/v1/workflows/{workflow_id}", headers=_headers())
     assert deleted.status_code == 200, deleted.text
-    # Resending the workflow and details it runs leaves them as they are.
+    # Resending the workflow and details it runs, however they're trimmed, leaves them be.
     renamed = await client.patch(
         url,
-        json={"name": "renamed", "workflow_id": workflow_id, "workflow_details": "Only bugs"},
+        json={"name": "renamed", "workflow_id": workflow_id, "workflow_details": " Only bugs\n"},
         headers=_headers(),
     )
     assert renamed.status_code == 200, renamed.text

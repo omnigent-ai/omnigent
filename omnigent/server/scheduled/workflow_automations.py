@@ -161,6 +161,11 @@ def workflow_skill_prefix(harness: str | None) -> str:
     return "$" if harness == "codex-native" else "/"
 
 
+def normalize_workflow_details(details: str) -> str:
+    """*details* as a run message carries them, trimmed as JavaScript's trim does."""
+    return details.strip(_JS_WHITESPACE)
+
+
 def saved_workflow_run_message(prefix: str, name: str, workflow_id: str, details: str) -> str:
     """The prompt that runs a saved workflow, as ``savedWorkflowMessage`` in
     web/src/lib/workflow.ts writes it for an automation.

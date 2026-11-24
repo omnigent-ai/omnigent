@@ -97,6 +97,7 @@ from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.scheduled.workflow_automations import (
     CONTINUED_SESSION_MESSAGE,
     is_bare_saved_workflow_run,
+    normalize_workflow_details,
     saved_workflow_id,
     saved_workflow_run,
     saved_workflow_run_message,
@@ -1314,7 +1315,7 @@ def create_scheduled_tasks_router(
         )
         saved_details = saved_run.details if saved_run is not None else ""
         details_given = "workflow_details" in fields
-        details = fields.pop("workflow_details", None) or ""
+        details = normalize_workflow_details(fields.pop("workflow_details", None) or "")
         prompt = fields.get("prompt")
         prompt_changed = prompt is not None and prompt != existing.prompt
         if "workflow_id" in fields and fields["workflow_id"] is None:
