@@ -6481,20 +6481,18 @@ async def _post_external_permission_mode_change(
 
 def _read_pane_observation(
     bridge_dir: Path, *, session_id: str
-) -> tuple[PaneSignals, HookForwardState]:
-    """Snapshot complete hooks before capturing the pane, starting at the durable checkpoint."""
+) -> tuple[PaneSignals, HookForwardState | None]:
+    """Capture the pane, deferring retry handling if parent ownership has not been forwarded."""
     checkpoint = _read_hook_state(bridge_dir)
     if checkpoint is None:
         checkpoint = HookForwardState(event_cursor=0, byte_offset=0)
     else:
         checkpoint = _validated_hook_state(bridge_dir, checkpoint, session_id=session_id)
+    signals = read_pane_signals(bridge_dir)
     hooks = _read_hook_events_for_state(bridge_dir, checkpoint)
-    observed = HookForwardState(
-        event_cursor=hooks.event_cursor,
-        byte_offset=hooks.byte_offset,
-        cursor_fingerprint=_jsonl_cursor_fingerprint(bridge_dir / _HOOKS_FILE, hooks.byte_offset),
-    )
-    return read_pane_signals(bridge_dir), observed
+    if _has_parent_turn_transition(bridge_dir, hooks.records):
+        return signals, None
+    return signals, checkpoint
 
 
 async def _forward_pane_signals(
@@ -6535,15 +6533,16 @@ async def _forward_pane_signals(
     await _relay_btw_overlay(
         client, session_id=session_id, overlay=signals.btw_overlay, dedupe=dedupe
     )
-    await _stop_rejected_api_retry(
-        client,
-        session_id=session_id,
-        bridge_dir=bridge_dir,
-        retry=signals.api_retry,
-        observed_hooks=observed_hooks,
-        response_id=response_id,
-        dedupe=dedupe,
-    )
+    if observed_hooks is not None:
+        await _stop_rejected_api_retry(
+            client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            retry=signals.api_retry,
+            observed_hooks=observed_hooks,
+            response_id=response_id,
+            dedupe=dedupe,
+        )
 
 
 async def _stop_rejected_api_retry(
@@ -6652,18 +6651,23 @@ def _interrupt_api_retry_if_current(
     ):
         return False
     hooks = _read_hook_events_for_state(bridge_dir, observed_hooks)
+    if _has_parent_turn_transition(bridge_dir, hooks.records):
+        return False
+    inject_interrupt(bridge_dir, timeout_s=1.0)
+    return True
+
+
+def _has_parent_turn_transition(bridge_dir: Path, records: Sequence[ClaudeHookRecord]) -> bool:
+    """Detect parent ownership changes while allowing same-turn compaction and child hooks."""
     parent_ids = read_seen_claude_session_ids(bridge_dir)
-    if any(
+    return any(
         (
             record.event_name in {"UserPromptSubmit", "Stop", "StopFailure"}
             or (record.event_name == "SessionStart" and record.source != "compact")
         )
         and not _is_subagent_hook_record(record, parent_claude_session_ids=parent_ids)
-        for record in hooks.records
-    ):
-        return False
-    inject_interrupt(bridge_dir, timeout_s=1.0)
-    return True
+        for record in records
+    )
 
 
 async def _relay_permission_mode(

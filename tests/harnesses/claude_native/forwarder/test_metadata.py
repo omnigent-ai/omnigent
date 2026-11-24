@@ -1247,6 +1247,7 @@ async def test_forward_pane_signals_leaves_other_api_retries_running(
         "compact-during-report",
         "restarted",
         "restarted-followup",
+        "pending-followup",
     ],
 )
 @pytest.mark.asyncio
@@ -1257,7 +1258,13 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
 ) -> None:
     """Report before Escape, recover delivery failures, and protect replacement turns."""
     recover_failures = scenario == "unchanged"
-    should_interrupt = scenario in {"unchanged", "compacted", "compact-during-report", "restarted"}
+    should_interrupt = scenario in {
+        "unchanged",
+        "compacted",
+        "compact-during-report",
+        "restarted",
+        "pending-followup",
+    }
     timeline: list[str] = []
     bridge_dir, panes, sent_keys = _fake_tmux_pane(
         monkeypatch,
@@ -1285,6 +1292,7 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
         return httpx.Response(200, json={})
 
     dedupe = forwarder._ForwardDedupeState()
+    response_id = "resp_1"
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
@@ -1328,8 +1336,25 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
                 session_id="conv1",
                 bridge_dir=bridge_dir,
                 dedupe=dedupe,
-                response_id="resp_1",
+                response_id=response_id,
             )
+
+        if scenario == "pending-followup":
+            record_hook_event(
+                bridge_dir,
+                {"hook_event_name": "UserPromptSubmit", "session_id": "parent-session"},
+            )
+            finish_report.set()
+            await _poll()
+            assert _failed_status_posts(calls) == []
+            assert sent_keys == []
+            assert dedupe.prompt_submit_cursor == 1
+            finish_report.clear()
+            restored = forwarder._read_hook_state(bridge_dir)
+            assert restored is not None
+            await _forward_hooks(restored)
+            assert dedupe.prompt_submit_cursor == 2
+            response_id = "resp_2"
 
         if recover_failures:
             await _poll()
@@ -1370,7 +1395,7 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
         await _poll()
 
     assert [post["response_id"] for post in _failed_status_posts(calls)] == [
-        "resp_1"
+        response_id
     ] * report_count
     escape_count = (2 if recover_failures else 1) if should_interrupt else 0
     assert timeline == [
