@@ -267,6 +267,7 @@ class TerminalRegistry:
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        program_status_forward_app: str | None = None,
         model_access_factory: Callable[[], ClaudeModelAccess | None] | None = None,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
@@ -280,6 +281,7 @@ class TerminalRegistry:
         was created.
 
         :param program_status_app: Opt-in runtime PTY relay application identity.
+        :param program_status_forward_app: Forward native reports without runtime observation.
         :param conversation_id: The owning conversation id, e.g.
             ``"conv_abc123"``.
         :param terminal_name: The terminal's spec name from
@@ -387,6 +389,7 @@ class TerminalRegistry:
         stage = "terminal_model_access"
         try:
             created.instance.program_status_app = program_status_app
+            created.instance.program_status_forward_app = program_status_forward_app
             created.instance.lifecycle_trace.transfer_session(conversation_id)
             policy = created.instance.sandbox_policy
             if policy is not None and policy.active:

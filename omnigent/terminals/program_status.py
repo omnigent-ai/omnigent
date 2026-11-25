@@ -20,6 +20,7 @@ _STATES = {"idle", "working", "done", "blocked", "error", "clear"}
 _KINDS = {"permission", "question", "auth"}
 _VALUE = re.compile(r"[A-Za-z0-9_.,+/=-]*")
 _SEGMENT = re.compile(r"[A-Za-z0-9_.+-]{1,32}")
+_TMUX_PREFIX = b"\x1bPtmux;"
 _REPLY = b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
 # A child that stops reading its input cannot queue query replies without bound.
 _UNSENT_INPUT_LIMIT = 1 << 20
@@ -34,11 +35,14 @@ class ProgramStatus:
     id: str | None = None
     kind: str | None = None
     message: str | None = None
+    title: str | None = None
 
 
 def parse_report(body: bytes) -> ProgramStatus | None:
     """Parse an OSC body, validating all fields before applying any of it."""
-    text = body.decode("ascii", errors="replace")
+    if any(not 32 <= byte <= 126 for byte in body):
+        return None
+    text = body.decode("ascii")
     pairs: dict[str, str] = {}
     decoded: dict[str, str] = {}
     for pair in text.split(":"):
@@ -59,7 +63,7 @@ def parse_report(body: bytes) -> ProgramStatus | None:
         if sep and key == "app" and len(value) > 32:
             return None
         if not (sep and re.fullmatch("[a-z]+", key) and _VALUE.fullmatch(value)):
-            continue
+            return None
         if key in {"msg", "title"}:
             encoded_limit, decoded_limit = (2732, 2048) if key == "msg" else (256, 192)
             if len(value) > encoded_limit:
@@ -80,7 +84,7 @@ def parse_report(body: bytes) -> ProgramStatus | None:
     record_id = pairs.get("id")
     app = pairs.get("app")
     if app is not None and not _SEGMENT.fullmatch(app):
-        app = None
+        return None
     kind = pairs.get("kind") if state == "blocked" else None
     return ProgramStatus(
         state=state,
@@ -88,7 +92,23 @@ def parse_report(body: bytes) -> ProgramStatus | None:
         id=record_id,
         kind=kind if kind in _KINDS else None,
         message=decoded.get("msg"),
+        title=decoded.get("title"),
     )
+
+
+def _serialize_report(report: ProgramStatus, ending: bytes) -> bytes:
+    """Build the forwarded report from validated fields, never child escape bytes."""
+    fields = [
+        ("state", report.state),
+        ("app", report.app),
+        ("id", report.id),
+        ("kind", report.kind),
+    ]
+    for key, text in (("title", report.title), ("msg", report.message)):
+        if text is not None:
+            fields.append((key, base64.b64encode(text.encode("utf-8")).decode("ascii")))
+    body = ":".join(f"{key}={value}" for key, value in fields if value is not None)
+    return b"\x1b]7501;" + body.encode("ascii") + ending
 
 
 class ProgramStatusParser:
@@ -96,6 +116,7 @@ class ProgramStatusParser:
 
     Other bytes pass through unchanged. Oversized strings stop being buffered;
     parsing resumes after their terminator, without interpreting their contents.
+    Forwarding mode discards child-supplied tmux wrappers.
     """
 
     def __init__(
@@ -104,17 +125,21 @@ class ProgramStatusParser:
         on_report: Callable[[ProgramStatus], None],
         on_query: Callable[[], None],
         on_reset: Callable[[bool], None],
+        tmux_passthrough: bool = False,
     ) -> None:
         self._report = on_report
         self._query = on_query
         self._reset = on_reset
+        self._tmux_passthrough = tmux_passthrough
         self._state = "ground"
         self._osc = False
         self._held = bytearray()
         self._overflow = False
 
     def feed(self, data: bytes) -> bytes:
-        """Return pass-through output, withholding only OSC 7501 queries."""
+        """Consume queries and optionally wrap valid reports for tmux, in order."""
+        if self._state == "ground" and b"\x1b" not in data:
+            return data
         output = bytearray()
         for byte in data:
             if self._state == "ground":
@@ -130,7 +155,9 @@ class ProgramStatusParser:
                     self._overflow = False
                     self._state = "string"
                     self._held.append(byte)
-                    if not self._osc:
+                    if byte == ord("P") and self._tmux_passthrough:
+                        self._state = "dcs_prefix"
+                    elif not self._osc:
                         output.extend(self._held)
                         self._held.clear()
                 else:
@@ -143,6 +170,29 @@ class ProgramStatusParser:
                         self._held.append(byte)
                     else:
                         output.append(byte)
+            elif self._state == "dcs_prefix":
+                self._held.append(byte)
+                if _TMUX_PREFIX.startswith(self._held):
+                    if len(self._held) == len(_TMUX_PREFIX):
+                        self._held.clear()
+                        self._state = "discard"
+                else:
+                    output.extend(self._held)
+                    self._held.clear()
+                    if byte in (24, 26):
+                        self._state = "ground"
+                    elif byte == 27:
+                        self._state = "string_escape"
+                    else:
+                        self._state = "string"
+            elif self._state in {"discard", "discard_escape"}:
+                # Doubled escapes belong to the payload, not the wrapper's terminator.
+                if byte in (24, 26) or (self._state == "discard_escape" and byte == 92):
+                    self._state = "ground"
+                elif self._state == "discard" and byte == 27:
+                    self._state = "discard_escape"
+                else:
+                    self._state = "discard"
             else:
                 if self._osc and not self._overflow:
                     self._held.append(byte)
@@ -157,12 +207,11 @@ class ProgramStatusParser:
                     self._osc and byte == 7
                 )
                 if terminated or cancelled:
-                    consumed = False
+                    replacement = None
                     if terminated and self._osc and not self._overflow:
                         end = -1 if byte == 7 else -2
-                        consumed = self._finish(bytes(self._held[2:end]))
-                    if not consumed:
-                        output.extend(self._held)
+                        replacement = self._finish(bytes(self._held[2:end]))
+                    output.extend(self._held if replacement is None else replacement)
                     self._held.clear()
                     self._state = "ground"
                 else:
@@ -171,22 +220,29 @@ class ProgramStatusParser:
 
     def finish(self) -> bytes:
         """Flush an incomplete escape sequence on process exit."""
-        pending = bytes(self._held)
+        pending = b"" if self._state == "dcs_prefix" else bytes(self._held)
         self._held.clear()
         self._state = "ground"
         return pending
 
-    def _finish(self, body: bytes) -> bool:
+    def _finish(self, body: bytes) -> bytes | None:
         if body == b"7501;?":
             self._query()
-            return True
+            return b""
         if body.startswith(b"7501;"):
             report = parse_report(body[5:])
             if report is not None:
                 self._report(report)
+                if self._tmux_passthrough:
+                    ending = b"\x07" if self._held[-1] == 7 else b"\x1b\\"
+                    return (
+                        _TMUX_PREFIX
+                        + _serialize_report(report, ending).replace(b"\x1b", b"\x1b\x1b")
+                        + b"\x1b\\"
+                    )
         elif body == b"133;A" or body.startswith(b"133;A;"):
             self._reset(False)
-        return False
+        return None
 
 
 class ProgramStatusReader:
@@ -240,7 +296,7 @@ def _write_all(fd: int, data: bytes) -> None:
         data = data[os.write(fd, data) :]
 
 
-def relay(path: Path, app: str, command: list[str]) -> int:
+def relay(path: Path | None, app: str, command: list[str]) -> int:
     """Run a command in an inner PTY, answering queries before tmux can answer DA.
 
     The relay stays outside the command's existing sandbox wrapper. It owns no
@@ -274,6 +330,8 @@ def relay(path: Path, app: str, command: list[str]) -> int:
     unsent_input = bytearray()
 
     def save() -> None:
+        if path is None:
+            return
         temporary = path.with_suffix(".tmp")
         try:
             temporary.write_text(
@@ -328,7 +386,9 @@ def relay(path: Path, app: str, command: list[str]) -> int:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signum)
 
-    parser = ProgramStatusParser(on_report=record, on_query=reply, on_reset=reset)
+    parser = ProgramStatusParser(
+        on_report=record, on_query=reply, on_reset=reset, tmux_passthrough=True
+    )
     try:
         os.set_blocking(master, False)
         tty.setraw(0)
@@ -392,8 +452,9 @@ def relay(path: Path, app: str, command: list[str]) -> int:
         os.close(master)
         with contextlib.suppress(OSError, termios.error):
             termios.tcsetattr(0, termios.TCSANOW, original)
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+        if path is not None:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
     return os.waitstatus_to_exitcode(exit_status)
 
 
@@ -403,7 +464,7 @@ def main() -> None:
     import signal
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--state-file", type=Path, required=True)
+    parser.add_argument("--state-file", type=Path)
     parser.add_argument("--app", required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()

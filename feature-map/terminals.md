@@ -132,6 +132,8 @@ unsupported explanation.
 
 **Local terminal:** a native harness launched from the CLI runs in the user's
 own terminal; see [native harnesses](./native-harnesses.md).
+OSC 7501 [forwarding to attached terminals](./native-harnesses.md#status-reports-for-attached-terminals)
+is separate from Omnigent's own session-status observation.
 
 ## Driving it with the repro environment
 
