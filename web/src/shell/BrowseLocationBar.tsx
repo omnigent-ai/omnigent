@@ -59,10 +59,13 @@ export function BrowseLocationBar({
   error,
 }: BrowseLocationBarProps) {
   const [open, setOpen] = useState(false);
-  const canRoam = canBrowseOutside && (reach?.unconfined ?? false) && hostId !== null;
-  const parent = parentPath(current);
-  const navigableParent =
-    parent !== null && (canRoam || pathIsWithin(parent, workspace)) ? parent : null;
+  const { canRoam, parent: navigableParent } = browseNavigation({
+    current,
+    workspace,
+    hostId,
+    canBrowseOutside,
+    reach,
+  });
 
   if (!canRoam) {
     return (
@@ -176,6 +179,29 @@ function ParentFolderButton({
       </Tooltip>
     </TooltipProvider>
   );
+}
+
+/**
+ * Where the files header can step from ``current``: its parent, while moving up stays
+ * inside the workspace or this viewer may roam the host, and back to the workspace root.
+ */
+export function browseNavigation({
+  current,
+  workspace,
+  hostId,
+  canBrowseOutside,
+  reach,
+}: Pick<
+  BrowseLocationBarProps,
+  "current" | "workspace" | "hostId" | "canBrowseOutside" | "reach"
+>): { canRoam: boolean; parent: string | null; workspaceRoot: string | null } {
+  const canRoam = canBrowseOutside && (reach?.unconfined ?? false) && hostId !== null;
+  const parent = parentPath(current);
+  return {
+    canRoam,
+    parent: parent !== null && (canRoam || pathIsWithin(parent, workspace)) ? parent : null,
+    workspaceRoot: current === workspace ? null : workspace,
+  };
 }
 
 /**
