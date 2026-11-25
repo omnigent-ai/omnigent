@@ -497,6 +497,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_btw_sidechat as _publish_btw_sidechat,
     _publish_session_created as _publish_session_created,
     _publish_session_superseded as _publish_session_superseded,
+    _publish_inputs_failed as _publish_inputs_failed,
     _publish_status as _publish_status,
     _publish_terminal_pending as _publish_terminal_pending,
     _query_host_runner_status as _query_host_runner_status,

@@ -1816,6 +1816,8 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
 
 /** The server's ErrorCode.HOST_OFFLINE: a held send whose host is offline. */
 export const HOST_OFFLINE_CODE = "host_offline";
+/** The server's ErrorCode.QUEUE_FULL: the session already holds the most queued messages. */
+export const QUEUE_FULL_CODE = "queue_full";
 /** A request answered by a sign-in page instead of the API. */
 export const SIGN_IN_EXPIRED_CODE = "sign_in_expired";
 

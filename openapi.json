@@ -9811,6 +9811,7 @@
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
+            "session.inputs.failed": "#/components/schemas/SessionInputsFailedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
             "session.journal.appended": "#/components/schemas/SessionJournalAppendedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
@@ -9873,6 +9874,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionTerminalPendingEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionInputsFailedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionSandboxStatusEvent"
@@ -11908,6 +11912,41 @@
           "data"
         ],
         "title": "SessionInputConsumedPayload",
+        "type": "object"
+      },
+      "SessionInputsFailedEvent": {
+        "description": "The server gave up on one or more of the session's queued inputs.\n\nEmitted when a saved input fails without a session status change, e.g.\na native submission whose transcript receipt never came. Clients re-read\nthe snapshot's `failed_inputs` so the bubble shows as not delivered.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients read `failed_inputs` from the session snapshot.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.inputs.failed",
+            "description": "Always `\"session.inputs.failed\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionInputsFailedEvent",
         "type": "object"
       },
       "SessionInterruptedEvent": {

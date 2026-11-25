@@ -300,6 +300,7 @@ from omnigent.server.schemas import (
     SessionGitOptions,
     SessionInputConsumedEvent,
     SessionInputConsumedPayload,
+    SessionInputsFailedEvent,
     SessionInterruptedEvent,
     SessionInterruptedPayload,
     SessionListItem,
@@ -5644,6 +5645,16 @@ def _publish_terminal_pending(session_id: str, pending: bool) -> None:
         conversation_id=session_id,
         pending=pending,
     )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_inputs_failed(session_id: str) -> None:
+    """
+    Tell connected clients that some of the session's queued inputs failed.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    """
+    event = SessionInputsFailedEvent(type="session.inputs.failed", conversation_id=session_id)
     session_stream.publish(session_id, event.model_dump())
 
 

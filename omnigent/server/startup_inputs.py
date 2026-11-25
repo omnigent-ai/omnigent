@@ -1085,7 +1085,11 @@ class ManagedStartupInputs:
         self, session_id: str, failure_id: str, message: str, *, publish_status: bool = True
     ) -> None:
         """Record a startup failure in the transcript and, by default, the session's status."""
-        from omnigent.server.routes.sessions import _publish_sandbox_status, _publish_status
+        from omnigent.server.routes.sessions import (
+            _publish_inputs_failed,
+            _publish_sandbox_status,
+            _publish_status,
+        )
 
         if await asyncio.to_thread(self.conversations.get_conversation, session_id) is None:
             return
@@ -1109,6 +1113,9 @@ class ManagedStartupInputs:
         if publish_status:
             _publish_sandbox_status(session_id, "failed", message)
             _publish_status(session_id, "failed", failure_origin="startup_input_failed")
+        else:
+            # Open chats still show the input as queued; let them re-read it.
+            _publish_inputs_failed(session_id)
 
     async def shutdown(self) -> None:
         tasks = [

@@ -4802,6 +4802,25 @@ class SessionTerminalPendingEvent(_SSEEventBase):
     pending: bool
 
 
+class SessionInputsFailedEvent(_SSEEventBase):
+    """
+    The server gave up on one or more of the session's queued inputs.
+
+    Emitted when a saved input fails without a session status change, e.g.
+    a native submission whose transcript receipt never came. Clients re-read
+    the snapshot's ``failed_inputs`` so the bubble shows as not delivered.
+
+    :param type: Always ``"session.inputs.failed"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+
+    Category: **transient** (SSE-only). On reconnect, clients read
+    ``failed_inputs`` from the session snapshot.
+    """
+
+    type: Literal["session.inputs.failed"]
+    conversation_id: str
+
+
 class SessionSandboxStatusEvent(_SSEEventBase):
     """
     Managed-sandbox launch progress for a ``host_type="managed"`` session.
@@ -6166,6 +6185,7 @@ ServerStreamEvent = Annotated[
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
+    | SessionInputsFailedEvent
     | SessionSandboxStatusEvent
     | SessionMcpStartupEvent
     | SessionModelOptionsEvent

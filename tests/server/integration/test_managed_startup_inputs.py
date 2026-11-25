@@ -1495,8 +1495,13 @@ async def test_unconfirmed_native_submission_stops_holding_later_inputs(
     startup.dispatch = dispatch
     woken: list[str] = []
     monkeypatch.setattr("omnigent.server.startup_inputs.wake_startup_worker", woken.append)
+    inputs_failed: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._publish_inputs_failed", inputs_failed.append
+    )
     await startup._deliver(env.app, session_id, entry)
     await asyncio.gather(*startup._receipt_watches.values())
+    assert inputs_failed == [session_id]
 
     [failed] = env.conv_store.list_pending_inputs(session_id)
     assert failed.id == entry.id and failed.status == "failed"

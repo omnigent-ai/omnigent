@@ -384,6 +384,18 @@ describe("ErrorBanner", () => {
     useChatStore.setState({ conversationId: null });
   });
 
+  it("titles a full-queue refusal and shows what to do without expanding it", () => {
+    render(
+      <ErrorBanner
+        message="This session's queue is full: 100 messages are already waiting to be delivered. Wait for it to catch up, or press Stop to clear the queue, then send again."
+        source=""
+        code="queue_full"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("This session's queue is full");
+    expect(screen.getByTestId("error-notice-body")).toHaveTextContent("press Stop to clear the queue");
+  });
+
   it("shows a completed sign-in notice's line without expanding it", () => {
     render(
       <ErrorBanner

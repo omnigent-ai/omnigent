@@ -527,6 +527,9 @@ Fields:
     submission order. File blocks keep their `file_id`, so attachments stay
     downloadable from this session. Clients show these as undelivered
     messages; a `retry_session` that redelivers them removes them.
+    When the server fails a queued input without a status change (e.g. a
+    native receipt that never came), it emits `session.inputs.failed` with
+    `conversation_id`; open clients re-read this list.
 
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.

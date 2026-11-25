@@ -9,7 +9,7 @@ from sqlalchemy import select, text
 
 from omnigent.db.db_models import SqlConversationItem, workspace_scope
 from omnigent.entities.conversation import MessageData, NewConversationItem, StartupInputOptions
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store import MAX_PENDING_INPUTS, PENDING_INPUT_RESPONSE_ID
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
@@ -92,8 +92,9 @@ def test_bound_pending_read_and_failed_claim_does_not_change_history(db_uri):
     store = SqlAlchemyConversationStore(db_uri)
     session = store.create_conversation()
     saved = store.append(session.id, [_input() for _ in range(MAX_PENDING_INPUTS)])
-    with pytest.raises(OmnigentError, match="queue is full"):
+    with pytest.raises(OmnigentError, match="queue is full") as refused:
         store.append(session.id, [_input()])
+    assert refused.value.code == ErrorCode.QUEUE_FULL
     assert not store.transition_pending_input(
         session.id, saved[0].id, expected="failed", status="completed"
     )

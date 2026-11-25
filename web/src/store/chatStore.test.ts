@@ -3676,6 +3676,39 @@ describe("chatStore — send (first-send ordering)", () => {
     });
   });
 
+  it("says at the composer that a session's queue is full", async () => {
+    // The card lands above up to 100 queued bubbles, where the sender can't see it.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "running",
+      blocks: [],
+      pendingUserMessages: [],
+    });
+    const full =
+      "This session's queue is full: 100 messages are already waiting to be delivered. " +
+      "Wait for it to catch up, or press Stop to clear the queue, then send again.";
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code: "queue_full", message: full } },
+          { ok: false, status: 409 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const toastError = vi.spyOn(toast, "error");
+    onTestFinished(() => toastError.mockRestore());
+
+    await useChatStore.getState().send("hi", "agent_xyz");
+
+    expect(toastError).toHaveBeenCalledExactlyOnceWith(full, { duration: 10_000 });
+    expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toMatchObject([
+      { code: "queue_full", message: full },
+    ]);
+  });
+
   it("holds a send whose host is offline and sends it once released", async () => {
     // The server refuses (and records nothing) only because this client asks to
     // hold: the message must wait in the queue, not land back in the composer.
@@ -8690,6 +8723,36 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         pendingUserMessages: [],
         startupPending: false,
         sandboxStatus: { stage: "failed", error: "managed host did not come online" },
+      });
+    });
+
+    it("shows a queued input the server gave up on as failed without a reload", async () => {
+      // A native receipt that never came fails the input with no status change.
+      const lost = { type: "input_text" as const, text: "Sent just before a restart" };
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_abc",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.startup": "ready" },
+          pending_elicitations: [],
+          pending_inputs: [],
+          failed_inputs: [{ pending_id: "pending_lost", content: [lost] }],
+        }),
+      );
+      useChatStore.setState({
+        pendingUserMessages: [{ tempId: "tmp_lost", content: [lost], posted: true }],
+      });
+
+      handleSessionEvent({ type: "session_inputs_failed", conversationId: "conv_abc" });
+
+      await vi.waitFor(() => expect(useChatStore.getState().failedInputs).toHaveLength(1));
+      expect(useChatStore.getState()).toMatchObject({
+        failedInputs: [{ pendingId: "pending_lost", content: [lost] }],
+        pendingUserMessages: [],
+        sandboxStatus: null,
       });
     });
 

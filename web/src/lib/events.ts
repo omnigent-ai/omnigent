@@ -747,6 +747,16 @@ export interface SessionTerminalPendingEvent {
 }
 
 /**
+ * `session.inputs.failed` — the server gave up on queued inputs without a
+ * session status change (e.g. a native receipt that never came). The store
+ * re-reads the snapshot's `failed_inputs` so their bubbles show as not delivered.
+ */
+export interface SessionInputsFailedEvent {
+  type: "session_inputs_failed";
+  conversationId: string;
+}
+
+/**
  * `session.sandbox_status` — the session's managed-sandbox launch
  * advanced a stage (provision → clone → host start → runner connect),
  * settled successfully (`ready`), or failed (`failed` + `error`).
@@ -1083,6 +1093,7 @@ export type StreamEvent =
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent
+  | SessionInputsFailedEvent
   | SessionSandboxStatusEvent
   | SessionMcpStartupEvent
   | SessionInputConsumedEvent

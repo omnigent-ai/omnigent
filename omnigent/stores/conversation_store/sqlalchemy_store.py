@@ -3713,7 +3713,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         f"This session's queue is full: {MAX_PENDING_INPUTS} messages are "
                         "already waiting to be delivered. Wait for it to catch up, or press "
                         "Stop to clear the queue, then send again.",
-                        code=ErrorCode.CONFLICT,
+                        code=ErrorCode.QUEUE_FULL,
                     )
 
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))

@@ -78,6 +78,7 @@ import {
   fetchSessionItemsPage,
   HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
+  QUEUE_FULL_CODE,
   interrupt as interruptSession,
   OLDER_HISTORY_PAGE_ITEMS,
   openSessionStream,
@@ -3232,6 +3233,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // A delivered send needs no card. One the server never answered may still
       // arrive, so its card names the send for the commit that retracts it.
       const sentText = failGet().isNativeTerminalSession ? messageContentText(content) : "";
+      // Its card lands above the queued bubbles, out of sight, so say it at the composer too.
+      if (code === QUEUE_FULL_CODE && !callerHandlesError) {
+        toast.error(message, { duration: QUEUE_FULL_TOAST_MS });
+      }
       const failureCard: ErrorBlock | null = deliveredDespiteFailure
         ? null
         : {
@@ -5219,6 +5224,9 @@ async function refreshFailedInputs(id: string): Promise<void> {
     };
   });
 }
+
+/** Long enough to read the queue-full refusal and its Stop hint. */
+const QUEUE_FULL_TOAST_MS = 10_000;
 
 /** Retries of a snapshot load that failed in a way a retry can fix. */
 const SNAPSHOT_LOAD_RETRIES = 2;
@@ -8758,6 +8766,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         terminalPending: event.pending,
         mcpStartupLaunch: updateMcpStartupLaunch(s.mcpStartupLaunch, event.pending),
       }));
+      return;
+    case "session_inputs_failed":
+      // A queued bubble the server gave up on reads as "Not delivered" without a reload.
+      void refreshFailedInputs(event.conversationId);
       return;
     case "session_sandbox_status": {
       const launchEntry =

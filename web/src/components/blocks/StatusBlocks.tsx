@@ -112,6 +112,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
   host_disk_full: "The host's disk is full, so the agent can't save the conversation.",
   harness_not_configured: "The harness isn't set up on the host, so this session can't start.",
+  queue_full: "This session's queue is full",
 };
 
 const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";
@@ -170,6 +171,9 @@ const SIGN_IN_PENDING_CODES = new Set(["databricks_sign_in_pending"]);
 // A sign-in that completed. Its one line of body shows without a click: the
 // headline alone ("Signed in to Databricks") does not say what to do next.
 const SIGN_IN_COMPLETED_CODES = new Set(["databricks_sign_in_completed"]);
+// Failures whose message is the whole story (what happened and what to do): shown
+// under the headline without a click, and nothing is left to expand.
+const INLINE_MESSAGE_CODES = new Set(["queue_full"]);
 
 /** Render text with each address as a link that opens in a new tab. */
 function linkify(text: string): ReactNode[] {
@@ -355,6 +359,7 @@ export function ErrorBanner({
   }, [cause, code, headline, parsed.message, remediation]);
   const signIn = SIGN_IN_PENDING_CODES.has(code);
   const signInComplete = notice && SIGN_IN_COMPLETED_CODES.has(code);
+  const inlineBody = signInComplete || INLINE_MESSAGE_CODES.has(code);
   const diagnostics = useMemo(
     () =>
       [
@@ -366,7 +371,8 @@ export function ErrorBanner({
     [parsed.lastOutput, parsed.terminal],
   );
   // The hint already shows this card's error and cause, so its Message section would repeat them.
-  const inlineMessage = code === COMPACTION_MODEL_FAILED_CODE && Boolean(cause);
+  const inlineMessage =
+    (code === COMPACTION_MODEL_FAILED_CODE && Boolean(cause)) || INLINE_MESSAGE_CODES.has(code);
   const expandable = !inlineMessage || relatedDetails.length > 0 || diagnostics.length > 0;
   const [expanded, setExpanded] = useState(false);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
@@ -653,7 +659,7 @@ export function ErrorBanner({
             <ErrorForkAction label="Fork session…" icon={SplitIcon} />
           </div>
         ) : null}
-        {signInComplete && parsed.message ? (
+        {inlineBody && parsed.message ? (
           <p
             data-testid="error-notice-body"
             onClick={(event) => event.stopPropagation()}

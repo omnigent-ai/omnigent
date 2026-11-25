@@ -66,6 +66,7 @@ import type {
   SessionSandboxStatusEvent,
   McpServerStartup,
   SessionMcpStartupEvent,
+  SessionInputsFailedEvent,
   SessionTerminalPendingEvent,
   SessionUsageEvent,
   SlashCommand,
@@ -789,6 +790,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       pending,
     } satisfies SessionTerminalPendingEvent;
+  }
+  if (eventType === "session.inputs.failed") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    return { type: "session_inputs_failed", conversationId } satisfies SessionInputsFailedEvent;
   }
   if (eventType === "session.sandbox_status") {
     const conversationId = data.conversation_id;

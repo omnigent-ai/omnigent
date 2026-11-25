@@ -274,6 +274,19 @@ describe("parseEvent — session.superseded", () => {
   });
 });
 
+describe("parseEvent — session.inputs.failed", () => {
+  it("names the session whose queued inputs failed", () => {
+    expect(parseEvent("session.inputs.failed", { conversation_id: "conv_a" })).toEqual({
+      type: "session_inputs_failed",
+      conversationId: "conv_a",
+    });
+  });
+
+  it("returns null when the conversation id is missing", () => {
+    expect(parseEvent("session.inputs.failed", {})).toBeNull();
+  });
+});
+
 describe("parseEvent — session.status (blocked_on)", () => {
   function blockedOn(data: Record<string, unknown>): string | undefined {
     const ev = parseEvent("session.status", {
