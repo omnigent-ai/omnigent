@@ -581,6 +581,17 @@ _UNCONFIRMED_STDERR = {
     "502": "gh: Bad Gateway (HTTP 502)",
     "reset": 'Post "https://api.github.com/graphql": read tcp: connection reset by peer',
     "eof": 'Post "https://api.github.com/graphql": unexpected EOF',
+    # A repository or host named like a refusal's wording.
+    "reset-sso-repository": (
+        'Patch "https://api.github.com/repos/example-org/sso/pulls/comments/101": '
+        "read tcp 10.0.0.2:51234->192.0.2.6:443: read: connection reset by peer"
+    ),
+    "reset-scope-repository": (
+        'Post "https://api.github.com/repos/example-org/missing-scope/pulls/7": '
+        "read: connection reset by peer"
+    ),
+    "eof-sso-host": 'Post "https://sso.example.com/api/graphql": unexpected EOF',
+    "lookup-sso-host": "dial tcp: lookup sso.example.com: i/o timeout",
 }
 # And the ones that mean GitHub refused it without making it.
 _REFUSED_STDERR = {
@@ -589,6 +600,10 @@ _REFUSED_STDERR = {
     "403": "gh: Resource not accessible by integration (HTTP 403)",
     "401": "gh: Bad credentials (HTTP 401)",
     "scope": "gh: INSUFFICIENT_SCOPES",
+    # Its wording still counts with an address beside it.
+    "sso": (
+        "gh: Resource protected by organization SAML enforcement. See https://docs.github.com/sso"
+    ),
 }
 
 
@@ -605,7 +620,7 @@ def test_a_mutation_that_fails_after_the_send_is_an_unknown_outcome(
     fake: FakeGitHub, stderr: str
 ) -> None:
     fake.graphql_failure = (1, "", stderr)
-    with pytest.raises(UnknownOutcomeError):
+    with pytest.raises(UnknownOutcomeError, match="Check the pull request before trying again"):
         _resolve()
 
 
@@ -617,7 +632,7 @@ def test_a_comment_change_that_fails_after_the_send_is_an_unknown_outcome(
     fake: FakeGitHub, action: str, stderr: str
 ) -> None:
     fake.rest_failure = (1, "", stderr)
-    with pytest.raises(UnknownOutcomeError):
+    with pytest.raises(UnknownOutcomeError, match="Check the pull request before trying again"):
         _change_comment(action)
 
 

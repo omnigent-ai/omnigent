@@ -34,6 +34,13 @@ _REFUSED_STATUS = re.compile(r"\(HTTP (?:401|403|404|422)\)")
 _GRAPHQL_INTERRUPTED = re.compile(r"timeout|timed out|Something went wrong", re.I)
 # GraphQL error types that say GitHub failed on its side, whatever the message.
 _INTERRUPTED_TYPES = frozenset({"INTERNAL", "TIMEOUT", "SERVICE_UNAVAILABLE"})
+# URLs, paths and host names: a repository or host named like ``sso`` must not read as a refusal.
+_ADDRESSES = re.compile(r"\S*(?:/|://)\S*|\b[\w-]+(?:\.[\w-]+)+(?::\d+)?\b")
+
+
+def _diagnostic(stderr: str) -> str:
+    """``gh``'s message with every address taken out, so only its wording is matched."""
+    return _ADDRESSES.sub(" ", stderr)
 
 
 def unknown_outcome() -> UnknownOutcomeError:
@@ -43,21 +50,24 @@ def unknown_outcome() -> UnknownOutcomeError:
 
 def refusal(stderr: str, *, host: str, action: str) -> ValueError:
     """Turn a failed ``gh`` call's stderr into the user-facing error for ``action``."""
-    if _SCOPE.search(stderr):
+    diagnostic = _diagnostic(stderr)
+    if _SCOPE.search(diagnostic):
         return ValueError(MISSING_SCOPE.format(host=host))
-    if _SSO.search(stderr):
+    if _SSO.search(diagnostic):
         return ValueError(SSO.format(host=host))
-    if _RATE.search(stderr):
+    if _RATE.search(diagnostic):
         return ValueError(RATE_LIMITED.format(host=host))
-    if _SIGNED_OUT.search(stderr):
+    if _SIGNED_OUT.search(diagnostic):
         return ValueError(SIGNED_OUT.format(host=host))
     return ValueError(github._merge_error(stderr, action=action))
 
 
 def definitely_refused(stderr: str) -> bool:
     """Whether a sent write's ``gh`` stderr shows GitHub refused it without making it."""
+    diagnostic = _diagnostic(stderr)
     return any(
-        pattern.search(stderr) for pattern in (_REFUSED_STATUS, _SCOPE, _SSO, _RATE, _SIGNED_OUT)
+        pattern.search(diagnostic)
+        for pattern in (_REFUSED_STATUS, _SCOPE, _SSO, _RATE, _SIGNED_OUT)
     )
 
 
