@@ -5,7 +5,7 @@
 import type { LucideIcon } from "lucide-react";
 
 import { chordKeys } from "@/lib/shortcuts/chord";
-import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import {
   isCommandAvailable,
   isCommandListed,

@@ -1,7 +1,7 @@
 import { foldedRanges } from "@codemirror/language";
 import { EditorSelection, EditorState, type Extension } from "@codemirror/state";
 import { EditorView, keymap, runScopeHandlers } from "@codemirror/view";
-import { codeMirrorKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { codeMirrorKeys } from "@/lib/shortcuts/registry";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { editability } from "./codeMirrorEditing";
 import { FILE_EDITOR_COMMANDS, fileEditorCommandLabel } from "@/components/fileEditorCommands";

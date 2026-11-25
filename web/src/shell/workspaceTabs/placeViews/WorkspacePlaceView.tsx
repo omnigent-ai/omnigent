@@ -9,7 +9,7 @@ import { lazy, Suspense, useCallback, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { cn } from "@/lib/utils";
-import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import { requestFileFinder, useFileFinderAvailable } from "@/store/fileFinder";
 import { useShowIgnoredFiles, writeShowIgnoredFiles } from "@/lib/filesTreeIgnoredPreferences";
 import type { ChangedSort } from "@/lib/changedSort";

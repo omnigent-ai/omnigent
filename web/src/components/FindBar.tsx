@@ -2,7 +2,7 @@
 // the search state; this component renders it and maps keys to commands. An
 // editor can add a replace row.
 
-import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import { type CSSProperties, useEffect, useId, useRef, type ReactNode } from "react";
 import {
   ChevronDownIcon,

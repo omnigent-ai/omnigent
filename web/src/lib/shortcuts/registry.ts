@@ -4,7 +4,14 @@
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
-import { type Chord, chordKeys, chordMatches, type KeyChordInput } from "@/lib/shortcuts/chord";
+import {
+  type Chord,
+  chordAriaShortcut,
+  chordKeyLabel,
+  chordKeys,
+  chordMatches,
+  type KeyChordInput,
+} from "@/lib/shortcuts/chord";
 
 /** What a binding's chords depend on. */
 export interface ShortcutEnvironment {
@@ -139,7 +146,7 @@ export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9
 /** Workspace rail tabs ⌃1–⌃9, by position. */
 const WORKSPACE_TAB_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 
-const BINDINGS = {
+const APP_BINDINGS = {
   "session.new": {
     group: "general",
     label: "Start a new session",
@@ -536,19 +543,256 @@ const BINDINGS = {
   },
 } satisfies Record<string, ShortcutBindingDefinition>;
 
+const mod = (key: Chord): Chord => ({ mod: true, ...key });
+const modAlt = (key: Chord): Chord => ({ mod: true, alt: true, ...key });
+
+// The workspace sidebar's own shortcuts: its tabs and history, the code editor's commands,
+// find, searches, and opening a row in a new tab. The Keyboard Shortcuts page and ⌘K list
+// them only once the sidebar is routed.
+const WORKSPACE_SIDEBAR_DEFINITIONS = {
+  // A browser keeps ⌘T and ⌘W for its own tabs, so the sidebar's tabs add Option.
+  "workspace.newTab": {
+    group: "workspace",
+    label: "New workspace tab",
+    chords: () => [modAlt({ shift: true, code: "KeyN" })],
+  },
+  "workspace.closeTab": {
+    group: "workspace",
+    label: "Close workspace tab",
+    chords: () => [modAlt({ code: "KeyW" })],
+  },
+  "workspace.reopenTab": {
+    group: "workspace",
+    label: "Reopen closed workspace tab",
+    chords: () => [modAlt({ shift: true, code: "KeyT" })],
+  },
+  // ⌘← / ⌘→ in the macOS app, as in the browsers it follows; text keeps them for line start / end.
+  "workspace.back": {
+    group: "workspace",
+    label: "Go back in the workspace",
+    chords: (environment) => [
+      environment.mac && environment.native
+        ? mod({ key: "ArrowLeft" })
+        : modAlt({ shift: true, key: "ArrowLeft" }),
+    ],
+  },
+  "workspace.forward": {
+    group: "workspace",
+    label: "Go forward in the workspace",
+    chords: (environment) => [
+      environment.mac && environment.native
+        ? mod({ key: "ArrowRight" })
+        : modAlt({ shift: true, key: "ArrowRight" }),
+    ],
+  },
+  // A browser keeps ⇧⌘[ and ⇧⌘] for its own tabs.
+  "workspace.nextTab": {
+    group: "workspace",
+    label: "Next workspace tab",
+    chords: (environment) =>
+      environment.native ? [mod({ shift: true, code: "BracketRight" })] : [],
+  },
+  "workspace.previousTab": {
+    group: "workspace",
+    label: "Previous workspace tab",
+    chords: (environment) =>
+      environment.native ? [mod({ shift: true, code: "BracketLeft" })] : [],
+  },
+  "workspace.moveTabLeft": {
+    group: "workspace",
+    label: "Move workspace tab left",
+    chords: () => [{ alt: true, shift: true, key: "ArrowLeft" }],
+  },
+  "workspace.moveTabRight": {
+    group: "workspace",
+    label: "Move workspace tab right",
+    chords: () => [{ alt: true, shift: true, key: "ArrowRight" }],
+  },
+  "workspace.toggleFullScreen": {
+    group: "workspace",
+    label: "Toggle workspace full screen",
+    chords: () => [mod({ shift: true, code: "KeyF" })],
+  },
+  "browser.new": {
+    group: "workspace",
+    label: "Open a new browser tab",
+    chords: () => [modAlt({ code: "KeyB" })],
+  },
+  // Physical keys, since Option rewrites letters; ⌃⌘F is the system's full screen on macOS.
+  "palette.text": {
+    group: "workspace",
+    label: "Search text in the open session's files",
+    chords: (environment) =>
+      environment.mac ? [{ ctrl: true, mod: true, code: "KeyO" }] : [modAlt({ code: "KeyF" })],
+  },
+  "palette.files": {
+    group: "workspace",
+    label: "Go to a file in the open session",
+    chords: (environment) =>
+      environment.mac ? [{ ctrl: true, mod: true, code: "KeyP" }] : [modAlt({ code: "KeyP" })],
+  },
+  // The Explorer chord editors use.
+  "files.toggleTree": {
+    group: "workspace",
+    label: "Show or hide the Files tree",
+    chords: () => [mod({ shift: true, code: "KeyE" })],
+  },
+  "find.open": { group: "workspace", label: "Find in file", chords: () => [mod({ key: "f" })] },
+  "file.findAndReplace": {
+    group: "files",
+    label: "Find and replace",
+    // Windows and Linux editors also replace with Control+H.
+    chords: (environment) => [
+      modAlt({ shift: true, code: "KeyF" }),
+      ...(environment.mac ? [] : [{ ctrl: true, code: "KeyH" }]),
+    ],
+  },
+  "file.goToLine": {
+    group: "files",
+    label: "Go to line",
+    // Control on every platform, as in other editors.
+    chords: () => [{ ctrl: true, code: "KeyG" }],
+  },
+  "file.toggleLineComment": {
+    group: "files",
+    label: "Toggle line comment",
+    chords: () => [mod({ key: "/" })],
+  },
+  "file.toggleBlockComment": {
+    group: "files",
+    label: "Toggle block comment",
+    chords: () => [{ alt: true, shift: true, code: "KeyA" }],
+  },
+  "file.indentLines": {
+    group: "files",
+    label: "Indent lines",
+    chords: () => [mod({ code: "BracketRight" })],
+  },
+  "file.outdentLines": {
+    group: "files",
+    label: "Outdent lines",
+    chords: () => [mod({ code: "BracketLeft" })],
+  },
+  "file.moveLinesUp": {
+    group: "files",
+    label: "Move lines up",
+    chords: () => [{ alt: true, key: "ArrowUp" }],
+  },
+  "file.moveLinesDown": {
+    group: "files",
+    label: "Move lines down",
+    chords: () => [{ alt: true, key: "ArrowDown" }],
+  },
+  "file.copyLinesUp": {
+    group: "files",
+    label: "Copy lines up",
+    chords: () => [{ alt: true, shift: true, key: "ArrowUp" }],
+  },
+  "file.copyLinesDown": {
+    group: "files",
+    label: "Copy lines down",
+    chords: () => [{ alt: true, shift: true, key: "ArrowDown" }],
+  },
+  "file.deleteLines": {
+    group: "files",
+    label: "Delete lines",
+    chords: () => [mod({ shift: true, code: "KeyK" })],
+  },
+  "file.insertLineBelow": {
+    group: "files",
+    label: "Insert line below",
+    chords: () => [mod({ key: "Enter" })],
+  },
+  "file.insertLineAbove": {
+    group: "files",
+    label: "Insert line above",
+    chords: () => [mod({ shift: true, key: "Enter" })],
+  },
+  "file.trimTrailingWhitespace": {
+    group: "files",
+    label: "Trim trailing whitespace",
+    chords: () => [],
+  },
+  "file.undoCursor": {
+    group: "files",
+    label: "Undo cursor change",
+    chords: () => [mod({ code: "KeyU" })],
+  },
+  "file.addCursorAbove": {
+    group: "files",
+    label: "Add cursor above",
+    chords: () => [modAlt({ key: "ArrowUp" })],
+  },
+  "file.addCursorBelow": {
+    group: "files",
+    label: "Add cursor below",
+    chords: () => [modAlt({ key: "ArrowDown" })],
+  },
+  "file.selectNextOccurrence": {
+    group: "files",
+    label: "Select next occurrence",
+    chords: () => [mod({ key: "d" })],
+  },
+  "file.selectAllOccurrences": {
+    group: "files",
+    label: "Select all occurrences",
+    chords: () => [mod({ shift: true, code: "KeyL" })],
+  },
+  "file.expandLineSelection": {
+    group: "files",
+    label: "Expand selection to line",
+    chords: () => [mod({ code: "KeyL" })],
+  },
+  "file.goToBracket": {
+    group: "files",
+    label: "Go to matching bracket",
+    chords: () => [mod({ shift: true, code: "Backslash" })],
+  },
+  // ⌘⌥[ and ⌘⌥] toggle the sidebars, so folding takes Control+Shift and a bracket.
+  "file.fold": {
+    group: "files",
+    label: "Fold",
+    chords: () => [{ ctrl: true, shift: true, code: "BracketLeft" }],
+  },
+  "file.unfold": {
+    group: "files",
+    label: "Unfold",
+    chords: () => [{ ctrl: true, shift: true, code: "BracketRight" }],
+  },
+  "file.foldAll": { group: "files", label: "Fold all", chords: () => [] },
+  "file.unfoldAll": { group: "files", label: "Unfold all", chords: () => [] },
+  // A row that opens a place (a changed file, a commit or a pull request) opens it in a new tab.
+  "rows.openInNewTab": {
+    group: "workspace",
+    label: "Open the focused row in a new tab (⇧ to switch to it)",
+    chords: () => [mod({ key: "Enter" }), mod({ shift: true, key: "Enter" })],
+  },
+} satisfies Record<string, ShortcutBindingDefinition>;
+
+const BINDINGS = { ...APP_BINDINGS, ...WORKSPACE_SIDEBAR_DEFINITIONS };
+
+/** A shortcut any surface matches: one of the app's, or one of the workspace sidebar's. */
 export type ShortcutId = keyof typeof BINDINGS;
+
+export type WorkspaceSidebarShortcutId = keyof typeof WORKSPACE_SIDEBAR_DEFINITIONS;
 
 export interface ShortcutBinding extends ShortcutBindingDefinition {
   id: ShortcutId;
 }
 
-/** Every binding, in registry order. */
-export const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = Object.entries(BINDINGS).map(
-  ([id, binding]) => ({ id: id as ShortcutId, ...(binding as ShortcutBindingDefinition) }),
+const toBindings = (definitions: Record<string, ShortcutBindingDefinition>): ShortcutBinding[] =>
+  Object.entries(definitions).map(([id, binding]) => ({ id: id as ShortcutId, ...binding }));
+
+/** Every app binding, in registry order. */
+export const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = toBindings(APP_BINDINGS);
+
+/** The workspace sidebar's bindings, in order, for the Keyboard Shortcuts page once it's routed. */
+export const WORKSPACE_SIDEBAR_BINDINGS: readonly ShortcutBinding[] = toBindings(
+  WORKSPACE_SIDEBAR_DEFINITIONS,
 );
 
 const BINDINGS_BY_ID = new Map<ShortcutId, ShortcutBinding>(
-  SHORTCUT_BINDINGS.map((binding) => [binding.id, binding]),
+  [...SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS].map((binding) => [binding.id, binding]),
 );
 
 export function shortcutBinding(id: ShortcutId): ShortcutBinding {
@@ -625,4 +869,41 @@ export function shortcutRowKeys(
   const keys = shortcutShownKeys(id, environment);
   const rowKeys = shortcutBinding(id).rowKeys;
   return rowKeys ? rowKeys(keys, { context, environment }) : keys;
+}
+
+const CODE_MIRROR_KEY_NAMES: Record<string, string> = {
+  Escape: "Escape",
+  Enter: "Enter",
+  Tab: "Tab",
+};
+
+/** The chord as a CodeMirror key name, such as `Mod-Alt-f`, for an editor keymap. */
+export function codeMirrorKey(chord: Chord): string {
+  const parts: string[] = [];
+  if (chord.mod) parts.push("Mod");
+  if (chord.ctrl) parts.push("Ctrl");
+  if (chord.alt) parts.push("Alt");
+  if (chord.shift) parts.push("Shift");
+  // A named key keeps its case, as CodeMirror's names need; a character is lowercased.
+  const key = chord.code !== undefined ? chordKeyLabel(chord) : (chord.key ?? "");
+  parts.push(CODE_MIRROR_KEY_NAMES[key] ?? (key.length === 1 ? key.toLowerCase() : key));
+  return parts.join("-");
+}
+
+/** `id`'s active chords as CodeMirror key names, for an editor keymap. */
+export function codeMirrorKeys(
+  id: ShortcutId,
+  environment?: Partial<ShortcutEnvironment>,
+): string[] {
+  return activeShortcutChords(id, environment).map(codeMirrorKey);
+}
+
+/** `aria-keyshortcuts` for the first of `id`'s chords here, or none when it has no chord. */
+export function shortcutAriaKeys(
+  id: ShortcutId,
+  environment?: Partial<ShortcutEnvironment>,
+): string | undefined {
+  const resolved = currentShortcutEnvironment(environment);
+  const chord = activeShortcutChords(id, resolved)[0];
+  return chord ? chordAriaShortcut(chord, resolved.mac) : undefined;
 }
