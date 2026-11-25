@@ -588,7 +588,7 @@ function usePullRequestQueryContext(rawConversationId: string | undefined) {
 
 /** The query key of a session's pull request info, or one of its pull requests' by URL. */
 export function pullRequestInfoQueryKey(conversationId: string | undefined, prUrl?: string) {
-  return ["github-info", conversationId, ...(prUrl ? [prUrl] : [])];
+  return ["classic-github-info", conversationId, ...(prUrl ? [prUrl] : [])];
 }
 
 /** Background reads of individual pull requests in flight at once, across every session. */
@@ -770,7 +770,7 @@ export function usePullRequestInfo(
   useTrailingInvalidate(
     context.conversationId,
     useSessionActive(context.conversationId),
-    "github-info",
+    "classic-github-info",
   );
   return useQuery(pullRequestInfoQueryOptions(context, options));
 }
@@ -856,7 +856,7 @@ export function useSetPullRequestPreference(conversationId: string | undefined) 
     onSuccess: (info, body) => {
       // A `pr_url` reply describes that PR, so it belongs in that PR's query.
       queryClient.setQueryData(
-        ["github-info", conversationId, ...(body.pr_url ? [body.pr_url] : [])],
+        ["classic-github-info", conversationId, ...(body.pr_url ? [body.pr_url] : [])],
         info,
       );
     },
@@ -865,7 +865,7 @@ export function useSetPullRequestPreference(conversationId: string | undefined) 
     onError: (_error, body) => {
       if (body.account === undefined) return;
       queryClient.setQueriesData<PullRequestInfo>(
-        { queryKey: ["github-info", conversationId] },
+        { queryKey: ["classic-github-info", conversationId] },
         (info) =>
           info && (!body.pr_url || info.selected_pr_url === body.pr_url)
             ? withoutSelectedAccount(info)
@@ -874,10 +874,10 @@ export function useSetPullRequestPreference(conversationId: string | undefined) 
     },
     // The host may save the choice and still fail the reply, so refetch either way.
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
-      queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
-      queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });
-      queryClient.invalidateQueries({ queryKey: ["github-merge-options", conversationId] });
+      queryClient.invalidateQueries({ queryKey: ["classic-github-info", conversationId] });
+      queryClient.invalidateQueries({ queryKey: ["classic-github-changed-files", conversationId] });
+      queryClient.invalidateQueries({ queryKey: ["classic-github-pr-diff", conversationId] });
+      queryClient.invalidateQueries({ queryKey: ["classic-github-merge-options", conversationId] });
     },
   });
 }
@@ -932,7 +932,7 @@ export function usePullRequestChangedFiles(
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
-    queryKey: ["github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
+    queryKey: ["classic-github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
     queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl, revision),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
@@ -1025,7 +1025,7 @@ export function usePullRequestDiff(
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
-    queryKey: ["github-pr-diff", conversationId, ...(prUrl ? [prUrl, revision] : [])],
+    queryKey: ["classic-github-pr-diff", conversationId, ...(prUrl ? [prUrl, revision] : [])],
     queryFn: () => fetchPullRequestDiff(conversationId!, prUrl, revision),
     enabled: !!conversationId && hasPr && serveable !== false,
     retry,
@@ -1131,7 +1131,7 @@ export function usePullRequestCommits(
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
-    queryKey: ["github-pr-commits", conversationId, prUrl, headSha],
+    queryKey: ["classic-github-pr-commits", conversationId, prUrl, headSha],
     queryFn: () => fetchPullRequestCommits(conversationId!, prUrl!, headSha!),
     enabled: enabled && !!conversationId && !!prUrl && !!headSha && serveable !== false,
     retry,
@@ -1188,7 +1188,7 @@ export function usePullRequestCommitDiff(
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
-    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha, untilHeadSha],
+    queryKey: ["classic-github-pr-commit-diff", conversationId, prUrl, commitSha, untilHeadSha],
     queryFn: () =>
       untilHeadSha
         ? fetchPullRequestChangesSince(conversationId!, prUrl!, commitSha!, untilHeadSha)
@@ -1228,25 +1228,28 @@ export function useUpdateSessionPr(conversationId: string) {
     mutationFn: (body: { url: string; action: "attach" | "remove" }) =>
       updateSessionPr(conversationId, body),
     onSuccess: async (info, body) => {
-      await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
+      await queryClient.cancelQueries({ queryKey: ["classic-github-info", conversationId] });
       // An attach reply reads only that PR; attaching doesn't change the workspace's repo.
       const workspaceRepo = queryClient.getQueryData<PullRequestInfo>([
-        "github-info",
+        "classic-github-info",
         conversationId,
       ])?.workspace_repo;
       queryClient.setQueryData(
-        ["github-info", conversationId],
+        ["classic-github-info", conversationId],
         info.workspace_repo || !workspaceRepo ? info : { ...info, workspace_repo: workspaceRepo },
       );
       if (info.selected_pr_url) {
-        queryClient.setQueryData(["github-info", conversationId, info.selected_pr_url], info);
+        queryClient.setQueryData(
+          ["classic-github-info", conversationId, info.selected_pr_url],
+          info,
+        );
       }
       if (body.action === "remove") {
         // Keep the observer's key populated until the panel switches selection.
-        queryClient.setQueryData(["github-info", conversationId, body.url], info);
+        queryClient.setQueryData(["classic-github-info", conversationId, body.url], info);
       }
       queryClient.invalidateQueries({
-        queryKey: ["github-info", conversationId],
+        queryKey: ["classic-github-info", conversationId],
         predicate: (query) => body.action !== "remove" || query.queryKey[2] !== body.url,
       });
     },
@@ -1302,7 +1305,7 @@ async function fetchPullRequestEditResource<T>(
 /** The labels the selected PR's repository offers, for the label picker. */
 export function usePullRequestRepoLabels(conversationId: string, prUrl: string, enabled: boolean) {
   return useQuery({
-    queryKey: ["github-labels", conversationId, prUrl],
+    queryKey: ["classic-github-labels", conversationId, prUrl],
     queryFn: () =>
       fetchPullRequestEditResource<PullRequestRepoLabels>(conversationId, "labels", { prUrl }),
     enabled,
@@ -1321,7 +1324,7 @@ export interface PullRequestLabelChange {
 
 /** Mutation key of {@link useUpdatePullRequestLabels}, for reading pending edits. */
 export function pullRequestLabelsMutationKey(conversationId: string) {
-  return ["github-labels-update", conversationId] as const;
+  return ["classic-github-labels-update", conversationId] as const;
 }
 
 /** Apply a label edit to a PR's labels. GitHub label names are case-insensitive. */
@@ -1342,7 +1345,7 @@ export function applyPullRequestLabelChange(
  */
 export function useUpdatePullRequestLabels(conversationId: string) {
   const queryClient = useQueryClient();
-  const infoKey = ["github-info", conversationId];
+  const infoKey = ["classic-github-info", conversationId];
   return useMutation({
     mutationKey: pullRequestLabelsMutationKey(conversationId),
     // One edit at a time, in click order, so GitHub and the cache end in the last state shown.
@@ -1383,7 +1386,7 @@ export function usePullRequestMergeOptions(
   enabled: boolean,
 ) {
   return useQuery({
-    queryKey: ["github-merge-options", conversationId, prUrl],
+    queryKey: ["classic-github-merge-options", conversationId, prUrl],
     queryFn: () =>
       fetchPullRequestEditResource<PullRequestMergeOptions>(conversationId, "merge-options", {
         prUrl,
@@ -1429,7 +1432,7 @@ function mergeAsUnsupported(error: unknown): boolean {
 export function useMergePullRequest(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationKey: ["github-merge", conversationId],
+    mutationKey: ["classic-github-merge", conversationId],
     scope: { id: `github-merge-${conversationId}` },
     mutationFn: async (request: PullRequestMergeRequest) => {
       const body = {
@@ -1449,7 +1452,8 @@ export function useMergePullRequest(conversationId: string) {
         throw mergeAsUnsupported(error) ? new Error(MERGE_AS_UNSUPPORTED) : error;
       });
     },
-    onSettled: () => queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] }),
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: ["classic-github-info", conversationId] }),
   });
 }
 
@@ -1457,12 +1461,13 @@ export function useMergePullRequest(conversationId: string) {
 export function useDisablePullRequestAutoMerge(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationKey: ["github-disable-auto-merge", conversationId],
+    mutationKey: ["classic-github-disable-auto-merge", conversationId],
     mutationFn: (prUrl: string) =>
       fetchPullRequestEditResource<PullRequestMergeResult>(conversationId, "disable-auto-merge", {
         body: { pr_url: prUrl },
       }),
-    onSettled: () => queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] }),
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: ["classic-github-info", conversationId] }),
   });
 }
 
@@ -1490,7 +1495,7 @@ export function usePullRequestReviewCandidates(
   enabled: boolean,
 ) {
   return useQuery({
-    queryKey: ["github-reviewers", conversationId, prUrl],
+    queryKey: ["classic-github-reviewers", conversationId, prUrl],
     queryFn: () =>
       fetchPullRequestEditResource<PullRequestReviewCandidates>(conversationId, "reviewers", {
         prUrl,
@@ -1514,7 +1519,7 @@ export interface PullRequestReviewerChange {
 
 /** Mutation key of {@link useUpdatePullRequestReviewers}, for reading pending edits. */
 export function pullRequestReviewersMutationKey(conversationId: string) {
-  return ["github-reviewers-update", conversationId] as const;
+  return ["classic-github-reviewers-update", conversationId] as const;
 }
 
 /** Identity of a reviewer; GitHub logins and team slugs are case-insensitive. */
@@ -1551,7 +1556,7 @@ export function applyPullRequestReviewerChange(
  */
 export function useUpdatePullRequestReviewers(conversationId: string) {
   const queryClient = useQueryClient();
-  const infoKey = ["github-info", conversationId];
+  const infoKey = ["classic-github-info", conversationId];
   return useMutation({
     mutationKey: pullRequestReviewersMutationKey(conversationId),
     scope: { id: `github-reviewers-${conversationId}` },
@@ -1599,9 +1604,9 @@ interface PullRequestDetails {
  */
 export function useUpdatePullRequestDetails(conversationId: string) {
   const queryClient = useQueryClient();
-  const infoKey = ["github-info", conversationId];
+  const infoKey = ["classic-github-info", conversationId];
   return useMutation({
-    mutationKey: ["github-details-update", conversationId],
+    mutationKey: ["classic-github-details-update", conversationId],
     scope: { id: `github-details-${conversationId}` },
     mutationFn: (change: PullRequestDetailsChange) =>
       fetchPullRequestEditResource<PullRequestDetails>(conversationId, "details", {
@@ -1691,7 +1696,12 @@ function usePullRequestCommentDraft(key: readonly string[]) {
 }
 
 function commentDraftKey(conversationId: string, prUrl: string, threadId?: string) {
-  return ["github-comment-draft", conversationId, prUrl, ...(threadId ? [threadId] : [])] as const;
+  return [
+    "classic-github-comment-draft",
+    conversationId,
+    prUrl,
+    ...(threadId ? [threadId] : []),
+  ] as const;
 }
 
 function mergePostedComments(comments: PullRequestComment[], posted: PullRequestComment[]) {
@@ -1711,7 +1721,12 @@ export function usePullRequestCommentComposer(
   const key = commentDraftKey(conversationId, prUrl, threadId);
   const { draft, updateDraft } = usePullRequestCommentDraft(key);
   const mutation = useMutation({
-    mutationKey: ["github-comment-create", conversationId, prUrl, ...(threadId ? [threadId] : [])],
+    mutationKey: [
+      "classic-github-comment-create",
+      conversationId,
+      prUrl,
+      ...(threadId ? [threadId] : []),
+    ],
     retry: false,
     mutationFn: ({
       body,
@@ -1738,8 +1753,8 @@ export function usePullRequestCommentComposer(
       { conversationId: targetSessionId, prUrl: targetPrUrl, threadId: targetThreadId },
     ) => {
       const queryKey = targetThreadId
-        ? ["github-review-threads", targetSessionId, targetPrUrl]
-        : ["github-info", targetSessionId];
+        ? ["classic-github-review-threads", targetSessionId, targetPrUrl]
+        : ["classic-github-info", targetSessionId];
       await queryClient.cancelQueries({ queryKey });
       queryClient.setQueryData(commentDraftKey(targetSessionId, targetPrUrl, targetThreadId), {
         body: "",
@@ -1804,7 +1819,7 @@ export function usePullRequestReviewThreadComposer(
   const serverInfo = useServerInfo();
   const localSupported = serverInfo !== "loading" && serverInfo.comment_anchor_metadata === true;
   const queryClient = useQueryClient();
-  const key = ["github-new-review-thread", conversationId, prUrl, path];
+  const key = ["classic-github-new-review-thread", conversationId, prUrl, path];
   const { draft, updateDraft } = usePullRequestCommentDraft(key);
   const stale =
     !!draft.anchor && (draft.anchor.head_sha !== headSha || draft.anchor.base_sha !== baseSha);
@@ -1856,11 +1871,11 @@ export function usePullRequestReviewThreadComposer(
       }
       if (!thread) return;
       await queryClient.cancelQueries({
-        queryKey: ["github-review-threads", target.conversationId, target.prUrl],
+        queryKey: ["classic-github-review-threads", target.conversationId, target.prUrl],
       });
       queryClient.setQueryData(target.key, { body: "", pending: false, error: null });
       queryClient.setQueriesData<ReviewThreadsPage>(
-        { queryKey: ["github-review-threads", target.conversationId, target.prUrl] },
+        { queryKey: ["classic-github-review-threads", target.conversationId, target.prUrl] },
         (page) =>
           page &&
           page.head_sha === target.anchor.head_sha &&
@@ -1872,7 +1887,7 @@ export function usePullRequestReviewThreadComposer(
             : page,
       );
       void queryClient.invalidateQueries({
-        queryKey: ["github-review-threads", target.conversationId, target.prUrl],
+        queryKey: ["classic-github-review-threads", target.conversationId, target.prUrl],
       });
     },
     onError: (error: Error, target) => {

@@ -42,10 +42,10 @@ it("forgets only that PR's account when a switch's reply fails", async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const cached = {
     // An older host's payload carries only the legacy top-level fields.
-    prA: [["github-info", "conv_1", PR_A], info(PR_A, "legacy")],
-    session: [["github-info", "conv_1"], info(PR_A, "auth")],
-    prB: [["github-info", "conv_1", PR_B], info(PR_B, "auth")],
-    otherConversation: [["github-info", "conv_2", PR_A], info(PR_A, "auth")],
+    prA: [["classic-github-info", "conv_1", PR_A], info(PR_A, "legacy")],
+    session: [["classic-github-info", "conv_1"], info(PR_A, "auth")],
+    prB: [["classic-github-info", "conv_1", PR_B], info(PR_B, "auth")],
+    otherConversation: [["classic-github-info", "conv_2", PR_A], info(PR_A, "auth")],
   } as const;
   for (const [key, data] of Object.values(cached)) client.setQueryData(key, data);
   const { result } = renderHook(() => useSetPullRequestPreference("conv_1"), {

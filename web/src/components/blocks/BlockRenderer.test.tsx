@@ -3260,7 +3260,7 @@ describe("BlockRenderer pull request references", () => {
 
   it("links references in assistant text but not in tool output", async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    qc.setQueryData(["github-info", "conv_1"], {
+    qc.setQueryData(["classic-github-info", "conv_1"], {
       object: "session.github.info",
       available: true,
       repo: { name_with_owner: "acme/app", host: "github.com" },

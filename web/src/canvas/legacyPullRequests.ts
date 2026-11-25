@@ -128,7 +128,7 @@ export function useLivePullRequests(
           let info;
           try {
             info = await queryClient.fetchQuery({
-              queryKey: ["github-info", session.id],
+              queryKey: ["classic-github-info", session.id],
               queryFn: () => fetchPullRequestInfo(session.id),
               staleTime: GITHUB_INFO_STALE_MS,
             });

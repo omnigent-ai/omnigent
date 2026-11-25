@@ -200,7 +200,7 @@ describe("PR info reads that may take the runner's previous answer", () => {
     await act(() => vi.advanceTimersByTimeAsync(0));
     await act(() => vi.advanceTimersByTimeAsync(10_000));
     // Refresh, turn end and edits invalidate, then refetch.
-    await act(() => client.invalidateQueries({ queryKey: ["github-info", "conv_live"] }));
+    await act(() => client.invalidateQueries({ queryKey: ["classic-github-info", "conv_live"] }));
     first.unmount();
     await act(() => vi.advanceTimersByTimeAsync(32_000));
     render(tree);

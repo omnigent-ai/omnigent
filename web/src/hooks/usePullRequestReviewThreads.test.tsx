@@ -68,11 +68,17 @@ it("remembers the last destination for new comments while preserving open drafts
 
 it("retains a new range draft, requires reselection after a revision change, and isolates a late write", async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(["github-review-threads", "session", "pr", "account", "base:head"], first);
-  client.setQueryData(["github-review-threads", "session", "pr", "account", "base:changed"], {
-    ...first,
-    head_sha: "changed",
-  });
+  client.setQueryData(
+    ["classic-github-review-threads", "session", "pr", "account", "base:head"],
+    first,
+  );
+  client.setQueryData(
+    ["classic-github-review-threads", "session", "pr", "account", "base:changed"],
+    {
+      ...first,
+      head_sha: "changed",
+    },
+  );
   let respond!: (response: Response) => void;
   const fetch = vi.fn<(...args: Parameters<typeof globalThis.fetch>) => Promise<Response>>(
     () =>
@@ -205,7 +211,7 @@ it("preserves paginated history through polls and retains it when the read is in
   await waitFor(() => expect(result.current.page?.data).toHaveLength(1));
   act(() => result.current.loadComments(first.data[0]));
   await waitFor(() => expect(result.current.page?.data[0].comments.data).toHaveLength(2));
-  await act(async () => client.invalidateQueries({ queryKey: ["github-review-threads"] }));
+  await act(async () => client.invalidateQueries({ queryKey: ["classic-github-review-threads"] }));
   await waitFor(() => expect(result.current.historyStale).toBe(true));
   expect(result.current.page?.data[0].comments.next_cursor).toBeNull();
   expect(result.current.page?.data[0].comments.has_more).toBe(false);
@@ -215,7 +221,7 @@ it("preserves paginated history through polls and retains it when the read is in
         JSON.stringify({ ...first, data: [], warning: "Could not load conversations." }),
       ),
   );
-  await act(async () => client.invalidateQueries({ queryKey: ["github-review-threads"] }));
+  await act(async () => client.invalidateQueries({ queryKey: ["classic-github-review-threads"] }));
   await waitFor(() => expect(result.current.page?.warning).toBe("Could not load conversations."));
   expect(result.current.page?.data[0].comments.data).toHaveLength(2);
   fetch.mockImplementation(async () => new Response(JSON.stringify(first)));
@@ -226,7 +232,10 @@ it("preserves paginated history through polls and retains it when the read is in
 
 it("keeps late pagination results with the original PR and isolates revisions and accounts", async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(["github-review-threads", "session", "pr", "alice", "base:head"], first);
+  client.setQueryData(
+    ["classic-github-review-threads", "session", "pr", "alice", "base:head"],
+    first,
+  );
   let respond!: (response: Response) => void;
   vi.stubGlobal(
     "fetch",
@@ -280,7 +289,7 @@ it("keeps late pagination results with the original PR and isolates revisions an
 it("fetches on opening Diff, polls only while active, and removes deleted comments after confirmation", async () => {
   vi.useFakeTimers();
   const client = new QueryClient();
-  const key = ["github-review-threads", "session", "pr", "account", "base:head"];
+  const key = ["classic-github-review-threads", "session", "pr", "account", "base:head"];
   let serverPage = first;
   const fetch = vi.fn().mockImplementation(async () => new Response(JSON.stringify(serverPage)));
   vi.stubGlobal("fetch", fetch);

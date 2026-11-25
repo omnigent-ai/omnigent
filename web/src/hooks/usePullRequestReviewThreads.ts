@@ -85,7 +85,13 @@ export function usePullRequestReviewThreads(
   enabled: boolean,
 ) {
   const queryClient = useQueryClient();
-  const key = ["github-review-threads", conversationId, prUrl ?? "", account ?? "", revision];
+  const key = [
+    "classic-github-review-threads",
+    conversationId,
+    prUrl ?? "",
+    account ?? "",
+    revision,
+  ];
   const query = useQuery<CachedThreads>({
     queryKey: key,
     queryFn: async ({ signal }) => {

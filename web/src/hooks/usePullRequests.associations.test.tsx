@@ -61,8 +61,8 @@ it.each([
       }),
     );
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    client.setQueryData(["github-info", "conv"], linked);
-    client.setQueryData(["github-info", "conv", url], linked);
+    client.setQueryData(["classic-github-info", "conv"], linked);
+    client.setQueryData(["classic-github-info", "conv", url], linked);
     const { result, rerender, unmount } = renderHook(
       ({ prUrl }: { prUrl?: string }) => ({
         info: usePullRequestInfo("conv", { prUrl }),
@@ -161,16 +161,16 @@ it("replaces the default selection and the removed PR's cached metadata", async 
     vi.fn().mockResolvedValue(new Response(JSON.stringify(empty), { status: 200 })),
   );
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(["github-info", "conv"], { selected_pr_url: url });
-  client.setQueryData(["github-info", "conv", url], { selected_pr_url: url });
+  client.setQueryData(["classic-github-info", "conv"], { selected_pr_url: url });
+  client.setQueryData(["classic-github-info", "conv", url], { selected_pr_url: url });
   const { result } = renderHook(() => useUpdateSessionPr("conv"), {
     wrapper: ({ children }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     ),
   });
   await act(() => result.current.mutateAsync({ url, action: "remove" }));
-  expect(client.getQueryData(["github-info", "conv"])).toMatchObject(empty);
-  expect(client.getQueryData(["github-info", "conv", url])).toMatchObject(empty);
+  expect(client.getQueryData(["classic-github-info", "conv"])).toMatchObject(empty);
+  expect(client.getQueryData(["classic-github-info", "conv", url])).toMatchObject(empty);
 });
 
 it("keeps the workspace's repo when an attach reply describes only the PR", async () => {
@@ -182,7 +182,7 @@ it("keeps the workspace's repo when an attach reply describes only the PR", asyn
     vi.fn().mockResolvedValue(new Response(JSON.stringify(attached), { status: 200 })),
   );
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(["github-info", "conv"], {
+  client.setQueryData(["classic-github-info", "conv"], {
     object: "session.github.info",
     prs: [],
     workspace_repo: workspaceRepo,
@@ -193,7 +193,7 @@ it("keeps the workspace's repo when an attach reply describes only the PR", asyn
     ),
   });
   await act(() => result.current.mutateAsync({ url, action: "attach" }));
-  expect(client.getQueryData(["github-info", "conv"])).toMatchObject({
+  expect(client.getQueryData(["classic-github-info", "conv"])).toMatchObject({
     ...attached,
     workspace_repo: workspaceRepo,
   });
@@ -214,7 +214,7 @@ it("keeps a link to its own session when the panel switches sessions", async () 
     ),
   );
   const client = new QueryClient();
-  client.setQueryData(["github-info", "conv_2"], other);
+  client.setQueryData(["classic-github-info", "conv_2"], other);
   const { result, rerender } = renderHook(({ id }) => useUpdateSessionPr(id), {
     initialProps: { id: "conv_1" },
     wrapper: ({ children }) => (
@@ -228,8 +228,10 @@ it("keeps a link to its own session when the panel switches sessions", async () 
   expect(result.current.isIdle).toBe(true);
   answer(new Response(JSON.stringify(linked), { status: 200 }));
 
-  await waitFor(() => expect(client.getQueryData(["github-info", "conv_1"])).toMatchObject(linked));
-  expect(client.getQueryData(["github-info", "conv_2"])).toEqual(other);
+  await waitFor(() =>
+    expect(client.getQueryData(["classic-github-info", "conv_1"])).toMatchObject(linked),
+  );
+  expect(client.getQueryData(["classic-github-info", "conv_2"])).toEqual(other);
 });
 
 it("does not restore an unlinked GitLab MR from an older host's stale selection", async () => {
@@ -257,11 +259,11 @@ it("does not restore an unlinked GitLab MR from an older host's stale selection"
     const response = await result.current.mutateAsync({ url, action: "remove" });
     expect(response.selected_pr_url).toBeUndefined();
   });
-  expect(client.getQueryData(["github-info", "conv"])).toMatchObject({
+  expect(client.getQueryData(["classic-github-info", "conv"])).toMatchObject({
     prs: [],
     selected_pr_url: undefined,
   });
-  expect(client.getQueryData(["github-info", "conv", url])).toMatchObject({
+  expect(client.getQueryData(["classic-github-info", "conv", url])).toMatchObject({
     prs: [],
     selected_pr_url: undefined,
   });

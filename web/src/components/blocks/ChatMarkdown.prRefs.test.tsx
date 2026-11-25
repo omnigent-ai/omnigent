@@ -95,7 +95,7 @@ function githubInfo(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
 }
 
 function seed(info: PullRequestInfo): void {
-  client.setQueryData(["github-info", CONVERSATION_ID], info);
+  client.setQueryData(["classic-github-info", CONVERSATION_ID], info);
 }
 
 function renderMarkdown(
@@ -246,7 +246,7 @@ describe("pull request references in chat markdown", () => {
     serveGithubInfo(() => new Response("boom", { status: 500 }));
     renderMarkdown("See #4242 and acme/app#12");
     await waitFor(() =>
-      expect(client.getQueryState(["github-info", CONVERSATION_ID])?.status).toBe("error"),
+      expect(client.getQueryState(["classic-github-info", CONVERSATION_ID])?.status).toBe("error"),
     );
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(screen.getByText("#4242")).toBeVisible();
@@ -254,7 +254,9 @@ describe("pull request references in chat markdown", () => {
     renderMarkdown("And #4243");
     // A mount-time refetch starts in the mount effect and fetches after a microtask.
     await act(async () => {});
-    expect(client.getQueryState(["github-info", CONVERSATION_ID])?.fetchStatus).toBe("idle");
+    expect(client.getQueryState(["classic-github-info", CONVERSATION_ID])?.fetchStatus).toBe(
+      "idle",
+    );
     expect(githubInfoRequests()).toHaveLength(calls);
   });
 
@@ -267,7 +269,7 @@ describe("pull request references in chat markdown", () => {
     writeOpenLinksInApp(true);
     seed(githubInfo());
     client.setQueryData(
-      ["github-info", "conv_child"],
+      ["classic-github-info", "conv_child"],
       githubInfo({
         workspace_repo: { name_with_owner: "acme/lib", host: "github.com" },
         prs: [linkedPullRequest("acme/lib", 4242)],

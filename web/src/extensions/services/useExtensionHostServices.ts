@@ -190,7 +190,7 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
           try {
             // Shares the GitHub panel's cache so the runner is asked at most every 30s per session.
             const info = await queryClient.fetchQuery({
-              queryKey: ["github-info", sessionId],
+              queryKey: ["classic-github-info", sessionId],
               queryFn: () => fetchPullRequestInfo(sessionId),
               staleTime: 30_000,
             });

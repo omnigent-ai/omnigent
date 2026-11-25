@@ -104,7 +104,7 @@ describe("useRecentPullRequestFacts", () => {
     expect(result.current.details.size).toBe(0);
     act(() => {
       client.setQueryData(
-        ["github-info", "conv", URL_321],
+        ["classic-github-info", "conv", URL_321],
         detailInfo({ url: URL_321, number: 321, title: "Retry uploads", author: "sam-lee" }),
       );
     });
@@ -113,7 +113,7 @@ describe("useRecentPullRequestFacts", () => {
     );
     act(() => {
       client.setQueryData(
-        ["github-info", "conv", URL_321],
+        ["classic-github-info", "conv", URL_321],
         detailInfo({ url: URL_321, number: 321, title: "Retry flaky uploads", author: "sam-lee" }),
       );
     });
@@ -129,7 +129,7 @@ describe("useRecentPullRequestFacts", () => {
     const readAt = Date.UTC(2026, 0, 1, 10, 0);
     act(() => {
       client.setQueryData(
-        ["github-info", "conv", URL_321],
+        ["classic-github-info", "conv", URL_321],
         detailInfo({ url: URL_321, number: 321, title: "Retry uploads", author: "sam-lee" }),
         { updatedAt: readAt },
       );
@@ -140,7 +140,7 @@ describe("useRecentPullRequestFacts", () => {
   it("reads the selected PR's details from the session's own info", async () => {
     const { client, result } = setup({ conversationId: "conv", urls: [] });
     act(() => {
-      client.setQueryData(["github-info", "conv"], {
+      client.setQueryData(["classic-github-info", "conv"], {
         ...sessionInfo([association(URL_338, 338, "Show who wrote each review comment")]),
         pr: {
           url: URL_338,
@@ -163,12 +163,12 @@ describe("useRecentPullRequestFacts", () => {
       const { client, result, unmount } = setup({ conversationId: "conv", urls: [URL_338] });
       act(() => {
         client.setQueryData(
-          ["github-info", "conv"],
+          ["classic-github-info", "conv"],
           { ...sessionInfo([]), pr: read(session > own ? "MERGED" : "OPEN") as PullRequest },
           { updatedAt: session },
         );
         client.setQueryData(
-          ["github-info", "conv", URL_338],
+          ["classic-github-info", "conv", URL_338],
           detailInfo(read(own > session ? "MERGED" : "OPEN")),
           { updatedAt: own },
         );
@@ -194,7 +194,7 @@ describe("useRecentPullRequestFacts", () => {
     const { client, result, rerender } = setup({ conversationId: "conv", urls: [URL_338] });
     act(() => {
       client.setQueryData(
-        ["github-info", "conv", URL_338],
+        ["classic-github-info", "conv", URL_338],
         detailInfo({ url: URL_338, number: 338, title: "Mine", author: "jane-doe" }),
       );
     });
@@ -236,7 +236,7 @@ describe("useRecentPullRequestFacts", () => {
     await waitFor(() => expect(result.current.facts.details.get(URL_338)?.author).toBe("jane-doe"));
     const before = prRequests().length;
 
-    await act(() => client.invalidateQueries({ queryKey: ["github-info", "conv"] }));
+    await act(() => client.invalidateQueries({ queryKey: ["classic-github-info", "conv"] }));
 
     await waitFor(() => expect(prRequests().length).toBeGreaterThan(before));
     await waitFor(() => expect(result.current.live.isFetching).toBe(false));

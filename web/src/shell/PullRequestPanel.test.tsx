@@ -502,7 +502,7 @@ describe("PullRequestPanel", () => {
         );
       }
       await waitFor(() => {
-        expect(client.getQueryData(["github-info", "conv_1", url])).toBeDefined();
+        expect(client.getQueryData(["classic-github-info", "conv_1", url])).toBeDefined();
       });
       await user.click(await screen.findByRole("tab", { name: "Comments" }));
       expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
@@ -511,7 +511,7 @@ describe("PullRequestPanel", () => {
       );
       // A subsequent poll replaces the original response in the shared cache.
       payload.pr = { ...payload.pr!, title: "Updated by polling" };
-      await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+      await act(() => client.refetchQueries({ queryKey: ["classic-github-info", "conv_1"] }));
       expect(await screen.findByText("Updated by polling")).toBeVisible();
 
       expect(client.getQueryData(["pull-request-panel-view", "conv_1"])).toMatchObject({
@@ -538,7 +538,10 @@ describe("PullRequestPanel", () => {
       // Even a stale response remains visible while the return refresh is pending.
       rerender(<div />);
       await act(() =>
-        client.invalidateQueries({ queryKey: ["github-info", "conv_1"], refetchType: "none" }),
+        client.invalidateQueries({
+          queryKey: ["classic-github-info", "conv_1"],
+          refetchType: "none",
+        }),
       );
       refreshing = true;
       rerender(<PullRequestPanel conversationId="conv_1" />);
@@ -604,17 +607,17 @@ describe("PullRequestPanel", () => {
       payload.pr.merge_state_status = transition === "error" ? "CLEAN" : transition;
       payload.pr.head_sha = "b".repeat(40);
       failed = transition === "error";
-      await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+      await act(() => client.refetchQueries({ queryKey: ["classic-github-info", "conv_1"] }));
       expect(screen.getByRole("dialog")).toBe(dialog);
       if (failed) {
         await waitFor(() => expect(confirm).toBeDisabled());
         failed = false;
-        await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+        await act(() => client.refetchQueries({ queryKey: ["classic-github-info", "conv_1"] }));
       }
       await user.click(confirm);
       expect(requests).toEqual([{ pr_url: url, merge_method: "squash", expected_head: head }]);
       payload.pr.merge_state_status = "BLOCKED";
-      await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+      await act(() => client.refetchQueries({ queryKey: ["classic-github-info", "conv_1"] }));
       expect(within(dialog).getByRole("button", { name: "Merging…" })).toBeDisabled();
       await act(async () =>
         respond(
@@ -815,7 +818,7 @@ describe("PullRequestPanel", () => {
     expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     // Turning the poll back on doesn't fetch by itself.
     expect(refetchQueries).toHaveBeenCalledWith({
-      queryKey: ["github-info", "conv_1"],
+      queryKey: ["classic-github-info", "conv_1"],
       stale: true,
     });
     await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
@@ -2577,12 +2580,12 @@ describe("PullRequestPanel", () => {
     renderPanel();
     await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey?.[0])).toEqual([
-      "github-info",
-      "github-review-threads",
-      "github-changed-files",
-      "github-pr-diff",
-      "github-pr-commits",
-      "github-pr-commit-diff",
+      "classic-github-info",
+      "classic-github-review-threads",
+      "classic-github-changed-files",
+      "classic-github-pr-diff",
+      "classic-github-pr-commits",
+      "classic-github-pr-commit-diff",
       "session-pull-requests",
     ]);
   });

@@ -173,7 +173,7 @@ function renderWithSessionRepo(children: ReactNode) {
     vi.fn(() => new Promise<Response>(() => {})),
   );
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  queryClient.setQueryData(["github-info", "conv_pr"], {
+  queryClient.setQueryData(["classic-github-info", "conv_pr"], {
     object: "session.github.info",
     available: true,
     repo: { name_with_owner: "acme/app", host: "github.com" },
@@ -949,7 +949,7 @@ describe("UserBubble command tint", () => {
   });
 
   it("tints the command and links a PR reference in the same paragraph", () => {
-    queryClient.setQueryData(["github-info", "conv_cmd"], {
+    queryClient.setQueryData(["classic-github-info", "conv_cmd"], {
       object: "session.github.info",
       available: true,
       repo: { name_with_owner: "acme/app", host: "github.com" },

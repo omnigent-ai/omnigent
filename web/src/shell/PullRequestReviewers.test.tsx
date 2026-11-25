@@ -13,7 +13,7 @@ import type {
 import { PullRequestReviewers, typedReviewer } from "./PullRequestReviewers";
 
 const PR_URL = "https://github.com/acme/app/pull/7";
-const INFO_KEY = ["github-info", "conv_1", PR_URL];
+const INFO_KEY = ["classic-github-info", "conv_1", PR_URL];
 const REVIEWERS_PATH = "/v1/sessions/conv_1/resources/github/reviewers";
 const alice: PullRequestReviewCandidate = { login: "alice", kind: "user", name: "Alice Liddell" };
 const dev: PullRequestReviewCandidate = { login: "dev", kind: "user", name: null };

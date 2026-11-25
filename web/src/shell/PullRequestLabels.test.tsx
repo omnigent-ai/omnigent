@@ -9,7 +9,7 @@ import type { PullRequestInfo, PullRequestLabel } from "@/hooks/usePullRequests"
 import { PullRequestLabels } from "./PullRequestLabels";
 
 const PR_URL = "https://github.com/acme/app/pull/7";
-const INFO_KEY = ["github-info", "conv_1", PR_URL];
+const INFO_KEY = ["classic-github-info", "conv_1", PR_URL];
 const LABELS_PATH = "/v1/sessions/conv_1/resources/github/labels";
 const bug: PullRequestLabel = { name: "bug", color: "d73a4a", description: null };
 const ready: PullRequestLabel = { name: "ready", color: "0e8a16", description: "Ship it" };

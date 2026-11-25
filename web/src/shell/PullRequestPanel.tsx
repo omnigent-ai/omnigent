@@ -1012,12 +1012,12 @@ export function refreshSessionPullRequests(
 ): Promise<unknown> {
   return Promise.all(
     [
-      "github-info",
-      "github-review-threads",
-      "github-changed-files",
-      "github-pr-diff",
-      "github-pr-commits",
-      "github-pr-commit-diff",
+      "classic-github-info",
+      "classic-github-review-threads",
+      "classic-github-changed-files",
+      "classic-github-pr-diff",
+      "classic-github-pr-commits",
+      "classic-github-pr-commit-diff",
       "session-pull-requests",
     ].map((key) => queryClient.invalidateQueries({ queryKey: [key, conversationId] })),
   );
@@ -1121,7 +1121,10 @@ export function PullRequestPanel({
   const wasActive = useRef(active);
   useEffect(() => {
     if (active && !wasActive.current) {
-      void queryClient.refetchQueries({ queryKey: ["github-info", conversationId], stale: true });
+      void queryClient.refetchQueries({
+        queryKey: ["classic-github-info", conversationId],
+        stale: true,
+      });
     }
     wasActive.current = active;
   }, [active, conversationId, queryClient]);

@@ -155,7 +155,7 @@ export function storedListToShow(
 export function useUnlinkSessionPr(conversationId: string) {
   const queryClient = useQueryClient();
   const serverInfo = useServerInfo();
-  const infoKey = ["github-info", conversationId];
+  const infoKey = ["classic-github-info", conversationId];
   const storedKey = sessionPullRequestsKey(conversationId);
   return useMutation({
     // The panel outlives a session switch; a per-session key leaves a running

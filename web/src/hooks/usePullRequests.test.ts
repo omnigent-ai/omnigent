@@ -11,7 +11,10 @@ import {
   fetchPullRequestInfo,
   normalizePullRequestInfo,
   pollAcceptsCachedAnswer,
+  pullRequestInfoQueryKey,
+  pullRequestLabelsMutationKey,
   pullRequestNotFoundReason,
+  pullRequestReviewersMutationKey,
   type PullRequestAccount,
   type PullRequestAuth,
   type PullRequestCapabilities,
@@ -285,8 +288,39 @@ describe("fetchPullRequestInfo's allow_cached", () => {
   });
 });
 
+describe("the classic view's cache keys", () => {
+  // The new pull request page keys a session's read of a PR as `["github-info", session, url]`.
+  const pageInfoKey = (session: string, url: string) => ["github-info", session, url];
+  const URL = "https://github.com/acme/app/pull/7";
+
+  it("never share an entry with the new page's read of the same session and URL", () => {
+    const client = new QueryClient();
+    client.setQueryData(pullRequestInfoQueryKey("conv", URL), { from: "classic" });
+    client.setQueryData(pageInfoKey("conv", URL), { from: "page" });
+
+    expect(client.getQueryData(pullRequestInfoQueryKey("conv", URL))).toEqual({ from: "classic" });
+    expect(client.getQueryData(pageInfoKey("conv", URL))).toEqual({ from: "page" });
+
+    // Each view's session-wide refresh drops only its own entries.
+    client.removeQueries({ queryKey: ["github-info", "conv"] });
+    expect(client.getQueryData(pullRequestInfoQueryKey("conv", URL))).toEqual({ from: "classic" });
+    client.removeQueries({ queryKey: pullRequestInfoQueryKey("conv") });
+    expect(client.getQueryData(pullRequestInfoQueryKey("conv", URL))).toBeUndefined();
+  });
+
+  it("all start with a classic family", () => {
+    for (const key of [
+      pullRequestInfoQueryKey("conv", URL),
+      pullRequestLabelsMutationKey("conv"),
+      pullRequestReviewersMutationKey("conv"),
+    ]) {
+      expect(String(key[0])).toMatch(/^classic-github-/);
+    }
+  });
+});
+
 describe("pollAcceptsCachedAnswer", () => {
-  const key = ["github-info", "conv"];
+  const key = ["classic-github-info", "conv"];
   const info = { object: "session.github.info", available: true } as PullRequestInfo;
 
   const prInfoStaleTime = 30_000;

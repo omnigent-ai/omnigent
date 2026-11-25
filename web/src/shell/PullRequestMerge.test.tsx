@@ -174,7 +174,7 @@ describe("with auto-merge enabled", () => {
       posts[0].respond(json({ object: "session.github.pr_merge", pr_url: PR_URL }));
     });
 
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["github-info", "conv_1"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["classic-github-info", "conv_1"] });
     expect(screen.getByRole("button", { name: "Disable auto-merge" })).toBeDisabled();
     rerender(pullRequest());
     expect(await screen.findByRole("button", { name: "Squash and merge" })).toBeEnabled();
@@ -227,7 +227,7 @@ it.each([false, true])("merges once at the confirmed head (compact: %s)", async 
   });
 
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-  expect(invalidate).toHaveBeenCalledWith({ queryKey: ["github-info", "conv_1"] });
+  expect(invalidate).toHaveBeenCalledWith({ queryKey: ["classic-github-info", "conv_1"] });
   expect(posts).toHaveLength(1);
 });
 
@@ -314,7 +314,7 @@ describe("merging as another account", () => {
     const { posts } = stubFetch(() => mergeOptions(["merge", "squash", "rebase"], defaultMethod)());
     const { client } = renderMerge(pullRequest(), false, twoAccounts);
     const sessionInfo = { object: "session.github.info", selected_pr_url: PR_URL };
-    client.setQueryData(["github-info", "conv_1"], sessionInfo);
+    client.setQueryData(["classic-github-info", "conv_1"], sessionInfo);
 
     await openDialog();
     const dialog = screen.getByRole("dialog");
@@ -350,8 +350,8 @@ describe("merging as another account", () => {
     expect(confirm).toBeEnabled();
     expect(picker).toHaveTextContent("personal");
     // The PR's reply fills that PR's query and leaves the session's alone.
-    expect(client.getQueryData(["github-info", "conv_1", PR_URL])).toEqual(prInfo);
-    expect(client.getQueryData(["github-info", "conv_1"])).toEqual(sessionInfo);
+    expect(client.getQueryData(["classic-github-info", "conv_1", PR_URL])).toEqual(prInfo);
+    expect(client.getQueryData(["classic-github-info", "conv_1"])).toEqual(sessionInfo);
 
     fireEvent.click(confirm);
     await waitFor(() => expect(posts).toHaveLength(3));
@@ -390,7 +390,7 @@ describe("merging as another account", () => {
   /** The dialog fed from the PR's info query, as the panel feeds it. */
   function MergeFromInfo() {
     const { data } = useQuery({
-      queryKey: ["github-info", "conv_1", PR_URL],
+      queryKey: ["classic-github-info", "conv_1", PR_URL],
       queryFn: async () => {
         const response = await fetch(INFO_PATH);
         if (!response.ok) throw new Error("info failed");
@@ -474,7 +474,8 @@ describe("merging as another account", () => {
         await act(async () => infoRequests[1](info("personal", logins)));
         await waitFor(() =>
           expect(
-            client.getQueryData<PullRequestInfo>(["github-info", "conv_1", PR_URL])?.auth?.accounts,
+            client.getQueryData<PullRequestInfo>(["classic-github-info", "conv_1", PR_URL])?.auth
+              ?.accounts,
           ).toHaveLength(logins.length),
         );
       }

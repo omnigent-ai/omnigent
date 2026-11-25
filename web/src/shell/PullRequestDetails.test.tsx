@@ -22,7 +22,7 @@ import {
 } from "./PullRequestDetails";
 
 const PR_URL = "https://github.com/acme/app/pull/7";
-const INFO_KEY = ["github-info", "conv_1", PR_URL];
+const INFO_KEY = ["classic-github-info", "conv_1", PR_URL];
 const DETAILS_PATH = "/v1/sessions/conv_1/resources/github/details";
 const ATTACHMENTS_PATH = "/v1/sessions/conv_1/resources/github/attachments";
 const ASSET_URL = "https://github.com/user-attachments/assets/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab";
@@ -728,7 +728,7 @@ it.each(["unmount", "rerender"])(
       selected_pr_url: PR_URL,
       pr: { comments: [] },
     });
-    const threadKey = ["github-review-threads", "conv_1", PR_URL, "octocat", "base:head"];
+    const threadKey = ["classic-github-review-threads", "conv_1", PR_URL, "octocat", "base:head"];
     client.setQueryData(threadKey, page);
     const tree = (prUrl: string, current: ReviewThread) => (
       <QueryClientProvider client={client}>
@@ -804,7 +804,7 @@ it("posts a comment once, keeps the draft through unmount, and updates only its 
   const { edits } = stubFetch();
   const { client, view } = renderDetails();
   view.unmount();
-  const otherKey = ["github-info", "conv_1", "other"];
+  const otherKey = ["classic-github-info", "conv_1", "other"];
   client.setQueryData(otherKey, {
     ...client.getQueryData<PullRequestInfo>(INFO_KEY),
     selected_pr_url: "other",
