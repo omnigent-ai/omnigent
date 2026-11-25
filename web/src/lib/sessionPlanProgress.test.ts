@@ -7,21 +7,20 @@ const step = (name: string, state: NonNullable<SessionPlanProgress["step"]>["sta
 });
 
 describe("planProgressLine", () => {
-  it("counts finished steps and names the step in progress", () => {
-    expect(
-      planProgressLine(
-        { total: 5, done: 3, started: 1, step: step("Open PRs for safe upgrades", "started") },
-        false,
-      ),
-    ).toEqual({ finished: 3, total: 5, lead: null, text: "Open PRs for safe upgrades", more: 0 });
-  });
-
-  it("counts the other steps running alongside the named one", () => {
-    const line = planProgressLine(
-      { total: 6, done: 1, started: 3, step: step("Upgrade web-app", "started") },
-      false,
-    );
-    expect(line?.more).toBe(2);
+  it("names the step in progress, counts the others running with it, and says when it waits", () => {
+    const progress = { total: 6, done: 3, started: 3, step: step("Upgrade web-app", "started") };
+    expect(planProgressLine(progress, false)).toEqual({
+      finished: 3,
+      total: 6,
+      lead: null,
+      text: "Upgrade web-app",
+      more: 2,
+    });
+    // A prompt in the session waits on the step in progress, as the chat's preview says.
+    expect(planProgressLine(progress, true)).toMatchObject({
+      lead: { text: "Waiting for you", tone: "waiting" },
+      text: "Upgrade web-app",
+    });
   });
 
   it("says a step waits for the user", () => {

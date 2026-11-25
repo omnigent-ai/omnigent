@@ -39,10 +39,12 @@ export interface PlanProgressLine {
 /**
  * The line for a session whose plan has started: null while no step has a
  * status, such as a planning chat's proposal or a run whose first step hasn't
- * begun. Also null for a finished plan with a step still in progress while a
- * prompt waits, where the chat's preview names that step instead.
+ * begun.
  *
- * @param promptWaiting - Whether a prompt in the session waits for the user.
+ * @param promptWaiting - Whether a prompt in the session waits for the user. As
+ *   in the chat's task preview, a step in progress then waits for you too, and a
+ *   finished plan with a step still in progress shows nothing rather than "All
+ *   done".
  */
 export function planProgressLine(
   progress: SessionPlanProgress,
@@ -68,7 +70,12 @@ export function planProgressLine(
         more: Math.max(needsInput - 1, 0),
       };
     case "started":
-      return { ...line, text: step.name, more: Math.max(started - 1, 0) };
+      return {
+        ...line,
+        lead: promptWaiting ? { text: WAITING_FOR_YOU, tone: "waiting" } : null,
+        text: step.name,
+        more: Math.max(started - 1, 0),
+      };
     case "failed":
       return { ...line, lead: { text: "Failed", tone: "failed" }, text: step.name };
     case "next":
