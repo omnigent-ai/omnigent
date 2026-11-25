@@ -41,8 +41,8 @@ export function shortcutSettingsEntry(
   return entry;
 }
 
-// Without ⌘K's QuickPick, Settings search finds only the rows it found before every page row
-// named its binding. Start a new session joins them only in the desktop app.
+// Without ⌘K's QuickPick, Settings search finds only these rows; Start a new session joins
+// them in the desktop app.
 const ROWS_SEARCHED_WITHOUT_QUICK_PICK: ReadonlySet<ShortcutId> = new Set<ShortcutId>([
   "approval.accept",
   "approval.decline",
