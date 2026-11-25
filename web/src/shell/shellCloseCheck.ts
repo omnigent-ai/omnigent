@@ -116,15 +116,22 @@ export async function readTerminalShell(
   }
 }
 
+/** How one check runs: from `started`, until `signal` stops reads nobody will use. */
+export interface ShellCloseCheckOptions {
+  started?: number;
+  signal?: AbortSignal;
+  /** When each shell's close was first asked, if earlier than `started`: input since then asks. */
+  askedAt?: ReadonlyMap<string, number>;
+}
+
 /**
  * Whether closing `terminalIds` in `sessionId` can go ahead without asking, and why. It answers
- * within the budget even when a read ignores its signal; `signal` stops reads nobody will use.
+ * within the budget even when a read ignores its signal.
  */
 export async function checkShellClose(
   sessionId: string,
   terminalIds: readonly string[],
-  started: number = performance.now(),
-  signal?: AbortSignal,
+  { started = performance.now(), signal, askedAt }: ShellCloseCheckOptions = {},
 ): Promise<{ check: ShellCloseCheck; reason: ShellCloseReason }> {
   if (terminalIds.length === 0) return { check: CONFIRM, reason: "unknown" };
   const controller = new AbortController();
@@ -154,7 +161,9 @@ export async function checkShellClose(
   if (readings === "timeout" || performance.now() - started > SHELL_CLOSE_CHECK_MS) {
     return { check: CONFIRM, reason: "timeout" };
   }
-  if (terminalIds.some((terminalId) => lastTerminalInputAt(sessionId, terminalId) >= started)) {
+  const typedInto = (terminalId: string) =>
+    lastTerminalInputAt(sessionId, terminalId) >= (askedAt?.get(terminalId) ?? started);
+  if (terminalIds.some(typedInto)) {
     return { check: CONFIRM, reason: "typed" };
   }
   const notIdle = readings.find((reading) => reading.state !== "idle");
@@ -185,6 +194,7 @@ export function useShellCloseCheck(
   trigger: ShellCloseTrigger,
   decide: (check: ShellCloseCheck) => void,
   dropped?: () => void,
+  askedAt?: ReadonlyMap<string, number>,
 ) => void {
   const place = JSON.stringify([getOmnigentServerIdentity(), sessionId ?? null]);
   const current = useRef<{ place: string; running: RunningCheck | null }>({
@@ -210,7 +220,7 @@ export function useShellCloseCheck(
     };
   }, []);
   return useCallback(
-    (terminalIds, trigger, decide, dropped) => {
+    (terminalIds, trigger, decide, dropped, askedAt) => {
       const state = current.current;
       state.running?.stop.abort();
       state.running = null;
@@ -221,7 +231,7 @@ export function useShellCloseCheck(
       const running: RunningCheck = { decide, dropped, stop: new AbortController() };
       const askedPlace = state.place;
       state.running = running;
-      void checkShellClose(sessionId, terminalIds, performance.now(), running.stop.signal).then(
+      void checkShellClose(sessionId, terminalIds, { signal: running.stop.signal, askedAt }).then(
         ({ check, reason }) => {
           if (state.running !== running) return;
           state.running = null;
@@ -251,10 +261,11 @@ export interface PendingShellClose<Item> {
   busy: ShellBusy | null;
 }
 
-/** The closes a surface is still checking, and their shells. */
+/** The closes a surface is still checking, their shells, and when each shell's close was asked. */
 interface CheckingShellClose<Item> {
   items: readonly Item[];
   terminalIds: readonly string[];
+  askedAt: ReadonlyMap<string, number>;
 }
 
 /**
@@ -295,9 +306,15 @@ export function useShellCloseRequest<Item>(
         setPending({ items, busy: null });
         return;
       }
+      // A joined shell keeps the time its own close was asked, so input since then still asks.
+      const askedAt = new Map(earlier?.askedAt);
+      const now = performance.now();
+      for (const terminalId of terminalIds)
+        if (!askedAt.has(terminalId)) askedAt.set(terminalId, now);
       const joined: CheckingShellClose<Item> = {
         items,
         terminalIds: [...new Set([...(earlier?.terminalIds ?? []), ...terminalIds])],
+        askedAt,
       };
       checking.current = joined;
       checkClose(
@@ -313,6 +330,7 @@ export function useShellCloseRequest<Item>(
         () => {
           if (checking.current === joined) checking.current = null;
         },
+        askedAt,
       );
     },
     [checkClose, trigger, setPending],

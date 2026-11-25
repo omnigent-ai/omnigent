@@ -297,6 +297,34 @@ describe("useShellCloseRequest", () => {
     await vi.waitFor(() => expect(close).toHaveBeenCalledExactlyOnceWith(["tab-1", "tab-2"]));
   });
 
+  it("asks about a joined close when the earlier shell was typed into before the join", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    let clock = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => (clock += 10));
+    const close = vi.fn<(items: readonly string[]) => void>();
+    const { result } = renderHook(() => useShellCloseRequest("conv_a", "grid_close", close));
+    let answer = () => {};
+    const held = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    runnerSays({
+      terminal_one: async () => {
+        await held;
+        return json({ state: "idle" });
+      },
+      terminal_two: json({ state: "idle" }),
+    });
+    act(() => result.current.request("tab-1", ["terminal_one"]));
+    noteTerminalInput("conv_a", "terminal_one");
+    act(() => result.current.request("tab-2", ["terminal_two"]));
+    act(() => answer());
+    // Both read idle, but the first shell took input after its close was asked.
+    await vi.waitFor(() =>
+      expect(result.current.pending).toEqual({ items: ["tab-1", "tab-2"], busy: null }),
+    );
+    expect(close).not.toHaveBeenCalled();
+  });
+
   it("asks once about both when the joined close finds one busy", async () => {
     vi.spyOn(console, "info").mockImplementation(() => {});
     const close = vi.fn<(items: readonly string[]) => void>();
