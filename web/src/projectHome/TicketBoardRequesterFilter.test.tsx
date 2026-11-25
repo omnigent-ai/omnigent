@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoardRequesterFilter";
 
 function Header({ projectId }: { projectId: string }) {
@@ -42,5 +42,35 @@ describe("TicketBoardRequesterFilter", () => {
     );
     act(() => fireEvent.click(screen.getByRole("button", { name: "Your tickets" })));
     expect(screen.getByTestId("board-mine")).toHaveTextContent("all");
+  });
+
+  it("shows Needs you (N) only while something waits on the viewer, and selects it alone", () => {
+    const onSelect = vi.fn();
+    const { rerender } = render(
+      <TicketBoardRequesterFilter
+        mine={false}
+        onChange={() => {}}
+        needsYou={{ count: 0, active: false, onSelect }}
+        compact
+      />,
+    );
+    expect(screen.queryByTestId("ticket-needs-you-filter")).toBeNull();
+    rerender(
+      <TicketBoardRequesterFilter
+        mine
+        onChange={() => {}}
+        needsYou={{ count: 2, active: true, onSelect }}
+        compact
+      />,
+    );
+    const chip = screen.getByTestId("ticket-needs-you-filter");
+    expect(chip).toHaveTextContent("Needs you (2)");
+    expect(chip).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Your tickets" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    fireEvent.click(chip);
+    expect(onSelect).toHaveBeenCalledOnce();
   });
 });

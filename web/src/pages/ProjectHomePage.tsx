@@ -42,6 +42,11 @@ import {
   useBoardRequesterFilter,
 } from "@/projectHome/TicketBoardRequesterFilter";
 import { useProjectTicketsEnabled, useTicketProject } from "@/projectHome/useProjectTickets";
+import {
+  NEEDS_YOU_PARAM,
+  NEEDS_YOU_VALUE,
+  useNeedsYouTicketIds,
+} from "@/projectHome/needsYouFilter";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 
 const SESSION_PANEL_DEFAULT_WIDTH_VW = 40;
@@ -136,6 +141,16 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
   }
 
   const [boardMine, setBoardMine] = useBoardRequesterFilter(projectId ?? null);
+  const needsYouIds = useNeedsYouTicketIds(tickets ? (projectId ?? null) : null);
+  // With nothing waiting on the viewer the chip hides and the board shows its usual view.
+  const needsYou = searchParams.get(NEEDS_YOU_PARAM) === NEEDS_YOU_VALUE && needsYouIds.length > 0;
+  const setNeedsYou = (on: boolean) => {
+    const next = new URLSearchParams(searchParams);
+    next.delete("tickets");
+    if (on) next.set(NEEDS_YOU_PARAM, NEEDS_YOU_VALUE);
+    else next.delete(NEEDS_YOU_PARAM);
+    replaceSearchParams(next);
+  };
   const view: ProjectHomeView = tickets && !orchestrator ? projectHomeView(searchParams) : "board";
   // Summary and Rules replace the board, so they drop its ticket and panel selection.
   const showTab = (nextView: ProjectHomeView) => {
@@ -190,7 +205,19 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
             onChange={showTab}
             end={viewTools}
             trailing={
-              <TicketBoardRequesterFilter mine={boardMine} onChange={setBoardMine} compact />
+              <TicketBoardRequesterFilter
+                mine={boardMine}
+                onChange={(mine) => {
+                  if (needsYou) setNeedsYou(false);
+                  setBoardMine(mine);
+                }}
+                needsYou={{
+                  count: needsYouIds.length,
+                  active: needsYou,
+                  onSelect: () => setNeedsYou(true),
+                }}
+                compact
+              />
             }
           />
         )}
@@ -204,7 +231,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
                 projectName={projectName}
                 selectedTicketId={panelTicketId}
                 isNewTicket={isNewTicket}
-                ticketIds={ticketSelectionIds(searchParams)}
+                ticketIds={needsYou ? needsYouIds : ticketSelectionIds(searchParams)}
                 requesterFilterInHeader={!ticketFillsPage}
                 overlayClearance={composerOpen ? "10rem" : undefined}
               />

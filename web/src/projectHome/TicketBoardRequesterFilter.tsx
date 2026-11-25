@@ -48,14 +48,24 @@ export function useBoardRequesterFilter(projectId: string | null) {
   return [mine, setMine] as const;
 }
 
-/** "All tickets" / "Your tickets" toggle; "yours" means tickets you requested. */
+/** "All tickets" / "Your tickets" toggle, plus "Needs you"; "yours" means tickets you requested. */
+/** The "Needs you (N)" chip: the tickets waiting on the viewer's answer. */
+export interface NeedsYouChip {
+  count: number;
+  active: boolean;
+  onSelect: () => void;
+}
+
 export function TicketBoardRequesterFilter({
   mine,
   onChange,
+  needsYou,
   compact = false,
 }: {
   mine: boolean;
   onChange: (mine: boolean) => void;
+  /** Shown in the compact chips while anything waits on the viewer. */
+  needsYou?: NeedsYouChip;
   /** A small segmented switch, for the end of the page's tab row. */
   compact?: boolean;
 }) {
@@ -63,7 +73,7 @@ export function TicketBoardRequesterFilter({
     { value: false, label: "All tickets" },
     { value: true, label: "Your tickets" },
   ];
-  if (compact) return <RequesterFilterChips mine={mine} onChange={onChange} />;
+  if (compact) return <RequesterFilterChips mine={mine} onChange={onChange} needsYou={needsYou} />;
   return (
     <ButtonGroup aria-label="Filter tickets by requester" data-testid="ticket-requester-filter">
       {options.map((option) => (
@@ -87,10 +97,13 @@ export function TicketBoardRequesterFilter({
 function RequesterFilterChips({
   mine,
   onChange,
+  needsYou,
 }: {
   mine: boolean;
   onChange: (mine: boolean) => void;
+  needsYou?: NeedsYouChip;
 }) {
+  const needsYouActive = needsYou?.active === true;
   const viewerId = useViewerId();
   const chip = (selected: boolean) =>
     cn(
@@ -108,19 +121,19 @@ function RequesterFilterChips({
     >
       <button
         type="button"
-        aria-pressed={!mine}
+        aria-pressed={!mine && !needsYouActive}
         onClick={() => onChange(false)}
-        className={chip(!mine)}
+        className={chip(!mine && !needsYouActive)}
       >
         <span className="text-optical">All tickets</span>
       </button>
       <button
         type="button"
-        aria-pressed={mine}
+        aria-pressed={mine && !needsYouActive}
         aria-label="Your tickets"
         title="Only tickets you requested"
         onClick={() => onChange(true)}
-        className={cn(chip(mine), viewerId && "pl-1")}
+        className={cn(chip(mine && !needsYouActive), viewerId && "pl-1")}
       >
         {viewerId && (
           <span
@@ -133,6 +146,18 @@ function RequesterFilterChips({
         )}
         <span className="text-optical">Yours</span>
       </button>
+      {needsYou && needsYou.count > 0 && (
+        <button
+          type="button"
+          aria-pressed={needsYouActive}
+          title="Only tickets waiting on your answer"
+          data-testid="ticket-needs-you-filter"
+          onClick={needsYou.onSelect}
+          className={chip(needsYouActive)}
+        >
+          <span className="text-optical">Needs you ({needsYou.count})</span>
+        </button>
+      )}
     </div>
   );
 }

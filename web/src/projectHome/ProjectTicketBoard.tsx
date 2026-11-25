@@ -31,6 +31,7 @@ import { TicketShipBlocker } from "./TicketShipBlocker";
 import { TicketStageBadge } from "./TicketStageAppearance";
 import { TicketAgentIcons } from "./TicketAgentIcons";
 import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoardRequesterFilter";
+import { NEEDS_YOU_PARAM } from "./needsYouFilter";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { needsWhom } from "./ticketWaitingOn";
 import {
@@ -145,6 +146,7 @@ function TicketBoard({
   const selectionPending = selected.some((query) => query.isPending);
   const unfilteredSearch = new URLSearchParams(search);
   unfilteredSearch.delete("tickets");
+  unfilteredSearch.delete(NEEDS_YOU_PARAM);
   const [mine, setMine] = useBoardRequesterFilter(projectId);
   const [dragged, setDragged] = useState<ProjectTicket | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
