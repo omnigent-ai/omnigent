@@ -2259,7 +2259,7 @@ function AppShellImpl() {
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState(false);
-  // The palette replaces the theme picker rather than stacking on it, which ends its preview.
+  // The palette replaces the theme and feature-flag pickers rather than stacking on them.
   useEffect(() => {
     if (commandPaletteOpen) {
       replaceThemePicker();

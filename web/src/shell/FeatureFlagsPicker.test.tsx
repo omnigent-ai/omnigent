@@ -94,6 +94,27 @@ describe("FeatureFlagsPicker", () => {
     expect(reload).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    { stored: null, label: /^Automatic \(Off\)/ },
+    { stored: '{"canvas":true}', label: /^On/ },
+    { stored: '{"canvas":false}', label: /^Off/ },
+  ])(
+    "returns without saving or reloading when the current choice is selected",
+    ({ stored, label }) => {
+      if (stored !== null) localStorage.setItem(key, stored);
+      openCanvas();
+      const reload = mockReload();
+      const write = vi.spyOn(Storage.prototype, "setItem");
+      const remove = vi.spyOn(Storage.prototype, "removeItem");
+      fireEvent.click(screen.getByRole("option", { name: label }));
+      expect(screen.getByRole("combobox", { name: "UI feature flags" })).toBeVisible();
+      expect(write).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+      expect(localStorage.getItem(key)).toBe(stored);
+    },
+  );
+
   it("writes a choice and reloads the page", () => {
     const input = openCanvas();
     expect(screen.getByRole("option", { name: /Automatic \(Off\)/ })).toHaveTextContent(

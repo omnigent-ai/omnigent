@@ -75,7 +75,7 @@ describe("UI feature overrides", () => {
         canvas: true,
         session_overview: false,
         usage_page: true,
-        sidebar_saved_views: "invalid",
+        sidebar_grouping_ui: "invalid",
       }),
     );
     expect(readUiFeatureOverrides()).toEqual({ canvas: true });
@@ -92,6 +92,24 @@ describe("UI feature overrides", () => {
     expect(writeUiFeatureOverride("canvas", null)).toBe(false);
     read.mockRestore();
     expect(localStorage.getItem(key)).toBe('{"canvas":true,"session_overview":false}');
+  });
+
+  it("ignores overrides for removed sidebar flags", () => {
+    localStorage.setItem(
+      key,
+      JSON.stringify({ sidebar_saved_views: true, sidebar_windowed_rows: false }),
+    );
+    expect(readUiFeatureOverrides()).toEqual({});
+    const reported = info({
+      quick_pick_palette: true,
+      sidebar_saved_views: false,
+      sidebar_windowed_rows: true,
+    });
+    expect(isFeatureEnabled(reported, "sidebar_saved_views")).toBe(false);
+    expect(isFeatureEnabled(reported, "sidebar_windowed_rows")).toBe(true);
+    expect(activeUiFeatureOverrides(reported)).toEqual([]);
+    expect(writeUiFeatureOverride("sidebar_saved_views", true)).toBe(false);
+    expect(writeUiFeatureOverride("sidebar_windowed_rows", false)).toBe(false);
   });
 
   it("does not read or write without a server identity", () => {
@@ -111,6 +129,15 @@ describe("UI feature overrides", () => {
     expect(writeUiFeatureOverride("canvas", true)).toBe(false);
     read.mockRestore();
     expect(writeUiFeatureOverride("canvas", true)).toBe(true);
+    const saved = localStorage.getItem(key);
+    expect(readUiFeatureOverrides()).toEqual({ canvas: true });
+    const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    expect(writeUiFeatureOverride("canvas", false)).toBe(false);
+    write.mockRestore();
+    expect(localStorage.getItem(key)).toBe(saved);
+    expect(readUiFeatureOverrides()).toEqual({ canvas: true });
     vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
       throw new Error("denied");
     });

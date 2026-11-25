@@ -106,6 +106,12 @@ export function FeatureFlagsPicker() {
     } else if (value.kind === "setting-choice" && setting) {
       const choice = value.value;
       if (choice !== "automatic" && choice !== "on" && choice !== "off") return "keepOpen" as const;
+      if (choice === setting.current) {
+        setOpened(null);
+        setStatus(null);
+        pop();
+        return "keepOpen" as const;
+      }
       if (writeUiFeatureOverride(setting.id, choice === "automatic" ? null : choice === "on")) {
         window.location.reload();
       } else {

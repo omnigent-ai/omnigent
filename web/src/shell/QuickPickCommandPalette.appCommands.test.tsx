@@ -192,6 +192,7 @@ describe("QuickPick ⌘K app commands", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(useFeatureFlagsPickerStore.getState().open).toBe(false);
     await waitFor(() => expect(useFeatureFlagsPickerStore.getState().open).toBe(true));
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("hides UI feature overrides without a server identity", () => {

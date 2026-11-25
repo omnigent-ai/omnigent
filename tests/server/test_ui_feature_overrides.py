@@ -20,9 +20,36 @@ _NOT_GATES = {
 }
 
 
+def _features_from_source(source: str) -> list[str]:
+    feature_list = re.search(
+        r"\bOVERRIDABLE_UI_FEATURES\b[^=]*=\s*\[(.*?)\]\s*;", source, re.DOTALL
+    )
+    assert feature_list is not None, "UI feature override list not found"
+    list_source = feature_list.group(1)
+    names = re.findall(r'\bfeature\s*:\s*"([a-z0-9_]+)"(?=\s*[,}])', list_source)
+    keys = re.findall(r"\bfeature\s*:", list_source)
+    assert len(names) == len(keys), "Every override entry must have a static feature name"
+    return names
+
+
 def _overridable_features() -> list[str]:
-    source = _OVERRIDES_SOURCE.read_text(encoding="utf-8")
-    return re.findall(r'^\s+feature: "([a-z0-9_]+)",$', source, re.MULTILINE)
+    return _features_from_source(_OVERRIDES_SOURCE.read_text(encoding="utf-8"))
+
+
+def test_feature_extraction_handles_compact_entries() -> None:
+    source = (
+        'const OVERRIDABLE_UI_FEATURES = [{feature: "canvas"}, {feature: "session_overview"}];'
+    )
+    assert _features_from_source(source) == ["canvas", "session_overview"]
+
+
+@pytest.mark.parametrize("expression", ["unknown", '"canvas" + "_extra"', "'canvas'"])
+def test_feature_extraction_rejects_unmatched_names(expression: str) -> None:
+    with pytest.raises(AssertionError, match="static feature name"):
+        _features_from_source(
+            f"const OVERRIDABLE_UI_FEATURES = [{{feature: {expression}}}]; "
+            'const unrelated = {feature: "canvas"};'
+        )
 
 
 def _definition(name: str):

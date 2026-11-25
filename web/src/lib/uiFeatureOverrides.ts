@@ -24,19 +24,9 @@ export const OVERRIDABLE_UI_FEATURES: readonly OverridableUiFeature[] = [
     description: "Run ⌘K and the session switcher on the fuzzy-matching QuickPick list.",
   },
   {
-    feature: "sidebar_saved_views",
-    label: "Sidebar saved views",
-    description: "Filter the sidebar's sessions by pull request, and save views.",
-  },
-  {
     feature: "sidebar_grouping_ui",
     label: "Sidebar grouping",
     description: "Grouping, ordering and row details in the sidebar, and a Shared section.",
-  },
-  {
-    feature: "sidebar_windowed_rows",
-    label: "Windowed sidebar rows",
-    description: "Mount only the sidebar rows near the viewport, so long lists stay fast.",
   },
   {
     feature: "grid_sessions_display_ui",

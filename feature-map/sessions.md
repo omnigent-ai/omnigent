@@ -63,6 +63,11 @@ the header menu), and each place is a separate entry point.
   (⌘⌥S / Ctrl+Alt+S) lists active sessions only. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
   the search. Desktop and mobile search use the same context.
+- `palette-ui-feature-overrides`: in QuickPick, **Override UI feature flag…**
+  sets a reported UI-only flag to Automatic, On, or Off. Choices stay on this
+  device for this server; changing one reloads the page. In the old palette,
+  search **Enable feature preview: new QuickPick command palette** to opt in.
+  An amber header flag shows active overrides and opens the picker.
 - `palette-session-commands`: ⌘K lists the open session's header-menu actions
   under **Session**: Add nested agent, Pin or Unpin, Share, Fork, Export,
   Rename, Mark as unread, Create automation, Archive or Unarchive, and Delete.
@@ -339,6 +344,9 @@ the header menu), and each place is a separate entry point.
   type an action such as "rename session" and press Enter. With
   `quick_pick_palette` on, type "go to session" and press Enter to switch
   sessions, or Escape to return to where you were.
+- For UI feature overrides, search ⌘K for **Override UI feature flag…** or
+  click the amber header flag. If QuickPick is off, search the old palette for
+  **Enable feature preview: new QuickPick command palette** first.
 - For the open screen's ⌘K actions, with `quick_pick_palette` on, press
   Cmd/Ctrl+K in a conversation and type "fork from latest" or "scroll to
   newest"; on a canvas with a conversation open, type "close conversation";
@@ -965,6 +973,13 @@ plain `uv run pytest`, which starts a private server for the test.
   worktree session from the row menu, bulk selection, and header menu, and
   expect the dialog each time; an idle session without a worktree archives
   silently.
+- **`palette-ui-feature-overrides`:** component coverage in
+  `web/src/shell/FeatureFlagsPicker.test.tsx`, `web/src/shell/CommandPalette.test.tsx`,
+  and `web/src/shell/ChatHeader.test.tsx`; storage and server gating are covered
+  in `web/src/lib/uiFeatureOverrides.test.ts` and `tests/server/test_ui_feature_overrides.py`.
+  Manually: enable the preview from the old palette, choose an override in
+  QuickPick, then use the amber header flag to restore Automatic. Each changed
+  choice reloads; selecting the current choice returns without reloading.
 - **`palette-session-commands`:**
   `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_on_an_open_session`
   runs with `quick_pick_palette` on: Rename session from ⌘K opens its dialog
@@ -1530,6 +1545,10 @@ its discoverability.
 
 ## Gotchas
 
+- UI flag overrides require a known server identity and reported flags. Turning
+  QuickPick off suspends the other overrides and hides the header flag. The flag
+  is also absent where the app header is hidden, including the desktop terminal
+  push panel.
 - Family membership is owner-only navigation context, not a sharing grant.
   Siblings start private even if the source has readers. Edit-shared sources
   cannot create siblings. Shared viewers see flat rows.

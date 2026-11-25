@@ -96,7 +96,7 @@ export function AppShellOverlays({
           onGoToSession={goToSession}
         />
       </Suspense>
-      {/* "Select theme…" from ⌘K; previews each theme as the user moves through them. */}
+      {/* ⌘K's theme and UI feature-flag pickers. */}
       {quickPick && (
         <Suspense fallback={null}>
           <ThemePicker />
