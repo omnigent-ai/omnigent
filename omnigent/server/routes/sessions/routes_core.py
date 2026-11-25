@@ -346,6 +346,46 @@ ClearSessionIntoFreshSession = Callable[
     [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
 ]
 _SESSION_LIST_BATCH_SIZE = 1000
+# Wider re-reads one session-list page may spend making room for dropped side
+# chats. Past this a long run of side chats returns a short page with
+# ``has_more``, and the client continues from ``last_id``.
+_SIDE_CHAT_PAGE_REREADS = 3
+
+
+def _without_side_chats(conversations: list[Conversation]) -> list[Conversation]:
+    """Drop side chats, which surface as Workspace-rail tabs rather than sidebar rows."""
+    return [conv for conv in conversations if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
+
+
+def _list_page_without_side_chats(
+    read_page: Callable[[int], PagedList[Conversation]], limit: int, *, allow_reread: bool
+) -> PagedList[Conversation]:
+    """
+    Read up to ``limit`` sessions, re-reading a wider range when side chats crowd them out.
+
+    Every read starts from the caller's cursor and the result is one read's rows and
+    cursor, so rows changing between reads cannot duplicate or skip sessions, and no
+    internal cursor can go stale.
+
+    :param read_page: Reads the requested range with the given row limit.
+    :param limit: Maximum number of visible sessions to return.
+    :param allow_reread: Whether a short page may be re-read with a wider limit.
+    :returns: The visible sessions and the store's cursor for them.
+    """
+    page = read_page(limit)
+    visible = _without_side_chats(page.data)
+    for _ in range(_SIDE_CHAT_PAGE_REREADS if allow_reread else 0):
+        if not page.has_more or len(visible) >= limit:
+            break
+        # Room for exactly the side chats seen so far, so the wider read holds at
+        # most ``limit`` visible rows unless rows changed in between.
+        wider = read_page(limit + len(page.data) - len(visible))
+        wider_visible = _without_side_chats(wider.data)
+        if len(wider_visible) > limit:
+            break
+        page, visible = wider, wider_visible
+    page.data = visible
+    return page
 
 
 def _require_attachment_compatible_history(
@@ -2787,42 +2827,41 @@ def register_core_routes(
             include_archived_param = include_archived
             archived_only_param = False
 
+        def _list_store_page(page_limit: int) -> PagedList[Conversation]:
+            return conversation_store.list_conversations(
+                limit=page_limit,
+                after=after,
+                before=before,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                accessible_by=accessible_by_param,
+                owned_by=owned_by_param,
+                shared_only=shared_only_param,
+                has_agent_id=True,
+                # The store treats ``None`` as "no kind filter"; the API
+                # spells that ``kind=any`` to keep the param required-ish
+                # and pattern-validated.
+                kind=None if kind == "any" else kind,
+                order=order,
+                sort_by=sort_by,
+                search_query=normalized_query,
+                search_scope=search_scope,
+                include_archived=include_archived_param,
+                archived_only=archived_only_param,
+                project=project,
+                pinned=pinned,
+                # Pins are per-user: filter to the caller's own pin key.
+                pinned_owner=user_id,
+            )
+
         def _read_page() -> _SessionPageReads:
             # One read-only burst over a single pool checkout per engine: the
             # page query, family projection and every per-row enrichment read
             # they feed. Nothing here waits on a runner or host.
             with shared_read_scope():
-                page = conversation_store.list_conversations(
-                    limit=limit,
-                    after=after,
-                    before=before,
-                    agent_id=agent_id,
-                    agent_name=agent_name,
-                    accessible_by=accessible_by_param,
-                    owned_by=owned_by_param,
-                    shared_only=shared_only_param,
-                    has_agent_id=True,
-                    # The store treats ``None`` as "no kind filter"; the API
-                    # spells that ``kind=any`` to keep the param required-ish
-                    # and pattern-validated.
-                    kind=None if kind == "any" else kind,
-                    order=order,
-                    sort_by=sort_by,
-                    search_query=normalized_query,
-                    search_scope=search_scope,
-                    include_archived=include_archived_param,
-                    archived_only=archived_only_param,
-                    project=project,
-                    pinned=pinned,
-                    # Pins are per-user: filter to the caller's own pin key.
-                    pinned_owner=user_id,
+                page = _list_page_without_side_chats(
+                    _list_store_page, limit, allow_reread=before is None
                 )
-                # Side chats surface only as Workspace-rail tabs, so drop any
-                # side-chat-labeled fork from the sidebar list (it is still a
-                # normal session, just not listed as a top-level one here).
-                page.data = [
-                    conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
-                ]
                 boundary_row = page.data[-1] if page.data else None
                 page_boundary = (
                     {
