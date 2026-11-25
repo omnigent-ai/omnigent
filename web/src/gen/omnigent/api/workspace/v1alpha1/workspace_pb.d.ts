@@ -854,8 +854,8 @@ export declare type ResolveWorkingCopyBaseRequest = Message<"omnigent.api.worksp
    * such as a worktree inside it. Empty for the workspace's own repository.
    * Paths in the request and response are then relative to that directory.
    * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-   * directory, or belongs to a repository outside the workspace. Feature
-   * "comparison.repository".
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace. Feature "comparison.repository".
    *
    * @generated from field: string repository = 2;
    */
@@ -1039,8 +1039,8 @@ export declare type ListWorkingCopyChangesRequest = Message<"omnigent.api.worksp
    * such as a worktree inside it. Empty for the workspace's own repository.
    * Paths in the request and response are then relative to that directory.
    * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-   * directory, or belongs to a repository outside the workspace. Feature
-   * "comparison.repository".
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace. Feature "comparison.repository".
    *
    * @generated from field: string repository = 2;
    */
@@ -1122,8 +1122,8 @@ export declare type ReadBaseFileRequest = Message<"omnigent.api.workspace.v1alph
    * such as a worktree inside it. Empty for the workspace's own repository.
    * Paths in the request and response are then relative to that directory.
    * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-   * directory, or belongs to a repository outside the workspace. Feature
-   * "comparison.repository".
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace. Feature "comparison.repository".
    *
    * @generated from field: string repository = 5;
    */
@@ -1208,8 +1208,8 @@ export declare type ListRepositoryRefsRequest = Message<"omnigent.api.workspace.
    * such as a worktree inside it. Empty for the workspace's own repository.
    * Paths in the request and response are then relative to that directory.
    * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-   * directory, or belongs to a repository outside the workspace. Feature
-   * "comparison.repository".
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace. Feature "comparison.repository".
    *
    * @generated from field: string repository = 1;
    */
@@ -1277,8 +1277,8 @@ export declare type ListBranchCommitsRequest = Message<"omnigent.api.workspace.v
    * such as a worktree inside it. Empty for the workspace's own repository.
    * Paths in the request and response are then relative to that directory.
    * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-   * directory, or belongs to a repository outside the workspace. Feature
-   * "comparison.repository".
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace. Feature "comparison.repository".
    *
    * @generated from field: string repository = 3;
    */

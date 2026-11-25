@@ -694,8 +694,8 @@ message ResolveWorkingCopyBaseRequest {
   // such as a worktree inside it. Empty for the workspace's own repository.
   // Paths in the request and response are then relative to that directory.
   // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-  // directory, or belongs to a repository outside the workspace. Feature
-  // "comparison.repository".
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace. Feature "comparison.repository".
   string repository = 2;
 }
 
@@ -777,8 +777,8 @@ message ListWorkingCopyChangesRequest {
   // such as a worktree inside it. Empty for the workspace's own repository.
   // Paths in the request and response are then relative to that directory.
   // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-  // directory, or belongs to a repository outside the workspace. Feature
-  // "comparison.repository".
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace. Feature "comparison.repository".
   string repository = 2;
 }
 
@@ -810,8 +810,8 @@ message ReadBaseFileRequest {
   // such as a worktree inside it. Empty for the workspace's own repository.
   // Paths in the request and response are then relative to that directory.
   // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-  // directory, or belongs to a repository outside the workspace. Feature
-  // "comparison.repository".
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace. Feature "comparison.repository".
   string repository = 5;
 }
 
@@ -839,8 +839,8 @@ message ListRepositoryRefsRequest {
   // such as a worktree inside it. Empty for the workspace's own repository.
   // Paths in the request and response are then relative to that directory.
   // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-  // directory, or belongs to a repository outside the workspace. Feature
-  // "comparison.repository".
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace. Feature "comparison.repository".
   string repository = 1;
 }
 
@@ -866,8 +866,8 @@ message ListBranchCommitsRequest {
   // such as a worktree inside it. Empty for the workspace's own repository.
   // Paths in the request and response are then relative to that directory.
   // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
-  // directory, or belongs to a repository outside the workspace. Feature
-  // "comparison.repository".
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace. Feature "comparison.repository".
   string repository = 3;
 }
 

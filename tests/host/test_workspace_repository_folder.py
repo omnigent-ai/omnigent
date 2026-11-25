@@ -50,7 +50,7 @@ def _outside(path: Path) -> Path:
 
 
 def _layout(tmp_path: Path) -> Path:
-    """A workspace holding a worktree, a nested repository, and links that lead astray."""
+    """A workspace holding a worktree, nested repositories, and links that lead astray."""
     workspace = _repository(tmp_path / "workspace")
     (workspace / "src").mkdir()
     (workspace / "src" / "b.txt").write_text("untracked\n")
@@ -75,6 +75,9 @@ def _layout(tmp_path: Path) -> Path:
     # A `.git` file inside the workspace that points at a repository outside it.
     (workspace / "forged").mkdir()
     (workspace / "forged" / ".git").write_text(f"gitdir: {other / '.git'}\n")
+    # A `.git` file aimed at the workspace's own Git directory, which no worktree uses.
+    (workspace / "main-git").mkdir()
+    (workspace / "main-git" / ".git").write_text(f"gitdir: {workspace / '.git'}\n")
     # A `.git` file aimed at worktree metadata outside, whose `commondir` leads back inside.
     _worktree_metadata(tmp_path / "outside-metadata", workspace / ".git")
     (workspace / "metadata-back").mkdir()
@@ -157,15 +160,17 @@ async def _refusal(workspace: Path, repository: str) -> str:
         ("lib-git", "is inside a Git directory"),
         ("vendor/lib/.git", "is inside a Git directory"),
         (".worktrees/feature/.git", "isn't a folder in the workspace"),
-        ("forged", "belongs to a repository outside the workspace"),
-        ("elsewhere", "has its working tree outside the workspace"),
-        ("metadata-back", "belongs to a repository outside the workspace"),
-        ("borrowed", "reads objects or refs from outside the workspace"),
-        ("http-borrowed", "reads objects or refs from outside the workspace"),
-        ("linked-objects", "reads objects or refs from outside the workspace"),
-        ("linked-refs", "reads objects or refs from outside the workspace"),
-        ("INSIDE_LARGER:outer-git", "belongs to a repository outside the workspace"),
-        ("INSIDE_LARGER:inner-metadata", "belongs to a repository outside the workspace"),
+        ("vendor/lib", "isn't a worktree of the workspace's repository"),
+        ("main-git", "isn't a worktree of the workspace's repository"),
+        ("forged", "isn't a worktree of the workspace's repository"),
+        ("elsewhere", "isn't a worktree of the workspace's repository"),
+        ("metadata-back", "isn't a worktree of the workspace's repository"),
+        ("borrowed", "isn't a worktree of the workspace's repository"),
+        ("http-borrowed", "isn't a worktree of the workspace's repository"),
+        ("linked-objects", "isn't a worktree of the workspace's repository"),
+        ("linked-refs", "isn't a worktree of the workspace's repository"),
+        ("INSIDE_LARGER:outer-git", "isn't a worktree of the workspace's repository"),
+        ("INSIDE_LARGER:inner-metadata", "isn't a worktree of the workspace's repository"),
     ],
 )
 async def test_a_folder_outside_the_workspace_or_in_a_git_directory_is_refused(
@@ -196,26 +201,52 @@ async def test_a_nested_git_directory_aimed_at_the_repository_around_the_workspa
 
     message = await _refusal(workspace, "sub")
 
+    assert message.endswith("isn't a worktree of the workspace's repository")
+
+
+async def test_a_worktree_whose_working_tree_is_outside_the_workspace_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Its metadata is the workspace's own, but its config moves the files it compares out."""
+    workspace = _repository(tmp_path / "workspace")
+    _git(workspace, "worktree", "add", "-q", "-b", "feature", ".worktrees/feature")
+    _git(workspace, "config", "extensions.worktreeConfig", "true")
+    outside = _outside(tmp_path / "outside-tree")
+    _git(
+        workspace / ".worktrees" / "feature", "config", "--worktree", "core.worktree", str(outside)
+    )
+
+    message = await _refusal(workspace, ".worktrees/feature")
+
     assert message.endswith("has its working tree outside the workspace")
 
 
+async def test_a_repository_in_a_workspace_outside_any_repository_is_refused(
+    tmp_path: Path,
+) -> None:
+    """With no repository of its own, the workspace has no worktrees to compare."""
+    workspace = tmp_path / "plain"
+    _repository(workspace / "vendor" / "lib")
+
+    message = await _refusal(workspace, "vendor/lib")
+
+    assert message.endswith("isn't a worktree of the workspace's repository")
+
+
 async def test_the_workspace_root_and_its_own_folders_are_accepted(tmp_path: Path) -> None:
-    """The root is checked as before; a worktree, link or nested repository carries its own."""
+    """The root is checked as before; a worktree or a link to one carries its own."""
     workspace = _layout(tmp_path).resolve()
     reader = WorkspaceReader(workspace)
 
     root = await repository_folder(reader, "")
     feature = await repository_folder(reader, ".worktrees/feature")
     linked = await repository_folder(reader, "worktree-link")
-    nested = await repository_folder(reader, "vendor/lib")
     plain = await repository_folder(reader, "src")
 
     assert root.path == workspace and root.repository is None
     assert feature.path == linked.path == workspace / ".worktrees" / "feature"
     assert feature.repository is not None
     assert feature.repository.top_level.resolve() == feature.path
-    assert nested.repository is not None
-    assert nested.repository.top_level.resolve() == workspace / "vendor" / "lib"
     # A plain folder belongs to the workspace's own repository.
     assert plain.repository is not None
     assert plain.repository.top_level.resolve() == workspace
@@ -286,6 +317,8 @@ _CALLS: dict[str, Callable[[WorkspaceServiceClient, str], Awaitable[Any]]] = {
         "a.txt",
         ".git",
         "into-git",
+        "vendor/lib",
+        "main-git",
         "forged",
         "elsewhere",
         "metadata-back",
@@ -345,21 +378,15 @@ async def test_a_worktree_inside_the_workspace_is_compared_on_its_own(tmp_path: 
     assert b"".join(message.data for message in read) == b"a\n"
 
 
-async def test_a_nested_repository_and_a_plain_folder_are_compared(tmp_path: Path) -> None:
-    """A repository stored inside the workspace is its own; a plain folder lists beneath it."""
+async def test_a_plain_folder_is_compared_beneath_the_workspace(tmp_path: Path) -> None:
+    """A folder of the workspace's own repository lists its files relative to the folder."""
     workspace = _layout(tmp_path)
     client = _client(workspace)
-    (workspace / "vendor" / "lib" / "a.txt").write_text("library, edited\n")
 
-    nested = await client.list_working_copy_changes(
-        ListWorkingCopyChangesRequest(repository="vendor/lib")
-    )
     folder = await client.list_working_copy_changes(
         ListWorkingCopyChangesRequest(repository="src")
     )
 
-    assert [file.path for file in nested.files] == ["a.txt"]
-    assert nested.base.head == _git(workspace / "vendor" / "lib", "rev-parse", "HEAD").strip()
     assert [file.path for file in folder.files] == ["b.txt"]
     assert folder.base.head == _git(workspace, "rev-parse", "HEAD").strip()
 

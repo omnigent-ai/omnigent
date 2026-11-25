@@ -1289,7 +1289,7 @@ async def test_workspace_api_gates_a_repository_folder_like_the_workspace(
     client: httpx.AsyncClient, session: str, passes: bool, method: str
 ) -> None:
     """Naming a folder inside the workspace needs the same file read gate, and no other."""
-    body = b'{"repository": "vendor/lib"}'
+    body = b'{"repository": ".worktrees/feature"}'
     streaming = method == "ReadBaseFile"
     resp = await client.post(
         f"/v1/sessions/{session}/workspace"

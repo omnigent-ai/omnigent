@@ -1,11 +1,11 @@
 """The folder a Git request compares: the workspace, or a repository inside it.
 
 A request may name a directory relative to the workspace root, such as a worktree
-checked out inside it. It is confined the way file reads are. Its repository's Git
-directory, common directory and working tree must all lie inside the workspace, unless
-the repository is exactly the workspace's own (the same Git directory and working tree).
-A repository inside must also keep its objects and refs inside, with no alternates. So a
-crafted link, ``.git`` file, ``commondir``, ``core.worktree``, symlinked store or
+checked out inside it. It is confined the way file reads are, and its repository must be
+the workspace's own, or a linked worktree of it whose working tree is inside the
+workspace. Such a worktree shares the workspace repository's objects and refs, so naming it
+reads nothing the workspace root doesn't. A nested, independent repository is refused, so
+a crafted link, ``.git`` file, ``commondir``, ``core.worktree``, symlinked store or
 alternates file can't point a comparison at another place on the host.
 """
 
@@ -22,7 +22,6 @@ from omnigent.host.workspace_git.runner import (
     CheckedRepository,
     Deadline,
     GitError,
-    GitProblem,
     GitRepository,
     UnreadableRepository,
 )
@@ -51,10 +50,6 @@ def _refuse(repository: str, reason: str) -> ConnectError:
     return ConnectError(Code.INVALID_ARGUMENT, f"Repository {repository!r} {reason}")
 
 
-# Files that point an object store at another one.
-_ALTERNATES_FILES = ("alternates", "http-alternates")
-
-
 def _is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
@@ -68,27 +63,6 @@ def _places(repository: GitRepository) -> tuple[Path, Path, Path]:
     )
 
 
-async def _reads_from_outside(found: GitRepository, workspace: Path, deadline: Deadline) -> bool:
-    """Whether Git would read objects or refs for ``found`` from outside the workspace.
-
-    A symlinked ``objects`` or ``refs`` resolves outside, and an alternates file borrows
-    another object store, so resolved commits and base files could come from elsewhere.
-    """
-    output = await found.run(
-        ["rev-parse", "--git-path", "objects", "--git-path", "refs"], deadline=deadline
-    )
-    try:
-        lines = [line for line in output.decode().split("\n") if line]
-    except UnicodeDecodeError:
-        raise GitError(GitProblem.FAILED, "The repository path isn't valid UTF-8") from None
-    places = [(found.working_directory / line).resolve() for line in lines]
-    if len(places) != 2 or not all(_is_within(place, workspace) for place in places):
-        return True
-    objects = places[0]
-    stores = {objects, (found.common_directory / "objects").resolve()}
-    return any((store / "info" / name).exists() for store in stores for name in _ALTERNATES_FILES)
-
-
 async def repository_folder(reader: WorkspaceReader, repository: str) -> RepositoryFolder:
     """The folder a Git request named by ``repository`` compares, once checked.
 
@@ -96,10 +70,9 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
     :param repository: A directory relative to the workspace root; empty for the root.
     :returns: The workspace root, or the resolved directory inside it with its repository.
     :raises ConnectError: INVALID_ARGUMENT when it escapes the workspace, even through a
-        symlink, isn't a folder, lies in a Git directory, or belongs to a repository whose
-        Git directory, common directory or working tree lies outside the workspace without
-        it being exactly the workspace's own repository, or one inside it that reads
-        objects or refs from outside it.
+        symlink, isn't a folder, lies in a Git directory, belongs to a repository that is
+        neither the workspace's own nor a linked worktree of it, or is such a worktree with
+        its working tree outside the workspace.
     """
     workspace = reader.root
     if not repository:
@@ -120,21 +93,23 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
         if found is None:
             # Fails closed: the comparison answers NOT_A_REPOSITORY without looking again.
             return RepositoryFolder(folder, OUTSIDE_ANY_REPOSITORY)
-        places = _places(found)
-        if all(_is_within(place, workspace) for place in places):
-            if await _reads_from_outside(found, workspace, deadline):
-                raise _refuse(repository, "reads objects or refs from outside the workspace")
-            return RepositoryFolder(folder, found)
         own = await GitRepository.discover(workspace, deadline)
     except GitError as error:
         # Fails closed as well: the comparison reports Git's problem, as for the workspace.
         return RepositoryFolder(folder, UnreadableRepository(error))
-    # Metadata outside the workspace only as the workspace's own repository, whole: a `.git`
-    # file aimed at the repository around the workspace, or at outside metadata whose
-    # `commondir` leads back in, isn't.
+    places = _places(found)
     if own is not None and _places(own) == places:
         return RepositoryFolder(folder, found)
-    git_directory, common_directory, _top_level = places
-    if _is_within(git_directory, workspace) and _is_within(common_directory, workspace):
+    git_directory, common_directory, top_level = places
+    # Only a worktree registered in the workspace repository's own `worktrees` folder: a
+    # `.git` file or `commondir` aimed at its metadata from anywhere else isn't one.
+    own_common = own.common_directory.resolve() if own is not None else None
+    if (
+        own_common is None
+        or common_directory != own_common
+        or git_directory.parent != own_common / "worktrees"
+    ):
+        raise _refuse(repository, "isn't a worktree of the workspace's repository")
+    if not _is_within(top_level, workspace):
         raise _refuse(repository, "has its working tree outside the workspace")
-    raise _refuse(repository, "belongs to a repository outside the workspace")
+    return RepositoryFolder(folder, found)
