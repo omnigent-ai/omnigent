@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-import hashlib
 import json
 import threading
 import time
@@ -39,7 +38,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT, SharingMode
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, SharingMode
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
@@ -8192,9 +8191,6 @@ async def test_a_loop_replaces_the_callers_loop_and_stops_on_request(
     # The store hides a deleted task.
     assert store.get(first["timer_id"]) is None
     assert store.get(second["timer_id"]).state == "active"
-    label = "omnigent.loop_timer." + hashlib.sha256(b"alice@example.com").hexdigest()[:16]
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert conv is not None and conv.labels[label] == second["timer_id"]
     bobs = await saved(
         {"seconds": 300, "repeat": True, "note": "mine", "origin": "loop"}, "bob@example.com"
     )
@@ -8212,9 +8208,43 @@ async def test_a_loop_replaces_the_callers_loop_and_stops_on_request(
         agent_timer["timer_id"],
         bobs["timer_id"],
     }
-    # A user without access to the session is refused as for every timer call.
+    # A user without access to the session is refused as for every timer call, and a
+    # read-only collaborator can neither arm nor stop.
     _make_user(db_uri, "carol@example.com")
     assert (await stop("carol@example.com", origin="loop")).status_code == 404
+    _make_user(db_uri, "dave@example.com")
+    SqlAlchemyPermissionStore(db_uri).grant("dave@example.com", session_id, LEVEL_READ)
+    read_only = await auth_client.post(
+        f"/v1/sessions/{session_id}/timers",
+        json={"seconds": 300, "repeat": True, "note": "mine", "origin": "loop"},
+        headers=_headers("dave@example.com"),
+    )
+    assert read_only.status_code == 403, read_only.text
+    assert (await stop("dave@example.com", origin="loop")).status_code == 403
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_a_loop_the_session_cannot_record_is_not_saved(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loop the session can't point at could never be stopped, so a failed record undoes it."""
+    session_id = _owned_session(db_uri)
+
+    def refuse(*args: object, **kwargs: object) -> str | None:
+        raise RuntimeError("label store down")
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "swap_label", refuse)
+    # The test transport surfaces the server's error directly.
+    with pytest.raises(RuntimeError, match="label store down"):
+        await auth_client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": 300, "repeat": True, "note": "check CI", "origin": "loop"},
+            headers=_headers(),
+        )
+    assert SqlAlchemyScheduledTaskStore(db_uri).list(kinds=("timer",)) == []
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)

@@ -1882,6 +1882,48 @@ describe("Composer slash-command menu", () => {
     expect(textarea()).toHaveValue("/loop 5m check CI");
   });
 
+  it("/loop cannot arm, but still stops, once the server has stopped saving timers", async () => {
+    const { stopLoop, setTimer } = renderLoopComposer(
+      "claude-sdk",
+      { session_loops: true },
+      "st_old",
+    );
+    submitLoop("/loop 5m check CI");
+    expect(await screen.findByText(/Saving timers is off on this server/)).toBeVisible();
+    expect(setTimer).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("/loop 5m check CI");
+    submitLoop("/loop stop");
+    expect(await screen.findByText("Loop stopped.")).toBeVisible();
+    expect(stopLoop).toHaveBeenCalledExactlyOnceWith("conv_test");
+  });
+
+  it("/loop says when the refused first run's cleanup failed, or what it had replaced", async () => {
+    const { cancelTimer, setTimer, sendPrompt } = renderLoopComposer("claude-sdk", savesTimers);
+    sendPrompt.mockRejectedValue(new Error("The host for this session is offline"));
+    cancelTimer.mockRejectedValueOnce(new Error("Session not found"));
+    submitLoop("/loop 5m check CI");
+    expect(
+      await screen.findByText(/offline\. The loop could not be cancelled and may still be running/),
+    ).toBeVisible();
+    setTimer.mockResolvedValueOnce({ ...savedLoop, replacedTimerId: "st_old" });
+    submitLoop("/loop 5m check CI");
+    expect(
+      await screen.findByText(/The loop was not armed\. The loop it replaced is already stopped\./),
+    ).toBeVisible();
+  });
+
+  it("/loop gives a failed command back to the session's draft after the composer unmounted", async () => {
+    const { setTimer } = renderLoopComposer("claude-sdk", savesTimers);
+    const pending = deferred<never>();
+    setTimer.mockImplementationOnce(() => pending.promise);
+    submitLoop("/loop 5m check CI");
+    await waitFor(() => expect(setTimer).toHaveBeenCalledOnce());
+    // Switching to the terminal view unmounts the chat surface, composer included.
+    cleanup();
+    pending.reject(new Error("This session is archived, so it can't take timers"));
+    await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe("/loop 5m check CI"));
+  });
+
   it("/loop stop shows the error and gives the command back when the stop fails", async () => {
     const { stopLoop } = renderLoopComposer("claude-sdk", savesTimers);
     stopLoop.mockRejectedValueOnce(new Error("Session not found"));

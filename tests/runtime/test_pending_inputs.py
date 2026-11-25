@@ -518,7 +518,7 @@ def test_restore_returns_a_drained_entry_to_the_front() -> None:
     belongs to the NEXT user message): the entry was the oldest when
     drained, so it must come back ahead of everything queued after it.
     """
-    first = pending_inputs.record("conv_r", [_text_block("first")])
+    first = pending_inputs.record("conv_r", [_text_block("first")], origin="loop")
     second = pending_inputs.record("conv_r", [_text_block("second")])
 
     drained = pending_inputs.resolve_oldest("conv_r")
@@ -528,9 +528,9 @@ def test_restore_returns_a_drained_entry_to_the_front() -> None:
     order = [e["pending_id"] for e in pending_inputs.snapshot_for("conv_r")]
     assert order == [first, second]
 
-    # The restored entry drains again as the oldest.
+    # The restored entry drains again as the oldest, with what sent it intact.
     redrained = pending_inputs.resolve_oldest("conv_r")
-    assert redrained is not None and redrained.pending_id == first
+    assert redrained is not None and (redrained.pending_id, redrained.origin) == (first, "loop")
 
 
 def test_interrupted_flag_survives_nonheld_resolve_and_restore() -> None:

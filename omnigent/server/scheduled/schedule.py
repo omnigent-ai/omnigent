@@ -94,9 +94,7 @@ LOOP_TIMER_NAME = "Loop"
 
 def timer_origin(name: str) -> str:
     """``"loop"`` for a timer the composer's ``/loop`` set, else ``"agent"``."""
-    if name == LOOP_TIMER_NAME or name.startswith(f"{LOOP_TIMER_NAME}: "):
-        return "loop"
-    return "agent"
+    return "loop" if name.startswith(f"{LOOP_TIMER_NAME}: ") else "agent"
 
 
 def next_timer_time(task: ScheduledTask, after: int) -> int | None:

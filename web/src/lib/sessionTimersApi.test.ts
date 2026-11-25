@@ -47,6 +47,8 @@ describe("sendLoopPrompt", () => {
     await sendLoopPrompt("sess", "check CI");
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/sess/events");
+    // Nothing resends it when the host is offline, so the send must not say it will.
+    expect(new Headers(init.headers).has("x-omnigent-hold-when-host-offline")).toBe(false);
     expect(JSON.parse(init.body as string)).toEqual({
       type: "message",
       data: {
@@ -64,6 +66,8 @@ describe("sendLoopPrompt", () => {
     });
   });
 });
+
+const loopInput = { seconds: 300, repeat: true, note: "check CI", origin: "loop" };
 
 describe("setSessionTimer", () => {
   it("posts the timer with its origin and maps the saved reply", async () => {
@@ -93,24 +97,20 @@ describe("setSessionTimer", () => {
 
   it("names the loop the new one replaced", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ ...SAVED, replaced_timer_id: "st_old" }, 201));
-    const timer = await setSessionTimer("conv_a", { seconds: 300, repeat: true, origin: "loop" });
+    const timer = await setSessionTimer("conv_a", {
+      seconds: 300,
+      repeat: true,
+      note: "check CI",
+      origin: "loop",
+    });
     expect(timer.replacedTimerId).toBe("st_old");
-  });
-
-  it("omits an unset origin, as the agent's own timers do", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ ...SAVED, origin: null }, 201));
-    await setSessionTimer("conv_a", { seconds: 300, repeat: true });
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(String(init.body))).toEqual({ seconds: 300, repeat: true, note: null });
   });
 
   it("throws the server's reason when it keeps no timers for the session", async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ durable: false, reason: "a sub-agent's or side chat's timers aren't saved" }),
     );
-    const error = await setSessionTimer("conv_a", { seconds: 300, repeat: true }).catch(
-      (e: unknown) => e,
-    );
+    const error = await setSessionTimer("conv_a", loopInput).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ApiError);
     expect(error).toMatchObject({
       code: TIMER_NOT_SAVED_CODE,
@@ -122,7 +122,7 @@ describe("setSessionTimer", () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ error: { code: "invalid_input", message: "This session is archived" } }, 400),
     );
-    await expect(setSessionTimer("conv_a", { seconds: 300, repeat: true })).rejects.toMatchObject({
+    await expect(setSessionTimer("conv_a", loopInput)).rejects.toMatchObject({
       status: 400,
     });
   });

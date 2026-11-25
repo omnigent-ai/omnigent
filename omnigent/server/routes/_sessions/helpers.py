@@ -11725,6 +11725,7 @@ def _reject_server_reserved_label_seed(
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
+        LOOP_TIMER_LABEL_PREFIX,
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         SCHEDULED_TASK_LAUNCH_LABEL_KEY,
@@ -11738,6 +11739,8 @@ def _reject_server_reserved_label_seed(
 
     if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
         raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
+    if any(key.startswith(LOOP_TIMER_LABEL_PREFIX) for key in labels):
+        raise OmnigentError("Loop labels are server-owned", code=ErrorCode.INVALID_INPUT)
     if any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in labels):
         raise OmnigentError(
             "Scheduled run labels are server-internal", code=ErrorCode.INVALID_INPUT

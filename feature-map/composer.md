@@ -251,9 +251,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   starting with `/` or `$` is sent as a message like any other, so the hint
   warns it may not run as a command. Offered in Claude Code native, claude-sdk,
   Codex native and codex sessions, top-level only (a sub-agent's or side chat's
-  timers aren't saved), when `/v1/info` reports both `session_timers` and
-  `session_loops`; otherwise a typed `/loop` is sent as text, so Claude Code's
-  own `/loop` runs in a native session. Selecting **/loop** in Commands fills
+  timers aren't saved), when `/v1/info` reports `session_loops`; arming also
+  needs `session_timers`, and without it the hint says loops can't be armed while
+  `/loop stop` still works. Otherwise a typed `/loop` is sent as text, so Claude
+  Code's own `/loop` runs in a native session. A prompt that a native harness
+  records as a command (`/loop 5m /some-skill`) comes back as a command item,
+  which carries no "Loop" label. Selecting **/loop** in Commands fills
   `/loop ` to complete. States: "Loop armed: every 5m, next run at …", "Loop
   stopped.", "No loop is running in this session.", usage and interval errors
   under the composer with the text kept, a server refusal with the text

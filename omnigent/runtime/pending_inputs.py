@@ -792,6 +792,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         pending_id=drained.pending_id,
         content=copy.deepcopy(drained.content),
         created_by=drained.created_by,
+        origin=drained.origin,
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,

@@ -1,10 +1,10 @@
-/** Saved session timers (`/v1/sessions/{id}/timers`): the server primitive behind `/loop`. */
+/** The composer's `/loop` over the server's saved session timers: arm, stop, and send its runs. */
 
 import { authenticatedFetch } from "./identity";
 import { SIDE_CHAT_LABEL_KEY } from "./sessionListCache";
 import { ApiError, apiErrorFromResponse, postEvent } from "./sessionsApi";
 
-/** The `origin` the composer's `/loop` tags its timers with, so it cancels only those. */
+/** The `origin` the composer's `/loop` gives its timer and every message it sends. */
 export const LOOP_TIMER_ORIGIN = "loop";
 
 export interface SessionTimer {
@@ -19,8 +19,9 @@ export interface SessionTimer {
 export interface SetSessionTimerInput {
   seconds: number;
   repeat: boolean;
-  note?: string | null;
-  origin?: string | null;
+  /** The prompt the loop repeats. */
+  note: string;
+  origin: string;
 }
 
 export const TIMER_NOT_SAVED_CODE = "timer_not_saved";
@@ -56,8 +57,8 @@ export async function setSessionTimer(
     body: JSON.stringify({
       seconds: input.seconds,
       repeat: input.repeat,
-      note: input.note ?? null,
-      ...(input.origin ? { origin: input.origin } : {}),
+      note: input.note,
+      origin: input.origin,
     }),
   });
   if (!res.ok) throw await apiErrorFromResponse(res);
@@ -108,21 +109,18 @@ export async function stopSessionLoop(sessionId: string): Promise<string | null>
 /**
  * Send a loop's prompt as the message every run of it sends: the first run from
  * the composer, then each tick from the server. Tagged so the transcript labels it.
- * Throws when a session policy refuses it, which the server reports as a success.
+ * Any refusal fails the run, an offline host included: nothing holds the message
+ * for a resend. A policy denial, which the server reports as a success, throws too.
  */
 export async function sendLoopPrompt(sessionId: string, prompt: string): Promise<void> {
-  const result = await postEvent(
-    sessionId,
-    {
-      type: "message",
-      data: {
-        role: "user",
-        origin: LOOP_TIMER_ORIGIN,
-        content: [{ type: "input_text", text: prompt }],
-      },
+  const result = await postEvent(sessionId, {
+    type: "message",
+    data: {
+      role: "user",
+      origin: LOOP_TIMER_ORIGIN,
+      content: [{ type: "input_text", text: prompt }],
     },
-    { holdWhenHostOffline: true },
-  );
+  });
   if (result.denied) {
     throw new ApiError("A session policy refused the prompt", 403, INPUT_DENIED_CODE);
   }
@@ -131,10 +129,8 @@ export async function sendLoopPrompt(sessionId: string, prompt: string): Promise
 const pendingMutations = new Map<string, Promise<unknown>>();
 
 /**
- * Run *mutation* once every earlier one queued for *sessionId* has settled, so two
- * `/loop` submissions can't both see no loop and arm two, and a `/loop stop` sent
- * while an arm is in flight waits for it and then cancels it. A rejected mutation
- * doesn't block the next.
+ * Run *mutation* once every earlier one queued for *sessionId* has settled, so a
+ * `/loop stop` waits for an arm still in flight. A rejected mutation doesn't block the next.
  */
 export function runSessionTimerMutation<T>(
   sessionId: string,

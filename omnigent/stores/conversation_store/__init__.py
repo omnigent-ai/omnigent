@@ -209,6 +209,9 @@ SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_sou
 SCHEDULED_TASK_RUN_LABEL_KEY = "omnigent.scheduled_task_run"
 SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY = "omnigent.scheduled_task_initial_run"
 SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX = "omnigent.pending_scheduled_run."
+# Server-owned: the web composer's running /loop for one user (the suffix hashes the
+# user), holding its timer's task id so a new loop replaces it and a stop finds it.
+LOOP_TIMER_LABEL_PREFIX = "omnigent.loop_timer."
 # The run whose agent has appended real activity; copied history never sets it.
 SCHEDULED_TASK_ACTIVITY_LABEL_KEY = "omnigent.scheduled_task_activity"
 

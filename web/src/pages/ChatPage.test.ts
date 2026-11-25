@@ -1524,17 +1524,18 @@ describe("composer /loop gating", () => {
     ["pi-native", false],
     ["openai-agents", false],
     [null, false],
-  ] as const)(
-    "offers /loop for %s when the server saves timers and manages loops",
-    (harness, offered) => {
-      const saves = info({ session_timers: true, session_loops: true });
-      expect(composerOffersLoop(harness, saves, topLevel)).toBe(offered);
-      // Saving alone is not enough: an older server would not replace or stop a loop.
-      expect(composerOffersLoop(harness, info({ session_timers: true }), topLevel)).toBe(false);
-      expect(composerOffersLoop(harness, info({ session_loops: true }), topLevel)).toBe(false);
-      expect(composerOffersLoop(harness, "loading", topLevel)).toBe(false);
-    },
-  );
+  ] as const)("offers /loop for %s when the server manages loops", (harness, offered) => {
+    const manages = info({ session_timers: true, session_loops: true });
+    expect(composerOffersLoop(harness, manages, topLevel)).toBe(offered);
+  });
+
+  it("needs the server to manage loops, not merely save timers", () => {
+    // An older server saves timers but can't replace or stop a loop.
+    expect(composerOffersLoop("claude-sdk", info({ session_timers: true }), topLevel)).toBe(false);
+    // Loops already running still stop once saving timers is turned off.
+    expect(composerOffersLoop("claude-sdk", info({ session_loops: true }), topLevel)).toBe(true);
+    expect(composerOffersLoop("claude-sdk", "loading", topLevel)).toBe(false);
+  });
 
   it("withholds /loop from a sub-agent's session and a side chat, whose timers aren't saved", () => {
     const saves = info({ session_timers: true, session_loops: true });

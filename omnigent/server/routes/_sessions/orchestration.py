@@ -4251,7 +4251,9 @@ async def _settle_undelivered_native_input(
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
-        data=MessageData(role="user", content=drained.content, user_authored=True),
+        data=MessageData(
+            role="user", content=drained.content, user_authored=True, origin=drained.origin
+        ),
         created_by=drained.created_by,
         stable_id=drained.stable_id
         or uuid.uuid5(
@@ -4445,7 +4447,9 @@ def _build_skipped_native_items(
             NewConversationItem(
                 type="message",
                 response_id=turn_id,
-                data=MessageData(role="user", content=skipped.content, user_authored=True),
+                data=MessageData(
+                    role="user", content=skipped.content, user_authored=True, origin=skipped.origin
+                ),
                 created_by=skipped.created_by,
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,

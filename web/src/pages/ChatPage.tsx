@@ -2220,7 +2220,7 @@ const LOOP_HARNESSES: ReadonlySet<string> = new Set([
   "codex",
 ]);
 
-/** Offer saved loops on supported top-level sessions when the server saves timers and manages loops. */
+/** Offer `/loop` on supported top-level sessions when the server manages loops; arming also needs saved timers. */
 export function composerOffersLoop(
   harness: string | null,
   info: ServerInfo | "loading",
@@ -2228,7 +2228,7 @@ export function composerOffersLoop(
     { parentSessionId?: string | null; labels?: Record<string, string> | null } | null | undefined,
 ): boolean {
   if (info === "loading") return false;
-  if (info.session_timers !== true || info.session_loops !== true) return false;
+  if (info.session_loops !== true) return false;
   if (harness === null || !LOOP_HARNESSES.has(harness)) return false;
   return sessionTakesSavedTimers(session);
 }
@@ -3020,6 +3020,14 @@ function ComposerImpl(
     composerOffersLoop(sessionHarness, composerServerInfo, composerSession);
   // The /loop handler settles after the user may have switched sessions or typed again.
   const composerSessionIdRef = useRef(composerSessionId);
+  // A /loop failure may land after the chat surface unmounted (the terminal view).
+  const composerMountedRef = useRef(true);
+  useEffect(
+    () => () => {
+      composerMountedRef.current = false;
+    },
+    [],
+  );
   composerSessionIdRef.current = composerSessionId;
   const draftRef = useRef(value);
   draftRef.current = value;
@@ -3599,6 +3607,17 @@ function ComposerImpl(
           setCommandError(command.message);
           return true;
         }
+        // Loops already running still stop after saving timers is turned off.
+        if (
+          command.kind === "start" &&
+          (composerServerInfo === "loading" || composerServerInfo.session_timers !== true)
+        ) {
+          setCommandError(
+            "Saving timers is off on this server, so a loop can't be armed. " +
+              "/loop stop still stops a running one.",
+          );
+          return true;
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3608,7 +3627,6 @@ function ComposerImpl(
         const report = (hint: string) => {
           if (composerSessionIdRef.current === loopSessionId) setCommandError(hint);
         };
-        // Starts and stops queue per session, so a stop waits for an arm still in flight.
         void runSessionTimerMutation(loopSessionId, async () => {
           if (command.kind === "stop") {
             const stopped = await stopSessionLoop(loopSessionId);
@@ -3629,12 +3647,21 @@ function ComposerImpl(
             // first tick: the same tagged message every tick sends.
             await sendLoopPrompt(loopSessionId, command.prompt);
           } catch (err: unknown) {
-            // Every tick would meet the same refusal, so arm nothing.
-            await cancelSessionTimer(loopSessionId, timer.timerId).catch(() => undefined);
-            const reason = err instanceof Error ? err.message : "The first run failed";
-            throw new Error(`${reason.replace(/\.$/, "")}. The loop was not armed.`, {
-              cause: err,
-            });
+            // Every tick would meet the same refusal, so arm nothing. The server has
+            // already stopped the loop this one replaced, so say so.
+            const reason = (err instanceof Error ? err.message : "The first run failed").replace(
+              /\.$/,
+              "",
+            );
+            const replacedNote =
+              timer.replacedTimerId !== null ? " The loop it replaced is already stopped." : "";
+            let outcome = "The loop was not armed.";
+            try {
+              await cancelSessionTimer(loopSessionId, timer.timerId);
+            } catch {
+              outcome = "The loop could not be cancelled and may still be running; try /loop stop.";
+            }
+            throw new Error(`${reason}. ${outcome}${replacedNote}`, { cause: err });
           }
           const every = formatLoopInterval(timer.intervalSeconds ?? command.seconds);
           const nextRun = new Date(timer.fireAt);
@@ -3650,9 +3677,9 @@ function ComposerImpl(
               `it repeats until /loop stop and survives runner restarts.${asText}`,
           );
         }).catch((err: unknown) => {
-          // Give the command back to fix: into the composer while its session is still
-          // open, else into that session's saved draft, unless something newer is there.
-          if (composerSessionIdRef.current === loopSessionId) {
+          // Give the command back to fix: into the composer while it still shows this
+          // session, else into the session's saved draft, unless something newer is there.
+          if (composerMountedRef.current && composerSessionIdRef.current === loopSessionId) {
             if (draftRef.current === "") setValue(typed);
           } else {
             const saved = getSessionDraft(loopSessionId);
