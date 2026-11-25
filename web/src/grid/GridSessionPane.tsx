@@ -300,7 +300,7 @@ export function GridSessionPane({
     pendingClose?.keys.includes(terminalTabKey(terminal)),
   );
   // Closes idle shells at once and asks about the rest; a bulk close asks once for all of them.
-  // Without floating panes every close asks.
+  // An older server can't tell, so there every close asks.
   const requestCloseTerminals = (keys: string[], callbacks?: ShellCloseCallbacks) => {
     if (keys.length === 0) return;
     const ids = terminals

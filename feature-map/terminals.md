@@ -78,10 +78,7 @@ with their own terminal retain the switcher.
 - With `floating_panes` on as well (off by default), a split's panes float as cards. Drag a
   pane by the band around its title strip's handle; a double-click elsewhere on the strip
   maximizes it, and a strip too narrow for both zones moves and maximizes from anywhere. A
-  pane whose shell exits closes at once, and the pane beside it takes the keyboard. Close Pane
-  closes a shell its runner reads as idle without asking; a busy one asks and names its job,
-  such as "vim is running in zsh". When the runner can't answer within half a second, or the
-  shell was typed into meanwhile, it asks as before.
+  pane whose shell exits closes at once, and the pane beside it takes the keyboard.
 
 **User shells:**
 
@@ -97,6 +94,10 @@ with their own terminal retain the switcher.
   while an embedded browser tab has focus. The menu item is disabled whenever
   the chord would be inert.
 - Select an open shell from the rail's shell list; close it from its tab.
+- Closing a shell, from any of the places below, first asks its runner what it runs. A shell
+  idle at its prompt closes without asking; a busy one asks and names its job, such as "vim is
+  running in zsh". When the runner can't answer within half a second, the server is too old to
+  serve the check, or the shell was typed into meanwhile, it asks as before.
   In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
   workspace tab, using the same terminal confirmation. A read-only viewer's
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.

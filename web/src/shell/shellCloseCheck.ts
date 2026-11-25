@@ -1,13 +1,11 @@
-// Whether closing shells needs confirmation: with floating panes, a shell its runner just read
-// idle closes at once. Anything else asks, naming the job a busy shell runs.
+// Whether closing shells needs confirmation: a shell its runner just read idle closes at once.
+// Anything else asks, naming the job a busy shell runs; an older server always asks.
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { lastTerminalInputAt } from "@/lib/terminalInputTimes";
-
-import { useFloatingPanes } from "./useFloatingPanes";
 
 /** How long a close waits for the runner's reading before it asks anyway. */
 export const SHELL_CLOSE_CHECK_MS = 500;
@@ -175,8 +173,8 @@ interface RunningCheck {
 
 /**
  * `checkShellClose` for one surface showing `sessionId`'s shells, recording each answer. A newer
- * check, or the surface going, drops a running one silently. Floating panes turning off makes it
- * ask, as every close then does. A new server or session drops it and calls its `dropped`.
+ * check, or the surface going, drops a running one silently. A new server or session drops it
+ * and calls its `dropped`.
  */
 export function useShellCloseCheck(
   sessionId: string | null | undefined,
@@ -186,27 +184,22 @@ export function useShellCloseCheck(
   decide: (check: ShellCloseCheck) => void,
   dropped?: () => void,
 ) => void {
-  const floatingPanes = useFloatingPanes();
   const place = JSON.stringify([getOmnigentServerIdentity(), sessionId ?? null]);
-  const current = useRef<{ place: string; floatingPanes: boolean; running: RunningCheck | null }>({
+  const current = useRef<{ place: string; running: RunningCheck | null }>({
     place,
-    floatingPanes,
     running: null,
   });
-  // Settle a running check for a new server, session or gate before anything shows.
+  // Drop a running check for a new server or session before anything shows.
   useLayoutEffect(() => {
     const state = current.current;
     const running = state.running;
-    const moved = state.place !== place;
-    const gateClosed = state.floatingPanes && !floatingPanes;
+    if (state.place === place) return;
     state.place = place;
-    state.floatingPanes = floatingPanes;
-    if (!running || (!moved && !gateClosed)) return;
+    if (!running) return;
     state.running = null;
     running.stop.abort();
-    if (moved) running.dropped?.();
-    else running.decide(CONFIRM);
-  }, [place, floatingPanes]);
+    running.dropped?.();
+  }, [place]);
   useEffect(() => {
     const state = current.current;
     return () => {
@@ -219,7 +212,7 @@ export function useShellCloseCheck(
       const state = current.current;
       state.running?.stop.abort();
       state.running = null;
-      if (!floatingPanes || !sessionId || terminalIds.length === 0) {
+      if (!sessionId || terminalIds.length === 0) {
         decide(CONFIRM);
         return;
       }
@@ -246,7 +239,7 @@ export function useShellCloseCheck(
         },
       );
     },
-    [floatingPanes, sessionId],
+    [sessionId],
   );
 }
 
