@@ -16808,6 +16808,29 @@ async def test_relay_proxy_error_marks_a_server_it_never_reached(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/policies/evaluate", "/hook/pi/extension-ui"])
+async def test_relay_policy_and_pi_routes_answer_502_when_the_runner_cannot_renew_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Only the permission route turns a runner auth lapse into a 401.
+
+    The policy and Pi extension proxies keep answering 502 when the runner's
+    token refresh returns nothing, so their callers' retry and fail-closed
+    handling stays as it was.
+    """
+    import urllib.error
+
+    failure = httpx.RequestError("Databricks token refresh returned no token")
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient(failure))
+    try:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            await asyncio.to_thread(_relay_request_raw, bridge_dir, path, _PRE_TOOL_USE_PAYLOAD)
+        assert raised.value.code == 502
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
 async def test_claude_permission_relay_keeps_a_login_redirect_recognizable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
