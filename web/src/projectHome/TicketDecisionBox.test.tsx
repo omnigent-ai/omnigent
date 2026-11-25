@@ -55,7 +55,7 @@ function waiting(overrides: Partial<TicketWaitingOn> = {}): TicketWaitingOn {
   };
 }
 
-function renderBox(viewer: string, waitingOn = waiting()) {
+function renderBox(viewer: string, waitingOn = waiting(), signOffOffered = false) {
   const handlers = { onAnswer: vi.fn(), onAnswerInComment: vi.fn(), onShowAsk: vi.fn() };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -68,6 +68,7 @@ function renderBox(viewer: string, waitingOn = waiting()) {
         personaLookup={(session) => (session === "lead-session" ? "Lead" : null)}
         nowMs={1_000_000 + 2 * 60_000}
         answering={false}
+        signOffOffered={signOffOffered}
         {...handlers}
       />
     </QueryClientProvider>,
@@ -133,6 +134,12 @@ describe("TicketDecisionBox", () => {
     expect(handlers.onAnswerInComment).toHaveBeenCalledWith("@Lead ");
     fireEvent.click(screen.getByRole("button", { name: "See the full ask" }));
     expect(handlers.onShowAsk).toHaveBeenCalledWith(4);
+  });
+
+  it("points to the one-click sign-off instead of option buttons on a sign-off ask", () => {
+    renderBox("owner@example.com", waiting({ question: "Product OK, yes or no?" }), true);
+    expect(screen.queryByTestId("ticket-decision-options")).toBeNull();
+    expect(screen.getByTestId("ticket-decision-sign-off")).toHaveTextContent("sign-off above");
   });
 
   it("shows anyone else one grey line, with no answer controls", () => {

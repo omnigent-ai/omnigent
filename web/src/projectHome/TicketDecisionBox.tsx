@@ -134,6 +134,7 @@ export function TicketDecisionBox({
   personaLookup,
   nowMs = Date.now(),
   answering,
+  signOffOffered = false,
   onAnswer,
   onAnswerInComment,
   onShowAsk,
@@ -145,6 +146,8 @@ export function TicketDecisionBox({
   personaLookup: ReturnType<typeof useProjectPersonaLookup>;
   nowMs?: number;
   answering: boolean;
+  /** The viewer can sign off right above; a "Yes" here wouldn't add the label the gate needs. */
+  signOffOffered?: boolean;
   onAnswer: (text: string) => void;
   onAnswerInComment: (mention: string) => void;
   onShowAsk: (position: number) => void;
@@ -179,7 +182,7 @@ export function TicketDecisionBox({
     );
   }
 
-  const options = decisionOptions(askText || question);
+  const options = signOffOffered ? [] : decisionOptions(askText || question);
   const evidence = askEvidence(askText);
   const questionText = questionStem(question, options.length > 0);
   return (
@@ -205,6 +208,11 @@ export function TicketDecisionBox({
       ) : (
         <p className="text-[15px] font-medium text-foreground">
           This ticket needs your response; see the latest comment.
+        </p>
+      )}
+      {signOffOffered && (
+        <p className="text-sm text-muted-foreground" data-testid="ticket-decision-sign-off">
+          Approve or decline with the sign-off above; that adds the label landing needs.
         </p>
       )}
       {options.length > 0 && (
