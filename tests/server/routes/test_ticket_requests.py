@@ -506,4 +506,27 @@ async def test_an_agents_ask_naming_members_reaches_their_inboxes(multi_user_cli
     assert got.json()["waiting_on"]["responders"] == [elise, kasey]
     assert await _requests(client, elise) == ["Stories"]
     assert await _requests(client, kasey) == ["Stories"]
+    # A person's cc on a ticket that also asks the viewer shows once, as the ask.
+    filed = await client.post(
+        f"/v1/projects/{project['id']}/tickets",
+        json={"title": "Roadmap", "description": "@Elise Gonzales please weigh in."},
+        headers=_as_user(ALICE),
+    )
+    assert filed.status_code == 201, filed.text
+    assert await _requests(client, elise) == ["Roadmap", "Stories"]
+    store.update(
+        project["id"],
+        filed.json()["id"],
+        UpdateTicket(
+            labels=[{"key": "needs-human"}],
+            comment="@Elise Gonzales Q3 or Q4?",
+            audience="human",
+        ),
+        worker,
+    )
+    listed = (await client.get(PATH, headers=_as_user(elise))).json()["data"]
+    assert sorted((item["title"], item["reason"]) for item in listed) == [
+        ("Roadmap", "owner"),
+        ("Stories", "owner"),
+    ]
     assert await _requests(client, ALICE) == []

@@ -34,7 +34,10 @@ def create_ticket_requests_router(
             asyncio.to_thread(store.human_requests, user_id=user_id),
             asyncio.to_thread(store.ticket_cc, user_id=user_id),
         )
-        # A cc is informational (reason "cc") and sorts in with the asks by time.
+        # A cc is informational (reason "cc") and sorts in with the asks by time; a
+        # ticket that also asks the viewer shows once, as the ask.
+        asked = {(item["project_id"], item["ticket_id"]) for item in asks["data"]}
+        cc = [item for item in cc if (item["project_id"], item["ticket_id"]) not in asked]
         data = sorted([*asks["data"], *cc], key=lambda item: item["raised_at"], reverse=True)
         return {
             **asks,
