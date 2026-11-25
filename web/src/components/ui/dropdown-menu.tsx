@@ -4,7 +4,8 @@ import * as DropdownMenuPrimitive from "radix-ui/dropdown-menu";
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
-import { MenuItem } from "./menu-item";
+import type { ShortcutId } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { describedWithShortcut, MenuItem } from "./menu-item";
 import { keepWheelInsidePortal } from "./portalWheel";
 import { MobileMenuGlassSurface } from "@/components/MobileMenuGlassSurface";
 
@@ -67,11 +68,19 @@ function DropdownMenuItem({
   className,
   inset,
   variant = "default",
+  shortcut,
+  description,
+  children,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Item> & {
   inset?: boolean;
   variant?: "default" | "destructive";
+  /** The command's binding; its active chord shows right-aligned. Not drawn with `asChild`. */
+  shortcut?: ShortcutId;
+  /** A quieter line under the label, such as why a disabled item can't run; read as its description. Not drawn with `asChild`. */
+  description?: React.ReactNode;
 }) {
+  const descriptionId = React.useId();
   return (
     <MenuItem
       asChild
@@ -85,6 +94,9 @@ function DropdownMenuItem({
         data-inset={inset}
         data-variant={variant}
         {...props}
+        {...(props.asChild
+          ? { children }
+          : describedWithShortcut(children, description, descriptionId, shortcut))}
       />
     </MenuItem>
   );
@@ -138,10 +150,14 @@ function DropdownMenuRadioItem({
   className,
   children,
   inset,
+  description,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.RadioItem> & {
   inset?: boolean;
+  /** A quieter line under the label saying what the choice does; read as its description. */
+  description?: React.ReactNode;
 }) {
+  const descriptionId = React.useId();
   return (
     <MenuItem
       asChild
@@ -154,6 +170,7 @@ function DropdownMenuRadioItem({
       <DropdownMenuPrimitive.RadioItem
         data-slot="dropdown-menu-radio-item"
         data-inset={inset}
+        aria-describedby={description ? descriptionId : undefined}
         {...props}
       >
         <span
@@ -164,7 +181,22 @@ function DropdownMenuRadioItem({
             <CheckIcon />
           </DropdownMenuPrimitive.ItemIndicator>
         </span>
-        {children}
+        {description ? (
+          <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <span className="flex min-w-0 items-center gap-2">{children}</span>
+            {/* Hidden from the row's name; aria-describedby still reads it. */}
+            <span
+              id={descriptionId}
+              aria-hidden
+              data-slot="dropdown-menu-item-description"
+              className="text-xs whitespace-normal text-muted-foreground"
+            >
+              {description}
+            </span>
+          </span>
+        ) : (
+          children
+        )}
       </DropdownMenuPrimitive.RadioItem>
     </MenuItem>
   );
@@ -215,6 +247,13 @@ function DropdownMenuShortcut({ className, ...props }: React.ComponentProps<"spa
     />
   );
 }
+
+/**
+ * Width for a menu whose rows carry descriptions: wide enough that labels don't truncate, with
+ * the descriptions wrapping, and never wider than the space beside the trigger.
+ */
+const DESCRIBED_MENU_CONTENT_CLASS =
+  "min-w-72 max-w-[min(24rem,var(--radix-dropdown-menu-content-available-width))]";
 
 function DropdownMenuSub({ ...props }: React.ComponentProps<typeof DropdownMenuPrimitive.Sub>) {
   return <DropdownMenuPrimitive.Sub data-slot="dropdown-menu-sub" {...props} />;
@@ -282,6 +321,7 @@ const DropdownMenuSubContent = React.forwardRef<
 });
 
 export {
+  DESCRIBED_MENU_CONTENT_CLASS,
   DropdownMenu,
   DropdownMenuPortal,
   DropdownMenuTrigger,

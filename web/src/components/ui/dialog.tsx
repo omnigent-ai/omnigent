@@ -52,11 +52,24 @@ function DialogContent({
   showCloseButton = true,
   overlayClassName,
   style,
+  initialFocus,
+  irreversible: _irreversible = false,
+  onOpenAutoFocus,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
   /** Classes for the backdrop, such as a clear one over a live preview. */
   overlayClassName?: string;
+  /**
+   * What takes focus on open instead of the first control, such as a confirmation's expected
+   * answer, so Enter gives it while Esc still cancels.
+   */
+  initialFocus?: React.RefObject<HTMLElement | null>;
+  /**
+   * The destructive action can't be undone, so Enter mustn't confirm it: focus starts on the
+   * first control, normally Cancel, as in any dialog without `initialFocus`.
+   */
+  irreversible?: boolean;
 }) {
   // On the iOS shell the layout viewport stays full-height when the soft
   // keyboard opens (the native shell keeps the WKWebView full via
@@ -89,6 +102,14 @@ function DialogContent({
           className,
         )}
         style={{ ...iosViewportStyle, ...style }}
+        onOpenAutoFocus={(event) => {
+          onOpenAutoFocus?.(event);
+          const target = initialFocus?.current;
+          if (event.defaultPrevented || !target) return;
+          target.focus();
+          // A target that can't take focus, such as a disabled button, leaves the default.
+          if (document.activeElement === target) event.preventDefault();
+        }}
         {...props}
       >
         {/* Hide the native browser view while this dialog is open (#3980).

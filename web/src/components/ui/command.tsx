@@ -135,19 +135,39 @@ function CommandSeparator({
 function CommandItem({
   className,
   children,
+  checked,
   ...props
-}: React.ComponentProps<typeof CommandPrimitive.Item>) {
+}: React.ComponentProps<typeof CommandPrimitive.Item> & {
+  /** One of several choices to check: set, the row leads with a checkbox instead of a tick. */
+  checked?: boolean;
+}) {
+  const checkable = checked !== undefined;
   return (
     <CommandPrimitive.Item
       data-slot="command-item"
+      {...(checkable ? { "data-checked": checked, "aria-checked": checked } : {})}
       className={cn(
         "group/command-item relative flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-ui outline-hidden select-none in-data-[slot=dialog-content]:rounded-lg! data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-muted data-selected:text-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-selected:*:[svg]:text-foreground",
         className,
       )}
       {...props}
     >
+      {checkable && (
+        <span
+          aria-hidden
+          data-slot="command-item-checkbox"
+          className="flex size-4 shrink-0 items-center justify-center rounded-[4px] border border-input bg-background text-primary-foreground dark:bg-input group-data-[checked=true]/command-item:border-primary group-data-[checked=true]/command-item:bg-primary dark:group-data-[checked=true]/command-item:bg-primary"
+        >
+          <CheckIcon
+            strokeWidth={3}
+            className="size-3! opacity-0 group-data-[checked=true]/command-item:opacity-100 group-data-selected/command-item:text-primary-foreground!"
+          />
+        </span>
+      )}
       {children}
-      <CheckIcon className="ml-auto opacity-0 group-has-data-[slot=command-shortcut]/command-item:hidden group-data-[checked=true]/command-item:opacity-100" />
+      {!checkable && (
+        <CheckIcon className="ml-auto opacity-0 group-has-data-[slot=command-shortcut]/command-item:hidden group-data-[checked=true]/command-item:opacity-100" />
+      )}
     </CommandPrimitive.Item>
   );
 }

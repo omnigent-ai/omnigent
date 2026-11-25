@@ -7,12 +7,15 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "./dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "./popover";
+import { shortcutAriaKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 
 afterEach(cleanup);
 
@@ -71,5 +74,47 @@ describe("wheel inside layers portalled out of a Dialog", () => {
 
     expect(wheelScrolls(screen.getByText("Hours"))).toBe(true);
     expect(wheelScrolls(screen.getByTestId("dialog-body"))).toBe(false);
+  });
+});
+
+describe("dropdown menu row shortcuts and descriptions", () => {
+  function openMenu(content: ReactNode) {
+    render(
+      <DropdownMenu open>
+        <DropdownMenuTrigger>Menu</DropdownMenuTrigger>
+        <DropdownMenuContent>{content}</DropdownMenuContent>
+      </DropdownMenu>,
+    );
+  }
+
+  it("ends a bound row with its chord and reads a description without adding it to the name", () => {
+    openMenu(
+      <DropdownMenuItem shortcut="session.rename" description="Only the owner can rename it.">
+        Rename
+      </DropdownMenuItem>,
+    );
+    const row = screen.getByRole("menuitem", { name: /^Rename/ });
+    expect(row).toHaveAttribute("aria-keyshortcuts", shortcutAriaKeys("session.rename"));
+    expect(row).toHaveAccessibleDescription("Only the owner can rename it.");
+  });
+
+  it("reads a radio choice's description", () => {
+    openMenu(
+      <DropdownMenuRadioGroup value="all">
+        <DropdownMenuRadioItem value="all" description="Every pull request the session links.">
+          All
+        </DropdownMenuRadioItem>
+      </DropdownMenuRadioGroup>,
+    );
+    expect(screen.getByRole("menuitemradio", { name: "All" })).toHaveAccessibleDescription(
+      "Every pull request the session links.",
+    );
+  });
+
+  it("leaves a row without a binding or description unchanged", () => {
+    openMenu(<DropdownMenuItem>Copy link</DropdownMenuItem>);
+    const row = screen.getByRole("menuitem", { name: "Copy link" });
+    expect(row).not.toHaveAttribute("aria-keyshortcuts");
+    expect(row).not.toHaveAttribute("aria-describedby");
   });
 });

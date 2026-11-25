@@ -1,4 +1,5 @@
 import { cleanup, render, screen } from "@testing-library/react";
+import { useRef } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { Dialog, DialogContent, DialogTitle } from "./dialog";
@@ -57,3 +58,47 @@ describe("DialogContent column sizing", () => {
     expect(screen.getByRole("dialog")).toHaveClass("grid-cols-[minmax(0,1fr)]");
   });
 });
+
+function ConfirmDialog({
+  focusConfirm,
+  irreversible,
+}: {
+  focusConfirm?: boolean;
+  irreversible?: boolean;
+}) {
+  const confirm = useRef<HTMLButtonElement>(null);
+  return (
+    <Dialog open onOpenChange={() => {}}>
+      <DialogContent
+        showCloseButton={false}
+        initialFocus={focusConfirm ? confirm : undefined}
+        irreversible={irreversible}
+      >
+        <DialogTitle>Close the pull request?</DialogTitle>
+        <button type="button">Cancel</button>
+        <button type="button" ref={confirm}>
+          Close
+        </button>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+describe("DialogContent initial focus", () => {
+  it("focuses the first control without initialFocus, irreversible or not", () => {
+    renderConfirm({});
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    cleanup();
+    renderConfirm({ irreversible: true });
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+  });
+
+  it("focuses initialFocus's element on open", () => {
+    renderConfirm({ focusConfirm: true });
+    expect(screen.getByRole("button", { name: "Close" })).toHaveFocus();
+  });
+});
+
+function renderConfirm(props: { focusConfirm?: boolean; irreversible?: boolean }) {
+  return render(<ConfirmDialog {...props} />);
+}
