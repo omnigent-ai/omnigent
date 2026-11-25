@@ -119,10 +119,12 @@ from omnigent.server.schemas import (
     CopiedFile,
     CopyFilesRequest,
     CopyFilesResponse,
+    ErrorResponse,
     SessionPullRequestList,
     SessionRepositoryBranchList,
     SessionResourceObject,
     SessionResourcePaginatedList,
+    TerminalShellState,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -1807,7 +1809,19 @@ def register_resources_routes(
 
     @router.get(
         "/sessions/{session_id}/resources/terminals/{terminal_id}/shell",
-        response_model=None,
+        response_model=TerminalShellState,
+        responses={
+            403: {"model": ErrorResponse, "description": "The caller can't close this terminal"},
+            404: {
+                "model": ErrorResponse,
+                "description": "No such running terminal in a session the caller can see",
+            },
+            502: {"description": "The runner failed to inspect the terminal"},
+            503: {
+                "model": ErrorResponse,
+                "description": "The runner is offline, or too old to inspect terminals",
+            },
+        },
     )
     async def get_session_terminal_shell(
         request: Request,
