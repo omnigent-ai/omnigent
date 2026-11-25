@@ -50,9 +50,11 @@ to customize.
 - `slack-thread-reply-event`: Slack **Reply posted in a thread** starts one session per
   thread that gets new replies in the watched channels, including threads the
   automation never handled; new top-level posts don't count. Its help text says so.
-  Each run finds threads by their `latest_reply` over the last 30 days of top-level
-  messages, reads the new replies from the check time, skips Omnigent's own posts, and
-  applies the conditions to the new replies. Nothing is followed between runs.
+  Each run finds the new replies with `search.messages` when the Slack tools offer it,
+  else by scanning at most 5 pages of the last day's top-level messages for threads whose
+  `latest_reply` is after the check time, then reads each such thread once from the check
+  time, skips Omnigent's own posts, and applies the conditions to the new replies.
+  Nothing is followed between runs.
 - `task-session`: when creating a trigger, Advanced shows **Start a new session for
   each match**, on by default. Turning it off sends every match to one task session,
   titled after the automation and started on the first match; later matches arrive

@@ -4975,9 +4975,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     const prompt = await submittedPrompt();
     expect(mutateAsync.mock.calls[0][0].templateId).toBe("slack");
     expect(prompt).toContain("Watch: new replies in threads in #roadmap posted by @alice\n");
-    expect(prompt).toContain(
-      "a thread has new replies when its latest_reply is after the check time",
-    );
+    expect(prompt).toContain("If your Slack tools offer search.messages, use it");
     expect(prompt).toContain("New top-level messages never count for this event");
     expect(prompt).toContain('title "Slack <channel> <thread ts> replies <newest reply ts>"');
     expect(prompt).not.toContain("Slack threads:");

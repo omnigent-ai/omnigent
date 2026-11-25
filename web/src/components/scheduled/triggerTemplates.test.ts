@@ -43,6 +43,8 @@ import {
   withTriggerEvent,
   TRIGGER_SOURCES,
   TRIGGER_TEMPLATES,
+  SLACK_THREAD_PARENT_LOOKBACK_DAYS,
+  SLACK_THREAD_PARENT_MAX_PAGES,
   type TriggerCondition,
   type TriggerConfig,
   type TriggerFields,
@@ -1028,7 +1030,7 @@ describe("Slack thread reply triggers", () => {
     expect(triggerFieldsComplete(threadReply({ scope: "#" }), "slack")).toBe(false);
   });
 
-  it("finds threads by latest_reply and reads their new replies from the check time", () => {
+  it("finds new replies with search and reads each thread once from the check time", () => {
     const prompt = renderTriggerPrompt(
       "slack",
       threadReply({
@@ -1052,21 +1054,25 @@ describe("Slack thread reply triggers", () => {
     expect(prompt).toContain(
       'Above it, write a "Slack IDs:" line followed by one-line JSON with channel_ids',
     );
-    // Thread starters are older than the check time, so the history read has its own window.
+    // Search finds replies directly, however old the thread is, in a call or two per channel.
     expect(prompt).toContain(
-      "The message that starts a thread is usually older than the check time, so don't bound this read by it: for each channel, read its top-level messages from the last 30 days with conversations.history, called with the channel ID, oldest set to 30 days before the time you noted as a Unix timestamp, latest set to the time you noted, inclusive false, limit 200 and caching off",
+      "If your Slack tools offer search.messages, use it: for each channel, search for in:<channel> after:<the day before the check time's date>, writing the channel as #<name> or <#<channel ID>> for an ID, with sort timestamp, sort_dir asc and count 100",
     );
     expect(prompt).toContain(
-      "with exactly these keys: ts, user, text (verbatim), reply_count, latest_reply.",
+      "with exactly these keys: ts, thread_ts, channel (its id), user, bot_id, text (verbatim). Use null for a missing key. End with one line giving page and pages from paging.",
     );
     expect(prompt).toContain(
-      "follow the cursor only while has_more is true and the oldest message on the page is still inside those 30 days.",
+      "keep only the messages whose thread_ts is set and differs from their ts (replies), whose ts is after the check time and not after the time you noted, and read the next page only while the last result's ts is still at or before the time you noted. Group the replies by their thread_ts.",
     );
     expect(prompt).toContain(
-      "a thread has new replies when its latest_reply is after the check time. Use the check time itself here, not 5 minutes before it",
+      "In both paths, use the check time itself, not 5 minutes before it: Slack shows replies at once, and the check time is what keeps a reply from being handled twice.",
+    );
+    // One thread read per thread, from the check time, with the posted event's analysis prompt.
+    expect(prompt).toContain(
+      'For each thread with new replies, make one read with conversations.replies, called with the channel ID, ts set to the thread ts, oldest set to the check time as a Unix timestamp, latest set to the time you noted, inclusive false, limit 200 and caching off, following the cursor only while has_more is true; if your Slack tool takes an analysis_prompt, pass "Output one JSON object per line for every message, oldest first, with exactly these keys: ts, thread_ts, user, bot_id, subtype, text (verbatim).',
     );
     expect(prompt).toContain(
-      'read its replies with conversations.replies, called with the channel ID, ts set to the thread ts, oldest set to the check time as a Unix timestamp, latest set to the time you noted, inclusive false, limit 200 and caching off, following the cursor while has_more is true; if your Slack tool takes an analysis_prompt, pass "Output one JSON object per line for every message, oldest first, with exactly these keys: ts, thread_ts, user, bot_id, subtype, text (verbatim).',
+      "Don't read a thread's earlier replies, don't pass a bash_query to a message read, and don't repeat a read.",
     );
     // Omnigent's own posts never count, and the conditions apply to the new replies.
     expect(prompt).toContain(
@@ -1078,7 +1084,7 @@ describe("Slack thread reply triggers", () => {
     expect(prompt).toContain(
       "?thread_ts=<thread ts>&cid=<channel ID>; the message that started the thread takes that form without the query.",
     );
-    // One session per thread, oldest first, carrying the whole thread with the new replies marked.
+    // One session per thread, oldest first, carrying the thread starter and the new replies.
     expect(prompt).toContain(
       "handle the threads oldest first, by the ts of the message that started each.",
     );
@@ -1086,7 +1092,7 @@ describe("Slack thread reply triggers", () => {
       'For each other thread, oldest first, call sys_session_create with agent_id set to your agent ID, placement "same_host", title "Slack <channel> <thread ts> replies <newest reply ts>"',
     );
     expect(prompt).toContain(
-      "then gives the channel, the message that started the thread with its author, text and permalink, and then every reply you read in the thread, oldest first, each with its author, text and permalink, with each reply posted after the check time marked as new between <slack-thread> and </slack-thread> lines.",
+      "then gives the channel, the message that started the thread with its author, text and permalink, and then the new replies, oldest first, each with its author, text and permalink between <slack-thread> and </slack-thread> lines.",
     );
     expect(prompt).toContain(
       'whose title starts with "Slack <channel> <thread ts> replies " for that thread. The ts at the end of the latest such title, or of a pending entry for the thread, is the newest reply already handled: skip the thread when it is at or after the thread\'s newest new reply, and otherwise count only the replies after it.',
@@ -1094,12 +1100,31 @@ describe("Slack thread reply triggers", () => {
     expect(prompt).toContain(
       'otherwise the previous check time, and say why you stopped. Above it, write a "Slack IDs:" line',
     );
-    // The worker answers in the thread it was given.
+    // The worker answers in the thread it was given and can read the rest of it itself.
     expect(prompt).toContain(
-      "Wherever a Slack tool asks which message to reply to, name the message that started the thread, not a reply.",
+      "Wherever a Slack tool asks which message to reply to, name the message that started the thread, not a reply. The thread can hold earlier replies your message doesn't carry: read it with your Slack tools when you need that context.",
     );
     const parts = splitTriggerPrompt(prompt);
     expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+  });
+
+  it("falls back to a short, capped history scan when search is unavailable", () => {
+    const prompt = renderTriggerPrompt("slack", threadReply(), CTX);
+    expect(SLACK_THREAD_PARENT_LOOKBACK_DAYS).toBe(1);
+    expect(SLACK_THREAD_PARENT_MAX_PAGES).toBe(5);
+    expect(prompt).toContain(
+      "Otherwise fall back to a history scan: for each channel, read its top-level messages from the last day with conversations.history, called with the channel ID, oldest set to one day before the time you noted as a Unix timestamp, latest set to the time you noted, inclusive false, limit 200 and caching off",
+    );
+    expect(prompt).toContain(
+      "with exactly these keys: ts, user, text (verbatim), reply_count, latest_reply.",
+    );
+    expect(prompt).toContain(
+      "a thread has new replies when its latest_reply is after the check time.",
+    );
+    expect(prompt).toContain(
+      "follow the cursor only while has_more is true and the oldest message on the page is still inside the window, and read at most 5 pages per channel; if that isn't every page, say in your reply that older threads in that channel weren't checked. Threads whose starting message is older than the window are only found through search.",
+    );
+    expect(prompt).not.toContain("30 days");
   });
 
   it("excludes new top-level posts and doesn't follow threads between runs", () => {
@@ -1107,9 +1132,7 @@ describe("Slack thread reply triggers", () => {
     expect(prompt).toContain(
       "New top-level messages never count for this event: a message with no reply after the check time starts nothing, however new it is. Every new reply by a person counts.",
     );
-    expect(prompt).toContain(
-      "a thread that gets more replies later is found again by its latest_reply then.",
-    );
+    expect(prompt).toContain("a thread that gets more replies later is found again then.");
     expect(prompt).not.toContain("Slack threads:");
     expect(prompt).not.toContain("replies in their threads");
     expect(prompt).not.toContain("Then send new replies in the threads you follow");
