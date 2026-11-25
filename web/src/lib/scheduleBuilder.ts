@@ -305,12 +305,15 @@ export function validateSchedule(
     sessionMode = "new",
     executionTarget,
     subhourSupported = false,
+    canContinueSession = true,
   }: {
     allowPastEnd?: boolean;
     now?: Date;
     sessionMode?: "new" | "continue";
     executionTarget?: ScheduledTaskExecutionTarget;
     subhourSupported?: boolean;
+    /** False when the automation must start new sessions, as a saved workflow's runs do. */
+    canContinueSession?: boolean;
   } = {},
 ): string | null {
   if (model.preset === "custom" && model.customFreq === "rule") {
@@ -344,7 +347,9 @@ export function validateSchedule(
       if (model.customFreq === "minutely" && model.interval < MIN_HOURLY_MINUTE_INTERVAL) {
         if (!subhourSupported) return "This server requires schedules of at least 60 minutes.";
         if (sessionMode !== "continue" && executionTarget !== "connected_host")
-          return "New sandbox sessions require schedules of at least 60 minutes. Continue in the same session or use a connected host for shorter intervals.";
+          return canContinueSession
+            ? "New sandbox sessions require schedules of at least 60 minutes. Continue in the same session or use a connected host for shorter intervals."
+            : "New sandbox sessions require schedules of at least 60 minutes. Use a connected host for shorter intervals.";
       }
       return `Interval must be a whole number of at least ${minimum} and at most ${maximum}.`;
     }

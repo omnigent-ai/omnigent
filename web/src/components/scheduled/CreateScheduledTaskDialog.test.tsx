@@ -7402,6 +7402,46 @@ describe("CreateScheduledTaskDialog workflow", () => {
     });
   });
 
+  it("points a workflow's sub-hour sandbox schedule to a connected host, not one session", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          prompt: run(""),
+          rrule: "FREQ=MINUTELY;INTERVAL=10",
+          executionTarget: "managed_sandbox",
+        })}
+      />,
+      {
+        info: {
+          ...SESSION_MODE_INFO,
+          scheduled_task_subhour: true,
+          managed_sandboxes_enabled: true,
+        },
+      },
+    );
+    openAutomationSection("Schedule");
+    const error = screen.getByTestId("schedule-error");
+    expect(error).toHaveTextContent(
+      "New sandbox sessions require schedules of at least 60 minutes. Use a connected host for shorter intervals.",
+    );
+    expect(error).not.toHaveTextContent("Continue in the same session");
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    expect(submit).toBeDisabled();
+
+    openAutomationSection("Run setup");
+    fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      rrule: "FREQ=MINUTELY;INTERVAL=10",
+      executionTarget: "connected_host",
+    });
+  });
+
   it("keeps instructions an automation already saved with its workflow editable", async () => {
     renderWithWorkflows(
       <CreateScheduledTaskDialog

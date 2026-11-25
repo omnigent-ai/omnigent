@@ -89,6 +89,7 @@ export function ScheduleFields({
   sessionMode = "new",
   executionTarget,
   subhourSupported = false,
+  canContinueSession = true,
   onChange,
   timezone,
   onTimezoneChange,
@@ -104,6 +105,8 @@ export function ScheduleFields({
   sessionMode?: "new" | "continue";
   executionTarget?: "connected_host" | "managed_sandbox";
   subhourSupported?: boolean;
+  /** False when the automation must start new sessions, as a saved workflow's runs do. */
+  canContinueSession?: boolean;
   onChange: (next: ScheduleModel) => void;
   timezone: string;
   onTimezoneChange: (timezone: string) => void;
@@ -154,7 +157,7 @@ export function ScheduleFields({
       : null;
   const error = validateSchedule(
     { ...model, end: undefined },
-    { sessionMode, subhourSupported, executionTarget },
+    { sessionMode, subhourSupported, executionTarget, canContinueSession },
   );
   const endingError =
     activeDateInput?.error ??

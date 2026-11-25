@@ -289,6 +289,17 @@ describe("minute cadence policy", () => {
         expect(newSession).toBe(
           "New sandbox sessions require schedules of at least 60 minutes. Continue in the same session or use a connected host for shorter intervals.",
         );
+        // A saved workflow's runs can't continue one session, so only the host is offered.
+        expect(
+          validateSchedule(schedule, {
+            sessionMode: "new",
+            executionTarget: "managed_sandbox",
+            subhourSupported: true,
+            canContinueSession: false,
+          }),
+        ).toBe(
+          "New sandbox sessions require schedules of at least 60 minutes. Use a connected host for shorter intervals.",
+        );
         for (const sessionMode of ["new", "continue"] as const) {
           expect(validateSchedule(schedule, { sessionMode })).toBe(
             "This server requires schedules of at least 60 minutes.",

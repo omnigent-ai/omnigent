@@ -1192,6 +1192,7 @@ export function CreateScheduledTaskDialog({
       sessionMode,
       subhourSupported,
       executionTarget,
+      canContinueSession: !workflowNeedsNewSessions,
     });
   }
   const scheduleInvalid = scheduleError !== null;
@@ -1935,6 +1936,7 @@ export function CreateScheduledTaskDialog({
               sessionMode={sessionMode}
               executionTarget={executionTarget}
               subhourSupported={subhourSupported}
+              canContinueSession={!workflowNeedsNewSessions}
               recurrenceUnsupported={scheduleUnsupported}
               allowPastEnd={allowPastEnd}
               onChange={setSchedule}
