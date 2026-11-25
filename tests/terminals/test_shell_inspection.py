@@ -8,14 +8,12 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from collections.abc import AsyncIterator
 
 import pytest
 
 from omnigent.terminals import shell_inspection
 from omnigent.terminals.shell_inspection import (
-    INSPECTION_TIMEOUT_SECONDS,
     MAX_COMMAND_NAME_LENGTH,
     PS_COLUMNS,
     UNKNOWN,
@@ -466,20 +464,13 @@ async def test_a_failing_tmux_is_unknown_and_nothing_it_printed_is_logged(
     assert "not pids" not in caplog.text and "200" not in caplog.text
 
 
-@pytest.mark.asyncio
-async def test_a_slow_tmux_is_unknown_within_the_budget() -> None:
-    tmux = [sys.executable, "-I", "-c", "import time; time.sleep(5)"]
-    started = time.monotonic()
-    assert await read_pane_shell(tmux, "main", "bash") == UNKNOWN
-    assert time.monotonic() - started < INSPECTION_TIMEOUT_SECONDS + 1
-
-
 class _EndlessProcess:
-    """A subprocess whose output passes the cap and never ends, until it is killed."""
+    """A subprocess that prints ``output`` and then nothing more, until it is killed."""
 
-    def __init__(self) -> None:
+    def __init__(self, output: bytes = b"") -> None:
         self.stdout = asyncio.StreamReader()
-        self.stdout.feed_data(b"x" * (shell_inspection._MAX_OUTPUT_BYTES + 1))
+        if output:
+            self.stdout.feed_data(output)
         self.returncode: int | None = None
         self.killed = asyncio.Event()
 
@@ -497,7 +488,7 @@ class _EndlessProcess:
 async def test_output_past_the_cap_stops_the_read_without_waiting_for_the_rest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = _EndlessProcess()
+    process = _EndlessProcess(b"x" * (shell_inspection._MAX_OUTPUT_BYTES + 1))
 
     async def start(*argv: str, **options: object) -> _EndlessProcess:
         return process
@@ -509,6 +500,23 @@ async def test_output_past_the_cap_stops_the_read_without_waiting_for_the_rest(
         await asyncio.wait_for(shell_inspection._run(["ps"], "/usr/bin"), 60)
     assert process.killed.is_set()
     assert not process.stdout.at_eof()
+
+
+@pytest.mark.asyncio
+async def test_a_tmux_that_never_answers_is_unknown_and_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmux = _EndlessProcess()
+
+    async def start(*argv: str, **options: object) -> _EndlessProcess:
+        return tmux
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    # tmux never answers, so the budget always runs out, however short or busy the machine.
+    monkeypatch.setattr(shell_inspection, "INSPECTION_TIMEOUT_SECONDS", 0.01)
+    answer = await asyncio.wait_for(read_pane_shell(["tmux"], "main", "bash"), 60)
+    assert answer == UNKNOWN
+    assert tmux.killed.is_set()
 
 
 class _Clock:
