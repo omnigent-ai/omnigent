@@ -2,6 +2,7 @@
 // override resolves once session info loads; Streamdown won't re-parse a settled message.
 
 import type { PullRequestInfo } from "@/hooks/usePullRequests";
+import { pullRequestKey } from "@/lib/pullRequestReference";
 
 /**
  * Href prefix of a parked reference, then `1234` or `owner/repo/12`. The per-load
@@ -219,7 +220,8 @@ export function linkedPullRequestUrl(
   const urls = new Map<string, string>();
   for (const pr of info?.prs ?? []) {
     if (pr.number !== Number(number) || !isWebUrl(pr.url)) continue;
-    const key = pr.url.toLowerCase();
+    // One PR however its link is stored: case, a trailing slash, a query or a fragment.
+    const key = pullRequestKey(pr.url);
     if (!urls.has(key)) urls.set(key, pr.url);
   }
   return urls.size === 1 ? [...urls.values()][0]! : null;

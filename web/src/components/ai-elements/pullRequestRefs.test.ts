@@ -354,7 +354,7 @@ describe("gitHubPullRequestUrl", () => {
 
 /** A PR the session links, as its PR info lists it. */
 function linked(url: string, relationship: "created" | "attached" | "inferred" = "attached") {
-  const [, repository, number] = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)$/)!;
+  const [, repository, number] = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)(?:[/?#]|$)/)!;
   return { url, host: "github.com", repository, number: Number(number), relationship };
 }
 
@@ -398,6 +398,18 @@ describe("linkedPullRequestUrl", () => {
       ],
     });
     expect(linkedPullRequestUrl(twice, "12")).toBe("https://github.com/Acme/App/pull/12");
+  });
+
+  it("counts one PR however its stored link ends: a trailing slash, a query or a fragment", () => {
+    const session = info({
+      prs: [
+        linked("https://github.com/acme/app/pull/12"),
+        linked("https://github.com/acme/app/pull/12/", "inferred"),
+        linked("https://github.com/acme/app/pull/12?tab=files", "attached"),
+        linked("https://github.com/acme/app/pull/12#discussion_r1", "created"),
+      ],
+    });
+    expect(linkedPullRequestUrl(session, "12")).toBe("https://github.com/acme/app/pull/12");
   });
 
   it("links a linked PR on any code host by its stored URL, and nothing that isn't a web URL", () => {
