@@ -5,7 +5,6 @@ import {
   LOOP_MAX_SECONDS,
   LOOP_MIN_SECONDS,
   LOOP_USAGE,
-  loopRunMessage,
   parseLoopCommand,
   parseLoopInterval,
 } from "./loopCommand";
@@ -106,12 +105,7 @@ describe("parseLoopCommand", () => {
   });
 });
 
-describe("loopRunMessage / looksLikeCommand", () => {
-  it("prefixes the prompt so the first run and every tick send the same instruction", () => {
-    expect(loopRunMessage("check CI")).toBe("Run now: check CI");
-    expect(loopRunMessage("/babysit-prs")).toBe("Run now: /babysit-prs");
-  });
-
+describe("looksLikeCommand", () => {
   it.each([
     ["/babysit-prs", true],
     ["$review", true],

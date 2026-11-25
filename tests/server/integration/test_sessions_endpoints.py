@@ -458,6 +458,38 @@ async def test_client_meta_and_external_messages_do_not_infer_user_authorship(
     assert message["content"] == item_data["content"]
     assert message.get("is_meta", False) is (event_type == "message")
     assert "user_authored" not in message
+    assert "origin" not in message
+
+
+async def test_a_user_message_keeps_the_origin_its_client_set(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A /loop run arrives tagged ``origin: "loop"``; the items API echoes the tag."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "origin": "loop",
+                    "content": [{"type": "input_text", "text": "check CI"}],
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    [message] = [item for item in items if item["type"] == "message"]
+    assert message["content"] == [{"type": "input_text", "text": "check CI"}]
+    assert (message["origin"], message["user_authored"]) == ("loop", True)
+    assert not message.get("is_meta")
 
 
 async def test_sidebar_rename_wins_in_flight_background_title(

@@ -8086,6 +8086,7 @@ async def test_a_sub_agent_or_side_chat_timer_is_left_to_its_runner(
         ({"seconds": 119}, "saves timers of at least 120 seconds"),
         ({"seconds": 300, "every": 5}, "unknown timer fields: every"),
         ({"seconds": 300, "origin": "cron"}, "origin must be 'loop'"),
+        ({"seconds": 300, "origin": "loop"}, "a loop needs a note"),
     ],
 )
 async def test_timer_requests_are_checked_like_the_tools_arguments(
@@ -8170,12 +8171,16 @@ async def test_a_session_lists_the_callers_own_timers_with_their_origin(
     agent_repeating = await saved({"seconds": 600, "repeat": True})
     agent_once = await saved({"seconds": 300})
     store = SqlAlchemyScheduledTaskStore(db_uri)
-    # The name carries the origin; the hidden prompt has the same shape for both.
+    # The name carries the origin. A loop's firing sends the prompt itself, shown in
+    # the transcript; an agent's timer sends its hidden wake.
     assert (store.get(loop_id).name, store.get(agent_repeating).name) == (
         "Loop: check CI",
         "Timer",
     )
-    assert store.get(loop_id).prompt == f"[System: timer {loop_id} fired]\nnote: 'check CI'"
+    assert (store.get(loop_id).prompt, store.get(agent_repeating).prompt) == (
+        "check CI",
+        f"[System: timer {agent_repeating} fired]",
+    )
 
     listed = await auth_client.get(f"/v1/sessions/{session_id}/timers", headers=_headers())
     assert listed.status_code == 200, listed.text

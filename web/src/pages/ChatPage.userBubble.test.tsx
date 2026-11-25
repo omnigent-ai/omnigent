@@ -210,6 +210,28 @@ describe("/btw answer pull request references", () => {
   });
 });
 
+describe("UserBubble loop runs", () => {
+  it("labels a message a /loop sent, beside the bubble", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          {/* The label explains itself in a tooltip. */}
+          <TooltipProvider>
+            <BubbleView bubble={userBubble("check CI", { origin: "loop" })} />
+          </TooltipProvider>
+        </FileViewerContext.Provider>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("message-origin")).toHaveTextContent("Loop");
+    expect(screen.getByText("check CI")).toBeInTheDocument();
+  });
+
+  it("leaves a typed message unlabelled", () => {
+    renderBubble(userBubble("check CI"));
+    expect(screen.queryByTestId("message-origin")).toBeNull();
+  });
+});
+
 describe("UserBubble system messages", () => {
   it("keeps hook order stable when a system message becomes a regular message", () => {
     const { rerender } = renderBubble(userBubble("[System: timer build fired]"));

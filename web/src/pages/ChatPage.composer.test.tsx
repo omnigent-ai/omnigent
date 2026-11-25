@@ -1742,13 +1742,14 @@ describe("Composer slash-command menu", () => {
       intervalSeconds: 300,
       seconds: 300,
       repeat: true,
-      note: "Run now: check CI",
+      note: "check CI",
       origin: "loop",
     });
-    return { listLoops, cancelTimer, setTimer, onSend: props.onSend };
+    const sendPrompt = vi.spyOn(sessionTimersApi, "sendLoopPrompt").mockResolvedValue(undefined);
+    return { listLoops, cancelTimer, setTimer, sendPrompt, onSend: props.onSend };
   }
   const savesTimers = { session_timers: true, session_timer_list: true };
-  const armed = { seconds: 300, repeat: true, note: "Run now: check CI", origin: "loop" };
+  const armed = { seconds: 300, repeat: true, note: "check CI", origin: "loop" };
   function submitLoop(text: string) {
     fireEvent.change(textarea(), { target: { value: text } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
@@ -1777,7 +1778,7 @@ describe("Composer slash-command menu", () => {
   });
 
   it("/loop <interval> <prompt> arms a loop-tagged timer and runs the prompt now", async () => {
-    const { listLoops, cancelTimer, setTimer, onSend } = renderLoopComposer(
+    const { listLoops, cancelTimer, setTimer, sendPrompt, onSend } = renderLoopComposer(
       "claude-native",
       savesTimers,
     );
@@ -1788,8 +1789,9 @@ describe("Composer slash-command menu", () => {
     expect(textarea()).toHaveValue("");
     expect(await screen.findByText(/^Loop armed: every 5m/)).toBeVisible();
     // The command itself never reaches the agent; the prompt runs once now as the
-    // same message every tick sends.
-    expect(onSend).toHaveBeenCalledExactlyOnceWith("Run now: check CI");
+    // same loop-tagged message every tick sends, not as composer input.
+    expect(sendPrompt).toHaveBeenCalledExactlyOnceWith("conv_test", "check CI");
+    expect(onSend).not.toHaveBeenCalled();
   });
 
   it("a new /loop replaces the session's running loop", async () => {
@@ -1802,11 +1804,11 @@ describe("Composer slash-command menu", () => {
     expect(await screen.findByText(/replacing the previous loop/)).toBeVisible();
   });
 
-  it("/loop warns when the prompt reads as a command, which ticks pass as text", async () => {
+  it("/loop warns when the prompt reads as a command, which a message may not run", async () => {
     const { setTimer } = renderLoopComposer("claude-sdk", savesTimers);
     submitLoop("/loop 5m /babysit-prs");
     await waitFor(() => expect(setTimer).toHaveBeenCalledOnce());
-    expect(await screen.findByText(/passes it as plain text/)).toBeVisible();
+    expect(await screen.findByText(/so it may not run as one/)).toBeVisible();
   });
 
   it.each([
@@ -1824,7 +1826,7 @@ describe("Composer slash-command menu", () => {
   });
 
   it("overlapping /loop commands run one at a time, so a stop waits for the arm", async () => {
-    const { listLoops, cancelTimer, setTimer, onSend } = renderLoopComposer(
+    const { listLoops, cancelTimer, setTimer, sendPrompt } = renderLoopComposer(
       "claude-sdk",
       savesTimers,
     );
@@ -1848,7 +1850,7 @@ describe("Composer slash-command menu", () => {
       expect(cancelTimer).toHaveBeenCalledExactlyOnceWith("conv_test", "st_loop"),
     );
     expect(await screen.findByText("Loop stopped.")).toBeVisible();
-    expect(onSend).toHaveBeenCalledExactlyOnceWith("Run now: check CI");
+    expect(sendPrompt).toHaveBeenCalledExactlyOnceWith("conv_test", "check CI");
   });
 
   it.each([
@@ -1875,12 +1877,14 @@ describe("Composer slash-command menu", () => {
     ],
     ["the listing fails", "listSessionLoops", "Session not found"],
     ["a cancel fails", "cancelSessionTimer", "The runner is offline"],
+    ["the first run is refused", "sendLoopPrompt", "Session is closed to new messages"],
   ] as const)("/loop shows the error and gives the command back when %s", async (_, fn, error) => {
     const spies = renderLoopComposer("claude-sdk", savesTimers, [{ timerId: "st_old" }]);
     const spy = {
       setSessionTimer: spies.setTimer,
       listSessionLoops: spies.listLoops,
       cancelSessionTimer: spies.cancelTimer,
+      sendLoopPrompt: spies.sendPrompt,
     }[fn];
     spy.mockRejectedValueOnce(new Error(error));
     submitLoop("/loop 5m check CI");

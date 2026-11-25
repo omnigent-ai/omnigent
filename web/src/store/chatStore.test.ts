@@ -11492,6 +11492,25 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(promoted.stableKey).toBe("pend_1");
     });
 
+    it("keeps a consumed message's origin, so a /loop tick's bubble can be labelled", () => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_tick",
+        itemType: "message",
+        data: {
+          role: "user",
+          origin: "loop",
+          user_authored: true,
+          content: [{ type: "input_text", text: "check CI" }],
+        },
+      });
+
+      const [tickBlock] = useChatStore.getState().blocks as UserMessageBlock[];
+      expect(tickBlock).toMatchObject({ type: "user_message", origin: "loop" });
+    });
+
     it("promotes using server file_ids, replacing 'pending:' placeholders", () => {
       // When the user attaches an image, the optimistic pending block carries
       // a "pending:<filename>" file_id as a placeholder. Once the server

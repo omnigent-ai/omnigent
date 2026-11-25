@@ -2,7 +2,7 @@
 
 import { authenticatedFetch } from "./identity";
 import { SIDE_CHAT_LABEL_KEY } from "./sessionListCache";
-import { ApiError, apiErrorFromResponse } from "./sessionsApi";
+import { ApiError, apiErrorFromResponse, postEvent } from "./sessionsApi";
 
 /** The `origin` the composer's `/loop` tags its timers with, so it cancels only those. */
 export const LOOP_TIMER_ORIGIN = "loop";
@@ -148,6 +148,25 @@ export async function listSessionTimers(sessionId: string): Promise<SessionTimer
 export async function listSessionLoops(sessionId: string): Promise<SessionTimerSummary[]> {
   const timers = await listSessionTimers(sessionId);
   return timers.filter((timer) => timer.origin === LOOP_TIMER_ORIGIN && timer.repeat);
+}
+
+/**
+ * Send a loop's prompt as the message every run of it sends: the first run from
+ * the composer, then each tick from the server. Tagged so the transcript labels it.
+ */
+export async function sendLoopPrompt(sessionId: string, prompt: string): Promise<void> {
+  await postEvent(
+    sessionId,
+    {
+      type: "message",
+      data: {
+        role: "user",
+        origin: LOOP_TIMER_ORIGIN,
+        content: [{ type: "input_text", text: prompt }],
+      },
+    },
+    { holdWhenHostOffline: true },
+  );
 }
 
 const pendingMutations = new Map<string, Promise<unknown>>();

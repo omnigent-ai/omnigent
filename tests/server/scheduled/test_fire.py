@@ -5727,3 +5727,24 @@ async def test_an_idle_session_is_polled_two_quiet_minutes_after_its_last_change
     check = _busy_until_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
     task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
     assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+def test_a_loop_timer_fires_its_prompt_as_a_tagged_message() -> None:
+    """A /loop tick is the prompt itself, labelled for the transcript; an agent's stays hidden."""
+    loop = _task(
+        kind="timer", name="Loop: check CI", prompt="check CI", rrule="FREQ=SECONDLY;INTERVAL=300"
+    )
+    assert fire_mod._task_event(loop).data == {
+        "role": "user",
+        "origin": "loop",
+        "content": [{"type": "input_text", "text": "check CI"}],
+    }
+    wake = "[System: timer task_1 fired]\nnote: 'check CI'"
+    agent = _task(
+        kind="timer", name="Timer: check CI", prompt=wake, rrule="FREQ=SECONDLY;INTERVAL=300"
+    )
+    assert fire_mod._task_event(agent).data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": wake}],
+    }

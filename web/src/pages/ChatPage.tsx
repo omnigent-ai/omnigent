@@ -135,17 +135,13 @@ import {
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
 import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
-import {
-  formatLoopInterval,
-  looksLikeCommand,
-  loopRunMessage,
-  parseLoopCommand,
-} from "@/lib/loopCommand";
+import { formatLoopInterval, looksLikeCommand, parseLoopCommand } from "@/lib/loopCommand";
 import {
   cancelSessionTimer,
   listSessionLoops,
   LOOP_TIMER_ORIGIN,
   runSessionTimerMutation,
+  sendLoopPrompt,
   sessionTakesSavedTimers,
   setSessionTimer,
 } from "@/lib/sessionTimersApi";
@@ -3632,17 +3628,16 @@ function ComposerImpl(
             report(existing.length === 0 ? "No loop is running in this session." : "Loop stopped.");
             return;
           }
-          const message = loopRunMessage(command.prompt);
           const timer = await setSessionTimer(loopSessionId, {
             seconds: command.seconds,
             repeat: true,
-            note: message,
+            note: command.prompt,
             origin: LOOP_TIMER_ORIGIN,
           });
           // Like Claude Code's /loop, run the prompt now rather than waiting for the
-          // first tick, as the same message every tick sends.
+          // first tick: the same tagged message every tick sends.
           appendEntry(typed);
-          onSend(message);
+          await sendLoopPrompt(loopSessionId, command.prompt);
           const every = formatLoopInterval(timer.intervalSeconds ?? command.seconds);
           const nextRun = new Date(timer.fireAt);
           const nextRunLabel = Number.isNaN(nextRun.getTime())
@@ -3650,7 +3645,7 @@ function ComposerImpl(
             : `, next run at ${nextRun.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
           const replaced = existing.length > 0 ? ", replacing the previous loop" : "";
           const asText = looksLikeCommand(command.prompt)
-            ? " The prompt looks like a command; the loop passes it as plain text."
+            ? " The prompt looks like a command; the loop sends it as a message, so it may not run as one."
             : "";
           report(
             `Loop armed: every ${every}${nextRunLabel}${replaced}. Running the prompt now; ` +

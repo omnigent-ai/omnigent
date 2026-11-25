@@ -355,8 +355,8 @@ class StartupInputOptions(BaseModel):
     scheduled_run: ScheduledRunLogContext | None = None
 
 
-# Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
-_MAX_MESSAGE_PHASE_LENGTH = 64
+# Longest message phase or origin label kept, e.g. Codex ``"partial_answer"``.
+_MAX_MESSAGE_LABEL_LENGTH = 64
 
 
 class MessageData(BaseModel):
@@ -384,6 +384,9 @@ class MessageData(BaseModel):
         server-expanded, e.g. skill instructions. Independent of ``is_meta``;
         client-settable by convention, not a trust signal. Also exempts the
         message from legacy markup cleanup on import.
+    :param origin: What sent a user message no human typed, e.g. ``"loop"`` for
+        a run of the web composer's ``/loop``. Display-only and client-settable
+        by convention, like ``user_authored``; ``None`` for ordinary input.
     :param subagent_return_id: Native task id of an explicitly completed child.
     :param phase: Assistant-only harness label for the message, e.g. Codex
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
@@ -397,6 +400,7 @@ class MessageData(BaseModel):
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
+    origin: str | None = Field(default=None, exclude_if=lambda value: value is None)
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
@@ -411,12 +415,12 @@ class MessageData(BaseModel):
         reject_authored_framework_notices(content)
         return content
 
-    @field_validator("phase", mode="before")
+    @field_validator("phase", "origin", mode="before")
     @classmethod
-    def drop_malformed_phase(cls, phase: object) -> str | None:
-        """Read a malformed phase as unlabelled rather than rejecting the message."""
-        if isinstance(phase, str) and 0 < len(phase) <= _MAX_MESSAGE_PHASE_LENGTH:
-            return phase
+    def drop_malformed_label(cls, label: object) -> str | None:
+        """Read a malformed phase or origin as unset rather than rejecting the message."""
+        if isinstance(label, str) and 0 < len(label) <= _MAX_MESSAGE_LABEL_LENGTH:
+            return label
         return None
 
     @model_validator(mode="after")

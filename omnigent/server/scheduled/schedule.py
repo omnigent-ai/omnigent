@@ -87,6 +87,18 @@ def timer_interval(rule: str) -> int:
     return int(match.group(1))
 
 
+# A timer's name says which client set it: the web composer's /loop saves
+# ``Loop: <prompt>``; an agent's sys_timer_set saves ``Timer: <note>``.
+LOOP_TIMER_NAME = "Loop"
+
+
+def timer_origin(name: str) -> str:
+    """``"loop"`` for a timer the composer's ``/loop`` set, else ``"agent"``."""
+    if name == LOOP_TIMER_NAME or name.startswith(f"{LOOP_TIMER_NAME}: "):
+        return "loop"
+    return "agent"
+
+
 def next_timer_time(task: ScheduledTask, after: int) -> int | None:
     """
     A timer's next firing strictly after *after*, skipping firings already missed.

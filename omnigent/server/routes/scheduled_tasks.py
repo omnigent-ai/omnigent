@@ -89,9 +89,11 @@ from omnigent.server.scheduled.rrule import (
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.schedule import (
+    LOOP_TIMER_NAME,
     continued_sandbox_host_id,
     is_trigger_automation,
     timer_interval,
+    timer_origin,
     timer_rule,
 )
 from omnigent.server.scheduled.telemetry import log_task_created
@@ -2522,13 +2524,6 @@ def create_scheduled_tasks_router(
     # Agent timers are a session primitive, so the per-request automations gate
     # doesn't hide them; they still need the database scheduler.
     timers = APIRouter()
-    # A timer's name says which client set it: the composer's /loop saves
-    # ``Loop: <note>``; an agent's sys_timer_set saves ``Timer: <note>``. The
-    # listing derives ``origin`` from that prefix, so no column is needed.
-    _LOOP_NAME_PREFIX = "Loop"
-
-    def _timer_origin(name: str) -> str:
-        return "loop" if name == _LOOP_NAME_PREFIX or name.startswith("Loop: ") else "agent"
 
     async def _timer_session(request: Request, session_id: str) -> tuple[str | None, Conversation]:
         """Authorize a timer call as a message would be.
@@ -2572,7 +2567,9 @@ def create_scheduled_tasks_router(
             like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``, plus an
             optional ``origin``: ``"loop"`` marks a timer the web composer's ``/loop`` set,
             saved under the name ``Loop: <note>`` rather than ``Timer: <note>`` so the
-            listing can tell it from the agent's own; anything else is refused.
+            listing can tell it from the agent's own; anything else is refused. A loop's
+            firings send its ``note`` (required) as a message the transcript shows,
+            tagged ``origin: "loop"``, where an agent's timer sends a hidden wake.
         :returns: ``durable`` true, ``timer_id``, ``status`` ``"scheduled"``, the UTC
             ``fire_at`` of the first firing, ``interval_seconds`` for a repeating timer
             (else ``None``), and the ``seconds``, ``repeat``, ``note`` and ``origin`` it
@@ -2600,6 +2597,10 @@ def create_scheduled_tasks_router(
         if isinstance(validated, str):
             raise OmnigentError(validated, code=ErrorCode.INVALID_INPUT)
         seconds, repeat, note = validated
+        if origin is not None and not note:
+            raise OmnigentError(
+                "a loop needs a note: the prompt it repeats", code=ErrorCode.INVALID_INPUT
+            )
         if seconds < DURABLE_TIMER_MIN_SECONDS:
             raise OmnigentError(
                 f"The server saves timers of at least {DURABLE_TIMER_MIN_SECONDS} seconds; "
@@ -2636,12 +2637,17 @@ def create_scheduled_tasks_router(
             task = store.create(
                 scheduled_task_id=task_id,
                 name=(
-                    f"{_LOOP_NAME_PREFIX if origin else 'Timer'}: {note}"[:256]
+                    f"{LOOP_TIMER_NAME if origin else 'Timer'}: {note}"[:256]
                     if note
-                    else (_LOOP_NAME_PREFIX if origin else "Timer")
+                    else (LOOP_TIMER_NAME if origin else "Timer")
                 ),
-                # The hidden message each firing sends into the session.
-                prompt=f"[System: timer {task_id} fired]" + (f"\nnote: {note!r}" if note else ""),
+                # What each firing sends the session: a loop's prompt as a message the
+                # transcript shows; an agent timer's hidden wake.
+                prompt=(
+                    note
+                    if origin and note
+                    else f"[System: timer {task_id} fired]" + (f"\nnote: {note!r}" if note else "")
+                ),
                 rrule=timer_rule(interval, repeat=repeat),
                 user_id=user_id,
                 agent_id=agent_id,
@@ -2691,7 +2697,7 @@ def create_scheduled_tasks_router(
             timers_out.append(
                 {
                     "timer_id": task.id,
-                    "origin": _timer_origin(task.name),
+                    "origin": timer_origin(task.name),
                     "name": task.name,
                     "repeat": not is_one_time_rule(task.rrule),
                     "interval_seconds": timer_interval(task.rrule),

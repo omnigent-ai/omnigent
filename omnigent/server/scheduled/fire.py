@@ -145,6 +145,7 @@ from omnigent.server.scheduled.schedule import (
     is_trigger_automation,
     strip_trigger_header,
     task_timezone,
+    timer_origin,
 )
 from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
@@ -540,9 +541,20 @@ def _prompt_event(prompt: str) -> SessionEventInput:
 
 
 def _task_event(task: ScheduledTask) -> SessionEventInput:
-    """The message a firing sends: a timer's hidden wake, or the task's prompt."""
+    """The message a firing sends: a loop's or task's prompt, or a timer's hidden wake."""
     if task.kind != "timer":
         return _prompt_event(run_prompt_text(task))
+    if timer_origin(task.name) == "loop":
+        # A /loop tick is the prompt itself, shown in the transcript and tagged so
+        # the web can label it as the loop's rather than the user's.
+        return SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "origin": "loop",
+                "content": [{"type": "input_text", "text": task.prompt}],
+            },
+        )
     # Hidden from transcripts, but still a user message, so it starts or steers a turn.
     return SessionEventInput(
         type="message",

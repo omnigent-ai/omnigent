@@ -8983,6 +8983,7 @@ function committedUserBlock(
   stableKey?: string,
   createdBy?: string,
   createdAtS?: number,
+  origin?: string,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -9003,7 +9004,14 @@ function committedUserBlock(
     },
     content,
     stableKey,
+    ...(origin !== undefined ? { origin } : {}),
   };
+}
+
+/** The `origin` a consumed user message carries, e.g. `"loop"` for a /loop run. */
+function consumedMessageOrigin(event: SessionInputConsumedEvent): string | undefined {
+  const origin = event.data.origin;
+  return typeof origin === "string" ? origin : undefined;
 }
 
 interface RefetchRunnerBackedSessionStateOptions {
@@ -9979,6 +9987,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
+                  consumedMessageOrigin(event),
                 ),
               ],
             };
@@ -10015,6 +10024,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 head.tempId,
                 event.createdBy ?? head.author,
                 head.createdAtS,
+                consumedMessageOrigin(event),
               ),
             ],
           };
@@ -10026,7 +10036,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              undefined,
+              consumedMessageOrigin(event),
+            ),
           ],
         };
       });

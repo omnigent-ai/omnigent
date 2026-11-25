@@ -5,16 +5,7 @@ export const LOOP_MIN_SECONDS = 120;
 /** The longest interval `/loop` accepts: a week, so a typo can't park a wake for months. */
 export const LOOP_MAX_SECONDS = 7 * 24 * 60 * 60;
 
-/**
- * The message every run of a loop sends, the first run and each tick alike. The
- * prefix makes the hidden timer note read as an instruction, and keeps a prompt
- * that starts with a slash from running as a command on the first run.
- */
-export function loopRunMessage(prompt: string): string {
-  return `Run now: ${prompt}`;
-}
-
-/** Whether the prompt reads as a slash or skill command, which a loop passes as plain text. */
+/** Whether the prompt reads as a slash or skill command; a loop sends it as a message instead. */
 export function looksLikeCommand(prompt: string): boolean {
   return /^[/$]\S/.test(prompt);
 }

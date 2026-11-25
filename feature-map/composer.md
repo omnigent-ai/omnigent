@@ -236,17 +236,19 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   name the affected files).
 - `slash-loop`: `/loop <interval> <prompt>` repeats a prompt on an interval by
   saving a repeating session timer on the server (`POST /v1/sessions/{id}/timers`
-  with `origin: "loop"`, named `Loop: <note>`), so it survives runner and server
-  restarts. The prompt runs once right away as the message `Run now: <prompt>`;
-  every tick then sends the same text as the timer's hidden `[System: timer <id>
-  fired]` note, which starts or joins a turn like a user message, so a task that
-  outlasts its interval accumulates ticks. One loop per session: a new `/loop`
+  with `origin: "loop"`, named `Loop: <prompt>`), so it survives runner and server
+  restarts. The prompt is sent once right away and again on every tick, each
+  time as a user message tagged `origin: "loop"`, which the transcript shows as
+  a user bubble with a "Loop" label beside it. A tick starts or joins a turn
+  like a typed message, so a task that outlasts its interval accumulates
+  ticks. One loop per session: a new `/loop`
   cancels the running one first and `/loop stop` (no arguments) cancels it; only
   loop-tagged timers are touched, never the agent's own `sys_timer_set` timers.
   Starts and stops queue per session, so overlapping submissions can't arm two.
   Intervals are a leading `5m`, `2h` or `1d` token, from 2 minutes (the server's
-  saved-timer floor) to 7 days. A prompt starting with `/` or `$` is passed as
-  plain text, and the hint says so. Offered in Claude Code native, claude-sdk,
+  saved-timer floor) to 7 days. A prompt starting with `/` or `$` is sent as a
+  message like any other, so the hint warns it may not run as a command. Offered
+  in Claude Code native, claude-sdk,
   Codex native and codex sessions, top-level only (a sub-agent's or side chat's
   timers aren't saved), when `/v1/info` reports both `session_timers` and
   `session_timer_list`; otherwise a typed `/loop` is sent as text, so Claude
@@ -513,9 +515,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - In a Claude Code native, claude-sdk, Codex native or codex session on a
   server with saved timers (`OMNIGENT_FEATURES=automations_v2,session_timers`),
   type `/lo` and click **/loop**, complete `/loop 2m Say tick`, and press
-  Enter: "Loop armed: every 2m" shows under the composer and `Run now: Say
-  tick` is sent; two minutes later the agent replies to the hidden tick. Type
-  `/loop stop` and press Enter to end it.
+  Enter: "Loop armed: every 2m" shows under the composer and `Say tick` is sent
+  as a user bubble with a "Loop" label beside it; two minutes later the same
+  labelled bubble appears again and the agent replies to it. Type `/loop stop`
+  and press Enter to end it.
 - In a claude-sdk or Claude Code native session with a few prompts sent,
   type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
   pick a prompt (search, or **Load older prompts** in a long session). The new

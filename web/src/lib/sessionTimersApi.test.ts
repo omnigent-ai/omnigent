@@ -6,6 +6,7 @@ import {
   listSessionLoops,
   listSessionTimers,
   runSessionTimerMutation,
+  sendLoopPrompt,
   sessionTakesSavedTimers,
   setSessionTimer,
   TIMER_NOT_SAVED_CODE,
@@ -37,9 +38,26 @@ const SAVED = {
   interval_seconds: 300,
   seconds: 300,
   repeat: true,
-  note: "Run now: check CI",
+  note: "check CI",
   origin: "loop",
 };
+
+describe("sendLoopPrompt", () => {
+  it("posts the prompt as a user message tagged with the loop origin", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, item_id: "msg_1" }, 202));
+    await sendLoopPrompt("sess", "check CI");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/sess/events");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: {
+        role: "user",
+        origin: "loop",
+        content: [{ type: "input_text", text: "check CI" }],
+      },
+    });
+  });
+});
 
 describe("setSessionTimer", () => {
   it("posts the timer with its origin and maps the saved reply", async () => {
@@ -47,7 +65,7 @@ describe("setSessionTimer", () => {
     const timer = await setSessionTimer("conv_a", {
       seconds: 300,
       repeat: true,
-      note: "Run now: check CI",
+      note: "check CI",
       origin: "loop",
     });
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -56,7 +74,7 @@ describe("setSessionTimer", () => {
     expect(JSON.parse(String(init.body))).toEqual({
       seconds: 300,
       repeat: true,
-      note: "Run now: check CI",
+      note: "check CI",
       origin: "loop",
     });
     expect(timer).toEqual({
@@ -65,7 +83,7 @@ describe("setSessionTimer", () => {
       intervalSeconds: 300,
       seconds: 300,
       repeat: true,
-      note: "Run now: check CI",
+      note: "check CI",
       origin: "loop",
     });
   });
@@ -128,7 +146,7 @@ const LISTED = {
     {
       timer_id: "st_loop",
       origin: "loop",
-      name: "Loop: Run now: check CI",
+      name: "Loop: check CI",
       repeat: true,
       interval_seconds: 300,
       next_run_at: "2026-11-25T10:05:00+00:00",
@@ -154,7 +172,7 @@ describe("listSessionTimers / listSessionLoops", () => {
     expect(timers[0]).toEqual({
       timerId: "st_loop",
       origin: "loop",
-      name: "Loop: Run now: check CI",
+      name: "Loop: check CI",
       repeat: true,
       intervalSeconds: 300,
       nextRunAt: "2026-11-25T10:05:00+00:00",

@@ -254,6 +254,8 @@ export interface UserMessageBlock {
    * Absent on blocks hydrated from history (`items`), which mount fresh.
    */
   stableKey?: string;
+  /** What sent the message when no human typed it, e.g. `"loop"` for a /loop run. */
+  origin?: string;
 }
 
 // ── Tool calls ───────────────────────────────────────────
