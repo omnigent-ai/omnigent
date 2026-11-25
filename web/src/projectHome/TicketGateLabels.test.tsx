@@ -99,6 +99,11 @@ describe("an approval on a card", () => {
     expect(approved).toHaveAttribute("title", "Reviewed and approved at commit 6f3cdf4");
   });
 
+  it("renders no empty row on a card whose only label is its kind", () => {
+    const { container } = render(<TicketLabels compact labels={[{ key: "kind", value: "fix" }]} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it("keeps the kind label in the ticket panel", () => {
     render(<TicketLabels labels={[{ key: "kind", value: "fix" }]} />);
     expect(screen.getByText("kind: fix")).toBeInTheDocument();

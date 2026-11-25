@@ -56,6 +56,8 @@ export function TicketLabels({
   const approvedSha = labels.find((label) => label.key === APPROVED_LABEL_KEY)?.value ?? null;
   const visible = compact ? ordered.slice(0, 2) : ordered;
   const hiddenCount = ordered.length - visible.length;
+  // Nothing left to show (a card whose only label is its kind): no empty row to leave a gap.
+  if (visible.length === 0) return null;
   return (
     <div className={cn("flex min-w-0 gap-1.5", compact ? "items-center" : "flex-wrap")}>
       {visible.map((label) =>
