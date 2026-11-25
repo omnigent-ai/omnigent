@@ -28,6 +28,10 @@ import { ProjectOrchestrator, ProjectPersonaChat } from "@/projectHome/ProjectOr
 import { useProjectIdentities } from "@/projectHome/useProjectIdentities";
 import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
 import { ProjectHomeTabs, ProjectSummary } from "@/projectHome/ProjectSummary";
+import {
+  TicketBoardRequesterFilter,
+  useBoardRequesterFilter,
+} from "@/projectHome/TicketBoardRequesterFilter";
 import { useProjectTicketsEnabled, useTicketProject } from "@/projectHome/useProjectTickets";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 
@@ -122,6 +126,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
     }
   }
 
+  const [boardMine, setBoardMine] = useBoardRequesterFilter(projectId ?? null);
   const summaryOpen =
     tickets && !orchestrator && searchParams.get(PROJECT_TAB_PARAM) === PROJECT_SUMMARY_TAB;
   // The Summary replaces the board, so it drops the board's ticket and panel selection.
@@ -145,11 +150,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
       <div className="relative flex min-h-0 flex-1 flex-col">
         <ProjectFileViewerHost projectId={projectId} />
         <PageScroll maxWidthClassName="max-w-none" extraTop={isMobile ? "0.25rem" : "0.5rem"}>
-          <ProjectHomeTabs
-            summaryOpen
-            onChange={showTab}
-            className="mx-auto w-full max-w-5xl px-1"
-          />
+          <ProjectHomeTabs summaryOpen onChange={showTab} />
           <ProjectSummary key={projectName} projectName={projectName} />
         </PageScroll>
       </div>
@@ -168,7 +169,13 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
         extraBottom="0px"
       >
         {tickets && !ticketFillsPage && (
-          <ProjectHomeTabs summaryOpen={false} onChange={showTab} className="px-4" />
+          <ProjectHomeTabs
+            summaryOpen={false}
+            onChange={showTab}
+            trailing={
+              <TicketBoardRequesterFilter mine={boardMine} onChange={setBoardMine} compact />
+            }
+          />
         )}
         <div className="flex min-h-0 flex-1">
           {tickets ? (
@@ -181,6 +188,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
                 selectedTicketId={panelTicketId}
                 isNewTicket={isNewTicket}
                 ticketIds={ticketSelectionIds(searchParams)}
+                requesterFilterInHeader={!ticketFillsPage}
                 overlayClearance={composerOpen ? "10rem" : undefined}
               />
             </div>

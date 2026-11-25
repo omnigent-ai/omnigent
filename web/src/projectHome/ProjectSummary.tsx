@@ -277,37 +277,59 @@ function NumberCell({ children }: { children: ReactNode }) {
 }
 
 /** Switches the project page between its ticket board and its Summary. */
+/**
+ * Board / Summary, one row in the same place on both views, with an optional
+ * control (the board's ticket filter) at its right end.
+ */
 export function ProjectHomeTabs({
   summaryOpen,
   onChange,
   className,
+  trailing,
 }: {
   summaryOpen: boolean;
   onChange: (summary: boolean) => void;
   className?: string;
+  trailing?: ReactNode;
 }) {
   return (
     <div
-      role="tablist"
-      aria-label="Project views"
-      className={cn("flex shrink-0 gap-1 pb-2", className)}
+      className={cn(
+        "mx-4 mb-3 flex shrink-0 items-center gap-3 border-b border-border/70",
+        className,
+      )}
     >
-      {[
-        { summary: false, label: "Board" },
-        { summary: true, label: "Summary" },
-      ].map((tab) => (
-        <Button
-          key={tab.label}
-          role="tab"
-          variant="ghost"
-          size="sm"
-          aria-selected={summaryOpen === tab.summary}
-          className={cn("h-7 px-2.5", summaryOpen === tab.summary && "bg-muted font-medium")}
-          onClick={() => onChange(tab.summary)}
-        >
-          {tab.label}
-        </Button>
-      ))}
+      <div role="tablist" aria-label="Project views" className="flex gap-4">
+        {[
+          { summary: false, label: "Board" },
+          { summary: true, label: "Summary" },
+        ].map((tab) => (
+          <Button
+            key={tab.label}
+            role="tab"
+            variant="ghost"
+            size="sm"
+            aria-selected={summaryOpen === tab.summary}
+            // One weight for both, so selecting a tab never changes its width.
+            className={cn(
+              // A transparent top border balances the underline, so the label sits centred.
+              "-mb-px inline-flex h-10 items-center rounded-none border-0 border-y-2 border-t-transparent px-0.5 leading-none font-medium hover:bg-transparent",
+              summaryOpen === tab.summary
+                ? "border-b-foreground text-foreground"
+                : "border-b-transparent text-muted-foreground hover:text-foreground",
+            )}
+            onClick={() => onChange(tab.summary)}
+          >
+            {tab.label}
+          </Button>
+        ))}
+      </div>
+      {trailing && (
+        <>
+          <span aria-hidden className="h-4 w-px bg-border" />
+          <div className="flex items-center">{trailing}</div>
+        </>
+      )}
     </div>
   );
 }

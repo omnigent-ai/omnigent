@@ -83,7 +83,10 @@ export function ProjectTicketBoard({
   overlayClearance,
   ticketIds = NO_TICKET_FILTER,
   isNewTicket = NOT_NEW,
+  requesterFilterInHeader = false,
 }: {
+  /** The page shows the All tickets / Yours filter in its tab row, so the board doesn't. */
+  requesterFilterInHeader?: boolean;
   projectName: string;
   selectedTicketId: string | null;
   overlayClearance?: string;
@@ -107,6 +110,7 @@ export function ProjectTicketBoard({
         selectedTicketId={selectedTicketId}
         overlayClearance={overlayClearance}
         ticketIds={ticketIds}
+        requesterFilterInHeader={requesterFilterInHeader}
       />
     </NewTicketContext.Provider>
   );
@@ -118,12 +122,14 @@ function TicketBoard({
   selectedTicketId,
   overlayClearance,
   ticketIds,
+  requesterFilterInHeader,
 }: {
   projectId: string | null;
   projectName: string;
   selectedTicketId: string | null;
   overlayClearance?: string;
   ticketIds: string[];
+  requesterFilterInHeader: boolean;
 }) {
   const [search] = useSearchParams();
   const [selectionLimit, setSelectionLimit] = useState(25);
@@ -182,7 +188,7 @@ function TicketBoard({
           )}
         </div>
       )}
-      {ticketIds.length === 0 && (
+      {ticketIds.length === 0 && !requesterFilterInHeader && (
         <div className="flex shrink-0 items-center px-4 pb-2">
           <TicketBoardRequesterFilter mine={mine} onChange={setMine} />
         </div>
