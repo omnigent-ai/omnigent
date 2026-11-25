@@ -338,7 +338,7 @@ class SysTicketLandTool(_TicketTool):
         "`verified` label is that SHA (or the identical patch rebased over commits that don't "
         "touch its files); otherwise it refuses and says why (for example, "
         "rebase and get re-approval). Accepted lands are batched: fast-forward, web rebuild if "
-        "needed, one server restart. The ticket then moves to the stage before completed and "
+        "needed, one server restart. The ticket then moves to the landed stage (Implemented) and "
         "you're told to verify live. Never pushes. Refused when the project's landing queue is "
         "off; then hand the branch and SHA to your coordinator. With dry_run it only runs "
         "those gates and reports, even when the queue is off: run it before landing by hand."

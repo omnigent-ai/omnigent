@@ -603,3 +603,28 @@ async def test_a_product_approver_can_give_risk_ok_but_not_on_their_own_request(
     world.tickets.label("risk-ok", "yes", user_id="member@example.com")
     with pytest.raises(OmnigentError, match="risk-ok"):
         await world.queue.submit(world.project, "t1", sha, None, dry_run=True)
+
+
+def _board(*names: str) -> list[dict[str, str]]:
+    return [{"id": name.casefold(), "name": name} for name in names]
+
+
+@pytest.mark.parametrize(
+    ("config", "stages", "expected"),
+    [
+        ({}, _board("Pending", "Review", "Implemented", "Verified", "Merged"), "implemented"),
+        ({}, _board("Pending", "Review", "Verified", "Landed", "Merged"), "landed"),
+        (
+            {"landing": {"landed_stage": "verified"}},
+            _board("Pending", "Review", "Implemented", "Verified", "Merged"),
+            "verified",
+        ),
+        ({"landing": {"landed_stage": "merged"}}, _board("Pending", "Done", "Merged"), "done"),
+        ({"landing": {"landed_stage": "missing"}}, _board("Open", "Review", "Done"), "review"),
+        ({}, _board("Done"), None),
+    ],
+)
+def test_landed_tickets_move_to_the_landed_stage_by_name_not_position(
+    config, stages, expected
+) -> None:
+    assert landing.landed_stage_id(config, stages) == expected

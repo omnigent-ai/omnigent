@@ -8,7 +8,7 @@ ticket, and the SHA fast-forwards the target branch.
 
 Submissions that arrive close together form one batch: each is fast-forwarded in
 turn, the web app is rebuilt once if any landed change touched ``web/``, the
-tickets move to the stage before the completed one, and one detached restart
+tickets move to the landed stage (see ``landed_stage_id``), and one detached restart
 runs. Any git, build or restart failure stops the queue for that project and
 escalates to the lead. The queue never pushes, resets or forces.
 
@@ -24,8 +24,9 @@ it was rebased over touched; the queue then sets ``verified`` to the landed SHA.
 
 Project config ``landing`` (owner-only): ``enabled``, plus optional ``checkout``
 and ``branch`` for a throwaway target (a worktree of the same repository),
-``restart: false`` to skip the restart and ``require_verified: true`` for the verified
-gate (off by default). The restart command is server-side only.
+``restart: false`` to skip the restart, ``require_verified: true`` for the verified
+gate (off by default) and ``landed_stage`` for the stage landed tickets move to.
+The restart command is server-side only.
 """
 
 from __future__ import annotations
@@ -402,6 +403,31 @@ def resolve_target(config: dict[str, Any]) -> Target:
 def landing_enabled(config: dict[str, Any]) -> bool:
     raw = config.get(CONFIG_KEY)
     return isinstance(raw, dict) and raw.get("enabled") is True
+
+
+_LANDED_STAGE_NAMES = ("implemented", "landed")
+
+
+def landed_stage_id(config: dict[str, Any], stages: list[dict[str, Any]]) -> str | None:
+    """The stage a landed ticket moves to, chosen by name rather than position.
+
+    In order: the config's ``landed_stage``, the ``implemented`` stage id, a stage named
+    Implemented or Landed, then the stage before the completed one. Never the completed one.
+    """
+    if len(stages) < 2:
+        return None
+    candidates = stages[:-1]
+    raw = config.get(CONFIG_KEY)
+    configured = (raw if isinstance(raw, dict) else {}).get("landed_stage")
+    ids = [stage["id"] for stage in candidates]
+    if isinstance(configured, str) and configured in ids:
+        return configured
+    if "implemented" in ids:
+        return "implemented"
+    for stage in candidates:
+        if str(stage.get("name") or "").strip().casefold() in _LANDED_STAGE_NAMES:
+            return stage["id"]
+    return stages[-2]["id"]
 
 
 def verification_required(config: dict[str, Any]) -> bool:
@@ -1040,7 +1066,7 @@ class LandingQueue:
         stages = (await asyncio.to_thread(tickets.stages, project.id, user_id=project.user_id))[
             "stages"
         ]
-        landed_stage = stages[-2]["id"] if len(stages) >= 2 else None
+        landed_stage = landed_stage_id(project.config, stages)
         restarting = (
             " The server restarts now; once it's back, verify live." if target.restart else ""
         )
