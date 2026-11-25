@@ -279,6 +279,7 @@ def test_a_description_keeps_its_time_through_writes_that_leave_it(
     assert (stepped.updated_at, stepped.description_updated_at) == (110, 100)
     renamed = store.update(saved.id, user_id=ALICE, name="deploy-2")
     assert renamed is not None and renamed.description_updated_at == 100
+    assert store.get(saved.id, user_id=ALICE) == renamed
     stale = store.update(
         saved.id, user_id=ALICE, description="From a stale page.", expected_description="Not it."
     )
@@ -320,6 +321,17 @@ def test_a_kept_description_time_goes_once_an_older_server_writes_the_descriptio
     assert stepped is not None
     assert (stepped.updated_at, stepped.description_updated_at) == (130, 120)
     assert store.get(saved.id, user_id=ALICE) == stepped
+    # The older server changing it away and back again leaves no kept time that counts.
+    for text, written_at in [("Older words.", 135), ("Run deploy.", 138)]:
+        with get_or_create_engine(store.storage_location).begin() as connection:
+            connection.execute(
+                update(SqlWorkflow)
+                .where(SqlWorkflow.id == saved.id)
+                .values(description=compression.encode(text), updated_at=written_at)
+            )
+    back = store.get(saved.id, user_id=ALICE)
+    assert back is not None and back.description == "Run deploy."
+    assert back.description_updated_at == 138
 
 
 def _full_plan_steps(store: WorkflowStore) -> list[dict[str, object]]:

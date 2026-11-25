@@ -62,14 +62,14 @@ const MARKDOWN_GOAL = [
 const MARKDOWN_STEPS: WorkflowStep[] = [STEPS[0]!, { ...STEPS[1]!, goal: MARKDOWN_GOAL }];
 
 /** Inline code checks whether it names a workspace file, which needs a query client. */
+/** Render *ui* with a query client, and rerender with that same client. */
 function renderWithQueries(ui: ReactElement) {
-  return render(
-    <QueryClientProvider
-      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
-    >
-      {ui}
-    </QueryClientProvider>,
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const withClient = (node: ReactElement) => (
+    <QueryClientProvider client={client}>{node}</QueryClientProvider>
   );
+  const view = render(withClient(ui));
+  return { ...view, rerender: (node: ReactElement) => view.rerender(withClient(node)) };
 }
 
 /** The goal's bold labels, list items and code rendered as Markdown, with no syntax left over. */
@@ -298,11 +298,7 @@ describe("a step's time limit", () => {
     );
     expect(screen.getByRole("menu")).toBeInTheDocument();
     // The step stops being editable while its menu is open, as when a proposal arrives.
-    rerender(
-      <QueryClientProvider client={new QueryClient()}>
-        <WorkflowStepsGraph steps={LIMITED} title="Triage flaky tests" />
-      </QueryClientProvider>,
-    );
+    rerender(<WorkflowStepsGraph steps={LIMITED} title="Triage flaky tests" />);
     expect(screen.queryByRole("menu")).toBeNull();
     await userEvent.hover(screen.getAllByTestId("workflow-step-node")[1]!);
     expect(await screen.findByTestId("workflow-step-card")).toHaveTextContent("Fix the test");
