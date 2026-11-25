@@ -14,7 +14,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runtime import pending_inputs, set_runner_client, set_runner_router
-from omnigent.runtime.message_sender import sender_line_index, with_message_sender
+from omnigent.runtime.message_sender import with_message_sender
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_MANAGE,
@@ -252,9 +252,6 @@ async def test_only_collaborators_model_input_names_them(
     [message] = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
     sender = f"{caller}@example.com" if named else None
     assert message["content"] == with_message_sender(content, sender)
-    # A native terminal is told where the line went, so an undelivered report can drop it.
-    position = sender_line_index(content) if named and queued else None
-    assert message.get("sender_line_index") == position
     # A native terminal's queued bubble keeps what the person typed; an API session queues none.
     expected = [content] if queued else []
     assert [row["content"] for row in pending_inputs.snapshot_for(_SESSION_ID)] == expected
@@ -354,6 +351,10 @@ async def test_codex_automated_message_requires_target_ownership_and_stays_model
         ("codex", False, _typed("/tmp/example.py: explain"), False),
         ("claude-sdk", False, _typed("/compact"), True),
         ("claude-sdk", False, _typed("/compact the notes"), False),
+        ("auto", False, _typed("/goal ship the fix"), True),
+        ("auto", False, _typed("/compact"), True),
+        ("auto", False, _typed("/tmp/example.py: explain"), False),
+        (None, False, _typed("/goal ship the fix"), True),
         (None, False, _typed("!important"), False),
         ("codex-native", True, _typed("/goal ship the fix"), True),
         ("codex-native", True, [*_typed("/goal ship the fix"), _FILE], False),

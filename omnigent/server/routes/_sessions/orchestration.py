@@ -122,7 +122,7 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.message_sender import sender_line_index, with_message_sender
+from omnigent.runtime.message_sender import with_message_sender
 from omnigent.runtime.policies.approval import (
     build_elicitation_request_event,
     resolve_ask_timeout,
@@ -4236,12 +4236,24 @@ async def _settle_undelivered_native_input(
         await restore_pending_inputs(conversation_store, session_id)
         matched_pending_id = mark_rejected_input()
     if matched_pending_id is None:
-        if fallback_content is not None:
+        evicted_id = (
+            pending_inputs.make_pending_id(session_id, input_stable_id)
+            if input_stable_id is not None
+            else reported_pending_id
+        )
+        # A named message's runner copy carries the sender line; prefer what was typed.
+        typed = (
+            pending_inputs.take_expired_named_content(session_id, evicted_id)
+            if evicted_id is not None
+            else None
+        )
+        content = typed if typed is not None else fallback_content
+        if content is not None:
             await _commit_undelivered_input_content(
                 conversation_store,
                 session_id,
                 response_id,
-                fallback_content,
+                content,
                 input_stable_id=input_stable_id,
                 pending_id=reported_pending_id,
             )
@@ -7756,10 +7768,7 @@ async def _forward_native_terminal_message(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-    if message_sender is not None and isinstance(event.get("content"), list) and event["content"]:
-        # The runner drops exactly this block if it reports the message undelivered.
-        event["sender_line_index"] = sender_line_index(event["content"])
-        event["content"] = with_message_sender(event["content"], message_sender)
+    event["content"] = with_message_sender(event["content"], message_sender)
     forward_options: dict[str, Any] = {}
     if native_shell_authorized:
         from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER

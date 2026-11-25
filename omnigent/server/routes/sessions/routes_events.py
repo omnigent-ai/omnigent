@@ -1089,12 +1089,16 @@ def _harness_runs_input(
     :returns: ``True`` for a standalone Codex ``/goal``, a Claude SDK ``/compact``,
         or input a native terminal runs without prompting the model.
     """
-    if harness in ("codex", "codex-native") and goal_objective_from_content(content) is not None:
+    # Until routing picks a harness, any executor could get the message.
+    unresolved = harness in (None, "auto")
+    if (unresolved or harness in ("codex", "codex-native")) and goal_objective_from_content(
+        content
+    ) is not None:
         return True
     if not native_terminal:
         # The Claude SDK executor compacts on a message that is exactly ``/compact``.
         return (
-            harness == "claude-sdk"
+            (unresolved or harness == "claude-sdk")
             and len(content) == 1
             and isinstance(content[0], dict)
             and content[0].get("type") in {"text", "input_text"}

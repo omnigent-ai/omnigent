@@ -267,3 +267,15 @@ def test_synthesized_recording_loads_on_resume(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert secret in proc.stdout
+
+
+def test_records_name_collaborators_the_model_saw() -> None:
+    named = {**_user_item("hello"), "created_by": "bob@example.com", "sender_in_context": True}
+    records = qnb.qwen_session_records_from_session_items(
+        [_user_item("hi"), _assistant_item("ok"), named, _assistant_item("ok")],
+        qwen_session_id="sess-n",
+        cwd="/tmp/x",
+    )
+    texts = [r["message"]["parts"][0]["text"] for r in records if r["type"] == "user"]
+    # Qwen joins a message's text blocks as they are; the bracket still sets the line apart.
+    assert texts == ["hi", '[Message sender: "bob@example.com"]hello']

@@ -760,6 +760,27 @@ def test_resolve_matching_text_reports_a_tie_across_passes() -> None:
     assert [entry.pending_id for entry in drain.uncertain] == [named, waiting]
 
 
+def test_expired_named_entry_keeps_its_typed_content_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TTL drops a named entry from the queue but keeps what was typed, for a while."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    named = pending_inputs.record("conv_a", [_text_block("mine")], named_sender="bob@example.com")
+    typed = pending_inputs.record("conv_a", [_text_block("other")])
+    late = pending_inputs.record("conv_b", [_text_block("late")], named_sender="bob@example.com")
+
+    clock["t"] += pending_inputs._TTL_S + 1
+    assert pending_inputs.snapshot_for("conv_a") == []
+    assert pending_inputs.snapshot_for("conv_b") == []
+
+    assert pending_inputs.take_expired_named_content("conv_a", named) == [_text_block("mine")]
+    assert pending_inputs.take_expired_named_content("conv_a", named) is None
+    assert pending_inputs.take_expired_named_content("conv_a", typed) is None
+    clock["t"] += pending_inputs._NAMED_CONTENT_TTL_S + 1
+    assert pending_inputs.take_expired_named_content("conv_b", late) is None
+
+
 def test_record_keeps_a_new_entry_when_every_other_entry_is_held() -> None:
     """A fresh record is never the eviction victim, even with the whole cap held."""
     cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION

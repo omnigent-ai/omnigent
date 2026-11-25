@@ -138,3 +138,12 @@ class TestDevinReplayableHistory:
         assert _devin_has_replayable_history([]) is False
         assert _devin_has_replayable_history([_msg("assistant", "")]) is False
         assert _devin_has_replayable_history([{"type": "function_call"}]) is False
+
+
+def test_fork_history_names_collaborators_the_model_saw() -> None:
+    """Cursor joins a message's text blocks as they are; the bracket sets the line apart."""
+    item = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]}
+    named = {**item, "created_by": "bob@example.com", "sender_in_context": True}
+    assert _cursor_fork_history_preamble([item, named]) == (
+        'You: go\n\nYou: [Message sender: "bob@example.com"]go'
+    )

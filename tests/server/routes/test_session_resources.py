@@ -9130,7 +9130,7 @@ async def test_relay_records_queued_native_messages_reported_after_a_long_prompt
     """
     from omnigent.runner.app import _prompt_wait_expired_failure
     from omnigent.runtime import pending_inputs
-    from omnigent.runtime.message_sender import sender_line_index, with_message_sender
+    from omnigent.runtime.message_sender import with_message_sender
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import _relay_runner_stream
 
@@ -9147,19 +9147,16 @@ async def test_relay_records_queued_native_messages_reported_after_a_long_prompt
     ):
         content = [{"type": "input_text", "text": text}]
         pending_id = pending_inputs.record(
-            session_id, content, created_by="alice@example.com", stable_id=stable_id
+            session_id,
+            content,
+            created_by="alice@example.com",
+            stable_id=stable_id,
+            named_sender="alice@example.com" if named else None,
         )
         identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
-        # A named message reaches the runner behind the line, with its position.
-        sent = (
-            {
-                "content": with_message_sender(content, "alice@example.com"),
-                "sender_line_index": sender_line_index(content),
-            }
-            if named
-            else {"content": content}
-        )
-        bodies.append({"type": "message", **sent, **identity})
+        # A named message reaches the runner behind the line, which it reports back as is.
+        sent = with_message_sender(content, "alice@example.com" if named else None)
+        bodies.append({"type": "message", "content": sent, **identity})
     if server_copy_expired:
         clock["t"] += pending_inputs._TTL_S + 1
         assert pending_inputs.snapshot_for(session_id) == []

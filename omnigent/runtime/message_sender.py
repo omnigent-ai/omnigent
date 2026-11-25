@@ -36,11 +36,11 @@ def with_message_sender(content: list[dict[str, Any]], sender: str | None) -> li
     line = message_sender_line(sender)
     if not line or not content:
         return content
-    index = sender_line_index(content)
+    index = _first_text_index(content)
     return [*content[:index], {"type": "input_text", "text": line}, *content[index:]]
 
 
-def sender_line_index(content: list[dict[str, Any]]) -> int:
+def _first_text_index(content: list[dict[str, Any]]) -> int:
     """
     Return where :func:`with_message_sender` puts the line: ahead of the first text block.
 

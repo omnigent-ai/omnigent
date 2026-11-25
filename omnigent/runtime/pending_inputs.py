@@ -123,6 +123,9 @@ from omnigent.runtime.message_sender import message_sender_line
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
 # transcript round-trip on a busy session still drains normally.
 _TTL_S: float = 600.0
+# How long a named entry's typed content outlives its queue slot: past the runner's
+# default wait behind an unanswered prompt, which then reports the content it holds.
+_NAMED_CONTENT_TTL_S: float = 48 * 60 * 60
 
 # Hard cap on unheld queued entries per conversation, enforced by
 # :func:`record`: the oldest unheld entries are evicted when a new one would
@@ -345,6 +348,12 @@ class _Entry:
 # relies on to drain the oldest matching message first. Empty inner
 # dicts are popped eagerly so the index doesn't accrete stale keys.
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
+# Typed content of named entries the TTL evicted, by conversation and pending id: the
+# runner's copy of such a message carries the sender line, so its last-resort report
+# cannot stand in for what was typed.
+_expired_named: WorkspaceScopedCache[str, dict[str, tuple[float, list[dict[str, Any]]]]] = (
+    WorkspaceScopedCache()
+)
 _lock = threading.Lock()
 
 
@@ -365,9 +374,37 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
         return
     stale = [pid for pid, entry in entries.items() if now - entry.created_at > _TTL_S]
     for pid in stale:
-        entries.pop(pid, None)
+        entry = entries.pop(pid, None)
+        if entry is not None and entry.named_sender is not None:
+            kept = _expired_named.setdefault(conversation_id, {})
+            kept[pid] = (now + _NAMED_CONTENT_TTL_S, entry.content)
+            while len(kept) > _MAX_ENTRIES_PER_CONVERSATION:
+                kept.pop(next(iter(kept)))
     if not entries:
         _pending.pop(conversation_id, None)
+
+
+def take_expired_named_content(
+    conversation_id: str, pending_id: str
+) -> list[dict[str, Any]] | None:
+    """
+    Return, once, the typed content of a named entry the TTL evicted.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The evicted entry's id, e.g. ``"pending_a1b2c3"``.
+    :returns: The content as typed, or ``None`` when none is kept for it.
+    """
+    with _lock:
+        kept = _expired_named.get(conversation_id)
+        if kept is None:
+            return None
+        now = _now()
+        for pid in [pid for pid, (expires_at, _) in kept.items() if expires_at < now]:
+            kept.pop(pid)
+        found = kept.pop(pending_id, None)
+        if not kept:
+            _expired_named.pop(conversation_id, None)
+        return copy.deepcopy(found[1]) if found is not None else None
 
 
 def make_pending_id(conversation_id: str, stable_id: str | None = None) -> str:
@@ -1208,3 +1245,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _expired_named.clear()

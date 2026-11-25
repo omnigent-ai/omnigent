@@ -124,8 +124,8 @@ implements them separately, so a fix for one harness does not reach the others.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
   With `message_sender_context` on, a collaborator's messages are rebuilt
-  behind the line naming them when Claude, Codex or Pi resume from stored
-  history, as on an updated runner's history reload.
+  behind the line naming them when Claude, Codex, Pi, Qwen, OpenCode or Cursor
+  resume from stored history, as on an updated runner's history reload.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names
   when rebuilding tool results, as required by Gemini. Results stay after their
   calls, ahead of messages sent while a tool ran. Unmatched outputs become
