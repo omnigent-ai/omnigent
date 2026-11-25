@@ -140,6 +140,11 @@ def _hold_for_recording(page: Page) -> None:
         page.wait_for_timeout(2000)
 
 
+def _expect_chat_header_after_exiting_full_screen(page: Page, rail: Locator) -> None:
+    rail.get_by_role("button", name="Exit full screen", exact=True).click()
+    expect(page.locator("header.chat-header")).to_be_visible()
+
+
 def _open_session_in_mac_shell(
     request: pytest.FixtureRequest, base_url: str, session_id: str
 ) -> Page:
@@ -290,11 +295,11 @@ def session_with_workspace_files(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{name}"
         for name in _WORKSPACE_TAB_FILES
     ]
-    for name, file_url in zip(_WORKSPACE_TAB_FILES, file_urls, strict=True):
-        httpx.put(
-            file_url, json={"content": f"# {name}\n", "encoding": "utf-8"}, timeout=10.0
-        ).raise_for_status()
     try:
+        for name, file_url in zip(_WORKSPACE_TAB_FILES, file_urls, strict=True):
+            httpx.put(
+                file_url, json={"content": f"# {name}\n", "encoding": "utf-8"}, timeout=10.0
+            ).raise_for_status()
         yield base_url, session_id
     finally:
         # Session deletion leaves workspace files behind.
@@ -334,6 +339,7 @@ def test_maximized_workspace_tab_bar_empty_space_drags_the_window(
     assert regions["emptySpace"], "no empty tab-bar space was sampled"
     undraggable = [point for point in regions["emptySpace"] if point["region"] != "drag"]
     assert undraggable == [], f"empty tab-bar space does not drag the window: {undraggable}"
+    _expect_chat_header_after_exiting_full_screen(page, rail)
 
 
 def test_maximized_tabs_sidebar_strip_empty_space_drags_the_window(
@@ -352,3 +358,4 @@ def test_maximized_tabs_sidebar_strip_empty_space_drags_the_window(
     assert empty_space, "no empty tab-bar space was sampled"
     undraggable = [point for point in empty_space if point["region"] != "drag"]
     assert undraggable == [], f"empty tab-bar space does not drag the window: {undraggable}"
+    _expect_chat_header_after_exiting_full_screen(page, rail)
