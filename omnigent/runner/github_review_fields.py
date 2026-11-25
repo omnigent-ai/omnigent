@@ -22,10 +22,18 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 NODE_ID = re.compile(r"[A-Za-z0-9_=-]{1,200}")
 
 
+# The largest whole number a JSON or protobuf Struct number (a double) carries exactly.
+MAX_EXACT_ID = 2**53 - 1
+
+
 def database_id(value: Any) -> int | None:
-    """A comment's numeric ID, which its edit, delete and reaction calls name; None if unknown."""
+    """A comment's numeric ID, which its edit, delete and reaction calls name; None if unknown.
+
+    An ID a double can't carry exactly is None too, so a client never names another comment.
+    """
     text = str(value) if isinstance(value, int | str) else ""
-    return int(text) if text.isdigit() and int(text) > 0 else None
+    number = int(text) if text.isdigit() else 0
+    return number if 0 < number <= MAX_EXACT_ID else None
 
 
 def reactions(groups: Any) -> list[dict[str, Any]]:
