@@ -11,6 +11,12 @@ import {
   type ComposerTextTarget,
 } from "./composerInput";
 
+/** An input's selection, in the input's own offsets. */
+export type ComposerInputSelection = Pick<
+  HandoffSnapshot,
+  "inputId" | "selectionStart" | "selectionEnd"
+>;
+
 interface HandoffSnapshot {
   /** The active input's id ("tail" or a reply quote's), which both engines render. */
   inputId: string;
@@ -75,8 +81,15 @@ export interface ComposerHandoffOptions {
    * last focused: the owner moves it on its own, as when a quote is removed.
    */
   activeInputId?: string | null;
-  /** The active input after a switch, now on the new engine, so the owner's refs stay current. */
-  onActiveInputChange?: (target: ComposerTextTarget) => void;
+  /** The active input after a switch, now on the new engine, and its id, so the owner's refs stay current. */
+  onActiveInputChange?: (target: ComposerTextTarget, inputId: string) => void;
+  /** The engine rendered, reported in the same commit that renders it. */
+  onRenderedEngineChange?: (engine: ComposerInputEngine) => void;
+  /** Maps the captured selection into the engine the composer is switching to. */
+  mapSelection?: (
+    selection: ComposerInputSelection,
+    from: ComposerInputEngine,
+  ) => ComposerInputSelection;
 }
 
 /**
@@ -92,6 +105,8 @@ export function useComposerEngineHandoff(
     draftKey = null,
     activeInputId,
     onActiveInputChange,
+    onRenderedEngineChange,
+    mapSelection,
   }: ComposerHandoffOptions = {},
 ): ComposerInputEngine {
   const [rendered, setRendered] = useState(requested);
@@ -103,9 +118,13 @@ export function useComposerEngineHandoff(
   const lastFocusedId = useRef<string | null>(null);
   const pending = useRef<HandoffSnapshot | null>(null);
   const onActiveInputChangeRef = useRef(onActiveInputChange);
+  const onRenderedEngineChangeRef = useRef(onRenderedEngineChange);
+  const mapSelectionRef = useRef(mapSelection);
   const activeInputIdRef = useRef(activeInputId);
   useLayoutEffect(() => {
     onActiveInputChangeRef.current = onActiveInputChange;
+    onRenderedEngineChangeRef.current = onRenderedEngineChange;
+    mapSelectionRef.current = mapSelection;
     activeInputIdRef.current = activeInputId;
     switchWaiting.current = requested !== rendered;
   });
@@ -171,8 +190,13 @@ export function useComposerEngineHandoff(
     const root = rootRef.current;
     const activeId =
       activeInputIdRef.current === undefined ? lastFocusedId.current : activeInputIdRef.current;
-    pending.current = root ? capture(root, activeId) : null;
+    const captured = root ? capture(root, activeId) : null;
+    pending.current =
+      captured && mapSelectionRef.current
+        ? { ...captured, ...mapSelectionRef.current(captured, rendered) }
+        : captured;
     setRendered(requested);
+    onRenderedEngineChangeRef.current?.(requested);
   }, [requested, rendered, dictating, busyTick, draftKey, rootRef]);
 
   // After the new engine has mounted its inputs, put the user back where they were.
@@ -184,7 +208,7 @@ export function useComposerEngineHandoff(
     // The restored input stays the remembered one for the next switch, focused or not.
     lastFocusedId.current = snapshot.inputId;
     const target = restore(root, snapshot);
-    if (target) onActiveInputChangeRef.current?.(target);
+    if (target) onActiveInputChangeRef.current?.(target, snapshot.inputId);
   }, [rendered, rootRef]);
 
   return rendered;

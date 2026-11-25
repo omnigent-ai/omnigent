@@ -248,6 +248,14 @@ describe("a locked CodeMirror composer", () => {
 });
 
 describe("CodeMirrorComposerInput reply cards with the macOS readline keys", () => {
+  it("removes the card before the caret's line with ⌃H, as Backspace does", () => {
+    const quoted = replyQuoteLine({ id: "q1", text: "Quoted line" });
+    const value = `Opener\n${quoted}\nWhy`;
+    const { target, press } = mount(value, value.indexOf("Why"));
+    press({ key: "h", code: "KeyH", ctrlKey: true });
+    expect(target().value).toBe("Opener\nWhy");
+  });
+
   it("removes a card with ⌃K before it, and ⌃Y yanks the break back", () => {
     const quoted = replyQuoteLine({ id: "q1", text: "Quoted line" });
     const { target, press } = mount(`Intro\n${quoted}\nReply`, "Intro".length);

@@ -32,6 +32,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
+import { replyQuoteLine } from "@/lib/replyDraftDocument";
 import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
@@ -10501,5 +10502,208 @@ describe("Composer model and effort in ⌘K", () => {
     expect(composerPaletteSettings.renders).toBe(0);
     expect(settingLabels()).not.toContain("Model");
     expect(settingLabels()).not.toContain("Reasoning Effort");
+  });
+});
+
+describe("Composer reply quotes on the CodeMirror engine", () => {
+  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  const plainInfo = { ...FALLBACK_SERVER_INFO, features: {} };
+  const card = (text: string) => replyQuoteLine({ id: "card", text });
+
+  beforeEach(() => {
+    clearSessionDrafts();
+    localStorage.clear();
+    setComposerState({
+      conversationId: "conv_codemirror_quotes",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      restoredSendDraft: null,
+      pendingRetryStableId: null,
+      queuedMessages: [],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    resetCodeMirrorComposerLoadForTests();
+    vi.restoreAllMocks();
+  });
+
+  /** A loader the test finishes itself, so the switch to the editor happens when it says. */
+  function deferEditorLoad() {
+    const box: { finish?: (module: typeof CodeMirrorModule) => void } = {};
+    resetCodeMirrorComposerLoadForTests(
+      () =>
+        new Promise((resolve) => {
+          box.finish = resolve;
+        }),
+    );
+    return async () => {
+      // The importer runs in a microtask after the first render asks for the editor.
+      await waitFor(() => expect(box.finish).toBeDefined());
+      await act(async () => box.finish!(CodeMirrorModule));
+    };
+  }
+
+  const editorTarget = () => composerTargetOf(screen.getByLabelText("Message the agent"))!;
+
+  it("shows the whole reply in one editor, with the caret on the empty line under a new card", async () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...props} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    act(() => insertComposerText(editorTarget(), "My introduction"));
+    act(() => ref.current?.appendReplyQuote("First point"));
+
+    expect(document.querySelectorAll(".cm-content")).toHaveLength(1);
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+    const target = editorTarget();
+    const lines = target.value.split("\n");
+    expect(lines[0]).toBe("My introduction");
+    expect(lines.at(-1)).toBe("");
+    expect(target.selectionStart).toBe(target.value.length);
+  });
+
+  it("sends a reply from the editor as the textarea engine would", async () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...props} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    act(() => insertComposerText(editorTarget(), "My introduction"));
+    act(() => ref.current?.appendReplyQuote("First point"));
+    act(() => insertComposerText(editorTarget(), "My answer"));
+    fireEvent.keyDown(screen.getByLabelText("Message the agent"), { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledOnce();
+    expect(vi.mocked(props.onSend).mock.calls[0][0]).toBe(
+      "My introduction\n\n> First point\n\nMy answer",
+    );
+  });
+
+  it("shows the textarea's text and quote blocks while the editor chunk is loading", () => {
+    resetCodeMirrorComposerLoadForTests(() => new Promise(() => {}));
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    act(() => ref.current?.appendReplyQuote("First point"));
+    fireEvent.change(textarea(), { target: { value: "My answer" } });
+
+    expect(textarea()).toHaveValue("My answer");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
+  });
+
+  it("keeps the quotes and the caret when the editor takes over mid-draft, and back again", async () => {
+    const finishLoad = deferEditorLoad();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    act(() => ref.current?.appendReplyQuote("First point"));
+    const before = screen.getByLabelText("Reply text before quote 1");
+    act(() => {
+      before.focus();
+      composerTargetOf(before)!.setSelectionRange(2, 2);
+    });
+
+    await finishLoad();
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    expect(editorTarget().value.split("\n")[0]).toBe("My introduction");
+    expect(editorTarget().selectionStart).toBe(2);
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+
+    rerender(
+      <CapabilitiesProvider info={plainInfo}>
+        <Composer {...composerProps()} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(
+      composerTargetOf(screen.getByLabelText("Reply text before quote 1"))!.selectionStart,
+    ).toBe(2);
+    rerender(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() => expect(editorTarget().selectionStart).toBe(2));
+    expect(editorTarget().value.split("\n")[0]).toBe("My introduction");
+  });
+
+  it("keeps the textarea until a composition ends, then switches to the editor", async () => {
+    const finishLoad = deferEditorLoad();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.compositionStart(textarea());
+    await finishLoad();
+    expect(textarea()).toBeInTheDocument();
+    expect(document.querySelector(".cm-content")).toBeNull();
+
+    act(() => {
+      fireEvent.compositionEnd(textarea());
+    });
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+  });
+
+  it("keeps the editor until a composition ends, then switches to the textarea", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    const { rerender } = render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    fireEvent.compositionStart(screen.getByLabelText("Message the agent"));
+    rerender(
+      <CapabilitiesProvider info={plainInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    expect(document.querySelector(".cm-content")).not.toBeNull();
+
+    act(() => {
+      fireEvent.compositionEnd(screen.getByLabelText("Message the agent"));
+    });
+    await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
+  });
+
+  it("creates no card from a token typed into the textarea while the editor loads", async () => {
+    const finishLoad = deferEditorLoad();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: `pasted ${card("Pasted")}` } });
+    await finishLoad();
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(0);
+    expect(editorTarget().value).toBe("pasted ");
   });
 });

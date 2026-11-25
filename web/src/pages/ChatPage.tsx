@@ -157,6 +157,7 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { mapComposerSelection } from "@/lib/replyDraftDocument";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -2373,19 +2374,23 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
+  // The engine ChatComposer renders; CodeMirror shows the whole draft as one document.
+  const composerEngine = useRequestedComposerEngine();
+  const [renderedEngine, setRenderedEngine] = useState(composerEngine);
   const {
     draft,
     value,
     setValue,
     fullText,
     storedReplyDraft,
+    replyDocument,
     activeTextId,
     focusText,
     editText,
     replaceText,
     appendQuote,
     removeQuote,
-  } = useReplyDraft();
+  } = useReplyDraft(renderedEngine === "codemirror");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
   useDismissOnEscape(commandError !== null, () => setCommandError(null));
@@ -2467,11 +2472,14 @@ function ComposerImpl(
     setTailTextareaNode(element);
     if (element && !textareaRef.current?.isConnected) textareaRef.current = element;
   }, []);
-  const composerEngine = useRequestedComposerEngine();
-  // An engine switch replaces every input; keep the active one current even without focus.
-  const rebindActiveInput = useCallback((target: ComposerTextTarget) => {
-    textareaRef.current = target;
-  }, []);
+  // An engine switch replaces every input; keep the active one and its id current.
+  const restoreActiveInput = useCallback(
+    (target: ComposerTextTarget, inputId: string) => {
+      textareaRef.current = target;
+      focusText(inputId === COMPOSER_TAIL_INPUT_ID ? null : inputId);
+    },
+    [focusText],
+  );
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(value, setValue, textareaRef);
@@ -3931,8 +3939,9 @@ function ComposerImpl(
     replyQuoteInsertedRef.current = false;
     const textarea = tailTextareaRef.current;
     if (!textarea) return;
+    // The caret goes under the new card before focusing, or an editor focuses at offset 0.
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
     if (!isMobileRef.current) textarea.focus({ preventScroll: true });
-    textarea.setSelectionRange(0, 0);
     const inputArea = composerTargetElement(textarea).closest("[data-composer-input-area]");
     if (inputArea) inputArea.scrollTop = inputArea.scrollHeight;
     onGrowthRef.current?.();
@@ -4525,10 +4534,20 @@ function ComposerImpl(
         dictating={dictation.hasInterim}
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
-        onActiveInputChange={rebindActiveInput}
+        onActiveInputChange={restoreActiveInput}
+        onRenderedEngineChange={setRenderedEngine}
+        mapSelection={(selection, from) =>
+          mapComposerSelection(
+            replyDocument,
+            selection,
+            from,
+            draft.quotes.map((quote) => quote.id),
+            COMPOSER_TAIL_INPUT_ID,
+          )
+        }
         input={{
           ref: bindTailTextarea,
-          value: draft.text,
+          value: renderedEngine === "codemirror" ? replyDocument : draft.text,
           // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
           commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
@@ -4577,7 +4596,7 @@ function ComposerImpl(
         }}
         slots={{
           inputPrefix:
-            draft.quotes.length > 0 ? (
+            draft.quotes.length > 0 && renderedEngine !== "codemirror" ? (
               <ReplyDraftBlocks
                 quotes={draft.quotes}
                 activeTextId={activeTextId}

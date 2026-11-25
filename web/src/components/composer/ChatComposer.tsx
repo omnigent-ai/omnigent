@@ -28,7 +28,10 @@ import {
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
 import { useCodeMirrorComposerLoad } from "@/components/composer/engine/composerEnginePolicy";
-import { useComposerEngineHandoff } from "@/components/composer/engine/useComposerEngineHandoff";
+import {
+  useComposerEngineHandoff,
+  type ComposerHandoffOptions,
+} from "@/components/composer/engine/useComposerEngineHandoff";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
@@ -113,6 +116,8 @@ type ChatComposerInputProps =
       draftKey?: undefined;
       activeInputId?: undefined;
       onActiveInputChange?: undefined;
+      onRenderedEngineChange?: undefined;
+      mapSelection?: undefined;
     }
   | {
       /** The engine to switch to; the composer hands off once that is safe. */
@@ -124,8 +129,12 @@ type ChatComposerInputProps =
       draftKey?: string | null;
       /** The input the owner treats as active ("tail" or a quote's id). */
       activeInputId?: string | null;
-      /** The active input, on its new engine, after a switch. */
-      onActiveInputChange?: (target: ComposerTextTarget) => void;
+      /** The active input, on its new engine, and its id, after a switch. */
+      onActiveInputChange?: (target: ComposerTextTarget, inputId: string) => void;
+      /** The engine rendered; reported in the commit that renders it. */
+      onRenderedEngineChange?: (engine: ComposerInputEngine) => void;
+      /** Maps a captured selection into the engine the composer switches to. */
+      mapSelection?: ComposerHandoffOptions["mapSelection"];
     };
 
 type ChatComposerProps = ChatComposerBaseProps & ChatComposerInputProps;
@@ -174,6 +183,8 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
     draftKey,
     activeInputId,
     onActiveInputChange,
+    onRenderedEngineChange,
+    mapSelection,
     keyboard,
     slots,
     actions,
@@ -197,7 +208,14 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
   const renderedEngine = useComposerEngineHandoff(
     engine === "codemirror" && chunkReady ? "codemirror" : "textarea",
     rootRef,
-    { dictating, draftKey, activeInputId, onActiveInputChange },
+    {
+      dictating,
+      draftKey,
+      activeInputId,
+      onActiveInputChange,
+      onRenderedEngineChange,
+      mapSelection,
+    },
   );
   const [focusWithin, setFocusWithin] = useState(false);
   const [uncontrolledValue, setUncontrolledValue] = useState(input.defaultValue ?? "");

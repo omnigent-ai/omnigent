@@ -127,6 +127,11 @@ import {
   snapshotReplyDraft,
 } from "@/lib/replyDraft";
 import {
+  mapComposerSelection,
+  typedDocumentFor,
+  unweaveReplyDraft,
+} from "@/lib/replyDraftDocument";
+import {
   buildOutgoingMessage,
   carriesMessageContext,
   type ComposerSendContext,
@@ -1040,59 +1045,131 @@ function SideChatComposer({
   const voiceEditsRef = useRef(
     new Map<string | null, { before: string; after: string; quoteIds: Set<string> }>(),
   );
-  const reconcileVoiceEdits = useCallback((current: SideChatComposerDraft) => {
-    for (const [id, edit] of voiceEditsRef.current) {
-      // Appending a quote moves the old tail into that quote's preceding text.
-      const targetId =
-        id ?? current.quotes?.find((item) => !edit.quoteIds.has(item.id))?.id ?? null;
-      const value =
-        targetId === null
-          ? current.text
-          : current.quotes?.find((item) => item.id === targetId)?.before;
-      if (value !== edit.after || targetId !== id) voiceEditsRef.current.delete(id);
-      if (value === edit.after && targetId !== id) voiceEditsRef.current.set(targetId, edit);
-    }
-  }, []);
-  // Manual edits and merged reply fields relinquish dictation's undo ownership.
-  useLayoutEffect(() => {
-    reconcileVoiceEdits(composer ?? EMPTY_SIDE_CHAT_COMPOSER);
-  }, [composer, reconcileVoiceEdits]);
-  const activeText = composer?.quotes?.find((quote) => quote.id === activeTextId)?.before ?? text;
-  const setActiveText = useCallback(
-    (next: string) => {
-      const current =
-        useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
-      reconcileVoiceEdits(current);
-      const before =
-        activeTextId === null
-          ? current.text
-          : current.quotes?.find((item) => item.id === activeTextId)?.before;
-      if (before === undefined) return;
-      const previous = voiceEditsRef.current.get(activeTextId);
-      voiceEditsRef.current.set(activeTextId, {
-        before: previous?.before ?? before,
-        after: next,
-        quoteIds: previous?.quoteIds ?? new Set(current.quotes?.map((item) => item.id)),
-      });
-      editText(activeTextId, next);
-    },
-    [activeTextId, composerKey, editText, reconcileVoiceEdits],
-  );
-  const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
   const composerEngine = useRequestedComposerEngine();
-  // An engine switch replaces every input; keep the active one current even without focus.
-  const rebindActiveInput = useCallback((target: ComposerTextTarget) => {
-    textareaRef.current = target;
-  }, []);
-
   // This tab's seeded text: on a pending tab the "Ask in side chat" selection
   // to QUOTE, on a live tab the `/side` question to SEND.
   const draft = useChatStore((s) => s.sideChatDrafts[childId]);
   const quote = pending ? draft : undefined;
-  const quotes = [
-    ...(quote === undefined ? [] : [{ id: "seed", before: "", text: quote }]),
-    ...(composer?.quotes ?? []),
-  ];
+  const quotes = useMemo(
+    () => [
+      ...(quote === undefined ? [] : [{ id: "seed", before: "", text: quote }]),
+      ...(composer?.quotes ?? []),
+    ],
+    [quote, composer?.quotes],
+  );
+  // The engine rendered decides whether the reply is one editor document.
+  const [renderedEngine, setRenderedEngine] = useState(composerEngine);
+  const singleDocument = renderedEngine === "codemirror";
+  // The editor's document while it still describes the draft; see `typedDocumentFor`.
+  const [typedDocument, setTypedDocument] = useState<string | null>(null);
+  const replyDocument = useMemo(
+    () => typedDocumentFor({ quotes, text }, typedDocument),
+    [quotes, text, typedDocument],
+  );
+  const typedDocumentRef = useRef<string | null>(null);
+  // The tail's value in the single document: the store's draft as one document.
+  const documentOf = useCallback(
+    (current: SideChatComposerDraft) => {
+      const seed = pending ? useChatStore.getState().sideChatDrafts[childId] : undefined;
+      return typedDocumentFor(
+        {
+          quotes: [
+            ...(seed === undefined ? [] : [{ id: "seed", before: "", text: seed }]),
+            ...(current.quotes ?? []),
+          ],
+          text: current.text,
+        },
+        typedDocumentRef.current,
+      );
+    },
+    [childId, pending],
+  );
+  // Read the store at call time: the seed is cleared when the document loses it.
+  const applyDocument = useCallback(
+    (next: string) => {
+      typedDocumentRef.current = next;
+      setTypedDocument(next);
+      const parsed = unweaveReplyDraft(next);
+      const seedRemoved =
+        pending &&
+        useChatStore.getState().sideChatDrafts[childId] !== undefined &&
+        !parsed.quotes.some((item) => item.id === "seed");
+      if (seedRemoved) clearSideChatDraft(childId);
+      updateComposer(composerKey, (current) => ({
+        ...current,
+        text: parsed.text,
+        quotes: parsed.quotes.filter((item) => item.id !== "seed"),
+      }));
+    },
+    [childId, clearSideChatDraft, composerKey, pending, updateComposer],
+  );
+  const reconcileVoiceEdits = useCallback(
+    (current: SideChatComposerDraft) => {
+      for (const [id, edit] of voiceEditsRef.current) {
+        // Appending a quote moves the old tail into that quote's preceding text. The single
+        // document has one tail, so its edits stay on it.
+        const targetId = singleDocument
+          ? id
+          : (id ?? current.quotes?.find((item) => !edit.quoteIds.has(item.id))?.id ?? null);
+        const value =
+          targetId === null
+            ? singleDocument
+              ? documentOf(current)
+              : current.text
+            : current.quotes?.find((item) => item.id === targetId)?.before;
+        if (value !== edit.after || targetId !== id) voiceEditsRef.current.delete(id);
+        if (value === edit.after && targetId !== id) voiceEditsRef.current.set(targetId, edit);
+      }
+    },
+    [documentOf, singleDocument],
+  );
+  // Manual edits and merged reply fields relinquish dictation's undo ownership.
+  useLayoutEffect(() => {
+    reconcileVoiceEdits(composer ?? EMPTY_SIDE_CHAT_COMPOSER);
+  }, [composer, reconcileVoiceEdits]);
+  const activeText = singleDocument
+    ? replyDocument
+    : (composer?.quotes?.find((item) => item.id === activeTextId)?.before ?? text);
+  const setActiveText = useCallback(
+    (next: string) => {
+      // The single document is the tail, so its dictation is recorded and undone as the tail's.
+      const id = singleDocument ? null : activeTextId;
+      const current =
+        useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
+      reconcileVoiceEdits(current);
+      const before =
+        id === null
+          ? singleDocument
+            ? documentOf(current)
+            : current.text
+          : current.quotes?.find((item) => item.id === id)?.before;
+      if (before === undefined) return;
+      const previous = voiceEditsRef.current.get(id);
+      voiceEditsRef.current.set(id, {
+        before: previous?.before ?? before,
+        after: next,
+        quoteIds: previous?.quoteIds ?? new Set(current.quotes?.map((item) => item.id)),
+      });
+      if (singleDocument) applyDocument(next);
+      else editText(id, next);
+    },
+    [
+      activeTextId,
+      applyDocument,
+      composerKey,
+      documentOf,
+      editText,
+      reconcileVoiceEdits,
+      singleDocument,
+    ],
+  );
+  const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
+  // An engine switch replaces every input; keep the active one and its id current.
+  const restoreActiveInput = useCallback((target: ComposerTextTarget, inputId: string) => {
+    textareaRef.current = target;
+    setActiveTextId(inputId === COMPOSER_TAIL_INPUT_ID ? null : inputId);
+  }, []);
+
   useAutoGrowTextarea(tailTextareaRef, text, quotes.length ? Infinity : 10);
   const autoSend = pending ? undefined : draft;
   useEffect(() => {
@@ -1558,19 +1635,33 @@ function SideChatComposer({
         engine={composerEngine}
         dictating={dictation.hasInterim}
         draftKey={childId}
-        activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
-        onActiveInputChange={rebindActiveInput}
+        activeInputId={(singleDocument ? null : activeTextId) ?? COMPOSER_TAIL_INPUT_ID}
+        onActiveInputChange={restoreActiveInput}
+        onRenderedEngineChange={(engine) => {
+          setRenderedEngine(engine);
+          setActiveTextId(null);
+        }}
+        mapSelection={(selection, from) =>
+          mapComposerSelection(
+            replyDocument,
+            selection,
+            from,
+            quotes.map((replyQuote) => replyQuote.id),
+            COMPOSER_TAIL_INPUT_ID,
+          )
+        }
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         className={highlight.cardClassName}
         input={{
           ref: bindTailTextarea,
-          value: text,
+          value: singleDocument ? replyDocument : text,
           onChange: (event) => {
             if (commandNotice !== null) setCommandNotice(null);
             slashCompletion.onSelectionChange(event.currentTarget);
-            setText(event.currentTarget.value);
+            if (singleDocument) applyDocument(event.currentTarget.value);
+            else setText(event.currentTarget.value);
             if (gridCell)
               setTypedMention(
                 detectMentionAt(
@@ -1591,6 +1682,8 @@ function SideChatComposer({
             dismissMention();
           },
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
+          // The seed is the editor's first line, so text typed above it lands below it.
+          pinnedFirstCard: quote !== undefined,
           rows: gridComposer ? 1 : undefined,
           heightMode: quotes.length ? "unbounded" : "compact",
           disabled: !ready,
@@ -1627,7 +1720,7 @@ function SideChatComposer({
             />
           ) : undefined,
           inputPrefix:
-            quotes.length === 0 ? undefined : (
+            quotes.length === 0 || singleDocument ? undefined : (
               <ReplyDraftBlocks
                 quotes={quotes}
                 activeTextId={activeTextId}
@@ -1711,7 +1804,10 @@ function SideChatComposer({
                   );
                   const edits = [...voiceEditsRef.current];
                   voiceEditsRef.current.clear();
-                  for (const [id, edit] of edits) editText(id, edit.before);
+                  for (const [id, edit] of edits) {
+                    if (singleDocument && id === null) applyDocument(edit.before);
+                    else editText(id, edit.before);
+                  }
                 }}
                 inputRef={textareaRef}
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}

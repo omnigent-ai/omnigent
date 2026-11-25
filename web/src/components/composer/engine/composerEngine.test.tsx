@@ -328,7 +328,7 @@ describe("switching with a reply quote's input active", () => {
     onActiveInputChange,
   }: {
     engine: ComposerInputEngine;
-    onActiveInputChange: (target: ComposerTextTarget) => void;
+    onActiveInputChange: (target: ComposerTextTarget, inputId: string) => void;
   }) {
     const [quote, setQuote] = useState("quote reply text");
     const [tail, setTail] = useState("tail text");
@@ -388,12 +388,12 @@ describe("switching with a reply quote's input active", () => {
 
     rerender(view(second));
     expect(selectionOf(inputs()[0])).toEqual([4, 7]);
-    expect(active).toHaveBeenLastCalledWith(composerTargetOf(inputs()[0]));
+    expect(active).toHaveBeenLastCalledWith(composerTargetOf(inputs()[0]), "quote-1");
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Palette" }));
 
     rerender(view(first));
     expect(selectionOf(inputs()[0])).toEqual([4, 7]);
-    expect(active).toHaveBeenLastCalledWith(composerTargetOf(inputs()[0]));
+    expect(active).toHaveBeenLastCalledWith(composerTargetOf(inputs()[0]), "quote-1");
     expect(composerTargetOf(inputs()[1])!.value).toBe("tail text");
   });
 });

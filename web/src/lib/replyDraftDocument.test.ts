@@ -5,6 +5,7 @@ import {
   mapComposerSelection,
   parseReplyQuoteLine,
   quoteRemovalSpan,
+  removeReplyQuoteAt,
   removeReplyQuoteLine,
   replyQuoteClipboardText,
   replyQuoteLine,
@@ -134,6 +135,12 @@ describe("card removal", () => {
 
   it("removes a document that ends right in a card", () => {
     expect(removeReplyQuoteLine(card, 0)).toBe("");
+  });
+
+  it("removes the card at a position in the draft, not by its id", () => {
+    const other = replyQuoteLine({ id: "dup", text: "Other" });
+    const copy = replyQuoteLine({ id: "dup", text: "Copy" });
+    expect(removeReplyQuoteAt(`${other}\n${copy}\nRest`, 1)).toBe(`${other}\nRest`);
   });
 
   it("leaves a plain line alone", () => {

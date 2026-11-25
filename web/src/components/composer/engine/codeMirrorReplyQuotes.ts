@@ -297,16 +297,22 @@ function normalizeCards(
       : [...breaks].sort((a, b) => a - b).map((position) => ({ from: position, insert: "\n" })),
   );
 
-  // The seed is the first line: text above it moves to the line after it.
+  // The seed is the first line: text above it moves to the start of the text after it.
   let selection: EditorSelection | undefined;
   const first = transaction.startState.facet(pinnedFirstCard) ? firstCardRange(doc) : null;
   if (first && first.from > 0) {
     const prefix = doc.sliceString(0, first.from - 1);
+    const cardLine = doc.lineAt(first.to);
+    const next = cardLine.number < doc.lines ? doc.line(cardLine.number + 1) : null;
+    const joinsTail = next !== null && parseReplyQuoteLine(next.text) === null;
+    const at = next ? next.from : first.to;
+    const insert = joinsTail ? prefix : next ? `${prefix}\n` : `\n${prefix}`;
     apply([
       { from: 0, to: first.from },
-      { from: first.to, insert: `\n${prefix}` },
+      { from: at, insert },
     ]);
-    selection = EditorSelection.single(first.to - first.from + 1 + prefix.length);
+    const insertedAt = at - first.from + (next ? 0 : 1);
+    selection = EditorSelection.single(insertedAt + prefix.length);
   }
 
   if (fixes.empty) return transaction;

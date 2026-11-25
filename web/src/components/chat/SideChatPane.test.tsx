@@ -30,7 +30,8 @@ import {
   SHELL_REVIEW_COMMENT_REFUSAL,
 } from "@/components/composer/composerHighlight";
 import type { Comment } from "@/hooks/useComments";
-import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { appendReplyQuote, serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { replyQuoteLine } from "@/lib/replyDraftDocument";
 import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
@@ -49,6 +50,8 @@ import {
 } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
+import { undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import {
   resetDesignOutbox,
@@ -3722,5 +3725,119 @@ describe("side-chat composer engine", () => {
     expect(screen.getByTestId("side-chat-input").tagName).toBe("TEXTAREA");
     expect(document.querySelector('[data-composer-engine="codemirror"]')).toBeNull();
     expect(codeMirrorComposerLoad().status).toBe("idle");
+  });
+});
+
+describe("side-chat reply in one editor", () => {
+  const withFlag = (enabled: boolean, ui: ReactNode) => (
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: enabled } }}
+    >
+      {ui}
+    </CapabilitiesProvider>
+  );
+  const seeded = "pending:quoted";
+  const seedCard = replyQuoteLine({ id: "seed", text: "Seed passage" });
+  const editorInput = () => screen.getByTestId("side-chat-input");
+  const editorText = () => composerTargetOf(editorInput())!.value;
+  const storeText = () => useChatStore.getState().sideChatComposers[seeded]?.text;
+  const pendingSeed = () => useChatStore.getState().sideChatDrafts[seeded];
+  const typeAt = (start: number, end: number, text: string) =>
+    act(() => insertComposerText(composerTargetOf(editorInput())!, text, start, end));
+  async function renderEditor() {
+    const view = renderPane(withFlag(true, <SideChatPane childId={seeded} />));
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    return view;
+  }
+  beforeEach(() => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    useChatStore.setState({ sideChatDrafts: { [seeded]: "Seed passage" } });
+  });
+  afterEach(() => resetCodeMirrorComposerLoadForTests());
+
+  it("shows the seed and the reply's quotes in one editor", async () => {
+    await renderEditor();
+    act(() => {
+      useChatStore.getState().updateSideChatComposer(seeded, (current) => ({
+        ...current,
+        ...appendReplyQuote(current, "Reply quote"),
+      }));
+    });
+    expect(document.querySelectorAll(".cm-content")).toHaveLength(1);
+    const quotes = screen.getAllByTestId("composer-reply-quote");
+    expect(quotes).toHaveLength(2);
+    expect(quotes[0]).toHaveTextContent("Seed passage");
+    expect(quotes[1]).toHaveTextContent("Reply quote");
+  });
+
+  it("puts text typed above the seed after it, so nothing lands above the seed", async () => {
+    await renderEditor();
+    typeAt(0, 0, "Typed");
+    expect(storeText()).toBe("Typed");
+    expect(pendingSeed()).toBe("Seed passage");
+    expect(editorText()).toBe(`${seedCard}\nTyped`);
+  });
+
+  it.each([true, false])(
+    "removes the seed without losing typed text, and clears the pending draft (editor: %s)",
+    async (editor) => {
+      if (editor) await renderEditor();
+      else renderPane(<SideChatPane childId={seeded} />);
+      if (editor) typeAt(0, 0, "Follow up");
+      else
+        fireEvent.change(screen.getByTestId("side-chat-input"), {
+          target: { value: "Follow up" },
+        });
+      fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+      expect(pendingSeed()).toBeUndefined();
+      expect(storeText()).toBe("Follow up");
+    },
+  );
+
+  it("undoes a deleted blank line, and an earlier edit stays undoable", async () => {
+    await renderEditor();
+    typeAt(0, 0, "Typed");
+    typeAt(editorText().length, editorText().length, "\n\nLater");
+    const withBlank = editorText();
+    expect(withBlank).toBe(`${seedCard}\nTyped\n\nLater`);
+
+    // Backspace at the start of "Later" removes the blank line above it.
+    const laterStart = withBlank.indexOf("Later");
+    typeAt(laterStart - 1, laterStart, "");
+    expect(editorText()).toBe(`${seedCard}\nTyped\nLater`);
+    expect(storeText()).toBe("Typed\nLater");
+
+    const editor = EditorView.findFromDOM(editorInput())!;
+    act(() => void undo(editor));
+    expect(editorText()).toBe(withBlank);
+    act(() => void undo(editor));
+    expect(editorText()).toBe(`${seedCard}\nTyped`);
+    expect(storeText()).toBe("Typed");
+  });
+
+  it("discards a dictated transcript from the editor's tail, as without quotes", async () => {
+    await renderEditor();
+    typeAt(editorText().length, editorText().length, "Draft");
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken"));
+    expect(storeText()).toContain("spoken");
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(storeText()).toBe("Draft");
+    expect(pendingSeed()).toBe("Seed passage");
+  });
+
+  it("lands typed text at the caret after the editor hands off to the textarea and back", async () => {
+    const view = await renderEditor();
+    typeAt(0, 0, "Typed");
+    view.rerender(withFlag(false, <SideChatPane childId={seeded} />));
+    await waitFor(() => expect(screen.getByTestId("side-chat-input").tagName).toBe("TEXTAREA"));
+    view.rerender(withFlag(true, <SideChatPane childId={seeded} />));
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    act(() => insertComposerText(composerTargetOf(editorInput())!, "!"));
+    expect(storeText()).toBe("Typed!");
   });
 });

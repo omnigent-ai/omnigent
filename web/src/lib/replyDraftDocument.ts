@@ -162,6 +162,17 @@ export function removeReplyQuoteLine(document: string, lineIndex: number): strin
   return lines.join("\n");
 }
 
+/** The document without its `index`-th card, which is the card at that position in the draft. */
+export function removeReplyQuoteAt(document: string, index: number): string {
+  let seen = -1;
+  const lineIndex = document.split("\n").findIndex((line) => {
+    if (parseReplyQuoteLine(line) === null) return false;
+    seen += 1;
+    return seen === index;
+  });
+  return lineIndex < 0 ? document : removeReplyQuoteLine(document, lineIndex);
+}
+
 /** Where a document's text sits in the composer's inputs: each card's text before it, then the tail. */
 export interface ComposerTextRegion {
   /** The input that holds the text: a card's id, or the tail's. */

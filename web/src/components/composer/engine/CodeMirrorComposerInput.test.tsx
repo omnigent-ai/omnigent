@@ -833,6 +833,13 @@ describe("CodeMirrorComposerInput reply cards", () => {
     expect(editor.state.doc.toString()).toBe("Opener\nWhy");
   });
 
+  it("drops a card pasted through the composer's own insert, so no duplicate card appears", () => {
+    const { editor, target } = mountDocument(`Opener\nWhy`);
+    const at = "Opener\n".length;
+    act(() => insertComposerText(target(), card("Pasted", "copy"), at, at));
+    expect(editor.state.doc.toString()).toBe("Opener\nWhy");
+  });
+
   it("turns cards into markdown quotes in the text copy, cut and drag take", () => {
     const quoted = card("one\ntwo");
     const value = `Opener\n${quoted}\nWhy`;
@@ -847,7 +854,7 @@ describe("CodeMirrorComposerInput reply cards", () => {
     const seed = card("Seed");
     const { editor, target } = mountDocument(`${seed}\nRest`, { pinnedFirstCard: true });
     typeAt(editor, 0, "x");
-    expect(target().value).toBe(`${seed}\nx\nRest`);
+    expect(target().value).toBe(`${seed}\nxRest`);
     expect(editor.state.selection.main.head).toBe(seed.length + 2);
   });
 
