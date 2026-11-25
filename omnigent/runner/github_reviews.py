@@ -17,10 +17,10 @@ from omnigent.runner import github_failures
 from omnigent.runner import github_pending_reviews as pending_reviews
 from omnigent.runner import github_resource as github
 from omnigent.runner.github_graphql import (
-    AUTHENTICATION_TIMED_OUT,
     mutate,
     pull_request_node,
     require_head,
+    write_token,
 )
 from omnigent.runner.github_review_fields import (
     COMMENT_KINDS,
@@ -588,10 +588,7 @@ def _rest_write(
     """Send one REST write and return its output; a failure after the send is classified."""
     with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
         host = github._host_args(root, reference)
-        token = github._pr_token(root, reference)
-        if github._gh_timed_out.get():
-            # The selected account's token is unknown, so the write must not run as another.
-            raise ValueError(AUTHENTICATION_TIMED_OUT)
+        token = write_token(root, reference)
         if fields is None:
             rc, output, err = github._gh(
                 ["api", *host, "-X", method, endpoint], cwd=root, token=token
