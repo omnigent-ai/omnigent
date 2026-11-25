@@ -1088,7 +1088,7 @@ def test_a_failed_registry_check_after_a_read_lets_the_next_poll_read_again(
 async def test_a_reconnected_runner_reads_the_forge_after_an_edit_it_could_not_see(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The host serves panel edits while this runner is offline, so reconnecting drops older reads."""
+    """The host serves panel edits while this runner is offline; reconnecting drops older reads."""
     from omnigent.runner._entry import _on_tunnel_reconnect
 
     views: list[list[str]] = []
