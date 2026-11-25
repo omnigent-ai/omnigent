@@ -3,6 +3,7 @@ import {
   BadgeCheckIcon,
   CircleAlertIcon,
   CircleCheckIcon,
+  RadioIcon,
   RefreshCwIcon,
   UserRoundIcon,
 } from "lucide-react";
@@ -13,7 +14,7 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
 import { getCurrentUserId } from "@/lib/identity";
 import { isServerRestartError } from "@/lib/serverRestart";
-import type { TicketLabel, TicketWaitingOn } from "@/lib/projectTicketsApi";
+import type { TicketLabel, TicketShipStatus, TicketWaitingOn } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 
 import { needsWhom, type NeedsWhom } from "./ticketWaitingOn";
@@ -155,6 +156,33 @@ function GateShaBadge({
           {stale && <span className="font-normal">≠ approved</span>}
         </>
       )}
+    </Badge>
+  );
+}
+
+/** Whether the ticket's landed commit is running in this app, or waits for a restart. */
+export function TicketShipStatusBadge({ status }: { status: TicketShipStatus }) {
+  const live = status.state === "live";
+  const Icon = live ? RadioIcon : RefreshCwIcon;
+  // About the server's code: a web-only change follows its rebuild, not the restart.
+  const description = live
+    ? `${status.sha} is in the server code this app runs (${status.running_commit})`
+    : `${status.sha} has landed, but the server still runs ${status.running_commit}; it shows up after a restart`;
+  return (
+    <Badge
+      variant="outline"
+      title={description}
+      data-testid="ticket-ship-status"
+      data-state={status.state}
+      className={cn(
+        "h-5 shrink-0 gap-1 rounded-md px-1.5 py-0 text-xs font-medium",
+        live
+          ? "border-success/40 bg-success/10 text-success"
+          : "border-warning/50 bg-warning/10 text-warning",
+      )}
+    >
+      <Icon aria-hidden className="size-3 shrink-0" />
+      {live ? "Live in this app" : "Landed, waiting for a restart"}
     </Badge>
   );
 }

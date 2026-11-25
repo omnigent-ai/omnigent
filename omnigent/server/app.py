@@ -2139,6 +2139,10 @@ def create_app(
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
     """
+    from omnigent.server import running_commit
+
+    # The code this process loaded; a checkout move only shows after a restart.
+    running_commit.capture()
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
 
@@ -3949,10 +3953,13 @@ def create_app(
 
         Used by the web UI to include version info in bug reports.
 
-        :returns: ``{"version": "<semver string>"}``,
-            e.g. ``{"version": "0.1.0"}``.
+        :returns: ``{"version": "<semver string>"}``, e.g. ``{"version": "0.1.0"}``,
+            plus ``commit``, the full SHA this server process runs, when it is known.
         """
-        return {"version": _server_version()}
+        from omnigent.server.running_commit import running_commit
+
+        commit = running_commit()
+        return {"version": _server_version(), **({"commit": commit} if commit else {})}
 
     @app.get("/.well-known/omnigent.json")
     async def well_known_manifest() -> dict[str, object]:

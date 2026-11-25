@@ -1,0 +1,87 @@
+"""The running commit and a ticket's ship status, against a real temporary git repository."""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from omnigent.server import project_landing
+from omnigent.server import running_commit as running
+
+BRANCH = "zz/target"
+
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def commit(repo: Path, name: str) -> str:
+    (repo / name).write_text(name)
+    git(repo, "add", name)
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", name)
+    return git(repo, "rev-parse", "HEAD")
+
+
+def ticket(sha: str | None, key: str = "approved") -> dict:
+    return {
+        "labels": [{"key": "kind", "value": "fix"}, *([{"key": key, "value": sha}] if sha else [])]
+    }
+
+
+@pytest.fixture()
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "repo"
+    path.mkdir()
+    git(path, "init", "-q", "-b", BRANCH)
+    commit(path, "base")
+    monkeypatch.setenv("OMNIGENT_LANDING_CHECKOUT", str(path))
+    monkeypatch.delenv("OMNIGENT_BUILD_COMMIT", raising=False)
+    monkeypatch.setattr(project_landing, "_DEFAULT_BRANCH", BRANCH)
+    running._reset_for_tests()
+    yield path
+    running._reset_for_tests()
+
+
+def test_the_running_commit_is_read_once_from_the_build_or_the_checkout(repo, monkeypatch) -> None:
+    head = git(repo, "rev-parse", "HEAD")
+    assert running.capture(repo) == head
+    commit(repo, "later")  # the checkout moves on; the process doesn't
+    assert running.running_commit() == head
+    running._reset_for_tests()
+    monkeypatch.setenv("OMNIGENT_BUILD_COMMIT", "B" * 40)
+    assert running.capture(repo) == "b" * 40
+    running._reset_for_tests()
+    monkeypatch.delenv("OMNIGENT_BUILD_COMMIT")
+    assert running.capture(repo.parent) is None  # not a git checkout: nothing to report
+
+
+def test_a_landed_ticket_is_live_or_waits_for_a_restart(repo) -> None:
+    shipped = git(repo, "rev-parse", "HEAD")
+    running.capture(repo)
+    landed_later = commit(repo, "landed after the server started")
+    git(repo, "checkout", "-q", "-b", "side")
+    unlanded = commit(repo, "still in review")
+    git(repo, "checkout", "-q", BRANCH)
+    assert running.ship_status({}, ticket(shipped)) == {
+        "state": "live",
+        "sha": shipped,
+        "running_commit": shipped,
+    }
+    assert running.ship_status({}, ticket(landed_later, "verified"))["state"] == "waiting_restart"
+    assert running.ship_status({}, ticket(unlanded)) is None
+    assert running.ship_status({}, ticket("0" * 40)) is None  # unknown to git
+    assert running.ship_status({}, ticket(None)) is None
+
+
+def test_no_status_without_git(repo, monkeypatch) -> None:
+    sha = git(repo, "rev-parse", "HEAD")
+    running.capture(repo.parent)  # a packaged deploy: no commit to compare with
+    assert running.ship_status({}, ticket(sha)) is None
+    running._reset_for_tests()
+    running.capture(repo)
+    monkeypatch.setenv("OMNIGENT_LANDING_CHECKOUT", str(repo.parent))  # not a checkout
+    assert running.ship_status({}, ticket(sha)) is None

@@ -42,7 +42,12 @@ from omnigent.runtime.project_ticket_instructions import (
     FINAL_UPDATE_REMINDER,
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
-from omnigent.server import github_pr_intake, product_approval, project_release
+from omnigent.server import (
+    github_pr_intake,
+    product_approval,
+    project_release,
+    running_commit,
+)
 from omnigent.server.auth import (
     LEVEL_EDIT,
     RESERVED_USER_LOCAL,
@@ -1002,6 +1007,10 @@ def create_project_tickets_router(
             # One-click approvals: the sign-offs this person may give the open ask.
             if who.session_id is None:
                 ticket["sign_offs"] = product_approval.sign_offs_for(project, ticket, who.user_id)
+            # Whether the landed commit is in the code this server runs; absent if unknown.
+            shipped = await asyncio.to_thread(running_commit.ship_status, project.config, ticket)
+            if shipped is not None:
+                ticket["ship_status"] = shipped
         await enrich(project_id, [ticket], who)
         return ticket
 

@@ -90,7 +90,12 @@ import {
   useTicketImageUpload,
 } from "./ticketImages";
 import { TicketSessionAvatar, TicketSessionLink } from "./TicketSessionLink";
-import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
+import {
+  TicketError,
+  TicketLabels,
+  TicketShipStatusBadge,
+  TicketStageIcon,
+} from "./TicketControls";
 import { TicketFollowUps, TicketRelatedTickets } from "./TicketRelatedTickets";
 import { TicketShipBlocker } from "./TicketShipBlocker";
 import { SUMMARY_MIN_EVENTS, TicketHistorySummary } from "./TicketHistorySummary";
@@ -620,6 +625,7 @@ function TicketDetails({
               {ticket.labels.length > 0 && (
                 <TicketLabels labels={ticket.labels} waitingOn={ticket.waiting_on} />
               )}
+              {ticket.ship_status && <TicketShipStatusBadge status={ticket.ship_status} />}
               <LabelEditor
                 labels={ticket.labels}
                 disabled={update.isPending}

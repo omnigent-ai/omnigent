@@ -105,6 +105,14 @@ export interface ProjectTicket {
   sign_offs?: TicketLabel[];
   /** Who the open needs-human ask waits on, routed as in the Inbox; null once answered. */
   waiting_on?: TicketWaitingOn | null;
+  /** Whether the landed commit runs in this server; absent when unknown. Single-ticket reads. */
+  ship_status?: TicketShipStatus | null;
+}
+export interface TicketShipStatus {
+  /** `live`: in the running code. `waiting_restart`: landed, but the server hasn't restarted. */
+  state: "live" | "waiting_restart";
+  sha: string;
+  running_commit: string;
 }
 export interface TicketLatestComment {
   text: string;
