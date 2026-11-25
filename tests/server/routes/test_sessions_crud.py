@@ -13,13 +13,14 @@ import logging
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 import pytest_asyncio
 
-from omnigent.db.utils import generate_agent_id
+from omnigent.db.utils import generate_agent_id, get_or_create_engine, make_managed_session_maker
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
 from omnigent.runner import create_runner_app
@@ -86,6 +87,127 @@ async def test_creating_client_surface_survives_create_child_and_fork(
     assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
 
 
+async def test_native_clear_replacement_keeps_creating_surface(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A runner-side ``/clear`` replacement keeps the desktop session's surface."""
+    from omnigent.native._native_supersession import clear_replacement_create_body
+    from omnigent.telemetry.request_headers import client_user_agent
+
+    store = SqlAlchemyConversationStore(db_uri)
+    client.headers["X-Omnigent-Client"] = "desktop"
+    agent = await create_test_agent(client, name="clear-surface")
+    old = (await client.get(f"/v1/sessions/{agent['_session_id']}")).json()
+    assert old["labels"][CLIENT_SURFACE_LABEL_KEY] == "desktop"
+    del client.headers["X-Omnigent-Client"]
+
+    # The hook copies the old labels and posts from the runner's environment.
+    body = clear_replacement_create_body(old, agent_id=agent["id"], labels=dict(old["labels"]))
+    runner_ua = {"User-Agent": client_user_agent().replace("omnigent-cli/", "omnigent-runner/")}
+    response = await client.post("/v1/sessions", json=body, headers=runner_ua)
+    assert response.status_code == 201, response.text
+    replacement = store.get_conversation(response.json()["id"])
+    assert replacement is not None
+    assert replacement.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    # A non-Omnigent caller can't claim a surface through the body label; curl is main's web.
+    response = await client.post("/v1/sessions", json=body, headers={"User-Agent": "curl/8"})
+    assert response.status_code == 201, response.text
+    scripted = store.get_conversation(response.json()["id"])
+    assert scripted is not None
+    assert scripted.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
+
+
+@pytest.mark.parametrize("source_surface", ["desktop", "web"])
+async def test_internal_fork_keeps_source_surface(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    source_surface: str,
+) -> None:
+    """A TUI ``/fork`` from the runner keeps the source's surface."""
+    from omnigent.telemetry.request_headers import client_user_agent
+
+    store = SqlAlchemyConversationStore(db_uri)
+    client.headers["X-Omnigent-Client"] = source_surface
+    agent = await create_test_agent(client, name="fork-surface")
+    source_id = agent["_session_id"]
+    source = store.get_conversation(source_id)
+    assert source is not None
+    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == source_surface
+    del client.headers["X-Omnigent-Client"]
+
+    runner_ua = {"User-Agent": client_user_agent().replace("omnigent-cli/", "omnigent-runner/")}
+    fork = await client.post(f"/v1/sessions/{source_id}/fork", json={}, headers=runner_ua)
+    assert fork.status_code == 201, fork.text
+    fork_row = store.get_conversation(fork.json()["id"])
+    assert fork_row is not None
+    assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == source_surface
+
+    # A curl fork is labeled by its own User-Agent (main's web), not the source's surface.
+    scripted = await client.post(
+        f"/v1/sessions/{source_id}/fork", json={}, headers={"User-Agent": "curl/8"}
+    )
+    assert scripted.status_code == 201, scripted.text
+    scripted_row = store.get_conversation(scripted.json()["id"])
+    assert scripted_row is not None
+    assert scripted_row.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
+
+
+# origin/main's gateway name for a session created by each request shape with no
+# originating session. Every shape here must still get it.
+MAIN_GATEWAY_BY_REQUEST_SHAPE = [
+    ("omnigent-runner/0.22.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-host/0.22.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-harness/0.22.0 (claude-sdk) python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-cli/0.22.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-client/0.22.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-slack/0.1.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("python-httpx/0.28.1", "omnigent-cli"),
+    ("Python-urllib/3.12", "omnigent-web"),
+    ("curl/7.68.0", "omnigent-web"),
+    ("node", "omnigent-web"),
+    ("Bun/1.3.11", "omnigent-web"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/124.0 Safari/537.36", "omnigent-web"),
+    ("Mozilla/5.0 (Macintosh) Electron/31.0.0", "omnigent-desktop"),
+]
+
+
+# Session surfaces a runner from before the sdk and slack surfaces accepts. Any other
+# label reaches it as "unknown" (runner resource registry).
+_RUNNER_SESSION_SURFACES_BEFORE_SDK_SLACK = frozenset(
+    {"web", "desktop", "ios", "android", "mobile", "cli"}
+)
+
+
+@pytest.mark.parametrize(("user_agent", "gateway_surface"), MAIN_GATEWAY_BY_REQUEST_SHAPE)
+async def test_session_gateway_name_matches_main_per_request_shape(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    user_agent: str,
+    gateway_surface: str,
+) -> None:
+    """The gateway name a create-session request gets is main's, for every request shape.
+
+    Also holds when the session's label reaches a runner that predates the sdk and
+    slack surfaces, so a mixed-version deployment keeps main's attribution.
+    """
+    from omnigent.databricks_ai_gateway import CLIENT_SURFACES_HEADER, gateway_attribution_headers
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client, name="gateway-shape")
+    response = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"]}, headers={"User-Agent": user_agent}
+    )
+    assert response.status_code == 201, response.text
+    row = store.get_conversation(response.json()["id"])
+    assert row is not None
+    stored = row.labels[CLIENT_SURFACE_LABEL_KEY]
+    runner_view = stored if stored in _RUNNER_SESSION_SURFACES_BEFORE_SDK_SLACK else "unknown"
+    attribution = gateway_attribution_headers("codex", client_surface=runner_view)
+    assert attribution[CLIENT_SURFACES_HEADER] == gateway_surface
+
+
 async def test_list_sessions_empty(client: httpx.AsyncClient) -> None:
     """Empty database returns an empty list."""
     resp = await client.get("/v1/sessions")
@@ -137,6 +259,144 @@ async def test_get_session(
     assert resp.status_code == 200
     body = resp.json()
     assert body["id"] == session_id
+
+
+@pytest.mark.parametrize("failure", ["statement", "decode"])
+async def test_get_session_survives_agent_row_read_failure(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """A failing agent-row read drops only the agent metadata; the snapshot and harness survive."""
+    from sqlalchemy import text
+
+    SqlAlchemyConversationStore(db_uri).update_conversation(session_id, harness_override="pi")
+    # A read maker on the same engine joins the request's shared read scope, so
+    # the failure aborts the shared transaction the way a real query failure would.
+    read = make_managed_session_maker(get_or_create_engine(db_uri))
+
+    def failing_get(self: SqlAlchemyAgentStore, agent_id: str) -> None:
+        if failure == "decode":
+            # What decode_agent_kind raises for an unknown stored kind code.
+            raise ValueError("unknown agent kind code")
+        with read() as session:
+            session.execute(text("SELECT * FROM table_that_does_not_exist"))
+
+    monkeypatch.setattr(SqlAlchemyAgentStore, "get", failing_get)
+    resp = await client.get(f"/v1/sessions/{session_id}")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["id"] == session_id
+    assert body["harness"] == "pi"
+    assert body.get("agent_name") is None
+    assert body.get("llm_model") is None
+
+
+_OWNER = {"X-Forwarded-Email": "owner@example.test"}
+
+
+async def _create_owned_session(auth_client: httpx.AsyncClient) -> str:
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    response = await post_session_bundle(
+        auth_client.post, "/v1/sessions", build_agent_bundle(name="hello_world"), headers=_OWNER
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["session_id"]
+
+
+def _count_rollbacks(monkeypatch: pytest.MonkeyPatch, module: object) -> list[None]:
+    """Record each ``rollback_shared_reads`` call a route module makes.
+
+    SQLite does not abort the transaction on a failed statement, so the recovery
+    assertions alone only discriminate on PostgreSQL; this makes the rollback
+    itself observable on every backend.
+    """
+    real_rollback = module.rollback_shared_reads  # type: ignore[attr-defined]
+    calls: list[None] = []
+
+    def counting_rollback() -> None:
+        calls.append(None)
+        real_rollback()
+
+    monkeypatch.setattr(module, "rollback_shared_reads", counting_rollback)
+    return calls
+
+
+def _failing_statement(db_uri: str) -> None:
+    """Fail one SQL statement on a read maker that joins the request's shared read scope."""
+    from sqlalchemy import text
+
+    with make_managed_session_maker(get_or_create_engine(db_uri))() as session:
+        session.execute(text("SELECT * FROM table_that_does_not_exist"))
+
+
+async def test_get_session_reads_owner_grant_after_agent_row_failure(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The side-chat owner read after a failed agent-row read still runs in the shared scope.
+
+    On PostgreSQL the failure aborts the shared transaction, so the owner-grant
+    read that follows only succeeds because the failure was rolled back.
+    """
+    session_id = await _create_owned_session(auth_client)
+
+    def failing_get(self: SqlAlchemyAgentStore, agent_id: str) -> None:
+        _failing_statement(db_uri)
+
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(SqlAlchemyAgentStore, "get", failing_get)
+    rollbacks = _count_rollbacks(monkeypatch, orchestration)
+    resp = await auth_client.get(f"/v1/sessions/{session_id}", headers=_OWNER)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["id"] == session_id
+    assert body.get("agent_name") is None
+    assert body["side_chat_allowed"] is True
+    assert len(rollbacks) == 1, "the failed agent-row read must roll the shared scope back"
+
+
+async def test_list_sessions_recovers_between_batches_after_pull_request_read_failure(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed PR-summary read in one list batch leaves the next batch's reads working.
+
+    PR summaries are each batch's last read, so two one-row batches put the
+    second batch's grant read after the failure; on PostgreSQL it succeeds only
+    because the failure was rolled back.
+    """
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.session_pull_request_store import SessionPullRequestStore
+
+    first_id = await _create_owned_session(auth_client)
+    second_id = await _create_owned_session(auth_client)
+    monkeypatch.setattr(routes_core, "_SESSION_LIST_BATCH_SIZE", 1)
+    original_summaries = SessionPullRequestStore.summaries
+    calls: list[list[str]] = []
+
+    def summaries_failing_once(self: SessionPullRequestStore, conversation_ids: list[str]):
+        calls.append(list(conversation_ids))
+        if len(calls) == 1:
+            _failing_statement(db_uri)
+        return original_summaries(self, conversation_ids)
+
+    monkeypatch.setattr(SessionPullRequestStore, "summaries", summaries_failing_once)
+    rollbacks = _count_rollbacks(monkeypatch, routes_core)
+    resp = await auth_client.get(
+        "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine", headers=_OWNER
+    )
+    assert resp.status_code == 200, resp.text
+    assert {row["id"] for row in resp.json()["data"]} == {first_id, second_id}
+    assert len(calls) == 2, "expected one PR-summary read per one-row batch"
+    assert len(rollbacks) == 1, "the failed PR-summary read must roll the shared scope back"
 
 
 async def test_get_session_not_found(client: httpx.AsyncClient) -> None:
@@ -193,6 +453,256 @@ async def test_delete_session_survives_blob_delete_failure(
     assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 404
     assert f"Failed to delete attachment blob {file_ids[0]} for session" in caplog.text
     assert "RuntimeError" in caplog.text
+
+
+async def test_delete_session_removes_sub_agent_files(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting a parent removes the files of every sub-agent deleted with it.
+
+    Covers two children's uploads, a child's copy of a parent file (what
+    ``sys_session_send`` with ``file_ids`` makes) and a grandchild's upload,
+    while a blob another session still shares, as a fork's row does, stays.
+    One-row batches and one-child pages make the cleanup cross both bounds.
+    """
+    from omnigent.server.routes._sessions import helpers as session_helpers
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    monkeypatch.setattr(session_helpers, "_SESSION_FILE_DELETE_BATCH_SIZE", 1)
+    monkeypatch.setattr(session_helpers, "_DESCENDANT_PAGE_SIZE", 1)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="worker:notes", parent_conversation_id=session_id
+    )
+    sibling = conv_store.create_conversation(
+        kind="sub_agent", title="worker:review", parent_conversation_id=session_id
+    )
+    grandchild = conv_store.create_conversation(
+        kind="sub_agent", title="worker:deep", parent_conversation_id=child.id
+    )
+    uploaded: dict[str, str] = {}
+    for owner in (session_id, child.id, sibling.id, grandchild.id):
+        resp = await client.post(
+            f"/v1/sessions/{owner}/resources/files",
+            files={"file": ("notes.txt", owner.encode(), "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        uploaded[owner] = resp.json()["id"]
+    copied = await client.post(
+        f"/v1/sessions/{child.id}/resources/files:copy",
+        json={"source_session_id": session_id, "file_ids": [uploaded[session_id]]},
+    )
+    assert copied.status_code == 200, copied.text
+    copy_id = copied.json()["mapping"][uploaded[session_id]]["new_id"]
+    other = conv_store.create_conversation(title="fork")
+    file_store.create(
+        "notes.txt", 1, "text/plain", session_id=other.id, blob_key=uploaded[session_id]
+    )
+    artifacts = tmp_path / "artifacts"
+
+    resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    owners = (session_id, child.id, sibling.id, grandchild.id)
+    assert [owner for owner in owners if file_store.list(owner).data] == []
+    blob_keys = (uploaded[child.id], uploaded[sibling.id], uploaded[grandchild.id], copy_id)
+    assert [key for key in blob_keys if (artifacts / key).exists()] == []
+    assert (artifacts / uploaded[session_id]).exists()
+
+
+async def test_delete_session_keeps_cleaning_files_after_a_sub_agent_failure(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A store failure on one sub-agent's files is logged; the rest are still cleaned.
+
+    The failing sub-agent is listed first, so the healthy one is cleaned after it.
+    """
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    failing = conv_store.create_conversation(
+        kind="sub_agent", title="worker:a", parent_conversation_id=session_id
+    )
+    healthy = conv_store.create_conversation(
+        kind="sub_agent", title="worker:b", parent_conversation_id=session_id
+    )
+    uploaded: dict[str, str] = {}
+    for owner in (session_id, failing.id, healthy.id):
+        resp = await client.post(
+            f"/v1/sessions/{owner}/resources/files",
+            files={"file": ("notes.txt", owner.encode(), "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        uploaded[owner] = resp.json()["id"]
+    original_batch = SqlAlchemyFileStore.delete_session_files_batch
+    original_page = SqlAlchemyConversationStore.list_child_conversation_ids_page
+    attempted: list[str] = []
+
+    def batch_failing_for_one_session(
+        self: SqlAlchemyFileStore, owner_id: str, *, limit: int
+    ) -> tuple[int, list[str]]:
+        attempted.append(owner_id)
+        if owner_id == failing.id:
+            raise RuntimeError("database unavailable")
+        return original_batch(self, owner_id, limit=limit)
+
+    def failing_child_first(
+        self: SqlAlchemyConversationStore, parent_id: str, **kwargs: Any
+    ) -> list[tuple[str, int]]:
+        page = original_page(self, parent_id, **kwargs)
+        return sorted(page, key=lambda row: row[0] != failing.id)
+
+    with (
+        patch.object(
+            SqlAlchemyFileStore, "delete_session_files_batch", batch_failing_for_one_session
+        ),
+        patch.object(
+            SqlAlchemyConversationStore, "list_child_conversation_ids_page", failing_child_first
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    assert attempted == [session_id, failing.id, healthy.id]
+    assert [owner for owner in (session_id, healthy.id) if file_store.list(owner).data] == []
+    artifacts = tmp_path / "artifacts"
+    assert not (artifacts / uploaded[session_id]).exists()
+    assert not (artifacts / uploaded[healthy.id]).exists()
+    assert f"Failed to delete the file rows of session {failing.id}" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+async def test_delete_session_keeps_the_session_when_its_file_rows_cannot_be_deleted(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A store failure on the session's own file rows fails the delete, keeping it to retry."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("notes.txt", b"notes", "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    file_id = resp.json()["id"]
+
+    def failing_batch(
+        self: SqlAlchemyFileStore, owner_id: str, *, limit: int
+    ) -> tuple[int, list[str]]:
+        del self, owner_id, limit
+        raise RuntimeError("database unavailable")
+
+    with (
+        patch.object(SqlAlchemyFileStore, "delete_session_files_batch", failing_batch),
+        pytest.raises(RuntimeError, match="database unavailable"),
+    ):
+        await client.delete(f"/v1/sessions/{session_id}")
+
+    assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 200
+    assert [f.id for f in SqlAlchemyFileStore(db_uri).list(session_id).data] == [file_id]
+    assert (tmp_path / "artifacts" / file_id).exists()
+
+
+async def test_delete_session_checks_blobs_only_once_its_rows_are_gone(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shared-blob checks wait for the session's last batch, so none scans its own rows."""
+    from omnigent.server.routes._sessions import helpers as session_helpers
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    monkeypatch.setattr(session_helpers, "_SESSION_FILE_DELETE_BATCH_SIZE", 1)
+    file_store = SqlAlchemyFileStore(db_uri)
+    file_ids = []
+    for index in range(3):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/resources/files",
+            files={"file": (f"notes-{index}.txt", b"notes", "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        file_ids.append(resp.json()["id"])
+    original_check = SqlAlchemyFileStore.is_blob_key_orphaned
+    rows_left_at_check: list[int] = []
+
+    def recording_check(self: SqlAlchemyFileStore, blob_key: str) -> bool:
+        rows_left_at_check.append(len(file_store.list(session_id).data))
+        return original_check(self, blob_key)
+
+    with patch.object(SqlAlchemyFileStore, "is_blob_key_orphaned", recording_check):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    assert rows_left_at_check == [0, 0, 0]
+    assert [key for key in file_ids if (tmp_path / "artifacts" / key).exists()] == []
+
+
+async def test_delete_session_cleans_other_branches_when_one_cannot_be_listed(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sub-agent whose children can't be listed is still cleaned, and so are its siblings."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    unlistable = conv_store.create_conversation(
+        kind="sub_agent", title="worker:a", parent_conversation_id=session_id
+    )
+    sibling = conv_store.create_conversation(
+        kind="sub_agent", title="worker:b", parent_conversation_id=session_id
+    )
+    uploaded: dict[str, str] = {}
+    for owner in (session_id, unlistable.id, sibling.id):
+        resp = await client.post(
+            f"/v1/sessions/{owner}/resources/files",
+            files={"file": ("notes.txt", owner.encode(), "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        uploaded[owner] = resp.json()["id"]
+    original_page = SqlAlchemyConversationStore.list_child_conversation_ids_page
+
+    def page_failing_for_one_parent(
+        self: SqlAlchemyConversationStore, parent_id: str, **kwargs: Any
+    ) -> list[tuple[str, int]]:
+        if parent_id == unlistable.id:
+            raise RuntimeError("database unavailable")
+        return original_page(self, parent_id, **kwargs)
+
+    with (
+        patch.object(
+            SqlAlchemyConversationStore,
+            "list_child_conversation_ids_page",
+            page_failing_for_one_parent,
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    owners = (session_id, unlistable.id, sibling.id)
+    assert [owner for owner in owners if file_store.list(owner).data] == []
+    artifacts = tmp_path / "artifacts"
+    assert [owner for owner in owners if (artifacts / uploaded[owner]).exists()] == []
+    assert f"Failed to list the sub-agents of session {unlistable.id}" in caplog.text
 
 
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
@@ -364,12 +874,19 @@ async def test_delete_session_calls_full_runner_teardown(
         base_url="http://runner",
     )
 
-    async def _get_runner(session_id: str) -> httpx.AsyncClient:
+    async def _get_runner(
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: object,
+        for_control: bool = False,
+    ) -> httpx.AsyncClient:
+        assert for_control
         return fake_runner
 
     monkeypatch.setattr(
         sessions_module,
-        "_get_runner_client_for_resource_access",
+        "_get_runner_client",
         _get_runner,
     )
     try:
@@ -445,10 +962,17 @@ async def test_delete_session_reaps_child_that_ignores_sigterm(
         transport=httpx.MockTransport(dispatch), base_url="http://runner", timeout=30.0
     ) as runner_client:
 
-        async def get_runner(session_id: str) -> httpx.AsyncClient:
+        async def get_runner(
+            session_id: str,
+            runner_router: object,
+            *,
+            conversation: object,
+            for_control: bool = False,
+        ) -> httpx.AsyncClient:
+            assert for_control
             return runner_client
 
-        monkeypatch.setattr(sessions_module, "_get_runner_client_for_resource_access", get_runner)
+        monkeypatch.setattr(sessions_module, "_get_runner_client", get_runner)
         create_request = asyncio.create_task(
             runner_client.post(
                 "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_cleanup"}
@@ -538,8 +1062,8 @@ async def test_list_projects_returns_names_sorted(
     assert resp.status_code == 200
     # Label-only projects (no first-class row) list with id=None, sorted by name.
     assert resp.json() == [
-        {"id": None, "name": "Customer X", "icon": None},
-        {"id": None, "name": "Sprint 42", "icon": None},
+        {"id": None, "name": "Customer X", "icon": None, "muted": False},
+        {"id": None, "name": "Sprint 42", "icon": None, "muted": False},
     ]
 
 
@@ -736,27 +1260,30 @@ async def test_archiving_wins_over_a_same_request_pin(
     assert user_key not in conv.labels
 
 
+@pytest.mark.parametrize("prefix", ["omnigent.pinned", "omnigent.muted"])
 async def test_patch_rejects_client_supplied_per_user_pin_key(
     client: httpx.AsyncClient,
     session_id: str,
     db_uri: str,
+    prefix: str,
 ) -> None:
-    """A client may only write the bare canonical ``omnigent.pinned`` key. A
-    suffixed ``omnigent.pinned.<user>`` is server-derived — accepting one would
-    let a caller pin/unpin a shared session for another user. It must be
-    rejected, and nothing persisted."""
+    """A client may only write the bare canonical pin or mute key. A suffixed
+    ``<key>.<user>`` is server-derived — accepting one would let a caller
+    pin or mute a shared session for another user. It must be rejected, and
+    nothing persisted."""
     conv_store = SqlAlchemyConversationStore(db_uri)
+    suffixed = f"{prefix}.bob@example.com"
 
     for value in ("1721760000000", ""):
         resp = await client.patch(
             f"/v1/sessions/{session_id}",
-            json={"labels": {"omnigent.pinned.bob@example.com": value}},
+            json={"labels": {suffixed: value}},
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 400
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
-    assert "omnigent.pinned.bob@example.com" not in conv.labels
+    assert suffixed not in conv.labels
 
 
 async def test_patch_rejects_client_supplied_sandbox_labels(
@@ -867,12 +1394,17 @@ async def test_list_sessions_pinned_filter(
 
 @pytest.mark.parametrize(
     "label_key",
-    ["omnigent.git.worktree_root_sha256", "omnigent.scheduled_task_worktree_source_sha256"],
+    [
+        "omnigent.git.worktree_root_sha256",
+        "omnigent.scheduled_task_worktree_source_sha256",
+        # Deleting a session with this label deletes the automation it names.
+        "omnigent.scheduled_task_source",
+    ],
 )
-async def test_patch_rejects_forged_worktree_identity(
+async def test_patch_rejects_forged_server_owned_labels(
     client: httpx.AsyncClient, session_id: str, db_uri: str, label_key: str
 ) -> None:
-    """The cleanup identity must remain server-owned after creation."""
+    """The cleanup identity and automation source must remain server-owned after creation."""
 
     response = await client.patch(
         f"/v1/sessions/{session_id}", json={"labels": {label_key: "forged"}}

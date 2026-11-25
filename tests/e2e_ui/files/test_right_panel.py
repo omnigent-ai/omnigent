@@ -53,12 +53,11 @@ def test_workspace_tab_hover_tooltip(
     tab.hover()
     tip = page.get_by_role("tooltip")
     expect(tip).to_contain_text(tooltip)
+    # ⌃digit on macOS; Alt+digit elsewhere, where Ctrl+digit opens sidebar sessions.
     keycaps = tip.locator('[data-slot="kbd"]')
-    expect(keycaps).to_have_count(4)
-    expect(keycaps.nth(0)).to_have_text("⌘" if sys.platform == "darwin" else "Ctrl")
-    expect(keycaps.nth(1)).to_have_text("⌥" if sys.platform == "darwin" else "Alt")
-    expect(keycaps.nth(2)).to_have_text("]")
-    expect(keycaps.nth(3)).to_have_text(shortcut)
+    expect(keycaps).to_have_count(2)
+    expect(keycaps.nth(0)).to_have_text("⌃" if sys.platform == "darwin" else "Alt")
+    expect(keycaps.nth(1)).to_have_text(shortcut)
     expect(tab).to_have_attribute("data-state", expected_state)
 
 
@@ -168,11 +167,15 @@ def test_right_panel_terminals_and_file_viewer(
             page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
         ).to_have_count(0)
         # Closing the tab kills the terminal, so its "x" confirms first; after
-        # confirming the xterm unmounts and the rail returns to its default
-        # (files) view for the Files steps below.
+        # confirming the xterm unmounts. It was the last open tab, so the rail
+        # hides; reopen it for the Files steps below.
         rail.get_by_role("button", name="Close zsh · main", exact=True).click()
         page.get_by_role("button", name="Close shell").click()
         expect(terminal_view).to_have_count(0)
+        # The tab leaves, and the rail hides, once the kill returns; wait for that
+        # before reopening it.
+        expect(page.get_by_role("button", name="Expand right panel")).to_be_visible(timeout=30_000)
+        open_right_rail(page)
 
         # Switch to the Files tab and open the seeded file. The
         # changed-file row renders two buttons carrying the filename: the

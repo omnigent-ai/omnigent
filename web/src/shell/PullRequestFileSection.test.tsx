@@ -1,8 +1,10 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen } from "@testing-library/react";
-import type { FileDiffMetadata } from "@pierre/diffs";
+import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
+import type { ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { LARGE_DIFF_THRESHOLD, PullRequestFileSection } from "./PullRequestFileSection";
 
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
@@ -59,6 +61,16 @@ vi.mock("@pierre/diffs/react", async () => {
   };
 });
 
+// A conversation on a line the stub diff doesn't place, so it counts without rendering a thread body.
+const THREAD = {
+  id: "t1",
+  path: "src/app.ts",
+  line: 2,
+  side: "RIGHT",
+  resolved: false,
+  comments: { data: [] },
+} as unknown as ReviewThread;
+
 const FILE: PullRequestChangedFile = {
   path: "src/app.ts",
   name: "app.ts",
@@ -73,28 +85,36 @@ function renderSection(
   props: Partial<React.ComponentProps<typeof PullRequestFileSection>> = {},
   unifiedLineCount = 3,
 ) {
-  const fileDiff = { name: FILE.path, type: "change", unifiedLineCount } as FileDiffMetadata;
+  const fileDiff = {
+    name: FILE.path,
+    type: "change",
+    hunks: [{ unifiedLineCount }],
+  } as unknown as FileDiffMetadata;
   const onToggleCollapsed = vi.fn();
+  // Unplaced conversations render their own queries, so the section gets a query client.
+  const queryClient = new QueryClient();
   const element = (overrides: typeof props) => (
-    <PullRequestFileSection
-      file={FILE}
-      fileDiff={fileDiff}
-      options={{}}
-      registerRef={() => {}}
-      collapsed={false}
-      onToggleCollapsed={onToggleCollapsed}
-      threads={[]}
-      threadContext={{
-        conversationId: "conv",
-        prUrl: "pr",
-        account: null,
-        canReply: false,
-        loadComments: () => {},
-        loadingComments: null,
-      }}
-      matchingRevision
-      {...overrides}
-    />
+    <QueryClientProvider client={queryClient}>
+      <PullRequestFileSection
+        file={FILE}
+        fileDiff={fileDiff}
+        options={{}}
+        registerRef={() => {}}
+        collapsed={false}
+        onToggleCollapsed={onToggleCollapsed}
+        threads={[]}
+        threadContext={{
+          conversationId: "conv",
+          prUrl: "pr",
+          account: null,
+          canReply: false,
+          loadComments: () => {},
+          loadingComments: null,
+        }}
+        matchingRevision
+        {...overrides}
+      />
+    </QueryClientProvider>
   );
   const result = render(element(props));
   return { onToggleCollapsed, rerender: (next: typeof props) => result.rerender(element(next)) };
@@ -135,11 +155,58 @@ describe("PullRequestFileSection overrides", () => {
     expect(screen.getByTestId("diff")).toBeInTheDocument();
   });
 
+  it("renders a small diff inline however far apart its hunks are", () => {
+    const hunks = [10, 2100, 4224].map(
+      (line) =>
+        `@@ -${line - 3},7 +${line - 3},7 @@\n` +
+        [1, 2, 3].map((offset) => ` context ${line - 4 + offset}\n`).join("") +
+        `-old ${line}\n+new ${line}\n` +
+        [1, 2, 3].map((offset) => ` context ${line + offset}\n`).join(""),
+    );
+    const patch = `diff --git a/${FILE.path} b/${FILE.path}\n--- a/${FILE.path}\n+++ b/${FILE.path}\n${hunks.join("")}`;
+    const [fileDiff] = parsePatchFiles(patch)[0].files;
+    expect(fileDiff.hunks.reduce((rows, hunk) => rows + hunk.unifiedLineCount, 0)).toBe(24);
+
+    renderSection({ forceMount: true, fileDiff });
+    expect(screen.queryByText(/^Large diff/)).toBeNull();
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+  });
+
   it("shows a collapsed file while forced expanded", () => {
     const { rerender } = renderSection({ forceMount: true, collapsed: true });
     expect(screen.queryByTestId("diff")).toBeNull();
     rerender({ forceMount: true, collapsed: true, forceExpanded: true });
     expect(screen.getByRole("button", { name: /app\.ts/, expanded: true })).toBeInTheDocument();
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+  });
+
+  it("keeps a sparse diff inline after its unchanged lines load", async () => {
+    const { hydratePartialDiff } = await import("@pierre/diffs");
+    const changedLines = [10, 1500];
+    const fileText = (marker: string) =>
+      Array.from({ length: 4300 }, (_, index) =>
+        changedLines.includes(index + 1) ? `${marker} ${index + 1}\n` : `context ${index + 1}\n`,
+      ).join("");
+    const context = (from: number) =>
+      [0, 1, 2].map((offset) => ` context ${from + offset}\n`).join("");
+    const hunks = changedLines.map(
+      (line) =>
+        `@@ -${line - 3},7 +${line - 3},7 @@\n${context(line - 3)}` +
+        `-old ${line}\n+new ${line}\n${context(line + 1)}`,
+    );
+    const patch = `diff --git a/${FILE.path} b/${FILE.path}\n--- a/${FILE.path}\n+++ b/${FILE.path}\n${hunks.join("")}`;
+    const [fileDiff] = parsePatchFiles(patch)[0].files;
+    const { rerender } = renderSection({ forceMount: true, fileDiff });
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+
+    // Expanding context hydrates the diff in place, so its file-level count grows to the whole file.
+    hydratePartialDiff("merge", fileDiff, {
+      oldFile: { name: FILE.path, contents: fileText("old") },
+      newFile: { name: FILE.path, contents: fileText("new") },
+    });
+    expect(fileDiff.unifiedLineCount).toBeGreaterThan(LARGE_DIFF_THRESHOLD);
+    rerender({ forceMount: true, fileDiff });
+    expect(screen.queryByText(/^Large diff/)).toBeNull();
     expect(screen.getByTestId("diff")).toBeInTheDocument();
   });
 
@@ -213,5 +280,35 @@ describe("PullRequestFileSection overrides", () => {
     expect(screen.getByRole("button", { name: /app\.ts/ })).not.toContainElement(
       screen.getByRole("button", { name: "Copy path" }),
     );
+  });
+
+  it("shows no review features while review is off, and keeps the file's own actions", () => {
+    const threads = [THREAD];
+    renderSection({
+      reviewable: false,
+      forceMount: true,
+      threads,
+      headerActions: <button type="button">Copy path</button>,
+      reviewActions: <button type="button">Viewed control</button>,
+    });
+
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy path" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Viewed control" })).toBeNull();
+    expect(screen.queryByTitle("1 conversation")).toBeNull();
+    expect(screen.queryByRole("region", { name: "New review conversation" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Select lines" }));
+    expect(selectedOf()).toBeNull();
+  });
+
+  it("shows the review actions and the thread's conversation count while review is on", () => {
+    renderSection({
+      forceMount: true,
+      threads: [THREAD],
+      reviewActions: <button type="button">Viewed control</button>,
+    });
+
+    expect(screen.getByRole("button", { name: "Viewed control" })).toBeInTheDocument();
+    expect(screen.getByTitle("1 conversation")).toBeInTheDocument();
   });
 });

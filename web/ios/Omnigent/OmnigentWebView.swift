@@ -34,13 +34,20 @@ struct OmnigentWebView: UIViewRepresentable {
   static func connectionErrorMessage(
     for error: Error, databricksInternalFeaturesEnabled: Bool
   ) -> String {
-    let nsError = error as NSError
-    if databricksInternalFeaturesEnabled, nsError.domain == NSURLErrorDomain,
-      [NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed].contains(nsError.code)
+    let failure = transportFailure(of: error)
+    if databricksInternalFeaturesEnabled, failure.domain == NSURLErrorDomain,
+      [NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed].contains(failure.code)
     {
       return "Couldn’t reach the server. Check your device’s compliance status in Jamf."
     }
     return error.localizedDescription
+  }
+
+  /// Workspace sign-in wraps the transport error, so look through it for the original code.
+  private static func transportFailure(of error: Error) -> DatabricksTransportFailure {
+    if case .networkUnavailable(let failure)? = error as? DatabricksSessionError { return failure }
+    if case .networkUnavailable(let failure)? = error as? DatabricksOAuthError { return failure }
+    return DatabricksTransportFailure(error)
   }
 
   func makeCoordinator() -> Coordinator {
@@ -72,9 +79,10 @@ struct OmnigentWebView: UIViewRepresentable {
     webView.allowsBackForwardNavigationGestures = false
     webView.isFindInteractionEnabled = true
     webView.isOpaque = false
-    webView.backgroundColor = .clear
-    webView.underPageBackgroundColor = .clear
-    webView.scrollView.backgroundColor = .clear
+    // The rounded keyboard exposes WebKit's backing surfaces below the page.
+    webView.backgroundColor = DesignTokens.nativeBackground
+    webView.underPageBackgroundColor = DesignTokens.nativeBackground
+    webView.scrollView.backgroundColor = DesignTokens.nativeBackground
     webView.scrollView.contentInsetAdjustmentBehavior = .never
 
     // Allow Safari Web Inspector to attach to the web content. Since iOS 16.4 a
@@ -409,10 +417,12 @@ struct OmnigentWebView: UIViewRepresentable {
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
-    UIGestureRecognizerDelegate, UIScrollViewDelegate
+    WKDownloadDelegate, UIGestureRecognizerDelegate, UIScrollViewDelegate
   {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
+    /// Where each in-flight `<a download>` is written, and the fresh directory holding it.
+    private var downloadFiles: [WKDownload: (file: URL, directory: URL)] = [:]
     /// The server this web view is pinned to; nil before the first load. Doubles as
     /// the identity `updateUIView` compares against, so a re-render only reloads
     /// when SwiftUI hands over a different server.
@@ -450,6 +460,7 @@ struct OmnigentWebView: UIViewRepresentable {
     private let contextResult: Result<DatabricksWebContext?, Error>
     fileprivate let webStore: DatabricksWebStore?
     private let workspaceBootstrap: DatabricksWorkspaceBootstrap
+    private let workspaceSessionClient = DatabricksSessionClient()
     private var workspaceSession: DatabricksWebSession?
     private var authenticationTask: Task<Void, Never>?
     private var navigationID = UUID()
@@ -769,12 +780,25 @@ struct OmnigentWebView: UIViewRepresentable {
         let cookies = await webStore.cookies()
         guard let self, !Task.isCancelled, navigationID == id, let view = webView, isCurrent(view)
         else { return }
-        activationTask = nil
-        if !cookies.contains(where: {
-          $0.name == "DBAUTH" && !$0.value.isEmpty && $0.isSecure && $0.isHTTPOnly
-            && DatabricksSessionClient.cookie($0, appliesTo: pageURL)
-        }) {
+        defer { if navigationID == id { activationTask = nil } }
+        guard
+          let cookie = cookies.first(where: {
+            $0.name == "DBAUTH" && !$0.value.isEmpty && $0.isSecure && $0.isHTTPOnly
+              && DatabricksSessionClient.cookie($0, appliesTo: pageURL)
+          })
+        else {
           requestWorkspaceRecovery()
+          return
+        }
+        // A cookie outlives its server session (idle timeout, revocation), so ask the workspace.
+        let verdict = await workspaceSessionClient.verify(pageURL: pageURL, cookie: cookie)
+        guard !Task.isCancelled, navigationID == id, authenticationTask == nil,
+          let view = webView, isCurrent(view)
+        else { return }
+        switch verdict {
+        case .expired: requestWorkspaceRecovery()
+        case .forbidden: showWorkspaceFailure(DatabricksSessionError.rejected(403))
+        case .accepted, .unknown: break
         }
       }
     }
@@ -1561,7 +1585,8 @@ struct OmnigentWebView: UIViewRepresentable {
       }
 
       if ["http", "https", "about", "blob", "data"].contains(scheme) {
-        decisionHandler(.allow)
+        // WKWebView ignores `<a download>` unless the shell turns it into a download.
+        decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
         return
       }
 
@@ -1603,6 +1628,80 @@ struct OmnigentWebView: UIViewRepresentable {
         return true
       }
       return false
+    }
+
+    func webView(
+      _ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload
+    ) {
+      download.delegate = self
+    }
+
+    func download(
+      _ download: WKDownload, decideDestinationUsing response: URLResponse,
+      suggestedFilename: String, completionHandler: @escaping (URL?) -> Void
+    ) {
+      // A fresh directory per download, so the page-chosen name can't collide or escape it.
+      let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+      do {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+      } catch {
+        // WebKit reports the refused destination as a cancellation, which stays quiet.
+        showDownloadFailure(error)
+        completionHandler(nil)
+        return
+      }
+      let file = directory.appendingPathComponent(Self.downloadFileName(suggestedFilename))
+      downloadFiles[download] = (file, directory)
+      completionHandler(file)
+    }
+
+    /// The page-suggested name as a single path component that stays inside its directory.
+    static func downloadFileName(_ suggestedFilename: String) -> String {
+      let name = (suggestedFilename as NSString).lastPathComponent
+      return ["", ".", "..", "/"].contains(name) ? "download" : name
+    }
+
+    /// Hands the saved file to the share sheet, which offers Save to Files, AirDrop and Print.
+    func downloadDidFinish(_ download: WKDownload) {
+      guard let saved = downloadFiles.removeValue(forKey: download) else { return }
+      // The web view's window still presents while the app is inactive or backgrounded; a
+      // download that outlives its web view (e.g. a server switch) has nowhere to show.
+      guard let webView, isCurrent(webView), let presenter = downloadPresenter else {
+        try? FileManager.default.removeItem(at: saved.directory)
+        return
+      }
+      let share = UIActivityViewController(activityItems: [saved.file], applicationActivities: nil)
+      if let popover = share.popoverPresentationController {
+        popover.sourceView = webView
+        popover.sourceRect = CGRect(
+          x: webView.bounds.midX, y: webView.bounds.midY, width: 0, height: 0)
+        popover.permittedArrowDirections = []
+      }
+      share.completionWithItemsHandler = { _, _, _, _ in
+        try? FileManager.default.removeItem(at: saved.directory)
+      }
+      presenter.present(share, animated: true)
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+      if let saved = downloadFiles.removeValue(forKey: download) {
+        try? FileManager.default.removeItem(at: saved.directory)
+      }
+      guard let webView, isCurrent(webView), (error as NSError).code != NSURLErrorCancelled
+      else { return }
+      showDownloadFailure(error)
+    }
+
+    private var downloadPresenter: UIViewController? {
+      webView?.window?.rootViewController?.omnigentTopViewController
+    }
+
+    private func showDownloadFailure(_ error: Error) {
+      let alert = UIAlertController(
+        title: "Download failed", message: error.localizedDescription, preferredStyle: .alert)
+      alert.addAction(UIAlertAction(title: "OK", style: .default))
+      downloadPresenter?.present(alert, animated: true)
     }
 
     func webView(
@@ -1720,7 +1819,9 @@ struct OmnigentWebView: UIViewRepresentable {
       let nsError = error as NSError
       guard nsError.code != NSURLErrorCancelled else { return }
       if webStore != nil {
-        showWorkspaceFailure(DatabricksSessionError.networkUnavailable)
+        let failure = DatabricksTransportFailure(error)
+        NSLog("[omnigent] workspace page load failed: \(failure)")
+        showWorkspaceFailure(DatabricksSessionError.networkUnavailable(failure))
         return
       }
       parent.model.isLoading = false

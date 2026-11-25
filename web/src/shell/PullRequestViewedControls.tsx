@@ -2,24 +2,35 @@
 // checkbox in each file's header, and the progress and "Hide viewed" row in the toolbar.
 // The Changes tab renders them only while viewed state is available.
 
+import type { RefObject } from "react";
+import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Progress } from "@/components/ui/progress";
 
-/** The "Viewed" checkbox in a file's header. */
+/** The "Viewed" checkbox in a file's header, with a badge when the file changed since it was viewed. */
 export function PullRequestViewedToggle({
   path,
   viewed,
+  changed,
   onToggle,
 }: {
   path: string;
   viewed: boolean;
+  changed: boolean;
   onToggle: () => void;
 }) {
   return (
-    <label className="flex shrink-0 cursor-pointer items-center gap-1.5 px-1 text-xs text-muted-foreground">
-      <Checkbox checked={viewed} onCheckedChange={onToggle} aria-label={`Viewed ${path}`} />
-      Viewed
-    </label>
+    <div className="flex shrink-0 flex-col items-end gap-0.5">
+      <label className="flex cursor-pointer items-center gap-1.5 px-1 text-xs text-muted-foreground">
+        <Checkbox checked={viewed} onCheckedChange={onToggle} aria-label={`Viewed ${path}`} />
+        Viewed
+      </label>
+      {changed && (
+        <Badge variant="outline" className="text-xs">
+          Changed since viewed
+        </Badge>
+      )}
+    </div>
   );
 }
 
@@ -31,6 +42,7 @@ export function PullRequestViewedProgress({
   mobile,
   hideViewed,
   onHideViewedChange,
+  rowRef,
 }: {
   viewedCount: number;
   totalCount: number;
@@ -40,9 +52,14 @@ export function PullRequestViewedProgress({
   mobile: boolean;
   hideViewed: boolean;
   onHideViewedChange: (hide: boolean) => void;
+  /** Lets the Changes tab find the "Hide viewed" box to focus. */
+  rowRef: RefObject<HTMLDivElement | null>;
 }) {
   return (
-    <div className="flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground">
+    <div
+      ref={rowRef}
+      className="flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground"
+    >
       <span>{`${viewedCount} / ${totalCount} files viewed${partial ? " (partial)" : ""}`}</span>
       {!mobile && (
         <Progress

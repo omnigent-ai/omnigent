@@ -55,3 +55,38 @@ describe("useChangesViewState", () => {
     expect(result.current.revealedPaths.has("a.ts")).toBe(false);
   });
 });
+
+describe("useChangesViewState commit mode", () => {
+  it("opens a commit, leaves it for the commit list, and keeps the mode across remounts", () => {
+    const prUrl = "https://github.com/o/r/pull/9";
+    const { result, unmount } = renderHook(() => useChangesViewState("view-commits", prUrl));
+    expect(result.current.mode).toBe("changes");
+
+    act(() => result.current.setMode("commits"));
+    act(() => result.current.openCommit("c".repeat(40)));
+    expect(result.current.mode).toBe("commit");
+    expect(result.current.commitSha).toBe("c".repeat(40));
+    unmount();
+
+    const remounted = renderHook(() => useChangesViewState("view-commits", prUrl)).result.current;
+    expect([remounted.mode, remounted.commitSha]).toEqual(["commit", "c".repeat(40)]);
+
+    act(() => remounted.setMode("commits"));
+    expect(
+      renderHook(() => useChangesViewState("view-commits", prUrl)).result.current,
+    ).toMatchObject({ mode: "commits", commitSha: null });
+  });
+
+  it("keeps the Changes since commit across Commits and back", () => {
+    const prUrl = "https://github.com/o/r/pull/10";
+    const { result } = renderHook(() => useChangesViewState("view-since", prUrl));
+
+    act(() => result.current.setSinceSha("c".repeat(40)));
+    act(() => result.current.setMode("commits"));
+    act(() => result.current.setMode("changes"));
+    expect(result.current.sinceSha).toBe("c".repeat(40));
+
+    act(() => result.current.setSinceSha(null));
+    expect(result.current.sinceSha).toBeNull();
+  });
+});

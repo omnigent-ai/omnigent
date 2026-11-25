@@ -32,13 +32,14 @@ which this test deliberately does not depend on.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections.abc import Iterator
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, Locator, Page, expect
+from playwright.sync_api import Browser, Locator, Page, Route, expect
 
 from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
@@ -46,6 +47,7 @@ from tests.e2e_ui.collaboration._multi_user_server import (
     MultiUserServer,
     spawn_multi_user_server,
 )
+from tests.e2e_ui.sessions._sidebar_helpers import choose_session_filter
 
 # Edit access (2) is the interesting non-owner case: it proves the sidebar gates
 # on ownership, not level — an EDIT holder still can't rename/share from the
@@ -53,7 +55,13 @@ from tests.e2e_ui.collaboration._multi_user_server import (
 _LEVEL_EDIT = 2
 
 _FILTER = '[data-testid="session-filter"]'
-_FILTER_SHARED = '[data-testid="session-filter-shared"]'
+_API = re.compile(r"/v1/")
+_EDGE_DENIED_BODY = json.dumps(
+    {
+        "error_code": "PERMISSION_DENIED",
+        "message": "You do not have permission to access this resource.",
+    }
+)
 
 
 @pytest.fixture(scope="module")
@@ -129,6 +137,38 @@ def test_owner_sees_session_under_my_sessions_with_enabled_actions(
         expect(page.get_by_test_id("rename-conversation-input")).to_be_visible(timeout=15_000)
 
 
+def test_owner_session_returns_to_my_sessions_after_brief_403_outage(
+    page: Page,
+    multi_user_server: MultiUserServer,
+) -> None:
+    """A reload during a brief edge 403 outage must not hide owned sessions once access returns."""
+    server = multi_user_server
+    sid = server.session_id
+    page.set_extra_http_headers({"X-Forwarded-Email": ADMIN_EMAIL})
+    page.goto(f"{server.public_url}/")
+    expect(_row(page, sid)).to_be_visible(timeout=30_000)
+
+    def deny(route: Route) -> None:
+        route.fulfill(status=403, content_type="application/json", body=_EDGE_DENIED_BODY)
+
+    page.route(_API, deny)
+    page.reload()
+    load_error = page.get_by_role("status").filter(has_text="Failed to load")
+    expect(load_error).to_be_visible(timeout=30_000)
+
+    page.unroute(_API, deny)
+    load_error.get_by_role("button", name="Retry").click()
+    # Retry refetches only the session list; the identity retry restores ownership.
+    expect(_row(page, sid)).to_be_visible(timeout=60_000)
+    _open_row_menu(page, sid)
+    expect(page.get_by_test_id("rename-conversation")).not_to_have_attribute(
+        "data-disabled", re.compile(r".*")
+    )
+    expect(page.get_by_test_id("share-conversation")).not_to_have_attribute(
+        "data-disabled", re.compile(r".*")
+    )
+
+
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
     browser: Browser,
@@ -152,8 +192,7 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
         # The shared session is not the viewer's own, so the default "My
         # sessions" filter hides it; it shows under the "Shared with me" filter.
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
-        page.locator(_FILTER).click()
-        page.locator(_FILTER_SHARED).click()
+        choose_session_filter(page, "shared")
         expect(_row(page, sid)).to_be_visible(timeout=30_000)
 
         _open_row_menu(page, sid)

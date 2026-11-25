@@ -25,6 +25,7 @@ export function scopeBoundaryRow<T extends ScopeBoundary>(
 }
 
 function boundaryOf(page: ConversationsPage): ScopeBoundary | undefined {
+  if (page.page_boundary !== undefined) return page.page_boundary ?? undefined;
   const row = scopeBoundaryRow(page.data, page.last_id);
   return row && { id: row.id, updated_at: row.updated_at, created_at: row.created_at };
 }
@@ -36,7 +37,7 @@ export function refreshScopeWindow(
   limit: number,
   sortBy: SessionSortBy = "updated_at",
 ): ScopeCacheData {
-  const compare = (a: Conversation, b: Conversation) => compareSessionRows(a, b, sortBy);
+  const compare = (a: ScopeBoundary, b: ScopeBoundary) => compareSessionRows(a, b, sortBy);
   const windowSize =
     current?.windowSize ?? Math.max(limit, current?.pages.flatMap((page) => page.data).length ?? 0);
   if (windowSize <= limit || !incoming.has_more) {
@@ -51,7 +52,7 @@ export function refreshScopeWindow(
     };
   }
   const previous = current?.pages.flatMap((page) => page.data) ?? [];
-  const incomingTail = incoming.data.at(-1);
+  const incomingTail = boundaryOf(incoming);
   const older = incomingTail ? previous.filter((row) => compare(row, incomingTail) > 0) : previous;
   const rows = dedupeSessionRows([...older, ...incoming.data]).sort(compare);
   const overlaps = incomingTail && previous.some((row) => row.id === incomingTail.id);
@@ -108,7 +109,11 @@ export function compareSessionRows(
   return b[sortBy] - a[sortBy] || b.id.localeCompare(a.id);
 }
 
-/** Only the merged prefix above both unfinished scopes' tails is complete. */
+/**
+ * Only the merged prefix above both unfinished scopes' tails is complete, so a
+ * list mixing both scopes shows `rows`. `loaded` keeps every loaded row, for
+ * layouts that list each scope in its own section.
+ */
 export function mergeScopeRows(
   mine: Conversation[],
   shared: Conversation[],
@@ -119,7 +124,7 @@ export function mergeScopeRows(
   sortBy: SessionSortBy = "updated_at",
   mineBoundary?: ScopeBoundary,
   sharedBoundary?: ScopeBoundary,
-): { rows: Conversation[]; watermark: ScopeBoundary | undefined } {
+): { rows: Conversation[]; loaded: Conversation[]; watermark: ScopeBoundary | undefined } {
   const compare = (a: ScopeBoundary, b: ScopeBoundary) => compareSessionRows(a, b, sortBy);
   // Prefer the cursor as fetched: a pushed bump can lift the live cursor row,
   // and a watermark taken from it would hide every row below.
@@ -134,9 +139,18 @@ export function mergeScopeRows(
     .filter((row): row is ScopeBoundary => row !== undefined)
     .sort(compare);
   const watermark = tails[0];
-  const rows = dedupeSessionRows([...mine, ...shared]).sort(compare);
+  const loaded = dedupeSessionRows([...mine, ...shared]).sort(compare);
+  const visibleFamilies = new Set(
+    loaded.filter((row) => !watermark || compare(row, watermark) <= 0).map((row) => row.family?.id),
+  );
   return {
-    rows: watermark ? rows.filter((row) => compare(row, watermark) <= 0) : rows,
+    rows: watermark
+      ? loaded.filter(
+          (row) =>
+            compare(row, watermark) <= 0 || (row.family && visibleFamilies.has(row.family.id)),
+        )
+      : loaded,
+    loaded,
     watermark,
   };
 }

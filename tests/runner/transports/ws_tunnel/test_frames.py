@@ -255,6 +255,24 @@ def test_ping_pong_round_trip() -> None:
     assert decoded_o.ts == 1709654400000
 
 
+@pytest.mark.parametrize("keep_warm", [True, False])
+def test_pong_keep_warm_round_trips(keep_warm: bool) -> None:
+    frame = PongFrame(ts=7, keep_warm=keep_warm)
+    assert decode_frame(encode_frame(frame)) == frame
+
+
+def test_unreported_pong_keep_warm_stays_off_the_wire() -> None:
+    # Older servers and peers that do not report see the pong unchanged.
+    assert json.loads(encode_frame(PongFrame(ts=7))) == {"kind": "pong", "ts": 7}
+    assert decode_frame('{"kind": "pong", "ts": 7}') == PongFrame(ts=7, keep_warm=None)
+
+
+def test_non_boolean_pong_keep_warm_is_treated_as_unreported() -> None:
+    for raw in ('"yes"', "1", "null"):
+        decoded = decode_frame('{"kind": "pong", "ts": 7, "keep_warm": ' + raw + "}")
+        assert decoded == PongFrame(ts=7, keep_warm=None)
+
+
 # ── Decode failure modes ─────────────────────────────────
 
 
@@ -364,6 +382,14 @@ def test_encode_body_picks_base64_for_binary() -> None:
     assert encoding == "base64"
     # decode_body round-trips back to the same bytes.
     assert decode_body(body, encoding) == b"\x89PNG"
+
+
+@pytest.mark.parametrize("payload", [b"\xc3", b"\xa9", b"\xff", b"prefix\xc3"])
+@pytest.mark.parametrize("content_type", ["text/plain", "application/json"])
+def test_encode_body_preserves_non_utf8_text_bytes(payload: bytes, content_type: str) -> None:
+    body, encoding = encode_body(payload, content_type)
+    assert encoding == "base64"
+    assert decode_body(body, encoding) == payload
 
 
 def test_decode_body_round_trips_both_encodings() -> None:

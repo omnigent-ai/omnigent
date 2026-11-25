@@ -62,6 +62,15 @@ _CONTENT_LENGTH_PHRASE = re.compile(r"exceeds maximum allowed content length", r
 _REQUEST_LIMIT_PAIR = re.compile(
     r"RequestSize\(bytes\):\s*(\d+),\s*Limit\(bytes\):\s*(\d+)", re.IGNORECASE
 )
+# Gateway wording that states the cap without the byte fields.
+_REQUEST_SIZE_LIMIT_WORDING = re.compile(
+    r"request size exceeds the maximum allowed limit", re.IGNORECASE
+)
+# Shown in place of a request-size rejection; names both ways out of the overflow.
+REQUEST_SIZE_OVERFLOW_GUIDANCE = (
+    "Context limit reached — this conversation is too large for the model gateway's "
+    "request size limit. Compact the conversation or start a new session to continue."
+)
 
 # Rough bytes-per-token ratio for expressing a byte-cap rejection in the
 # token units the context-overflow plumbing carries.
@@ -119,6 +128,18 @@ def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
         # Python caps int(str) at 4300 digits; a malformed oversized field must
         # not crash classification, so treat it as an unrecognized message.
         return None
+
+
+def is_request_size_rejection(message: str) -> bool:
+    """Whether *message* is a gateway rejection for a request body over its byte cap.
+
+    :param message: Error text, e.g. a raw response body or a harness-reported string.
+    :returns: ``True`` for the sized front-door wording or the wording without byte fields.
+    """
+    return (
+        detect_request_size_overflow(message) is not None
+        or _REQUEST_SIZE_LIMIT_WORDING.search(message) is not None
+    )
 
 
 def llm_error_category(code: str) -> ErrorCategory:

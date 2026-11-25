@@ -14,7 +14,7 @@ import { useSyncExternalStore, type ReactElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
@@ -65,6 +65,8 @@ const mocks = vi.hoisted(() => {
     projects: [] as string[],
     projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
+    moveToNest: { mutate: vi.fn(), isPending: false },
+    searchRows: [] as Conversation[],
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
     // owned by someone else is the shared case Leave applies to.
@@ -77,7 +79,8 @@ const mocks = vi.hoisted(() => {
 // Mock the mobile-viewport hook — jsdom doesn't evaluate media queries, so
 // drive it explicitly. Defaults to desktop (false); the mobile flyout test
 // flips `mocks.isMobile` for the duration of that case.
-vi.mock("@/hooks/useIsMobileViewport", () => ({
+vi.mock(import("@/hooks/useIsMobileViewport"), async (importOriginal) => ({
+  ...(await importOriginal()),
   useIsMobileViewport: () => mocks.isMobile,
 }));
 
@@ -124,6 +127,19 @@ vi.mock("@/hooks/useConversations", async () => {
       isFetchingNextPage: false,
     }),
     useMoveToProject: () => mocks.moveToProject,
+    useMoveToNest: () => mocks.moveToNest,
+    useSessionSearch: (query: string) => ({
+      data: {
+        pages: [
+          {
+            data: mocks.searchRows.filter((row) =>
+              row.title?.toLowerCase().includes(query.toLowerCase()),
+            ),
+          },
+        ],
+      },
+      isFetching: false,
+    }),
   };
 });
 
@@ -141,6 +157,11 @@ vi.mock("./ForkSessionDialog", () => ({
 // Force a multi-user (non-local) server so the "Shared with me" tab renders —
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
+vi.mock("@/components/scheduled/CreateAutomationFromSessionDialog", () => ({
+  CreateAutomationFromSessionDialog: ({ conversation }: { conversation: { id: string } }) => (
+    <div data-testid="create-automation-dialog" data-conversation-id={conversation.id} />
+  ),
+}));
 vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 // Pin "who am I": ownership (and therefore Leave, which revokes the viewer's
 // own grant) is derived from this id. Unmocked it resolves to null in jsdom,
@@ -220,6 +241,11 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
+function CurrentPath() {
+  const location = useLocation();
+  return <span data-testid="current-path">{`${location.pathname}${location.search}`}</span>;
+}
+
 // `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
 // Route so `useParams` populates), making that row the active one — the
 // rest of the suite renders at `/` where no row is active. `info` pins the
@@ -274,11 +300,24 @@ function renderSidebar(
   });
 }
 
+/** Switch the session list to sessions shared with the viewer. */
+function openSharedTab() {
+  // Radix Tabs triggers activate on mousedown (primary button), not click.
+  fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+  fireEvent.click(screen.getByTestId("session-filter-shared"));
+}
+
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
   mocks.rename.isSuccess = false;
   mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
+  mocks.moveToNest.mutate.mockReset();
+  mocks.searchRows = [];
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
   mocks.projectIcons = {};
@@ -374,30 +413,23 @@ describe("quick pin/unpin hover button", () => {
     expect(iconSelector.querySelector("svg")).toHaveClass("text-primary");
   });
 
-  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
+  it("keeps the Projects group-header actions visible on mobile, hover-revealed on desktop", () => {
     // The "New project" (+) button is the only way to create a project, so its
-    // group-header wrapper must stay visible wherever hover is unavailable —
-    // phones AND touch tablets at `md`+ widths — rather than fade out like the
-    // desktop-only session-header controls. jsdom doesn't evaluate media
-    // queries, so assert the responsive classes: base `flex` (shown at every
-    // breakpoint) with the fade + hover/focus reveals gated on hover
-    // capability, not just the `md` width.
+    // group-header wrapper must stay visible in the mobile layout. jsdom doesn't
+    // evaluate media queries, so assert the responsive classes: base `flex`
+    // (shown at every breakpoint) with the fade + hover/focus reveals from `md`.
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
     expect(wrapper).not.toBeNull();
-    // Visible without hover: base display is `flex`, never `hidden`, and the
-    // fade is not applied by viewport width alone.
     expect(wrapper).toHaveClass("flex");
     expect(wrapper).not.toHaveClass("hidden");
-    expect(wrapper).not.toHaveClass("md:opacity-0");
-    // Hover-capable desktop: fades out until the header is hovered / focused /
-    // a menu opens.
+    // Desktop: fades out until the header is hovered / focused / a menu opens.
     expect(wrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:has-[:focus-visible]:opacity-100",
     );
   });
 
@@ -880,16 +912,6 @@ describe("leave a shared session", () => {
   // sidebar without touching the owner's copy.
 
   /** Switch to the "Shared with me" tab, where non-owned rows live. */
-  function openSharedTab() {
-    // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    fireEvent.click(screen.getByTestId("session-filter-shared"));
-  }
-
   it("offers Leave on a shared row and calls the mutation after confirming", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
@@ -1102,6 +1124,84 @@ describe("pinned row project flyout", () => {
     // Focusing the row opens nothing — the flyout never mounts on mobile.
     fireEvent.focus(row);
     expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
+});
+
+describe("two-step move menu", () => {
+  it.each([false, true])("offers searchable Projects and Nests (mobile=%s)", async (mobile) => {
+    mocks.isMobile = mobile;
+    mocks.projects = ["Sprint 42"];
+    const destination = {
+      ...CONV,
+      id: "destination",
+      title: "Destination nest",
+      family: {
+        id: "other",
+        pinned: false,
+        representative_id: "destination",
+        representative_title: "Destination nest",
+      },
+    };
+    mockConversations([
+      { ...CONV, family: { id: "current", representative_id: CONV.id, pinned: false } },
+      destination,
+    ]);
+    const view = renderSidebar(
+      undefined,
+      serverInfo({ sibling_sessions: true, session_nest_moves: true }),
+    );
+    const open = async (item: HTMLElement) => {
+      if (mobile) fireEvent.click(item);
+      else {
+        item.focus();
+        fireEvent.keyDown(item, { key: "ArrowRight" });
+      }
+    };
+    fireEvent.pointerDown(
+      within(
+        document.querySelector('li[data-sidebar-session-id="conv_1"]') as HTMLElement,
+      ).getByTestId("conversation-actions"),
+      { button: 0 },
+    );
+    expect(screen.queryByRole("menuitem", { name: "Remove from nest" })).toBeNull();
+    await open(screen.getByTestId("move-to-project"));
+    expect(await screen.findByRole("menuitem", { name: "Projects" })).toBeInTheDocument();
+    await open(screen.getByRole("menuitem", { name: "Projects" }));
+    expect(await screen.findByPlaceholderText("Search or create project")).toBeInTheDocument();
+    if (mobile) fireEvent.click(screen.getByTestId("project-picker-back"));
+    await open(screen.getByRole("menuitem", { name: "Nests" }));
+    const search = await screen.findByPlaceholderText("Search nests");
+    fireEvent.change(search, { target: { value: "missing" } });
+    expect(screen.queryByRole("menuitem", { name: "Destination nest" })).toBeNull();
+    fireEvent.change(search, { target: { value: "Destination" } });
+    expect(screen.getByRole("menuitem", { name: "Destination nest" })).toBeInTheDocument();
+    const remote = {
+      ...destination,
+      id: "remote",
+      title: "Member session",
+      family: {
+        ...destination.family,
+        id: "remote",
+        representative_id: "remote",
+        representative_title: "Remote nest",
+      },
+    };
+    mocks.searchRows = [remote];
+    fireEvent.change(search, { target: { value: "Member" } });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remote nest" }));
+    expect(mocks.moveToNest.mutate).toHaveBeenCalledWith({ id: CONV.id, destination: remote });
+    view.unmount();
+    renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
+    fireEvent.pointerDown(
+      within(
+        document.querySelector('li[data-sidebar-session-id="conv_1"]') as HTMLElement,
+      ).getByTestId("conversation-actions"),
+      { button: 0 },
+    );
+    await open(screen.getByTestId("move-to-project"));
+    await open(await screen.findByRole("menuitem", { name: "Nests" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from nest" }));
+    expect(mocks.moveToNest.mutate).toHaveBeenLastCalledWith({ id: CONV.id, destination: null });
   });
 });
 
@@ -1337,6 +1437,39 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("offers no new window on a mobile viewport", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("open-session-window")).toBeNull();
+  });
+
+  it.each([
+    ["while it shows that session", "conv_1", false],
+    ["after it moved to another session", "conv_2", true],
+  ])("offers a pop-out's own session a new window only %s", (_name, shownId, offered) => {
+    mockConversations([CONV, { ...CONV, id: "conv_2", title: "Other Session" }]);
+    document.documentElement.dataset.sessionWindow = "true";
+    document.documentElement.dataset.sessionWindowFor = "conv_1";
+    try {
+      renderSidebar(shownId);
+
+      fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+      expect(screen.queryByTestId("open-session-window") !== null).toBe(offered);
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+      fireEvent.contextMenu(screen.getByRole("link", { name: /Other Session/ }));
+      expect(screen.getByTestId("open-session-window")).toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.sessionWindow;
+      delete document.documentElement.dataset.sessionWindowFor;
+    }
+  });
+
   it("offers Fork for a managed source", () => {
     mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
     renderSidebar();
@@ -1374,28 +1507,72 @@ describe("right-click context menu", () => {
     },
   );
 
-  it("opens the same action items as the kebab and drives the same handlers", () => {
-    renderSidebar();
+  it.each(["kebab", "context"])(
+    "opens the shared actions from %s and drives their handlers",
+    (menu) => {
+      renderSidebar(undefined, serverInfo({ sibling_sessions: true }));
 
-    // Nothing in the DOM until the row is right-clicked (the kebab menu is
-    // closed, so its items aren't rendered either).
-    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+      // Nothing in the DOM until the row is right-clicked (the kebab menu is
+      // closed, so its items aren't rendered either).
+      expect(screen.queryByTestId("rename-conversation")).toBeNull();
 
-    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      if (menu === "kebab") {
+        fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+      } else {
+        fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      }
+      const addAgent = screen.getByTestId("add-sibling-session");
+      expect(screen.getAllByRole("menuitem")[0]).toBe(addAgent);
+      expect(addAgent.nextElementSibling).toHaveAttribute("role", "separator");
 
-    // The context menu carries the full set of kebab actions — same testids,
-    // so it renders from the shared ConversationMenuItems body.
-    expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("move-to-project")).toBeInTheDocument();
-    expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+      // The context menu carries the full set of kebab actions — same testids,
+      // so it renders from the shared ConversationMenuItems body.
+      expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("move-to-project")).toBeInTheDocument();
+      expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
 
-    // Selecting Rename runs the same path as the kebab / double-click: the
-    // inline rename input appears.
-    fireEvent.click(screen.getByTestId("rename-conversation"));
-    expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
-  });
+      // Selecting Rename runs the same path as the kebab / double-click: the
+      // inline rename input appears.
+      fireEvent.click(screen.getByTestId("rename-conversation"));
+      expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+    },
+  );
+
+  it.each(["kebab", "context"])(
+    "opens another session in its own window from %s without leaving the current page",
+    (menu) => {
+      const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
+      const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+      try {
+        mockConversations([CONV, { ...CONV, id: "conv_2", title: "Current Session" }]);
+        renderSidebar("conv_2", undefined, { header: <CurrentPath /> });
+        const targetRow = screen.getByRole("link", { name: /My Session/ });
+
+        if (menu === "kebab") {
+          fireEvent.pointerDown(
+            within(targetRow.closest("li")!).getByTestId("conversation-actions"),
+            { button: 0 },
+          );
+        } else {
+          fireEvent.contextMenu(targetRow);
+        }
+        fireEvent.click(screen.getByTestId("open-session-window"));
+
+        expect(open).toHaveBeenCalledWith(
+          "",
+          "omnigent-session-conv_1",
+          "popup,width=960,height=820",
+        );
+        expect(popup.location.href).toBe("/c/conv_1?window=session");
+        expect(popup.focus).toHaveBeenCalled();
+        expect(screen.getByTestId("current-path")).toHaveTextContent(/^\/c\/conv_2$/);
+      } finally {
+        open.mockRestore();
+      }
+    },
+  );
 
   it("holds the list order under the pointer so a right-click rename hits the aimed row", () => {
     // A right-click is a single event, so nothing can cross-check it like the
@@ -1567,6 +1744,64 @@ describe("sharing kill switch", () => {
 
     expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
+  });
+});
+
+describe("create automation from a session", () => {
+  const AUTOMATION_INFO = {
+    automations_enabled: true,
+    scheduled_task_source_sessions: true,
+  } satisfies Partial<ServerInfo>;
+  const AGENT_SESSION: Conversation = { ...CONV, agent_id: "ag_1" };
+
+  it("offers Create automation right below Mark as unread and opens the dialog for the session", () => {
+    mockConversations([AGENT_SESSION]);
+    renderSidebar(undefined, serverInfo(AUTOMATION_INFO));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    const items = screen.getAllByRole("menuitem");
+    const readState = items.indexOf(screen.getByTestId("mark-unread-conversation"));
+    expect(items[readState + 1]).toBe(screen.getByTestId("create-automation-from-session"));
+    expect(items[readState + 1]).toHaveTextContent(/^Create automation$/);
+
+    fireEvent.click(screen.getByTestId("create-automation-from-session"));
+    expect(screen.getByTestId("create-automation-dialog")).toHaveAttribute(
+      "data-conversation-id",
+      "conv_1",
+    );
+  });
+
+  it.each([
+    [
+      "automations are off",
+      serverInfo({ ...AUTOMATION_INFO, automations_enabled: false }),
+      AGENT_SESSION,
+    ],
+    [
+      "the server can't copy sessions",
+      serverInfo({ ...AUTOMATION_INFO, scheduled_task_source_sessions: false }),
+      AGENT_SESSION,
+    ],
+    [
+      "an automation already runs from the session",
+      serverInfo(AUTOMATION_INFO),
+      { ...AGENT_SESSION, labels: { "omnigent.scheduled_task_source": "st_1" } },
+    ],
+    [
+      "the viewer doesn't own the session",
+      serverInfo(AUTOMATION_INFO),
+      { ...AGENT_SESSION, owner: "someone@example.com", permission_level: 1 },
+    ],
+  ])("leaves it out when %s", (_reason, info, conversation) => {
+    mockConversations([conversation]);
+    renderSidebar(undefined, info);
+    if (conversation.owner) openSharedTab();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("fork-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("create-automation-from-session")).toBeNull();
   });
 });
 

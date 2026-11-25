@@ -12,12 +12,19 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog, ForkSessionForm } from "./ForkSessionDialog";
 import { beginClone, cloneKey, pendingClones } from "./cloneRequests";
 import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
 import { fetchSandboxProfiles, SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
+import {
+  clearRecentlyCreated,
+  recentlyCreatedSessions,
+  type ConversationsInfiniteData,
+} from "@/lib/sessionListCache";
+import type { Conversation } from "@/hooks/useConversations";
 import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
@@ -33,14 +40,18 @@ import {
   hostDirectoryMissing,
   useHostFilesystem,
 } from "@/hooks/useHostFilesystem";
+import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
+import type * as SandboxLaunchModule from "@/hooks/useSandboxLaunchSelectionCheck";
 import { toast } from "sonner";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<typeof ReactRouterDomModule>();
   return { ...actual, useNavigate: () => navigateMock };
 });
-vi.mock("@/lib/sessionsApi", () => ({
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
   fetchSessionRepositoryBranches: vi.fn(),
   forkSession: vi.fn(),
   launchRunner: vi.fn(),
@@ -68,6 +79,11 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   checkHostDirectory: vi.fn(),
   hostDirectoryMissing: vi.fn(),
+}));
+// The chat page consumes the registration; these tests check what a fork registers.
+vi.mock("@/hooks/useSandboxLaunchSelectionCheck", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxLaunchModule>()),
+  markSandboxLaunch: vi.fn(),
 }));
 // The tree browser only mounts when browsing; coding-fork tests rely on the
 // directory being prefilled from the source, so the real picker never opens —
@@ -104,6 +120,7 @@ const checkHostDirectoryMock = vi.mocked(checkHostDirectory);
 const hostDirectoryMissingMock = vi.mocked(hostDirectoryMissing);
 const prefetchAvailableAgentDetailsMock = vi.mocked(prefetchAvailableAgentDetails);
 const toastMock = vi.mocked(toast);
+const markSandboxLaunchMock = vi.mocked(markSandboxLaunch);
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -115,13 +132,18 @@ function host(overrides: Partial<Host> = {}): Host {
   } as Host;
 }
 
-// Mirrors fetchHosts: pickers never see server-managed sandbox hosts; only
-// includeSandbox callers (the action-restrictions lookup) do.
+// Mirrors fetchHosts: pickers hide managed sandboxes except for an explicitly
+// reusable source host; includeSandbox callers see the full list.
 function setHosts(hosts: Host[]): void {
   useHostsMock.mockImplementation(
     (options) =>
       ({
-        data: options?.includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider),
+        data: options?.includeSandbox
+          ? hosts
+          : hosts.filter(
+              (candidate) =>
+                !candidate.sandbox_provider || candidate.host_id === options?.sourceHostId,
+            ),
       }) as ReturnType<typeof useHosts>,
   );
 }
@@ -225,7 +247,14 @@ function renderDialog(
     Object.assign(form, next);
     utils.rerender(strict());
   };
-  return { ...utils, invalidateSpy, onClose, update, refresh: () => utils.rerender(strict()) };
+  return {
+    ...utils,
+    invalidateSpy,
+    client,
+    onClose,
+    update,
+    refresh: () => utils.rerender(strict()),
+  };
 }
 
 type ForkResponse = Awaited<ReturnType<typeof forkSession>>;
@@ -325,14 +354,20 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useHostFilesystem>);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  clearRecentlyCreated();
+});
 
 describe("ForkSessionDialog", () => {
   it.each([
-    ["managed snapshot", null],
-    ["Arclet host", "arclet"],
-    ["Databricks Sandbox host", "lakebox"],
-  ])("offers every destination to a %s source", (source, provider) => {
+    ["managed snapshot", null, true],
+    ["Arclet host", "arclet", true],
+    ["Databricks Sandbox host", "lakebox", true],
+    ["managed snapshot", null, false],
+    ["Arclet host", "arclet", false],
+    ["Databricks Sandbox host", "lakebox", false],
+  ])("offers supported destinations to a %s source (%s, reuse: %s)", (source, provider, reuse) => {
     useSessionMock.mockReturnValue({
       session: {
         hostId: "host_1",
@@ -341,20 +376,34 @@ describe("ForkSessionDialog", () => {
       isLoading: false,
       error: null,
     } as ReturnType<typeof useSession>);
-    setHosts([host({ sandbox_provider: provider }), host({ host_id: "host_2", name: "laptop" })]);
+    setHosts([
+      host({ sandbox_provider: provider }),
+      host({ host_id: "host_2", name: "laptop" }),
+      host({ host_id: "unrelated", sandbox_provider: "arclet" }),
+    ]);
     renderDialog({
       sourceHostId: "host_1",
       sourceWorkspace: "/Users/a/repo",
-      info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+      info: {
+        managed_sandboxes_enabled: true,
+        sandbox_providers: ["lakebox", "arclet"],
+        sibling_sessions: reuse,
+      },
     });
 
     expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
     expect(screen.getByTestId("fork-session-connect-host-toggle")).toBeInTheDocument();
     openHostSelect();
     expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
-    // A source's own sandbox host is never offered as an existing destination.
-    if (provider !== null) {
-      expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
+    // Embedded managed markers alone do not identify a core sandbox host.
+    expect(screen.queryByTestId("fork-session-host-option-host_1") !== null).toBe(
+      reuse || provider === null,
+    );
+    expect(screen.queryByTestId("fork-session-host-option-unrelated")).not.toBeInTheDocument();
+    if (reuse && provider) {
+      expect(screen.getByTestId("fork-session-host-option-host_1")).toHaveTextContent(
+        "Same sandbox",
+      );
     }
     expect(screen.getByTestId("fork-session-sandbox-option")).toBeInTheDocument();
     expect(screen.getByTestId("fork-session-sandbox-option-arclet")).toBeInTheDocument();
@@ -413,9 +462,28 @@ describe("ForkSessionDialog", () => {
   it("forks with the edited title, refreshes the list, and navigates into the fork", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",
+      title: "My clone",
+      createdAt: 1_700_000_000,
+      labels: {},
+      permissionLevel: null,
+      agentId: "ag_source",
+      parentSessionId: null,
     } as unknown as Awaited<ReturnType<typeof forkSession>>);
 
-    const { invalidateSpy } = renderDialog();
+    const { client, invalidateSpy } = renderDialog();
+    const existing: Conversation = {
+      id: "conv_old",
+      object: "conversation",
+      title: "Older",
+      created_at: 1,
+      updated_at: 1,
+      labels: {},
+      permission_level: null,
+    };
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+      pages: [{ data: [existing], first_id: "conv_old", last_id: "conv_old", has_more: false }],
+      pageParams: [undefined],
+    });
 
     openAdvanced();
     fireEvent.change(screen.getByTestId("fork-session-title-input"), {
@@ -443,6 +511,17 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
     expect(toastMock).not.toHaveBeenCalled();
     expect(toastMock.success).not.toHaveBeenCalled();
+
+    const page = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+      .pages[0];
+    expect(page.data.map((c) => c.id)).toEqual(["conv_fork", "conv_old"]);
+    expect(page.data[0]).toMatchObject({
+      title: "My clone",
+      created_at: 1_700_000_000,
+      updated_at: 1_700_000_000,
+      agent_id: "ag_source",
+    });
+    expect(recentlyCreatedSessions.has("conv_fork")).toBe(true);
   });
 
   it("spins the submit button while the fork is in flight", async () => {
@@ -529,6 +608,27 @@ describe("ForkSessionDialog", () => {
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+  });
+
+  it("does not fork on the Enter that confirms an IME candidate", async () => {
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+
+    renderDialog();
+
+    openAdvanced();
+    const input = screen.getByTestId("fork-session-title-input");
+    // Chrome flags the confirming Enter with keyCode 229; Safari sends a plain
+    // Enter before compositionend, so only the tracked composition catches it.
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    fireEvent.compositionStart(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.compositionEnd(input);
+    expect(forkSessionMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
   });
 
   it("surfaces the server error inline on failure and does not navigate", async () => {
@@ -973,6 +1073,100 @@ describe("ForkSessionDialog", () => {
     });
   });
 
+  describe("Codex run settings", () => {
+    const models = [
+      {
+        id: "reasoner",
+        displayName: "Reasoner",
+        isDefault: true,
+        supportedReasoningEfforts: [{ reasoningEffort: "minimal" }, { reasoningEffort: "high" }],
+      },
+      {
+        id: "quick",
+        displayName: "Quick",
+        supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+      },
+      { id: "basic", displayName: "Basic", supportedReasoningEfforts: [] },
+    ];
+
+    beforeEach(() => {
+      useHostModelOptionsMock.mockReturnValue({
+        data: models,
+        isLoading: false,
+      } as ReturnType<typeof useHostModelOptions>);
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+    });
+
+    it("sends a chosen Codex effort without changing approval settings", async () => {
+      renderDialog();
+      openAgentSelect();
+      fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_codex_native"));
+      fireEvent.click(screen.getByLabelText("Reasoning effort"));
+      expect(screen.queryByRole("option", { name: "Max" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("option", { name: "Minimal" }));
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({ reasoningEffort: "minimal" });
+    });
+
+    it.each(["Quick", "Basic"])(
+      "clears an unsupported effort when switching to %s",
+      async (nextModel) => {
+        renderDialog();
+        openAgentSelect();
+        fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_codex_native"));
+        fireEvent.click(screen.getByLabelText("Reasoning effort"));
+        fireEvent.click(screen.getByRole("option", { name: "High" }));
+        fireEvent.click(screen.getByTestId("fork-session-config-model"));
+        fireEvent.click(screen.getByRole("option", { name: nextModel }));
+
+        if (nextModel === "Quick") {
+          expect(screen.getByLabelText("Reasoning effort")).toHaveTextContent("Default");
+          fireEvent.click(screen.getByLabelText("Reasoning effort"));
+          expect(screen.queryByRole("option", { name: "High" })).not.toBeInTheDocument();
+          expect(screen.getByRole("option", { name: "Low" })).toBeInTheDocument();
+          fireEvent.click(screen.getByRole("option", { name: "Default" }));
+        } else {
+          expect(screen.queryByLabelText("Reasoning effort")).not.toBeInTheDocument();
+        }
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({
+          modelOverride: nextModel.toLowerCase(),
+          reasoningEffort: "default",
+        });
+      },
+    );
+
+    it("preserves untouched inherited settings while the catalog loads", async () => {
+      setAgents(AVAILABLE_AGENTS, "codex-native");
+      useSessionMock.mockReturnValue({
+        session: { modelOverride: "reasoner", reasoningEffort: "minimal" },
+        isLoading: false,
+        error: null,
+      } as ReturnType<typeof useSession>);
+      useHostModelOptionsMock.mockReturnValue({
+        data: undefined,
+        isLoading: true,
+      } as ReturnType<typeof useHostModelOptions>);
+      const { refresh } = renderDialog();
+      expect(screen.queryByLabelText("Reasoning effort")).not.toBeInTheDocument();
+
+      useHostModelOptionsMock.mockReturnValue({
+        data: models,
+        isLoading: false,
+      } as ReturnType<typeof useHostModelOptions>);
+      refresh();
+      expect(screen.getByLabelText("Reasoning effort")).toHaveTextContent("Minimal");
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({});
+    });
+  });
+
   it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",
@@ -1029,31 +1223,45 @@ describe("ForkSessionDialog", () => {
     };
 
     it.each([
-      ["plain directory", "/Users/a/repo", null],
-      ["worktree", RECOVERY.sourceWorkspace, RECOVERY.sourceGitBranch],
-      ["worktree without a recorded branch", RECOVERY.sourceWorkspace, null],
-    ])("requires a directory instead of prefilling the missing %s", (_name, workspace, branch) => {
-      renderDialog({ ...RECOVERY, sourceWorkspace: workspace, sourceGitBranch: branch });
+      ["plain directory", "/Users/a/repo", null, null],
+      ["worktree", RECOVERY.sourceWorkspace, RECOVERY.sourceGitBranch, null],
+      ["worktree without a recorded branch", RECOVERY.sourceWorkspace, null, null],
+      ["sandbox directory", "/Users/a/repo", null, "modal"],
+    ])(
+      "requires a directory instead of prefilling the missing %s",
+      (_name, workspace, branch, provider) => {
+        if (provider) setHosts([host({ sandbox_provider: provider })]);
+        renderDialog({
+          ...RECOVERY,
+          sourceWorkspace: workspace,
+          sourceGitBranch: branch,
+          info: { sibling_sessions: true },
+        });
 
-      expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
-      expect(
-        screen.getByText(
-          "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.",
-        ),
-      ).toBeVisible();
-      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
-      expect(screen.getByTestId("workspace-path-input")).toBeVisible();
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
-      // Offered up front, but never prefilled with the missing worktree's branch.
-      expect(screen.getByTestId("fork-session-branch-input")).toBeVisible();
-      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
-      expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Continue" })).toHaveAttribute(
-        "aria-disabled",
-        "true",
-      );
-      expect(forkSessionMock).not.toHaveBeenCalled();
-    });
+        expect(
+          screen.getByRole("heading", { name: "Continue in another directory" }),
+        ).toBeVisible();
+        expect(
+          screen.getByText(
+            "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.",
+          ),
+        ).toBeVisible();
+        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent(
+          provider ? "Same sandbox" : "serena-laptop",
+        );
+        expect(screen.getByTestId("workspace-path-input")).toBeVisible();
+        expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+        // Offered up front, but never prefilled with the missing worktree's branch.
+        expect(screen.getByTestId("fork-session-branch-input")).toBeVisible();
+        expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
+        expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Continue" })).toHaveAttribute(
+          "aria-disabled",
+          "true",
+        );
+        expect(forkSessionMock).not.toHaveBeenCalled();
+      },
+    );
 
     it("rejects a missing chosen path without recreating its worktree or creating a session", async () => {
       checkHostDirectoryMock.mockResolvedValue("The working directory doesn't exist on this host.");
@@ -1796,6 +2004,7 @@ describe("ForkSessionDialog", () => {
           info: {
             features: { sandbox_profiles: true },
             managed_sandboxes_enabled: true,
+            request_managed_sandbox_host_id: true,
             sandbox_provider: "modal",
             sandbox_providers: ["modal", "agent_sandbox"],
           },
@@ -1835,6 +2044,7 @@ describe("ForkSessionDialog", () => {
             upToResponseId,
             sandbox: {
               provider: "agent_sandbox",
+              hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
               profileId: "large",
               profileRevision: "other-revision",
               workspaces: [],
@@ -2070,7 +2280,11 @@ describe("ForkSessionDialog", () => {
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       renderDialog({
         ...CODING,
-        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          request_managed_sandbox_host_id: true,
+        },
       });
 
       selectSandbox();
@@ -2090,7 +2304,11 @@ describe("ForkSessionDialog", () => {
         agentId: undefined,
         upToResponseId: undefined,
         config: {},
-        sandbox: { provider: "modal", workspaces: ["https://github.com/org/repo#release-1.2"] },
+        sandbox: {
+          provider: "modal",
+          hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
+          workspaces: ["https://github.com/org/repo#release-1.2"],
+        },
       });
       // The server provisions the host, so the dialog must NOT also try to
       // bind one — a launchRunner here would 404 on a host that doesn't exist.
@@ -2103,21 +2321,23 @@ describe("ForkSessionDialog", () => {
       // The first provider row keeps the bare test id; later rows add the provider.
       ["a fresh Arclet", "arclet", "fork-session-sandbox-option-arclet"],
       ["another sandbox provider", "lakebox", "fork-session-sandbox-option"],
+      ["the same sandbox", null, "fork-session-host-option-host_1"],
     ])(
       "forks an Arclet source onto %s beside the connected hosts",
       async (_name, provider, row) => {
+        launchRunnerMock.mockResolvedValue({ runnerId: "fork-runner" });
         useSessionMock.mockReturnValue({
           session: {
             hostId: "host_1",
             labels: {
               "omnigent.host_type": "managed",
-              [SANDBOX_REPO_LABEL_KEY]: "https://github.com/databricks-eng/universe",
+              [SANDBOX_REPO_LABEL_KEY]: "https://github.com/example-org/monorepo",
             },
           },
           isLoading: false,
           error: null,
         } as unknown as ReturnType<typeof useSession>);
-        // The source Arclet is filtered from the picker; another machine is a target.
+        // The source Arclet and another machine are both valid targets.
         setHosts([
           host({ sandbox_provider: "arclet" }),
           host({ host_id: "host_2", name: "laptop" }),
@@ -2127,16 +2347,26 @@ describe("ForkSessionDialog", () => {
         } as unknown as Awaited<ReturnType<typeof forkSession>>);
         renderDialog({
           ...CODING,
-          info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+          info: {
+            managed_sandboxes_enabled: true,
+            request_managed_sandbox_host_id: true,
+            sandbox_providers: ["lakebox", "arclet"],
+            sibling_sessions: true,
+          },
         });
 
         await act(async () => {});
         expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
         openHostSelect();
         expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
-        expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
+        expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
         fireEvent.click(screen.getByTestId(row));
-        expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
+        if (provider) {
+          expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("monorepo");
+        } else {
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Same sandbox");
+          expect(screen.queryByTestId("fork-session-sandbox-repo-row")).not.toBeInTheDocument();
+        }
 
         // Picking the sandbox starts a repository-branch lookup that disables Clone until it settles.
         await waitFor(() => expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled());
@@ -2149,10 +2379,26 @@ describe("ForkSessionDialog", () => {
           agentId: undefined,
           upToResponseId: undefined,
           config: {},
-          sandbox: { provider, workspaces: ["https://github.com/databricks-eng/universe"] },
+          sandbox: provider
+            ? {
+                provider,
+                hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
+                workspaces: ["https://github.com/example-org/monorepo"],
+              }
+            : undefined,
         });
-        expect(launchRunnerMock).not.toHaveBeenCalled();
-        expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+        if (provider) {
+          expect(launchRunnerMock).not.toHaveBeenCalled();
+          expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+        } else {
+          expect(launchRunnerMock).toHaveBeenCalledWith(
+            "host_1",
+            "conv_fork",
+            CODING.sourceWorkspace,
+            undefined,
+          );
+          expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", CODING.sourceWorkspace);
+        }
         await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
       },
     );
@@ -2204,9 +2450,9 @@ describe("ForkSessionDialog", () => {
         "Arclet Sandbox",
       ],
       [
-        "falls back to a connected host when the server doesn't offer that provider",
+        "reuses the source sandbox when the server no longer offers that provider",
         "modal",
-        "laptop",
+        "Same sandbox",
       ],
     ])("%s", async (_name, sourceProvider, expected) => {
       useSessionMock.mockReturnValue({
@@ -2220,7 +2466,11 @@ describe("ForkSessionDialog", () => {
       ]);
       renderDialog({
         ...CODING,
-        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_providers: ["lakebox", "arclet"],
+          sibling_sessions: true,
+        },
       });
 
       await act(async () => {});
@@ -2352,6 +2602,7 @@ describe("ForkSessionDialog", () => {
           ...CODING,
           info: {
             managed_sandboxes_enabled: true,
+            request_managed_sandbox_host_id: true,
             sandbox_provider: "agent_sandbox",
             sandbox_providers: ["agent_sandbox"],
             sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
@@ -2385,7 +2636,10 @@ describe("ForkSessionDialog", () => {
           ]);
         } else {
           expect(fetchSessionRepositoryBranchesMock).not.toHaveBeenCalled();
-          expect(call?.sandbox).toEqual({ provider: "agent_sandbox" });
+          expect(call?.sandbox).toEqual({
+            provider: "agent_sandbox",
+            hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
+          });
         }
       },
     );
@@ -2405,6 +2659,7 @@ describe("ForkSessionDialog", () => {
         ...CODING,
         info: {
           managed_sandboxes_enabled: true,
+          request_managed_sandbox_host_id: true,
           sandbox_provider: "agent_sandbox",
           sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
           session_fork_workspaces: undefined,
@@ -2436,6 +2691,7 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(submit);
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
       expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+        hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
         provider: "agent_sandbox",
         workspace: "https://github.com/org/api#main",
       });
@@ -2574,6 +2830,7 @@ describe("ForkSessionDialog", () => {
           ...CODING,
           info: {
             managed_sandboxes_enabled: true,
+            request_managed_sandbox_host_id: true,
             sandbox_provider: "modal",
             session_fork_workspaces: undefined,
           },
@@ -2587,6 +2844,7 @@ describe("ForkSessionDialog", () => {
         fireEvent.click(screen.getByTestId("fork-session-submit"));
         await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
         expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+          hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
           provider: "modal",
           workspace: "https://github.com/org/api#main",
         });
@@ -2848,7 +3106,11 @@ describe("ForkSessionDialog", () => {
         } as unknown as Awaited<ReturnType<typeof forkSession>>);
         renderDialog({
           ...CODING,
-          info: { managed_sandboxes_enabled: true, session_fork_workspaces: acceptsWorkspaces },
+          info: {
+            managed_sandboxes_enabled: true,
+            session_fork_workspaces: acceptsWorkspaces,
+            request_managed_sandbox_host_id: true,
+          },
         });
 
         selectSandbox();
@@ -2863,6 +3125,7 @@ describe("ForkSessionDialog", () => {
 
         await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
         expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+          hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
           provider: null,
           ...(acceptsWorkspaces ? { workspaces: [] } : { workspace: null }),
         });
@@ -2889,6 +3152,263 @@ describe("ForkSessionDialog", () => {
         "Enter a repository URL",
       );
       expect(forkSessionMock).not.toHaveBeenCalled();
+    });
+
+    describe("model choices", () => {
+      const GATEWAY_SANDBOX = {
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "modal",
+        sandbox_provider_capabilities: { modal: { default_models: true } },
+      };
+      const fetchMock = vi.fn<typeof fetch>();
+
+      function openModelSelect(): void {
+        fireEvent.click(screen.getByTestId("fork-session-config-model"));
+      }
+
+      beforeEach(() => {
+        // The provider's gateway preview lists one model per harness.
+        fetchMock.mockReset().mockImplementation(async (input) => {
+          const harness = /\/sandbox-providers\/modal\/harnesses\/([^/]+)\/model-options/.exec(
+            String(input),
+          )?.[1];
+          if (harness === undefined) return new Response(null, { status: 404 });
+          return Response.json({
+            configured: false,
+            status: "ready",
+            models: [{ id: `gateway/${harness}`, displayName: `Gateway ${harness}` }],
+            configuration_revision: null,
+            provider_label: "AI Gateway",
+            default_model: null,
+          });
+        });
+        vi.stubGlobal("fetch", fetchMock);
+        markSandboxLaunchMock.mockReset();
+        useSessionAgentMock.mockReturnValue({
+          data: { id: "ag_claude_native", name: "claude-native-ui", harness: "claude-native" },
+        } as unknown as ReturnType<typeof useSessionAgent>);
+        forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+      });
+
+      afterEach(() => {
+        vi.unstubAllGlobals();
+      });
+
+      it.each([
+        { agent: "Claude Code", harness: "claude-native", agentId: "ag_claude_native" },
+        { agent: "Codex", harness: "codex-native", agentId: "ag_codex_native" },
+      ])("offers the gateway's $agent models for a new sandbox", async ({ harness, agentId }) => {
+        // A sandbox source clones onto a fresh sandbox, which has no host yet.
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({ ...CODING, sourceHostId: "sandbox_src", info: GATEWAY_SANDBOX });
+        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Modal Sandbox");
+        if (agentId !== "ag_claude_native") {
+          openAgentSelect();
+          fireEvent.click(screen.getByTestId(`fork-session-agent-option-${agentId}`));
+        }
+
+        openModelSelect();
+        const gatewayModel = await screen.findByRole("option", { name: `Gateway ${harness}` });
+        expect(screen.getByRole("option", { name: "Default" })).toBeInTheDocument();
+        expect(screen.queryByText("Select a host to list models")).not.toBeInTheDocument();
+        fireEvent.click(gatewayModel);
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]).toMatchObject({
+          config: { modelOverride: `gateway/${harness}` },
+          sandbox: { provider: "modal" },
+        });
+        expect(fetchMock).toHaveBeenCalledWith(
+          `/v1/sandbox-providers/modal/harnesses/${harness}/model-options?agent_id=${agentId}`,
+          expect.anything(),
+        );
+        // The fork's page resets this pick if the live sandbox doesn't offer it.
+        expect(markSandboxLaunchMock).toHaveBeenCalledExactlyOnceWith("conv_fork", {
+          model: `gateway/${harness}`,
+          effort: null,
+          modelLabel: `Gateway ${harness}`,
+        });
+      });
+
+      it("lists the sandbox's models in place of a previously picked host's", async () => {
+        useHostModelOptionsMock.mockReturnValue({
+          data: [{ id: "host-model", displayName: "Host model" }],
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useHostModelOptions>);
+        renderDialog({ ...CODING, info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        expect(screen.getByRole("option", { name: "Host model" })).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+        selectSandbox();
+        openModelSelect();
+        expect(
+          await screen.findByRole("option", { name: "Gateway claude-native" }),
+        ).toBeInTheDocument();
+        expect(screen.queryByRole("option", { name: "Host model" })).not.toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+
+        openHostSelect();
+        fireEvent.click(screen.getByTestId("fork-session-host-option-host_1"));
+        openModelSelect();
+        expect(screen.getByRole("option", { name: "Host model" })).toBeInTheDocument();
+        expect(
+          screen.queryByRole("option", { name: "Gateway claude-native" }),
+        ).not.toBeInTheDocument();
+      });
+
+      it("lists Claude Code's built-in models on a sandbox without a catalog", () => {
+        renderDialog({
+          ...CODING,
+          info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+        });
+
+        selectSandbox();
+        openModelSelect();
+        for (const model of CLAUDE_NATIVE_MODELS) {
+          expect(screen.getByRole("option", { name: model.id })).toBeInTheDocument();
+        }
+        expect(fetchMock).not.toHaveBeenCalledWith(
+          expect.stringContaining("/model-options"),
+          expect.anything(),
+        );
+      });
+
+      it("drops a host's model and effort picks, but not its permission pick, when the fork moves to a sandbox", async () => {
+        useHostModelOptionsMock.mockReturnValue({
+          data: [{ id: "host-model", displayName: "Host model" }],
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useHostModelOptions>);
+        renderDialog({ ...CODING, info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        fireEvent.click(screen.getByRole("option", { name: "Host model" }));
+        fireEvent.click(screen.getByLabelText("Reasoning effort"));
+        fireEvent.click(screen.getByRole("option", { name: "High" }));
+        fireEvent.click(screen.getByTestId("fork-session-config-permission"));
+        fireEvent.click(screen.getByRole("option", { name: "Plan" }));
+        selectSandbox();
+        expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Default");
+        expect(screen.getByLabelText("Reasoning effort")).toHaveTextContent("Default");
+        expect(screen.getByTestId("fork-session-config-permission")).toHaveTextContent("Plan");
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({
+          terminalLaunchArgs: ["--permission-mode", "plan"],
+        });
+      });
+
+      function previewReturns(status: string, error: string): void {
+        fetchMock.mockImplementation(async () =>
+          Response.json({
+            configured: false,
+            status,
+            models: [],
+            configuration_revision: null,
+            provider_label: "AI Gateway",
+            default_model: null,
+            error,
+          }),
+        );
+      }
+
+      it("blocks a fork onto a sandbox that can't run the agent, giving the provider's reason", async () => {
+        previewReturns("unsupported", "Claude Code can't run in this sandbox.");
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({ ...CODING, sourceHostId: "sandbox_src", info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        expect(await screen.findByText("Claude Code can't run in this sandbox.")).toBeVisible();
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+        const submit = screen.getByTestId("fork-session-submit");
+        expect(submit).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(submit);
+
+        expect(screen.getByTestId("fork-session-field-error")).toHaveTextContent(
+          "Claude Code can't run in this sandbox.",
+        );
+        expect(screen.getByTestId("fork-session-agent-select")).toHaveFocus();
+        expect(forkSessionMock).not.toHaveBeenCalled();
+      });
+
+      it("explains a failed gateway listing and still forks on Default", async () => {
+        previewReturns("unavailable", "The gateway didn't answer.");
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({ ...CODING, sourceHostId: "sandbox_src", info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        expect(await screen.findByText("The gateway didn't answer.")).toBeVisible();
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({});
+      });
+
+      it("keeps a source's saved inference settings instead of offering the provider's models", async () => {
+        // The server checks a fork's model against the source's saved policy.
+        useSessionMock.mockReturnValue({
+          session: { inferenceConfigured: true, modelOverride: "saved-model" },
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({ ...CODING, sourceHostId: "sandbox_src", info: GATEWAY_SANDBOX });
+
+        openModelSelect();
+        expect(
+          screen.getByText("The fork keeps the original session's model settings."),
+        ).toBeVisible();
+        expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+          "Default",
+        ]);
+        fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({});
+        expect(fetchMock).not.toHaveBeenCalledWith(
+          expect.stringContaining("/model-options"),
+          expect.anything(),
+        );
+      });
+
+      it("doesn't offer a bound destination's catalog, which a fork doesn't take on", () => {
+        fetchMock.mockImplementation(async () =>
+          Response.json({
+            configured: true,
+            status: "ready",
+            models: [{ id: "bound/model", displayName: "Bound model" }],
+            configuration_revision: "revision-1",
+            provider_label: "Bound provider",
+            default_model: "bound/model",
+          }),
+        );
+        setHosts([host(), host({ host_id: "sandbox_src", sandbox_provider: "modal" })]);
+        renderDialog({
+          ...CODING,
+          sourceHostId: "sandbox_src",
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            sandbox_provider_capabilities: { modal: { inference_models: true } },
+          },
+        });
+
+        openModelSelect();
+        for (const model of CLAUDE_NATIVE_MODELS) {
+          expect(screen.getByRole("option", { name: model.id })).toBeInTheDocument();
+        }
+        expect(screen.queryByRole("option", { name: "Bound model" })).not.toBeInTheDocument();
+        expect(fetchMock).not.toHaveBeenCalledWith(
+          expect.stringContaining("/model-options"),
+          expect.anything(),
+        );
+      });
     });
   });
 });

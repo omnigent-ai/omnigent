@@ -271,6 +271,7 @@ from omnigent.server.routes._sessions.common import (
     _LAST_TASK_ERROR_CODE_LABEL_KEY as _LAST_TASK_ERROR_CODE_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY as _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _MANAGED_RESUMABLE_TUNNEL_STALE_S as _MANAGED_RESUMABLE_TUNNEL_STALE_S,
+    _MANAGED_RUNNER_REPLACEMENT_WAIT_S as _MANAGED_RUNNER_REPLACEMENT_WAIT_S,
     _MAX_TERMINAL_LAUNCH_ARGS as _MAX_TERMINAL_LAUNCH_ARGS,
     _MAX_TERMINAL_LAUNCH_ARG_LEN as _MAX_TERMINAL_LAUNCH_ARG_LEN,
     _MCP_ELICITATION_TYPE as _MCP_ELICITATION_TYPE,
@@ -336,6 +337,7 @@ from omnigent.server.routes._sessions.common import (
     _server_host_registry as _server_host_registry,
     _server_runner_router as _server_runner_router,
     _session_active_response_cache as _session_active_response_cache,
+    _session_background_agents_cache as _session_background_agents_cache,
     _session_background_task_count_cache as _session_background_task_count_cache,
     _session_background_tasks_cache as _session_background_tasks_cache,
     _session_blocked_on_cache as _session_blocked_on_cache,
@@ -395,7 +397,6 @@ from omnigent.server.routes._sessions.helpers import (
     _create_session_worktree as _create_session_worktree,
     _delete_stored_session_bundle_after_failure as _delete_stored_session_bundle_after_failure,
     _derive_terminal_launch_args_from_spec as _derive_terminal_launch_args_from_spec,
-    _descendant_sessions as _descendant_sessions,
     _discovery_key as _discovery_key,
     _dispatch_skill_slash_command_to_runner as _dispatch_skill_slash_command_to_runner,
     _emit_server_routing_decision as _emit_server_routing_decision,
@@ -952,6 +953,7 @@ def create_sessions_router(
         agent_store=agent_store,
         auth_provider=auth_provider,
         permission_store=permission_store,
+        liveness_lookup=liveness_lookup,
     )
 
     register_resources_routes(

@@ -17,15 +17,23 @@
  *    detached on hide and destroyed only on explicit close.
  */
 
+const { randomUUID } = require("node:crypto");
 const {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isAgentNavigationAllowed,
+  isDirectOnly,
+  isLocalhostSubdomain,
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
+const { isDesktopOpenRequest } = require("./desktopOpenServer");
+const { createAgentNavigation } = require("./agentNavigation");
+const { hasHostLocalAccess } = require("./hostIdentity");
+const { agentInputInFlight } = require("./browserInput");
 
-const DEFAULT_CAP = 10;
+// Each view is a separate renderer process; the cap bounds memory per window.
+const DEFAULT_CAP = 20;
 
 // Map WebSocket handshakes onto the HTTP URL rules.
 function httpUrlForWebSocket(url) {
@@ -92,6 +100,7 @@ function createBrowserViewRegistry({
   resolveHost = lookupHostAddresses,
   resolveProxy = async () => "DIRECT",
   cap = DEFAULT_CAP,
+  historyLoadTimeoutMs = 10_000,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
@@ -99,19 +108,25 @@ function createBrowserViewRegistry({
   const entries = new Map(); // conversationId -> BrowserViewEntry
   const pendingNavigations = new Map();
 
-  function beginAgentNavigation(conversationId) {
-    const generation = Symbol();
+  // A continuation consumes its original generation without superseding a newer navigation.
+  function beginAgentNavigation(conversationId, retryToken) {
+    if (retryToken !== undefined && pendingNavigations.get(conversationId) !== retryToken) {
+      return null;
+    }
+    const generation = randomUUID();
     pendingNavigations.set(conversationId, generation);
-    return () => pendingNavigations.get(conversationId) === generation;
+    return Object.assign(() => pendingNavigations.get(conversationId) === generation, {
+      retryToken: generation,
+    });
   }
   const allowsLocalhost = (context) => !context?.revoked && contextAllowsLocalhost(context);
 
   function needsAgentViewRevocation(entry, nextContext) {
     const context = entry?.agentContext;
     return (
-      context?.hostIsThisMachine === true &&
+      hasHostLocalAccess(context) &&
       (context.revoked ||
-        !nextContext?.hostIsThisMachine ||
+        !hasHostLocalAccess(nextContext) ||
         nextContext.sourceHostId !== context.sourceHostId)
     );
   }
@@ -140,6 +155,9 @@ function createBrowserViewRegistry({
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
   let recentSessionSwitchSupported = false;
+  // Set by an SPA that opens `browser-open-tab` requests as new tabs; an older
+  // SPA would drop them, so modifier-clicks navigate in place until declared.
+  let openTabSupported = false;
 
   // Apply the current suppress flag to the active view (no-op with none active).
   function applyActiveVisibility() {
@@ -223,13 +241,13 @@ function createBrowserViewRegistry({
     return { ok: true, entry, created: true };
   }
 
-  // Popups stay in this view: an agent-visited page opening the user's system
-  // browser is an abuse vector. Programmatic loadURL skips will-navigate,
-  // so enforce navigation policy here too when enabled.
+  // Popups never open the system browser (an abuse vector for agent-visited
+  // pages): background-tab clicks go to a supporting renderer as new tabs, others
+  // load in this view. loadURL skips will-navigate, so enforce policy here.
   function installWindowOpenPolicy(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.setWindowOpenHandler !== "function") return;
-    wc.setWindowOpenHandler(({ url }) => {
+    wc.setWindowOpenHandler(({ url, disposition }) => {
       let parsed;
       try {
         parsed = new URL(url);
@@ -252,7 +270,12 @@ function createBrowserViewRegistry({
           return { action: "deny" };
         }
       }
+      if (disposition === "background-tab" && openTabSupported) {
+        sendToRenderer("browser-open-tab", { conversationId: entry.conversationId, url });
+        return { action: "deny" };
+      }
       try {
+        beginAgentNavigation(entry.conversationId);
         wc.loadURL(url);
       } catch {
         /* view destroyed mid-click */
@@ -270,6 +293,8 @@ function createBrowserViewRegistry({
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     wc.on("context-menu", (_event, params) => {
+      // An agent's right-click opens the page's own menu, never the shell's.
+      if (entry.suppressContextMenuUntil > Date.now()) return;
       const items = [];
       if (params.linkURL) {
         if (/^https?:\/\//i.test(params.linkURL)) {
@@ -312,9 +337,14 @@ function createBrowserViewRegistry({
           url: targetUrl,
           error: verdict.error,
         });
+        // Lets agent history navigation report the block.
+        if (event?.isMainFrame !== false) entry.agentNavBlockedError = verdict.error;
       }
     };
-    wc.on("will-navigate", guard);
+    wc.on("will-navigate", (event, targetUrl) => {
+      beginAgentNavigation(conversationId);
+      guard(event, targetUrl);
+    });
     wc.on("will-redirect", guard);
     // Subframe navigations (iframes) can also reach an internal host; guard them
     // too. Older Electron may not emit this event — harmless if it never fires.
@@ -359,11 +389,23 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
+  function setOpenTabSupported(supported) {
+    openTabSupported = !!supported;
+    return { ok: true };
+  }
+
   function attachRecentSessionInput(entry) {
-    const wc = entry.view && entry.view.webContents;
+    // Another view taking keys for the page (the design tools' overlay) forwards them too.
+    entry.forwardRecentSessionInput = (wc) => forwardRecentSessionInputFrom(entry, wc);
+    forwardRecentSessionInputFrom(entry, entry.view && entry.view.webContents);
+  }
+
+  function forwardRecentSessionInputFrom(entry, wc) {
     if (!wc || typeof wc.on !== "function") return;
     wc.on("before-input-event", (event, input) => {
       if (!recentSessionSwitchSupported) return;
+      // An agent's key presses are for the page, never the shell.
+      if (agentInputInFlight(wc)) return;
       const type =
         input && input.type === "keyDown"
           ? "keydown"
@@ -414,6 +456,15 @@ function createBrowserViewRegistry({
     });
   }
 
+  // Agent viewport sizing and back / forward / reload.
+  const agentNavigation = createAgentNavigation({
+    entries,
+    isActive: (conversationId) => activeConversationId === conversationId,
+    checkAgentNavigationFor,
+    historyLoadTimeoutMs,
+    beginAgentNavigation,
+  });
+
   function entryForWebContents(webContentsId) {
     for (const entry of entries.values()) {
       try {
@@ -452,13 +503,24 @@ function createBrowserViewRegistry({
     };
   }
 
+  function hostnameOf(url) {
+    return URL.canParse(url) ? new URL(url).hostname : "";
+  }
+
   // Resolve named hosts in the owning partition before any request is sent.
-  // IP literals and eligible exact-loopback hosts need only the URL check.
+  // IP literals and exact loopback names need only the URL check; `*.localhost`
+  // must also be on a direct route so a proxy never receives the request.
   async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
+    // A page in an embedded browser pane must not steer the user's main window.
+    if (isDesktopOpenRequest(url)) return true;
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
-    const verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
+    let verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
+    const hostname = hostnameOf(policyUrl);
+    if (verdict.ok && isLocalhostSubdomain(hostname)) {
+      verdict = await checkDirectLocalhostRoute(url, hostname, policy.partition);
+    }
     if (verdict.ok) return false;
     if (policy.conversationId) {
       sendToRenderer("browser-nav-blocked", {
@@ -492,8 +554,21 @@ function createBrowserViewRegistry({
     return { requestHeaders: { ...headers, "Cache-Control": [...directives.values()].join(", ") } };
   }
 
-  // IP-less WebSocket upgrades repeat the partition DNS check, not endpoint
-  // verification; DNS may change between the check and connection.
+  // Chromium pins `*.localhost` to loopback, so only a proxy could send it
+  // anywhere else; an unknown route counts as proxied. WebSockets keep their
+  // ws(s) URL here because Chromium picks their proxy by that scheme.
+  async function checkDirectLocalhostRoute(requestUrl, hostname, partition) {
+    const blocked = {
+      ok: false,
+      error: `navigation blocked: host "${hostname}" may be routed through a proxy`,
+    };
+    try {
+      return isDirectOnly(await resolveProxy(requestUrl, partition)) ? { ok: true } : blocked;
+    } catch {
+      return blocked;
+    }
+  }
+
   async function shouldCancelAgentResponse(
     { webContentsId, url, ip, resourceType, statusCode },
     partition,
@@ -501,17 +576,32 @@ function createBrowserViewRegistry({
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
-    const verdict =
-      !ip && resourceType === "webSocket" && statusCode === 101
-        ? await checkAgentNavigationWithPolicy(policyUrl, policy)
-        : isAgentConnectionAllowed(policyUrl, ip, policy);
+    const hostname = hostnameOf(policyUrl);
+    const localhostSubdomain = isLocalhostSubdomain(hostname);
+    // WebSocket upgrades omit the connected IP.
+    const ipLessUpgrade = !ip && resourceType === "webSocket" && statusCode === 101;
+    let verdict;
+    if (policy.allowLocalhost && localhostSubdomain) {
+      // A loopback IP may be a local proxy's, so `*.localhost` also needs a direct route.
+      verdict = ipLessUpgrade ? { ok: true } : isAgentConnectionAllowed(policyUrl, ip, policy);
+      if (verdict.ok) {
+        verdict = await checkDirectLocalhostRoute(url, hostname, policy.partition);
+      }
+    } else if (ipLessUpgrade) {
+      // Repeating the DNS check cannot rule out a DNS change before the connection.
+      verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
+    } else {
+      verdict = isAgentConnectionAllowed(policyUrl, ip, policy);
+    }
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
-    // (same-IP limit documented on isProxyAddress).
+    // (same-IP limit documented on isProxyAddress). A proxy would resolve
+    // `*.localhost` on its own network, so those must connect to loopback.
     const proxied =
       !!ip &&
-      (await isProxyAddress(ip, await resolveProxy(policyUrl, policy.partition), (hostname) =>
-        resolveHost(hostname, policy.partition),
+      !localhostSubdomain &&
+      (await isProxyAddress(ip, await resolveProxy(policyUrl, policy.partition), (proxyHost) =>
+        resolveHost(proxyHost, policy.partition),
       ));
     if (proxied) return false;
     if (policy.conversationId) {
@@ -708,6 +798,7 @@ function createBrowserViewRegistry({
     needsAgentViewRevocation,
     revokeAgentView,
     checkAgentNavigation: checkAgentNavigationFor,
+    ...agentNavigation,
     shouldCancelAgentRequest,
     agentRequestHeaders,
     shouldCancelAgentResponse,
@@ -715,6 +806,7 @@ function createBrowserViewRegistry({
     setSuppressed,
     cancelRecentSessionSwitch,
     setRecentSessionSwitchSupported,
+    setOpenTabSupported,
     close,
     closeAll,
     // Introspection

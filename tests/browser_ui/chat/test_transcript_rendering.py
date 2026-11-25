@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from itertools import pairwise
@@ -66,6 +67,41 @@ _CLIPPED_MERMAID_LABELS = """svg => [...svg.querySelectorAll('foreignObject')].f
     ));
     return clipped ? [label.textContent.trim()] : [];
 })"""
+_STREAMED_MERMAID_LINES = [
+    "flowchart TD\n",
+    "  A[Start] --> B[Read the config]\n",
+    "  B --> C{Is it valid?}\n",
+    "  C -->|yes| D[Run the job]\n",
+    "  C -->|no| E[Report the error]\n",
+]
+# Per painted frame: whether the diagram's source and the diagram show, and the shown one's height.
+_SAMPLE_DIAGRAM_FRAMES = """() => {
+    window.__diagramFrames = [];
+    const shown = (element) => !!element && element.checkVisibility({ visibilityProperty: true });
+    const record = () => {
+        const log = document.querySelector('[role="log"]');
+        const source = [...log.querySelectorAll('[data-streamdown="code-block"]')]
+            .find((block) => block.textContent.includes("flowchart TD"));
+        const diagram = log.querySelector('[data-streamdown="mermaid-block"]');
+        const visible = shown(diagram) ? diagram : shown(source) ? source : null;
+        window.__diagramFrames.push({
+            source: shown(source),
+            diagram: shown(diagram),
+            drawn: shown(log.querySelector('svg[id^="mermaid-"]')),
+            height: visible ? Math.round(visible.getBoundingClientRect().height) : null,
+        });
+    };
+    // Read layout after the app's resize observers have run, as the frame paints.
+    const sample = () => {
+        const observer = new ResizeObserver(() => {
+            observer.disconnect();
+            record();
+        });
+        observer.observe(document.body);
+        requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+}"""
 _POINTER_CONTEXTS = [
     pytest.param(
         True,
@@ -118,7 +154,7 @@ def test_message_font_size_survives_rotation_and_reload(
         ]
     )
     viewports = (
-        [(390, 844), (844, 390), (390, 844)] if touch else [(767, 844), (768, 844), (1280, 844)]
+        [(390, 844), (844, 390), (390, 844)] if touch else [(1180, 844), (1181, 844), (1280, 844)]
     )
     page.set_viewport_size({"width": viewports[0][0], "height": viewports[0][1]})
     page.goto(chat.url)
@@ -138,11 +174,11 @@ def test_message_font_size_survives_rotation_and_reload(
             if reload:
                 page.reload()
             assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
-            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 14)
+            interface_px = saved_size if saved_size is not None else (15 if width < 1181 else 14)
             message_px = interface_px
             for element in prose:
                 expect(element).to_have_css("font-size", f"{message_px}px")
-            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.8:g}px")
+            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.6:g}px")
             for selector in ('[data-streamdown="inline-code"]', _CODE_BODY):
                 expect(assistant.locator(selector)).to_have_css(
                     "font-size", f"{message_px * 0.875:g}px"
@@ -178,7 +214,7 @@ def test_large_message_fallback_keeps_message_font_size(
         for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
             fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
             expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
-            expected_px = (15 if width < 768 else 14) if touch else 13
+            expected_px = 15 if width < 1181 else 13
             expect(fallback).to_have_css("font-size", f"{expected_px}px")
 
 
@@ -204,7 +240,7 @@ def test_custom_browser_font_default_matches_rendered_sizes_and_settings(
         )
         page.set_viewport_size({"width": 800, "height": 844})
         page.goto(chat.url)
-        assert not page.evaluate("matchMedia('(min-width: 48rem)').matches")
+        assert not page.evaluate("matchMedia('(min-width: 73.8125rem)').matches")
         assert not page.evaluate("matchMedia('(pointer: coarse)').matches")
         for selector in ('[data-role="user"] p', '[data-testid="assistant-text-section"] p'):
             expect(page.locator(selector)).to_have_css("font-size", "15px")
@@ -394,6 +430,57 @@ def test_mermaid_recovery_uses_the_real_browser_renderer(
         )
         expect(escaped).to_contain_text("one semicolon escaped as #59; (first on line 3)")
     expect(page.get_by_test_id("mermaid-error")).to_have_count(0)
+
+
+def test_streaming_mermaid_shows_its_source_until_the_diagram_draws(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A Mermaid fence streams as code, and its diagram replaces the code once, already drawn.
+
+    Drawing each partial source moved the text around it on every update, and an
+    empty box and a spinner showed before each first drawing.
+    """
+    chat = chat_session_contract
+    response_id = "streamed-diagram"
+    user = message_item("streamed-diagram-user", "user", "Draw the flow.", response_id=response_id)
+    chat.set_items([user])
+    chat.update_session(status="running")
+    open_live(page, chat)
+    chat.emit_busy(response_id)
+    chat.emit(
+        {
+            "event": "response.created",
+            "data": {"id": response_id, "status": "in_progress", "output": []},
+        }
+    )
+    chat.emit({"event": "response.output_text.delta", "data": {"delta": "Here is the flow:\n\n"}})
+    expect(page.locator('[role="log"] p', has_text="Here is the flow")).to_be_visible(
+        timeout=10_000
+    )
+    page.evaluate(_SAMPLE_DIAGRAM_FRAMES)
+    for delta in ["```mermaid\n", *_STREAMED_MERMAID_LINES, "```\n\nThat's the flow.\n"]:
+        chat.emit({"event": "response.output_text.delta", "data": {"delta": delta}})
+        page.wait_for_timeout(300)
+    expect(page.locator('[role="log"] svg[id^="mermaid-"]')).to_be_visible(timeout=10_000)
+    page.wait_for_timeout(300)
+
+    frames = page.evaluate("() => window.__diagramFrames")
+    early = [frame["height"] for frame in frames if frame["diagram"] and not frame["drawn"]]
+    assert not early, f"the diagram's box showed before it drew: {early}"
+    shown = [frame for frame in frames if frame["source"] or frame["drawn"]]
+    assert shown, "neither the source nor the diagram showed"
+    after_first = frames[frames.index(shown[0]) :]
+    assert all(frame["source"] or frame["drawn"] for frame in after_first), (
+        "a frame showed neither the source nor the diagram"
+    )
+    kinds = [frame["diagram"] for frame in shown]
+    assert kinds == sorted(kinds), "the source showed again after the diagram"
+    source = [frame["height"] for frame in shown if not frame["diagram"]]
+    diagram = [frame["height"] for frame in shown if frame["diagram"]]
+    grew = len(set(source)) > 1 and source == sorted(source)
+    assert grew, f"the source didn't grow as it streamed: {source}"
+    assert max(diagram) - min(diagram) <= 1, f"the diagram changed size once shown: {diagram}"
 
 
 @pytest.mark.parametrize("activation", ["click", "keyboard"])
@@ -985,7 +1072,9 @@ def test_tool_rows_read_as_actions_with_their_outcome(
 
     issue.click()
     read = page.get_by_role("button", name=f"Read {_LONG_TOOL_PATH}", exact=True)
-    edit = page.get_by_role("button", name=re.compile(r"^Edit "))
+    edit = page.get_by_role("button", name=re.compile(r"^Edit ")).filter(
+        has=page.get_by_test_id("tool-line-counts")
+    )
     counts = edit.get_by_test_id("tool-line-counts")
     expect(counts).to_have_text("+2 -1")
     for row in (read, edit):
@@ -1002,7 +1091,7 @@ def test_tool_rows_read_as_actions_with_their_outcome(
         }""")
         # The path must retain a readable prefix beside its verb, not disappear atomically.
         assert geometry["visiblePathWidth"] >= 44, geometry
-        if app_kind:
+        if width < 1181:
             assert geometry["path"]["height"] >= 44, geometry
             assert geometry["path"]["width"] >= 44, geometry
             assert geometry["path"]["left"] >= geometry["verb"]["right"], geometry
@@ -1033,6 +1122,72 @@ def test_tool_rows_read_as_actions_with_their_outcome(
         "File opened from a tool row"
     )
     expect(edit).to_have_attribute("aria-expanded", "false")
+
+
+_LIGATURE_COMMAND = "python3 -c \"s='a=>b'; assert s.count('=>')==1; print('===')\""
+# JS evaluator returning the text nodes under root whose computed style still allows ligatures.
+_LIGATED_TEXT = """root => {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const ligated = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (!node.textContent.trim()) continue;
+        const style = getComputedStyle(node.parentElement);
+        const variant = style.fontVariantLigatures;
+        const features = style.fontFeatureSettings.replace(/\\s+/g, "");
+        const off = variant === "none"
+            || (variant.includes("no-common-ligatures") && variant.includes("no-contextual"))
+            || (features.includes('"liga"0') && features.includes('"calt"0'));
+        if (!off) ligated.push(node.textContent);
+    }
+    return ligated;
+}"""
+
+
+def test_shell_command_renders_without_ligatures_like_chat_code(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A shell call's command keeps one glyph per character in its row and terminal panel."""
+    chat = chat_session_contract
+    response_id = "ligature-command"
+    chronological = [
+        message_item(
+            "ligature-command-user", "user", "Check the anchor.", response_id=response_id
+        ),
+        *tool_call_items(
+            "call-ligature-command",
+            "Bash",
+            {"command": _LIGATURE_COMMAND},
+            "===\n",
+            response_id=response_id,
+        ),
+        message_item(
+            "ligature-command-answer",
+            "assistant",
+            "`s.count('=>')==1` holds.",
+            response_id=response_id,
+        ),
+    ]
+    chat.set_items(list(reversed(chronological)))
+    page.goto(chat.url)
+
+    inline_code = page.locator('[role="log"] [data-streamdown="inline-code"]')
+    expect(inline_code).to_have_text("s.count('=>')==1", timeout=20_000)
+    assert inline_code.evaluate(_LIGATED_TEXT) == []
+    page.get_by_role("button", name=re.compile(r"^Worked")).click()
+    page.get_by_text("Ran 1 shell command", exact=True).click()
+    row = page.locator('[data-slot="collapsible-trigger"]', has_text="python3 -c")
+    preview = row.get_by_text(_LIGATURE_COMMAND, exact=True)
+    expect(preview).to_be_visible()
+    row.click()
+    terminal_command = page.get_by_test_id("shell-tool-terminal").locator("pre code").first
+    expect(terminal_command).to_contain_text("assert s.count('=>')==1")
+
+    ligated = {
+        "row preview": preview.evaluate(_LIGATED_TEXT),
+        "terminal command": terminal_command.evaluate(_LIGATED_TEXT),
+    }
+    assert ligated == {"row preview": [], "terminal command": []}, ligated
 
 
 _PATCH_CHANGES = [
@@ -1189,7 +1344,7 @@ def test_failed_edit_rows_show_their_error(
 def test_automation_context_is_hidden_from_transcript(
     page: Page, chat_session_contract: ChatSessionContract
 ) -> None:
-    from omnigent.server.scheduled.fire import UNATTENDED_RUN_NOTE
+    from omnigent.server.scheduled.fire import unattended_run_note
 
     chat = chat_session_contract
     chat.set_items(
@@ -1197,7 +1352,7 @@ def test_automation_context_is_hidden_from_transcript(
             message_item(
                 "automation-task",
                 "user",
-                f"Summarize **today's changes**.\n\n{UNATTENDED_RUN_NOTE}",
+                f"Summarize **today's changes**.\n\n{unattended_run_note(1_794_895_414)}",
                 response_id="automation-turn",
             )
         ]
@@ -1207,3 +1362,56 @@ def test_automation_context_is_hidden_from_transcript(
     expect(user).to_contain_text("Summarize today's changes.")
     expect(user).not_to_contain_text("no one is watching")
     expect(user).not_to_contain_text("omnigent-automation-context")
+    expect(user).not_to_contain_text("Run time:")
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_view_image_tool_opens_image(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """A persisted Codex imageView call opens the existing file image preview."""
+    chat = chat_session_contract
+    chat.harness = "codex-native"
+    image_path = "/browser-workspace/screenshot.png"
+    chat.set_items(
+        list(
+            reversed(
+                tool_call_items(
+                    "image-view",
+                    "view_image",
+                    {"path": image_path},
+                    image_path,
+                    response_id="image-view-response",
+                )
+            )
+        )
+    )
+    environment_api = f"/v1/sessions/{chat.session_id}/resources/environments/default"
+    chat.contract.json(environment_api, {"metadata": {"root": "/browser-workspace"}})
+    for resource in ("changes", "filesystem"):
+        chat.contract.json(f"{environment_api}/{resource}", list_payload([]))
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/comments", [])
+    image = (Path(__file__).resolve().parents[2] / "resources/test_image.png").read_bytes()
+    chat.contract.json(
+        f"{environment_api}/filesystem/screenshot.png",
+        {
+            "object": "session.environment.filesystem.file_content",
+            "path": "screenshot.png",
+            "content": base64.b64encode(image).decode(),
+            "content_type": "image/png",
+            "encoding": "base64",
+            "bytes": len(image),
+        },
+    )
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+    page.get_by_role("button", name="Called 1 tool", exact=True).click()
+    row = page.get_by_role("button", name=re.compile(r"^View image "))
+    expect(row).to_be_visible()
+    row.get_by_role("link", name="screenshot.png", exact=True).click()
+    preview = page.locator('[data-testid="file-viewer"]:visible').get_by_role("img")
+    expect(preview).to_be_visible()
+    expect(preview).to_have_js_property("naturalWidth", 100)
+    expect(row).to_have_attribute("aria-expanded", "false")

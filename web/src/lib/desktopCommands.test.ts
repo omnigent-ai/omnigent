@@ -64,6 +64,7 @@ describe("useDesktopCommand", () => {
       command: "close",
       browserViewId: "browser-tab:s:t",
       closingQuits: false,
+      quitDetail: null,
     });
   });
 
@@ -96,9 +97,13 @@ describe("useDesktopCommand", () => {
     expect(shell).not.toHaveBeenCalled();
   });
 
-  it("ignores commands while a dialog holds focus", () => {
+  it("ignores commands while a dialog holds focus, except Quit", () => {
     const handler = vi.fn();
-    renderHook(() => useDesktopCommand("new-browser-tab", handler));
+    const quit = vi.fn();
+    renderHook(() => {
+      useDesktopCommand("new-browser-tab", handler);
+      useDesktopCommand("quit", quit);
+    });
     const dialog = document.createElement("div");
     dialog.setAttribute("role", "dialog");
     const input = document.createElement("input");
@@ -107,7 +112,27 @@ describe("useDesktopCommand", () => {
     input.focus();
 
     send("new-browser-tab");
+    send("quit");
     expect(handler).not.toHaveBeenCalled();
+    expect(quit).toHaveBeenCalledTimes(1);
+  });
+
+  it("still reloads while a dialog holds focus", () => {
+    const reload = vi.fn();
+    const newTab = vi.fn();
+    renderHook(() => useDesktopCommand("reload", reload));
+    renderHook(() => useDesktopCommand("new-browser-tab", newTab));
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    const input = document.createElement("input");
+    dialog.append(input);
+    document.body.append(dialog);
+    input.focus();
+
+    send("reload");
+    send("new-browser-tab");
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(newTab).not.toHaveBeenCalled();
   });
 
   it("uses the latest handler without re-registering", async () => {

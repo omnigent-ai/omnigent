@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SessionStateBadge } from "./SessionStateBadge";
 import type { SessionState } from "@/hooks/useSessionState";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 
 function renderBadge(state: SessionState) {
   return render(
@@ -35,6 +36,13 @@ describe("SessionStateBadge — per-state rendering", () => {
     );
   });
 
+  it("hedges a terminal prompt the runner inferred from the screen", () => {
+    renderBadge({ kind: "awaiting", count: 0, terminalReason: TERMINAL_PROMPT_BLOCKED_ON });
+    const badge = screen.getByTestId("session-state-badge");
+    expect(badge).toHaveTextContent("May need input");
+    expect(badge).toHaveAttribute("aria-label", "May need your input in the agent's terminal");
+  });
+
   it("uses singular wording when only one prompt is pending", () => {
     renderBadge({ kind: "awaiting", count: 1 });
     expect(screen.getByTestId("session-state-badge")).toHaveAttribute(
@@ -57,12 +65,17 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(container.querySelector(".bg-success")).toBeNull();
   });
 
-  it("renders background work with the running spinner and its own label", () => {
+  it("renders background work as a static terminal icon with its own label", () => {
     const { container } = renderBadge({ kind: "running", background: true });
     const badge = screen.getByTestId("session-state-badge");
     expect(badge).toHaveAttribute("data-state", "running");
     expect(badge).toHaveAttribute("aria-label", "Working in the background");
-    expect(container.querySelector('[data-testid="running-dot"]')).not.toBeNull();
+    // A dev server left running between turns must not show the busy-turn spinner.
+    expect(container.querySelector('[data-testid="running-dot"]')).toBeNull();
+    expect(container.querySelector(".animate-spin")).toBeNull();
+    const icon = container.querySelector("svg.lucide-square-terminal");
+    expect(icon).toHaveClass("size-3.5", "shrink-0", "text-muted-foreground");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
   });
 
   it("renders starting with the same spinner as running and its own label", () => {

@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Page, Request, Route, WebSocketRoute
 
+from omnigent.util.reasoning_effort import EFFORT_CLEAR_VALUES
 from tests.browser_ui.conftest import BrowserContract
 
 DEFAULT_SESSION_ID = "browser-chat-session"
@@ -499,6 +500,11 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
     contract.json(f"/v1/hosts/{handle.host_id}/mcp-servers", {"mcp_servers": []})
     contract.json("/v1/projects", empty)
     contract.json("/v1/projects/order", {"ordered_project_ids": None, "sort_mode": "alphabetical"})
+    contract.json(
+        "/v1/scheduled-tasks/default-timezone",
+        lambda request: request.post_data_json,
+        method="PUT",
+    )
     contract.json("/v1/extensions", empty)
     contract.json(
         "/v1/harnesses",
@@ -567,7 +573,16 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             return
         handle.session_patches.append(body)
         handle._session_updates.update(
-            {key: value for key, value in body.items() if key != "silent"}
+            {
+                # Like the server, store a clear alias as no override.
+                key: None
+                if key in {"model_override", "reasoning_effort"}
+                and isinstance(value, str)
+                and value.strip().lower() in EFFORT_CLEAR_VALUES
+                else value
+                for key, value in body.items()
+                if key != "silent"
+            }
         )
         route.fulfill(
             status=200,
