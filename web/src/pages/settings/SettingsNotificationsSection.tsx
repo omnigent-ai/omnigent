@@ -27,20 +27,21 @@ export function SettingsNotificationsSection() {
   const revision = useRef(0);
 
   useEffect(() => {
+    let active = true;
     const refresh = async () => {
       const request = ++revision.current;
       try {
         const value = await getNativeNotificationSettings();
-        if (request === revision.current) setSettings(value);
+        if (active && request === revision.current) setSettings(value);
       } catch {
-        if (request === revision.current)
+        if (active && request === revision.current)
           setError("Could not load notification settings. Reopen this page to try again.");
       }
     };
     void refresh();
     const unsubscribe = onNativeNotificationModeChanged(() => void refresh());
     return () => {
-      ++revision.current;
+      active = false;
       unsubscribe();
     };
   }, []);
