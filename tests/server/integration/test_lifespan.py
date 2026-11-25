@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock
 
 import httpx
@@ -181,53 +183,34 @@ async def test_lifespan_starts_periodic_metrics_otel_publisher(
 
 
 async def test_lifespan_creates_sessions_while_python_default_pool_is_occupied(
-    runtime_init: None,
-    db_uri: str,
-    tmp_path: Path,
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Postgres-backed server keeps creating sessions while 32 offloads block.
+    """A Postgres-sized server keeps creating sessions while 32 offloads block."""
+    from omnigent.server import app as server_app
 
-    The stores use SQLite; only the location that sizes the executor names Postgres.
-    """
-    from omnigent.runtime.agent_cache import AgentCache
-    from omnigent.server.app import create_app
-    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-    from omnigent.stores.artifact_store.local import LocalArtifactStore
-    from omnigent.stores.conversation_store.sqlalchemy_store import (
-        SqlAlchemyConversationStore,
+    monkeypatch.setattr(
+        server_app, "_server_thread_pool_workers", lambda _store: server_app._SERVER_THREAD_LIMIT
     )
-    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    conversation_store = SqlAlchemyConversationStore(db_uri)
-    app = create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=conversation_store,
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
-    )
-    conversation_store.storage_location = "postgresql+psycopg://omnigent@db.example.com/omnigent"
     release = threading.Event()
 
     threads_before = set(threading.enumerate())
     async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            agent = await create_test_agent(client)
-            loop = asyncio.get_running_loop()
-            blocked = [
-                loop.run_in_executor(None, release.wait)
-                for _ in range(_PYTHON_DEFAULT_EXECUTOR_MAX_WORKERS)
-            ]
-            try:
-                created = await asyncio.wait_for(
-                    client.post("/v1/sessions", json={"agent_id": agent["id"]}),
-                    timeout=budget(10),
-                )
-            finally:
-                release.set()
-                await asyncio.gather(*blocked)
+        agent = await create_test_agent(client)
+        loop = asyncio.get_running_loop()
+        blocked = [
+            loop.run_in_executor(None, release.wait)
+            for _ in range(_PYTHON_DEFAULT_EXECUTOR_MAX_WORKERS)
+        ]
+        try:
+            created = await asyncio.wait_for(
+                client.post("/v1/sessions", json={"agent_id": agent["id"]}),
+                timeout=budget(10),
+            )
+        finally:
+            release.set()
+            await asyncio.gather(*blocked)
         assert created.status_code == 201, created.text
         pool_watchdogs = [
             thread
@@ -238,3 +221,47 @@ async def test_lifespan_creates_sessions_while_python_default_pool_is_occupied(
     pool_watchdogs[0].join(timeout=budget(3))
     assert not pool_watchdogs[0].is_alive()
     assert await asyncio.to_thread(release.is_set)
+
+
+@pytest.mark.parametrize(
+    ("failing_step", "error"),
+    [("startup", RuntimeError), ("teardown", asyncio.CancelledError)],
+)
+async def test_lifespan_failure_still_shuts_down_the_server_pool(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_step: str,
+    error: type[BaseException],
+) -> None:
+    """A lifespan that fails to start or stop still shuts down its pool and watchdog."""
+    from omnigent.runtime import get_terminal_registry
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+    from omnigent.server import app as server_app
+    from omnigent.util.thread_pool_watchdog import watch_thread_pool
+
+    watched: list[tuple[ThreadPoolExecutor, threading.Thread]] = []
+
+    def record_watchdog(executor: ThreadPoolExecutor, **kwargs: Any) -> threading.Thread:
+        watchdog = watch_thread_pool(executor, **kwargs)
+        watched.append((executor, watchdog))
+        return watchdog
+
+    async def fail(*_args: object) -> None:
+        raise error
+
+    monkeypatch.setattr(server_app, "watch_thread_pool", record_watchdog)
+    if failing_step == "startup":
+        monkeypatch.setattr(HarnessProcessManager, "start", fail)
+    else:
+        monkeypatch.setattr(get_terminal_registry(), "shutdown", fail)
+
+    with pytest.raises(error):
+        async with app.router.lifespan_context(app):
+            pass
+
+    [(executor, watchdog)] = watched
+    with pytest.raises(RuntimeError, match="cannot schedule new futures"):
+        executor.submit(int)
+    watchdog.join(timeout=budget(3))
+    assert not watchdog.is_alive()
+    assert await asyncio.to_thread(bool, 1)

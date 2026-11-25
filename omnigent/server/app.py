@@ -10,9 +10,9 @@ import re
 import tarfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from importlib import import_module
 from itertools import batched, groupby
@@ -250,6 +250,28 @@ def _server_thread_pool_workers(conversation_store: object) -> int | None:
         if isinstance(location, str) and normalize_database_url(location).startswith("sqlite"):
             return None
     return _SERVER_THREAD_LIMIT
+
+
+@contextmanager
+def _server_default_executor(conversation_store: object) -> Iterator[None]:
+    """Run the loop's ``asyncio.to_thread`` calls on a watched ``server`` pool.
+
+    The pool is shut down, and a fresh default installed, even when the lifespan fails.
+
+    :param conversation_store: The server's conversation store, which sizes the pool.
+    """
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(
+        max_workers=_server_thread_pool_workers(conversation_store),
+        thread_name_prefix="server",
+    )
+    loop.set_default_executor(executor)
+    watch_thread_pool(executor, thread_name_prefix="server", process_role="server")
+    try:
+        yield
+    finally:
+        loop.set_default_executor(ThreadPoolExecutor(thread_name_prefix="asyncio"))
+        executor.shutdown(wait=False)
 
 
 @dataclass(frozen=True)
@@ -2353,17 +2375,10 @@ def create_app(
             per-AP state via ``app_inst.state.*``.
         """
         # FastAPI sync routes take AnyIO limiter tokens; ``asyncio.to_thread``
-        # runs on the loop's default executor, which Python caps at 32 threads.
+        # uses the default executor from ``_server_default_executor`` instead.
         from anyio import to_thread as _to_thread
 
         _to_thread.current_default_thread_limiter().total_tokens = _SERVER_THREAD_LIMIT
-        server_loop = asyncio.get_running_loop()
-        server_executor = ThreadPoolExecutor(
-            max_workers=_server_thread_pool_workers(conversation_store),
-            thread_name_prefix="server",
-        )
-        server_loop.set_default_executor(server_executor)
-        watch_thread_pool(server_executor, thread_name_prefix="server", process_role="server")
 
         # Initialise usage telemetry (fire-and-forget; no-op when disabled).
         from omnigent.telemetry import init_client as _init_telemetry
@@ -2676,9 +2691,16 @@ def create_app(
             # endpoint. Best-effort — individual close failures are logged
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
-            # Offloads after shutdown get a fresh pool; this one drains and its watchdog exits.
-            server_loop.set_default_executor(ThreadPoolExecutor(thread_name_prefix="asyncio"))
-            server_executor.shutdown(wait=False)
+
+    @asynccontextmanager
+    async def _lifespan_on_server_executor(app_inst: FastAPI) -> AsyncIterator[None]:
+        """Run :func:`_lifespan` with the server's default executor installed.
+
+        :param app_inst: The FastAPI app passed through to :func:`_lifespan`.
+        """
+        with _server_default_executor(conversation_store):
+            async with _lifespan(app_inst):
+                yield
 
     from omnigent.server.auth import AccountAuthorityMiddleware, UnifiedAuthProvider
 
@@ -2688,7 +2710,7 @@ def create_app(
         else None
     )
 
-    app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    app = FastAPI(title="Omnigent Server", lifespan=_lifespan_on_server_executor)
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
