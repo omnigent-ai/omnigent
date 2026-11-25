@@ -1556,7 +1556,8 @@ class _RecordingClient:
     """``httpx.Client`` stand-in that records each POST and replays scripted replies.
 
     Each reply is a status code, an exception class raised as a transport
-    failure, or ``"ok"`` for a verdict. Past the end, the last reply repeats.
+    failure, ``"ok"`` for a verdict, or a dict answered as a 200 JSON body.
+    Past the end, the last reply repeats.
     """
 
     posts: list[tuple[str, str]] = []
@@ -1585,6 +1586,8 @@ class _RecordingClient:
             raise reply("scripted transport failure", request=request)
         if reply == "ok":
             return httpx.Response(200, json={"ok": True}, request=request)
+        if isinstance(reply, dict):
+            return httpx.Response(200, json=reply, request=request)
         return httpx.Response(int(reply), text="rejected", request=request)
 
 
@@ -1626,18 +1629,22 @@ def _permission_bridge_with_stdin(
     return bridge_dir
 
 
+@pytest.mark.parametrize("relay_auth", [True, False], ids=["relay-auth", "bearer-in-config"])
 def test_permission_request_hook_goes_through_the_tool_relay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    relay_auth: bool,
 ) -> None:
-    """The hook posts to the session's tool relay, following it when it restarts.
+    """A relay_auth hook posts to the tool relay, following it when it restarts.
 
     The relay authenticates with the runner's refresh-capable client, so the
     hook sends only the relay's local token, never a server bearer. A relay
-    restarted on a new port or token is picked up on the next attempt.
+    restarted on a new port or token is picked up on the next attempt. A
+    config that still holds a bearer keeps the direct path: an older runner's
+    relay, still running after an upgrade, has no permission route.
     """
-    bridge_dir = _permission_bridge_with_stdin(tmp_path, monkeypatch)
+    bridge_dir = _permission_bridge_with_stdin(tmp_path, monkeypatch, relay_auth=relay_auth)
     _write_relay_file(bridge_dir, 47001, "relay-one")
 
     def restart_relay(index: int) -> None:
@@ -1649,10 +1656,43 @@ def test_permission_request_hook_goes_through_the_tool_relay(
     assert claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
 
     assert json.loads(capsys.readouterr().out) == {"ok": True}
-    assert client.posts == [
-        ("http://127.0.0.1:47001/hook/claude/permission-request", "Bearer relay-one"),
-        ("http://127.0.0.1:47002/hook/claude/permission-request", "Bearer relay-two"),
-    ]
+    if relay_auth:
+        assert client.posts == [
+            ("http://127.0.0.1:47001/hook/claude/permission-request", "Bearer relay-one"),
+            ("http://127.0.0.1:47002/hook/claude/permission-request", "Bearer relay-two"),
+        ]
+    else:
+        direct = "http://127.0.0.1:8787/v1/sessions/conv_relay/hooks/permission-request"
+        assert client.posts == [(direct, "Bearer xyz"), (direct, "Bearer xyz")]
+
+
+def test_relay_auth_parked_prompt_rides_out_an_auth_lapse_in_the_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A parked prompt keeps retrying while the runner can't renew its login.
+
+    The relay answers 401 when the runner's token refresh returns nothing, the
+    same signal a lapsed bearer gives on the direct path, so the hook keeps
+    retrying past the hard-failure cap until the login is back.
+    """
+    bridge_dir = _permission_bridge_with_stdin(tmp_path, monkeypatch, relay_auth=True)
+    _write_relay_file(bridge_dir, 47005, "relay-auth")
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    replies: list[object] = [httpx.RemoteProtocolError, *([401] * (cap + 5)), "ok"]
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+
+    def hold_the_first_poll(index: int) -> None:
+        if index == 0:
+            client.clock["t"] += held  # type: ignore[attr-defined]
+
+    client = _recording_client(monkeypatch, replies, hold_the_first_poll)
+
+    assert claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert len(client.posts) == len(replies)
 
 
 @pytest.mark.parametrize("relay_starts", [True, False], ids=["relay-starts", "relay-never-starts"])
@@ -1691,20 +1731,23 @@ def test_relay_auth_permission_hook_waits_a_bounded_time_for_the_relay(
         assert client.clock["t"] < claude_native_hook._RELAY_WAIT_S  # type: ignore[attr-defined]
     else:
         assert stdout == "", "a prompt with no relay and no bearer must not get a verdict"
-        assert client.clock["t"] >= claude_native_hook._RELAY_WAIT_S  # type: ignore[attr-defined]
+        waited = client.clock["t"]  # type: ignore[attr-defined]
+        wait_s = claude_native_hook._RELAY_WAIT_S
+        assert wait_s <= waited <= wait_s + claude_native_hook._RELAY_WAIT_POLL_S
         assert client.posts == [
             ("http://127.0.0.1:8787/v1/sessions/conv_relay/hooks/permission-request", "")
         ]
 
 
 def test_relay_auth_evaluate_policy_waits_for_the_relay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A tool call checked before the relay is up waits for it instead of a bearer."""
     bridge_dir = _permission_bridge_with_stdin(tmp_path, monkeypatch, relay_auth=True)
     payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-    client = _recording_client(monkeypatch, ["ok"])
+    verdict = {"result": "POLICY_ACTION_DENY", "reason": "Blocked by policy"}
+    client = _recording_client(monkeypatch, [verdict])
     sleep = claude_native_hook.time.sleep
 
     def sleep_then_start_relay(seconds: float) -> None:
@@ -1716,6 +1759,8 @@ def test_relay_auth_evaluate_policy_waits_for_the_relay(
     assert claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)]) == 0
 
     assert client.posts == [("http://127.0.0.1:47004/policies/evaluate", "Bearer relay-eval")]
+    output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
 
 
 @pytest.mark.parametrize("rotate", ["clear", "fork"])

@@ -16768,14 +16768,27 @@ async def test_claude_permission_relay_path_parks_on_the_active_session(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("failure", "unreachable"),
-    [(httpx.ConnectError("refused"), True), (httpx.ReadError("cut"), False)],
-    ids=["never-connected", "cut-mid-request"],
+    ("failure", "status", "unreachable"),
+    [
+        (httpx.ConnectError("refused"), 502, True),
+        (httpx.ReadError("cut"), 502, False),
+        (httpx.RequestError("Databricks token refresh returned no token"), 401, False),
+    ],
+    ids=["never-connected", "cut-mid-request", "token-refresh-empty"],
 )
 async def test_relay_proxy_error_marks_a_server_it_never_reached(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception, unreachable: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    status: int,
+    unreachable: bool,
 ) -> None:
-    """A relay 502 says whether the runner ever reached the Omnigent server."""
+    """A relay error tells a never-reached server and a lapsed login apart.
+
+    A 502 says whether the runner ever reached the Omnigent server. A token
+    refresh that returned nothing answers 401, the auth lapse the permission
+    hook already rides out while its prompt is parked.
+    """
     import urllib.error
 
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient(failure))
@@ -16787,9 +16800,39 @@ async def test_relay_proxy_error_marks_a_server_it_never_reached(
                 "/hook/claude/permission-request",
                 {"tool_name": "Read"},
             )
-        assert raised.value.code == 502
+        assert raised.value.code == status
         marker = raised.value.headers.get(claude_native_bridge.RELAY_UPSTREAM_UNREACHABLE_HEADER)
         assert (marker == "1") is unreachable
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_permission_relay_keeps_a_login_redirect_recognizable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A login redirect the runner couldn't follow reaches the hook with its target."""
+
+    class RedirectingClient:
+        async def post(self, url: str, json: dict[str, object]) -> SimpleNamespace:
+            del url, json
+            return SimpleNamespace(
+                status_code=302, content=b"", headers={"Location": "https://ws.example/oidc/login"}
+            )
+
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, RedirectingClient())
+    info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+    try:
+        async with httpx.AsyncClient(
+            base_url=info["url"],
+            headers={"Authorization": f"Bearer {info['token']}"},
+            trust_env=False,
+        ) as client:
+            response = await client.post(
+                "/hook/claude/permission-request", json={"tool_name": "R"}
+            )
+        assert response.status_code == 302
+        assert response.headers["Location"] == "https://ws.example/oidc/login"
     finally:
         relay.close()
 

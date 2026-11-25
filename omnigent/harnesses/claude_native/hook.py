@@ -192,10 +192,8 @@ _SESSION_ROTATION_TIMEOUT_S = 70.0
 # the permission long-poll. Held at one day; the server caps the real
 # wait via the deciding policy's ``ask_timeout``.
 _EVALUATE_POLICY_TIMEOUT_S = 86400.0
-# A runner-launched session's hooks authenticate through its tool relay, which
-# the runner starts just after the pane. A hook that fires first waits this long
-# for it, then falls back to the direct call, which has no bearer and so fails
-# safe (no web verdict, never an approval).
+# A relay_auth hook waits this long for the runner's relay, then makes the direct
+# call, which has no configured bearer and can only mint one from a local login.
 _RELAY_WAIT_S = 30.0
 _RELAY_WAIT_POLL_S = 0.25
 # A question Omnigent can't show on the web is otherwise left in Claude's
@@ -1004,9 +1002,9 @@ def _post_hook_with_reattach(
                     return None
                 # A fast 5xx is a sick server (the spin). One that arrives only
                 # after the poll was held past the floor is a gateway timing out
-                # an idle long-poll (a 504 at 300s) — a held-poll sever. The relay
-                # marks a server it never reached, which counts as a failed connect.
+                # an idle long-poll (a 504 at 300s) — a held-poll sever.
                 held_s = time.monotonic() - attempt_started
+                # The relay flags a server it never reached; count it as a failed connect.
                 never_connected = bool(exc.response.headers.get(RELAY_UPSTREAM_UNREACHABLE_HEADER))
                 is_hard_failure = never_connected or held_s < _PERMISSION_HELD_POLL_FLOOR_S
                 kind = (
@@ -1203,11 +1201,13 @@ def _main_permission_request(argv: list[str]) -> int:
     if not isinstance(ap_server_url, str) or not ap_server_url:
         print("omnigent claude permission hook: Omnigent server URL missing", file=sys.stderr)
         return 0
-    # The runner's tool relay authenticates with its own refresh-capable client
-    # and parks the card on the active session, so the hook holds no bearer.
-    relay_target = _relay_permission_target(bridge_dir)
-    if relay_target is None and config.get("relay_auth") is True and _wait_for_relay(bridge_dir):
+    # A relay_auth session's runner relay authenticates with its own refresh-capable
+    # client and parks the card on the active session, so the hook holds no bearer.
+    relay_target = None
+    if config.get("relay_auth") is True:
         relay_target = _relay_permission_target(bridge_dir)
+        if relay_target is None and _wait_for_relay(bridge_dir):
+            relay_target = _relay_permission_target(bridge_dir)
     retarget: Callable[[], tuple[str, dict[str, str]] | None] | None = None
     if relay_target is not None:
         url, headers = relay_target

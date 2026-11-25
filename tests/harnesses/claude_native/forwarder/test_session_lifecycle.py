@@ -176,15 +176,8 @@ async def test_relay_auth_clear_banner_names_the_old_session_until_the_forwarder
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """
-    A relay-authenticated ``/clear`` is rotated by the forwarder, not the hook.
-
-    Deliberate behavior change: the hook config of a runner-launched session
-    holds no bearer, so the SessionStart hook sends no rotation request before
-    Claude prints its banner, and the banner links the session being cleared. The forwarder
-    then rotates from the recorded hook event with the runner's own client, so
-    the bridge, and with it the web UI, moves to the new session.
-    """
+    """With relay auth, SessionStart prints the current session's banner without
+    rotating; the forwarder then rotates and the bridge moves to the new session."""
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)

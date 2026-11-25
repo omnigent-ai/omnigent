@@ -8887,6 +8887,7 @@ def _tool_relay_handler_factory(
                     "/hooks/permission-request",
                     watch_disconnect=True,
                     target_session_id=active,
+                    auth_lapse_status=HTTPStatus.UNAUTHORIZED,
                 )
                 return
             if self.path == "/hook/pi/extension-ui":
@@ -9113,6 +9114,7 @@ def _tool_relay_handler_factory(
             *,
             watch_disconnect: bool = False,
             target_session_id: str | None = None,
+            auth_lapse_status: HTTPStatus = HTTPStatus.BAD_GATEWAY,
         ) -> None:
             target = target_session_id or session_id
             if policy_client is None or target is None:
@@ -9136,14 +9138,15 @@ def _tool_relay_handler_factory(
                             return
                 resp = future.result(timeout=86400.0)
             except Exception as exc:  # noqa: BLE001
-                self._send_policy_proxy_error(exc)
+                self._send_policy_proxy_error(exc, auth_lapse_status=auth_lapse_status)
                 return
             finally:
                 # Closing a dialog releases the upstream parked card.
                 future.cancel()
             raw = resp.content
             self.send_response(resp.status_code)
-            for header in ("Content-Type", "Content-Length"):
+            # Location keeps a login redirect recognizable to the hook.
+            for header in ("Content-Type", "Content-Length", "Location"):
                 val = resp.headers.get(header)
                 if val is not None:
                     self.send_header(header, val)
@@ -9152,7 +9155,9 @@ def _tool_relay_handler_factory(
             self.end_headers()
             self.wfile.write(raw)
 
-        def _send_policy_proxy_error(self, exc: Exception) -> None:
+        def _send_policy_proxy_error(
+            self, exc: Exception, *, auth_lapse_status: HTTPStatus = HTTPStatus.BAD_GATEWAY
+        ) -> None:
             """Return a 502 whose body names why the upstream forward failed.
 
             The default ``send_error`` writes a generic ``http.server`` HTML
@@ -9163,6 +9168,9 @@ def _tool_relay_handler_factory(
             body with that cause so the blocked-turn message is actionable.
 
             :param exc: The exception raised by the upstream policy POST.
+            :param auth_lapse_status: Status for a token refresh that returned
+                nothing; the permission route sends ``401`` so the hook treats it
+                as the auth lapse it is.
             :returns: None.
             """
             reason = str(exc).strip()
@@ -9180,8 +9188,10 @@ def _tool_relay_handler_factory(
                 exc,
                 (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError),
             )
+            # The runner's auth raises a bare RequestError when no token comes back.
+            auth_lapse = type(exc) is httpx.RequestError
             try:
-                self.send_response(HTTPStatus.BAD_GATEWAY)
+                self.send_response(auth_lapse_status if auth_lapse else HTTPStatus.BAD_GATEWAY)
                 if never_connected:
                     # The hook rides out an unreachable server as it would a
                     # failed connect of its own.
