@@ -36,7 +36,18 @@ def with_message_sender(content: list[dict[str, Any]], sender: str | None) -> li
     line = message_sender_line(sender)
     if not line or not content:
         return content
-    first_text = next(
+    index = sender_line_index(content)
+    return [*content[:index], {"type": "input_text", "text": line}, *content[index:]]
+
+
+def sender_line_index(content: list[dict[str, Any]]) -> int:
+    """
+    Return where :func:`with_message_sender` puts the line: ahead of the first text block.
+
+    :param content: Message content blocks before the line is added.
+    :returns: The block index, or ``len(content)`` when there is no text block.
+    """
+    return next(
         (
             index
             for index, block in enumerate(content)
@@ -44,7 +55,6 @@ def with_message_sender(content: list[dict[str, Any]], sender: str | None) -> li
         ),
         len(content),
     )
-    return [*content[:first_text], {"type": "input_text", "text": line}, *content[first_text:]]
 
 
 def replayed_content(item: Mapping[str, object]) -> object:

@@ -122,7 +122,7 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.message_sender import with_message_sender
+from omnigent.runtime.message_sender import sender_line_index, with_message_sender
 from omnigent.runtime.policies.approval import (
     build_elicitation_request_event,
     resolve_ask_timeout,
@@ -7699,8 +7699,8 @@ async def _forward_native_terminal_message(
     :param input_delivery: Queued input identifiers and original enqueue time.
     :param agent_revision: Effective spec revision used to invalidate runner caches.
     :param native_shell_authorized: Owner authorization for this shell delivery.
-    :param message_sender: Identity typed ahead of the message for the agent;
-        the mirrored transcript drops it again (see
+    :param message_sender: Identity typed ahead of the message for the agent. An
+        unambiguous matching echo restores the typed content (see
         :func:`_persist_external_conversation_item_unlocked`).
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
@@ -7714,7 +7714,6 @@ async def _forward_native_terminal_message(
         input_delivery=input_delivery,
         agent_revision=agent_revision,
     )
-    event["content"] = with_message_sender(event["content"], message_sender)
     log_input_event(
         _logger,
         "native_input_forward_started",
@@ -7757,6 +7756,10 @@ async def _forward_native_terminal_message(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+    if message_sender is not None and isinstance(event.get("content"), list) and event["content"]:
+        # The runner drops exactly this block if it reports the message undelivered.
+        event["sender_line_index"] = sender_line_index(event["content"])
+        event["content"] = with_message_sender(event["content"], message_sender)
     forward_options: dict[str, Any] = {}
     if native_shell_authorized:
         from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER

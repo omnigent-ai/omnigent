@@ -464,6 +464,14 @@ def _prompt_wait_expired_failure(body: Mapping[str, Any]) -> _JsonObject:
     payload["input_only"] = True
     cast(_JsonObject, payload["response"])["id"] = f"resp_{uuid.uuid4().hex}"
     content = body.get("content")
+    line_index = body.get("sender_line_index")
+    if (
+        isinstance(content, list)
+        and isinstance(line_index, int)
+        and 0 <= line_index < len(content)
+    ):
+        # Report what the person typed, without the sender line the server added.
+        content = [*content[:line_index], *content[line_index + 1 :]]
     if isinstance(content, list) and content:
         try:
             # UTF-8 bytes, as the server's request limit counts them.

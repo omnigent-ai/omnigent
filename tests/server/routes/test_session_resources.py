@@ -6660,6 +6660,7 @@ async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry(
         assert [item.type for item in store.appended_items] == ["message"]
         assert store.appended_items[0].created_by is None
         assert store.appended_items[0].data.content == mirrored
+        assert store.appended_items[0].data.sender_in_context is False
         assert pending_inputs.snapshot_for(sid) == []
         assert pending_id  # the drained entry was the reformatted message itself
     finally:
@@ -9107,12 +9108,14 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("named", [False, True], ids=["typed", "named"])
 @pytest.mark.parametrize("server_copy_expired", [True, False])
 @pytest.mark.parametrize("parked_response_id", [None, "resp_" + "c" * 32])
 async def test_relay_records_queued_native_messages_reported_after_a_long_prompt_wait(
     monkeypatch: pytest.MonkeyPatch,
     parked_response_id: str | None,
     server_copy_expired: bool,
+    named: bool,
 ) -> None:
     """Messages the runner reports as not sent after a long prompt wait stay visible.
 
@@ -9127,6 +9130,7 @@ async def test_relay_records_queued_native_messages_reported_after_a_long_prompt
     """
     from omnigent.runner.app import _prompt_wait_expired_failure
     from omnigent.runtime import pending_inputs
+    from omnigent.runtime.message_sender import sender_line_index, with_message_sender
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import _relay_runner_stream
 
@@ -9146,7 +9150,16 @@ async def test_relay_records_queued_native_messages_reported_after_a_long_prompt
             session_id, content, created_by="alice@example.com", stable_id=stable_id
         )
         identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
-        bodies.append({"type": "message", "content": content, **identity})
+        # A named message reaches the runner behind the line, with its position.
+        sent = (
+            {
+                "content": with_message_sender(content, "alice@example.com"),
+                "sender_line_index": sender_line_index(content),
+            }
+            if named
+            else {"content": content}
+        )
+        bodies.append({"type": "message", **sent, **identity})
     if server_copy_expired:
         clock["t"] += pending_inputs._TTL_S + 1
         assert pending_inputs.snapshot_for(session_id) == []
