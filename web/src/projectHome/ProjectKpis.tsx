@@ -80,7 +80,8 @@ export function ProjectKpiTiles({
   return (
     <section
       aria-label={title}
-      className="space-y-3"
+      // Columns follow the space the tiles get (the Team dialog is much narrower than the page).
+      className="@container/kpis space-y-3"
       data-testid={identityId ? "role-kpi-slot" : "project-kpi-slot"}
     >
       <div className="flex items-center gap-2">
@@ -115,7 +116,7 @@ export function ProjectKpiTiles({
         </p>
       ) : (
         <>
-          <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <ul className="grid grid-cols-1 gap-3 @lg/kpis:grid-cols-2 @3xl/kpis:grid-cols-3">
             {kpis.data.kpis.map((kpi) => (
               <KpiTile key={kpi.position} kpi={kpi} onDrill={drill} />
             ))}
@@ -192,8 +193,11 @@ export function KpiTile({
       className="flex min-w-0 flex-col gap-2 rounded-lg border border-border/60 p-3"
       data-testid="project-kpi-tile"
     >
-      <div className="flex items-start gap-2">
-        <h3 className="min-w-0 flex-1 font-medium wrap-anywhere">{kpi.name}</h3>
+      {/* A long name keeps whole words; the status drops below it rather than squeezing it. */}
+      <div className="flex flex-wrap items-start gap-x-2 gap-y-1">
+        <h3 className="min-w-[min(100%,9rem)] flex-1 font-medium text-pretty wrap-break-word">
+          {kpi.name}
+        </h3>
         <StatusBadge status={status} />
       </div>
       {target && <p className="text-xs text-muted-foreground">Target: {target}</p>}
