@@ -3778,6 +3778,47 @@ async def test_a_listed_session_is_imported_from_its_runner_in_the_background(
 
 
 @pytest.mark.asyncio
+async def test_a_main_checkout_session_synced_without_prs_keeps_refreshing(
+    runner_globals_reset: None, db_uri: str
+) -> None:
+    """A session with no git branch of its own still picks up a PR opened later."""
+    from omnigent.server.session_pull_requests import PullRequestRefresher
+
+    del runner_globals_reset
+    SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)
+    conversation_store = _ConversationStore()
+    conversation_store.storage_location = db_uri  # type: ignore[attr-defined]
+    conversation = conversation_store._conversations[_PR_SESSION]
+    conversation.runner_id = "runner_pr"
+    assert conversation.git_branch is None
+    refresher = PullRequestRefresher(turn_end_delay_s=0)
+    app = _sessions_app(conversation_store, pull_request_refresher=refresher)
+    runner = _FakeRunnerClient(
+        payload={"object": "session.github.info", "tracking_available": True, "prs": []}
+    )
+    set_runner_router(_OnlineRunnerRouter(runner))  # type: ignore[arg-type]
+    listed = f"/v1/sessions/{_PR_SESSION}/pull-requests"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        await _end_turn(refresher, _PR_SESSION)
+        empty = (await client.get(listed)).json()
+        runner._payload = _pr_info()
+        await _end_turn(refresher, _PR_SESSION)
+        after = (await client.get(listed)).json()
+    assert (empty["data"], empty["synced"]) == ([], True)
+    assert [pr["url"] for pr in after["data"]] == [_FIRST_PR, _SECOND_PR]
+
+
+async def _end_turn(refresher: Any, session_id: str) -> None:
+    """End a turn and wait for the PR refresh it schedules."""
+    refresher.turn_ended(session_id)
+    await asyncio.sleep(0)
+    while refresher._running:
+        await asyncio.gather(*refresher._running.values())
+
+
+@pytest.mark.asyncio
 async def test_pull_request_list_pages_by_url(pr_client: httpx.AsyncClient) -> None:
     set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=_pr_info())))  # type: ignore[arg-type]
     await pr_client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
