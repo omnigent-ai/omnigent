@@ -211,6 +211,25 @@ def risk_ok_refusal(project: Any, requested_by: str | None) -> str:
     )
 
 
+def pending_sign_off_approvers(
+    project: Any, labels: list[dict[str, Any]] | None, requested_by: str | None
+) -> list[dict[str, Any]]:
+    """Each sign-off the ticket still owes, with who may give it, for the decision box.
+
+    ``[{"key": "product-ok", "approvers": [...]}]``: product approvers for
+    ``product-ok``, :func:`risk_ok_givers` for ``risk-ok``, the owner for ``owner-ok``.
+    """
+    givers = {
+        PRODUCT_OK_LABEL: {*product_approvers(project), project.user_id},
+        RISK_OK_LABEL: risk_ok_givers(project, requested_by),
+        OWNER_OK_LABEL: {project.user_id},
+    }
+    return [
+        {"key": key, "approvers": sorted(user for user in givers[key] if user)}
+        for key in pending_sign_offs(project, labels, requested_by)
+    ]
+
+
 def sign_offs_for(
     project: Any, ticket: dict[str, Any], viewer: str | None
 ) -> list[dict[str, Any]]:

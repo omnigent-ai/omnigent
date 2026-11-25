@@ -398,6 +398,27 @@ describe("groupInboxEntries", () => {
 });
 
 describe("groupInboxEntriesByApproval", () => {
+  it("lists questions for the viewer apart from sign-offs, both first", () => {
+    const now = new Date("2026-01-10T12:00:00Z");
+    const at = now.getTime() / 1000;
+    const entries = [
+      { id: "question", at: at - 10, ask_kind: "question" },
+      { id: "sign-off", at: at - 5, ask_kind: "sign-off" },
+      { id: "reply", at: at - 1 },
+    ];
+    const groups = groupInboxEntriesByApproval(
+      entries,
+      (entry) => entry.ask_kind !== undefined,
+      now,
+      (entry) => entry.ask_kind === "question",
+    );
+    expect(groups.map((group) => [group.label, group.entries.map((entry) => entry.id)])).toEqual([
+      ["Questions for you", ["question"]],
+      ["Needs your approval", ["sign-off"]],
+      ["Just now", ["reply"]],
+    ]);
+  });
+
   it("puts what needs approval first, newest first, and keeps the rest in time groups", () => {
     const now = new Date("2026-01-10T12:00:00Z");
     const at = (hoursAgo: number) => now.getTime() / 1000 - hoursAgo * 3600;

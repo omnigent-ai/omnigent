@@ -1196,6 +1196,10 @@ def create_project_tickets_router(
             # One-click approvals: the sign-offs this person may give the open ask.
             if who.session_id is None:
                 ticket["sign_offs"] = product_approval.sign_offs_for(project, ticket, who.user_id)
+                # Every sign-off still owed and who gives it, shown beside a plain question.
+                ticket["pending_sign_offs"] = product_approval.pending_sign_off_approvers(
+                    project, ticket.get("labels"), ticket.get("requested_by")
+                )
             # Whether the landed commit is in the code this server runs; absent if unknown.
             shipped = await asyncio.to_thread(running_commit.ship_status, project.config, ticket)
             if shipped is not None:

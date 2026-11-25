@@ -113,6 +113,7 @@ import {
   collectUnreadInboxItems,
   groupInboxEntriesByApproval,
   isTicketApprovalRequest,
+  isTicketQuestion,
   type CommentInboxItem,
   type InboxItem,
   type InboxSource,
@@ -579,6 +580,8 @@ export function InboxPage() {
     visibleEntries,
     (entry) =>
       entry.kind === "approval" || (entry.kind === "ticket" && isTicketApprovalRequest(entry.item)),
+    undefined,
+    (entry) => entry.kind === "ticket" && isTicketQuestion(entry.item),
   );
   const defaultExpandedKey = visibleEntries.find((entry) => entry.kind === "approval")?.key;
 
@@ -863,7 +866,7 @@ export function InboxPage() {
           testId="inbox-ticket-request"
           dataKind="ticket"
           tile={<KindTile icon={HandIcon} tone="yellow" />}
-          kindLabel="Needs your response"
+          kindLabel={isTicketQuestion(item) ? "Question for you" : "Needs your response"}
           title={item.title}
           preview={item.question ?? item.project_name}
           at={entry.at}

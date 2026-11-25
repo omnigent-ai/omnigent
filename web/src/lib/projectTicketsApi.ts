@@ -103,6 +103,8 @@ export interface ProjectTicket {
   needs_final_update?: boolean;
   /** Sign-off labels the open ask waits on that the viewer may add; single-ticket reads. */
   sign_offs?: TicketLabel[];
+  /** Every sign-off still owed and who may give it; single-ticket reads. */
+  pending_sign_offs?: TicketPendingSignOff[];
   /** Who the open needs-human ask waits on, routed as in the Inbox; null once answered. */
   waiting_on?: TicketWaitingOn | null;
   /**
@@ -162,6 +164,13 @@ export interface TicketWaitingOn {
   ask_position?: number | null;
   /** The question, from the asker's comment (up to 500 characters). */
   question?: string | null;
+  /** "question" is answered in words; "sign-off" by adding a label. Absent on older servers. */
+  ask_kind?: "question" | "sign-off";
+}
+/** A sign-off the ticket still owes, and the people who may give it. */
+export interface TicketPendingSignOff {
+  key: string;
+  approvers: string[];
 }
 export interface TicketFinalUpdate {
   event_id: string;

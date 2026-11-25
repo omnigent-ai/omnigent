@@ -14,6 +14,8 @@ export interface TicketRequest {
    * person cc'd the viewer in a comment they haven't read yet.
    */
   reason: "product-ok" | "risk-ok" | "owner" | "cc";
+  /** "question" for a plain question to the viewer, "sign-off" for an approval. */
+  ask_kind?: "question" | "sign-off";
   /** Everyone the ask is routed to; any one of them answering clears it for all. */
   responders: string[];
   /** Activity position of the ask's question (or of the label change), to scroll to. */

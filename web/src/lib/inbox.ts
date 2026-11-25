@@ -232,23 +232,42 @@ export function isTicketApprovalRequest(item: { reason: string }): boolean {
   return TICKET_APPROVAL_REASONS.has(item.reason);
 }
 
-export const NEEDS_APPROVAL_GROUP = "Needs your approval";
+export const NEEDS_APPROVAL_GROUP = "Needs your approval" as const;
+export const QUESTIONS_GROUP = "Questions for you" as const;
+
+/** Whether a ticket request is a plain question to the viewer rather than a sign-off. */
+export function isTicketQuestion(item: { reason: string; ask_kind?: string }): boolean {
+  return item.reason !== "cc" && item.ask_kind === "question";
+}
 
 /**
- * The Inbox's groups: entries needing the viewer's decision first, newest first, then
- * everything else in its time groups.
+ * The Inbox's groups: questions for the viewer, then entries needing their approval,
+ * each newest first, then everything else in its time groups.
  */
 export function groupInboxEntriesByApproval<T extends { at: number }>(
   entries: T[],
   needsApproval: (entry: T) => boolean,
   now: Date = new Date(),
-): { label: InboxTimeGroup | typeof NEEDS_APPROVAL_GROUP; approval: boolean; entries: T[] }[] {
-  const approvals = entries.filter(needsApproval).sort((a, b) => b.at - a.at);
+  isQuestion: (entry: T) => boolean = () => false,
+): {
+  label: InboxTimeGroup | typeof NEEDS_APPROVAL_GROUP | typeof QUESTIONS_GROUP;
+  approval: boolean;
+  entries: T[];
+}[] {
+  const newestFirst = (a: T, b: T) => b.at - a.at;
+  const questions = entries.filter(isQuestion).sort(newestFirst);
+  const approvals = entries
+    .filter((entry) => !isQuestion(entry) && needsApproval(entry))
+    .sort(newestFirst);
   const rest = groupInboxEntries(
-    entries.filter((entry) => !needsApproval(entry)),
+    entries.filter((entry) => !isQuestion(entry) && !needsApproval(entry)),
     now,
   ).map((group) => ({ ...group, approval: false }));
-  return approvals.length > 0
-    ? [{ label: NEEDS_APPROVAL_GROUP, approval: true, entries: approvals }, ...rest]
-    : rest;
+  return [
+    ...(questions.length ? [{ label: QUESTIONS_GROUP, approval: true, entries: questions }] : []),
+    ...(approvals.length
+      ? [{ label: NEEDS_APPROVAL_GROUP, approval: true, entries: approvals }]
+      : []),
+    ...rest,
+  ];
 }

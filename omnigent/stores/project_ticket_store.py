@@ -1094,7 +1094,7 @@ class ProjectTicketStore:
         routing_project = SimpleNamespace(
             user_id=project.user_id, config=_decode_config(project.config)
         )
-        _, _, answerers = self._ask_routing(session, routing_project, ticket)
+        _, _, answerers, _ = self._ask_routing(session, routing_project, ticket)
         if actor.user_id not in answerers:
             return False
         asks = self._human_asks(session, ticket)
@@ -1868,8 +1868,9 @@ class ProjectTicketStore:
 
     def _ask_routing(
         self, session: Session, routing_project: Any, ticket: SqlProjectTicket
-    ) -> tuple[str, set[str | None], set[str | None]]:
-        """A ``needs-human`` ask's reason, the people it's routed to, and who may answer it.
+    ) -> tuple[str, set[str | None], set[str | None], bool]:
+        """A ``needs-human`` ask's reason, the people it's routed to, who may answer it, and
+        whether it's a plain question rather than a sign-off.
 
         Sign-off asks keep :func:`human_request_routing`; only the owner answers one still
         owed their own sign-off. A plain question goes to the people its question
@@ -1890,7 +1891,7 @@ class ProjectTicketStore:
         )
         owner = routing_project.user_id
         if owner_sign_off_pending(ticket.labels, ticket.requested_by):
-            return reason, responders, {owner}
+            return reason, responders, {owner}, False
         plain = is_plain_ask(routing_project, ticket.labels, ticket.requested_by)
         context = None
         if not plain and only_product_ok_owed(ticket.labels, ticket.requested_by):
@@ -1911,10 +1912,10 @@ class ProjectTicketStore:
             if plain:
                 reason = REQUEST_OWNER
         if not plain:
-            return reason, responders, responders
+            return reason, responders, responders, False
         asker, question = context or self._open_ask_context(session, ticket)
         responders = self._plain_ask_responders(session, owner, ticket, asker, question)
-        return reason, responders, {*responders, owner}
+        return reason, responders, {*responders, owner}, True
 
     def _open_ask_context(
         self, session: Session, ticket: SqlProjectTicket
@@ -2027,7 +2028,7 @@ class ProjectTicketStore:
             product_approvers,
         )
 
-        reason, responders, answerers = self._ask_routing(session, routing_project, ticket)
+        reason, responders, answerers, plain = self._ask_routing(session, routing_project, ticket)
         if only_for_viewer and viewer not in responders:
             return reason, responders, None
         owner_pending = owner_sign_off_pending(ticket.labels, ticket.requested_by)
@@ -2043,6 +2044,9 @@ class ProjectTicketStore:
         request = self._open_human_request(
             session, ticket, answerers, viewer, product_ok_from=product_ok_from
         )
+        if request is not None:
+            # A plain question is answered in words; a sign-off ask by adding its label.
+            request["ask_kind"] = "question" if plain else "sign-off"
         return reason, responders, request
 
     def _waiting_on(
@@ -2070,6 +2074,7 @@ class ProjectTicketStore:
             "raised_at": request["raised_at"],
             "ask_position": request["ask_position"],
             "question": request["question"],
+            "ask_kind": request["ask_kind"],
         }
 
     def _open_human_request(

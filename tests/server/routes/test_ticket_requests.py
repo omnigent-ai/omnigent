@@ -577,8 +577,18 @@ async def test_a_plain_question_on_a_feature_goes_to_the_requester_not_the_appro
 
     # A question on a feature waits on its requester; a product-ok ask on approvers.
     plain = await waiting(question)
-    assert (plain["reason"], plain["responders"]) == ("owner", [BOB])
+    assert (plain["reason"], plain["responders"], plain["ask_kind"]) == (
+        "owner",
+        [BOB],
+        "question",
+    )
     ask = await waiting(approval)
     assert ask["reason"] == "product-ok" and carol in ask["responders"]
+    assert ask["ask_kind"] == "sign-off"
+    # The box beside the question still says the product OK is owed, and by whom.
+    got = (await client.get(f"{base}/{question}", headers=_as_user(BOB))).json()
+    assert got["pending_sign_offs"] == [{"key": "product-ok", "approvers": sorted([ALICE, carol])}]
+    inbox = (await client.get(PATH, headers=_as_user(BOB))).json()["data"]
+    assert [item["ask_kind"] for item in inbox] == ["question"]
     assert await _requests(client, BOB) == ["Whimsy"]
     assert await _requests(client, carol) == ["Launch"]

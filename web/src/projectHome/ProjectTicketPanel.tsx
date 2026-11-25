@@ -700,6 +700,8 @@ function TicketDetails({
                   personaLookup={personaLookup}
                   answering={comment.isPending}
                   signOffOffered={(ticket.sign_offs ?? []).length > 0}
+                  requestedBy={ticket.requested_by ?? null}
+                  pendingSignOffs={ticket.pending_sign_offs ?? []}
                   onAnswer={(text) => comment.mutate({ id: ticketId, body: { text, outputs: [] } })}
                   onAnswerInComment={(mention) =>
                     setComposerPrefill((previous) => ({

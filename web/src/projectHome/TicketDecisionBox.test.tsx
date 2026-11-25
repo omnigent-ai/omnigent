@@ -1,9 +1,16 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as TicketsApi from "@/lib/projectTicketsApi";
 import type { TicketWaitingOn } from "@/lib/projectTicketsApi";
-import { askEvidence, decisionOptions, questionStem, TicketDecisionBox } from "./TicketDecisionBox";
+import {
+  askEvidence,
+  askRecommendation,
+  decisionOptions,
+  questionStem,
+  TicketDecisionBox,
+} from "./TicketDecisionBox";
 
 vi.mock("@/lib/projectTicketsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof TicketsApi>()),
@@ -55,7 +62,12 @@ function waiting(overrides: Partial<TicketWaitingOn> = {}): TicketWaitingOn {
   };
 }
 
-function renderBox(viewer: string, waitingOn = waiting(), signOffOffered = false) {
+function renderBox(
+  viewer: string,
+  waitingOn = waiting(),
+  signOffOffered = false,
+  extra: Partial<ComponentProps<typeof TicketDecisionBox>> = {},
+) {
   const handlers = { onAnswer: vi.fn(), onAnswerInComment: vi.fn(), onShowAsk: vi.fn() };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -70,6 +82,7 @@ function renderBox(viewer: string, waitingOn = waiting(), signOffOffered = false
         answering={false}
         signOffOffered={signOffOffered}
         {...handlers}
+        {...extra}
       />
     </QueryClientProvider>,
   );
@@ -187,6 +200,77 @@ describe("TicketDecisionBox", () => {
     renderBox("owner@example.com", waiting({ question: "Product OK, yes or no?" }), true);
     expect(screen.queryByTestId("ticket-decision-options")).toBeNull();
     expect(screen.getByTestId("ticket-decision-sign-off")).toHaveTextContent("sign-off above");
+  });
+
+  const PDF_QUESTION = [
+    "Kasey, should the PDF include the charts?",
+    "",
+    "A) Charts and table",
+    "B) Table only",
+    "C) Charts only, table as an appendix",
+    "",
+    "I recommend A: it matches the web view.",
+  ].join("\n");
+
+  it("reads the recommendation and the option it names", () => {
+    const options = decisionOptions(PDF_QUESTION);
+    expect(askRecommendation(PDF_QUESTION, options)).toMatchObject({
+      text: "A: it matches the web view.",
+      label: "A. Charts and table",
+    });
+    expect(
+      askRecommendation("Pick one?\nA. x\nB. y", decisionOptions("Pick one?\nA. x\nB. y")),
+    ).toBeNull();
+  });
+
+  it("asks the named member, with choices, the recommendation and the sign-off row", () => {
+    const handlers = renderBox(
+      "kasey@example.com",
+      waiting({
+        responders: ["kasey@example.com"],
+        question: PDF_QUESTION,
+        ask_kind: "question",
+      }),
+      true,
+      {
+        requestedBy: "alex.rivera@example.com",
+        pendingSignOffs: [
+          { key: "product-ok", approvers: ["aaron@example.com", "ankit@example.com"] },
+        ],
+      },
+    );
+    const box = screen.getByRole("region", { name: "Question for you" });
+    expect(box).toHaveTextContent("Question for you · from Lead, for Alex Rivera · 2m ago");
+    expect(box).toHaveTextContent("Kasey, should the PDF include the charts?");
+    expect(screen.getByTestId("ticket-decision-recommendation")).toHaveTextContent(
+      "Recommended: A: it matches the web view.",
+    );
+    // A sign-off owed elsewhere doesn't drop the question's choices.
+    const recommended = screen.getByRole("button", { name: /^A\. Charts and table/ });
+    expect(recommended).toHaveTextContent("Recommended");
+    expect(screen.getByRole("button", { name: /^C\. Charts only/ })).toHaveTextContent(
+      "table as an appendix",
+    );
+    expect(screen.getByTestId("ticket-decision-comment")).toHaveTextContent(
+      "Or reply in your own words",
+    );
+    expect(screen.getByTestId("ticket-decision-sign-off-row")).toHaveTextContent(
+      "Also needs a product OKfrom Aaron or Ankit. Not you.",
+    );
+    fireEvent.click(recommended);
+    expect(handlers.onAnswer).toHaveBeenCalledWith("Decision: A. Charts and table");
+  });
+
+  it("tells an approver they can give the sign-off themselves", () => {
+    renderBox(
+      "aaron@example.com",
+      waiting({ responders: ["aaron@example.com"], question: PDF_QUESTION, ask_kind: "question" }),
+      false,
+      { pendingSignOffs: [{ key: "product-ok", approvers: ["aaron@example.com"] }] },
+    );
+    expect(screen.getByTestId("ticket-decision-sign-off-row")).toHaveTextContent(
+      "You can give it with the sign-off above.",
+    );
   });
 
   it("shows anyone else one grey line, with no answer controls", () => {
