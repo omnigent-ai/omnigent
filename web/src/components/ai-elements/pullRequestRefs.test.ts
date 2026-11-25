@@ -412,6 +412,45 @@ describe("linkedPullRequestUrl", () => {
     expect(linkedPullRequestUrl(session, "12")).toBe("https://github.com/acme/app/pull/12");
   });
 
+  it("links only providers whose #N names a pull request", () => {
+    const gitlab = {
+      url: "https://gitlab.example.com/acme/app/-/merge_requests/12",
+      host: "gitlab.example.com",
+      repository: "acme/app",
+      number: 12,
+      relationship: "attached" as const,
+      provider: "gitlab",
+      provider_display: {
+        id: "gitlab",
+        display_name: "GitLab",
+        request_name: "merge request",
+        number_prefix: "!",
+      },
+    };
+    // On GitLab `#12` is an issue; the merge request is `!12`.
+    expect(linkedPullRequestUrl(info({ prs: [gitlab] }), "12")).toBeNull();
+    const azure = {
+      ...gitlab,
+      url: "https://dev.azure.example.com/acme/app/_git/app/pullrequest/12",
+      provider: "azure_devops",
+      provider_display: { ...gitlab.provider_display, id: "azure_devops" },
+    };
+    expect(linkedPullRequestUrl(info({ prs: [azure] }), "12")).toBeNull();
+    // A provider without its display copy can't say what `#N` means there.
+    const { provider_display: _display, ...bare } = gitlab;
+    expect(linkedPullRequestUrl(info({ prs: [bare] }), "12")).toBeNull();
+    const hashed = {
+      ...gitlab,
+      url: "https://code.example.com/acme/app/pulls/12",
+      provider: "forge",
+      provider_display: { ...gitlab.provider_display, id: "forge", number_prefix: "#" },
+    };
+    expect(linkedPullRequestUrl(info({ prs: [hashed] }), "12")).toBe(hashed.url);
+    // A GitHub PR with the same number beside a GitLab one is the only `#12`.
+    const github = linked("https://github.com/acme/app/pull/12");
+    expect(linkedPullRequestUrl(info({ prs: [gitlab, github] }), "12")).toBe(github.url);
+  });
+
   it("links a linked PR on any code host by its stored URL, and nothing that isn't a web URL", () => {
     const enterprise = {
       url: "https://ghe.example.com/acme/app/pull/7",

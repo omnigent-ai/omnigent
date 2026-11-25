@@ -1,7 +1,7 @@
 // Parks PR references (`#1234`, `owner/repo#12`) on fragment links that the anchor
 // override resolves once session info loads; Streamdown won't re-parse a settled message.
 
-import type { PullRequestInfo } from "@/hooks/usePullRequests";
+import type { PullRequestAssociation, PullRequestInfo } from "@/hooks/usePullRequests";
 import { pullRequestKey } from "@/lib/pullRequestReference";
 
 /**
@@ -219,12 +219,21 @@ export function linkedPullRequestUrl(
   if (!PULL_REQUEST_NUMBER.test(number)) return null;
   const urls = new Map<string, string>();
   for (const pr of info?.prs ?? []) {
-    if (pr.number !== Number(number) || !isWebUrl(pr.url)) continue;
+    if (pr.number !== Number(number) || !numbersWithHash(pr) || !isWebUrl(pr.url)) continue;
     // One PR however its link is stored: case, a trailing slash, a query or a fragment.
     const key = pullRequestKey(pr.url);
     if (!urls.has(key)) urls.set(key, pr.url);
   }
   return urls.size === 1 ? [...urls.values()][0]! : null;
+}
+
+/**
+ * Whether `#N` names this PR on its provider. GitHub's does; on GitLab and Azure DevOps `#N`
+ * is an issue or work item and a merge or pull request is `!N`.
+ */
+function numbersWithHash(pr: PullRequestAssociation): boolean {
+  if (!pr.provider || pr.provider === "github") return true;
+  return pr.provider_display?.id === pr.provider && pr.provider_display.number_prefix === "#";
 }
 
 function isWebUrl(value: string): boolean {
