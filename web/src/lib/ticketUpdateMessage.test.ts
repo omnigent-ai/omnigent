@@ -84,4 +84,47 @@ describe("parseTicketUpdateMessage", () => {
   ])("falls back to text for %s", (_name, text) => {
     expect(parseTicketUpdateMessage(text)).toBeNull();
   });
+
+  it("reads a worker's turn for a person's comment as a comment card", () => {
+    const text =
+      `A person commented on ticket ${TICKET} "tabs on project page shift" in project ${PROJECT}, which you are linked to:\n\n` +
+      "You might want to spin up a Codex harness.\n\nSecond paragraph.\n\n" +
+      "You are the one agent asked to answer it; the ticket's other agents were not woken. Reply on the ticket yourself.";
+    const message = parseTicketUpdateMessage(text);
+    expect(message?.projectId).toBe(PROJECT);
+    expect(message?.cards).toHaveLength(1);
+    expect(message?.cards[0]).toMatchObject({
+      ticketId: TICKET,
+      title: "tabs on project page shift",
+      personNotice: { kind: "comment" },
+      comment: {
+        text: "You might want to spin up a Codex harness.\n\nSecond paragraph.",
+        audience: "human",
+        author: null,
+      },
+    });
+  });
+
+  it.each([
+    [
+      "worker",
+      `A person added \`risk-ok\`, \`product-ok\` on ticket ${TICKET} "Fix it" in project ${PROJECT}, which you are linked to.\n\nCarry on with the step that waited on it.`,
+    ],
+    [
+      "merger",
+      `A person added \`risk-ok\`, \`product-ok\` on ticket ${TICKET} "Fix it" in project ${PROJECT}. Its approved commit is \`${"c".repeat(40)}\`. If it is waiting, continue.`,
+    ],
+  ])("reads the %s's sign-off turn as a card naming the labels", (_who, text) => {
+    expect(parseTicketUpdateMessage(text)?.cards[0]).toMatchObject({
+      ticketId: TICKET,
+      title: "Fix it",
+      personNotice: { kind: "signoff", labels: "risk-ok, product-ok" },
+      comment: null,
+    });
+  });
+
+  it("leaves a person's own message that merely starts the same way alone", () => {
+    expect(parseTicketUpdateMessage("A person commented on ticket 42, can you look?")).toBeNull();
+  });
 });
+

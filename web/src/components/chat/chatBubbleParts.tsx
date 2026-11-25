@@ -1151,15 +1151,24 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   if (!origin && images.length === 0 && fileChips.length === 0) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
-    // The server's automatic ticket notifications read as ticket cards.
-    if (!isShellCommand && !bubble.pending) {
+    // The server's automatic ticket notifications read as ticket cards, including
+    // one that wasn't delivered: nobody typed it, so it isn't shown as their message.
+    if (!isShellCommand && (!bubble.pending || bubble.undelivered)) {
       const ticketUpdate = parseTicketUpdateMessage(
         stripAutomationContext(joinTextBlocks(bubble.content)),
       );
       if (ticketUpdate)
         return (
-          <div data-message-id={bubble.itemId} className="flex w-full">
+          <div data-message-id={bubble.itemId} className="flex w-full flex-col items-start">
             <TicketUpdateCards message={ticketUpdate} />
+            {bubble.undelivered && (
+              <UndeliveredMessageNotice
+                sessionId={sessionId}
+                pendingId={bubble.itemId}
+                text={text}
+                content={bubble.content}
+              />
+            )}
           </div>
         );
     }

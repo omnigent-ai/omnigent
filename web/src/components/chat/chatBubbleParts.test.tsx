@@ -1522,4 +1522,30 @@ describe("automatic ticket updates", () => {
     expect(screen.queryByTestId("message-bubble")).toBeNull();
     expect(screen.queryByRole("button", { name: "Show raw" })).toBeNull();
   });
+
+  it("shows a worker's person-comment turn as a card, keeping undelivered actions", () => {
+    const notice =
+      `A person commented on ticket ${ticketId} "tabs on project page shift" in project ${"d".repeat(32)}, which you are linked to:\n\n` +
+      "You might want to spin up a Codex harness.\n\n" +
+      "You are the one agent asked to answer it; the ticket's other agents were not woken.";
+    const [bubble] = buildUndeliveredBubbles(
+      [{ pendingId: "pending_notice", content: [{ type: "input_text", text: notice }] }],
+      "owner@example.com",
+    );
+    render(
+      <MemoryRouter initialEntries={["/c/conv_pd"]}>
+        <ConversationScopeContext.Provider value="conv_pd">
+          <BubbleView bubble={bubble!} isLastAssistant={false} />
+        </ConversationScopeContext.Provider>
+      </MemoryRouter>,
+    );
+    const card = screen.getByTestId("ticket-update-card");
+    expect(card).toHaveTextContent("tabs on project page shift");
+    expect(card).toHaveTextContent("A person commented");
+    expect(card).toHaveTextContent("You might want to spin up a Codex harness.");
+    expect(card).not.toHaveTextContent("You are the one agent");
+    expect(screen.queryByTestId("message-bubble")).toBeNull();
+    expect(screen.getByTestId("message-undelivered")).toHaveTextContent("Not delivered");
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
+  });
 });

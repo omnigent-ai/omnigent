@@ -1,6 +1,7 @@
 // Parses the server's automatic ticket notifications (``ticket_batch_message`` in
-// ``omnigent/server/project_orchestrator.py``) into per-ticket summaries so the chat
-// can show them as cards. Display-only; anything unexpected returns null and the
+// ``omnigent/server/project_orchestrator.py``, and the turns it hands a worker for a
+// person's comment or sign-off) into per-ticket summaries so the chat can show them
+// as cards. Display-only; anything unexpected returns null and the
 // message renders as plain text.
 
 import type { TicketLabel, TicketStage } from "./projectTicketsApi";
@@ -12,6 +13,12 @@ const SECTION_RE =
 const DIGEST_HEADER_RE = /^Digest of \d+ background updates? /;
 const DIGEST_LINE_RE = /^- ([0-9a-f]{32}) "(.*?)": (.+?)(?: — latest: (.*))?$/;
 const ESCALATION_PREFIX = "No worker linked to this ticket replied";
+// ``ticket_comment_for_worker_message``: the header line, then the comment, then guidance.
+const WORKER_COMMENT_RE =
+  /^A person commented on ticket ([0-9a-f]{32}) "(.*)" in project ([0-9a-f]{32}), which you are linked to:\n\n([\s\S]*?)\n\nYou are the one agent asked to answer it;/;
+// ``ticket_gate_label_for_worker_message`` and ``ticket_gate_label_for_merger_message``.
+const SIGNOFF_RE =
+  /^A person added (.+?) on ticket ([0-9a-f]{32}) "(.*)" in project ([0-9a-f]{32})(?:, which you are linked to)?\./;
 
 export interface TicketUpdateComment {
   text: string;
@@ -41,6 +48,8 @@ export interface TicketUpdateCard {
   digestLatest: string | null;
   /** A person's comment no worker answered in time. */
   escalated: boolean;
+  /** A turn handed to this agent for a person's comment or sign-off label. */
+  personNotice: { kind: "comment" } | { kind: "signoff"; labels: string } | null;
 }
 
 export interface TicketUpdateMessage {
@@ -61,6 +70,7 @@ function emptyCard(ticketId: string): TicketUpdateCard {
     digestSummary: null,
     digestLatest: null,
     escalated: false,
+    personNotice: null,
   };
 }
 
@@ -150,6 +160,8 @@ function applyEvent(
  * :returns: null when *text* isn't a ticket update or any part fails to parse.
  */
 export function parseTicketUpdateMessage(text: string): TicketUpdateMessage | null {
+  const notice = parsePersonNotice(text.replace(/\r\n/g, "\n"));
+  if (notice) return notice;
   const lines = text.replace(/\r\n/g, "\n").trimEnd().split("\n");
   const header = HEADER_RE.exec(lines[0] ?? "");
   if (!header) return null;
@@ -203,4 +215,30 @@ export function parseTicketUpdateMessage(text: string): TicketUpdateMessage | nu
   }
   if (cards.size === 0) return null;
   return { projectId: header[1]!, cards: [...cards.values()] };
+}
+
+/** A worker's turn for a person's comment or sign-off on one ticket, as one card. */
+function parsePersonNotice(text: string): TicketUpdateMessage | null {
+  const comment = WORKER_COMMENT_RE.exec(text);
+  if (comment) {
+    const card = emptyCard(comment[1]!);
+    card.title = comment[2]!;
+    card.comment = {
+      text: comment[4]!.trim(),
+      audience: "human",
+      author: null,
+      kind: "comment",
+      final: false,
+    };
+    card.personNotice = { kind: "comment" };
+    return { projectId: comment[3]!, cards: [card] };
+  }
+  const signoff = SIGNOFF_RE.exec(text);
+  if (signoff) {
+    const card = emptyCard(signoff[2]!);
+    card.title = signoff[3]!;
+    card.personNotice = { kind: "signoff", labels: signoff[1]!.replaceAll("`", "") };
+    return { projectId: signoff[4]!, cards: [card] };
+  }
+  return null;
 }

@@ -5,7 +5,7 @@ import { useContext, type ReactNode } from "react";
 import { useInRouterContext } from "react-router-dom";
 import { Link } from "@/lib/routing";
 import { QueryClientContext, useQuery } from "@tanstack/react-query";
-import { ArrowUpRightIcon, BotIcon, CircleAlertIcon } from "lucide-react";
+import { ArrowUpRightIcon, BotIcon, CircleAlertIcon, UserIcon } from "lucide-react";
 import { useProjects } from "@/hooks/useConversations";
 import { getTicket, getTicketStages, type TicketStage } from "@/lib/projectTicketsApi";
 import type { TicketUpdateCard, TicketUpdateMessage } from "@/lib/ticketUpdateMessage";
@@ -68,6 +68,8 @@ function digestPhrase(summary: string): string {
 /** What happened, in a few words, beside the stage chip. */
 function eventPhrase(card: TicketUpdateCard): string | null {
   const comment = card.comment;
+  if (card.personNotice?.kind === "comment") return "A person commented";
+  if (card.personNotice?.kind === "signoff") return `A person added ${card.personNotice.labels}`;
   if (card.created) return "New ticket";
   if (comment?.author) return "New comment";
   if (comment?.final) return "Final update";
@@ -80,7 +82,13 @@ function eventPhrase(card: TicketUpdateCard): string | null {
   return null;
 }
 
-function Avatar({ author }: { author: string | null }) {
+function Avatar({ author, person }: { author: string | null; person: boolean }) {
+  if (!author && person)
+    return (
+      <span className="mt-0.5 grid size-4 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground">
+        <UserIcon aria-hidden className="size-2.5" />
+      </span>
+    );
   if (!author)
     return (
       <span className="mt-0.5 grid size-4 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground">
@@ -104,7 +112,7 @@ function Quote({ card, oneLine }: { card: TicketUpdateCard; oneLine: boolean }) 
   const author = card.comment?.author ?? null;
   return (
     <div className="mt-2 flex min-w-0 items-start gap-1.5 border-l-2 pl-2.5 text-[13px] leading-5 text-muted-foreground">
-      <Avatar author={author} />
+      <Avatar author={author} person={card.personNotice !== null} />
       <p className={cn("min-w-0 break-words", oneLine ? "line-clamp-1" : "line-clamp-2")}>
         {author && <span className="font-medium text-foreground">{personName(author)} </span>}
         {text}
