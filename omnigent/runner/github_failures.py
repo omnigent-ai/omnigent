@@ -11,6 +11,7 @@ import re
 
 from omnigent.runner import github_resource as github
 from omnigent.runner.pull_request_errors import UnknownOutcomeError
+from omnigent.runner.session_prs import PullRequestRef
 
 NOT_INSTALLED = "GitHub CLI isn't installed on {host}."
 SIGNED_OUT = "Sign in on {host} with `gh auth login`."
@@ -38,9 +39,16 @@ _INTERRUPTED_TYPES = frozenset({"INTERNAL", "TIMEOUT", "SERVICE_UNAVAILABLE"})
 _ADDRESSES = re.compile(r"\S*(?:/|://)\S*|\b[\w-]+(?:\.[\w-]+)+(?::\d+)?\b")
 
 
-def _diagnostic(stderr: str) -> str:
-    """``gh``'s message with every address taken out, so only its wording is matched."""
-    return _ADDRESSES.sub(" ", stderr)
+def _diagnostic(stderr: str, reference: PullRequestRef) -> str:
+    """``gh``'s message with every address and the PR's own names taken out.
+
+    Only its wording is matched: a host, owner or repository named like ``sso`` must not count.
+    """
+    text = _ADDRESSES.sub(" ", stderr)
+    owner, _, repository = reference.repository.partition("/")
+    for name in {reference.host, owner, repository} - {""}:
+        text = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", " ", text, flags=re.I)
+    return text
 
 
 def unknown_outcome() -> UnknownOutcomeError:
@@ -48,9 +56,10 @@ def unknown_outcome() -> UnknownOutcomeError:
     return UnknownOutcomeError()
 
 
-def refusal(stderr: str, *, host: str, action: str) -> ValueError:
+def refusal(stderr: str, *, reference: PullRequestRef, action: str) -> ValueError:
     """Turn a failed ``gh`` call's stderr into the user-facing error for ``action``."""
-    diagnostic = _diagnostic(stderr)
+    host = reference.host
+    diagnostic = _diagnostic(stderr, reference)
     if _SCOPE.search(diagnostic):
         return ValueError(MISSING_SCOPE.format(host=host))
     if _SSO.search(diagnostic):
@@ -62,23 +71,23 @@ def refusal(stderr: str, *, host: str, action: str) -> ValueError:
     return ValueError(github._merge_error(stderr, action=action))
 
 
-def definitely_refused(stderr: str) -> bool:
+def definitely_refused(stderr: str, reference: PullRequestRef) -> bool:
     """Whether a sent write's ``gh`` stderr shows GitHub refused it without making it."""
-    diagnostic = _diagnostic(stderr)
+    diagnostic = _diagnostic(stderr, reference)
     return any(
         pattern.search(diagnostic)
         for pattern in (_REFUSED_STATUS, _SCOPE, _SSO, _RATE, _SIGNED_OUT)
     )
 
 
-def write_failure(stderr: str, *, host: str, action: str) -> ValueError:
+def write_failure(stderr: str, *, reference: PullRequestRef, action: str) -> ValueError:
     """The error for a sent write that failed: a refusal only when GitHub definitely refused."""
-    if definitely_refused(stderr):
-        return refusal(stderr, host=host, action=action)
+    if definitely_refused(stderr, reference):
+        return refusal(stderr, reference=reference, action=action)
     return unknown_outcome()
 
 
-def graphql_refusal(errors: list[object], *, host: str, action: str) -> ValueError:
+def graphql_refusal(errors: list[object], *, reference: PullRequestRef, action: str) -> ValueError:
     """The error for a GraphQL mutation GitHub answered with ``errors``."""
     messages = [str(error.get("message", "")) for error in errors if isinstance(error, dict)]
     text = "\n".join(messages)
@@ -87,7 +96,7 @@ def graphql_refusal(errors: list[object], *, host: str, action: str) -> ValueErr
     )
     if not messages or internal or _GRAPHQL_INTERRUPTED.search(text):
         return unknown_outcome()
-    return refusal(text, host=host, action=action)
+    return refusal(text, reference=reference, action=action)
 
 
 def not_installed(host: str) -> ValueError:

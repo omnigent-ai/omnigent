@@ -127,12 +127,12 @@ def mutate(
             # The mutation ran; an error in a field it selected leaves its answer unreliable.
             raise github_failures.unknown_outcome()
         refused = github_failures.graphql_refusal(
-            response["errors"], host=reference.host, action=action
+            response["errors"], reference=reference, action=action
         )
         raise refusal_or_moved_head(root, reference, expected_head_oid, refused)
     if rc == 0 and isinstance(payload, dict):
         return payload
     if rc != 0 and err:
-        failure = github_failures.write_failure(err, host=reference.host, action=action)
+        failure = github_failures.write_failure(err, reference=reference, action=action)
         raise refusal_or_moved_head(root, reference, expected_head_oid, failure)
     raise github_failures.unknown_outcome()
