@@ -192,16 +192,16 @@ export function QuickPickDialog<Value>({
     const unfinished = returnFocusRef.current;
     const reopenedDuringExit =
       closesAtCommit && (active === null || active === document.body) && unfinished !== null;
-    returnFocusRef.current =
-      handoff && successorName !== undefined && handoff.successor === successorName
-        ? handoff.target
-        : replaced
-          ? (returnFocusTargets.get(replaced) ?? null)
-          : reopenedDuringExit
-            ? unfinished
-            : active instanceof HTMLElement
-              ? active
-              : null;
+    // In priority order: a handoff, the picker this replaced, an unfinished close, the opener.
+    const returnTarget = (): HTMLElement | null => {
+      if (handoff && successorName !== undefined && handoff.successor === successorName) {
+        return handoff.target;
+      }
+      if (replaced) return returnFocusTargets.get(replaced) ?? null;
+      if (reopenedDuringExit) return unfinished;
+      return active instanceof HTMLElement ? active : null;
+    };
+    returnFocusRef.current = returnTarget();
     // oxlint-disable-next-line react-hooks/exhaustive-deps -- the name is read as it opens.
   }, [open, ownership]);
   /**
@@ -233,7 +233,7 @@ export function QuickPickDialog<Value>({
     }
     if (open || !ownership.closing()) return;
     closeFinishedRef.current = finishClose();
-    // oxlint-disable-next-line react-hooks/exhaustive-deps -- finishClose reads only refs.
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- reads closesAtCommit as `open` changes.
   }, [open]);
   // Each opening mounts its own content, even one during the last one's exit, so Radix stacks
   // its focus scope over a picker it replaces and autofocuses it as on any opening.
