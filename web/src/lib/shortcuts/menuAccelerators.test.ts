@@ -19,8 +19,11 @@ const ELECTRON_SOURCES = path.resolve(
   "../../../electron/src",
 );
 
+// The global Show shortcut's setting has accelerator fields too, but no menu items.
+const NOT_MENU_SOURCES = new Set(["globalShowShortcut.js", "preload.js"]);
+
 const SOURCES = readdirSync(ELECTRON_SOURCES)
-  .filter((file) => file.endsWith(".js"))
+  .filter((file) => file.endsWith(".js") && !NOT_MENU_SOURCES.has(file))
   .map((file) => readFileSync(path.join(ELECTRON_SOURCES, file), "utf8"));
 
 /**
@@ -55,16 +58,31 @@ const ROLE_ACCELERATORS: Record<string, { mac?: string; other?: string }> = {
   windowMenu: {},
 };
 
+/**
+ * The accelerators `source` declares, as a string or a constant naming one. Any other
+ * declaration fails, so a menu item's keys can't go unchecked.
+ */
+function declaredAccelerators(source: string): string[] {
+  return source
+    .split("\n")
+    .filter((line) => !/^\s*(\/\/|\*)/.test(line))
+    .flatMap((line) => [...line.matchAll(/\baccelerator:(.*)$/g)])
+    .map((match) => {
+      const declaration = match[1]!.trim();
+      const value = /^(?:"([^"]+)"|([A-Z][A-Z0-9_]+))\s*(?:[,}]|$)/.exec(declaration);
+      const keys = value?.[2]
+        ? new RegExp(`const ${value[2]} = "([^"]+)"`).exec(source)?.[1]
+        : value?.[1];
+      if (!keys) {
+        throw new Error(`Declare the accelerator \`${declaration}\` as a string or a constant`);
+      }
+      return keys;
+    });
+}
+
 /** Every menu accelerator on the Mac or elsewhere: literal, named by a constant, or a role's. */
 function menuAccelerators(mac: boolean): string[] {
-  const named = SOURCES.flatMap((source) =>
-    [...source.matchAll(/accelerator: (?:"([^"]+)"|([A-Z][A-Z0-9_]+)\b)/g)].map((match) => {
-      if (match[1]) return match[1];
-      const value = new RegExp(`const ${match[2]} = "([^"]+)"`).exec(source)?.[1];
-      if (!value) throw new Error(`No string for the accelerator constant ${match[2]}`);
-      return value;
-    }),
-  );
+  const named = SOURCES.flatMap(declaredAccelerators);
   const roles = SOURCES.flatMap((source) =>
     [...source.matchAll(/role: "(\w+)"/g)].map((match) => {
       const keys = ROLE_ACCELERATORS[match[1]!];
@@ -130,11 +148,19 @@ const KNOWN_OVERLAPS: Record<string, readonly ShortcutId[]> = {
 /** App shortcuts that share `accelerator`'s keys, leaving out the ones listed above. */
 function clashingShortcuts(accelerator: string, mac: boolean): ShortcutId[] {
   const press = acceleratorPress(accelerator, mac);
-  const environment = { mac, native: true, desktopMenu: true, submitWithModEnter: true };
+  // Both submit preferences, since some shortcuts change keys with it.
+  const environments = [true, false].map((submitWithModEnter) => ({
+    mac,
+    native: true,
+    desktopMenu: true,
+    submitWithModEnter,
+  }));
   const allowed = [...(SAME_COMMAND[accelerator] ?? []), ...(KNOWN_OVERLAPS[accelerator] ?? [])];
   return [...SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS]
     .filter(
-      (binding) => !allowed.includes(binding.id) && matchesShortcut(press, binding.id, environment),
+      (binding) =>
+        !allowed.includes(binding.id) &&
+        environments.some((environment) => matchesShortcut(press, binding.id, environment)),
     )
     .map((binding) => binding.id);
 }
@@ -169,5 +195,22 @@ describe("desktop menu accelerators", () => {
 
   it("would catch an app shortcut on a menu item's keys", () => {
     expect(clashingShortcuts("CmdOrCtrl+K", false)).toContain("palette.commands");
+  });
+
+  it.each([
+    ["a conditional", 'accelerator: isMac ? "Cmd+K" : "Ctrl+K",'],
+    ["a call", "accelerator: keysFor(item),"],
+    ["the next line", "accelerator:\n  SOME_KEYS,"],
+    ["a constant without a string", "accelerator: MISSING_KEYS,"],
+  ])("refuse to skip an accelerator declared as %s", (_form, source) => {
+    expect(() => declaredAccelerators(`{ label: "Item", ${source} }`)).toThrow(
+      /as a string or a constant/,
+    );
+  });
+
+  it("read an accelerator declared beside other fields and through a constant", () => {
+    const source =
+      'const KEYS = "CmdOrCtrl+K";\n{ label: "A", accelerator: "CmdOrCtrl+J" },\n{ accelerator: KEYS }';
+    expect(declaredAccelerators(source)).toEqual(["CmdOrCtrl+J", "CmdOrCtrl+K"]);
   });
 });
