@@ -999,6 +999,70 @@ def test_skip_dir_pathspecs_anchored_to_workspace_subdir(tmp_path: Path) -> None
     assert ":(exclude)node_modules" not in specs
 
 
+def test_git_list_changed_files_scopes_git_reads_to_workspace_subdir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A workspace below the repo root runs ``git status`` and numstat on its own subtree.
+
+    Exclude-only pathspecs leave git walking the whole repository, which in a
+    monorepo made every Changes refresh take ~14 s although only the
+    workspace's own records are returned. Failure means a status or numstat
+    call ran without the workspace pathspec.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    workspace = tmp_path / "sub" / "ws"
+    workspace.mkdir(parents=True)
+    (workspace / "tracked.py").write_text("a\n")
+    (tmp_path / "elsewhere.py").write_text("a\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (workspace / "tracked.py").write_text("a\nb\n")
+    (workspace / "new.py").write_text("new\n")
+    (tmp_path / "elsewhere.py").write_text("a\nb\n")
+    (tmp_path / "outside_new.py").write_text("x\n")
+
+    git_reads: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _record(argv, *args, **kwargs):
+        if isinstance(argv, list) and ("status" in argv or "diff" in argv):
+            git_reads.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _record)
+
+    reg = GitFilesystemRegistry(watch_path=workspace, git_root=tmp_path)
+    records = {r["path"]: r for r in reg.list_changed_files("any-conv", limit=100)}
+
+    assert set(records) == {"tracked.py", "new.py"}, (
+        f"Expected only the workspace's own changes, got {sorted(records)}."
+    )
+    assert (records["tracked.py"]["lines_added"], records["tracked.py"]["lines_removed"]) == (1, 0)
+    assert {"status", "diff"} <= {word for argv in git_reads for word in argv}, git_reads
+    unscoped = [argv for argv in git_reads if ":(literal)sub/ws" not in argv]
+    assert not unscoped, f"Expected every git read scoped to sub/ws, got {unscoped}."
+
+
+def test_workspace_pathspecs_cover_root_and_outside_workspaces(tmp_path: Path) -> None:
+    """Only a workspace strictly below the git root gets a scoping pathspec.
+
+    At the root there is nothing to narrow, and a workspace outside the repo
+    has no git-relative prefix, so both keep the unscoped status.
+    """
+    repo = tmp_path / "repo"
+    nested = repo / "sub"
+    nested.mkdir(parents=True)
+
+    assert GitFilesystemRegistry(watch_path=nested, git_root=repo)._workspace_pathspecs() == [
+        ":(literal)sub"
+    ]
+    assert GitFilesystemRegistry(watch_path=repo, git_root=repo)._workspace_pathspecs() == []
+    assert GitFilesystemRegistry(watch_path=tmp_path, git_root=repo)._workspace_pathspecs() == []
+
+
 def test_untracked_cache_enable_helper_sets_repo_config(tmp_path: Path) -> None:
     """The background helper enables ``core.untrackedCache`` when supported.
 
