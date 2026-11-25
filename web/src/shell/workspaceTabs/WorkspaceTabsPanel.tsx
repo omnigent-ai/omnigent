@@ -8,6 +8,7 @@ import { isPinnedTab } from "./pinnedTabs";
 import { reorderStripEntries, type StripReorderEntry } from "./stripReorder";
 import { pinnedTabsMaxWidth, TAB_GAP } from "./tabStripWidth";
 import { useTabStripWidth } from "./useTabStripWidth";
+import { publishRailControlsWidth } from "./railControlsWidth";
 import { settingsPagePlace, useWorkspaceTabSettings } from "./workspaceTabSettings";
 import { tabGroup as tabGroupDefinition, tabGroupOf, tabPullRequestUrl } from "./tabGroups";
 import {
@@ -36,6 +37,7 @@ import {
   type LucideIcon,
   MaximizeIcon,
   XIcon,
+  PanelRightCloseIcon,
   MessageSquareIcon,
   MinimizeIcon,
   SearchIcon,
@@ -337,6 +339,12 @@ function WorkspaceTabsPanelImpl({
   onHistoryGo,
 }: WorkspaceTabsPanelProps) {
   const { session, tabs, selectedTabId } = useWorkspaceTabs(conversationId);
+  // The header keeps its toggle while this sidebar is too narrow to show its own Collapse.
+  const reportControlsWidth = useCallback(
+    (controlsWidth: number) => publishRailControlsWidth(conversationId, controlsWidth),
+    [conversationId],
+  );
+  useEffect(() => () => publishRailControlsWidth(conversationId, null), [conversationId]);
   const { store } = session;
   const knownTabs = tabs.filter((tab): tab is WorkspaceTab => !isUnknownTab(tab));
   const selectedTab = knownTabs.find((tab) => tab.id === selectedTabId);
@@ -1360,6 +1368,7 @@ function WorkspaceTabsPanelImpl({
         <WorkspaceSidebarFrame
           stripWidth={stripWidth}
           tabListRef={tabListRef}
+          onControlsWidth={reportControlsWidth}
           leading={
             // ‹ › and the tab list sit together, without the strip's gap.
             <div className="flex shrink-0 items-center">
@@ -1530,10 +1539,18 @@ function WorkspaceTabsPanelImpl({
                     aria-keyshortcuts={shortcutAriaKeys("sidebar.right")}
                     onClick={onHide}
                     size="icon-xs"
-                    // A narrow strip leaves room to "+", as the header's toggle beside it does the same.
-                    className="flex size-6 text-muted-foreground hover:text-foreground @max-[240px]/rail:hidden"
+                    // A narrow strip leaves room to "+" while the header's toggle beside it also closes
+                    // the sidebar. Floating panes hide that toggle, so this one stays.
+                    className={cn(
+                      "flex size-6 text-muted-foreground hover:text-foreground",
+                      !floatingPanes && "@max-[240px]/rail:hidden",
+                    )}
                   >
-                    <XIcon className="size-4" />
+                    {floatingPanes ? (
+                      <PanelRightCloseIcon className="size-4" />
+                    ) : (
+                      <XIcon className="size-4" />
+                    )}
                   </Button>
                 </WorkspaceTabTooltip>
               )}

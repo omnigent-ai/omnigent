@@ -1371,6 +1371,11 @@ aside[aria-label="Workspace"][data-maximized] {
     left: var(--pane-gap-start, var(--pane-gap));
     right: calc(var(--workspace-panel-offset, 0px) + var(--pane-gap));
   }
+  /* The tabs strip's end inset (px-2 inside the sidebar's 1px edge), so Expand right panel takes
+   * the spot of the open sidebar's Collapse button. */
+  .app-shell[data-floating-panes] [data-main-view] > .chat-header[data-corner-toggle] {
+    padding-right: calc(0.5rem + 1px - var(--pane-gap));
+  }
   .app-shell[data-floating-panes] [data-main-view] > .chat-header.session-header-glass::before {
     display: none;
   }

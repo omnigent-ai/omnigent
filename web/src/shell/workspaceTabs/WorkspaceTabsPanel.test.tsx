@@ -416,6 +416,29 @@ describe("the gutter beside floating panes", () => {
   });
 });
 
+describe("the strip's Collapse right panel button", () => {
+  const collapse = () => screen.getByRole("button", { name: "Collapse right panel", hidden: true });
+
+  it("with floating panes, shows the collapse-right icon, stays in a narrow strip and hides the sidebar", () => {
+    floatingPanes.on = true;
+    const onHide = vi.fn();
+    renderPanels([{ conversationId: "conv_a", open: true, onHide }]);
+    expect(collapse().querySelector(".lucide-panel-right-close")).not.toBeNull();
+    expect(collapse().querySelector(".lucide-x")).toBeNull();
+    // The header hides its own toggle while this sidebar is open, so this one never folds away.
+    expect(collapse().className).not.toContain("@max-[240px]/rail:hidden");
+    fireEvent.click(collapse());
+    expect(onHide).toHaveBeenCalledTimes(1);
+  });
+
+  it("without floating panes, keeps its X and leaves a narrow strip to the header's toggle", () => {
+    renderPanels([{ conversationId: "conv_a", open: true, onHide: vi.fn() }]);
+    expect(collapse().querySelector(".lucide-x")).not.toBeNull();
+    expect(collapse().querySelector(".lucide-panel-right-close")).toBeNull();
+    expect(collapse().className).toContain("@max-[240px]/rail:hidden");
+  });
+});
+
 describe("All tabs' place in the strip", () => {
   const button = (name: string) => screen.getByRole("button", { name, hidden: true });
   const precedes = (first: Element, second: Element) =>

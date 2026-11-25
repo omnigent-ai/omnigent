@@ -242,6 +242,8 @@ interface ChatHeaderProps {
   rightPanelOpen: boolean;
   /** Toggle the right workspace panel. */
   onToggleRightPanel: () => void;
+  /** The open Workspace sidebar has its own Collapse button, so the header's toggle only opens it. */
+  rightPanelCollapsesItself?: boolean;
   /** Show dependency-free disabled chrome while the server session is pending. */
   pending?: boolean;
   /** Gating + handlers for the mobile session-menu FAB. */
@@ -392,6 +394,7 @@ export function ChatHeader({
   hasRailContent,
   rightPanelOpen,
   onToggleRightPanel,
+  rightPanelCollapsesItself = false,
   pending = false,
   mobileMenu,
 }: ChatHeaderProps) {
@@ -622,6 +625,12 @@ export function ChatHeader({
         !conversationId && "pointer-events-none *:pointer-events-auto",
         settingsMode && !sidebarOpen && "settings-mobile-header",
       )}
+      // Collapsed, the sidebar's toggle ends the row where its own Collapse button sits open.
+      data-corner-toggle={
+        conversationId && hasRailContent && rightPanelCollapsesItself && !rightPanelOpen && !canvas
+          ? ""
+          : undefined
+      }
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
           back-to-parent link (when this is a sub-agent session). The
@@ -901,7 +910,7 @@ export function ChatHeader({
         ) : null}
         {/* Beside the right-panel toggle: both show or hide a panel on the right. */}
         {!pending && conversationId && sessionOverviewControl}
-        {conversationId && hasRailContent && (
+        {conversationId && hasRailContent && !(rightPanelOpen && rightPanelCollapsesItself) && (
           <Tooltip>
             <TooltipTrigger asChild>
               <Button

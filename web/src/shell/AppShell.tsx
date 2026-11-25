@@ -59,6 +59,8 @@ import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useFloatingComposerSupport } from "@/hooks/useFloatingComposerSupport";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useWorkspaceFullScreenCommand } from "@/shell/workspaceCommands/useWorkspaceFullScreenCommand";
+import { rightPanelCollapsesItself } from "./rightPanelCollapse";
+import { useRailControlsWidth } from "./workspaceTabs/railControlsWidth";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
@@ -540,6 +542,7 @@ function AppShellImpl() {
   const mobileViewport = useIsMobileViewport();
   // The tabs host sits in the Workspace drawer once a narrow window has mounted it.
   const tabsInDrawer = mobileViewport && tabsDrawerTarget !== null;
+  const railControlsWidth = useRailControlsWidth(conversationId);
   const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
@@ -3555,6 +3558,15 @@ function AppShellImpl() {
                     hasRailContent={hasRailContent}
                     rightPanelOpen={rightPanelOpen}
                     onToggleRightPanel={toggleRightPanel}
+                    // The floating tabs sidebar collapses from its own corner button, where the toggle sits.
+                    rightPanelCollapsesItself={rightPanelCollapsesItself({
+                      floatingPanesShown,
+                      tabsSidebar,
+                      tabsInDrawer,
+                      rightPanelOpen,
+                      railWidth: inlinePanelWidth,
+                      controlsWidth: railControlsWidth,
+                    })}
                     pending={pendingConversation}
                     mobileMenu={{
                       fileViewerOpen,
