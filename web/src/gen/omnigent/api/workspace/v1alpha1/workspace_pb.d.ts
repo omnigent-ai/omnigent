@@ -2431,6 +2431,1365 @@ export declare type DisableAutoMergeResponse = Message<"omnigent.api.workspace.v
 export declare const DisableAutoMergeResponseSchema: GenMessage<DisableAutoMergeResponse>;
 
 /**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestListStatsRequest
+ */
+export declare type GetPullRequestListStatsRequest = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestListStatsRequest"> & {
+  /**
+   * @generated from field: repeated string pr_urls = 1;
+   */
+  prUrls: string[];
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestListStatsRequest.
+ * Use `create(GetPullRequestListStatsRequestSchema)` to create a new message.
+ */
+export declare const GetPullRequestListStatsRequestSchema: GenMessage<GetPullRequestListStatsRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestListStatsResponse
+ */
+export declare type GetPullRequestListStatsResponse = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestListStatsResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestListStatsResponse.
+ * Use `create(GetPullRequestListStatsResponseSchema)` to create a new message.
+ */
+export declare const GetPullRequestListStatsResponseSchema: GenMessage<GetPullRequestListStatsResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.LookupPullRequestRequest
+ */
+export declare type LookupPullRequestRequest = Message<"omnigent.api.workspace.v1alpha1.LookupPullRequestRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.LookupPullRequestRequest.
+ * Use `create(LookupPullRequestRequestSchema)` to create a new message.
+ */
+export declare const LookupPullRequestRequestSchema: GenMessage<LookupPullRequestRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.LookupPullRequestResponse
+ */
+export declare type LookupPullRequestResponse = Message<"omnigent.api.workspace.v1alpha1.LookupPullRequestResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.LookupPullRequestResponse.
+ * Use `create(LookupPullRequestResponseSchema)` to create a new message.
+ */
+export declare const LookupPullRequestResponseSchema: GenMessage<LookupPullRequestResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListBranchPullRequestsRequest
+ */
+export declare type ListBranchPullRequestsRequest = Message<"omnigent.api.workspace.v1alpha1.ListBranchPullRequestsRequest"> & {
+  /**
+   * A branch of the workspace's own repository.
+   *
+   * @generated from field: string branch = 1;
+   */
+  branch: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListBranchPullRequestsRequest.
+ * Use `create(ListBranchPullRequestsRequestSchema)` to create a new message.
+ */
+export declare const ListBranchPullRequestsRequestSchema: GenMessage<ListBranchPullRequestsRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListBranchPullRequestsResponse
+ */
+export declare type ListBranchPullRequestsResponse = Message<"omnigent.api.workspace.v1alpha1.ListBranchPullRequestsResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListBranchPullRequestsResponse.
+ * Use `create(ListBranchPullRequestsResponseSchema)` to create a new message.
+ */
+export declare const ListBranchPullRequestsResponseSchema: GenMessage<ListBranchPullRequestsResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SearchReviewersRequest
+ */
+export declare type SearchReviewersRequest = Message<"omnigent.api.workspace.v1alpha1.SearchReviewersRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string text = 2;
+   */
+  text: string;
+
+  /**
+   * At most 20.
+   *
+   * @generated from field: int32 page_size = 3;
+   */
+  pageSize: number;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchReviewersRequest.
+ * Use `create(SearchReviewersRequestSchema)` to create a new message.
+ */
+export declare const SearchReviewersRequestSchema: GenMessage<SearchReviewersRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SearchReviewersResponse
+ */
+export declare type SearchReviewersResponse = Message<"omnigent.api.workspace.v1alpha1.SearchReviewersResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchReviewersResponse.
+ * Use `create(SearchReviewersResponseSchema)` to create a new message.
+ */
+export declare const SearchReviewersResponseSchema: GenMessage<SearchReviewersResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SearchCompletionsRequest
+ */
+export declare type SearchCompletionsRequest = Message<"omnigent.api.workspace.v1alpha1.SearchCompletionsRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.CompletionKind kind = 2;
+   */
+  kind: CompletionKind;
+
+  /**
+   * @generated from field: string text = 3;
+   */
+  text: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchCompletionsRequest.
+ * Use `create(SearchCompletionsRequestSchema)` to create a new message.
+ */
+export declare const SearchCompletionsRequestSchema: GenMessage<SearchCompletionsRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SearchCompletionsResponse
+ */
+export declare type SearchCompletionsResponse = Message<"omnigent.api.workspace.v1alpha1.SearchCompletionsResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchCompletionsResponse.
+ * Use `create(SearchCompletionsResponseSchema)` to create a new message.
+ */
+export declare const SearchCompletionsResponseSchema: GenMessage<SearchCompletionsResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.UploadAttachmentRequest
+ */
+export declare type UploadAttachmentRequest = Message<"omnigent.api.workspace.v1alpha1.UploadAttachmentRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * The file's name, as the link shows it.
+   *
+   * @generated from field: string name = 2;
+   */
+  name: string;
+
+  /**
+   * @generated from field: bytes content = 3;
+   */
+  content: Uint8Array;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.UploadAttachmentRequest.
+ * Use `create(UploadAttachmentRequestSchema)` to create a new message.
+ */
+export declare const UploadAttachmentRequestSchema: GenMessage<UploadAttachmentRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.UploadAttachmentResponse
+ */
+export declare type UploadAttachmentResponse = Message<"omnigent.api.workspace.v1alpha1.UploadAttachmentResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.UploadAttachmentResponse.
+ * Use `create(UploadAttachmentResponseSchema)` to create a new message.
+ */
+export declare const UploadAttachmentResponseSchema: GenMessage<UploadAttachmentResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SubmitReviewRequest
+ */
+export declare type SubmitReviewRequest = Message<"omnigent.api.workspace.v1alpha1.SubmitReviewRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * "COMMENT"; the server refuses the other events with INVALID_ARGUMENT.
+   *
+   * @generated from field: string event = 2;
+   */
+  event: string;
+
+  /**
+   * @generated from field: string body = 3;
+   */
+  body: string;
+
+  /**
+   * The head commit the review was written against.
+   *
+   * @generated from field: string commit_oid = 4;
+   */
+  commitOid: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SubmitReviewRequest.
+ * Use `create(SubmitReviewRequestSchema)` to create a new message.
+ */
+export declare const SubmitReviewRequestSchema: GenMessage<SubmitReviewRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SubmitReviewResponse
+ */
+export declare type SubmitReviewResponse = Message<"omnigent.api.workspace.v1alpha1.SubmitReviewResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SubmitReviewResponse.
+ * Use `create(SubmitReviewResponseSchema)` to create a new message.
+ */
+export declare const SubmitReviewResponseSchema: GenMessage<SubmitReviewResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SubmitReviewVerdictRequest
+ */
+export declare type SubmitReviewVerdictRequest = Message<"omnigent.api.workspace.v1alpha1.SubmitReviewVerdictRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * "APPROVE" or "REQUEST_CHANGES".
+   *
+   * @generated from field: string event = 2;
+   */
+  event: string;
+
+  /**
+   * @generated from field: string body = 3;
+   */
+  body: string;
+
+  /**
+   * @generated from field: string commit_oid = 4;
+   */
+  commitOid: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SubmitReviewVerdictRequest.
+ * Use `create(SubmitReviewVerdictRequestSchema)` to create a new message.
+ */
+export declare const SubmitReviewVerdictRequestSchema: GenMessage<SubmitReviewVerdictRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SubmitReviewVerdictResponse
+ */
+export declare type SubmitReviewVerdictResponse = Message<"omnigent.api.workspace.v1alpha1.SubmitReviewVerdictResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SubmitReviewVerdictResponse.
+ * Use `create(SubmitReviewVerdictResponseSchema)` to create a new message.
+ */
+export declare const SubmitReviewVerdictResponseSchema: GenMessage<SubmitReviewVerdictResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPendingReviewRequest
+ */
+export declare type GetPendingReviewRequest = Message<"omnigent.api.workspace.v1alpha1.GetPendingReviewRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPendingReviewRequest.
+ * Use `create(GetPendingReviewRequestSchema)` to create a new message.
+ */
+export declare const GetPendingReviewRequestSchema: GenMessage<GetPendingReviewRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPendingReviewResponse
+ */
+export declare type GetPendingReviewResponse = Message<"omnigent.api.workspace.v1alpha1.GetPendingReviewResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPendingReviewResponse.
+ * Use `create(GetPendingReviewResponseSchema)` to create a new message.
+ */
+export declare const GetPendingReviewResponseSchema: GenMessage<GetPendingReviewResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.StartPendingReviewRequest
+ */
+export declare type StartPendingReviewRequest = Message<"omnigent.api.workspace.v1alpha1.StartPendingReviewRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string commit_oid = 2;
+   */
+  commitOid: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.StartPendingReviewRequest.
+ * Use `create(StartPendingReviewRequestSchema)` to create a new message.
+ */
+export declare const StartPendingReviewRequestSchema: GenMessage<StartPendingReviewRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.StartPendingReviewResponse
+ */
+export declare type StartPendingReviewResponse = Message<"omnigent.api.workspace.v1alpha1.StartPendingReviewResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.StartPendingReviewResponse.
+ * Use `create(StartPendingReviewResponseSchema)` to create a new message.
+ */
+export declare const StartPendingReviewResponseSchema: GenMessage<StartPendingReviewResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.AddPendingReviewCommentRequest
+ */
+export declare type AddPendingReviewCommentRequest = Message<"omnigent.api.workspace.v1alpha1.AddPendingReviewCommentRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string body = 2;
+   */
+  body: string;
+
+  /**
+   * The lines a new conversation is on; unset for a reply.
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.ReviewThreadAnchor anchor = 3;
+   */
+  anchor?: ReviewThreadAnchor | undefined;
+
+  /**
+   * The review conversation on this pull request a draft reply goes in; it joins the viewer's
+   * pending review, which must already exist.
+   *
+   * @generated from field: string in_reply_to_thread_id = 4;
+   */
+  inReplyToThreadId: string;
+
+  /**
+   * The viewer's pending review the client saw; the change is refused when it's another.
+   *
+   * @generated from field: string pending_review_id = 5;
+   */
+  pendingReviewId: string;
+
+  /**
+   * The head the client showed; a push since refuses the draft.
+   *
+   * @generated from field: string expected_head_oid = 6;
+   */
+  expectedHeadOid: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.AddPendingReviewCommentRequest.
+ * Use `create(AddPendingReviewCommentRequestSchema)` to create a new message.
+ */
+export declare const AddPendingReviewCommentRequestSchema: GenMessage<AddPendingReviewCommentRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.AddPendingReviewCommentResponse
+ */
+export declare type AddPendingReviewCommentResponse = Message<"omnigent.api.workspace.v1alpha1.AddPendingReviewCommentResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.AddPendingReviewCommentResponse.
+ * Use `create(AddPendingReviewCommentResponseSchema)` to create a new message.
+ */
+export declare const AddPendingReviewCommentResponseSchema: GenMessage<AddPendingReviewCommentResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.UpdatePendingReviewCommentRequest
+ */
+export declare type UpdatePendingReviewCommentRequest = Message<"omnigent.api.workspace.v1alpha1.UpdatePendingReviewCommentRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * The draft's GitHub node ID; it must be in the viewer's pending review on this pull request.
+   *
+   * @generated from field: string comment_node_id = 2;
+   */
+  commentNodeId: string;
+
+  /**
+   * @generated from field: string body = 3;
+   */
+  body: string;
+
+  /**
+   * SHA-256 of the draft's text the client last saw; the change is refused when it differs.
+   *
+   * @generated from field: string expected_body_sha256 = 4;
+   */
+  expectedBodySha256: string;
+
+  /**
+   * The viewer's pending review the client saw; the change is refused when it's another.
+   *
+   * @generated from field: string pending_review_id = 5;
+   */
+  pendingReviewId: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.UpdatePendingReviewCommentRequest.
+ * Use `create(UpdatePendingReviewCommentRequestSchema)` to create a new message.
+ */
+export declare const UpdatePendingReviewCommentRequestSchema: GenMessage<UpdatePendingReviewCommentRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.UpdatePendingReviewCommentResponse
+ */
+export declare type UpdatePendingReviewCommentResponse = Message<"omnigent.api.workspace.v1alpha1.UpdatePendingReviewCommentResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.UpdatePendingReviewCommentResponse.
+ * Use `create(UpdatePendingReviewCommentResponseSchema)` to create a new message.
+ */
+export declare const UpdatePendingReviewCommentResponseSchema: GenMessage<UpdatePendingReviewCommentResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.DeletePendingReviewCommentRequest
+ */
+export declare type DeletePendingReviewCommentRequest = Message<"omnigent.api.workspace.v1alpha1.DeletePendingReviewCommentRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * The draft's GitHub node ID; it must be in the viewer's pending review on this pull request.
+   *
+   * @generated from field: string comment_node_id = 2;
+   */
+  commentNodeId: string;
+
+  /**
+   * The viewer's pending review the client saw; the change is refused when it's another.
+   *
+   * @generated from field: string pending_review_id = 3;
+   */
+  pendingReviewId: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.DeletePendingReviewCommentRequest.
+ * Use `create(DeletePendingReviewCommentRequestSchema)` to create a new message.
+ */
+export declare const DeletePendingReviewCommentRequestSchema: GenMessage<DeletePendingReviewCommentRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.DeletePendingReviewCommentResponse
+ */
+export declare type DeletePendingReviewCommentResponse = Message<"omnigent.api.workspace.v1alpha1.DeletePendingReviewCommentResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.DeletePendingReviewCommentResponse.
+ * Use `create(DeletePendingReviewCommentResponseSchema)` to create a new message.
+ */
+export declare const DeletePendingReviewCommentResponseSchema: GenMessage<DeletePendingReviewCommentResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SubmitPendingReviewRequest
+ */
+export declare type SubmitPendingReviewRequest = Message<"omnigent.api.workspace.v1alpha1.SubmitPendingReviewRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * "COMMENT", "APPROVE" or "REQUEST_CHANGES".
+   *
+   * @generated from field: string event = 2;
+   */
+  event: string;
+
+  /**
+   * @generated from field: string body = 3;
+   */
+  body: string;
+
+  /**
+   * @generated from field: string commit_oid = 4;
+   */
+  commitOid: string;
+
+  /**
+   * The viewer's pending review the client saw; the change is refused when it's another.
+   *
+   * @generated from field: string pending_review_id = 5;
+   */
+  pendingReviewId: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SubmitPendingReviewRequest.
+ * Use `create(SubmitPendingReviewRequestSchema)` to create a new message.
+ */
+export declare const SubmitPendingReviewRequestSchema: GenMessage<SubmitPendingReviewRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SubmitPendingReviewResponse
+ */
+export declare type SubmitPendingReviewResponse = Message<"omnigent.api.workspace.v1alpha1.SubmitPendingReviewResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SubmitPendingReviewResponse.
+ * Use `create(SubmitPendingReviewResponseSchema)` to create a new message.
+ */
+export declare const SubmitPendingReviewResponseSchema: GenMessage<SubmitPendingReviewResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.DiscardPendingReviewRequest
+ */
+export declare type DiscardPendingReviewRequest = Message<"omnigent.api.workspace.v1alpha1.DiscardPendingReviewRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * The viewer's pending review the client saw; the change is refused when it's another.
+   *
+   * @generated from field: string pending_review_id = 2;
+   */
+  pendingReviewId: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.DiscardPendingReviewRequest.
+ * Use `create(DiscardPendingReviewRequestSchema)` to create a new message.
+ */
+export declare const DiscardPendingReviewRequestSchema: GenMessage<DiscardPendingReviewRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.DiscardPendingReviewResponse
+ */
+export declare type DiscardPendingReviewResponse = Message<"omnigent.api.workspace.v1alpha1.DiscardPendingReviewResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.DiscardPendingReviewResponse.
+ * Use `create(DiscardPendingReviewResponseSchema)` to create a new message.
+ */
+export declare const DiscardPendingReviewResponseSchema: GenMessage<DiscardPendingReviewResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SetPullRequestStateRequest
+ */
+export declare type SetPullRequestStateRequest = Message<"omnigent.api.workspace.v1alpha1.SetPullRequestStateRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * "closed" or "open".
+   *
+   * @generated from field: string state = 2;
+   */
+  state: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SetPullRequestStateRequest.
+ * Use `create(SetPullRequestStateRequestSchema)` to create a new message.
+ */
+export declare const SetPullRequestStateRequestSchema: GenMessage<SetPullRequestStateRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SetPullRequestStateResponse
+ */
+export declare type SetPullRequestStateResponse = Message<"omnigent.api.workspace.v1alpha1.SetPullRequestStateResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SetPullRequestStateResponse.
+ * Use `create(SetPullRequestStateResponseSchema)` to create a new message.
+ */
+export declare const SetPullRequestStateResponseSchema: GenMessage<SetPullRequestStateResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SetPullRequestDraftRequest
+ */
+export declare type SetPullRequestDraftRequest = Message<"omnigent.api.workspace.v1alpha1.SetPullRequestDraftRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * True to make the pull request a draft again; false to mark it ready.
+   *
+   * @generated from field: bool draft = 2;
+   */
+  draft: boolean;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SetPullRequestDraftRequest.
+ * Use `create(SetPullRequestDraftRequestSchema)` to create a new message.
+ */
+export declare const SetPullRequestDraftRequestSchema: GenMessage<SetPullRequestDraftRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SetPullRequestDraftResponse
+ */
+export declare type SetPullRequestDraftResponse = Message<"omnigent.api.workspace.v1alpha1.SetPullRequestDraftResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SetPullRequestDraftResponse.
+ * Use `create(SetPullRequestDraftResponseSchema)` to create a new message.
+ */
+export declare const SetPullRequestDraftResponseSchema: GenMessage<SetPullRequestDraftResponse>;
+
+/**
+ * One pull request in an auto-merge batch, with the head the user saw.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.PullRequestAutoMerge
+ */
+export declare type PullRequestAutoMerge = Message<"omnigent.api.workspace.v1alpha1.PullRequestAutoMerge"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * "merge", "squash" or "rebase".
+   *
+   * @generated from field: string merge_method = 2;
+   */
+  mergeMethod: string;
+
+  /**
+   * @generated from field: string expected_head_oid = 3;
+   */
+  expectedHeadOid: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.PullRequestAutoMerge.
+ * Use `create(PullRequestAutoMergeSchema)` to create a new message.
+ */
+export declare const PullRequestAutoMergeSchema: GenMessage<PullRequestAutoMerge>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.EnableAutoMergeRequest
+ */
+export declare type EnableAutoMergeRequest = Message<"omnigent.api.workspace.v1alpha1.EnableAutoMergeRequest"> & {
+  /**
+   * @generated from field: repeated omnigent.api.workspace.v1alpha1.PullRequestAutoMerge pull_requests = 1;
+   */
+  pullRequests: PullRequestAutoMerge[];
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.EnableAutoMergeRequest.
+ * Use `create(EnableAutoMergeRequestSchema)` to create a new message.
+ */
+export declare const EnableAutoMergeRequestSchema: GenMessage<EnableAutoMergeRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.EnableAutoMergeResponse
+ */
+export declare type EnableAutoMergeResponse = Message<"omnigent.api.workspace.v1alpha1.EnableAutoMergeResponse"> & {
+  /**
+   * Each pull request's result, in request order.
+   *
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.EnableAutoMergeResponse.
+ * Use `create(EnableAutoMergeResponseSchema)` to create a new message.
+ */
+export declare const EnableAutoMergeResponseSchema: GenMessage<EnableAutoMergeResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.EnqueuePullRequestRequest
+ */
+export declare type EnqueuePullRequestRequest = Message<"omnigent.api.workspace.v1alpha1.EnqueuePullRequestRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string expected_head_oid = 2;
+   */
+  expectedHeadOid: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.EnqueuePullRequestRequest.
+ * Use `create(EnqueuePullRequestRequestSchema)` to create a new message.
+ */
+export declare const EnqueuePullRequestRequestSchema: GenMessage<EnqueuePullRequestRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.EnqueuePullRequestResponse
+ */
+export declare type EnqueuePullRequestResponse = Message<"omnigent.api.workspace.v1alpha1.EnqueuePullRequestResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.EnqueuePullRequestResponse.
+ * Use `create(EnqueuePullRequestResponseSchema)` to create a new message.
+ */
+export declare const EnqueuePullRequestResponseSchema: GenMessage<EnqueuePullRequestResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.DequeuePullRequestRequest
+ */
+export declare type DequeuePullRequestRequest = Message<"omnigent.api.workspace.v1alpha1.DequeuePullRequestRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.DequeuePullRequestRequest.
+ * Use `create(DequeuePullRequestRequestSchema)` to create a new message.
+ */
+export declare const DequeuePullRequestRequestSchema: GenMessage<DequeuePullRequestRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.DequeuePullRequestResponse
+ */
+export declare type DequeuePullRequestResponse = Message<"omnigent.api.workspace.v1alpha1.DequeuePullRequestResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.DequeuePullRequestResponse.
+ * Use `create(DequeuePullRequestResponseSchema)` to create a new message.
+ */
+export declare const DequeuePullRequestResponseSchema: GenMessage<DequeuePullRequestResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetMergeQueueRequest
+ */
+export declare type GetMergeQueueRequest = Message<"omnigent.api.workspace.v1alpha1.GetMergeQueueRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetMergeQueueRequest.
+ * Use `create(GetMergeQueueRequestSchema)` to create a new message.
+ */
+export declare const GetMergeQueueRequestSchema: GenMessage<GetMergeQueueRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetMergeQueueResponse
+ */
+export declare type GetMergeQueueResponse = Message<"omnigent.api.workspace.v1alpha1.GetMergeQueueResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetMergeQueueResponse.
+ * Use `create(GetMergeQueueResponseSchema)` to create a new message.
+ */
+export declare const GetMergeQueueResponseSchema: GenMessage<GetMergeQueueResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SetReviewThreadResolvedRequest
+ */
+export declare type SetReviewThreadResolvedRequest = Message<"omnigent.api.workspace.v1alpha1.SetReviewThreadResolvedRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string thread_id = 2;
+   */
+  threadId: string;
+
+  /**
+   * @generated from field: bool resolved = 3;
+   */
+  resolved: boolean;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SetReviewThreadResolvedRequest.
+ * Use `create(SetReviewThreadResolvedRequestSchema)` to create a new message.
+ */
+export declare const SetReviewThreadResolvedRequestSchema: GenMessage<SetReviewThreadResolvedRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SetReviewThreadResolvedResponse
+ */
+export declare type SetReviewThreadResolvedResponse = Message<"omnigent.api.workspace.v1alpha1.SetReviewThreadResolvedResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SetReviewThreadResolvedResponse.
+ * Use `create(SetReviewThreadResolvedResponseSchema)` to create a new message.
+ */
+export declare const SetReviewThreadResolvedResponseSchema: GenMessage<SetReviewThreadResolvedResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.EditCommentRequest
+ */
+export declare type EditCommentRequest = Message<"omnigent.api.workspace.v1alpha1.EditCommentRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * "issue" for a conversation comment, "review" for an inline comment.
+   *
+   * @generated from field: string kind = 2;
+   */
+  kind: string;
+
+  /**
+   * @generated from field: int64 comment_id = 3;
+   */
+  commentId: bigint;
+
+  /**
+   * @generated from field: string body = 4;
+   */
+  body: string;
+
+  /**
+   * SHA-256 of the body the client last saw; the edit is refused when it differs.
+   *
+   * @generated from field: string expected_body_sha256 = 5;
+   */
+  expectedBodySha256: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.EditCommentRequest.
+ * Use `create(EditCommentRequestSchema)` to create a new message.
+ */
+export declare const EditCommentRequestSchema: GenMessage<EditCommentRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.EditCommentResponse
+ */
+export declare type EditCommentResponse = Message<"omnigent.api.workspace.v1alpha1.EditCommentResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.EditCommentResponse.
+ * Use `create(EditCommentResponseSchema)` to create a new message.
+ */
+export declare const EditCommentResponseSchema: GenMessage<EditCommentResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.DeleteCommentRequest
+ */
+export declare type DeleteCommentRequest = Message<"omnigent.api.workspace.v1alpha1.DeleteCommentRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * "issue" or "review".
+   *
+   * @generated from field: string kind = 2;
+   */
+  kind: string;
+
+  /**
+   * @generated from field: int64 comment_id = 3;
+   */
+  commentId: bigint;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.DeleteCommentRequest.
+ * Use `create(DeleteCommentRequestSchema)` to create a new message.
+ */
+export declare const DeleteCommentRequestSchema: GenMessage<DeleteCommentRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.DeleteCommentResponse
+ */
+export declare type DeleteCommentResponse = Message<"omnigent.api.workspace.v1alpha1.DeleteCommentResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.DeleteCommentResponse.
+ * Use `create(DeleteCommentResponseSchema)` to create a new message.
+ */
+export declare const DeleteCommentResponseSchema: GenMessage<DeleteCommentResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.AddReactionRequest
+ */
+export declare type AddReactionRequest = Message<"omnigent.api.workspace.v1alpha1.AddReactionRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * "issue" or "review".
+   *
+   * @generated from field: string kind = 2;
+   */
+  kind: string;
+
+  /**
+   * @generated from field: int64 comment_id = 3;
+   */
+  commentId: bigint;
+
+  /**
+   * A GitHub reaction, e.g. "THUMBS_UP".
+   *
+   * @generated from field: string content = 4;
+   */
+  content: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.AddReactionRequest.
+ * Use `create(AddReactionRequestSchema)` to create a new message.
+ */
+export declare const AddReactionRequestSchema: GenMessage<AddReactionRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.AddReactionResponse
+ */
+export declare type AddReactionResponse = Message<"omnigent.api.workspace.v1alpha1.AddReactionResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.AddReactionResponse.
+ * Use `create(AddReactionResponseSchema)` to create a new message.
+ */
+export declare const AddReactionResponseSchema: GenMessage<AddReactionResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.RemoveReactionRequest
+ */
+export declare type RemoveReactionRequest = Message<"omnigent.api.workspace.v1alpha1.RemoveReactionRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string kind = 2;
+   */
+  kind: string;
+
+  /**
+   * @generated from field: int64 comment_id = 3;
+   */
+  commentId: bigint;
+
+  /**
+   * @generated from field: string content = 4;
+   */
+  content: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.RemoveReactionRequest.
+ * Use `create(RemoveReactionRequestSchema)` to create a new message.
+ */
+export declare const RemoveReactionRequestSchema: GenMessage<RemoveReactionRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.RemoveReactionResponse
+ */
+export declare type RemoveReactionResponse = Message<"omnigent.api.workspace.v1alpha1.RemoveReactionResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.RemoveReactionResponse.
+ * Use `create(RemoveReactionResponseSchema)` to create a new message.
+ */
+export declare const RemoveReactionResponseSchema: GenMessage<RemoveReactionResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestStackRequest
+ */
+export declare type GetPullRequestStackRequest = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestStackRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestStackRequest.
+ * Use `create(GetPullRequestStackRequestSchema)` to create a new message.
+ */
+export declare const GetPullRequestStackRequestSchema: GenMessage<GetPullRequestStackRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestStackResponse
+ */
+export declare type GetPullRequestStackResponse = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestStackResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestStackResponse.
+ * Use `create(GetPullRequestStackResponseSchema)` to create a new message.
+ */
+export declare const GetPullRequestStackResponseSchema: GenMessage<GetPullRequestStackResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ReadPullRequestImageRequest
+ */
+export declare type ReadPullRequestImageRequest = Message<"omnigent.api.workspace.v1alpha1.ReadPullRequestImageRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * An image URL the pull request's description or comments link to.
+   *
+   * @generated from field: string image_url = 2;
+   */
+  imageUrl: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadPullRequestImageRequest.
+ * Use `create(ReadPullRequestImageRequestSchema)` to create a new message.
+ */
+export declare const ReadPullRequestImageRequestSchema: GenMessage<ReadPullRequestImageRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetMergeReadinessRequest
+ */
+export declare type GetMergeReadinessRequest = Message<"omnigent.api.workspace.v1alpha1.GetMergeReadinessRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string head_sha = 2;
+   */
+  headSha: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetMergeReadinessRequest.
+ * Use `create(GetMergeReadinessRequestSchema)` to create a new message.
+ */
+export declare const GetMergeReadinessRequestSchema: GenMessage<GetMergeReadinessRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetMergeReadinessResponse
+ */
+export declare type GetMergeReadinessResponse = Message<"omnigent.api.workspace.v1alpha1.GetMergeReadinessResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetMergeReadinessResponse.
+ * Use `create(GetMergeReadinessResponseSchema)` to create a new message.
+ */
+export declare const GetMergeReadinessResponseSchema: GenMessage<GetMergeReadinessResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.PreviewReviewerPingRequest
+ */
+export declare type PreviewReviewerPingRequest = Message<"omnigent.api.workspace.v1alpha1.PreviewReviewerPingRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string reviewer = 2;
+   */
+  reviewer: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.PreviewReviewerPingRequest.
+ * Use `create(PreviewReviewerPingRequestSchema)` to create a new message.
+ */
+export declare const PreviewReviewerPingRequestSchema: GenMessage<PreviewReviewerPingRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.PreviewReviewerPingResponse
+ */
+export declare type PreviewReviewerPingResponse = Message<"omnigent.api.workspace.v1alpha1.PreviewReviewerPingResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.PreviewReviewerPingResponse.
+ * Use `create(PreviewReviewerPingResponseSchema)` to create a new message.
+ */
+export declare const PreviewReviewerPingResponseSchema: GenMessage<PreviewReviewerPingResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SendReviewerPingRequest
+ */
+export declare type SendReviewerPingRequest = Message<"omnigent.api.workspace.v1alpha1.SendReviewerPingRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string preview_token = 2;
+   */
+  previewToken: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SendReviewerPingRequest.
+ * Use `create(SendReviewerPingRequestSchema)` to create a new message.
+ */
+export declare const SendReviewerPingRequestSchema: GenMessage<SendReviewerPingRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SendReviewerPingResponse
+ */
+export declare type SendReviewerPingResponse = Message<"omnigent.api.workspace.v1alpha1.SendReviewerPingResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SendReviewerPingResponse.
+ * Use `create(SendReviewerPingResponseSchema)` to create a new message.
+ */
+export declare const SendReviewerPingResponseSchema: GenMessage<SendReviewerPingResponse>;
+
+/**
+ * The first message of a ReadPullRequestImage stream.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.PullRequestImageMetadata
+ */
+export declare type PullRequestImageMetadata = Message<"omnigent.api.workspace.v1alpha1.PullRequestImageMetadata"> & {
+  /**
+   * @generated from field: string content_type = 1;
+   */
+  contentType: string;
+
+  /**
+   * @generated from field: int64 size = 2;
+   */
+  size: bigint;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.PullRequestImageMetadata.
+ * Use `create(PullRequestImageMetadataSchema)` to create a new message.
+ */
+export declare const PullRequestImageMetadataSchema: GenMessage<PullRequestImageMetadata>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ReadPullRequestImageResponse
+ */
+export declare type ReadPullRequestImageResponse = Message<"omnigent.api.workspace.v1alpha1.ReadPullRequestImageResponse"> & {
+  /**
+   * Set on the first message only.
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.PullRequestImageMetadata metadata = 1;
+   */
+  metadata?: PullRequestImageMetadata | undefined;
+
+  /**
+   * The next part of the image. Concatenate every message's `data`.
+   *
+   * @generated from field: bytes data = 2;
+   */
+  data: Uint8Array;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadPullRequestImageResponse.
+ * Use `create(ReadPullRequestImageResponseSchema)` to create a new message.
+ */
+export declare const ReadPullRequestImageResponseSchema: GenMessage<ReadPullRequestImageResponse>;
+
+/**
  * @generated from enum omnigent.api.workspace.v1alpha1.EntryType
  */
 export enum EntryType {
@@ -2921,6 +4280,37 @@ export enum PushUnresolved {
 export declare const PushUnresolvedSchema: GenEnum<PushUnresolved>;
 
 /**
+ * What an editor completion searches for.
+ *
+ * @generated from enum omnigent.api.workspace.v1alpha1.CompletionKind
+ */
+export enum CompletionKind {
+  /**
+   * @generated from enum value: COMPLETION_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * People, after @.
+   *
+   * @generated from enum value: COMPLETION_KIND_MENTION = 1;
+   */
+  MENTION = 1,
+
+  /**
+   * The repository's pull requests, after #.
+   *
+   * @generated from enum value: COMPLETION_KIND_REFERENCE = 2;
+   */
+  REFERENCE = 2,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.CompletionKind.
+ */
+export declare const CompletionKindSchema: GenEnum<CompletionKind>;
+
+/**
  * @generated from service omnigent.api.workspace.v1alpha1.WorkspaceService
  */
 export declare const WorkspaceService: GenService<{
@@ -3268,6 +4658,318 @@ export declare const WorkspaceService: GenService<{
     methodKind: "unary";
     input: typeof DisableAutoMergeRequestSchema;
     output: typeof DisableAutoMergeResponseSchema;
+  },
+  /**
+   * Adds a draft comment on a line or range to the pending review, starting one if needed,
+   * or a draft reply in a review conversation to the viewer's pending review.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.AddPendingReviewComment
+   */
+  addPendingReviewComment: {
+    methodKind: "unary";
+    input: typeof AddPendingReviewCommentRequestSchema;
+    output: typeof AddPendingReviewCommentResponseSchema;
+  },
+  /**
+   * Adds the session user's reaction to a comment.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.AddReaction
+   */
+  addReaction: {
+    methodKind: "unary";
+    input: typeof AddReactionRequestSchema;
+    output: typeof AddReactionResponseSchema;
+  },
+  /**
+   * Deletes a comment.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.DeleteComment
+   */
+  deleteComment: {
+    methodKind: "unary";
+    input: typeof DeleteCommentRequestSchema;
+    output: typeof DeleteCommentResponseSchema;
+  },
+  /**
+   * Deletes a draft comment from the viewer's pending review.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.DeletePendingReviewComment
+   */
+  deletePendingReviewComment: {
+    methodKind: "unary";
+    input: typeof DeletePendingReviewCommentRequestSchema;
+    output: typeof DeletePendingReviewCommentResponseSchema;
+  },
+  /**
+   * Removes the pull request from its merge queue.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.DequeuePullRequest
+   */
+  dequeuePullRequest: {
+    methodKind: "unary";
+    input: typeof DequeuePullRequestRequestSchema;
+    output: typeof DequeuePullRequestResponseSchema;
+  },
+  /**
+   * Deletes the pending review and its draft comments.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.DiscardPendingReview
+   */
+  discardPendingReview: {
+    methodKind: "unary";
+    input: typeof DiscardPendingReviewRequestSchema;
+    output: typeof DiscardPendingReviewResponseSchema;
+  },
+  /**
+   * Changes a comment's text, only while it still reads as the client last saw it.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.EditComment
+   */
+  editComment: {
+    methodKind: "unary";
+    input: typeof EditCommentRequestSchema;
+    output: typeof EditCommentResponseSchema;
+  },
+  /**
+   * Turns on auto-merge for each pull request, each only while its head is the one the user saw.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.EnableAutoMerge
+   */
+  enableAutoMerge: {
+    methodKind: "unary";
+    input: typeof EnableAutoMergeRequestSchema;
+    output: typeof EnableAutoMergeResponseSchema;
+  },
+  /**
+   * Adds the pull request to its base branch's merge queue, at the head the user saw.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.EnqueuePullRequest
+   */
+  enqueuePullRequest: {
+    methodKind: "unary";
+    input: typeof EnqueuePullRequestRequestSchema;
+    output: typeof EnqueuePullRequestResponseSchema;
+  },
+  /**
+   * The pull request's merge queue membership and position.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetMergeQueue
+   */
+  getMergeQueue: {
+    methodKind: "unary";
+    input: typeof GetMergeQueueRequestSchema;
+    output: typeof GetMergeQueueResponseSchema;
+  },
+  /**
+   * The merge-readiness checks an installed insights provider reports for a head.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetMergeReadiness
+   */
+  getMergeReadiness: {
+    methodKind: "unary";
+    input: typeof GetMergeReadinessRequestSchema;
+    output: typeof GetMergeReadinessResponseSchema;
+  },
+  /**
+   * The session's pending review, its head and its draft comments.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetPendingReview
+   */
+  getPendingReview: {
+    methodKind: "unary";
+    input: typeof GetPendingReviewRequestSchema;
+    output: typeof GetPendingReviewResponseSchema;
+  },
+  /**
+   * Diff size, update time, state and checks for list rows, for the session's owner.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetPullRequestListStats
+   */
+  getPullRequestListStats: {
+    methodKind: "unary";
+    input: typeof GetPullRequestListStatsRequestSchema;
+    output: typeof GetPullRequestListStatsResponseSchema;
+  },
+  /**
+   * The pull requests in the same stack as this one, found through their branches.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetPullRequestStack
+   */
+  getPullRequestStack: {
+    methodKind: "unary";
+    input: typeof GetPullRequestStackRequestSchema;
+    output: typeof GetPullRequestStackResponseSchema;
+  },
+  /**
+   * The pull requests for a branch of the workspace's own repository.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ListBranchPullRequests
+   */
+  listBranchPullRequests: {
+    methodKind: "unary";
+    input: typeof ListBranchPullRequestsRequestSchema;
+    output: typeof ListBranchPullRequestsResponseSchema;
+  },
+  /**
+   * One pull request's title and state by its URL, for the session's owner.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.LookupPullRequest
+   */
+  lookupPullRequest: {
+    methodKind: "unary";
+    input: typeof LookupPullRequestRequestSchema;
+    output: typeof LookupPullRequestResponseSchema;
+  },
+  /**
+   * Previews a reviewer ping, and returns the single-use token that sends it.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.PreviewReviewerPing
+   */
+  previewReviewerPing: {
+    methodKind: "unary";
+    input: typeof PreviewReviewerPingRequestSchema;
+    output: typeof PreviewReviewerPingResponseSchema;
+  },
+  /**
+   * Streams an image the pull request links to: its metadata, then its bytes.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ReadPullRequestImage
+   */
+  readPullRequestImage: {
+    methodKind: "server_streaming";
+    input: typeof ReadPullRequestImageRequestSchema;
+    output: typeof ReadPullRequestImageResponseSchema;
+  },
+  /**
+   * Removes the session user's reaction from a comment.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.RemoveReaction
+   */
+  removeReaction: {
+    methodKind: "unary";
+    input: typeof RemoveReactionRequestSchema;
+    output: typeof RemoveReactionResponseSchema;
+  },
+  /**
+   * An editor's @ and # completions: people (the session's owner only) or the repository's PRs.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SearchCompletions
+   */
+  searchCompletions: {
+    methodKind: "unary";
+    input: typeof SearchCompletionsRequestSchema;
+    output: typeof SearchCompletionsResponseSchema;
+  },
+  /**
+   * People and teams who can review the pull request, matching `text`, for the session's owner.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SearchReviewers
+   */
+  searchReviewers: {
+    methodKind: "unary";
+    input: typeof SearchReviewersRequestSchema;
+    output: typeof SearchReviewersResponseSchema;
+  },
+  /**
+   * Sends a previewed reviewer ping. Each preview token works once, for a short time.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SendReviewerPing
+   */
+  sendReviewerPing: {
+    methodKind: "unary";
+    input: typeof SendReviewerPingRequestSchema;
+    output: typeof SendReviewerPingResponseSchema;
+  },
+  /**
+   * Marks the pull request ready for review, or back to draft.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SetPullRequestDraft
+   */
+  setPullRequestDraft: {
+    methodKind: "unary";
+    input: typeof SetPullRequestDraftRequestSchema;
+    output: typeof SetPullRequestDraftResponseSchema;
+  },
+  /**
+   * Closes or reopens the pull request.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SetPullRequestState
+   */
+  setPullRequestState: {
+    methodKind: "unary";
+    input: typeof SetPullRequestStateRequestSchema;
+    output: typeof SetPullRequestStateResponseSchema;
+  },
+  /**
+   * Resolves or reopens a review conversation.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SetReviewThreadResolved
+   */
+  setReviewThreadResolved: {
+    methodKind: "unary";
+    input: typeof SetReviewThreadResolvedRequestSchema;
+    output: typeof SetReviewThreadResolvedResponseSchema;
+  },
+  /**
+   * Starts a pending review on the head the user saw.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.StartPendingReview
+   */
+  startPendingReview: {
+    methodKind: "unary";
+    input: typeof StartPendingReviewRequestSchema;
+    output: typeof StartPendingReviewResponseSchema;
+  },
+  /**
+   * Submits the pending review with its verdict, only while its head is the commit the user saw.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SubmitPendingReview
+   */
+  submitPendingReview: {
+    methodKind: "unary";
+    input: typeof SubmitPendingReviewRequestSchema;
+    output: typeof SubmitPendingReviewResponseSchema;
+  },
+  /**
+   * Submits a comment-only review on the head the user saw. APPROVE and
+   * REQUEST_CHANGES are refused by the server before they reach the host.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SubmitReview
+   */
+  submitReview: {
+    methodKind: "unary";
+    input: typeof SubmitReviewRequestSchema;
+    output: typeof SubmitReviewResponseSchema;
+  },
+  /**
+   * Approves or requests changes on the head the user saw, in one review.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SubmitReviewVerdict
+   */
+  submitReviewVerdict: {
+    methodKind: "unary";
+    input: typeof SubmitReviewVerdictRequestSchema;
+    output: typeof SubmitReviewVerdictResponseSchema;
+  },
+  /**
+   * Changes a draft comment in the viewer's pending review, only while its text is as last read.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.UpdatePendingReviewComment
+   */
+  updatePendingReviewComment: {
+    methodKind: "unary";
+    input: typeof UpdatePendingReviewCommentRequestSchema;
+    output: typeof UpdatePendingReviewCommentResponseSchema;
+  },
+  /**
+   * Uploads a file to link from a comment.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.UploadAttachment
+   */
+  uploadAttachment: {
+    methodKind: "unary";
+    input: typeof UploadAttachmentRequestSchema;
+    output: typeof UploadAttachmentResponseSchema;
   },
 }>;
 

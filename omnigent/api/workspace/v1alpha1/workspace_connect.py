@@ -21,7 +21,7 @@ from connectrpc.protocol import ProtocolType
 from connectrpc.server import ConnectASGIApplication, ConnectWSGIApplication, DEFAULT_READ_MAX_BYTES, Endpoint, EndpointSync
 from pyqwest import Client, SyncClient
 
-from .workspace_pb2 import ComparePullRequestRangeRequest, ComparePullRequestRangeResponse, CreateCommentRequest, CreateCommentResponse, CreateReviewThreadRequest, CreateReviewThreadResponse, DisableAutoMergeRequest, DisableAutoMergeResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetCommitDiffRequest, GetCommitDiffResponse, GetMergeOptionsRequest, GetMergeOptionsResponse, GetPullRequestDiffRequest, GetPullRequestDiffResponse, GetPullRequestRequest, GetPullRequestResponse, ListBranchCommitsRequest, ListBranchCommitsResponse, ListDirectoryRequest, ListDirectoryResponse, ListLabelsRequest, ListLabelsResponse, ListPullRequestCommitsRequest, ListPullRequestCommitsResponse, ListPullRequestFilesRequest, ListPullRequestFilesResponse, ListRepositoryRefsRequest, ListRepositoryRefsResponse, ListReviewThreadCommentsRequest, ListReviewThreadCommentsResponse, ListReviewThreadsRequest, ListReviewThreadsResponse, ListReviewerCandidatesRequest, ListReviewerCandidatesResponse, ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse, MergePullRequestAsAccountRequest, MergePullRequestAsAccountResponse, MergePullRequestRequest, MergePullRequestResponse, ReadBaseFileRequest, ReadBaseFileResponse, ReadFileRequest, ReadFileResponse, ReadLinkTextRequest, ReadLinkTextResponse, ReplyToReviewThreadRequest, ReplyToReviewThreadResponse, ResolveRepositoryContextRequest, ResolveRepositoryContextResponse, ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse, SearchFilesRequest, SearchFilesResponse, SearchTextRequest, SearchTextResponse, SetPullRequestAccountRequest, SetPullRequestAccountResponse, StatPathRequest, StatPathResponse, UpdateLabelsRequest, UpdateLabelsResponse, UpdatePullRequestDetailsRequest, UpdatePullRequestDetailsResponse, UpdateReviewersRequest, UpdateReviewersResponse
+from .workspace_pb2 import AddPendingReviewCommentRequest, AddPendingReviewCommentResponse, AddReactionRequest, AddReactionResponse, ComparePullRequestRangeRequest, ComparePullRequestRangeResponse, CreateCommentRequest, CreateCommentResponse, CreateReviewThreadRequest, CreateReviewThreadResponse, DeleteCommentRequest, DeleteCommentResponse, DeletePendingReviewCommentRequest, DeletePendingReviewCommentResponse, DequeuePullRequestRequest, DequeuePullRequestResponse, DisableAutoMergeRequest, DisableAutoMergeResponse, DiscardPendingReviewRequest, DiscardPendingReviewResponse, EditCommentRequest, EditCommentResponse, EnableAutoMergeRequest, EnableAutoMergeResponse, EnqueuePullRequestRequest, EnqueuePullRequestResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetCommitDiffRequest, GetCommitDiffResponse, GetMergeOptionsRequest, GetMergeOptionsResponse, GetMergeQueueRequest, GetMergeQueueResponse, GetMergeReadinessRequest, GetMergeReadinessResponse, GetPendingReviewRequest, GetPendingReviewResponse, GetPullRequestDiffRequest, GetPullRequestDiffResponse, GetPullRequestListStatsRequest, GetPullRequestListStatsResponse, GetPullRequestRequest, GetPullRequestResponse, GetPullRequestStackRequest, GetPullRequestStackResponse, ListBranchCommitsRequest, ListBranchCommitsResponse, ListBranchPullRequestsRequest, ListBranchPullRequestsResponse, ListDirectoryRequest, ListDirectoryResponse, ListLabelsRequest, ListLabelsResponse, ListPullRequestCommitsRequest, ListPullRequestCommitsResponse, ListPullRequestFilesRequest, ListPullRequestFilesResponse, ListRepositoryRefsRequest, ListRepositoryRefsResponse, ListReviewThreadCommentsRequest, ListReviewThreadCommentsResponse, ListReviewThreadsRequest, ListReviewThreadsResponse, ListReviewerCandidatesRequest, ListReviewerCandidatesResponse, ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse, LookupPullRequestRequest, LookupPullRequestResponse, MergePullRequestAsAccountRequest, MergePullRequestAsAccountResponse, MergePullRequestRequest, MergePullRequestResponse, PreviewReviewerPingRequest, PreviewReviewerPingResponse, ReadBaseFileRequest, ReadBaseFileResponse, ReadFileRequest, ReadFileResponse, ReadLinkTextRequest, ReadLinkTextResponse, ReadPullRequestImageRequest, ReadPullRequestImageResponse, RemoveReactionRequest, RemoveReactionResponse, ReplyToReviewThreadRequest, ReplyToReviewThreadResponse, ResolveRepositoryContextRequest, ResolveRepositoryContextResponse, ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse, SearchCompletionsRequest, SearchCompletionsResponse, SearchFilesRequest, SearchFilesResponse, SearchReviewersRequest, SearchReviewersResponse, SearchTextRequest, SearchTextResponse, SendReviewerPingRequest, SendReviewerPingResponse, SetPullRequestAccountRequest, SetPullRequestAccountResponse, SetPullRequestDraftRequest, SetPullRequestDraftResponse, SetPullRequestStateRequest, SetPullRequestStateResponse, SetReviewThreadResolvedRequest, SetReviewThreadResolvedResponse, StartPendingReviewRequest, StartPendingReviewResponse, StatPathRequest, StatPathResponse, SubmitPendingReviewRequest, SubmitPendingReviewResponse, SubmitReviewRequest, SubmitReviewResponse, SubmitReviewVerdictRequest, SubmitReviewVerdictResponse, UpdateLabelsRequest, UpdateLabelsResponse, UpdatePendingReviewCommentRequest, UpdatePendingReviewCommentResponse, UpdatePullRequestDetailsRequest, UpdatePullRequestDetailsResponse, UpdateReviewersRequest, UpdateReviewersResponse, UploadAttachmentRequest, UploadAttachmentResponse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Iterator, Mapping
@@ -244,6 +244,194 @@ class WorkspaceService(Protocol):
     async def disable_auto_merge(self, request: DisableAutoMergeRequest, ctx: RequestContext[DisableAutoMergeRequest, DisableAutoMergeResponse], /) -> DisableAutoMergeResponse:
         """
         Turns off the pull request's auto-merge.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def add_pending_review_comment(self, request: AddPendingReviewCommentRequest, ctx: RequestContext[AddPendingReviewCommentRequest, AddPendingReviewCommentResponse], /) -> AddPendingReviewCommentResponse:
+        """
+        Adds a draft comment on a line or range to the pending review, starting one if needed,
+        or a draft reply in a review conversation to the viewer's pending review.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def add_reaction(self, request: AddReactionRequest, ctx: RequestContext[AddReactionRequest, AddReactionResponse], /) -> AddReactionResponse:
+        """
+        Adds the session user's reaction to a comment.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def delete_comment(self, request: DeleteCommentRequest, ctx: RequestContext[DeleteCommentRequest, DeleteCommentResponse], /) -> DeleteCommentResponse:
+        """
+        Deletes a comment.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def delete_pending_review_comment(self, request: DeletePendingReviewCommentRequest, ctx: RequestContext[DeletePendingReviewCommentRequest, DeletePendingReviewCommentResponse], /) -> DeletePendingReviewCommentResponse:
+        """
+        Deletes a draft comment from the viewer's pending review.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def dequeue_pull_request(self, request: DequeuePullRequestRequest, ctx: RequestContext[DequeuePullRequestRequest, DequeuePullRequestResponse], /) -> DequeuePullRequestResponse:
+        """
+        Removes the pull request from its merge queue.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def discard_pending_review(self, request: DiscardPendingReviewRequest, ctx: RequestContext[DiscardPendingReviewRequest, DiscardPendingReviewResponse], /) -> DiscardPendingReviewResponse:
+        """
+        Deletes the pending review and its draft comments.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def edit_comment(self, request: EditCommentRequest, ctx: RequestContext[EditCommentRequest, EditCommentResponse], /) -> EditCommentResponse:
+        """
+        Changes a comment's text, only while it still reads as the client last saw it.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def enable_auto_merge(self, request: EnableAutoMergeRequest, ctx: RequestContext[EnableAutoMergeRequest, EnableAutoMergeResponse], /) -> EnableAutoMergeResponse:
+        """
+        Turns on auto-merge for each pull request, each only while its head is the one the user saw.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def enqueue_pull_request(self, request: EnqueuePullRequestRequest, ctx: RequestContext[EnqueuePullRequestRequest, EnqueuePullRequestResponse], /) -> EnqueuePullRequestResponse:
+        """
+        Adds the pull request to its base branch's merge queue, at the head the user saw.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def get_merge_queue(self, request: GetMergeQueueRequest, ctx: RequestContext[GetMergeQueueRequest, GetMergeQueueResponse], /) -> GetMergeQueueResponse:
+        """
+        The pull request's merge queue membership and position.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def get_merge_readiness(self, request: GetMergeReadinessRequest, ctx: RequestContext[GetMergeReadinessRequest, GetMergeReadinessResponse], /) -> GetMergeReadinessResponse:
+        """
+        The merge-readiness checks an installed insights provider reports for a head.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def get_pending_review(self, request: GetPendingReviewRequest, ctx: RequestContext[GetPendingReviewRequest, GetPendingReviewResponse], /) -> GetPendingReviewResponse:
+        """
+        The session's pending review, its head and its draft comments.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def get_pull_request_list_stats(self, request: GetPullRequestListStatsRequest, ctx: RequestContext[GetPullRequestListStatsRequest, GetPullRequestListStatsResponse], /) -> GetPullRequestListStatsResponse:
+        """
+        Diff size, update time, state and checks for list rows, for the session's owner.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def get_pull_request_stack(self, request: GetPullRequestStackRequest, ctx: RequestContext[GetPullRequestStackRequest, GetPullRequestStackResponse], /) -> GetPullRequestStackResponse:
+        """
+        The pull requests in the same stack as this one, found through their branches.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def list_branch_pull_requests(self, request: ListBranchPullRequestsRequest, ctx: RequestContext[ListBranchPullRequestsRequest, ListBranchPullRequestsResponse], /) -> ListBranchPullRequestsResponse:
+        """
+        The pull requests for a branch of the workspace's own repository.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def lookup_pull_request(self, request: LookupPullRequestRequest, ctx: RequestContext[LookupPullRequestRequest, LookupPullRequestResponse], /) -> LookupPullRequestResponse:
+        """
+        One pull request's title and state by its URL, for the session's owner.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def preview_reviewer_ping(self, request: PreviewReviewerPingRequest, ctx: RequestContext[PreviewReviewerPingRequest, PreviewReviewerPingResponse], /) -> PreviewReviewerPingResponse:
+        """
+        Previews a reviewer ping, and returns the single-use token that sends it.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def read_pull_request_image(self, request: ReadPullRequestImageRequest, ctx: RequestContext[ReadPullRequestImageRequest, ReadPullRequestImageResponse], /) -> AsyncIterator[ReadPullRequestImageResponse]:
+        """
+        Streams an image the pull request links to: its metadata, then its bytes.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def remove_reaction(self, request: RemoveReactionRequest, ctx: RequestContext[RemoveReactionRequest, RemoveReactionResponse], /) -> RemoveReactionResponse:
+        """
+        Removes the session user's reaction from a comment.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def search_completions(self, request: SearchCompletionsRequest, ctx: RequestContext[SearchCompletionsRequest, SearchCompletionsResponse], /) -> SearchCompletionsResponse:
+        """
+        An editor's @ and # completions: people (the session's owner only) or the repository's PRs.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def search_reviewers(self, request: SearchReviewersRequest, ctx: RequestContext[SearchReviewersRequest, SearchReviewersResponse], /) -> SearchReviewersResponse:
+        """
+        People and teams who can review the pull request, matching `text`, for the session's owner.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def send_reviewer_ping(self, request: SendReviewerPingRequest, ctx: RequestContext[SendReviewerPingRequest, SendReviewerPingResponse], /) -> SendReviewerPingResponse:
+        """
+        Sends a previewed reviewer ping. Each preview token works once, for a short time.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def set_pull_request_draft(self, request: SetPullRequestDraftRequest, ctx: RequestContext[SetPullRequestDraftRequest, SetPullRequestDraftResponse], /) -> SetPullRequestDraftResponse:
+        """
+        Marks the pull request ready for review, or back to draft.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def set_pull_request_state(self, request: SetPullRequestStateRequest, ctx: RequestContext[SetPullRequestStateRequest, SetPullRequestStateResponse], /) -> SetPullRequestStateResponse:
+        """
+        Closes or reopens the pull request.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def set_review_thread_resolved(self, request: SetReviewThreadResolvedRequest, ctx: RequestContext[SetReviewThreadResolvedRequest, SetReviewThreadResolvedResponse], /) -> SetReviewThreadResolvedResponse:
+        """
+        Resolves or reopens a review conversation.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def start_pending_review(self, request: StartPendingReviewRequest, ctx: RequestContext[StartPendingReviewRequest, StartPendingReviewResponse], /) -> StartPendingReviewResponse:
+        """
+        Starts a pending review on the head the user saw.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def submit_pending_review(self, request: SubmitPendingReviewRequest, ctx: RequestContext[SubmitPendingReviewRequest, SubmitPendingReviewResponse], /) -> SubmitPendingReviewResponse:
+        """
+        Submits the pending review with its verdict, only while its head is the commit the user saw.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def submit_review(self, request: SubmitReviewRequest, ctx: RequestContext[SubmitReviewRequest, SubmitReviewResponse], /) -> SubmitReviewResponse:
+        """
+        Submits a comment-only review on the head the user saw. APPROVE and
+        REQUEST_CHANGES are refused by the server before they reach the host.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def submit_review_verdict(self, request: SubmitReviewVerdictRequest, ctx: RequestContext[SubmitReviewVerdictRequest, SubmitReviewVerdictResponse], /) -> SubmitReviewVerdictResponse:
+        """
+        Approves or requests changes on the head the user saw, in one review.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def update_pending_review_comment(self, request: UpdatePendingReviewCommentRequest, ctx: RequestContext[UpdatePendingReviewCommentRequest, UpdatePendingReviewCommentResponse], /) -> UpdatePendingReviewCommentResponse:
+        """
+        Changes a draft comment in the viewer's pending review, only while its text is as last read.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def upload_attachment(self, request: UploadAttachmentRequest, ctx: RequestContext[UploadAttachmentRequest, UploadAttachmentResponse], /) -> UploadAttachmentResponse:
+        """
+        Uploads a file to link from a comment.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -634,6 +822,347 @@ class WorkspaceServiceASGIApplication(ConnectASGIApplication[WorkspaceService]):
                         stream_type=StreamType.UNARY,
                     ),
                     function=svc.disable_auto_merge,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/AddPendingReviewComment": Endpoint.unary(
+                    method=MethodInfo(
+                        name="AddPendingReviewComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=AddPendingReviewCommentRequest,
+                        output=AddPendingReviewCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.add_pending_review_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/AddReaction": Endpoint.unary(
+                    method=MethodInfo(
+                        name="AddReaction",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=AddReactionRequest,
+                        output=AddReactionResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.add_reaction,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/DeleteComment": Endpoint.unary(
+                    method=MethodInfo(
+                        name="DeleteComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=DeleteCommentRequest,
+                        output=DeleteCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.delete_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/DeletePendingReviewComment": Endpoint.unary(
+                    method=MethodInfo(
+                        name="DeletePendingReviewComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=DeletePendingReviewCommentRequest,
+                        output=DeletePendingReviewCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.delete_pending_review_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/DequeuePullRequest": Endpoint.unary(
+                    method=MethodInfo(
+                        name="DequeuePullRequest",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=DequeuePullRequestRequest,
+                        output=DequeuePullRequestResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.dequeue_pull_request,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/DiscardPendingReview": Endpoint.unary(
+                    method=MethodInfo(
+                        name="DiscardPendingReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=DiscardPendingReviewRequest,
+                        output=DiscardPendingReviewResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.discard_pending_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/EditComment": Endpoint.unary(
+                    method=MethodInfo(
+                        name="EditComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=EditCommentRequest,
+                        output=EditCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.edit_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/EnableAutoMerge": Endpoint.unary(
+                    method=MethodInfo(
+                        name="EnableAutoMerge",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=EnableAutoMergeRequest,
+                        output=EnableAutoMergeResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.enable_auto_merge,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/EnqueuePullRequest": Endpoint.unary(
+                    method=MethodInfo(
+                        name="EnqueuePullRequest",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=EnqueuePullRequestRequest,
+                        output=EnqueuePullRequestResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.enqueue_pull_request,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetMergeQueue": Endpoint.unary(
+                    method=MethodInfo(
+                        name="GetMergeQueue",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetMergeQueueRequest,
+                        output=GetMergeQueueResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.get_merge_queue,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetMergeReadiness": Endpoint.unary(
+                    method=MethodInfo(
+                        name="GetMergeReadiness",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetMergeReadinessRequest,
+                        output=GetMergeReadinessResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.get_merge_readiness,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetPendingReview": Endpoint.unary(
+                    method=MethodInfo(
+                        name="GetPendingReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetPendingReviewRequest,
+                        output=GetPendingReviewResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.get_pending_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetPullRequestListStats": Endpoint.unary(
+                    method=MethodInfo(
+                        name="GetPullRequestListStats",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetPullRequestListStatsRequest,
+                        output=GetPullRequestListStatsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.get_pull_request_list_stats,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetPullRequestStack": Endpoint.unary(
+                    method=MethodInfo(
+                        name="GetPullRequestStack",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetPullRequestStackRequest,
+                        output=GetPullRequestStackResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.get_pull_request_stack,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListBranchPullRequests": Endpoint.unary(
+                    method=MethodInfo(
+                        name="ListBranchPullRequests",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ListBranchPullRequestsRequest,
+                        output=ListBranchPullRequestsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.list_branch_pull_requests,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/LookupPullRequest": Endpoint.unary(
+                    method=MethodInfo(
+                        name="LookupPullRequest",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=LookupPullRequestRequest,
+                        output=LookupPullRequestResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.lookup_pull_request,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/PreviewReviewerPing": Endpoint.unary(
+                    method=MethodInfo(
+                        name="PreviewReviewerPing",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=PreviewReviewerPingRequest,
+                        output=PreviewReviewerPingResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.preview_reviewer_ping,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadPullRequestImage": Endpoint.server_stream(
+                    method=MethodInfo(
+                        name="ReadPullRequestImage",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ReadPullRequestImageRequest,
+                        output=ReadPullRequestImageResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.SERVER_STREAM,
+                    ),
+                    function=svc.read_pull_request_image,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/RemoveReaction": Endpoint.unary(
+                    method=MethodInfo(
+                        name="RemoveReaction",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=RemoveReactionRequest,
+                        output=RemoveReactionResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.remove_reaction,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SearchCompletions": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SearchCompletions",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SearchCompletionsRequest,
+                        output=SearchCompletionsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.search_completions,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SearchReviewers": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SearchReviewers",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SearchReviewersRequest,
+                        output=SearchReviewersResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.search_reviewers,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SendReviewerPing": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SendReviewerPing",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SendReviewerPingRequest,
+                        output=SendReviewerPingResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.send_reviewer_ping,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SetPullRequestDraft": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SetPullRequestDraft",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SetPullRequestDraftRequest,
+                        output=SetPullRequestDraftResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.set_pull_request_draft,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SetPullRequestState": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SetPullRequestState",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SetPullRequestStateRequest,
+                        output=SetPullRequestStateResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.set_pull_request_state,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SetReviewThreadResolved": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SetReviewThreadResolved",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SetReviewThreadResolvedRequest,
+                        output=SetReviewThreadResolvedResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.set_review_thread_resolved,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/StartPendingReview": Endpoint.unary(
+                    method=MethodInfo(
+                        name="StartPendingReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=StartPendingReviewRequest,
+                        output=StartPendingReviewResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.start_pending_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SubmitPendingReview": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SubmitPendingReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SubmitPendingReviewRequest,
+                        output=SubmitPendingReviewResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.submit_pending_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SubmitReview": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SubmitReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SubmitReviewRequest,
+                        output=SubmitReviewResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.submit_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SubmitReviewVerdict": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SubmitReviewVerdict",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SubmitReviewVerdictRequest,
+                        output=SubmitReviewVerdictResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.submit_review_verdict,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/UpdatePendingReviewComment": Endpoint.unary(
+                    method=MethodInfo(
+                        name="UpdatePendingReviewComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=UpdatePendingReviewCommentRequest,
+                        output=UpdatePendingReviewCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.update_pending_review_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/UploadAttachment": Endpoint.unary(
+                    method=MethodInfo(
+                        name="UploadAttachment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=UploadAttachmentRequest,
+                        output=UploadAttachmentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.upload_attachment,
                 ),
             },
             interceptors=interceptors,
@@ -1502,6 +2031,739 @@ class WorkspaceServiceClient(ConnectClient):
             headers=headers,
             timeout_ms=timeout_ms,
         )
+    async def add_pending_review_comment(
+        self,
+        request: AddPendingReviewCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> AddPendingReviewCommentResponse:
+        """
+        Adds a draft comment on a line or range to the pending review, starting one if needed,
+        or a draft reply in a review conversation to the viewer's pending review.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="AddPendingReviewComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=AddPendingReviewCommentRequest,
+                output=AddPendingReviewCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def add_reaction(
+        self,
+        request: AddReactionRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> AddReactionResponse:
+        """
+        Adds the session user's reaction to a comment.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="AddReaction",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=AddReactionRequest,
+                output=AddReactionResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def delete_comment(
+        self,
+        request: DeleteCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> DeleteCommentResponse:
+        """
+        Deletes a comment.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="DeleteComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=DeleteCommentRequest,
+                output=DeleteCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def delete_pending_review_comment(
+        self,
+        request: DeletePendingReviewCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> DeletePendingReviewCommentResponse:
+        """
+        Deletes a draft comment from the viewer's pending review.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="DeletePendingReviewComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=DeletePendingReviewCommentRequest,
+                output=DeletePendingReviewCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def dequeue_pull_request(
+        self,
+        request: DequeuePullRequestRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> DequeuePullRequestResponse:
+        """
+        Removes the pull request from its merge queue.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="DequeuePullRequest",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=DequeuePullRequestRequest,
+                output=DequeuePullRequestResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def discard_pending_review(
+        self,
+        request: DiscardPendingReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> DiscardPendingReviewResponse:
+        """
+        Deletes the pending review and its draft comments.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="DiscardPendingReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=DiscardPendingReviewRequest,
+                output=DiscardPendingReviewResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def edit_comment(
+        self,
+        request: EditCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> EditCommentResponse:
+        """
+        Changes a comment's text, only while it still reads as the client last saw it.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="EditComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=EditCommentRequest,
+                output=EditCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def enable_auto_merge(
+        self,
+        request: EnableAutoMergeRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> EnableAutoMergeResponse:
+        """
+        Turns on auto-merge for each pull request, each only while its head is the one the user saw.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="EnableAutoMerge",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=EnableAutoMergeRequest,
+                output=EnableAutoMergeResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def enqueue_pull_request(
+        self,
+        request: EnqueuePullRequestRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> EnqueuePullRequestResponse:
+        """
+        Adds the pull request to its base branch's merge queue, at the head the user saw.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="EnqueuePullRequest",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=EnqueuePullRequestRequest,
+                output=EnqueuePullRequestResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def get_merge_queue(
+        self,
+        request: GetMergeQueueRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetMergeQueueResponse:
+        """
+        The pull request's merge queue membership and position.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetMergeQueue",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetMergeQueueRequest,
+                output=GetMergeQueueResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def get_merge_readiness(
+        self,
+        request: GetMergeReadinessRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetMergeReadinessResponse:
+        """
+        The merge-readiness checks an installed insights provider reports for a head.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetMergeReadiness",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetMergeReadinessRequest,
+                output=GetMergeReadinessResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def get_pending_review(
+        self,
+        request: GetPendingReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetPendingReviewResponse:
+        """
+        The session's pending review, its head and its draft comments.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetPendingReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetPendingReviewRequest,
+                output=GetPendingReviewResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def get_pull_request_list_stats(
+        self,
+        request: GetPullRequestListStatsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetPullRequestListStatsResponse:
+        """
+        Diff size, update time, state and checks for list rows, for the session's owner.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetPullRequestListStats",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetPullRequestListStatsRequest,
+                output=GetPullRequestListStatsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def get_pull_request_stack(
+        self,
+        request: GetPullRequestStackRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetPullRequestStackResponse:
+        """
+        The pull requests in the same stack as this one, found through their branches.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetPullRequestStack",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetPullRequestStackRequest,
+                output=GetPullRequestStackResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def list_branch_pull_requests(
+        self,
+        request: ListBranchPullRequestsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ListBranchPullRequestsResponse:
+        """
+        The pull requests for a branch of the workspace's own repository.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ListBranchPullRequests",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ListBranchPullRequestsRequest,
+                output=ListBranchPullRequestsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def lookup_pull_request(
+        self,
+        request: LookupPullRequestRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> LookupPullRequestResponse:
+        """
+        One pull request's title and state by its URL, for the session's owner.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="LookupPullRequest",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=LookupPullRequestRequest,
+                output=LookupPullRequestResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def preview_reviewer_ping(
+        self,
+        request: PreviewReviewerPingRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> PreviewReviewerPingResponse:
+        """
+        Previews a reviewer ping, and returns the single-use token that sends it.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="PreviewReviewerPing",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=PreviewReviewerPingRequest,
+                output=PreviewReviewerPingResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def read_pull_request_image(
+        self,
+        request: ReadPullRequestImageRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> AsyncIterator[ReadPullRequestImageResponse]:
+        """
+        Streams an image the pull request links to: its metadata, then its bytes.
+        """
+        return self.execute_server_stream(
+            request=request,
+            method=MethodInfo(
+                name="ReadPullRequestImage",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ReadPullRequestImageRequest,
+                output=ReadPullRequestImageResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.SERVER_STREAM,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def remove_reaction(
+        self,
+        request: RemoveReactionRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> RemoveReactionResponse:
+        """
+        Removes the session user's reaction from a comment.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="RemoveReaction",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=RemoveReactionRequest,
+                output=RemoveReactionResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def search_completions(
+        self,
+        request: SearchCompletionsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> SearchCompletionsResponse:
+        """
+        An editor's @ and # completions: people (the session's owner only) or the repository's PRs.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SearchCompletions",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SearchCompletionsRequest,
+                output=SearchCompletionsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def search_reviewers(
+        self,
+        request: SearchReviewersRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> SearchReviewersResponse:
+        """
+        People and teams who can review the pull request, matching `text`, for the session's owner.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SearchReviewers",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SearchReviewersRequest,
+                output=SearchReviewersResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def send_reviewer_ping(
+        self,
+        request: SendReviewerPingRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SendReviewerPingResponse:
+        """
+        Sends a previewed reviewer ping. Each preview token works once, for a short time.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SendReviewerPing",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SendReviewerPingRequest,
+                output=SendReviewerPingResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def set_pull_request_draft(
+        self,
+        request: SetPullRequestDraftRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SetPullRequestDraftResponse:
+        """
+        Marks the pull request ready for review, or back to draft.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SetPullRequestDraft",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SetPullRequestDraftRequest,
+                output=SetPullRequestDraftResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def set_pull_request_state(
+        self,
+        request: SetPullRequestStateRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SetPullRequestStateResponse:
+        """
+        Closes or reopens the pull request.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SetPullRequestState",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SetPullRequestStateRequest,
+                output=SetPullRequestStateResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def set_review_thread_resolved(
+        self,
+        request: SetReviewThreadResolvedRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SetReviewThreadResolvedResponse:
+        """
+        Resolves or reopens a review conversation.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SetReviewThreadResolved",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SetReviewThreadResolvedRequest,
+                output=SetReviewThreadResolvedResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def start_pending_review(
+        self,
+        request: StartPendingReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> StartPendingReviewResponse:
+        """
+        Starts a pending review on the head the user saw.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="StartPendingReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=StartPendingReviewRequest,
+                output=StartPendingReviewResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def submit_pending_review(
+        self,
+        request: SubmitPendingReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SubmitPendingReviewResponse:
+        """
+        Submits the pending review with its verdict, only while its head is the commit the user saw.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SubmitPendingReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SubmitPendingReviewRequest,
+                output=SubmitPendingReviewResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def submit_review(
+        self,
+        request: SubmitReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SubmitReviewResponse:
+        """
+        Submits a comment-only review on the head the user saw. APPROVE and
+        REQUEST_CHANGES are refused by the server before they reach the host.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SubmitReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SubmitReviewRequest,
+                output=SubmitReviewResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def submit_review_verdict(
+        self,
+        request: SubmitReviewVerdictRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SubmitReviewVerdictResponse:
+        """
+        Approves or requests changes on the head the user saw, in one review.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SubmitReviewVerdict",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SubmitReviewVerdictRequest,
+                output=SubmitReviewVerdictResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def update_pending_review_comment(
+        self,
+        request: UpdatePendingReviewCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> UpdatePendingReviewCommentResponse:
+        """
+        Changes a draft comment in the viewer's pending review, only while its text is as last read.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="UpdatePendingReviewComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=UpdatePendingReviewCommentRequest,
+                output=UpdatePendingReviewCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def upload_attachment(
+        self,
+        request: UploadAttachmentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> UploadAttachmentResponse:
+        """
+        Uploads a file to link from a comment.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="UploadAttachment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=UploadAttachmentRequest,
+                output=UploadAttachmentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
 
 class WorkspaceServiceSync(Protocol):
     def get_capabilities(self, request: GetCapabilitiesRequest, ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse], /) -> GetCapabilitiesResponse:
@@ -1710,6 +2972,194 @@ class WorkspaceServiceSync(Protocol):
     def disable_auto_merge(self, request: DisableAutoMergeRequest, ctx: RequestContext[DisableAutoMergeRequest, DisableAutoMergeResponse], /) -> DisableAutoMergeResponse:
         """
         Turns off the pull request's auto-merge.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def add_pending_review_comment(self, request: AddPendingReviewCommentRequest, ctx: RequestContext[AddPendingReviewCommentRequest, AddPendingReviewCommentResponse], /) -> AddPendingReviewCommentResponse:
+        """
+        Adds a draft comment on a line or range to the pending review, starting one if needed,
+        or a draft reply in a review conversation to the viewer's pending review.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def add_reaction(self, request: AddReactionRequest, ctx: RequestContext[AddReactionRequest, AddReactionResponse], /) -> AddReactionResponse:
+        """
+        Adds the session user's reaction to a comment.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def delete_comment(self, request: DeleteCommentRequest, ctx: RequestContext[DeleteCommentRequest, DeleteCommentResponse], /) -> DeleteCommentResponse:
+        """
+        Deletes a comment.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def delete_pending_review_comment(self, request: DeletePendingReviewCommentRequest, ctx: RequestContext[DeletePendingReviewCommentRequest, DeletePendingReviewCommentResponse], /) -> DeletePendingReviewCommentResponse:
+        """
+        Deletes a draft comment from the viewer's pending review.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def dequeue_pull_request(self, request: DequeuePullRequestRequest, ctx: RequestContext[DequeuePullRequestRequest, DequeuePullRequestResponse], /) -> DequeuePullRequestResponse:
+        """
+        Removes the pull request from its merge queue.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def discard_pending_review(self, request: DiscardPendingReviewRequest, ctx: RequestContext[DiscardPendingReviewRequest, DiscardPendingReviewResponse], /) -> DiscardPendingReviewResponse:
+        """
+        Deletes the pending review and its draft comments.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def edit_comment(self, request: EditCommentRequest, ctx: RequestContext[EditCommentRequest, EditCommentResponse], /) -> EditCommentResponse:
+        """
+        Changes a comment's text, only while it still reads as the client last saw it.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def enable_auto_merge(self, request: EnableAutoMergeRequest, ctx: RequestContext[EnableAutoMergeRequest, EnableAutoMergeResponse], /) -> EnableAutoMergeResponse:
+        """
+        Turns on auto-merge for each pull request, each only while its head is the one the user saw.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def enqueue_pull_request(self, request: EnqueuePullRequestRequest, ctx: RequestContext[EnqueuePullRequestRequest, EnqueuePullRequestResponse], /) -> EnqueuePullRequestResponse:
+        """
+        Adds the pull request to its base branch's merge queue, at the head the user saw.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def get_merge_queue(self, request: GetMergeQueueRequest, ctx: RequestContext[GetMergeQueueRequest, GetMergeQueueResponse], /) -> GetMergeQueueResponse:
+        """
+        The pull request's merge queue membership and position.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def get_merge_readiness(self, request: GetMergeReadinessRequest, ctx: RequestContext[GetMergeReadinessRequest, GetMergeReadinessResponse], /) -> GetMergeReadinessResponse:
+        """
+        The merge-readiness checks an installed insights provider reports for a head.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def get_pending_review(self, request: GetPendingReviewRequest, ctx: RequestContext[GetPendingReviewRequest, GetPendingReviewResponse], /) -> GetPendingReviewResponse:
+        """
+        The session's pending review, its head and its draft comments.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def get_pull_request_list_stats(self, request: GetPullRequestListStatsRequest, ctx: RequestContext[GetPullRequestListStatsRequest, GetPullRequestListStatsResponse], /) -> GetPullRequestListStatsResponse:
+        """
+        Diff size, update time, state and checks for list rows, for the session's owner.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def get_pull_request_stack(self, request: GetPullRequestStackRequest, ctx: RequestContext[GetPullRequestStackRequest, GetPullRequestStackResponse], /) -> GetPullRequestStackResponse:
+        """
+        The pull requests in the same stack as this one, found through their branches.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def list_branch_pull_requests(self, request: ListBranchPullRequestsRequest, ctx: RequestContext[ListBranchPullRequestsRequest, ListBranchPullRequestsResponse], /) -> ListBranchPullRequestsResponse:
+        """
+        The pull requests for a branch of the workspace's own repository.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def lookup_pull_request(self, request: LookupPullRequestRequest, ctx: RequestContext[LookupPullRequestRequest, LookupPullRequestResponse], /) -> LookupPullRequestResponse:
+        """
+        One pull request's title and state by its URL, for the session's owner.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def preview_reviewer_ping(self, request: PreviewReviewerPingRequest, ctx: RequestContext[PreviewReviewerPingRequest, PreviewReviewerPingResponse], /) -> PreviewReviewerPingResponse:
+        """
+        Previews a reviewer ping, and returns the single-use token that sends it.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def read_pull_request_image(self, request: ReadPullRequestImageRequest, ctx: RequestContext[ReadPullRequestImageRequest, ReadPullRequestImageResponse], /) -> Iterator[ReadPullRequestImageResponse]:
+        """
+        Streams an image the pull request links to: its metadata, then its bytes.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def remove_reaction(self, request: RemoveReactionRequest, ctx: RequestContext[RemoveReactionRequest, RemoveReactionResponse], /) -> RemoveReactionResponse:
+        """
+        Removes the session user's reaction from a comment.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def search_completions(self, request: SearchCompletionsRequest, ctx: RequestContext[SearchCompletionsRequest, SearchCompletionsResponse], /) -> SearchCompletionsResponse:
+        """
+        An editor's @ and # completions: people (the session's owner only) or the repository's PRs.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def search_reviewers(self, request: SearchReviewersRequest, ctx: RequestContext[SearchReviewersRequest, SearchReviewersResponse], /) -> SearchReviewersResponse:
+        """
+        People and teams who can review the pull request, matching `text`, for the session's owner.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def send_reviewer_ping(self, request: SendReviewerPingRequest, ctx: RequestContext[SendReviewerPingRequest, SendReviewerPingResponse], /) -> SendReviewerPingResponse:
+        """
+        Sends a previewed reviewer ping. Each preview token works once, for a short time.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def set_pull_request_draft(self, request: SetPullRequestDraftRequest, ctx: RequestContext[SetPullRequestDraftRequest, SetPullRequestDraftResponse], /) -> SetPullRequestDraftResponse:
+        """
+        Marks the pull request ready for review, or back to draft.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def set_pull_request_state(self, request: SetPullRequestStateRequest, ctx: RequestContext[SetPullRequestStateRequest, SetPullRequestStateResponse], /) -> SetPullRequestStateResponse:
+        """
+        Closes or reopens the pull request.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def set_review_thread_resolved(self, request: SetReviewThreadResolvedRequest, ctx: RequestContext[SetReviewThreadResolvedRequest, SetReviewThreadResolvedResponse], /) -> SetReviewThreadResolvedResponse:
+        """
+        Resolves or reopens a review conversation.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def start_pending_review(self, request: StartPendingReviewRequest, ctx: RequestContext[StartPendingReviewRequest, StartPendingReviewResponse], /) -> StartPendingReviewResponse:
+        """
+        Starts a pending review on the head the user saw.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def submit_pending_review(self, request: SubmitPendingReviewRequest, ctx: RequestContext[SubmitPendingReviewRequest, SubmitPendingReviewResponse], /) -> SubmitPendingReviewResponse:
+        """
+        Submits the pending review with its verdict, only while its head is the commit the user saw.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def submit_review(self, request: SubmitReviewRequest, ctx: RequestContext[SubmitReviewRequest, SubmitReviewResponse], /) -> SubmitReviewResponse:
+        """
+        Submits a comment-only review on the head the user saw. APPROVE and
+        REQUEST_CHANGES are refused by the server before they reach the host.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def submit_review_verdict(self, request: SubmitReviewVerdictRequest, ctx: RequestContext[SubmitReviewVerdictRequest, SubmitReviewVerdictResponse], /) -> SubmitReviewVerdictResponse:
+        """
+        Approves or requests changes on the head the user saw, in one review.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def update_pending_review_comment(self, request: UpdatePendingReviewCommentRequest, ctx: RequestContext[UpdatePendingReviewCommentRequest, UpdatePendingReviewCommentResponse], /) -> UpdatePendingReviewCommentResponse:
+        """
+        Changes a draft comment in the viewer's pending review, only while its text is as last read.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def upload_attachment(self, request: UploadAttachmentRequest, ctx: RequestContext[UploadAttachmentRequest, UploadAttachmentResponse], /) -> UploadAttachmentResponse:
+        """
+        Uploads a file to link from a comment.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -2098,6 +3548,347 @@ class WorkspaceServiceWSGIApplication(ConnectWSGIApplication):
                         stream_type=StreamType.UNARY,
                     ),
                     function=service.disable_auto_merge,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/AddPendingReviewComment": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="AddPendingReviewComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=AddPendingReviewCommentRequest,
+                        output=AddPendingReviewCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.add_pending_review_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/AddReaction": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="AddReaction",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=AddReactionRequest,
+                        output=AddReactionResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.add_reaction,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/DeleteComment": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="DeleteComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=DeleteCommentRequest,
+                        output=DeleteCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.delete_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/DeletePendingReviewComment": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="DeletePendingReviewComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=DeletePendingReviewCommentRequest,
+                        output=DeletePendingReviewCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.delete_pending_review_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/DequeuePullRequest": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="DequeuePullRequest",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=DequeuePullRequestRequest,
+                        output=DequeuePullRequestResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.dequeue_pull_request,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/DiscardPendingReview": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="DiscardPendingReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=DiscardPendingReviewRequest,
+                        output=DiscardPendingReviewResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.discard_pending_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/EditComment": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="EditComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=EditCommentRequest,
+                        output=EditCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.edit_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/EnableAutoMerge": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="EnableAutoMerge",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=EnableAutoMergeRequest,
+                        output=EnableAutoMergeResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.enable_auto_merge,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/EnqueuePullRequest": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="EnqueuePullRequest",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=EnqueuePullRequestRequest,
+                        output=EnqueuePullRequestResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.enqueue_pull_request,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetMergeQueue": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="GetMergeQueue",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetMergeQueueRequest,
+                        output=GetMergeQueueResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.get_merge_queue,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetMergeReadiness": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="GetMergeReadiness",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetMergeReadinessRequest,
+                        output=GetMergeReadinessResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.get_merge_readiness,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetPendingReview": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="GetPendingReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetPendingReviewRequest,
+                        output=GetPendingReviewResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.get_pending_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetPullRequestListStats": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="GetPullRequestListStats",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetPullRequestListStatsRequest,
+                        output=GetPullRequestListStatsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.get_pull_request_list_stats,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/GetPullRequestStack": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="GetPullRequestStack",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=GetPullRequestStackRequest,
+                        output=GetPullRequestStackResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.get_pull_request_stack,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListBranchPullRequests": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="ListBranchPullRequests",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ListBranchPullRequestsRequest,
+                        output=ListBranchPullRequestsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.list_branch_pull_requests,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/LookupPullRequest": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="LookupPullRequest",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=LookupPullRequestRequest,
+                        output=LookupPullRequestResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.lookup_pull_request,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/PreviewReviewerPing": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="PreviewReviewerPing",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=PreviewReviewerPingRequest,
+                        output=PreviewReviewerPingResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.preview_reviewer_ping,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadPullRequestImage": EndpointSync.server_stream(
+                    method=MethodInfo(
+                        name="ReadPullRequestImage",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ReadPullRequestImageRequest,
+                        output=ReadPullRequestImageResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.SERVER_STREAM,
+                    ),
+                    function=service.read_pull_request_image,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/RemoveReaction": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="RemoveReaction",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=RemoveReactionRequest,
+                        output=RemoveReactionResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.remove_reaction,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SearchCompletions": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SearchCompletions",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SearchCompletionsRequest,
+                        output=SearchCompletionsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.search_completions,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SearchReviewers": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SearchReviewers",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SearchReviewersRequest,
+                        output=SearchReviewersResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.search_reviewers,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SendReviewerPing": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SendReviewerPing",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SendReviewerPingRequest,
+                        output=SendReviewerPingResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.send_reviewer_ping,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SetPullRequestDraft": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SetPullRequestDraft",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SetPullRequestDraftRequest,
+                        output=SetPullRequestDraftResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.set_pull_request_draft,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SetPullRequestState": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SetPullRequestState",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SetPullRequestStateRequest,
+                        output=SetPullRequestStateResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.set_pull_request_state,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SetReviewThreadResolved": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SetReviewThreadResolved",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SetReviewThreadResolvedRequest,
+                        output=SetReviewThreadResolvedResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.set_review_thread_resolved,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/StartPendingReview": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="StartPendingReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=StartPendingReviewRequest,
+                        output=StartPendingReviewResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.start_pending_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SubmitPendingReview": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SubmitPendingReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SubmitPendingReviewRequest,
+                        output=SubmitPendingReviewResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.submit_pending_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SubmitReview": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SubmitReview",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SubmitReviewRequest,
+                        output=SubmitReviewResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.submit_review,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SubmitReviewVerdict": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SubmitReviewVerdict",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SubmitReviewVerdictRequest,
+                        output=SubmitReviewVerdictResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.submit_review_verdict,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/UpdatePendingReviewComment": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="UpdatePendingReviewComment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=UpdatePendingReviewCommentRequest,
+                        output=UpdatePendingReviewCommentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.update_pending_review_comment,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/UploadAttachment": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="UploadAttachment",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=UploadAttachmentRequest,
+                        output=UploadAttachmentResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.upload_attachment,
                 ),
             },
             interceptors=interceptors,
@@ -2960,6 +4751,739 @@ class WorkspaceServiceClientSync(ConnectClientSync):
                 service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
                 input=DisableAutoMergeRequest,
                 output=DisableAutoMergeResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def add_pending_review_comment(
+        self,
+        request: AddPendingReviewCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> AddPendingReviewCommentResponse:
+        """
+        Adds a draft comment on a line or range to the pending review, starting one if needed,
+        or a draft reply in a review conversation to the viewer's pending review.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="AddPendingReviewComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=AddPendingReviewCommentRequest,
+                output=AddPendingReviewCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def add_reaction(
+        self,
+        request: AddReactionRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> AddReactionResponse:
+        """
+        Adds the session user's reaction to a comment.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="AddReaction",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=AddReactionRequest,
+                output=AddReactionResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def delete_comment(
+        self,
+        request: DeleteCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> DeleteCommentResponse:
+        """
+        Deletes a comment.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="DeleteComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=DeleteCommentRequest,
+                output=DeleteCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def delete_pending_review_comment(
+        self,
+        request: DeletePendingReviewCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> DeletePendingReviewCommentResponse:
+        """
+        Deletes a draft comment from the viewer's pending review.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="DeletePendingReviewComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=DeletePendingReviewCommentRequest,
+                output=DeletePendingReviewCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def dequeue_pull_request(
+        self,
+        request: DequeuePullRequestRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> DequeuePullRequestResponse:
+        """
+        Removes the pull request from its merge queue.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="DequeuePullRequest",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=DequeuePullRequestRequest,
+                output=DequeuePullRequestResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def discard_pending_review(
+        self,
+        request: DiscardPendingReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> DiscardPendingReviewResponse:
+        """
+        Deletes the pending review and its draft comments.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="DiscardPendingReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=DiscardPendingReviewRequest,
+                output=DiscardPendingReviewResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def edit_comment(
+        self,
+        request: EditCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> EditCommentResponse:
+        """
+        Changes a comment's text, only while it still reads as the client last saw it.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="EditComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=EditCommentRequest,
+                output=EditCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def enable_auto_merge(
+        self,
+        request: EnableAutoMergeRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> EnableAutoMergeResponse:
+        """
+        Turns on auto-merge for each pull request, each only while its head is the one the user saw.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="EnableAutoMerge",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=EnableAutoMergeRequest,
+                output=EnableAutoMergeResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def enqueue_pull_request(
+        self,
+        request: EnqueuePullRequestRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> EnqueuePullRequestResponse:
+        """
+        Adds the pull request to its base branch's merge queue, at the head the user saw.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="EnqueuePullRequest",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=EnqueuePullRequestRequest,
+                output=EnqueuePullRequestResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def get_merge_queue(
+        self,
+        request: GetMergeQueueRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetMergeQueueResponse:
+        """
+        The pull request's merge queue membership and position.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetMergeQueue",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetMergeQueueRequest,
+                output=GetMergeQueueResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def get_merge_readiness(
+        self,
+        request: GetMergeReadinessRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetMergeReadinessResponse:
+        """
+        The merge-readiness checks an installed insights provider reports for a head.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetMergeReadiness",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetMergeReadinessRequest,
+                output=GetMergeReadinessResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def get_pending_review(
+        self,
+        request: GetPendingReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetPendingReviewResponse:
+        """
+        The session's pending review, its head and its draft comments.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetPendingReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetPendingReviewRequest,
+                output=GetPendingReviewResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def get_pull_request_list_stats(
+        self,
+        request: GetPullRequestListStatsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetPullRequestListStatsResponse:
+        """
+        Diff size, update time, state and checks for list rows, for the session's owner.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetPullRequestListStats",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetPullRequestListStatsRequest,
+                output=GetPullRequestListStatsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def get_pull_request_stack(
+        self,
+        request: GetPullRequestStackRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> GetPullRequestStackResponse:
+        """
+        The pull requests in the same stack as this one, found through their branches.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="GetPullRequestStack",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=GetPullRequestStackRequest,
+                output=GetPullRequestStackResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def list_branch_pull_requests(
+        self,
+        request: ListBranchPullRequestsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ListBranchPullRequestsResponse:
+        """
+        The pull requests for a branch of the workspace's own repository.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ListBranchPullRequests",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ListBranchPullRequestsRequest,
+                output=ListBranchPullRequestsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def lookup_pull_request(
+        self,
+        request: LookupPullRequestRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> LookupPullRequestResponse:
+        """
+        One pull request's title and state by its URL, for the session's owner.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="LookupPullRequest",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=LookupPullRequestRequest,
+                output=LookupPullRequestResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def preview_reviewer_ping(
+        self,
+        request: PreviewReviewerPingRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> PreviewReviewerPingResponse:
+        """
+        Previews a reviewer ping, and returns the single-use token that sends it.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="PreviewReviewerPing",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=PreviewReviewerPingRequest,
+                output=PreviewReviewerPingResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def read_pull_request_image(
+        self,
+        request: ReadPullRequestImageRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> Iterator[ReadPullRequestImageResponse]:
+        """
+        Streams an image the pull request links to: its metadata, then its bytes.
+        """
+        return self.execute_server_stream(
+            request=request,
+            method=MethodInfo(
+                name="ReadPullRequestImage",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ReadPullRequestImageRequest,
+                output=ReadPullRequestImageResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.SERVER_STREAM,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def remove_reaction(
+        self,
+        request: RemoveReactionRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> RemoveReactionResponse:
+        """
+        Removes the session user's reaction from a comment.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="RemoveReaction",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=RemoveReactionRequest,
+                output=RemoveReactionResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def search_completions(
+        self,
+        request: SearchCompletionsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> SearchCompletionsResponse:
+        """
+        An editor's @ and # completions: people (the session's owner only) or the repository's PRs.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SearchCompletions",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SearchCompletionsRequest,
+                output=SearchCompletionsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def search_reviewers(
+        self,
+        request: SearchReviewersRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> SearchReviewersResponse:
+        """
+        People and teams who can review the pull request, matching `text`, for the session's owner.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SearchReviewers",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SearchReviewersRequest,
+                output=SearchReviewersResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def send_reviewer_ping(
+        self,
+        request: SendReviewerPingRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SendReviewerPingResponse:
+        """
+        Sends a previewed reviewer ping. Each preview token works once, for a short time.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SendReviewerPing",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SendReviewerPingRequest,
+                output=SendReviewerPingResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def set_pull_request_draft(
+        self,
+        request: SetPullRequestDraftRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SetPullRequestDraftResponse:
+        """
+        Marks the pull request ready for review, or back to draft.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SetPullRequestDraft",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SetPullRequestDraftRequest,
+                output=SetPullRequestDraftResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def set_pull_request_state(
+        self,
+        request: SetPullRequestStateRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SetPullRequestStateResponse:
+        """
+        Closes or reopens the pull request.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SetPullRequestState",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SetPullRequestStateRequest,
+                output=SetPullRequestStateResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def set_review_thread_resolved(
+        self,
+        request: SetReviewThreadResolvedRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SetReviewThreadResolvedResponse:
+        """
+        Resolves or reopens a review conversation.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SetReviewThreadResolved",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SetReviewThreadResolvedRequest,
+                output=SetReviewThreadResolvedResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def start_pending_review(
+        self,
+        request: StartPendingReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> StartPendingReviewResponse:
+        """
+        Starts a pending review on the head the user saw.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="StartPendingReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=StartPendingReviewRequest,
+                output=StartPendingReviewResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def submit_pending_review(
+        self,
+        request: SubmitPendingReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SubmitPendingReviewResponse:
+        """
+        Submits the pending review with its verdict, only while its head is the commit the user saw.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SubmitPendingReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SubmitPendingReviewRequest,
+                output=SubmitPendingReviewResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def submit_review(
+        self,
+        request: SubmitReviewRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SubmitReviewResponse:
+        """
+        Submits a comment-only review on the head the user saw. APPROVE and
+        REQUEST_CHANGES are refused by the server before they reach the host.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SubmitReview",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SubmitReviewRequest,
+                output=SubmitReviewResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def submit_review_verdict(
+        self,
+        request: SubmitReviewVerdictRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> SubmitReviewVerdictResponse:
+        """
+        Approves or requests changes on the head the user saw, in one review.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SubmitReviewVerdict",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SubmitReviewVerdictRequest,
+                output=SubmitReviewVerdictResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def update_pending_review_comment(
+        self,
+        request: UpdatePendingReviewCommentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> UpdatePendingReviewCommentResponse:
+        """
+        Changes a draft comment in the viewer's pending review, only while its text is as last read.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="UpdatePendingReviewComment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=UpdatePendingReviewCommentRequest,
+                output=UpdatePendingReviewCommentResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def upload_attachment(
+        self,
+        request: UploadAttachmentRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> UploadAttachmentResponse:
+        """
+        Uploads a file to link from a comment.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="UploadAttachment",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=UploadAttachmentRequest,
+                output=UploadAttachmentResponse,
                 idempotency_level=IdempotencyLevel.UNKNOWN,
                 stream_type=StreamType.UNARY,
             ),
