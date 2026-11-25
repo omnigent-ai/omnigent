@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen } from "@testing-library/react";
-import type { FileDiffMetadata } from "@pierre/diffs";
+import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
@@ -88,8 +88,7 @@ function renderSection(
   const fileDiff = {
     name: FILE.path,
     type: "change",
-    unifiedLineCount,
-    hunks: [],
+    hunks: [{ unifiedLineCount }],
   } as unknown as FileDiffMetadata;
   const onToggleCollapsed = vi.fn();
   // Unplaced conversations render their own queries, so the section gets a query client.
@@ -153,6 +152,25 @@ describe("PullRequestFileSection overrides", () => {
     rerender({ forceMount: true, bypassLargeDiffGate: true });
     expect(screen.getByTestId("diff")).toBeInTheDocument();
     rerender({ forceMount: true, bypassLargeDiffGate: false });
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+  });
+
+  it("renders a small diff inline however far apart its hunks are", () => {
+    const hunks = [10, 2100, 4224].map(
+      (line) =>
+        `@@ -${line - 3},7 +${line - 3},7 @@\n` +
+        [1, 2, 3].map((offset) => ` context ${line - 4 + offset}\n`).join("") +
+        `-old ${line}\n+new ${line}\n` +
+        [1, 2, 3].map((offset) => ` context ${line + offset}\n`).join(""),
+    );
+    const patch = `diff --git a/${FILE.path} b/${FILE.path}\n--- a/${FILE.path}\n+++ b/${FILE.path}\n${hunks.join("")}`;
+    const [fileDiff] = parsePatchFiles(patch)[0].files;
+    // The parser's file-level count spans the gaps between hunks.
+    expect(fileDiff.unifiedLineCount).toBeGreaterThan(LARGE_DIFF_THRESHOLD);
+    expect(fileDiff.hunks.reduce((rows, hunk) => rows + hunk.unifiedLineCount, 0)).toBe(24);
+
+    renderSection({ forceMount: true, fileDiff });
+    expect(screen.queryByText(/^Large diff/)).toBeNull();
     expect(screen.getByTestId("diff")).toBeInTheDocument();
   });
 
