@@ -6,6 +6,7 @@ import {
   IgnoredFilesSearchError,
   RunnerOfflineError,
   type WorkspaceFile,
+  type WorkspaceListing,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
@@ -187,6 +188,17 @@ describe("FilesPageTree", () => {
     cleanup();
     renderTree(listed([entry(".env")]), true);
     expect(screen.getByTestId("files-tree")).toBeInTheDocument();
+  });
+
+  it("says a listing of only hidden entries stopped short, since files may lie past it", () => {
+    const entries: WorkspaceListing = Object.assign([entry(".a"), entry(".b")], {
+      cutOff: true as const,
+    });
+    renderTree(listed(entries));
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "The first 2 entries here are hidden, and the list stops there.",
+    );
+    expect(screen.getByRole("button", { name: "Show hidden files" })).toBeInTheDocument();
   });
 
   it("lists without what Git ignores while ignored files are off, and offers them when nothing's left", () => {

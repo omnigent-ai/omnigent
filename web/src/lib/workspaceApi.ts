@@ -397,10 +397,15 @@ async function listDirectory(
   { signal, hideIgnored = false, collapseSingleChildDirectories = false }: ListDirectoryOptions,
 ): Promise<{ data: ListedEntry[]; hasMore: boolean }> {
   const data: ListedEntry[] = [];
+  // A host whose token's entry was deleted starts its listing over, resending what it gave.
+  const held = new Set<string>();
   let pageToken = "";
+  // A host that hands back a token already asked for is cycling; stop before asking again.
+  const requested = new Set<string>();
   // Each page needs the token the previous one returned.
   /* oxlint-disable no-await-in-loop */
   do {
+    requested.add(pageToken);
     const page = await client.listDirectory(
       {
         path,
@@ -411,15 +416,20 @@ async function listDirectory(
       },
       { signal },
     );
-    // A host that hands back the token it was given is resending a page; stop before keeping it.
-    if (pageToken && page.nextPageToken === pageToken) break;
-    data.push(...page.entries.map(listedEntry));
+    // A page ending on a token already asked for resends one the listing holds; stop before keeping it.
+    if (page.nextPageToken && requested.has(page.nextPageToken)) break;
+    const fresh = page.entries.filter((entry) => !held.has(entry.path));
+    for (const entry of fresh) held.add(entry.path);
+    data.push(...fresh.map(listedEntry));
     pageToken = page.nextPageToken;
     // A page that adds nothing would never end the listing; report the rest as more.
-    if (page.entries.length === 0) break;
+    if (fresh.length === 0) break;
   } while (pageToken && data.length < maxEntries);
   /* oxlint-enable no-await-in-loop */
-  return { data, hasMore: pageToken !== "" };
+  // A host may ignore the page size; keep to the caller's limit and report the rest as more.
+  const overLimit = data.length > maxEntries;
+  if (overLimit) data.length = maxEntries;
+  return { data, hasMore: overLimit || pageToken !== "" };
 }
 
 interface CallOptions {

@@ -26,12 +26,15 @@ import { useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import {
   type WorkspaceEnvironment,
+  LISTING_ENTRY_LIMIT,
   MAX_RUNNER_OFFLINE_RETRIES,
   RunnerOfflineError,
   browseLocationBase,
   browseLocationSegment,
   isRunnerUnavailable503,
+  listingCutOff,
   looksLikeWorkspaceFilePath,
+  readListingPages,
   relativizeToWorkspace,
   resolveChatFilePath,
   runnerOfflineRetryDelay,
@@ -927,8 +930,9 @@ describe("useWorkspaceDirectory gating", () => {
     expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith(
       "conv_api",
       "src/inner",
-      1000,
-      undefined,
+      LISTING_ENTRY_LIMIT,
+      // The query's own signal, so closing the folder stops its pages.
+      expect.any(AbortSignal),
       {
         hideIgnored: false,
       },
@@ -1128,6 +1132,232 @@ describe("fetchWorkspaceFolderListing", () => {
       hasMore: true,
     });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("folder listings past one page", () => {
+  const entry = (name: string) => ({
+    id: `experimental/${name}`,
+    name,
+    path: `experimental/${name}`,
+    type: "directory",
+    bytes: null,
+    modified_at: null,
+  });
+  const page = (names: string[], hasMore: boolean, lastId = names.at(-1)) =>
+    jsonResponse({
+      object: "list",
+      data: names.map(entry),
+      has_more: hasMore,
+      last_id: lastId === undefined ? null : `experimental/${lastId}`,
+    });
+  const listFolder = (id: string, signal = new AbortController().signal) =>
+    workspaceDirectoryQuery(id, "experimental").queryFn({ signal });
+
+  it("reads every page through the after cursor, so a late folder is listed", async () => {
+    fetchMock
+      .mockResolvedValueOnce(page(["d0000", "d0999"], true))
+      .mockResolvedValueOnce(page(["d1000", "d1999"], true))
+      .mockResolvedValueOnce(page(["late"], false));
+
+    const entries = await listFolder("conv_pages");
+
+    expect(entries.map((file) => file.name)).toEqual(["d0000", "d0999", "d1000", "d1999", "late"]);
+    const urls = fetchMock.mock.calls.map(([url]) => new URL(String(url), "http://x"));
+    expect(urls.map((url) => url.searchParams.get("after"))).toEqual([
+      null,
+      "experimental/d0999",
+      "experimental/d1999",
+    ]);
+    expect(urls.every((url) => url.searchParams.get("limit") === "1000")).toBe(true);
+  });
+
+  it("asks for no page past the first once nobody waits for the listing", async () => {
+    const controller = new AbortController();
+    fetchMock.mockImplementationOnce(async (_url, init?: RequestInit) => {
+      // The folder closes while its first page is on its way.
+      controller.abort();
+      expect(init?.signal).toBe(controller.signal);
+      return page(["d0000", "d0999"], true);
+    });
+
+    await expect(listFolder("conv_closed", controller.signal)).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("pages the browsed folder's own listing too", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(page(["d0000"], true))
+      .mockResolvedValueOnce(page(["zz"], false));
+    let names: string[] = [];
+    function Probe() {
+      const query = useWorkspaceAllFiles("conv_root_pages");
+      names = query.data?.data.map((file) => file.name) ?? [];
+      return null;
+    }
+
+    render(
+      <Wrap>
+        <Probe />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(names).toEqual(["d0000", "zz"]));
+  });
+
+  it("stops at a page that repeats its cursor, as from a server that ignores it", async () => {
+    fetchMock.mockResolvedValue(page(["d0000", "d0999"], true));
+
+    const entries = await listFolder("conv_stuck");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The resent page is left out, and the folder still reads as cut off.
+    expect(entries.map((file) => file.name)).toEqual(["d0000", "d0999"]);
+    expect(listingCutOff(entries)).toBe(true);
+  });
+
+  it("keeps each entry once when the server starts over because the cursor's entry was deleted", async () => {
+    // A server that starts from the top when the `after` entry is gone, as the hosts do.
+    let names = Array.from({ length: 1500 }, (_, i) => `f${String(i).padStart(4, "0")}`);
+    const listing = await readListingPages(async (after) => {
+      const found = names.findIndex((name) => `experimental/${name}` === after);
+      const start = found < 0 ? 0 : found + 1;
+      const slice = names.slice(start, start + 1000);
+      // Its first page's last entry is deleted before the second is asked for.
+      if (after === null) names = names.filter((name) => name !== "f0999");
+      return {
+        object: "list",
+        data: slice.map(entry),
+        has_more: start + slice.length < names.length,
+        last_id: `experimental/${slice.at(-1)}`,
+      };
+    });
+
+    const ids = listing.data.map((file) => file.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toHaveLength(1500);
+    expect(listing.has_more).toBe(false);
+  });
+
+  it("keeps has_more when a page arrives with no cursor to continue from", async () => {
+    const listing = await readListingPages(async () => ({
+      object: "list",
+      data: [entry("d0000")],
+      has_more: true,
+      last_id: null,
+    }));
+
+    expect(listing?.has_more).toBe(true);
+    expect(listing?.data).toHaveLength(1);
+  });
+
+  it("stops before asking again for a cursor it already asked for, keeping has_more", async () => {
+    // The server cycles: after b it resends the page after d0, which ends on a.
+    const pages: Record<string, string> = {
+      "": "d0",
+      "experimental/d0": "a",
+      "experimental/a": "b",
+      "experimental/b": "a",
+    };
+    const asked: string[] = [];
+    const listing = await readListingPages(async (after) => {
+      asked.push(after ?? "");
+      const name = pages[after ?? ""]!;
+      return {
+        object: "list",
+        data: [entry(name)],
+        has_more: true,
+        last_id: `experimental/${name}`,
+      };
+    });
+
+    expect(asked).toEqual(["", "experimental/d0", "experimental/a", "experimental/b"]);
+    expect(listing?.has_more).toBe(true);
+    expect(listing?.data.map((file) => file.name)).toEqual(["d0", "a", "b"]);
+  });
+
+  it("fails the browsed folder's listing when a later page is gone", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(page(["d0000"], true))
+      .mockResolvedValueOnce(jsonResponse({}, 404));
+    let state: { isError: boolean; message?: string; data?: unknown } = { isError: false };
+    function Probe() {
+      const query = useWorkspaceAllFiles("conv_root_gone");
+      state = { isError: query.isError, message: query.error?.message, data: query.data };
+      return null;
+    }
+
+    render(
+      <Wrap>
+        <Probe />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(state.isError).toBe(true));
+    expect(state.message).toBe("the folder was removed while it was being listed");
+    expect(state.data).toBeUndefined();
+  });
+
+  it("fails the listing when a later page fails", async () => {
+    fetchMock
+      .mockResolvedValueOnce(page(["d0000"], true))
+      .mockResolvedValueOnce(jsonResponse({}, 500));
+
+    await expect(listFolder("conv_fail")).rejects.toThrow("500");
+  });
+
+  it("stops at exactly the entry limit, keeping has_more, so the tree can say it's cut off", async () => {
+    let calls = 0;
+    const listing = await readListingPages(async () => {
+      const start = calls++ * 1000;
+      const names = Array.from({ length: 1000 }, (_, i) => `d${start + i}`);
+      return {
+        object: "list",
+        data: names.map(entry),
+        has_more: true,
+        last_id: `experimental/${names.at(-1)}`,
+      };
+    });
+
+    expect(calls).toBe(LISTING_ENTRY_LIMIT / 1000);
+    expect(listing?.data).toHaveLength(LISTING_ENTRY_LIMIT);
+    expect(listing?.has_more).toBe(true);
+  });
+
+  it("marks a folder cut off from has_more, not from how many entries it holds", async () => {
+    fetchMock
+      // More past the page, with no cursor to read it by.
+      .mockResolvedValueOnce(
+        jsonResponse({ object: "list", data: [entry("d0000")], has_more: true }),
+      )
+      .mockResolvedValueOnce(page(["d0000", "d0001"], false));
+
+    expect(listingCutOff(await listFolder("conv_cut"))).toBe(true);
+    expect(listingCutOff(await listFolder("conv_whole"))).toBe(false);
+  });
+
+  it("trims a last page that overshoots the limit, and marks the listing cut off", async () => {
+    let calls = 0;
+    const listing = await readListingPages(async () => {
+      calls++;
+      // Pages bigger than the endpoint's own, from a server that ignores `limit`: 51,000
+      // entries in all, the last page saying it's the end.
+      const names = Array.from({ length: 3000 }, (_, i) => `d${calls}_${i}`);
+      return {
+        object: "list",
+        data: names.map(entry),
+        has_more: calls * 3000 < 51_000,
+        last_id: `experimental/${names.at(-1)}`,
+      };
+    });
+
+    expect(listing?.data).toHaveLength(LISTING_ENTRY_LIMIT);
+    expect(listing?.has_more).toBe(true);
+    expect(listing?.last_id).toBe(listing?.data.at(-1)?.id);
   });
 });
 
@@ -2403,8 +2633,9 @@ describe("browse-location listings normalize to paths relative to the location",
     expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith(
       "conv_rel_api",
       "reports",
-      1000,
-      undefined,
+      LISTING_ENTRY_LIMIT,
+      // The query's own signal, so closing the folder stops its pages.
+      expect.any(AbortSignal),
       {
         hideIgnored: false,
       },

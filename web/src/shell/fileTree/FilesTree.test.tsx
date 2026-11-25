@@ -3,13 +3,53 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  LISTING_ENTRY_LIMIT,
+  type WorkspaceFile,
+  type WorkspaceListing,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { isMacPlatform } from "@/lib/hotkeys";
+import type * as IdentityModule from "@/lib/identity";
+import { authenticatedFetch } from "@/lib/identity";
+import type * as WorkspaceApiModule from "@/lib/workspaceApi";
 
 import { useFileActionStore } from "../fileCommands/fileActionStore";
 import { pathToCopy } from "../fileCommands/target";
 import { FileViewerContext } from "../FileViewerContext";
 import { FilesTree, type FilesTreeProps, type FilesTreeReveal } from "./FilesTree";
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  authenticatedFetch: vi.fn(),
+}));
+vi.mock("@/lib/workspaceApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspaceApiModule>()),
+  listDirectoryViaWorkspaceApi: vi.fn(async () => null),
+}));
+
+/**
+ * Answers folder listings by the folder named in the request URL, a page of `limit` entries
+ * `after` the given one as the endpoint does, and records which folders were asked.
+ */
+function serveListings(listings: Record<string, WorkspaceFile[]>): string[] {
+  const asked: string[] = [];
+  vi.mocked(authenticatedFetch).mockImplementation(async (input: RequestInfo | URL) => {
+    const { pathname, searchParams } = new URL(String(input), "http://localhost");
+    const folder = decodeURIComponent(pathname.split("/filesystem")[1]?.replace(/^\//, "") ?? "");
+    asked.push(folder);
+    const listing = listings[folder];
+    if (!listing) return new Response("unavailable", { status: 503 });
+    const after = searchParams.get("after");
+    const start = after === null ? 0 : listing.findIndex((entry) => entry.path === after) + 1;
+    const page = listing.slice(start, start + Number(searchParams.get("limit") ?? listing.length));
+    const data = page.map((entry) => ({ id: entry.path, ...entry }));
+    const hasMore = start + page.length < listing.length;
+    return new Response(
+      JSON.stringify({ object: "list", data, has_more: hasMore, last_id: page.at(-1)?.path }),
+    );
+  });
+  return asked;
+}
 
 const folder = (path: string): WorkspaceFile => ({
   path,
@@ -182,5 +222,82 @@ describe("FilesTree", () => {
     (document.activeElement as HTMLElement).blur();
     tree.reveal(entries, { path: "docs", key: 2 });
     await waitFor(() => expect(screen.getByRole("treeitem", { name: /docs/ })).toHaveFocus());
+  });
+
+  it("lists every entry of an opened folder longer than one page", async () => {
+    const names = Array.from({ length: 1500 }, (_, i) => `big/f${String(i).padStart(4, "0")}.txt`);
+    const asked = serveListings({ big: names.map(file) });
+    renderTree([folder("big")]);
+    fireEvent.click(await screen.findByRole("treeitem", { name: "big" }));
+
+    // Rows are virtualized, so the first row's set size says how many the folder holds.
+    await waitFor(() =>
+      expect(screen.getByRole("treeitem", { name: "f0000.txt" })).toHaveAttribute(
+        "aria-setsize",
+        "1500",
+      ),
+    );
+    // Two pages of the endpoint's 1,000, the second after the first's last entry.
+    expect(asked).toEqual(["big", "big"]);
+  });
+
+  it("says when a folder's listing stopped with more entries past it", async () => {
+    const entries = Array.from({ length: LISTING_ENTRY_LIMIT }, (_, i) => file(`f${i}.txt`));
+    const cutOff: WorkspaceListing = Object.assign(entries, { cutOff: true as const });
+    renderTree(cutOff);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Showing the first 50,000 entries of this folder.",
+    );
+  });
+
+  it("names a nested folder that stopped short only while it's open", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async () =>
+      // The host says more lie past these two, but gives no cursor to read them by.
+      Response.json({
+        object: "list",
+        data: [file("partial/a.txt"), file("partial/b.txt")].map((entry) => ({
+          id: entry.path,
+          ...entry,
+        })),
+        has_more: true,
+        last_id: null,
+      }),
+    );
+    // A folder no other case opens: the tree remembers open folders per session.
+    renderTree([folder("partial"), file("README.md")]);
+    const partial = await screen.findByRole("treeitem", { name: "partial" });
+
+    fireEvent.click(partial);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Showing the first 2 entries of partial.",
+    );
+    fireEvent.click(screen.getByRole("treeitem", { name: "partial" }));
+    await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("treeitem", { name: "partial" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("of partial.");
+  });
+
+  it("lists a closed folder whose chain row a refreshed listing stops describing", async () => {
+    const asked = serveListings({ chained: [folder("chained/inner"), file("chained/b.ts")] });
+    // The host first describes `chained` as a chain ending at `chained/inner`.
+    const tree = renderTree([
+      { ...folder("chained"), leaf_directory_path: "chained/inner" },
+      file("README.md"),
+    ]);
+    expect(await screen.findByRole("treeitem", { name: /inner/ })).toBeInTheDocument();
+    expect(asked).toEqual([]);
+
+    // A new file in it ends the chain: the root's listing no longer describes it.
+    tree.populate([folder("chained"), file("README.md")]);
+    await waitFor(() => expect(asked).toEqual(["chained"]));
+    expect(await screen.findByRole("treeitem", { name: "chained" })).toBeInTheDocument();
+  });
+
+  it("says nothing of a complete listing as long as the entry limit", async () => {
+    // A host that ignores the page size can list a whole folder of this size in one go.
+    const entries = Array.from({ length: LISTING_ENTRY_LIMIT }, (_, i) => file(`f${i}.txt`));
+    renderTree(entries);
+    await screen.findByRole("treeitem", { name: "f0.txt" });
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 });
