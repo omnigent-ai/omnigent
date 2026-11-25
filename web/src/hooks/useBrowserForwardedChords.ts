@@ -12,10 +12,7 @@ import {
   setBrowserForwardedChords,
 } from "@/lib/nativeBridge";
 import type { Chord } from "@/lib/shortcuts/chord";
-import {
-  activeShortcutChords,
-  type ShortcutId,
-} from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { activeShortcutChords, type ShortcutId } from "@/lib/shortcuts/registry";
 
 /**
  * The app chords a focused browser page hands over in the tabs sidebar. Back and Forward stay

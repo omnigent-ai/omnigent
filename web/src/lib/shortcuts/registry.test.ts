@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { WORKSPACE_SIDEBAR_BINDINGS } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 import type { KeyChordInput } from "./chord";
 import {
   activeShortcutChords,
@@ -15,6 +14,7 @@ import {
   type ShortcutId,
   type ShortcutPageContext,
   shortcutRowKeys,
+  WORKSPACE_SIDEBAR_BINDINGS,
 } from "./registry";
 
 function press(init: Partial<KeyChordInput> & { key: string }): KeyChordInput {

@@ -6,21 +6,19 @@ import { describe, expect, it } from "vitest";
 
 import type { Chord, KeyChordInput } from "@/lib/shortcuts/chord";
 import {
-  type ShortcutId as AppShortcutId,
-  SHORTCUT_BINDINGS,
-  type ShortcutEnvironment,
-} from "@/lib/shortcuts/registry";
-import { rowsForChord, searchableChords } from "@/pages/settings/search/chordQuery";
-import {
   activeShortcutChords,
   codeMirrorKeys,
   matchesShortcut,
+  type ShortcutId as AppShortcutId,
+  SHORTCUT_BINDINGS,
+  type ShortcutEnvironment,
   type ShortcutId,
   shortcutAriaKeys,
   shortcutBinding,
   shortcutKeys,
   WORKSPACE_SIDEBAR_BINDINGS,
-} from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+} from "@/lib/shortcuts/registry";
+import { rowsForChord, searchableChords } from "@/pages/settings/search/chordQuery";
 
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>

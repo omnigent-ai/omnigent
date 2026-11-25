@@ -7,10 +7,7 @@ import { toast } from "sonner";
 
 import { isMacPlatform } from "@/lib/hotkeys";
 import type { Chord } from "@/lib/shortcuts/chord";
-import {
-  activeShortcutChords,
-  matchesShortcut,
-} from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { activeShortcutChords, matchesShortcut } from "@/lib/shortcuts/registry";
 import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands";
 
 import type { WorkspaceTabActionCommand, WorkspaceTabListFacts } from "./model";

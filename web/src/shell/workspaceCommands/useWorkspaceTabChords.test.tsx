@@ -2,7 +2,7 @@ import { fireEvent, renderHook } from "@testing-library/react";
 import { toast } from "sonner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { activeShortcutChords } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { activeShortcutChords } from "@/lib/shortcuts/registry";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 

@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { KeyboardIcon } from "lucide-react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { activeShortcutChords } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { activeShortcutChords } from "@/lib/shortcuts/registry";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 

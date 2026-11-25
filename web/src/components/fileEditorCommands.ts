@@ -25,7 +25,7 @@ import {
   WholeWordIcon,
   type LucideIcon,
 } from "lucide-react";
-import { shortcutBinding } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutBinding } from "@/lib/shortcuts/registry";
 
 /** A shortcut registry id that names a file editor command. */
 export type FileEditorCommandId =

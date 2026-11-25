@@ -11,10 +11,7 @@ import {
 } from "@/lib/hotkeys";
 import type { Chord } from "@/lib/shortcuts/chord";
 import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands";
-import {
-  activeShortcutChords,
-  matchesShortcut,
-} from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { activeShortcutChords, matchesShortcut } from "@/lib/shortcuts/registry";
 
 import {
   type WorkspaceHistoryCommand,

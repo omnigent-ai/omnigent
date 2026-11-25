@@ -69,7 +69,7 @@ import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { closeBrowserView, forgetBrowserTab, useBrowserPageLabels } from "@/hooks/useBrowserTabs";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { getPullRequestStatus } from "@/lib/pullRequestStatus";
-import { shortcutAriaKeys, shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutAriaKeys, shortcutKeys } from "@/lib/shortcuts/registry";
 import { supportsSideChat } from "@/lib/sideChat";
 import { subagentSessionIdFromTab, subagentTabId } from "@/lib/subagentTabs";
 import { ApiError, getSessionSlim } from "@/lib/sessionsApi";
