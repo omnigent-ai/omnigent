@@ -1004,10 +1004,9 @@ def test_git_list_changed_files_scopes_git_reads_to_workspace_subdir(
 ) -> None:
     """A workspace below the repo root runs ``git status`` and numstat on its own subtree.
 
-    Exclude-only pathspecs leave git walking the whole repository, which in a
-    monorepo made every Changes refresh take ~14 s although only the
-    workspace's own records are returned. Failure means a status or numstat
-    call ran without the workspace pathspec.
+    Exclude-only pathspecs still scan the whole repository even though only
+    workspace records are returned. Failure means a status or numstat call ran
+    without the workspace pathspec.
     """
     env = _git_env()
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
@@ -1061,6 +1060,37 @@ def test_workspace_pathspecs_cover_root_and_outside_workspaces(tmp_path: Path) -
     ]
     assert GitFilesystemRegistry(watch_path=repo, git_root=repo)._workspace_pathspecs() == []
     assert GitFilesystemRegistry(watch_path=tmp_path, git_root=repo)._workspace_pathspecs() == []
+
+
+def test_git_list_changed_files_shows_workspace_side_of_cross_boundary_renames(
+    tmp_path: Path,
+) -> None:
+    """A staged rename across the workspace boundary shows as the workspace's add or delete.
+
+    With status scoped to the workspace, git cannot pair the two sides of the
+    rename, so a file moved in is ``created`` and a file moved out is
+    ``deleted``, each with its full line count.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    workspace = tmp_path / "sub" / "ws"
+    workspace.mkdir(parents=True)
+    (workspace / "leaving.py").write_text("a\nb\n")
+    (tmp_path / "arriving.py").write_text("x\ny\nz\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    for src, dst in (("arriving.py", "sub/ws/arrived.py"), ("sub/ws/leaving.py", "left.py")):
+        subprocess.run(["git", "mv", src, dst], cwd=tmp_path, check=True, capture_output=True)
+
+    reg = GitFilesystemRegistry(watch_path=workspace, git_root=tmp_path)
+    records = {
+        r["path"]: (r["status"], r["lines_added"], r["lines_removed"])
+        for r in reg.list_changed_files("any-conv", limit=100)
+    }
+
+    assert records == {"arrived.py": ("created", 3, 0), "leaving.py": ("deleted", 0, 2)}, records
 
 
 def test_untracked_cache_enable_helper_sets_repo_config(tmp_path: Path) -> None:

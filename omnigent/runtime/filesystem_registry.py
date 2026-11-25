@@ -1342,11 +1342,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # below anyway.  With ``-uall`` git otherwise stat's every file in them,
         # which dominates the runtime on big repos.  These mirror the
         # ``_SKIP_DIRS`` root-level prune (kept below as a safety net).
-        #
-        # A workspace below the repository root also limits status to its own
-        # subtree: exclude-only pathspecs leave git scanning the whole
-        # repository, and ``_git_to_rel`` drops everything outside the
-        # workspace anyway.  In a monorepo that scan is most of the runtime.
+        # Exclude-only pathspecs still scan the whole repo, so also scope to the workspace.
         argv = ["git", "status", "--porcelain", "--untracked-files=all"]
         argv.extend(self._workspace_pathspecs())
         argv.extend(self._skip_dir_pathspecs())
