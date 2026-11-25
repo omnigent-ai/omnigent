@@ -199,6 +199,33 @@ describe("useShellCloseCheck", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("drops a check that's still running when floating panes turn off, closing nothing", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const answers: ((response: Response) => void)[] = [];
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          answers.push(resolve);
+        }),
+    );
+    const decide = vi.fn<(check: ShellCloseCheck) => void>();
+    const { result, rerender } = renderHook(() => useShellCloseCheck("conv_a"));
+    result.current(["terminal_zsh_s1"], "pane_close", decide);
+    await vi.waitFor(() => expect(answers).toHaveLength(1));
+    floating.on = false;
+    rerender();
+    answers[0](json({ state: "idle" }));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    // The idle answer came from before the gate closed: no close without asking, and no record.
+    expect(decide).not.toHaveBeenCalled();
+    expect(info).not.toHaveBeenCalled();
+    // The next close, with the gate off, asks at once.
+    result.current(["terminal_zsh_s1"], "pane_close", decide);
+    expect(decide).toHaveBeenCalledExactlyOnceWith({ close: "confirm", busy: null });
+  });
+
   it("drops a check that's still running when the session changes or a newer one begins", async () => {
     vi.spyOn(console, "info").mockImplementation(() => {});
     const answers: ((response: Response) => void)[] = [];

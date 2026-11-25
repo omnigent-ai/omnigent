@@ -157,8 +157,9 @@ export async function checkShellClose(
 
 /**
  * `checkShellClose` for one surface showing `sessionId`'s shells, recording each answer. A check
- * still running when the server or session changes, a newer one begins, or the surface goes is
- * dropped: it never answers. Without floating panes it asks at once, reading nothing.
+ * still running when the server or session changes, floating panes turn off, a newer one begins,
+ * or the surface goes is dropped: it never answers. Without floating panes it asks at once,
+ * reading nothing.
  */
 export function useShellCloseCheck(
   sessionId: string | null | undefined,
@@ -168,9 +169,10 @@ export function useShellCloseCheck(
   decide: (check: ShellCloseCheck) => void,
 ) => void {
   const floatingPanes = useFloatingPanes();
-  const scope = JSON.stringify([getOmnigentServerIdentity(), sessionId ?? null]);
+  // Floating panes are part of the scope, so turning them off drops a check still running.
+  const scope = JSON.stringify([getOmnigentServerIdentity(), sessionId ?? null, floatingPanes]);
   const current = useRef({ scope, generation: 0 });
-  // A new server or session drops what was asked about the old one, before anything shows.
+  // A new server, session or gate drops what was asked before, before anything shows.
   useLayoutEffect(() => {
     if (current.current.scope !== scope) {
       current.current.generation += 1;
