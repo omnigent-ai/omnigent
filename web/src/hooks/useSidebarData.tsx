@@ -41,7 +41,7 @@ import {
 } from "@/lib/sidebarConfig";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { useIdentityReady, useViewerId } from "./useViewerId";
-import { sumPendingApprovals } from "@/lib/inbox";
+import { isTicketApprovalRequest, sumPendingApprovals } from "@/lib/inbox";
 import { useAutomationInbox } from "./useAutomationInbox";
 import { useTicketRequests } from "./useTicketRequests";
 import { useProactiveInbox } from "./useProactiveInbox";
@@ -253,6 +253,9 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const automationInbox = useAutomationInbox(identityReady);
   const proactiveInbox = useProactiveInbox(identityReady);
   const ticketRequests = useTicketRequests(identityReady);
+  // What needs the viewer's decision: the only number the Inbox nav badge shows.
+  const inboxApprovalCount =
+    sumPendingApprovals(inboxRows) + ticketRequests.items.filter(isTicketApprovalRequest).length;
   const inboxCount =
     sumPendingApprovals(inboxRows) +
     ticketRequests.items.length +
@@ -353,6 +356,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     inboxRows,
     serverInboxRows,
     inboxCount,
+    inboxApprovalCount,
     inboxCountIncomplete: automationInbox.hasNextPage,
     inboxCountCapped,
     comments,

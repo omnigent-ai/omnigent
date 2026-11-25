@@ -1483,9 +1483,8 @@ describe("InboxPage replies", () => {
 });
 
 describe("InboxPage recency groups", () => {
-  it("interleaves kinds newest first under recency headers", async () => {
-    // WHY: items of every kind share one timeline, so a fresh reply sits
-    // above an older approval — the approval still opens by default.
+  it("groups what needs approval first, then everything else under recency headers", async () => {
+    // WHY: an older approval still outranks a fresh reply, and opens by default.
     const nowSeconds = Math.floor(Date.now() / 1000);
     const approvalRow = conversation({
       id: "sess_approval",
@@ -1503,9 +1502,13 @@ describe("InboxPage recency groups", () => {
 
     await screen.findByTestId("inbox-item");
     const regions = screen.getAllByRole("region");
-    expect(regions.map((r) => r.getAttribute("aria-label"))).toEqual(["Just now", "This week"]);
-    expect(within(regions[0]).getByTestId("inbox-unread")).toBeInTheDocument();
-    expect(within(regions[1]).getByTestId("inbox-item")).toHaveAttribute("data-expanded", "true");
+    expect(regions.map((r) => r.getAttribute("aria-label"))).toEqual([
+      "Needs your approval",
+      "Just now",
+    ]);
+    expect(regions[0]).toHaveAttribute("data-testid", "inbox-approval-group");
+    expect(within(regions[0]).getByTestId("inbox-item")).toHaveAttribute("data-expanded", "true");
+    expect(within(regions[1]).getByTestId("inbox-unread")).toBeInTheDocument();
     // The header pill totals every kind; its label spells out the breakdown.
     expect(screen.getByText("1 approval · 1 unread")).toBeInTheDocument();
   });

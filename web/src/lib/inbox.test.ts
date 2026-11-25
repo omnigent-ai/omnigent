@@ -6,7 +6,9 @@ import {
   collectInboxItems,
   collectUnreadInboxItems,
   groupInboxEntries,
+  groupInboxEntriesByApproval,
   inboxTimeGroup,
+  isTicketApprovalRequest,
   sumPendingApprovals,
 } from "./inbox";
 
@@ -392,5 +394,33 @@ describe("groupInboxEntries", () => {
       ["Earlier today", ["noon", "morning"]],
       ["Yesterday", ["yesterday"]],
     ]);
+  });
+});
+
+describe("groupInboxEntriesByApproval", () => {
+  it("puts what needs approval first, newest first, and keeps the rest in time groups", () => {
+    const now = new Date("2026-01-10T12:00:00Z");
+    const at = (hoursAgo: number) => now.getTime() / 1000 - hoursAgo * 3600;
+    const entries = [
+      { id: "fyi-new", at: at(0), approval: false },
+      { id: "ask-old", at: at(72), approval: true },
+      { id: "ask-new", at: at(1), approval: true },
+      { id: "fyi-old", at: at(30), approval: false },
+    ];
+    const groups = groupInboxEntriesByApproval(entries, (entry) => entry.approval, now);
+    expect(groups.map((group) => [group.label, group.entries.map((entry) => entry.id)])).toEqual([
+      ["Needs your approval", ["ask-new", "ask-old"]],
+      ["Just now", ["fyi-new"]],
+      ["Yesterday", ["fyi-old"]],
+    ]);
+    expect(groupInboxEntriesByApproval(entries.slice(0, 1), () => false, now)[0].approval).toBe(
+      false,
+    );
+  });
+
+  it("counts only open asks, not a cc or an unknown reason, as needing approval", () => {
+    expect(
+      ["owner", "product-ok", "cc", "mention"].map((reason) => isTicketApprovalRequest({ reason })),
+    ).toEqual([true, true, false, false]);
   });
 });

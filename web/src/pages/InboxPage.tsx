@@ -105,7 +105,8 @@ import {
 import {
   collectInboxItems,
   collectUnreadInboxItems,
-  groupInboxEntries,
+  groupInboxEntriesByApproval,
+  isTicketApprovalRequest,
   type CommentInboxItem,
   type InboxItem,
   type InboxSource,
@@ -474,44 +475,48 @@ export function InboxPage() {
     ...visibleApprovals.map((item) => item.row.id),
     ...visibleUnread.map((item) => item.row.id),
   ]);
-  const groups = groupInboxEntries<InboxEntry>([
-    ...visibleTicketRequests.map((item) => ({
-      kind: "ticket" as const,
-      key: `ticket:${item.reason === "cc" ? "cc:" : ""}${item.project_id}:${item.ticket_id}`,
-      at: item.raised_at,
-      item,
-    })),
-    ...visibleSuggestions.map((item) => ({
-      kind: "suggestion" as const,
-      key: `suggestion:${item.id}`,
-      at: item.createdAt,
-      item,
-    })),
-    ...visibleAutomations.map((item) => ({
-      kind: "automation" as const,
-      key: `automation:${item.runId}`,
-      at: item.finishedAt ?? item.scheduledAt,
-      item,
-    })),
-    ...visibleApprovals.map((item) => ({
-      kind: "approval" as const,
-      key: `approval:${item.elicitation.elicitationId}`,
-      at: item.row.updated_at,
-      item,
-    })),
-    ...visibleComments.map((item) => ({
-      kind: "comment" as const,
-      key: `comment:${item.comment.id}`,
-      at: item.comment.created_at,
-      item,
-    })),
-    ...visibleUnread.map((item) => ({
-      kind: "unread" as const,
-      key: `unread:${item.row.id}`,
-      at: item.row.updated_at,
-      item,
-    })),
-  ]);
+  const groups = groupInboxEntriesByApproval<InboxEntry>(
+    [
+      ...visibleTicketRequests.map((item) => ({
+        kind: "ticket" as const,
+        key: `ticket:${item.reason === "cc" ? "cc:" : ""}${item.project_id}:${item.ticket_id}`,
+        at: item.raised_at,
+        item,
+      })),
+      ...visibleSuggestions.map((item) => ({
+        kind: "suggestion" as const,
+        key: `suggestion:${item.id}`,
+        at: item.createdAt,
+        item,
+      })),
+      ...visibleAutomations.map((item) => ({
+        kind: "automation" as const,
+        key: `automation:${item.runId}`,
+        at: item.finishedAt ?? item.scheduledAt,
+        item,
+      })),
+      ...visibleApprovals.map((item) => ({
+        kind: "approval" as const,
+        key: `approval:${item.elicitation.elicitationId}`,
+        at: item.row.updated_at,
+        item,
+      })),
+      ...visibleComments.map((item) => ({
+        kind: "comment" as const,
+        key: `comment:${item.comment.id}`,
+        at: item.comment.created_at,
+        item,
+      })),
+      ...visibleUnread.map((item) => ({
+        kind: "unread" as const,
+        key: `unread:${item.row.id}`,
+        at: item.row.updated_at,
+        item,
+      })),
+    ],
+    (entry) =>
+      entry.kind === "approval" || (entry.kind === "ticket" && isTicketApprovalRequest(entry.item)),
+  );
   const defaultExpandedKey = items[0] && `approval:${items[0].elicitation.elicitationId}`;
 
   // A newer delivery attempt supersedes optimistic sending, even if the
@@ -1362,12 +1367,31 @@ export function InboxPage() {
         )}
 
       <div className="flex flex-col gap-4">
-        {groups.map((group) => (
-          <section key={group.label} aria-label={group.label} className="flex flex-col gap-2">
-            <h2 className="px-3 py-1.5 text-sm font-normal text-muted-foreground">{group.label}</h2>
-            {group.entries.map(renderEntry)}
-          </section>
-        ))}
+        {groups.map((group) =>
+          group.approval ? (
+            <section
+              key={group.label}
+              aria-label={group.label}
+              data-testid="inbox-approval-group"
+              className="flex flex-col gap-2 rounded-xl border border-primary-cta/40 bg-primary-cta/5 p-2"
+            >
+              <h2 className="flex items-center gap-2 px-1 py-1 text-sm font-semibold text-foreground">
+                {group.label}
+                <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary-cta px-1 text-xs text-primary-cta-foreground tabular-nums">
+                  {group.entries.length}
+                </span>
+              </h2>
+              {group.entries.map(renderEntry)}
+            </section>
+          ) : (
+            <section key={group.label} aria-label={group.label} className="flex flex-col gap-2">
+              <h2 className="px-3 py-1.5 text-sm font-normal text-muted-foreground">
+                {group.label}
+              </h2>
+              {group.entries.map(renderEntry)}
+            </section>
+          ),
+        )}
         {assembling && visibleCount > 0 && (
           <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
             <Loader2Icon className="size-3.5 animate-spin" />

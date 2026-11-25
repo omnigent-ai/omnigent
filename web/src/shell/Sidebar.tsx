@@ -807,12 +807,11 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored, ownedIds]);
 }
 
-function inboxBadgeLabel(count: number, incomplete: boolean, capped: boolean): string {
-  const items = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
-  // The server stops counting suggestions at its limit, so the total is a floor.
-  const label = capped ? `At least ${items}` : items;
-  return incomplete ? `${label}; more automations not yet checked` : label;
+function inboxBadgeLabel(count: number): string {
+  return count === 1 ? "1 item needs your approval" : `${count} items need your approval`;
 }
+
+const INBOX_FYI_LABEL = "New in Inbox, nothing needs your approval";
 
 function SidebarImpl({
   open,
@@ -933,9 +932,12 @@ function SidebarImpl({
         attentionSupported(serverInfo),
       ).length,
   );
-  const inboxCount = sidebarData.inboxCount + unreadInboxCount;
-  const inboxCountIncomplete = sidebarData.inboxCountIncomplete;
-  const inboxCountCapped = sidebarData.inboxCountCapped;
+  // The number is only what needs the viewer's decision; anything else unread is a dot.
+  const inboxApprovalCount = sidebarData.inboxApprovalCount;
+  const inboxHasOther =
+    sidebarData.inboxCount + unreadInboxCount > inboxApprovalCount ||
+    sidebarData.inboxCountIncomplete ||
+    sidebarData.inboxCountCapped;
 
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
@@ -1554,21 +1556,24 @@ function SidebarImpl({
                     )}
                   />
                   Inbox
-                  {(inboxCount > 0 || inboxCountIncomplete) && (
+                  {inboxApprovalCount > 0 ? (
                     <span
-                      title={
-                        inboxCountIncomplete ? "Open Inbox to check older automations." : undefined
-                      }
-                      aria-label={inboxBadgeLabel(
-                        inboxCount,
-                        inboxCountIncomplete,
-                        inboxCountCapped,
-                      )}
+                      aria-label={inboxBadgeLabel(inboxApprovalCount)}
+                      title={inboxBadgeLabel(inboxApprovalCount)}
                       className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary-cta px-1 text-sm text-primary-cta-foreground tabular-nums"
                     >
-                      {inboxCount > 0 ? inboxCount : ""}
-                      {inboxCountIncomplete || inboxCountCapped ? "+" : ""}
+                      {inboxApprovalCount}
                     </span>
+                  ) : (
+                    inboxHasOther && (
+                      <span
+                        role="img"
+                        aria-label={INBOX_FYI_LABEL}
+                        title={INBOX_FYI_LABEL}
+                        data-testid="inbox-fyi-dot"
+                        className="mr-1 ml-auto size-1.5 shrink-0 rounded-full bg-muted-foreground/60"
+                      />
+                    )
                   )}
                 </Link>
               </Button>

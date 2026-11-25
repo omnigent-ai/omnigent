@@ -222,3 +222,33 @@ export function groupInboxEntries<T extends { at: number }>(
   }
   return groups;
 }
+
+// Ticket request reasons that are open asks for the viewer's decision or sign-off: a
+// routed `needs-human` ask, or a feature awaiting product-ok. A cc is informational.
+const TICKET_APPROVAL_REASONS: ReadonlySet<string> = new Set(["owner", "product-ok"]);
+
+/** Whether a ticket request needs the viewer's approval; unknown reasons don't count. */
+export function isTicketApprovalRequest(item: { reason: string }): boolean {
+  return TICKET_APPROVAL_REASONS.has(item.reason);
+}
+
+export const NEEDS_APPROVAL_GROUP = "Needs your approval";
+
+/**
+ * The Inbox's groups: entries needing the viewer's decision first, newest first, then
+ * everything else in its time groups.
+ */
+export function groupInboxEntriesByApproval<T extends { at: number }>(
+  entries: T[],
+  needsApproval: (entry: T) => boolean,
+  now: Date = new Date(),
+): { label: InboxTimeGroup | typeof NEEDS_APPROVAL_GROUP; approval: boolean; entries: T[] }[] {
+  const approvals = entries.filter(needsApproval).sort((a, b) => b.at - a.at);
+  const rest = groupInboxEntries(
+    entries.filter((entry) => !needsApproval(entry)),
+    now,
+  ).map((group) => ({ ...group, approval: false }));
+  return approvals.length > 0
+    ? [{ label: NEEDS_APPROVAL_GROUP, approval: true, entries: approvals }, ...rest]
+    : rest;
+}

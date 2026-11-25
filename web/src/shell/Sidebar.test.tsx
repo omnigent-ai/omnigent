@@ -1198,18 +1198,18 @@ describe("Sidebar session list", () => {
 
     const inbox = screen.getByTestId("inbox-button");
     expect(inbox).not.toHaveClass("bg-[var(--sidebar-active)]");
-    const badge = within(inbox).getByLabelText("2 inbox items waiting");
+    const badge = within(inbox).getByLabelText("2 items need your approval");
     expect(badge).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
     expect(badge.className).not.toContain("brand-accent");
   });
 
   it.each([
-    { approvals: 0, automations: 0, label: "0 inbox items waiting", badge: "+" },
-    { approvals: 0, automations: 1, label: "1 inbox item waiting", badge: "1+" },
-    { approvals: 2, automations: 1, label: "3 inbox items waiting", badge: "3+" },
+    { approvals: 0, automations: 0, number: null, dot: true },
+    { approvals: 0, automations: 1, number: null, dot: true },
+    { approvals: 2, automations: 1, number: "2", dot: false },
   ])(
-    "combines $approvals approvals and $automations failures until all task pages are checked",
-    ({ approvals, automations, label, badge }) => {
+    "numbers only the $approvals approvals; $automations failures and unchecked pages are a dot",
+    ({ approvals, automations, number, dot }) => {
       const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
       const failure = {
         taskId: "task",
@@ -1219,36 +1219,29 @@ describe("Sidebar session list", () => {
         finishedAt: 101,
         errorCode: "host_offline",
       };
-      const state = {
+      automationInbox.mockReturnValue({
         items: automations ? [failure] : [],
         hasNextPage: true,
-      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>;
-      automationInbox.mockReturnValue(state);
+      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>);
       try {
         mockConversations([
           conv("conv_awaiting", "Claude Code", { pending_elicitations_count: approvals }),
         ]);
-        const first = renderSidebar();
-        expect(
-          within(screen.getByTestId("inbox-button")).getByLabelText(
-            `${label}; more automations not yet checked`,
-          ),
-        ).toHaveTextContent(badge);
-        first.unmount();
-        automationInbox.mockReturnValue({ ...state, hasNextPage: false });
         renderSidebar();
         const inbox = within(screen.getByTestId("inbox-button"));
-        expect(inbox.queryByLabelText(/more automations/)).toBeNull();
-        if (approvals + automations) {
-          expect(inbox.getByLabelText(label)).toHaveTextContent(String(approvals + automations));
-        } else expect(inbox.queryByText("+")).toBeNull();
+        if (number) {
+          expect(inbox.getByLabelText(`${number} items need your approval`)).toHaveTextContent(
+            number,
+          );
+        } else expect(inbox.queryByLabelText(/need your approval/)).toBeNull();
+        expect(inbox.queryByTestId("inbox-fyi-dot") !== null).toBe(dot);
       } finally {
         automationInbox.mockRestore();
       }
     },
   );
 
-  it("calls a capped suggestion count a floor, since the server stopped counting at it", () => {
+  it("shows unread suggestions as a dot, never a number", () => {
     const proactiveInbox = vi.spyOn(proactiveInboxHook, "useProactiveInbox");
     const base = proactiveInbox.getMockImplementation()?.(true);
     proactiveInbox.mockReturnValue({
@@ -1261,32 +1254,16 @@ describe("Sidebar session list", () => {
       mockConversations([]);
       renderSidebar();
       const inbox = within(screen.getByTestId("inbox-button"));
-      expect(inbox.getByLabelText("At least 100 inbox items waiting")).toHaveTextContent("100+");
-      cleanup();
-
-      // Unchecked automations qualify the same label rather than replacing it.
-      const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
-      automationInbox.mockReturnValue({
-        items: [],
-        hasNextPage: true,
-      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>);
-      try {
-        mockConversations([]);
-        renderSidebar();
-        expect(
-          within(screen.getByTestId("inbox-button")).getByLabelText(
-            "At least 100 inbox items waiting; more automations not yet checked",
-          ),
-        ).toHaveTextContent("100+");
-      } finally {
-        automationInbox.mockRestore();
-      }
+      expect(inbox.getByTestId("inbox-fyi-dot")).toHaveAccessibleName(
+        "New in Inbox, nothing needs your approval",
+      );
+      expect(inbox.queryByText("100+")).toBeNull();
     } finally {
       proactiveInbox.mockRestore();
     }
   });
 
-  it.each(["/", "/inbox"])("counts an unread session in the Inbox badge on %s", (route) => {
+  it.each(["/", "/inbox"])("shows an unread session as the Inbox dot on %s", (route) => {
     seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
     // The badge counts a finished person-started turn, which the server stamps.
     mockConversations([
@@ -1296,9 +1273,9 @@ describe("Sidebar session list", () => {
 
     const row = screen.getByRole("link", { name: /conv_unread/ }).closest("li")!;
     expect(within(row).getByRole("img", { name: "New messages" })).toBeInTheDocument();
-    expect(
-      within(screen.getByTestId("inbox-button")).getByLabelText("1 inbox item waiting"),
-    ).toHaveTextContent("1");
+    const inbox = within(screen.getByTestId("inbox-button"));
+    expect(inbox.getByTestId("inbox-fyi-dot")).toBeInTheDocument();
+    expect(inbox.queryByLabelText(/need your approval/)).toBeNull();
   });
 
   it("keeps the primary CTA count fill on the active Inbox row", () => {
@@ -1310,7 +1287,7 @@ describe("Sidebar session list", () => {
       "bg-[var(--sidebar-active)]",
       "text-[var(--sidebar-active-foreground)]",
     );
-    const badge = within(inbox).getByLabelText("2 inbox items waiting");
+    const badge = within(inbox).getByLabelText("2 items need your approval");
     expect(badge).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
   });
 
@@ -4159,11 +4136,11 @@ describe("Sidebar active-row auto-scroll", () => {
     renderAtRoute("/c/conv_active");
 
     const inbox = screen.getByTestId("inbox-button");
-    expect(within(inbox).queryByLabelText(/inbox items? waiting/)).toBeNull();
+    expect(within(inbox).queryByTestId("inbox-fyi-dot")).toBeNull();
     act(() => markConversationUnread("conv_active", 200));
-    expect(within(inbox).getByLabelText("1 inbox item waiting")).toHaveTextContent("1");
+    expect(within(inbox).getByTestId("inbox-fyi-dot")).toBeInTheDocument();
     act(() => markConversationRead("conv_active", 200));
-    expect(within(inbox).queryByLabelText(/inbox items? waiting/)).toBeNull();
+    expect(within(inbox).queryByTestId("inbox-fyi-dot")).toBeNull();
     vi.restoreAllMocks();
   });
 
