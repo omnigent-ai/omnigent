@@ -2023,6 +2023,40 @@ class SqlSessionDailyCost(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlProjectDailyCost(OmnigentBase):
+    """
+    SQLAlchemy model for the ``project_daily_cost`` table.
+
+    A per-project rollup of ``session_daily_cost``: each row is one root
+    session's spend on one UTC day, counted for a project the session or its
+    root is filed in. The project Summary reads a window as a primary-key
+    range scan instead of joining every session's rows.
+
+    :param project_id: The project the spend counts for.
+    :param day_utc: UTC day as ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
+    :param root_id: The root session whose family incurred it.
+    :param cost_micros: Spend in integer micro-dollars: the sum of each
+        session-day's ``cost_usd`` rounded to micros, so totals match the
+        per-session rows exactly.
+    :param updated_at: Unix epoch seconds of the last change.
+    """
+
+    __tablename__ = "project_daily_cost"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    day_utc: Mapped[str] = mapped_column(String(10), primary_key=True)
+    root_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    cost_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer)
+
+
 class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.

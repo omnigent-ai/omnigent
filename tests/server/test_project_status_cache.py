@@ -147,3 +147,26 @@ async def test_new_ticket_moves_and_spend_show_on_the_next_load(
     # A sub-agent's spend counts for its root's project.
     conversations.add_session_daily_cost(sub_agent.id, today, 0.5)
     assert (await totals())["spend_cents"] == 150
+
+
+async def test_moving_a_session_out_shows_on_the_next_load(
+    project_client: httpx.AsyncClient,  # noqa: F811 - imported fixture
+    db_uri: str,
+) -> None:
+    """A spend rebuild, here from filing a session elsewhere, clears the cached spend."""
+    created = (await project_client.post("/v1/projects", json={"name": "zz-cache-move"})).json()
+    project = f"/v1/projects/{created['id']}"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    kept = conversations.create_conversation(project_id=created["id"])
+    moved = conversations.create_conversation(project_id=created["id"])
+    today = datetime.now(UTC).date().isoformat()
+    conversations.add_session_daily_cost(kept.id, today, 1.0)
+    conversations.add_session_daily_cost(moved.id, today, 2.0)
+
+    async def spend_cents() -> int:
+        response = await project_client.get(f"{project}/status/summary", params={"window": "7d"})
+        return response.json()["totals"]["spend_cents"]
+
+    assert await spend_cents() == 300
+    assert conversations.set_conversation_project(moved.id, None)
+    assert await spend_cents() == 100

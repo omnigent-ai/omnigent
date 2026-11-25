@@ -1798,6 +1798,60 @@ class ConversationStore(ABC):
         del project_id, since_day_utc
         return []
 
+    def list_project_daily_costs(
+        self, project_id: str, since_day_utc: str | None, until_day_utc: str
+    ) -> list[tuple[str, str, int]]:
+        """
+        List a project's spend per root session and UTC day from its rollup.
+
+        The same spend as :meth:`list_project_root_daily_costs`, summed per root
+        and day in integer micro-dollars, read as one indexed range.
+
+        :param project_id: The project, as a 32-char hex id.
+        :param since_day_utc: Inclusive lower-bound UTC day, or ``None`` for all days.
+        :param until_day_utc: Inclusive upper-bound UTC day, ``"YYYY-MM-DD"``.
+        :returns: ``(root_conversation_id, day_utc, cost_micros)`` rows with positive spend.
+        """
+        del project_id, since_day_utc, until_day_utc
+        return []
+
+    def rebuild_project_daily_cost(self, project_id: str) -> None:
+        """
+        Recompute a project's spend rollup from the per-session daily rows.
+
+        Run after a change that moves spend between projects, such as filing a
+        session or deleting one.
+
+        :param project_id: The project, as a 32-char hex id.
+        """
+        del project_id
+
+    def project_daily_cost_projects(self, root_id: str) -> list[str]:
+        """
+        The projects whose spend rollup counts root session *root_id*.
+
+        :param root_id: A root session id.
+        :returns: Project ids, as 32-char hex.
+        """
+        del root_id
+        return []
+
+    def get_session_owners(
+        self, conversation_ids: list[str], *, owner_only: bool = False
+    ) -> dict[str, str]:
+        """
+        Read several sessions' owners in one query.
+
+        The batched form of :meth:`get_session_owner_authority`: each session's
+        highest live grant, excluding the public user.
+
+        :param conversation_ids: Sessions to read.
+        :param owner_only: Require an explicit owner-level grant.
+        :returns: ``{conversation_id: user_id}`` for sessions that have one.
+        """
+        del conversation_ids, owner_only
+        return {}
+
     @abstractmethod
     def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
         """

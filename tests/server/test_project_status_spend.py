@@ -17,7 +17,12 @@ from omnigent.server.project_status import (
     WORKERS_MEMBER_KEY,
     status_period,
 )
-from omnigent.server.project_status_spend import ProjectSpend, build_source, usd_to_cents
+from omnigent.server.project_status_spend import (
+    ProjectSpend,
+    build_source,
+    legacy_window_rows,
+    usd_to_cents,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
@@ -97,6 +102,9 @@ def test_family_sessions_count_for_the_workers_pool(db_uri: str) -> None:
         def get_conversation(self, conversation_id: str):  # type: ignore[no-untyped-def]
             return worker if conversation_id == worker.id else None
 
+        def get_conversations(self, conversation_ids: list[str]):  # type: ignore[no-untyped-def]
+            return {worker.id: worker} if worker.id in conversation_ids else {}
+
     totals = ProjectSpend(FamilyStore()).spend(project, status_period("7d", NOW))  # type: ignore[arg-type]
     assert totals.by_member == {WORKERS_MEMBER_KEY: 100}
 
@@ -144,3 +152,63 @@ async def test_header_cost_matches_the_summary_including_sub_agents(
     ).json()
     assert header["cost_usd"] == 3.78
     assert round(header["cost_usd"] * 100) == summary["totals"]["spend_cents"] == 378
+
+
+def _by_root_day(rows) -> dict[tuple[str, str], int]:  # type: ignore[no-untyped-def]
+    totals: dict[tuple[str, str], int] = {}
+    for root_id, day, micros in rows:
+        totals[(root_id, day)] = totals.get((root_id, day), 0) + micros
+    return totals
+
+
+def _assert_rollup_matches(conversations: SqlAlchemyConversationStore, project_id: str) -> None:
+    """The rollup holds exactly the micro-dollars the per-session rows sum to."""
+    rollup = _by_root_day(conversations.list_project_daily_costs(project_id, None, "9999-12-31"))
+    legacy = _by_root_day(legacy_window_rows(conversations, project_id, None, "9999-12-31"))
+    assert rollup == legacy
+
+
+async def test_rollup_matches_session_rows_through_moves_and_deletes(db_uri: str) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    projects = SqlAlchemyProjectStore(db_uri)
+    first = projects.create(uuid.uuid4().hex, "zz-first", "owner")
+    second = projects.create(uuid.uuid4().hex, "zz-second", "owner")
+    root = conversations.create_conversation(project_id=first.id)
+    sub_agent = conversations.create_conversation(parent_conversation_id=root.id)
+    # A sub-agent filed elsewhere counts for both its own project and its root's.
+    filed_sub_agent = conversations.create_conversation(
+        parent_conversation_id=root.id, project_id=second.id
+    )
+    other = conversations.create_conversation(project_id=first.id)
+    # Many small deltas on one session-day: the rollup tracks the rounded total.
+    for _ in range(7):
+        conversations.add_session_daily_cost(root.id, "2026-06-10", 0.0000004)
+    conversations.add_session_daily_cost(sub_agent.id, "2026-06-10", 1.2345675)
+    conversations.add_session_daily_cost(filed_sub_agent.id, "2026-06-09", 0.5)
+    conversations.add_session_daily_cost(other.id, "2026-06-08", 3.0)
+    for project in (first, second):
+        _assert_rollup_matches(conversations, project.id)
+    assert conversations.list_project_daily_costs(second.id, None, "9999-12-31") == [
+        (root.id, "2026-06-09", 500_000)
+    ]
+
+    # Moving the root's family to the second project moves its spend with it.
+    assert conversations.set_conversation_project(root.id, second.id)
+    for project in (first, second):
+        _assert_rollup_matches(conversations, project.id)
+    assert {
+        root_id
+        for root_id, _, _ in conversations.list_project_daily_costs(first.id, None, "9999-12-31")
+    } == {other.id}
+
+    # Deleting a session drops its spend, as the per-session read did.
+    assert await conversations.delete_conversation(other.id)
+    _assert_rollup_matches(conversations, first.id)
+    assert conversations.list_project_daily_costs(first.id, None, "9999-12-31") == []
+
+    # A rebuild reproduces what the incremental writes kept.
+    kept = conversations.list_project_daily_costs(second.id, None, "9999-12-31")
+    conversations.rebuild_project_daily_cost(second.id)
+    assert sorted(conversations.list_project_daily_costs(second.id, None, "9999-12-31")) == sorted(
+        kept
+    )

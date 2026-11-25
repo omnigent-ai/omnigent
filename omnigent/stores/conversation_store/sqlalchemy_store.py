@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections import defaultdict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, fields, replace
@@ -52,6 +53,7 @@ from omnigent.db.db_models import (
     SqlPolicy,
     SqlPreference,
     SqlProject,
+    SqlProjectDailyCost,
     SqlSessionDailyCost,
     SqlSessionPermission,
     SqlUser,
@@ -2262,6 +2264,28 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         File a conversation into a first-class project (or unfile it).
 
+        See :meth:`_file_conversation_project`; afterwards rebuilds the spend
+        rollup of every project the move takes spend from or adds it to.
+        """
+        before = self.get_conversation(conversation_id)
+        root_id = before.root_conversation_id if before is not None else None
+        affected = set(self.project_daily_cost_projects(root_id)) if root_id else set()
+        changed = self._file_conversation_project(conversation_id, project_id)
+        if changed:
+            if project_id is not None:
+                affected.add(project_id)
+            for affected_id in affected:
+                self.rebuild_project_daily_cost(affected_id)
+        return changed
+
+    def _file_conversation_project(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """
+        File a conversation into a first-class project (or unfile it).
+
         Sets ``omnigent_conversation_metadata.project_id``. ``None`` unfiles the
         session. The first-class counterpart to moving a session between
         ``omni_project`` labels.
@@ -2565,12 +2589,36 @@ class SqlAlchemyConversationStore(ConversationStore):
             return float(total or 0.0)
 
     def add_session_daily_cost(self, conversation_id: str, day_utc: str, delta_usd: float) -> None:
-        """See :meth:`ConversationStore.add_session_daily_cost`."""
+        """See :meth:`ConversationStore.add_session_daily_cost`.
+
+        In the same transaction, adds the session-day's change in rounded
+        micro-dollars to ``project_daily_cost`` for each project it counts for.
+        """
         if delta_usd <= 0:
             return
         now = now_epoch()
+        touched: list[str] = []
 
         def write(session: Session) -> None:
+            touched.clear()
+            before = session.execute(
+                select(SqlSessionDailyCost.cost_usd).where(
+                    SqlSessionDailyCost.workspace_id == current_workspace_id(),
+                    SqlSessionDailyCost.conversation_id == conversation_id,
+                    SqlSessionDailyCost.day_utc == day_utc,
+                )
+            ).scalar_one_or_none()
+            write_session_row(session)
+            if len(day_utc) != 10 or not self._keeps_project_daily_cost:
+                return
+            old = float(before or 0.0)
+            micros = _usd_to_micros(old + delta_usd) - _usd_to_micros(old)
+            if micros:
+                for project_id, root_id in _session_cost_projects(session, conversation_id):
+                    _add_project_daily_micros(session, project_id, day_utc, root_id, micros, now)
+                    touched.append(project_id)
+
+        def write_session_row(session: Session) -> None:
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect == "sqlite" or is_postgresql_family(dialect):
                 stmt: Any
@@ -2614,7 +2662,11 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "add_session_daily_cost", write)
         if _status_cache_active():
-            _clear_status_cache(self._spend_project_id(conversation_id), inputs=("spend",))
+            # The rollup names every project the spend counts for, own and root's.
+            projects = touched if self._keeps_project_daily_cost else []
+            _clear_status_cache(
+                *(projects or [self._spend_project_id(conversation_id)]), inputs=("spend",)
+            )
 
     def _spend_project_id(self, conversation_id: str) -> str | None:
         """The project a session's spend counts for: its own, else its root's."""
@@ -2654,42 +2706,135 @@ class SqlAlchemyConversationStore(ConversationStore):
         self, project_id: str, since_day_utc: str | None
     ) -> list[tuple[str, str, float]]:
         """See :meth:`ConversationStore.list_project_root_daily_costs`."""
-        own_meta = aliased(SqlConversationMetadata)
-        root_meta = aliased(SqlConversationMetadata)
-        workspace_id = current_workspace_id()
-        query = (
-            select(
-                SqlConversation.root_conversation_id,
-                SqlSessionDailyCost.day_utc,
-                SqlSessionDailyCost.cost_usd,
-            )
-            .join(
-                SqlConversation,
-                (SqlConversation.workspace_id == SqlSessionDailyCost.workspace_id)
-                & (SqlConversation.id == SqlSessionDailyCost.conversation_id),
-            )
-            .outerjoin(
-                own_meta,
-                (own_meta.workspace_id == SqlConversation.workspace_id)
-                & (own_meta.id == SqlConversation.id),
-            )
-            .outerjoin(
-                root_meta,
-                (root_meta.workspace_id == SqlConversation.workspace_id)
-                & (root_meta.id == SqlConversation.root_conversation_id),
-            )
-            .where(SqlSessionDailyCost.workspace_id == workspace_id)
-            .where(or_(own_meta.project_id == project_id, root_meta.project_id == project_id))
-            # Daily rows only; longer keys would be period rollups.
-            .where(func.length(SqlSessionDailyCost.day_utc) == 10)
-        )
-        if since_day_utc is not None:
-            query = query.where(SqlSessionDailyCost.day_utc >= since_day_utc)
+        query = _project_root_cost_query(project_id, since_day_utc)
         with self._session("list_project_root_daily_costs") as session:
             return [
                 (str(root_id), str(day), float(cost or 0.0))
                 for root_id, day, cost in session.execute(query)
             ]
+
+    @property
+    def _keeps_project_daily_cost(self) -> bool:
+        """Whether this store maintains ``project_daily_cost``.
+
+        The rollup joins sessions with their metadata, so it needs both in one
+        database; a split store reads the per-session rows directly instead.
+        """
+        return self._conv_engine is self._engine
+
+    def list_project_daily_costs(
+        self, project_id: str, since_day_utc: str | None, until_day_utc: str
+    ) -> list[tuple[str, str, int]]:
+        """See :meth:`ConversationStore.list_project_daily_costs`."""
+        if not self._keeps_project_daily_cost:
+            micros: dict[tuple[str, str], int] = defaultdict(int)
+            legacy = self.list_project_root_daily_costs(project_id, since_day_utc)
+            for root_id, day, cost in legacy:
+                if cost > 0 and day <= until_day_utc:
+                    micros[(root_id, day)] += _usd_to_micros(cost)
+            return [(root_id, day, value) for (root_id, day), value in micros.items() if value]
+        query = (
+            select(
+                SqlProjectDailyCost.root_id,
+                SqlProjectDailyCost.day_utc,
+                SqlProjectDailyCost.cost_micros,
+            )
+            .where(SqlProjectDailyCost.workspace_id == current_workspace_id())
+            .where(SqlProjectDailyCost.project_id == project_id)
+            .where(SqlProjectDailyCost.day_utc <= until_day_utc)
+            .where(SqlProjectDailyCost.cost_micros > 0)
+        )
+        if since_day_utc is not None:
+            query = query.where(SqlProjectDailyCost.day_utc >= since_day_utc)
+        with self._session("list_project_daily_costs") as session:
+            return [
+                (str(root_id), str(day), int(micros))
+                for root_id, day, micros in session.execute(query)
+            ]
+
+    def rebuild_project_daily_cost(self, project_id: str) -> None:
+        """See :meth:`ConversationStore.rebuild_project_daily_cost`."""
+        if not self._keeps_project_daily_cost:
+            return
+        now = now_epoch()
+
+        def write(session: Session) -> None:
+            session.execute(
+                delete(SqlProjectDailyCost).where(
+                    SqlProjectDailyCost.workspace_id == current_workspace_id(),
+                    SqlProjectDailyCost.project_id == project_id,
+                )
+            )
+            micros: dict[tuple[str, str], int] = defaultdict(int)
+            for root_id, day, cost in session.execute(_project_root_cost_query(project_id, None)):
+                if root_id is not None and cost and cost > 0:
+                    micros[(str(root_id), str(day))] += _usd_to_micros(float(cost))
+            session.add_all(
+                SqlProjectDailyCost(
+                    project_id=project_id,
+                    day_utc=day,
+                    root_id=root_id,
+                    cost_micros=value,
+                    updated_at=now,
+                )
+                for (root_id, day), value in micros.items()
+                if value
+            )
+
+        run_write_transaction(self._session_immediate, "rebuild_project_daily_cost", write)
+        # A rebuild changes the project's spend without passing add_session_daily_cost.
+        _clear_status_cache(project_id, inputs=("spend",))
+
+    def project_daily_cost_projects(self, root_id: str) -> list[str]:
+        """The projects whose spend rollup has rows for root session *root_id*."""
+        if not self._keeps_project_daily_cost:
+            return []
+        with self._session("project_daily_cost_projects") as session:
+            return [
+                str(project_id)
+                for project_id in session.scalars(
+                    select(SqlProjectDailyCost.project_id)
+                    .where(SqlProjectDailyCost.workspace_id == current_workspace_id())
+                    .where(SqlProjectDailyCost.root_id == root_id)
+                    .distinct()
+                )
+            ]
+
+    def get_session_owners(
+        self, conversation_ids: list[str], *, owner_only: bool = False
+    ) -> dict[str, str]:
+        """See :meth:`ConversationStore.get_session_owners`."""
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+
+        owners: dict[str, tuple[int, str]] = {}
+        with self._session("select_session_owners") as session:
+            for batch_ids in batched(conversation_ids, _DELETE_METADATA_BATCH_SIZE):
+                query = (
+                    select(
+                        SqlSessionPermission.conversation_id,
+                        SqlSessionPermission.user_id,
+                        SqlSessionPermission.level,
+                    )
+                    .outerjoin(
+                        SqlUser,
+                        and_(
+                            SqlUser.workspace_id == SqlSessionPermission.workspace_id,
+                            SqlUser.id == SqlSessionPermission.user_id,
+                        ),
+                    )
+                    .where(SqlSessionPermission.workspace_id == current_workspace_id())
+                    .where(SqlSessionPermission.conversation_id.in_(batch_ids))
+                    .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
+                    .where(SqlUser.deleted_at.is_(None))
+                )
+                if owner_only:
+                    query = query.where(SqlSessionPermission.level >= LEVEL_OWNER)
+                for conversation_id, user_id, level in session.execute(query):
+                    key = str(conversation_id)
+                    # The highest grant wins, as in get_session_owner_authority.
+                    if key not in owners or level > owners[key][0]:
+                        owners[key] = (level, str(user_id))
+        return {key: user_id for key, (_, user_id) in owners.items()}
 
     def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
         """
@@ -7862,6 +8007,14 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 
+        # Spend from the deleted subtree leaves these projects' rollups.
+        doomed = self.get_conversation(conversation_id)
+        spend_projects = (
+            self.project_daily_cost_projects(doomed.root_conversation_id)
+            if doomed is not None and doomed.root_conversation_id
+            else []
+        )
+
         def delete_ap(ap_sess: Session) -> tuple[list[str], dict[str, str]] | None:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
@@ -8011,6 +8164,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 lambda session, batch=batch_ids: delete_metadata(session, batch),
             )
         self._delete_session_journals(subtree_ids)
+        for spend_project in spend_projects:
+            self.rebuild_project_daily_cost(spend_project)
 
         return True
 
@@ -8034,3 +8189,123 @@ class SqlAlchemyConversationStore(ConversationStore):
                 == JOURNAL_DELETE_BATCH
             ):
                 pass
+
+
+def _usd_to_micros(usd: float) -> int:
+    """A USD amount as integer micro-dollars, the unit project spend is summed in."""
+    return round(usd * 1_000_000)
+
+
+def _project_root_cost_query(project_id: str, since_day_utc: str | None) -> Any:
+    """A project's per-session daily spend as ``(root_id, day_utc, cost_usd)`` rows.
+
+    A session counts when it or its root is filed in the project; sub-agent spend
+    reports under its root. Daily rows only.
+    """
+    own_meta = aliased(SqlConversationMetadata)
+    root_meta = aliased(SqlConversationMetadata)
+    query = (
+        select(
+            SqlConversation.root_conversation_id,
+            SqlSessionDailyCost.day_utc,
+            SqlSessionDailyCost.cost_usd,
+        )
+        .join(
+            SqlConversation,
+            (SqlConversation.workspace_id == SqlSessionDailyCost.workspace_id)
+            & (SqlConversation.id == SqlSessionDailyCost.conversation_id),
+        )
+        .outerjoin(
+            own_meta,
+            (own_meta.workspace_id == SqlConversation.workspace_id)
+            & (own_meta.id == SqlConversation.id),
+        )
+        .outerjoin(
+            root_meta,
+            (root_meta.workspace_id == SqlConversation.workspace_id)
+            & (root_meta.id == SqlConversation.root_conversation_id),
+        )
+        .where(SqlSessionDailyCost.workspace_id == current_workspace_id())
+        .where(or_(own_meta.project_id == project_id, root_meta.project_id == project_id))
+        # Daily rows only; longer keys would be period rollups.
+        .where(func.length(SqlSessionDailyCost.day_utc) == 10)
+    )
+    if since_day_utc is not None:
+        query = query.where(SqlSessionDailyCost.day_utc >= since_day_utc)
+    return query
+
+
+def _session_cost_projects(session: Session, conversation_id: str) -> list[tuple[str, str]]:
+    """The ``(project_id, root_id)`` pairs a session's spend counts for.
+
+    Its own project and its root's, as :func:`_project_root_cost_query` reads them.
+    """
+    own_meta = aliased(SqlConversationMetadata)
+    root_meta = aliased(SqlConversationMetadata)
+    row = session.execute(
+        select(SqlConversation.root_conversation_id, own_meta.project_id, root_meta.project_id)
+        .outerjoin(
+            own_meta,
+            (own_meta.workspace_id == SqlConversation.workspace_id)
+            & (own_meta.id == SqlConversation.id),
+        )
+        .outerjoin(
+            root_meta,
+            (root_meta.workspace_id == SqlConversation.workspace_id)
+            & (root_meta.id == SqlConversation.root_conversation_id),
+        )
+        .where(SqlConversation.workspace_id == current_workspace_id())
+        .where(SqlConversation.id == conversation_id)
+    ).one_or_none()
+    if row is None or row[0] is None:
+        return []
+    root_id = str(row[0])
+    return [(str(project), root_id) for project in {row[1], row[2]} - {None}]
+
+
+def _add_project_daily_micros(
+    session: Session, project_id: str, day_utc: str, root_id: str, micros: int, now: int
+) -> None:
+    """Add *micros* to one project, day and root's spend, creating the row if needed."""
+    dialect = session.bind.dialect.name if session.bind is not None else ""
+    if dialect == "sqlite" or is_postgresql_family(dialect):
+        stmt: Any
+        if dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = sqlite_insert(SqlProjectDailyCost)
+        else:
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            stmt = pg_insert(SqlProjectDailyCost)
+        stmt = stmt.values(
+            project_id=project_id,
+            day_utc=day_utc,
+            root_id=root_id,
+            cost_micros=micros,
+            updated_at=now,
+        ).on_conflict_do_update(
+            index_elements=["workspace_id", "project_id", "day_utc", "root_id"],
+            set_={
+                "cost_micros": SqlProjectDailyCost.cost_micros + stmt.excluded.cost_micros,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
+        session.execute(stmt)
+        return
+    existing = session.get(
+        SqlProjectDailyCost, (current_workspace_id(), project_id, day_utc, root_id)
+    )
+    if existing is None:
+        session.add(
+            SqlProjectDailyCost(
+                project_id=project_id,
+                day_utc=day_utc,
+                root_id=root_id,
+                cost_micros=micros,
+                updated_at=now,
+            )
+        )
+    else:
+        existing.cost_micros = existing.cost_micros + micros
+        existing.updated_at = now

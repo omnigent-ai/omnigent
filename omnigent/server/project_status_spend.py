@@ -1,8 +1,9 @@
 """Agent spend for the project status summary: integer US cents per member and day.
 
-The one definition of project spend. It reads ``session_daily_cost``, which every
-priced turn writes as it happens, and attributes each row through its root
-session, so a sub-agent's spend counts for whoever ran the root.
+The one definition of project spend. It reads ``project_daily_cost``, the
+per-project rollup of ``session_daily_cost`` that every priced turn updates as it
+happens. Spend is kept per root session, so a sub-agent's spend counts for
+whoever ran the root; members are resolved for the window's roots in one batch.
 
 Running sessions count: their spend is included up to their latest priced turn,
 on the UTC day each turn happened, not only once the session ends. A session
@@ -93,16 +94,15 @@ class ProjectSpend:
         conversations = self._conversations
         if conversations is None:
             return None
-        members: dict[str, MemberKey] = {}
+        rows = list(
+            _window_rows(conversations, project.id, period.since_day_utc, period.today_utc)
+        )
+        members = _members_for_roots(conversations, project, {root_id for root_id, _, _ in rows})
         total = 0
         member_micros: dict[MemberKey, int] = defaultdict(int)
         day_micros: dict[str, int] = defaultdict(int)
         member_day_micros: dict[MemberKey, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for root_id, day_utc, micros in _window_rows(
-            conversations, project.id, period.since_day_utc, period.today_utc
-        ):
-            if root_id not in members:
-                members[root_id] = _member_for_root(conversations, project, root_id)
+        for root_id, day_utc, micros in rows:
             member = members[root_id]
             total += micros
             member_micros[member] += micros
@@ -128,13 +128,12 @@ class ProjectSpend:
         conversations = self._conversations
         if conversations is None:
             return None
-        members: dict[str, MemberKey] = {}
+        rows = list(
+            _window_rows(conversations, project.id, period.since_day_utc, period.today_utc)
+        )
+        members = _members_for_roots(conversations, project, {root_id for root_id, _, _ in rows})
         micros_by_root_day: dict[tuple[str, str], int] = defaultdict(int)
-        for root_id, day_utc, micros in _window_rows(
-            conversations, project.id, period.since_day_utc, period.today_utc
-        ):
-            if root_id not in members:
-                members[root_id] = _member_for_root(conversations, project, root_id)
+        for root_id, day_utc, micros in rows:
             micros_by_root_day[(root_id, day_utc)] += micros
         return [
             (root_id, day_utc, micros, members[root_id])
@@ -149,6 +148,21 @@ def _window_rows(
     until_day_utc: str,
 ) -> Iterator[tuple[str, str, int]]:
     """A project's positive spend rows in the day window, as ``(root_id, day_utc, micros)``."""
+    yield from conversations.list_project_daily_costs(
+        uuid_to_bytes(project_id).hex(), since_day_utc, until_day_utc
+    )
+
+
+def legacy_window_rows(
+    conversations: ConversationStore,
+    project_id: str,
+    since_day_utc: str | None,
+    until_day_utc: str,
+) -> Iterator[tuple[str, str, int]]:
+    """The same rows computed from ``session_daily_cost`` directly, as before the rollup.
+
+    Kept to check the rollup against: both must sum to the same micro-dollars.
+    """
     rows = conversations.list_project_root_daily_costs(
         uuid_to_bytes(project_id).hex(), since_day_utc
     )
@@ -174,17 +188,24 @@ def project_total_cents(
     )
 
 
-def _member_for_root(
-    conversations: ConversationStore, project: Project, root_id: str
-) -> MemberKey:
-    root = conversations.get_conversation(root_id)
-    if root is None:
-        # A deleted root's spend still belongs to the project; count it for the owner.
-        return user_member_key(project.user_id)
-    owner = conversations.get_session_owner_authority(root_id, owner_only=True)
-    return member_key_for_session(
-        project, root, owner_user_id=owner.user_id if owner is not None else None
-    )
+def _members_for_roots(
+    conversations: ConversationStore, project: Project, root_ids: set[str]
+) -> dict[str, MemberKey]:
+    """Each root session's member, read with two batched queries."""
+    ids = sorted(root_ids)
+    roots = conversations.get_conversations(ids) if ids else {}
+    owners = conversations.get_session_owners(list(roots), owner_only=True) if roots else {}
+    members: dict[str, MemberKey] = {}
+    for root_id in ids:
+        root = roots.get(root_id)
+        if root is None:
+            # A deleted root's spend still belongs to the project; count it for the owner.
+            members[root_id] = user_member_key(project.user_id)
+        else:
+            members[root_id] = member_key_for_session(
+                project, root, owner_user_id=owners.get(root_id)
+            )
+    return members
 
 
 def build_source(app_state: Any) -> ProjectSpend:

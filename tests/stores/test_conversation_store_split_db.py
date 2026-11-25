@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -1337,3 +1338,16 @@ def test_interruption_notice_preserves_stop_fence(
         ],
     )
     assert store.get_session_recovery(conv.id) == (None if user_authored else state)
+
+
+def test_priced_turns_skip_the_project_spend_rollup_across_dbs(
+    store: SqlAlchemyConversationStore, omnigent_db: Path
+) -> None:
+    """With sessions in another database, spend writes still work and skip the rollup."""
+    project_id = uuid.uuid4().hex
+    conv = store.create_conversation(project_id=project_id)
+    store.add_session_daily_cost(conv.id, "2026-06-10", 1.25)
+    assert _count(omnigent_db, "session_daily_cost") == 1
+    assert _count(omnigent_db, "project_daily_cost") == 0
+    store.rebuild_project_daily_cost(project_id)
+    assert _count(omnigent_db, "project_daily_cost") == 0
