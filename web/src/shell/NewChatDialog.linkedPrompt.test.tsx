@@ -75,7 +75,8 @@ vi.mock("@/hooks/useDictationInsert", async (importOriginal) => {
   return {
     ...actual,
     useDictationInsert: (...args: Parameters<typeof actual.useDictationInsert>) => {
-      dictationSetMessage = args[1];
+      // A plain setter: the composer text is written without the change the editor reports.
+      dictationSetMessage = (text: string) => args[1](text, { from: 0, to: 0, insert: "" });
       return actual.useDictationInsert(...args);
     },
   };

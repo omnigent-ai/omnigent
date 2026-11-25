@@ -87,7 +87,7 @@ import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesi
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
-import { insertComposerText, insertPastedText, replaceComposerDocument } from "@/lib/composerText";
+import { insertPastedText, replaceComposerDocument } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -128,12 +128,18 @@ import {
   type ReplyQuote,
 } from "@/lib/replyDraft";
 import {
-  dictationRevertEdit,
   mapComposerSelection,
   replaceTail,
   typedDocumentFor,
   unweaveReplyDraft,
+  type TextEdit,
 } from "@/lib/replyDraftDocument";
+import {
+  discardDictatedSpans,
+  mapDictatedSpansAcrossDocuments,
+  writeDictatedEdit,
+  type DictatedSpan,
+} from "@/lib/dictatedSpans";
 import {
   buildOutgoingMessage,
   carriesMessageContext,
@@ -1050,6 +1056,9 @@ function SideChatComposer({
     setTailTextareaNode(element);
   }, []);
   const textareaRef = useRef<ComposerTextTarget | null>(null);
+  // The text this take wrote in the editor, in one document; see `dictatedSpans`.
+  const dictatedRef = useRef<DictatedSpan[]>([]);
+  const dictatedDocRef = useRef("");
   const voiceEditsRef = useRef(
     new Map<string | null, { before: string; after: string; quoteIds: Set<string> }>(),
   );
@@ -1136,13 +1145,15 @@ function SideChatComposer({
   const reconcileVoiceEdits = useCallback(
     (current: SideChatComposerDraft) => {
       if (singleDocument) {
-        // The dictated text owns its undo while it is still in the document; a quote added
-        // meanwhile doesn't release it.
-        const document = documentOf(current);
-        for (const [id, edit] of voiceEditsRef.current) {
-          if (dictationRevertEdit(document, edit.before, edit.after) === null) {
-            voiceEditsRef.current.delete(id);
-          }
+        // Store changes, such as a quote, move the spans the editor doesn't see.
+        const target = editorSurface();
+        if (target) {
+          dictatedRef.current = mapDictatedSpansAcrossDocuments(
+            dictatedRef.current,
+            dictatedDocRef.current,
+            target.value,
+          );
+          dictatedDocRef.current = target.value;
         }
         return;
       }
@@ -1157,7 +1168,7 @@ function SideChatComposer({
         if (value === edit.after && targetId !== id) voiceEditsRef.current.set(targetId, edit);
       }
     },
-    [documentOf, singleDocument],
+    [editorSurface, singleDocument],
   );
   // Manual edits and merged reply fields relinquish dictation's undo ownership.
   useLayoutEffect(() => {
@@ -1167,22 +1178,15 @@ function SideChatComposer({
     ? replyDocument
     : (composer?.quotes?.find((item) => item.id === activeTextId)?.before ?? text);
   const setActiveText = useCallback(
-    (edited: string) => {
+    (edited: string, change: TextEdit) => {
       const current =
         useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
       reconcileVoiceEdits(current);
       if (singleDocument) {
-        // The editor takes the dictated edit as its own, and the edit is recorded for a discard.
         const target = editorSurface();
         if (!target) return;
-        const previous = voiceEditsRef.current.get(null);
-        const before = previous?.before ?? target.value;
-        replaceComposerDocument(target, edited);
-        voiceEditsRef.current.set(null, {
-          before,
-          after: target.value,
-          quoteIds: new Set(),
-        });
+        dictatedRef.current = writeDictatedEdit(target, dictatedRef.current, edited, change);
+        dictatedDocRef.current = target.value;
         return;
       }
       const id = activeTextId;
@@ -1833,24 +1837,26 @@ function SideChatComposer({
               <ComposerMicButton
                 className="size-8 md:size-7"
                 disabled={!ready}
-                onVoiceStart={() => voiceEditsRef.current.clear()}
+                onVoiceStart={() => {
+                  voiceEditsRef.current.clear();
+                  dictatedRef.current = [];
+                }}
                 onVoiceDiscard={() => {
                   reconcileVoiceEdits(
                     useChatStore.getState().sideChatComposers[composerKey] ??
                       EMPTY_SIDE_CHAT_COMPOSER,
                   );
+                  if (singleDocument) {
+                    // Only the dictated text goes, so a quote added during the take stays.
+                    const spans = dictatedRef.current;
+                    dictatedRef.current = [];
+                    const target = editorSurface();
+                    if (target) discardDictatedSpans(target, spans);
+                    return;
+                  }
                   const edits = [...voiceEditsRef.current];
                   voiceEditsRef.current.clear();
-                  for (const [id, edit] of edits) {
-                    const target = singleDocument ? editorSurface() : undefined;
-                    // Without the editor there is nothing to revert in one document.
-                    if (singleDocument && !target) continue;
-                    if (target) {
-                      // Only the dictated text goes, so a quote added during the take stays.
-                      const revert = dictationRevertEdit(target.value, edit.before, edit.after);
-                      if (revert) insertComposerText(target, revert.insert, revert.from, revert.to);
-                    } else editText(id, edit.before);
-                  }
+                  for (const [id, edit] of edits) editText(id, edit.before);
                 }}
                 inputRef={textareaRef}
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}

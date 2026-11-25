@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   appendQuoteToDocument,
   composerTextRegions,
-  dictationRevertEdit,
   mapComposerSelection,
   minimalTextChange,
   parseReplyQuoteLine,
@@ -146,35 +145,6 @@ describe("reply draft document", () => {
     expect(minimalTextChange("abc", "abc")).toBeNull();
     expect(minimalTextChange("abXc", "abYZc")).toEqual({ from: 2, to: 3, insert: "YZ" });
     expect(minimalTextChange("", "new")).toEqual({ from: 0, to: 0, insert: "new" });
-  });
-
-  it("reverts only the dictated span, wherever it now sits", () => {
-    const card = replyQuoteLine({ id: "a", text: "A" });
-    // A quote added during the take appends after the dictated text, which stays where it was.
-    const before = "Hello";
-    const after = "Hello dictated";
-    const edit = dictationRevertEdit(`${after}\n${card}\n`, before, after);
-    expect(edit).toEqual({ from: 5, to: 14, insert: "" });
-    // The text moved ahead of it, so the span is found where it is now.
-    expect(dictationRevertEdit(`Intro\n${after}`, before, after)).toEqual({
-      from: 11,
-      to: 20,
-      insert: "",
-    });
-    // A dictation that only deleted text puts the deleted text back where it was.
-    expect(dictationRevertEdit("Hello", "Hello world", "Hello")).toEqual({
-      from: 5,
-      to: 5,
-      insert: " world",
-    });
-    expect(dictationRevertEdit("Hi", "Hello world", "Hello")).toEqual({
-      from: 2,
-      to: 2,
-      insert: " world",
-    });
-    // Once the dictated text is gone, there is nothing to revert.
-    expect(dictationRevertEdit("Hello", before, after)).toBeNull();
-    expect(dictationRevertEdit("anything", before, before)).toEqual({ from: 0, to: 0, insert: "" });
   });
 
   it("copies cards as markdown quotes", () => {

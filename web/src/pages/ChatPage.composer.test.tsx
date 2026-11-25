@@ -10745,6 +10745,42 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Added during take");
   });
 
+  it("keeps the user's own copy of a repeated word when they delete the dictated one, then discard", async () => {
+    const finishLoad = deferEditorLoad();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await finishLoad();
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    act(() => insertComposerText(editorTarget(), "Draft spoken"));
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken"));
+    expect(editorTarget().value).toBe("Draft spoken spoken");
+    // The user deletes the dictated copy by hand, so it is theirs to keep.
+    act(() => insertComposerText(editorTarget(), "", 12, 19));
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(editorTarget().value).toBe("Draft spoken");
+  });
+
+  it("leaves the caret where it was when a dictation is cancelled before any words", async () => {
+    const finishLoad = deferEditorLoad();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await finishLoad();
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    act(() => insertComposerText(editorTarget(), "Draft"));
+    act(() => editorTarget().setSelectionRange(2, 2));
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(editorTarget().value).toBe("Draft");
+    expect(editorTarget().selectionStart).toBe(2);
+  });
+
   it("puts the caret at the tail when the editor hands off with it above a leading card", async () => {
     const finishLoad = deferEditorLoad();
     const ref = createRef<ComponentRef<typeof Composer>>();

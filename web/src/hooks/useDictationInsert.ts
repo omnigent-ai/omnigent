@@ -36,6 +36,7 @@ import {
   isComposerTargetFocused,
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
+import type { TextEdit } from "@/lib/replyDraftDocument";
 
 /** The draft this hook produced, and how to keep building on it.
  *
@@ -93,7 +94,8 @@ function splice(
 
 export function useDictationInsert(
   draft: string,
-  setDraft: (next: string) => void,
+  /** Writes the draft; `change` is the one edit it makes, in the draft as it was before. */
+  setDraft: (next: string, change: TextEdit) => void,
   textareaRef?: RefObject<ComposerTextTarget | null>,
 ): {
   /** Pin a final utterance, replacing any pending interim region. */
@@ -199,11 +201,15 @@ export function useDictationInsert(
         return;
       }
 
+      // The lifted interim region is replaced; otherwise the text is inserted at `at`.
+      const change: TextEdit = region
+        ? { from: region.start, to: region.start + region.text.length, insert: spliced.region.text }
+        : { from: spliced.region.start, to: spliced.region.start, insert: spliced.region.text };
       draftRef.current = spliced.next;
       producedRef.current = settled;
       wantCaretRef.current = spliced.caret;
       setInterimPending(settled.region !== null);
-      setDraft(spliced.next);
+      setDraft(spliced.next, change);
     },
     [setDraft, textareaRef],
   );

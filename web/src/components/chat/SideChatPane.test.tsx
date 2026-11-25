@@ -3926,6 +3926,31 @@ describe("side-chat reply in one editor", () => {
     expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
   });
 
+  it("keeps a repeated word the user typed when the dictated copy is deleted by hand", async () => {
+    await renderEditor();
+    const end = editorText().length;
+    typeAt(end, end, "Draft spoken");
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript!("spoken"));
+    const dictatedAt = editorText().length - " spoken".length;
+    typeAt(dictatedAt, editorText().length, "");
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(editorText().endsWith("Draft spoken")).toBe(true);
+    expect(storeText()).toBe("Draft spoken");
+  });
+
+  it("leaves the caret where it was when a dictation is cancelled before any words", async () => {
+    await renderEditor();
+    const end = editorText().length;
+    typeAt(end, end, "Draft");
+    const editor = EditorView.findFromDOM(editorInput())!;
+    act(() => editor.dispatch({ selection: { anchor: 2 } }));
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(storeText()).toBe("Draft");
+    expect(composerTargetOf(editorInput())!.selectionStart).toBe(2);
+  });
+
   it("discards only the dictated text, and keeps a quote added during the take", async () => {
     await renderEditor();
     const end = editorText().length;

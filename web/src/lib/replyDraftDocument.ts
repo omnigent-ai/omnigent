@@ -250,40 +250,6 @@ export function minimalTextChange(before: string, after: string): TextEdit | nul
   };
 }
 
-/**
- * The occurrence of `needle` in `text` that starts nearest `near`, or -1 when there is none. An
- * empty needle sits at `near`; searching for it would never run out of occurrences.
- */
-function nearestOccurrence(text: string, needle: string, near: number): number {
-  if (needle === "") return Math.min(near, text.length);
-  let best = -1;
-  for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + 1)) {
-    if (best === -1 || Math.abs(at - near) < Math.abs(best - near)) best = at;
-  }
-  return best;
-}
-
-/**
- * The edit that undoes a dictation which turned `before` into `after`, applied to `document`. It
- * touches only the dictated span, wherever the span now sits, so a quote added meanwhile stays.
- * Null when the dictated text is no longer in `document`.
- */
-export function dictationRevertEdit(
-  document: string,
-  before: string,
-  after: string,
-): TextEdit | null {
-  const dictated = minimalTextChange(before, after);
-  if (dictated === null) return { from: 0, to: 0, insert: "" };
-  const at = nearestOccurrence(document, dictated.insert, dictated.from);
-  if (at === -1) return null;
-  return {
-    from: at,
-    to: at + dictated.insert.length,
-    insert: before.slice(dictated.from, dictated.to),
-  };
-}
-
 /** Where a document's text sits in the composer's inputs: each card's text before it, then the tail. */
 export interface ComposerTextRegion {
   /** The input that holds the text: a card's id, or the tail's. */

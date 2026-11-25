@@ -157,8 +157,14 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
-import { mapComposerSelection, dictationRevertEdit } from "@/lib/replyDraftDocument";
-import { insertComposerText, replaceComposerDocument } from "@/lib/composerText";
+import { mapComposerSelection, type TextEdit } from "@/lib/replyDraftDocument";
+import { replaceComposerDocument } from "@/lib/composerText";
+import {
+  discardDictatedSpans,
+  mapDictatedSpansAcrossDocuments,
+  writeDictatedEdit,
+  type DictatedSpan,
+} from "@/lib/dictatedSpans";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -2489,11 +2495,28 @@ function ComposerImpl(
     if (renderedEngine !== "codemirror") setValue(next);
     else if (textareaRef.current) replaceComposerDocument(textareaRef.current, next);
   };
-  // The document as the editor shows it after the last dictated edit, for a discard to undo.
-  const voiceAfterRef = useRef("");
-  const writeDictation = (next: string) => {
-    writeDocument(next);
-    voiceAfterRef.current = textareaRef.current?.value ?? next;
+  // The text this take wrote in the editor, which a discard removes and nothing else touches.
+  const dictatedRef = useRef<DictatedSpan[]>([]);
+  const dictatedDocRef = useRef("");
+  // Edits that don't come from dictation, such as typing or a quote, move or drop those spans.
+  useLayoutEffect(() => {
+    const target = textareaRef.current;
+    if (renderedEngine !== "codemirror" || !target) return;
+    dictatedRef.current = mapDictatedSpansAcrossDocuments(
+      dictatedRef.current,
+      dictatedDocRef.current,
+      target.value,
+    );
+    dictatedDocRef.current = target.value;
+  }, [replyDocument, renderedEngine]);
+  const writeDictation = (next: string, change: TextEdit) => {
+    const target = textareaRef.current;
+    if (renderedEngine !== "codemirror" || !target) {
+      writeDocument(next);
+      return;
+    }
+    dictatedRef.current = writeDictatedEdit(target, dictatedRef.current, next, change);
+    dictatedDocRef.current = target.value;
   };
   // Declared after textareaRef so dictation inserts at the caret.
   const dictation = useDictationInsert(composerValue, writeDictation, textareaRef);
@@ -4880,22 +4903,18 @@ function ComposerImpl(
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
                   voiceSnapshotRef.current = composerValue;
-                  voiceAfterRef.current = composerValue;
+                  dictatedRef.current = [];
                 }}
                 onVoiceDiscard={() => {
                   if (renderedEngine !== "codemirror") {
                     setValue(voiceSnapshotRef.current);
                     return;
                   }
-                  const target = textareaRef.current;
-                  if (!target) return;
                   // Only the dictated text goes, so a quote added during the take stays.
-                  const edit = dictationRevertEdit(
-                    target.value,
-                    voiceSnapshotRef.current,
-                    voiceAfterRef.current,
-                  );
-                  if (edit) insertComposerText(target, edit.insert, edit.from, edit.to);
+                  const spans = dictatedRef.current;
+                  dictatedRef.current = [];
+                  const target = textareaRef.current;
+                  if (target) discardDictatedSpans(target, spans);
                 }}
                 onListeningChange={setDictating}
                 inputRef={textareaRef}
