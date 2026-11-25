@@ -407,6 +407,69 @@ async def test_an_owner_method_runs_its_rest_function_with_the_requests_fields(
     assert dict(payload) == {"object": "test"}
 
 
+@pytest.mark.parametrize(
+    ("method", "request_message", "kwargs"),
+    [
+        (
+            "UpdatePullRequestDetails",
+            pb.UpdatePullRequestDetailsRequest(pr_url=_PR, body=""),
+            _pr_target(title=None, body=""),
+        ),
+        (
+            "UpdatePullRequestDetails",
+            pb.UpdatePullRequestDetailsRequest(pr_url=_PR, title=""),
+            _pr_target(title="", body=None),
+        ),
+        (
+            "UpdatePullRequestDetails",
+            pb.UpdatePullRequestDetailsRequest(pr_url=_PR),
+            _pr_target(title=None, body=None),
+        ),
+        (
+            "CreateReviewThread",
+            pb.CreateReviewThreadRequest(
+                pr_url=_PR,
+                body="Why this?",
+                anchor=pb.ReviewThreadAnchor(
+                    path="src/app.py", side="LEFT", line=4, head_sha=_HEAD, base_sha=_BASE
+                ),
+            ),
+            _pr_target(
+                body="Why this?",
+                anchor={
+                    "path": "src/app.py",
+                    "side": "LEFT",
+                    "line": 4,
+                    "start_line": None,
+                    "head_sha": _HEAD,
+                    "base_sha": _BASE,
+                },
+            ),
+        ),
+        (
+            "CreateReviewThread",
+            pb.CreateReviewThreadRequest(pr_url=_PR, body="Why this?"),
+            _pr_target(body="Why this?", anchor=None),
+        ),
+    ],
+    ids=["empty-body", "empty-title", "neither", "one-line", "no-anchor"],
+)
+async def test_an_unset_field_stays_unset_and_an_empty_one_is_passed_on(
+    tmp_path: Path,
+    method: str,
+    request_message: Any,
+    kwargs: dict[str, Any],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    """``pr_resource`` tells "keep it" (``None``) from "make it empty", and refuses the latter."""
+    _messages, code, message = await _answer(
+        _frame(tmp_path, method, request_message.SerializeToString())
+    )
+
+    assert code is None, message
+    assert [call[2] for call in owner_calls] == [kwargs]
+
+
 @pytest.mark.parametrize("method", sorted(_OWNER_CALLS))
 async def test_an_owner_method_refuses_a_pr_the_session_never_recorded(
     tmp_path: Path, method: str, providers: list[str | None]

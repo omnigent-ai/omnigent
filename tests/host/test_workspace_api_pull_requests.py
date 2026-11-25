@@ -684,7 +684,11 @@ async def test_only_owner_gated_calls_look_up_the_owner_and_never_on_the_event_l
 
 @pytest.fixture
 def reads_only_server(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This server as it was before the owner methods: no table entry and no gate for them."""
+    """A simulated server without the owner methods: no table entry and no gate for them.
+
+    It keeps this server's capability filtering, so it stands in for a server whose
+    method table lacks them, not for any one released version.
+    """
     monkeypatch.setattr(
         workspace_api,
         "WORKSPACE_METHODS",
@@ -727,11 +731,13 @@ async def test_a_new_host_behind_a_reads_only_server_offers_no_owner_method(
     client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
 
     listed = await client.get_capabilities(pb.GetCapabilitiesRequest())
-    with pytest.raises(ConnectError):
+    with pytest.raises(ConnectError) as refused:
         await client.create_comment(_CREATE_COMMENT)
 
     assert set(listed.capabilities) >= _PULL_REQUEST_READS
     assert not set(listed.capabilities) & _PULL_REQUEST_OWNER_METHODS
+    # The route's 404 for a method it has no gate for.
+    assert refused.value.code == Code.UNIMPLEMENTED
     assert [call.method for call in host_calls] == ["GetCapabilities"]
     assert owner_calls == []
 
