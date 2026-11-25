@@ -1,6 +1,9 @@
 // A workflow step's time limit lives in its description, as a line of its own such as
 // "**Time limit:** 2 hours" between Outputs and Details, where the workflow skill reads it.
 
+import remarkParse from "remark-parse";
+import { unified } from "unified";
+
 import { formatDuration } from "@/lib/relativeTime";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 
@@ -29,30 +32,55 @@ function descriptionLines(goal: string | null): string[] {
   return goal ? goal.split(/\r?\n/) : [];
 }
 
-/**
- * Which lines sit in a fenced code block, fences included: an example there names no limit. A
- * block closes on a bare fence of the same character, at least as long as the one that opened it.
- */
-function fencedLines(lines: readonly string[]): boolean[] {
-  let opening: string | null = null;
-  return lines.map((line) => {
-    const fence = FENCE.exec(line);
-    if (opening === null) {
-      opening = fence?.[1] ?? null;
-      return fence !== null;
-    }
-    const run = fence?.[1];
-    if (run && run[0] === opening[0] && run.length >= opening.length && !fence![2]!.trim()) {
-      opening = null;
-    }
-    return true;
-  });
+interface CodeBlock {
+  /** Its first and last lines, from 0. */
+  start: number;
+  end: number;
 }
 
-/** The indexes of the lines *pattern* matches outside fenced code blocks. */
-function matchingLines(lines: readonly string[], pattern: RegExp): number[] {
-  const fenced = fencedLines(lines);
-  return lines.flatMap((line, index) => (!fenced[index] && pattern.test(line) ? [index] : []));
+interface MarkdownNode {
+  type: string;
+  position?: { start: { line: number }; end: { line: number } };
+  children?: MarkdownNode[];
+}
+
+/** A description's code blocks, fenced or indented, as Markdown reads them. */
+function codeBlocks(lines: readonly string[]): CodeBlock[] {
+  const blocks: CodeBlock[] = [];
+  const visit = (node: MarkdownNode) => {
+    if (node.type === "code" && node.position) {
+      blocks.push({ start: node.position.start.line - 1, end: node.position.end.line - 1 });
+      return;
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(unified().use(remarkParse).parse(lines.join("\n")) as MarkdownNode);
+  return blocks;
+}
+
+/** The indexes of the lines *pattern* matches outside code blocks, where an example names no limit. */
+function matchingLines(
+  lines: readonly string[],
+  pattern: RegExp,
+  blocks: readonly CodeBlock[] = codeBlocks(lines),
+): number[] {
+  const inCode = (index: number) => blocks.some(({ start, end }) => start <= index && index <= end);
+  return lines.flatMap((line, index) => (!inCode(index) && pattern.test(line) ? [index] : []));
+}
+
+/** The fenced code block a description leaves open at its end, which would take in a new last line. */
+function openBlockAtEnd(lines: readonly string[], blocks: readonly CodeBlock[]): CodeBlock | null {
+  const last = blocks.at(-1);
+  if (!last || last.end !== lines.length - 1) return null;
+  const opening = FENCE.exec(lines[last.start]!)?.[1];
+  if (!opening) return null;
+  const closing = last.end > last.start ? FENCE.exec(lines[last.end]!) : null;
+  const closed =
+    !!closing &&
+    closing[1]![0] === opening[0] &&
+    closing[1]!.length >= opening.length &&
+    !closing[2]!.trim();
+  return closed ? null : last;
 }
 
 /** The step's time limit as its description words it, e.g. "2 hours"; null without one. */
@@ -107,7 +135,8 @@ export function shortTimeLimit(limit: string): string | null {
 export function withStepTimeLimit(goal: string | null, limit: string | null): string | null {
   const lines = descriptionLines(goal);
   const limitLine = limit ? `**Time limit:** ${limit}` : null;
-  const found = matchingLines(lines, LIMIT_LINE);
+  const blocks = codeBlocks(lines);
+  const found = matchingLines(lines, LIMIT_LINE, blocks);
   const kept = limitLine ? found[0] : undefined;
   // From the last, so the earlier lines keep their places.
   for (const at of [...found].reverse()) {
@@ -121,18 +150,23 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
     if (lines[at - 1]?.trim() === "" && lines[at]?.trim() === "") lines.splice(at, 1);
   }
   if (found.length === 0 && limitLine) {
-    const details = matchingLines(lines, DETAILS_LINE)[0] ?? -1;
+    const details = matchingLines(lines, DETAILS_LINE, blocks)[0] ?? -1;
+    const open = openBlockAtEnd(lines, blocks);
     const detailsMatch = details < 0 ? null : DETAILS_LINE.exec(lines[details]!);
     const listMarker = detailsMatch?.[2] ? `${detailsMatch[1]}${detailsMatch[2]}` : "";
     if (listMarker) {
       // Details is a list item, so the limit joins the list just above it.
       lines.splice(details, 0, `${listMarker}${limitLine}`);
-    } else if (details < 0) {
-      if (lines.length > 0 && lines.at(-1)!.trim() !== "") lines.push("");
-      lines.push(limitLine);
-    } else {
+    } else if (details >= 0) {
       const before = details > 0 && lines[details - 1]!.trim() !== "" ? [""] : [];
       lines.splice(details, 0, ...before, limitLine, "");
+    } else if (open) {
+      // A code block left open at the end would take in the limit, so it goes before the block.
+      const before = open.start > 0 && lines[open.start - 1]!.trim() !== "" ? [""] : [];
+      lines.splice(open.start, 0, ...before, limitLine, "");
+    } else {
+      if (lines.length > 0 && lines.at(-1)!.trim() !== "") lines.push("");
+      lines.push(limitLine);
     }
   }
   // Only the edited lines change: the line breaks stay, and only blank lines at the ends go.

@@ -246,7 +246,9 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
         ),
         // The menu shows only while no proposal is offered, so the description stands over the
         // current one; recording that keeps a later proposal's offer from going by this save's time.
-        ...(proposal
+        // While the description's own source can't be placed, as after a failed lookup, nothing is
+        // recorded, so a proposal not offered yet stays unhandled.
+        ...(proposal && (!source || sourceAt !== undefined)
           ? {
               description: workflow.description,
               expected_description: workflow.description,

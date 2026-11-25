@@ -480,7 +480,10 @@ overrun), or a Continue after Stop, it starts a new attempt:
 
 1. Call `sys_timer_set` with `seconds` set to the limit (7200 for 2 hours)
    and `note: "time limit: <step ID>"`. It's separate from the run's other
-   timers.
+   timers. A timer waits at most 1,000,000 seconds (about 11 days). For a
+   longer limit, set it for that long. When it fires before the limit, set
+   it again for the rest, and note the new `timer_id` on the step with the
+   same start time. If the call fails, use the fallback below.
 2. Note it on the step with `sys_journal_write_note` (`step`: its ID): the
    limit, the time now from `date -u +"%m-%d %H:%M:%SZ"`, and the
    `timer_id`, such as `Time limit 2h from 11-24 14:05:09Z, timer 4f1c…`.

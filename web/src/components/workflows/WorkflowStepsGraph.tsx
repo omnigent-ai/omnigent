@@ -1,4 +1,12 @@
-import { createContext, type ReactNode, useContext, useEffect, useMemo, useState } from "react";
+import {
+  createContext,
+  type ReactNode,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   Background,
@@ -387,10 +395,19 @@ export function WorkflowStepsGraph({
   timeLimitPaused?: boolean;
 }) {
   const [fullscreen, setFullscreen] = useState(false);
+  // The latest callback, so a parent's new function each render doesn't re-render every step.
+  const onTimeLimitChangeRef = useRef(onTimeLimitChange);
+  onTimeLimitChangeRef.current = onTimeLimitChange;
+  const editable = onTimeLimitChange !== undefined;
   const timeLimit = useMemo(
     () =>
-      onTimeLimitChange ? { onChange: onTimeLimitChange, paused: timeLimitPaused } : undefined,
-    [onTimeLimitChange, timeLimitPaused],
+      editable
+        ? {
+            onChange: (change: StepTimeLimitChange) => onTimeLimitChangeRef.current?.(change),
+            paused: timeLimitPaused,
+          }
+        : undefined,
+    [editable, timeLimitPaused],
   );
   const { height: stepsHeight } = useMemo(() => layoutWorkflowSteps(steps), [steps]);
   // Full size when it fits, with room for fitView's margin; past the cap it zooms out.

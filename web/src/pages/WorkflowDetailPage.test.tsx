@@ -615,6 +615,38 @@ describe("WorkflowDetailPage", () => {
     expect(server.patches).toEqual([]);
   });
 
+  it("records no description source when it can't place the current one", async () => {
+    // The description stands over a proposal the loaded journal page doesn't hold, and the
+    // lookup of where it sits fails.
+    const newer = "Finds flaky tests and fixes the worst one.";
+    const entries = [plan(5, WORKFLOW.steps), plan(15, WORKFLOW.steps, newer)];
+    const { server } = await workflowWithProposals(WORKFLOW.steps, entries, {
+      description_source: "f".repeat(32),
+    });
+    const storeFetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
+    let lookupFails = true;
+    vi.mocked(authenticatedFetch).mockImplementation(async (path, options) => {
+      if (!String(path).includes("/journal?")) return storeFetch(path, options);
+      if (lookupFails) return new Response("{}", { status: 500 });
+      const page = { object: "list", data: [{ position: 0 }], has_more: true };
+      return new Response(JSON.stringify(page));
+    });
+    renderPage(new QueryClient({ defaultOptions: { queries: { retry: false } } }));
+
+    const limit = await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" });
+    await waitFor(() => expect(limit).toBeEnabled());
+    fireEvent.click(limit);
+    await waitFor(() => expect(server.patches).toHaveLength(1));
+    expect(server.patches[0]).not.toHaveProperty("description_source");
+
+    // Once the lookup works, the newer description is still offered.
+    lookupFails = false;
+    cleanup();
+    renderPage();
+    expect(await screen.findByRole("button", { name: "Save plan" })).toBeInTheDocument();
+    expect(screen.getByText(newer)).toBeInTheDocument();
+  });
+
   it("keeps the time limit menus usable when the planning session can't load", async () => {
     await workflowWithProposals(WORKFLOW.steps, []);
     vi.mocked(useSession).mockImplementation((id) => ({

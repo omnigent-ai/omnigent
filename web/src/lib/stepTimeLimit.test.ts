@@ -128,6 +128,43 @@ describe("withStepTimeLimit", () => {
     expect(withStepTimeLimit(example, null)).toBe(example);
   });
 
+  it("leaves a Time limit line in an indented code block alone", () => {
+    const example = [
+      "Copy this example:",
+      "",
+      "    **Time limit:** 2 hours",
+      "",
+      "**Details:** Keep the example unchanged.",
+    ].join("\n");
+    expect(stepTimeLimit(example)).toBeNull();
+    expect(withStepTimeLimit(example, "1 hour")).toBe(
+      [
+        "Copy this example:",
+        "",
+        "    **Time limit:** 2 hours",
+        "",
+        "**Time limit:** 1 hour",
+        "",
+        "**Details:** Keep the example unchanged.",
+      ].join("\n"),
+    );
+    expect(withStepTimeLimit(example, null)).toBe(example);
+  });
+
+  it("puts the limit before a code block left open at the end, where it stays readable", () => {
+    const open = "Fix it.\n\n```\nsome code";
+    const limited = withStepTimeLimit(open, "2 hours");
+    expect(limited).toBe("Fix it.\n\n**Time limit:** 2 hours\n\n```\nsome code");
+    expect(stepTimeLimit(limited)).toBe("2 hours");
+    expect(withStepTimeLimit(limited, "4 hours")).toBe(
+      "Fix it.\n\n**Time limit:** 4 hours\n\n```\nsome code",
+    );
+    // With Details, the limit goes before it as usual.
+    expect(withStepTimeLimit("**Details:** run it.\n\n```\nsome code", "1 hour")).toBe(
+      "**Time limit:** 1 hour\n\n**Details:** run it.\n\n```\nsome code",
+    );
+  });
+
   it("changes only the edited lines: their breaks and the first line's indent stay", () => {
     expect(withStepTimeLimit("Fix it.\r\n\r\n**Details:** run it.", "1 hour")).toBe(
       "Fix it.\r\n\r\n**Time limit:** 1 hour\r\n\r\n**Details:** run it.",
