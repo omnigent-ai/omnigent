@@ -14,7 +14,7 @@
 // gracefully when the runner has no OS environment for the session
 // (e.g. cloud-only agents).
 
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { type UseQueryResult, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -1409,8 +1409,6 @@ export function workspaceFolderListingQuery(
   };
 }
 
-const NO_FOLDERS: ReadonlySet<string> = new Set();
-
 /** One expanded lazy directory's fetched children + load/error state. */
 export interface DirectoryResult {
   data: WorkspaceFile[] | undefined;
@@ -1428,9 +1426,6 @@ export interface DirectoryResult {
  * for every currently-expanded lazy dir — keeps the queries alive regardless of
  * which rows are windowed in, and shares the same cache entries as the singular
  * hook (identical query keys).
- *
- * Folders in `cachedOnly` keep their cached listing but nothing observes them, so a listing
- * still being read for one, as for a closed folder, is cancelled and asks for no more pages.
  */
 export function useWorkspaceDirectories(
   conversationId: string | undefined,
@@ -1438,25 +1433,20 @@ export function useWorkspaceDirectories(
   location = "",
   refreshToken = 0,
   hideIgnored = false,
-  cachedOnly: ReadonlySet<string> = NO_FOLDERS,
 ): Map<string, DirectoryResult> {
   const serveable = useWorkspaceServeable(conversationId);
   const enabled = !!conversationId && serveable !== false;
   const queryClient = useQueryClient();
-  const observed = useMemo(
-    () => (cachedOnly.size === 0 ? dirPaths : dirPaths.filter((path) => !cachedOnly.has(path))),
-    [dirPaths, cachedOnly],
-  );
   // `combine` lets TanStack memoize the assembled Map. Its recompute gate is a
   // reference check on the combine fn (`combine !== lastCombine`), so the
   // callback must be stable — an inline closure is a fresh fn every render and
   // defeats the gate, rebuilding the Map (and re-running the tree's flatten
   // memo + widening effect) on every render, including every scroll frame.
-  // Keyed on `observed`, which the caller holds stable at its widening fixpoint.
+  // Keyed on `dirPaths`, which the caller holds stable at its widening fixpoint.
   const combine = useCallback(
     (results: { data?: WorkspaceFile[]; isLoading: boolean; isError: boolean }[]) => {
       const map = new Map<string, DirectoryResult>();
-      observed.forEach((dirPath, i) => {
+      dirPaths.forEach((dirPath, i) => {
         map.set(dirPath, {
           data: results[i]?.data,
           isLoading: results[i]?.isLoading ?? false,
@@ -1465,23 +1455,10 @@ export function useWorkspaceDirectories(
       });
       return map;
     },
-    [observed],
+    [dirPaths],
   );
-  const cachedListing = useCallback(
-    (dirPath: string, hidingIgnored: boolean) =>
-      queryClient.getQueryData<WorkspaceFile[]>(
-        workspaceDirectoryQuery(
-          conversationId ?? "",
-          dirPath,
-          location,
-          refreshToken,
-          hidingIgnored,
-        ).queryKey,
-      ),
-    [queryClient, conversationId, location, refreshToken],
-  );
-  const results = useQueries({
-    queries: observed.map((dirPath) => ({
+  return useQueries({
+    queries: dirPaths.map((dirPath) => ({
       ...workspaceDirectoryQuery(
         conversationId ?? "",
         dirPath,
@@ -1491,24 +1468,18 @@ export function useWorkspaceDirectories(
       ),
       // useQueries starts a fresh observer per key, so the folder's other listing comes from
       // the cache: showing or hiding ignored files keeps its rows up meanwhile.
-      placeholderData: () => cachedListing(dirPath, !hideIgnored),
+      placeholderData: () =>
+        queryClient.getQueryData<WorkspaceFile[]>(
+          workspaceDirectoryQuery(
+            conversationId ?? "",
+            dirPath,
+            location,
+            refreshToken,
+            !hideIgnored,
+          ).queryKey,
+        ),
       enabled,
     })),
     combine,
   });
-  return useMemo(() => {
-    if (observed === dirPaths) return results;
-    const all = new Map<string, DirectoryResult>();
-    for (const dirPath of dirPaths) {
-      all.set(
-        dirPath,
-        results.get(dirPath) ?? {
-          data: cachedListing(dirPath, hideIgnored) ?? cachedListing(dirPath, !hideIgnored),
-          isLoading: false,
-          isError: false,
-        },
-      );
-    }
-    return all;
-  }, [results, observed, dirPaths, cachedListing, hideIgnored]);
 }
