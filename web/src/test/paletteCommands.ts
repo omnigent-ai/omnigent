@@ -3,6 +3,11 @@ import { expect } from "vitest";
 import { type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
 import { currentChoiceLabel, type PaletteSetting } from "@/store/paletteSettings";
 
+/** The palette's dialog while it's open; once closed it may still be mounted, animating out. */
+export function openPaletteDialog(): Element | null {
+  return document.querySelector('[role="dialog"][data-state="open"]');
+}
+
 /** Every command mounted features offer ⌘K, listed or not. */
 export function registeredPaletteCommands(): PaletteCommand[] {
   return Object.values(usePaletteCommandsStore.getState().groups).flatMap(
@@ -11,6 +16,17 @@ export function registeredPaletteCommands(): PaletteCommand[] {
 }
 
 /** The setting `label` among `commands`, failing the test when it isn't offered. */
+/** Each setting among `commands`, by name, with the value its row shows. */
+export function settingValues(
+  commands: readonly PaletteCommand[],
+): Record<string, string | undefined> {
+  return Object.fromEntries(
+    commands.flatMap((command) =>
+      command.setting ? [[command.label, currentChoiceLabel(command.setting)]] : [],
+    ),
+  );
+}
+
 export function settingIn(commands: readonly PaletteCommand[], label: string): PaletteSetting {
   const setting = commands.find((command) => command.label === label)?.setting;
   if (!setting) {
