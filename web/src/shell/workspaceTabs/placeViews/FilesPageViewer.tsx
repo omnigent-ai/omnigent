@@ -131,6 +131,8 @@ export function FilesPageViewer({
   const appViewer = <ComparisonFileViewer key={commentId} {...viewerProps} />;
   const text = file.data && !rich ? fileContentText(file.data) : null;
   const [searchOpen, setSearchOpen] = useState(false);
+  // Each Find in file bumps it, so a repeat refocuses a find bar that is already open.
+  const [searchFocusNonce, setSearchFocusNonce] = useState(0);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   return (
     <div className={cn("flex min-h-0 flex-col bg-background", WORKSPACE_SIDEBAR_LAYOUT.page)}>
@@ -163,7 +165,10 @@ export function FilesPageViewer({
             <FileActionsMenu
               conversationId={conversationId}
               path={path}
-              onFind={() => setSearchOpen(true)}
+              onFind={() => {
+                setSearchOpen(true);
+                setSearchFocusNonce((nonce) => nonce + 1);
+              }}
             />
           </TooltipProvider>
         ) : null}
@@ -198,6 +203,7 @@ export function FilesPageViewer({
             position={position}
             registerLeaveGuard={registerLeaveGuard}
             searchOpen={searchOpen}
+            searchFocusNonce={searchFocusNonce}
             onSearchOpenChange={setSearchOpen}
             onSaveStatusChange={setSaveStatus}
           />
@@ -237,6 +243,7 @@ function TextFile({
   position,
   registerLeaveGuard,
   searchOpen,
+  searchFocusNonce,
   onSearchOpenChange,
   onSaveStatusChange,
 }: {
@@ -249,6 +256,7 @@ function TextFile({
   registerLeaveGuard?: (guard: FilesPageLeaveGuard) => () => void;
   /** The editor's find bar is open, as from the toolbar's Find in file. */
   searchOpen: boolean;
+  searchFocusNonce: number;
   onSearchOpenChange: (open: boolean) => void;
   onSaveStatusChange: (status: SaveStatus) => void;
 }) {
@@ -271,6 +279,7 @@ function TextFile({
         wrapLines={false}
         stickyScroll={stickyScroll}
         searchOpen={searchOpen}
+        searchFocusNonce={searchFocusNonce}
         onSearchOpened={() => onSearchOpenChange(true)}
         onSearchHandled={() => onSearchOpenChange(false)}
         onDirtyChange={setDirty}

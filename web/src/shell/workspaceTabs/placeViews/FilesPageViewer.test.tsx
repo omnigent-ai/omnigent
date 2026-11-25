@@ -182,6 +182,12 @@ describe("FilesPageViewer", () => {
         }),
     );
     expect(screen.getByTestId("file-find-input")).toHaveFocus();
+    // Asked again while find is still open, it asks the editor to refocus the find field.
+    const firstRequest = captured.editor!.searchFocusNonce;
+    await userEvent.click(screen.getByRole("button", { name: "File actions" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    expect(captured.editor!.searchOpen).toBe(true);
+    expect(captured.editor!.searchFocusNonce).not.toBe(firstRequest);
     act(() => captured.editor!.onSearchHandled!());
     expect(captured.editor!.searchOpen).toBe(false);
   });
