@@ -117,6 +117,7 @@ import {
 } from "@/hooks/usePullRequests";
 import {
   PULL_REQUEST_MARKDOWN_COMPONENTS,
+  PULL_REQUEST_MARKDOWN_REMARK_PLUGINS,
   PullRequestDescription,
   PullRequestTitle,
 } from "./PullRequestDetails";
@@ -529,7 +530,11 @@ function PullRequestCommentCard({
         )}
       </div>
       <div className="text-ui break-words">
-        <MessageResponse allowGitHubAttachmentImages components={PULL_REQUEST_MARKDOWN_COMPONENTS}>
+        <MessageResponse
+          allowGitHubAttachmentImages
+          components={PULL_REQUEST_MARKDOWN_COMPONENTS}
+          remarkPlugins={PULL_REQUEST_MARKDOWN_REMARK_PLUGINS}
+        >
           {comment.body}
         </MessageResponse>
       </div>

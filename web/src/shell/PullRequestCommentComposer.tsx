@@ -11,7 +11,10 @@ import {
   usePullRequestCommentComposer,
   type PullRequestCommentDraft,
 } from "@/hooks/usePullRequests";
-import { PULL_REQUEST_MARKDOWN_COMPONENTS } from "./PullRequestDetails";
+import {
+  PULL_REQUEST_MARKDOWN_COMPONENTS,
+  PULL_REQUEST_MARKDOWN_REMARK_PLUGINS,
+} from "./PullRequestDetails";
 
 export function PullRequestCommentComposer({
   conversationId,
@@ -135,6 +138,7 @@ export function PullRequestCommentForm({
                 <MessageResponse
                   allowGitHubAttachmentImages
                   components={PULL_REQUEST_MARKDOWN_COMPONENTS}
+                  remarkPlugins={PULL_REQUEST_MARKDOWN_REMARK_PLUGINS}
                 >
                   {draft.body}
                 </MessageResponse>
