@@ -6,6 +6,7 @@ import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
 import {
   type Chord,
+  chordAriaShortcut,
   chordKeyLabel,
   chordKeys,
   chordMatches,
@@ -894,28 +895,6 @@ export function codeMirrorKeys(
   environment?: Partial<ShortcutEnvironment>,
 ): string[] {
   return activeShortcutChords(id, environment).map(codeMirrorKey);
-}
-
-const ARIA_KEY_NAMES: Record<string, string> = {
-  "↵": "Enter",
-  "⌫": "Backspace",
-  Esc: "Escape",
-  "↑": "ArrowUp",
-  "↓": "ArrowDown",
-  "←": "ArrowLeft",
-  "→": "ArrowRight",
-};
-
-/** The chord as an `aria-keyshortcuts` value, such as `Meta+Alt+R`. */
-export function chordAriaShortcut(chord: Chord, mac: boolean = isMacPlatform()): string {
-  const parts: string[] = [];
-  if (mac && chord.mod) parts.push("Meta");
-  if (chord.ctrl || (!mac && chord.mod)) parts.push("Control");
-  if (chord.alt) parts.push("Alt");
-  if (chord.shift) parts.push("Shift");
-  const label = chordKeyLabel(chord);
-  parts.push(ARIA_KEY_NAMES[label] ?? label);
-  return parts.join("+");
 }
 
 /** `aria-keyshortcuts` for the first of `id`'s chords here, or none when it has no chord. */
