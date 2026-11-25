@@ -31,7 +31,7 @@ describe("stepTimeLimit", () => {
   it("breaks lines where Markdown does, at a lone CR too", () => {
     expect(stepTimeLimit("Fix it.\r**Time limit:** 2 hours")).toBe("2 hours");
     expect(stepTimeLimit("Example:\r\r```\r**Time limit:** 2 hours\r```")).toBeNull();
-    expect(withStepTimeLimit("Fix it.\r**Details:** run it.", "1 hour")).toBe(
+    expect(withStepTimeLimit("Fix it.\r\r**Details:** run it.", "1 hour")).toBe(
       "Fix it.\r\r**Time limit:** 1 hour\r\r**Details:** run it.",
     );
   });
@@ -97,8 +97,9 @@ describe("withStepTimeLimit", () => {
         "**Details:** run `gh pr checks <number>`.",
       ].join("\n"),
     );
+    // Where Details continues a paragraph, the limit joins it, so clearing it undoes it.
     expect(withStepTimeLimit("Fix it.\n**Details:** run the tests.", "1 hour")).toBe(
-      "Fix it.\n\n**Time limit:** 1 hour\n\n**Details:** run the tests.",
+      "Fix it.\n**Time limit:** 1 hour\n**Details:** run the tests.",
     );
   });
 
@@ -143,6 +144,30 @@ describe("withStepTimeLimit", () => {
     expect(stepTimeLimit(written)).toBe("2 hours");
     expect(withStepTimeLimit(written, "4 hours")).toBe(changed);
     expect(stepTimeLimit(withStepTimeLimit(written, null))).toBeNull();
+  });
+
+  it.each([
+    "Fix it.\n\n**Details:** run it.",
+    "Fix it.\n**Details:** run it.",
+    "**Details:** run it.",
+    "> **Details:** rerun it.",
+    "> Fix it.\n>\n> **Details:** rerun it.",
+    "> Fix it.\n> **Details:** rerun it.",
+    "Intro\n\n> **Details:** x",
+    "Intro\n> **Details:** x",
+    "- Fix it.\n\n  **Details:** rerun it.",
+    "- Fix it.\n  **Details:** rerun it.",
+    "1. Fix it.\n2. **Details:** rerun it.",
+    "Fix it.\r\n\r\n**Details:** run it.",
+    "Fix it.\r**Details:** run it.",
+    "Fix it.",
+    "Fix it.\n\n```\nsome code",
+    "Fix it.\n```\nsome code",
+    GOAL,
+  ])("gives %j back once a limit set on it is cleared", (goal) => {
+    const limited = withStepTimeLimit(goal, "1 hour");
+    expect(stepTimeLimit(limited)).toBe("1 hour");
+    expect(withStepTimeLimit(limited, null)).toBe(goal);
   });
 
   it("puts a new limit in the list item or quote that holds Details", () => {

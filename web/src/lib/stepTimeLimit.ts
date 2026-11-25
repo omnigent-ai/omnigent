@@ -33,6 +33,11 @@ const UNIT_MINUTES: Readonly<Record<string, number>> = { d: 1440, h: 60, m: 1 };
 const LENGTH_PART =
   /(\d+(?:\.\d+)?)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d)(?![a-z])([\s,]*(?:and\s+)?)/iy;
 
+/** A line with nothing on it, or nothing but a quote's markers. */
+function isBlankLine(line: string | undefined): boolean {
+  return line !== undefined && line.replace(/^[ \t>]*/, "") === "";
+}
+
 /** A description's lines, broken where Markdown breaks them: at CRLF, LF or a lone CR. */
 function descriptionLines(goal: string | null): string[] {
   return goal ? goal.split(/\r\n|\r|\n/) : [];
@@ -171,9 +176,7 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
     }
     lines.splice(at, 1);
     // Keep one blank line between the paragraphs on either side; in a quote, one with its marker.
-    const blank = (line: string | undefined) =>
-      line !== undefined && line.replace(/^[ \t>]*/, "") === "";
-    if (blank(lines[at - 1]) && blank(lines[at])) lines.splice(at, 1);
+    if (isBlankLine(lines[at - 1]) && isBlankLine(lines[at])) lines.splice(at, 1);
   }
   if (found.length === 0 && limitLine) {
     const details = matchingLines(lines, DETAILS_LINE, code)[0] ?? -1;
@@ -183,12 +186,16 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       // Details is a list item, so the limit joins the list just above it.
       lines.splice(details, 0, `${listMarker}${limitLine}`);
     } else if (details >= 0) {
-      // A paragraph of its own, indented or quoted as Details is, so it stays in Details' list
-      // item or quote; a quote's blank lines keep its marker.
+      // Indented or quoted as Details is, so it stays in Details' list item or quote; a paragraph
+      // of its own only where one starts there already, so clearing it gives the text back.
       const prefix = detailsMatch![1]!;
-      const blank = prefix.trimEnd();
-      const before = details > 0 && lines[details - 1]!.trim() !== blank.trim() ? [blank] : [];
-      lines.splice(details, 0, ...before, `${prefix}${limitLine}`, blank);
+      const startsParagraph = details === 0 || isBlankLine(lines[details - 1]);
+      lines.splice(
+        details,
+        0,
+        `${prefix}${limitLine}`,
+        ...(startsParagraph ? [prefix.trimEnd()] : []),
+      );
     } else {
       // Last, unless a code block left open at the end would take the line in, as Markdown
       // reads it: then just before that block.
@@ -198,8 +205,8 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
         ({ start, end }) => start < lines.length && end === last,
       );
       if (open) {
-        const before = open.start > 0 && lines[open.start - 1]!.trim() !== "" ? [""] : [];
-        lines.splice(open.start, 0, ...before, limitLine, "");
+        const startsParagraph = open.start === 0 || isBlankLine(lines[open.start - 1]);
+        lines.splice(open.start, 0, limitLine, ...(startsParagraph ? [""] : []));
       } else {
         lines.push(...tail);
       }
@@ -208,9 +215,9 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
   // Only the edited lines change: the description's own line break stays, and only blank lines at
   // the ends go.
   let first = 0;
-  while (first < lines.length && !lines[first]!.trim()) first += 1;
+  while (first < lines.length && isBlankLine(lines[first])) first += 1;
   let last = lines.length;
-  while (last > first && !lines[last - 1]!.trim()) last -= 1;
+  while (last > first && isBlankLine(lines[last - 1])) last -= 1;
   const text = lines.slice(first, last).join(goal?.match(/\r\n|\r|\n/)?.[0] ?? "\n");
   return text.trim() ? text : null;
 }

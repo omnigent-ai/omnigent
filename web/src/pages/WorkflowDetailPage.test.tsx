@@ -591,6 +591,27 @@ describe("WorkflowDetailPage", () => {
     expect(runButton()).toBeEnabled();
   });
 
+  it("leaves no unsaved change once a limit set from the menu is cleared", async () => {
+    // A quote that starts with Details, as an older proposal has it too.
+    const quoted = [
+      WORKFLOW.steps[0]!,
+      { ...WORKFLOW.steps[1]!, goal: "> **Details:** rerun it." },
+    ];
+    await workflowWithProposals(quoted, [plan(5, quoted)]);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    await waitFor(() =>
+      expect(graphGoals()).toEqual([
+        null,
+        "> **Time limit:** 4 hours\n>\n> **Details:** rerun it.",
+      ]),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear Fix the test's limit" }));
+    await waitFor(() => expect(graphGoals()).toEqual([null, "> **Details:** rerun it."]));
+    expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
+    expect(runButton()).toBeEnabled();
+  });
+
   it("lets the time limit menus work while the planning chat loads", async () => {
     const { patches } = await workflowWithProposals(WORKFLOW.steps, []);
     mockJournal([], { isLoading: true });
