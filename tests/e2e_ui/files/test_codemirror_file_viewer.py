@@ -78,17 +78,23 @@ _SEEDED = {
 
 @pytest.fixture
 def code_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
-    base_url, session_id = seeded_session
+    with seeded_workspace(seeded_session, _SEEDED) as session:
+        yield session
+
+
+@pytest.fixture
+def large_code_session(code_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
+    """Also writes the file past the viewer's truncation limit, for the one journey opening it."""
+    base_url, session_id = code_session
     workspace = session_workspace(base_url, session_id)
     # The large file takes longer to write than the shared helper waits.
-    httpx.put(
-        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{_LARGE_PATH}",
-        json={"content": _LARGE_SOURCE, "encoding": "utf-8"},
-        timeout=60.0,
-    ).raise_for_status()
     try:
-        with seeded_workspace(seeded_session, _SEEDED) as session:
-            yield session
+        httpx.put(
+            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{_LARGE_PATH}",
+            json={"content": _LARGE_SOURCE, "encoding": "utf-8"},
+            timeout=60.0,
+        ).raise_for_status()
+        yield code_session
     finally:
         remove_seeded(workspace, [_LARGE_PATH])
 
@@ -142,9 +148,9 @@ def test_alt_drag_selects_a_column_and_the_palette_grows_it(
 
 
 def test_a_read_only_file_highlights_matching_brackets(
-    page: Page, code_session: tuple[str, str]
+    page: Page, large_code_session: tuple[str, str]
 ) -> None:
-    base_url, session_id = code_session
+    base_url, session_id = large_code_session
     editor = _open_file(page, base_url, session_id, _LARGE_PATH)
     line = editor.locator(".cm-line").first
     expect(line).to_contain_text("entry000000", timeout=60_000)
