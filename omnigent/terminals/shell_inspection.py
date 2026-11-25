@@ -1,0 +1,343 @@
+"""Whether a terminal's shell is idle, from one process-table snapshot of its tmux pane.
+
+Closing a shell asks "Close shell?" only when something besides the login shell runs in it. The
+runner reads its own pane's processes and keeps only an answer: idle, busy with a named job, or
+unknown. Rows never leave this module, so no other process, pid or command line is reported,
+logged or raised.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import re
+import shutil
+import time
+import unicodedata
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from enum import Enum
+
+from omnigent.host.workspace_git.runner import trusted_search_path
+
+# The columns ``ps`` prints, fixed: never arguments, environment or working directory.
+PS_COLUMNS = "pid=,ppid=,pgid=,tpgid=,stat=,comm="
+# A command name the dialog shows is at most this long.
+MAX_COMMAND_NAME_LENGTH = 32
+# One inspection's budget for both subprocesses; past it the answer is unknown.
+INSPECTION_TIMEOUT_SECONDS = 0.45
+# A fresh answer is reused this long, so several close paths firing at once share one read.
+CACHE_SECONDS = 0.25
+# Inspections running at once in one process, the host git runner's limit.
+MAX_CONCURRENT_INSPECTIONS = 4
+# Largest output either subprocess may print before the answer is unknown.
+_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+
+_ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+
+
+class ShellState(Enum):
+    """What a terminal's shell is doing."""
+
+    IDLE = "idle"
+    BUSY = "busy"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ShellInspection:
+    """One terminal's answer: no pids and no other processes, only what the close dialog needs.
+
+    :param state: Idle, busy, or unknown.
+    :param foreground: The foreground job's command name when busy and known, e.g. ``"vim"``.
+    :param background_jobs: How many other jobs run, or ``None`` where jobs can't be told apart,
+        as in a sandboxed pane with no job control.
+    """
+
+    state: ShellState
+    foreground: str | None = None
+    background_jobs: int | None = None
+
+    def to_dict(self) -> dict[str, str | int | None]:
+        """The wire form, e.g. ``{"state": "busy", "foreground": "vim", "background_jobs": 0}``."""
+        return {
+            "state": self.state.value,
+            "foreground": self.foreground,
+            "background_jobs": self.background_jobs,
+        }
+
+    @classmethod
+    def from_untrusted(cls, payload: object) -> ShellInspection:
+        """Rebuild an answer from another process's JSON, keeping only the expected fields.
+
+        The state must be one of the three, the name is cleaned again, and the count must be a
+        whole number from 0 up; anything else answers unknown.
+
+        :param payload: Parsed JSON, e.g. ``{"state": "idle"}``.
+        :returns: The rebuilt inspection.
+        """
+        if not isinstance(payload, dict):
+            return UNKNOWN
+        try:
+            state = ShellState(payload.get("state"))
+        except ValueError:
+            return UNKNOWN
+        if state is not ShellState.BUSY:
+            return cls(state)
+        name = payload.get("foreground")
+        count = payload.get("background_jobs")
+        valid_count = type(count) is int and 0 <= count <= 1_000_000
+        return cls(
+            state,
+            sanitize_command_name(name) if isinstance(name, str) else None,
+            count if valid_count else None,
+        )
+
+
+UNKNOWN = ShellInspection(ShellState.UNKNOWN)
+
+# The one body every missing, foreign or stopped terminal answers with.
+TERMINAL_SHELL_NOT_FOUND = {"error": {"code": "not_found", "message": "Terminal not found"}}
+
+
+@dataclass(frozen=True)
+class _Row:
+    pid: int
+    ppid: int
+    pgid: int
+    tpgid: int
+    comm: str
+
+
+def sanitize_command_name(comm: str) -> str | None:
+    """The name to show for a process's ``comm``: untrusted text the process chose itself.
+
+    macOS prints the executable's full path, so only its basename is kept, without a login
+    shell's leading ``-``. ANSI sequences and control, format and bidi characters are removed,
+    and the result is capped at :data:`MAX_COMMAND_NAME_LENGTH` characters.
+
+    :param comm: The ``comm`` column, e.g. ``"/usr/bin/vim"`` or ``"-zsh"``.
+    :returns: The name, e.g. ``"vim"``, or ``None`` when nothing printable is left.
+    """
+    text = _ANSI_SEQUENCE.sub("", comm)
+    text = "".join(
+        char for char in text if unicodedata.category(char)[0] not in ("C", "Z") or char == " "
+    )
+    name = text.strip().rsplit("/", 1)[-1].lstrip("-").strip()
+    return name[:MAX_COMMAND_NAME_LENGTH] or None
+
+
+def _parse(snapshot: str) -> list[_Row]:
+    """The snapshot's rows. A line whose first four fields aren't numbers, such as the rest of a
+    ``comm`` with a newline in it, is dropped."""
+    rows: list[_Row] = []
+    for line in snapshot.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) < 6:
+            continue
+        try:
+            pid, ppid, pgid, tpgid = (int(value) for value in fields[:4])
+        except ValueError:
+            continue
+        rows.append(_Row(pid, ppid, pgid, tpgid, fields[5]))
+    return rows
+
+
+def _shell_name(command: str) -> str | None:
+    return sanitize_command_name(command.rsplit("/", 1)[-1])
+
+
+def inspect_shell(
+    snapshot: str,
+    *,
+    tmux_server_pid: int,
+    pane_pid: int,
+    shell_command: str,
+) -> ShellInspection:
+    """Decide whether the pane's login shell is idle, from one ``ps`` snapshot.
+
+    The pane's process must be a child of its own tmux server in this same snapshot, else its
+    pid may have been reused and the answer is unknown. The login shell is the first process
+    under the pane named for the terminal's command: the pane's own process, or one below a
+    sandbox launcher. It is idle when nothing runs under it.
+
+    :param snapshot: ``ps -e -o`` :data:`PS_COLUMNS` output.
+    :param tmux_server_pid: The pane's tmux server, from tmux's ``#{pid}``.
+    :param pane_pid: The pane's process, from tmux's ``#{pane_pid}``.
+    :param shell_command: The terminal's configured command, e.g. ``"zsh"``.
+    :returns: The inspection; only names and counts, never a row.
+    """
+    rows = _parse(snapshot)
+    by_pid = {row.pid: row for row in rows}
+    # A pid listed twice means a line was forged, e.g. through a newline in a ``comm``.
+    if len(by_pid) != len(rows):
+        return UNKNOWN
+    pane = by_pid.get(pane_pid)
+    if pane is None or pane.ppid != tmux_server_pid or tmux_server_pid not in by_pid:
+        return UNKNOWN
+    children: dict[int, list[_Row]] = {}
+    for row in rows:
+        children.setdefault(row.ppid, []).append(row)
+
+    wanted = _shell_name(shell_command)
+    shell: _Row | None = None
+    queue = [pane]
+    while queue and shell is None:
+        row = queue.pop(0)
+        if sanitize_command_name(row.comm) == wanted:
+            shell = row
+        else:
+            queue.extend(children.get(row.pid, []))
+    if shell is None:
+        return UNKNOWN
+
+    jobs: list[_Row] = []
+    stack = list(children.get(shell.pid, []))
+    while stack:
+        row = stack.pop()
+        jobs.append(row)
+        stack.extend(children.get(row.pid, []))
+    if not jobs:
+        return ShellInspection(ShellState.IDLE)
+
+    foreground_group = shell.tpgid
+    if foreground_group <= 0:
+        # No job control, as under a sandbox's new session: name the shell's first child.
+        first = min(children[shell.pid], key=lambda row: row.pid)
+        return ShellInspection(ShellState.BUSY, sanitize_command_name(first.comm), None)
+    groups = {row.pgid for row in jobs}
+    foreground_rows = [row for row in jobs if row.pgid == foreground_group]
+    foreground = None
+    if foreground_rows:
+        leader = next((row for row in foreground_rows if row.pid == foreground_group), None)
+        foreground = sanitize_command_name((leader or foreground_rows[0]).comm)
+    background = len(groups - {foreground_group})
+    return ShellInspection(ShellState.BUSY, foreground, background)
+
+
+class _CommandFailed(Exception):
+    """A subprocess failed; it carries no output so nothing it printed can leak."""
+
+
+async def _run(argv: Sequence[str], path: str) -> str:
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env={"PATH": path, "LC_ALL": "C"},
+    )
+    try:
+        stdout, _ = await process.communicate()
+    finally:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+    if process.returncode != 0 or len(stdout) > _MAX_OUTPUT_BYTES:
+        raise _CommandFailed
+    return stdout.decode("utf-8", errors="replace")
+
+
+async def read_pane_shell(
+    tmux_command: Sequence[str],
+    target: str,
+    shell_command: str,
+) -> ShellInspection:
+    """Inspect one tmux pane's shell: tmux's server and pane pids, then one ``ps`` snapshot.
+
+    Both run with fixed arguments, no shell and the trusted ``PATH``. Any failure, odd output
+    or timeout answers unknown, and nothing either command printed is kept.
+
+    :param tmux_command: The terminal's own tmux argv prefix, e.g.
+        ``["/usr/bin/tmux", "-S", "/tmp/omnigent-terminal-x/tmux.sock", "-f", "/dev/null"]``.
+    :param target: The pane's tmux target, e.g. ``"main"``.
+    :param shell_command: The terminal's configured command, e.g. ``"zsh"``.
+    :returns: The inspection.
+    """
+    path = trusted_search_path()
+    ps = shutil.which("ps", path=path)
+    if ps is None:
+        return UNKNOWN
+
+    async def read() -> ShellInspection:
+        pids = await _run(
+            [*tmux_command, "display-message", "-p", "-t", target, "#{pid} #{pane_pid}"], path
+        )
+        fields = pids.split()
+        if len(fields) != 2 or not all(field.isascii() and field.isdigit() for field in fields):
+            return UNKNOWN
+        snapshot = await _run([ps, "-e", "-o", PS_COLUMNS], path)
+        return inspect_shell(
+            snapshot,
+            tmux_server_pid=int(fields[0]),
+            pane_pid=int(fields[1]),
+            shell_command=shell_command,
+        )
+
+    try:
+        return await asyncio.wait_for(read(), INSPECTION_TIMEOUT_SECONDS)
+    except (TimeoutError, OSError, _CommandFailed):
+        return UNKNOWN
+
+
+class ShellInspector:
+    """Runs inspections one per terminal at a time, under a shared limit, with a short cache.
+
+    A request for a terminal already being read waits for that read; a request within
+    :data:`CACHE_SECONDS` of the last answer reuses it. Keys must name one terminal, e.g. its
+    tmux socket path; callers check that the caller may see that terminal first.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_concurrent: int = MAX_CONCURRENT_INSPECTIONS,
+        cache_seconds: float = CACHE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._slots = asyncio.Semaphore(max_concurrent)
+        self._cache_seconds = cache_seconds
+        self._clock = clock
+        self._answers: dict[str, tuple[float, ShellInspection]] = {}
+        self._in_flight: dict[str, asyncio.Task[ShellInspection]] = {}
+
+    async def inspect(
+        self, key: str, read: Callable[[], Awaitable[ShellInspection]]
+    ) -> ShellInspection:
+        """The answer for the terminal ``key``, reading it with ``read`` only when needed.
+
+        :param key: One terminal's identity, e.g. its tmux socket path.
+        :param read: Reads the terminal, e.g. ``read_pane_shell`` bound to its pane.
+        :returns: The inspection; unknown when ``read`` raises.
+        """
+        now = self._clock()
+        self._answers = {
+            name: answer
+            for name, answer in self._answers.items()
+            if now - answer[0] < self._cache_seconds
+        }
+        cached = self._answers.get(key)
+        if cached is not None:
+            return cached[1]
+        task = self._in_flight.get(key)
+        if task is None:
+            task = asyncio.ensure_future(self._read(key, read))
+            self._in_flight[key] = task
+        # Shielded so one cancelled caller doesn't cancel the read the others wait on.
+        return await asyncio.shield(task)
+
+    async def _read(
+        self, key: str, read: Callable[[], Awaitable[ShellInspection]]
+    ) -> ShellInspection:
+        try:
+            async with self._slots:
+                try:
+                    answer = await read()
+                # A surprise answers unknown, so no exception text holding a row is logged.
+                except Exception:  # noqa: BLE001
+                    answer = UNKNOWN
+            self._answers[key] = (self._clock(), answer)
+            return answer
+        finally:
+            self._in_flight.pop(key, None)
