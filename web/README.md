@@ -40,7 +40,8 @@ OMNIGENT_URL=https://my-workspace.databricks.com pnpm run dev
 
 A `?o=<org-id>` selector in `OMNIGENT_URL` is sent as the `X-Databricks-Org-Id`
 header. Set `OMNIGENT_DATABRICKS_PROFILE=<name>` to mint tokens from that
-Databricks CLI profile instead of matching by host. `omnidev ui` (see
+Databricks CLI profile instead of matching by host. These tokens are never sent
+over plain `http://`, except to localhost. `omnidev ui` (see
 `dev/omnidev/README.md`) wraps this with a recent-server picker.
 
 Additional `omnigent server` options:

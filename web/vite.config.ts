@@ -51,10 +51,26 @@ const DATABRICKS_PROFILE = process.env.OMNIGENT_DATABRICKS_PROFILE || undefined;
 let cliToken: { value: string | null; expiresAt: number } = { value: null, expiresAt: 0 };
 let refreshAt = 0;
 let refreshing: Promise<void> | undefined;
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+let refreshFailing = false;
 
-// Mints a CLI token in the background; requests keep the current one until it
-// expires. A failed refresh keeps it and is retried after 10s.
+function reportRefreshFailure(message: string) {
+  if (!refreshFailing) console.warn(`[dev-proxy] could not get a Databricks token: ${message}`);
+  refreshFailing = true;
+}
+
+// Mints a CLI token in the background and again shortly before it expires, even
+// while idle; requests keep the current token meanwhile. Failures retry after 10s.
 function refreshToken(host: string): Promise<void> {
+  const target = new URL(host);
+  // A Databricks token never travels in cleartext, except to this machine.
+  if (
+    target.protocol === "http:" &&
+    !["localhost", "127.0.0.1", "[::1]"].includes(target.hostname)
+  ) {
+    reportRefreshFailure(`refusing to send it over plain http to ${host}; use https`);
+    return Promise.resolve();
+  }
   refreshing ??= new Promise((resolve) => {
     const selector = DATABRICKS_PROFILE ? ["--profile", DATABRICKS_PROFILE] : ["--host", host];
     const args = ["auth", "token", ...selector, "--output", "json"];
@@ -75,9 +91,14 @@ function refreshToken(host: string): Promise<void> {
           const expiresAt = Date.parse(tokenResponse.expiry ?? "") || now + 5 * 60_000;
           cliToken = { value: tokenResponse.access_token, expiresAt };
           refreshAt = Math.max(refreshAt, expiresAt - 60_000);
-        } catch {
-          // Failed refresh: keep the current token, e.g. until the user logs in again.
+          refreshFailing = false;
+        } catch (failure) {
+          // Keep the current token, e.g. until the user logs in again.
+          reportRefreshFailure((failure as Error).message.trim());
         }
+        clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => resolveToken(host), refreshAt - now);
+        refreshTimer.unref();
         refreshing = undefined;
         resolve();
       },

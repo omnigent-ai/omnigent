@@ -100,10 +100,17 @@ fn check_url(url: &str) -> Result<()> {
     let valid = rest.is_some_and(|rest| {
         let (before_query, query) = rest.split_once('?').unwrap_or((rest, ""));
         let host = before_query.split('/').next().unwrap_or_default();
-        let org_selector = query
-            .strip_prefix("o=")
-            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
-        !host.is_empty()
+        let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        // `name[:port]`, where only a bracketed IPv6 name may itself contain ':'.
+        let host_ok = match host.rsplit_once(':') {
+            Some((name, port)) if digits(port) => !name.is_empty(),
+            _ => {
+                !host.is_empty()
+                    && (!host.contains(':') || (host.starts_with('[') && host.ends_with(']')))
+            }
+        };
+        let org_selector = query.strip_prefix("o=").is_some_and(digits);
+        host_ok
             && !host.contains('@')
             && (query.is_empty() || org_selector)
             && !rest.contains('#')
@@ -136,7 +143,10 @@ fn save_recent(path: &Path, recent: &[Server]) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(recent)?;
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    // Write then rename, so an interrupted or concurrent run never leaves a partial file.
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
 }
 
 fn label(server: &Server) -> String {
@@ -295,6 +305,8 @@ mod tests {
             "https://a.example.com/?o=1",
             "https://a.example.com/custom/mount",
             "http://localhost:6767",
+            "http://[::1]:6767/",
+            "http://[::1]",
         ] {
             assert!(check_url(good).is_ok(), "{good:?} should be accepted");
         }
@@ -304,6 +316,9 @@ mod tests {
             "ftp://a.example.com",
             "https://",
             "https:///path",
+            "https://:443",
+            "https://a.example.com:invalid",
+            "https://a.example.com:",
             "https://a.example.com /",
             "https://user:secret@a.example.com",
             "https://a.example.com/?token=secret",
