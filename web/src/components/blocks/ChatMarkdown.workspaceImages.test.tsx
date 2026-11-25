@@ -225,8 +225,11 @@ describe("assistant workspace markdown images", () => {
     VIEWER.openFile.mockClear();
     renderMarkdown("![Screenshot](/workspace/project-worktrees/worker/shot.png)");
 
-    fireEvent.click(await screen.findByRole("button", { name: "Open shot.png" }));
+    const chip = await screen.findByRole("button", { name: "Open shot.png" });
+    expect(VIEWER.openFile).not.toHaveBeenCalled();
+    fireEvent.click(chip);
 
+    expect(VIEWER.openFile).toHaveBeenCalledOnce();
     expect(VIEWER.openFile).toHaveBeenCalledWith("/workspace/project-worktrees/worker/shot.png");
     expect(fetchMock).not.toHaveBeenCalled();
     expect(document.querySelector("img")).toBeNull();
@@ -234,12 +237,21 @@ describe("assistant workspace markdown images", () => {
 
   it("opens a workspace image whose preview failed in the file viewer", async () => {
     VIEWER.openFile.mockClear();
-    fetchMock.mockResolvedValue(new Response("missing", { status: 404 }));
+    let finishRequest!: (response: Response) => void;
+    const request = new Promise<Response>((resolve) => {
+      finishRequest = resolve;
+    });
+    fetchMock.mockReturnValue(request);
     renderMarkdown("![Screenshot](/workspace/project/shots/shot.png)");
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    fireEvent.click(await screen.findByRole("button", { name: "Open shot.png" }));
+    await act(async () => {
+      finishRequest(new Response("missing", { status: 404 }));
+      await request;
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open shot.png" }));
 
+    expect(VIEWER.openFile).toHaveBeenCalledOnce();
     expect(VIEWER.openFile).toHaveBeenCalledWith("shots/shot.png");
   });
 
