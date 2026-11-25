@@ -612,6 +612,19 @@ class SysProjectKpisGetTool(_TicketTool):
     arguments = GetProjectKpis
 
 
+class SysProjectTelemetryGetTool(_TicketTool):
+    tool_name = "sys_project_telemetry_get"
+    read_only = True
+    help_text = (
+        "Read how people work in this project over a UTC window, from the project's own data: "
+        "how people start work (sessions vs tickets), how they use the Lead and roles, how the "
+        "team of roles was built, and what the project shipped (tickets, PRs, rework, review "
+        "rounds, stalled work). Totals only; per-person rows are never returned to agents. "
+        "Numbers that aren't measured on this server are null."
+    )
+    arguments = GetProjectKpis
+
+
 class SysProjectKpisSetTool(_TicketTool):
     tool_name = "sys_project_kpis_set"
     help_text = (
@@ -672,6 +685,7 @@ TICKET_TOOL_CLASSES = (
     SysProjectKpisGetTool,
     SysProjectKpisSetTool,
     SysProjectTicketFileTool,
+    SysProjectTelemetryGetTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}
 READ_ONLY_TICKET_TOOLS: tuple[str, ...] = tuple(

@@ -380,6 +380,7 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
             {"url": f"/v1/projects/{PROJECT}/ticket-attachments/{TICKET}/content"},
         ),
         ("sys_project_kpis_get", {"window": "30d"}),
+        ("sys_project_telemetry_get", {"window": "7d"}),
     ],
 )
 async def test_read_only_tools_only_send_gets(name, args):
@@ -391,6 +392,7 @@ async def test_read_only_tools_only_send_gets(name, args):
         "sys_project_identity_list",
         "sys_project_file_view",
         "sys_project_kpis_get",
+        "sys_project_telemetry_get",
     )
     methods = []
 
@@ -409,7 +411,7 @@ async def test_read_only_tools_only_send_gets(name, args):
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 22
+    assert len(TICKET_TOOLS) == 23
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (

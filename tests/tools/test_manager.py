@@ -107,6 +107,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_project_kpis_get",
         "sys_project_kpis_set",
         "sys_project_ticket_file",
+        "sys_project_telemetry_get",
         # Policy tools are always auto-registered so agents can
         # browse the registry and add policies at runtime.
         "sys_add_policy",

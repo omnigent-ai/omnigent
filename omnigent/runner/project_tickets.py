@@ -118,6 +118,9 @@ async def execute_ticket_tool(
                 },
                 ensure_ascii=False,
             )
+        if name == "sys_project_telemetry_get":
+            result = await request("GET", f"/v1/projects/{project_id}/telemetry", params=body)
+            return json.dumps(result, ensure_ascii=False)
         if name in ("sys_project_kpis_get", "sys_project_kpis_set"):
             path = f"/v1/projects/{project_id}/kpis"
             role = body.pop("role", None)
