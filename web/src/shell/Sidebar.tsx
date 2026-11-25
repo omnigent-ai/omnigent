@@ -36,6 +36,7 @@ import {
   type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
+  type Ref,
   type RefObject,
   createContext,
   Fragment,
@@ -55,6 +56,7 @@ import {
   ArrowUpDownIcon,
   ArchiveRestoreIcon,
   CheckIcon as CheckMarkIcon,
+  ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   ClockIcon,
@@ -1892,15 +1894,32 @@ function ProjectFolder({
   // Each expansion, archive switch or re-sort restarts the page count and auto-load
   // budget; when paginated, the open session is never left hidden.
   const listScope = JSON.stringify([expanded, archived, sortBy]);
+  const agentRow = useCallback(
+    (row: Conversation) => isProjectAgentRow(row, mainSessionIds),
+    [mainSessionIds],
+  );
+  // A project with team roles lists them all first, under "Agents"; paging
+  // ("Show more") only ever applies to its other sessions.
+  const split = useMemo(() => splitAgentRows(conversations, agentRow), [conversations, agentRow]);
+  const grouped = !archived && split.agents.length > 0 && split.sessions.length > 0;
+  const pagedRows = grouped ? split.sessions : conversations;
   const display = useSidebarDisplayPagination(
-    conversations,
+    pagedRows,
     listScope,
     pageSize,
     query.hasNextPage,
     query.fetchNextPage,
-    expanded ? conversations.findIndex((c) => c.id === activeConversationId) : -1,
+    expanded ? pagedRows.findIndex((c) => c.id === activeConversationId) : -1,
   );
-  const visibleCount = display.rows.length;
+  const shownRows = useMemo(
+    () => (grouped ? [...split.agents, ...display.rows] : display.rows),
+    [grouped, split.agents, display.rows],
+  );
+  const listedRows = useMemo(
+    () => (grouped ? [...split.agents, ...split.sessions] : conversations),
+    [grouped, split, conversations],
+  );
+  const visibleCount = shownRows.length;
   // The project-scoped composer lists a ghost row at the top of the folder, as a
   // nested-agent draft does under its parent, until the session is created.
   const draftRow = useMemo<Conversation | null>(() => {
@@ -1936,24 +1955,24 @@ function ProjectFolder({
     growFrom.current = { height: listRef.current?.offsetHeight ?? 0, count: visibleCount };
     return display.loadMore();
   };
-  const states = useSessionBadgeStates(conversations);
+  const states = useSessionBadgeStates(listedRows);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
   // A collapsed folder keeps showing the open session until you navigate away; that
   // row owns its badge, so the header summarizes only the rows it hides.
-  const heldIndex = expanded ? -1 : conversations.findIndex((c) => c.id === activeConversationId);
+  const heldIndex = expanded ? -1 : listedRows.findIndex((c) => c.id === activeConversationId);
   const isHidden = (_row: unknown, index: number) => index !== heldIndex;
   const marker = projectMarkerState(
-    conversations.filter(isHidden),
+    listedRows.filter(isHidden),
     states.filter(isHidden),
     startingConversationId,
   );
   // "Show more" carries the badge of the rows it hides, as a collapsed header does.
   const hiddenMarker =
-    expanded && visibleCount < conversations.length
+    expanded && visibleCount < listedRows.length
       ? projectMarkerState(
-          conversations.slice(visibleCount),
+          listedRows.slice(visibleCount),
           states.slice(visibleCount),
           startingConversationId,
         )
@@ -1963,8 +1982,8 @@ function ProjectFolder({
   // resolves them (the parent sources its action set from these, not the global
   // paginated window), and the visible count for keyboard and range selection.
   useEffect(() => {
-    onConversationsLoaded?.(name, conversations, visibleCount);
-  }, [name, conversations, visibleCount, onConversationsLoaded]);
+    onConversationsLoaded?.(name, listedRows, visibleCount);
+  }, [name, listedRows, visibleCount, onConversationsLoaded]);
 
   // While the first page loads, show a "Loading…" footer instead of the "No
   // chats" empty state (which would otherwise flash before rows arrive).
@@ -2071,13 +2090,13 @@ function ProjectFolder({
         active={headerActive}
         marker={marker}
         titleBadge={newTicketCount > 0 ? <NewTicketBadge count={newTicketCount} /> : undefined}
-        conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
+        conversations={draftRow ? [draftRow, ...shownRows] : shownRows}
         heldConversations={
           expanded
             ? undefined
             : [
                 ...(draftRow ? [draftRow] : []),
-                ...conversations.filter((_row, index) => index === heldIndex),
+                ...listedRows.filter((_row, index) => index === heldIndex),
               ]
         }
         listRef={listRef}
@@ -2097,6 +2116,11 @@ function ProjectFolder({
         onToggleSelected={onToggleSelected}
         onProjectAssigned={onProjectAssigned}
         reorderGroup={reorderable ? `project:${name}` : undefined}
+        agentRow={grouped ? agentRow : undefined}
+        groupCounts={
+          grouped ? { agents: split.agents.length, sessions: split.sessions.length } : undefined
+        }
+        groupStorageKey={projectId ?? name}
         emptyMessage={
           loadingFirstPage ? undefined : archived ? (
             "No archived sessions"
@@ -4727,6 +4751,131 @@ function SectionGroup({
   );
 }
 
+/** A project's team role session (the Lead or a persona), listed under "Agents". */
+function isProjectAgentRow(row: Conversation, mainSessionIds: ReadonlySet<string>): boolean {
+  return sidebarPersonaName(row, mainSessionIds) !== null;
+}
+
+const COLLAPSED_ROW_GROUPS_STORAGE_KEY = "sidebar.collapsedRowGroups";
+
+function readCollapsedRowGroups(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const parsed: unknown = JSON.parse(
+      window.localStorage.getItem(COLLAPSED_ROW_GROUPS_STORAGE_KEY) ?? "[]",
+    );
+    return Array.isArray(parsed)
+      ? parsed.filter((key): key is string => typeof key === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeCollapsedRowGroups(keys: string[]) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(COLLAPSED_ROW_GROUPS_STORAGE_KEY, JSON.stringify(keys));
+  } catch {
+    // A lost local preference is harmless.
+  }
+}
+
+/** Splits rows into agents and other sessions, keeping each session family with its head. */
+export function splitAgentRows(
+  rows: Conversation[],
+  agentRow: (conversation: Conversation) => boolean,
+): { agents: Conversation[]; sessions: Conversation[] } {
+  const agents: Conversation[] = [];
+  const sessions: Conversation[] = [];
+  const familyIsAgent = new Map<string, boolean>();
+  for (const row of rows) {
+    const familyId = row.family?.id;
+    let isAgent = familyId !== undefined ? familyIsAgent.get(familyId) : undefined;
+    if (isAgent === undefined) {
+      isAgent = agentRow(row);
+      if (familyId !== undefined) familyIsAgent.set(familyId, isAgent);
+    }
+    (isAgent ? agents : sessions).push(row);
+  }
+  return { agents, sessions };
+}
+
+/** A project's rows, as one list or as "Agents" and "Sessions" folders when it has both. */
+function SidebarRowGroups({
+  rows,
+  agentRow,
+  storageKey,
+  footer,
+  renderList,
+  listRef,
+  counts,
+  activeConversationId,
+}: {
+  /** A collapsed folder keeps listing the open session, as a collapsed project does. */
+  activeConversationId?: string | null;
+  rows: Conversation[];
+  agentRow?: (conversation: Conversation) => boolean;
+  /** Whole-folder counts, which decide the split when paging hides some rows. */
+  counts?: { agents: number; sessions: number };
+  storageKey?: string;
+  footer: ReactNode;
+  renderList: (rows: Conversation[], ref?: Ref<HTMLUListElement>) => ReactNode;
+  listRef?: Ref<HTMLUListElement>;
+}) {
+  const [collapsedGroups, setCollapsedGroups] = useState(readCollapsedRowGroups);
+  const split = agentRow ? splitAgentRows(rows, agentRow) : null;
+  const agentCount = counts?.agents ?? split?.agents.length ?? 0;
+  const sessionCount = counts?.sessions ?? split?.sessions.length ?? 0;
+  if (!split || agentCount === 0 || sessionCount === 0)
+    return (
+      <>
+        {renderList(rows, listRef)}
+        {footer}
+      </>
+    );
+  const groupKey = (group: string) => `${storageKey ?? ""}:${group}`;
+  const toggle = (group: string) => {
+    const key = groupKey(group);
+    const next = collapsedGroups.includes(key)
+      ? collapsedGroups.filter((entry) => entry !== key)
+      : [...collapsedGroups, key];
+    setCollapsedGroups(next);
+    writeCollapsedRowGroups(next);
+  };
+  const group = (id: string, label: string, groupRows: Conversation[], last: boolean) => {
+    const collapsed = collapsedGroups.includes(groupKey(id));
+    return (
+      <div key={id} data-testid={`sidebar-row-group-${id}`}>
+        <button
+          type="button"
+          aria-expanded={!collapsed}
+          onClick={() => toggle(id)}
+          className="flex h-6 w-full items-center gap-1 rounded-[var(--radius-otto-button)] pl-6 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {collapsed ? (
+            <ChevronRightIcon aria-hidden className="size-3" />
+          ) : (
+            <ChevronDownIcon aria-hidden className="size-3" />
+          )}
+          <span>{label}</span>
+        </button>
+        {collapsed
+          ? groupRows.some((row) => row.id === activeConversationId) &&
+            renderList(groupRows.filter((row) => row.id === activeConversationId))
+          : renderList(groupRows, last ? listRef : undefined)}
+        {last && !collapsed && footer}
+      </div>
+    );
+  };
+  return (
+    <div className="flex flex-col gap-1">
+      {group("agents", "Agents", split.agents, false)}
+      {group("sessions", "Sessions", split.sessions, true)}
+    </div>
+  );
+}
+
 function ConversationSection({
   headerDrag,
   title,
@@ -4760,7 +4909,19 @@ function ConversationSection({
   onProjectAssigned,
   reorderGroup,
   listRef,
+  agentRow,
+  groupStorageKey,
+  groupCounts,
 }: {
+  /** Whole-folder counts for the group headers, when paging hides some sessions. */
+  groupCounts?: { agents: number; sessions: number };
+  /**
+   * Splits the rows into an "Agents" and a "Sessions" folder when both kinds
+   * are present, e.g. a project's team roles apart from its other sessions.
+   */
+  agentRow?: (conversation: Conversation) => boolean;
+  /** Remembers each folder's collapsed state under this key, e.g. the project name. */
+  groupStorageKey?: string;
   headerDrag?: ProjectHeaderDrag;
   title?: string;
   /** Optional icon rendered before the title (e.g. project folder icon). */
@@ -4848,7 +5009,6 @@ function ConversationSection({
       ? !collapsedFamilies.has(row.family.id)
       : undefined;
   const visibleFamilyRows = orderSessionFamilies(rows, collapsedFamilies);
-  const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
 
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
@@ -4959,42 +5119,60 @@ function ConversationSection({
               <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
             )
           ) : (
-            // Indent project chats a step under the project-folder name above.
-            <ul ref={listRef} className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
-              {visibleFamilyRows.map((conv) => (
-                <ConversationRow
-                  key={nestedSessionSidebarKey(conv.id)}
-                  conversation={conv}
-                  familyIndented={isNestedFamilyRow(conv)}
-                  familyNestedCount={familyNestedCount(conv)}
-                  familyParentTitle={familyParentTitle(conv)}
-                  familyExpanded={familyExpandedState(conv)}
-                  onToggleFamily={() => onToggleFamily(conv.family!.id)}
-                  isActive={
-                    conv.id === activeConversationId ||
-                    !!conv.nested_draft_source_id ||
-                    conv.project_draft_name !== undefined
-                  }
-                  inActiveGrid={gridMembers.has(conv.id)}
-                  gridSelected={conv.id === grids?.selectedSessionId}
-                  gridsEnabled={grids?.enabled ?? false}
-                  isPinned={isSessionPinned(conv, new Set(pinnedConversationIds))}
-                  shortcutSlot={sessionShortcutSlots?.get(conv.id)}
-                  onClick={onRowClick}
-                  onTogglePinned={onTogglePinned}
-                  selectionMode={selectionMode}
-                  isSelected={selectedIds.has(conv.id)}
-                  onToggleSelected={onToggleSelected}
-                  onProjectAssigned={onProjectAssigned}
-                  reorderGroup={isNestedFamilyRow(conv) ? undefined : reorderGroup}
-                  previousId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) - 1])}
-                  nextId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) + 1])}
-                  reorderIndex={reorderGroup ? reorderRows.indexOf(conv) : undefined}
-                />
-              ))}
-            </ul>
+            <SidebarRowGroups
+              rows={visibleFamilyRows}
+              agentRow={isCollapsed ? undefined : agentRow}
+              storageKey={groupStorageKey}
+              counts={groupCounts}
+              activeConversationId={activeConversationId}
+              footer={isCollapsed ? null : footer}
+              renderList={(groupRows, ref) => {
+                const groupReorderRows = groupRows.filter((row) => !isNestedFamilyRow(row));
+                return (
+                  // Indent project chats a step under the project-folder name above.
+                  <ul ref={ref} className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
+                    {groupRows.map((conv) => (
+                      <ConversationRow
+                        key={nestedSessionSidebarKey(conv.id)}
+                        conversation={conv}
+                        familyIndented={isNestedFamilyRow(conv)}
+                        familyNestedCount={familyNestedCount(conv)}
+                        familyParentTitle={familyParentTitle(conv)}
+                        familyExpanded={familyExpandedState(conv)}
+                        onToggleFamily={() => onToggleFamily(conv.family!.id)}
+                        isActive={
+                          conv.id === activeConversationId ||
+                          !!conv.nested_draft_source_id ||
+                          conv.project_draft_name !== undefined
+                        }
+                        inActiveGrid={gridMembers.has(conv.id)}
+                        gridSelected={conv.id === grids?.selectedSessionId}
+                        gridsEnabled={grids?.enabled ?? false}
+                        isPinned={isSessionPinned(conv, new Set(pinnedConversationIds))}
+                        shortcutSlot={sessionShortcutSlots?.get(conv.id)}
+                        onClick={onRowClick}
+                        onTogglePinned={onTogglePinned}
+                        selectionMode={selectionMode}
+                        isSelected={selectedIds.has(conv.id)}
+                        onToggleSelected={onToggleSelected}
+                        onProjectAssigned={onProjectAssigned}
+                        reorderGroup={isNestedFamilyRow(conv) ? undefined : reorderGroup}
+                        previousId={reorderNeighbour(
+                          groupReorderRows[groupReorderRows.indexOf(conv) - 1],
+                        )}
+                        nextId={reorderNeighbour(
+                          groupReorderRows[groupReorderRows.indexOf(conv) + 1],
+                        )}
+                        reorderIndex={reorderGroup ? groupReorderRows.indexOf(conv) : undefined}
+                      />
+                    ))}
+                  </ul>
+                );
+              }}
+              listRef={listRef}
+            />
           )}
-          {!isCollapsed && footer}
+          {rows.length === 0 && emptyMessage && !isCollapsed && footer}
         </div>
       )}
     </section>
