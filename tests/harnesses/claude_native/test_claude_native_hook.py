@@ -21,6 +21,7 @@ from omnigent._platform import stable_user_id
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     OBSERVER_HOOK_STDERR_FILE,
+    RELAY_UPSTREAM_UNREACHABLE_HEADER,
     ClaudeNativeHookInterpreterMismatchError,
     approval_wait_is_fresh,
     approval_wait_marker_path,
@@ -1544,6 +1545,179 @@ def test_permission_hook_reauth_takes_only_a_matching_unsent_snapshot(
     assert reauth() == {"Authorization": "Bearer minted"}, "an unchanged snapshot mints"
 
 
+def _write_relay_file(bridge_dir: Path, port: int, token: str) -> None:
+    """Advertise a tool relay in *bridge_dir* the way the runner does."""
+    (bridge_dir / "tool_relay.json").write_text(
+        json.dumps({"url": f"http://127.0.0.1:{port}", "token": token, "session_id": "conv_r"})
+    )
+
+
+class _RecordingClient:
+    """``httpx.Client`` stand-in that records each POST and replays scripted replies.
+
+    Each reply is a status code, an exception class raised as a transport
+    failure, or ``"ok"`` for a verdict. Past the end, the last reply repeats.
+    """
+
+    posts: list[tuple[str, str]] = []
+    replies: list[object] = []
+    on_post: Callable[[int], None] | None = None
+
+    def __init__(self, *, headers: dict[str, str], **_kwargs: object) -> None:
+        self._auth = headers.get("Authorization", "")
+
+    def __enter__(self) -> _RecordingClient:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+
+    def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+        del json
+        cls = type(self)
+        cls.posts.append((url, self._auth))
+        index = len(cls.posts) - 1
+        if cls.on_post is not None:
+            cls.on_post(index)
+        reply = cls.replies[min(index, len(cls.replies) - 1)]
+        request = httpx.Request("POST", url)
+        if isinstance(reply, type) and issubclass(reply, Exception):
+            raise reply("scripted transport failure", request=request)
+        if reply == "ok":
+            return httpx.Response(200, json={"ok": True}, request=request)
+        return httpx.Response(int(reply), text="rejected", request=request)
+
+
+def _recording_client(
+    monkeypatch: pytest.MonkeyPatch,
+    replies: list[object],
+    on_post: Callable[[int], None] | None = None,
+) -> type[_RecordingClient]:
+    """Install a fresh :class:`_RecordingClient` subclass with a fake clock."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        claude_native_hook.time, "sleep", lambda seconds: clock.update(t=clock["t"] + seconds)
+    )
+    client = type(
+        "_Client", (_RecordingClient,), {"posts": [], "replies": replies, "on_post": on_post}
+    )
+    client.clock = clock  # type: ignore[attr-defined]
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+    return client
+
+
+def _permission_bridge_with_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, relay_auth: bool = False
+) -> Path:
+    """Prepare a permission bridge and feed the hook one Read request."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_relay")
+    if relay_auth:
+        build_hook_settings(
+            bridge_dir,
+            ap_server_url="http://127.0.0.1:8787",
+            ap_auth_headers={"Authorization": "Bearer xyz"},
+            relay_auth=True,
+        )
+    payload = {"hook_event_name": "PermissionRequest", "tool_name": "Read", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    return bridge_dir
+
+
+def test_permission_request_hook_goes_through_the_tool_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The hook posts to the session's tool relay, following it when it restarts.
+
+    The relay authenticates with the runner's refresh-capable client, so the
+    hook sends only the relay's local token, never a server bearer. A relay
+    restarted on a new port or token is picked up on the next attempt.
+    """
+    bridge_dir = _permission_bridge_with_stdin(tmp_path, monkeypatch)
+    _write_relay_file(bridge_dir, 47001, "relay-one")
+
+    def restart_relay(index: int) -> None:
+        if index == 0:
+            _write_relay_file(bridge_dir, 47002, "relay-two")
+
+    client = _recording_client(monkeypatch, [httpx.ConnectError, "ok"], restart_relay)
+
+    assert claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert client.posts == [
+        ("http://127.0.0.1:47001/hook/claude/permission-request", "Bearer relay-one"),
+        ("http://127.0.0.1:47002/hook/claude/permission-request", "Bearer relay-two"),
+    ]
+
+
+@pytest.mark.parametrize("relay_starts", [True, False], ids=["relay-starts", "relay-never-starts"])
+def test_relay_auth_permission_hook_waits_a_bounded_time_for_the_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    relay_starts: bool,
+) -> None:
+    """A prompt raised before the runner's relay is up waits for it, then fails safe.
+
+    The hook config of a relay-authenticated session holds no bearer. If the
+    relay never appears, the direct call is rejected and the hook returns no
+    decision, so Claude keeps its own prompt: nothing is approved.
+    """
+    bridge_dir = _permission_bridge_with_stdin(tmp_path, monkeypatch, relay_auth=True)
+    monkeypatch.setattr(native_policy_hook, "policy_hook_reauth", lambda *_args: lambda: None)
+    client = _recording_client(monkeypatch, ["ok"] if relay_starts else [401])
+    sleep = claude_native_hook.time.sleep
+
+    def sleep_then_start_relay(seconds: float) -> None:
+        sleep(seconds)
+        if relay_starts and client.clock["t"] >= 3.0:  # type: ignore[attr-defined]
+            _write_relay_file(bridge_dir, 47003, "relay-late")
+
+    monkeypatch.setattr(claude_native_hook.time, "sleep", sleep_then_start_relay)
+
+    assert claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+
+    stdout = capsys.readouterr().out
+    if relay_starts:
+        assert json.loads(stdout) == {"ok": True}
+        assert client.posts == [
+            ("http://127.0.0.1:47003/hook/claude/permission-request", "Bearer relay-late")
+        ]
+        assert client.clock["t"] < claude_native_hook._RELAY_WAIT_S  # type: ignore[attr-defined]
+    else:
+        assert stdout == "", "a prompt with no relay and no bearer must not get a verdict"
+        assert client.clock["t"] >= claude_native_hook._RELAY_WAIT_S  # type: ignore[attr-defined]
+        assert client.posts == [
+            ("http://127.0.0.1:8787/v1/sessions/conv_relay/hooks/permission-request", "")
+        ]
+
+
+def test_relay_auth_evaluate_policy_waits_for_the_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool call checked before the relay is up waits for it instead of a bearer."""
+    bridge_dir = _permission_bridge_with_stdin(tmp_path, monkeypatch, relay_auth=True)
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    client = _recording_client(monkeypatch, ["ok"])
+    sleep = claude_native_hook.time.sleep
+
+    def sleep_then_start_relay(seconds: float) -> None:
+        sleep(seconds)
+        _write_relay_file(bridge_dir, 47004, "relay-eval")
+
+    monkeypatch.setattr(claude_native_hook.time, "sleep", sleep_then_start_relay)
+
+    assert claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)]) == 0
+
+    assert client.posts == [("http://127.0.0.1:47004/policies/evaluate", "Bearer relay-eval")]
+
+
 def _assert_chat_fallback(stdout: str) -> None:
     """
     Assert the hook denied a question with the ask-in-chat hint.
@@ -2840,6 +3014,7 @@ def _scripted_client(
         timeout elapses (a held poll whose reply never arrives; ignores ``held_s``)
       * ``"5xx"``     — a 503 response (hard iff ``held_s`` < the floor; a
         gateway 5xx ending a held poll is a sever)
+      * ``"unreachable"`` — the tool relay's 502 for a server it never reached
       * ``"401"`` / ``"403"`` — an auth rejection
       * ``"ok"``      — a 200 response (the human answered: final)
 
@@ -2893,6 +3068,13 @@ def _scripted_client(
                 raise httpx.ReadTimeout("no reply before the read timeout", request=req)
             if kind == "5xx":
                 return httpx.Response(503, text="upstream down", request=req)
+            if kind == "unreachable":
+                return httpx.Response(
+                    502,
+                    headers={RELAY_UPSTREAM_UNREACHABLE_HEADER: "1"},
+                    text="omnigent policy-eval proxy could not reach the Omnigent server",
+                    request=req,
+                )
             if kind in ("401", "403"):
                 return httpx.Response(int(kind), text="Invalid Token", request=req)
             if kind == "ok":
@@ -3159,9 +3341,12 @@ def test_reattach_held_poll_sever_resets_backoff(monkeypatch: pytest.MonkeyPatch
     assert sleeps == [initial, initial * 2, initial * 4, initial, initial]
 
 
+@pytest.mark.parametrize(
+    ("outage", "attempt_s"), [("connect", 30.0), ("unreachable", 0.0)], ids=["direct", "via-relay"]
+)
 @pytest.mark.parametrize("answer_window_s", [None, 270.0], ids=["approval", "question"])
 def test_reattach_parked_wait_rides_out_a_host_network_outage(
-    monkeypatch: pytest.MonkeyPatch, answer_window_s: float | None
+    monkeypatch: pytest.MonkeyPatch, answer_window_s: float | None, outage: str, attempt_s: float
 ) -> None:
     """A parked prompt keeps retrying while the host cannot reach the server.
 
@@ -3169,11 +3354,12 @@ def test_reattach_parked_wait_rides_out_a_host_network_outage(
     connects left Claude's prompt blocking the session with no card to answer,
     so web messages stayed buffered until the turn failed. A question's answer
     window doesn't end this wait, since reconnecting re-publishes its card.
+    Through the tool relay the same outage arrives as the relay's quick, marked 502.
     """
     cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
     held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
     client = _scripted_client(
-        script=[("5xx", held)] + [("connect", 30.0)] * (cap * 3) + [("ok", 0.0)],
+        script=[("5xx", held)] + [(outage, attempt_s)] * (cap * 3) + [("ok", 0.0)],
         monkeypatch=monkeypatch,
     )
     monkeypatch.setattr(native_policy_hook.httpx, "Client", client)

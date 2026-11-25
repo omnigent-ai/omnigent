@@ -5072,6 +5072,27 @@ def test_augment_claude_args_registers_permission_command_hook(
     assert "context_raw.json" in settings["statusLine"]["command"]
 
 
+def test_augment_claude_args_relay_auth_keeps_no_bearer_in_the_hook_config(
+    tmp_path: Path,
+) -> None:
+    """A session whose hooks use the runner's relay keeps no bearer on disk.
+
+    Routing headers stay, so the direct fallback still reaches the right replica.
+    """
+    augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz", "X-Databricks-Org-Id": "123"},
+        relay_auth=True,
+    )
+    permission_config = json.loads((tmp_path / "permission_hook.json").read_text(encoding="utf-8"))
+    assert permission_config["ap_auth_headers"] == {"X-Databricks-Org-Id": "123"}
+    assert permission_config["relay_auth"] is True
+    assert "Bearer xyz" not in (tmp_path / "permission_hook.json").read_text(encoding="utf-8")
+
+
 def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
     tmp_path: Path,
 ) -> None:
@@ -16721,11 +16742,69 @@ async def test_pi_extension_ui_relay_path_proxies_to_session_hook(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra_bytes", [False, True])
-async def test_pi_dialog_disconnect_cancels_upstream_wait(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_bytes: bool
+async def test_claude_permission_relay_path_parks_on_the_active_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Client EOF or pipelined bytes release the upstream wait without spinning."""
+    """The relay forwards a permission request to the bridge's active session.
+
+    A /clear or fork rotates the bridge without restarting the relay, so the
+    relay's own session would park the card on the session the user left.
+    """
+    verdict = {"hookSpecificOutput": {"decision": {"behavior": "allow"}}}
+    client = _ScriptedPolicyClient(verdict)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "conv_after_clear"}))
+    payload = {"tool_name": "Read", "_omnigent_elicitation_id": "elicit_claude_" + "cd" * 16}
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/hook/claude/permission-request", payload
+        )
+        assert json.loads(body) == verdict
+        assert client.urls == ["/v1/sessions/conv_after_clear/hooks/permission-request"]
+        assert client.bodies == [payload]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "unreachable"),
+    [(httpx.ConnectError("refused"), True), (httpx.ReadError("cut"), False)],
+    ids=["never-connected", "cut-mid-request"],
+)
+async def test_relay_proxy_error_marks_a_server_it_never_reached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception, unreachable: bool
+) -> None:
+    """A relay 502 says whether the runner ever reached the Omnigent server."""
+    import urllib.error
+
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient(failure))
+    try:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            await asyncio.to_thread(
+                _relay_request_raw,
+                bridge_dir,
+                "/hook/claude/permission-request",
+                {"tool_name": "Read"},
+            )
+        assert raised.value.code == 502
+        marker = raised.value.headers.get(claude_native_bridge.RELAY_UPSTREAM_UNREACHABLE_HEADER)
+        assert (marker == "1") is unreachable
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_bytes", [False, True])
+@pytest.mark.parametrize("path", ["/hook/pi/extension-ui", "/hook/claude/permission-request"])
+async def test_pi_dialog_disconnect_cancels_upstream_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_bytes: bool, path: str
+) -> None:
+    """Client EOF or pipelined bytes release the upstream wait without spinning.
+
+    A permission hook that exits because the prompt was answered in the
+    terminal must release its parked card the same way.
+    """
     started, cancelled = asyncio.Event(), asyncio.Event()
 
     class WaitingClient:
@@ -16746,7 +16825,7 @@ async def test_pi_dialog_disconnect_cancels_upstream_wait(
         body = json.dumps({"elicitation_id": "cancel-check", "request": {"method": "confirm"}})
         writer.write(
             (
-                "POST /hook/pi/extension-ui HTTP/1.1\r\n"
+                f"POST {path} HTTP/1.1\r\n"
                 f"Host: {url.netloc}\r\nAuthorization: Bearer {info['token']}\r\n"
                 f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
             ).encode()

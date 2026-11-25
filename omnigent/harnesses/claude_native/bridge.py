@@ -2657,6 +2657,7 @@ def build_hook_settings(
     launch_effort: str | None = None,
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    relay_auth: bool = False,
 ) -> _JsonObject:
     """
     Build invocation-local Claude Code hook settings.
@@ -2681,6 +2682,9 @@ def build_hook_settings(
         ``PermissionRequest`` command hook, e.g.
         ``{"Authorization": "Bearer <token>"}``. Stored in the
         owner-only bridge directory instead of in hook argv.
+    :param relay_auth: ``True`` when the runner starts this session's tool
+        relay, which authenticates hook requests itself. The file then keeps
+        no ``Authorization`` header, and the hooks wait for the relay.
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
@@ -2844,14 +2848,19 @@ def build_hook_settings(
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
-        _write_json_file(
-            bridge_dir / _PERMISSION_HOOK_FILE,
-            {
-                "ap_server_url": ap_server_url,
-                "ap_auth_headers": ap_auth_headers or {},
-                "updated_at": time.time(),
-            },
-        )
+        hook_headers = {
+            key: value
+            for key, value in (ap_auth_headers or {}).items()
+            if not (relay_auth and key.lower() == "authorization")
+        }
+        hook_config: _JsonObject = {
+            "ap_server_url": ap_server_url,
+            "ap_auth_headers": hook_headers,
+            "updated_at": time.time(),
+        }
+        if relay_auth:
+            hook_config["relay_auth"] = True
+        _write_json_file(bridge_dir / _PERMISSION_HOOK_FILE, hook_config)
         # ``PermissionRequest`` fires only when Claude is about to
         # show its TUI permission prompt — that's exactly the
         # interception point we want for routing to the web UI.
@@ -3145,6 +3154,7 @@ def augment_claude_args(
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
     active_harnesses: Collection[str] | None = None,
+    relay_auth: bool = False,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3198,6 +3208,8 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param relay_auth: ``True`` when the runner starts this session's tool
+        relay; threaded to :func:`build_hook_settings`.
     :returns: Augmented argument list for the terminal resource.
     """
     hook_settings = build_hook_settings(
@@ -3213,6 +3225,7 @@ def augment_claude_args(
         launch_effort=_launch_effort_arg(claude_args),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
+        relay_auth=relay_auth,
     )
     from omnigent.mcp_disabled_servers import apply_claude_settings
 
@@ -8763,6 +8776,8 @@ def _handler_factory(
 # body. Applied to the detail before the fixed prefix so the leading cause is
 # never cut mid-reason by the truncation.
 _POLICY_PROXY_ERROR_DETAIL_MAX = 400
+#: Set on a relay 502 when the runner never reached the Omnigent server.
+RELAY_UPSTREAM_UNREACHABLE_HEADER = "X-Omnigent-Upstream-Unreachable"
 
 # How long /hook/observe-tool waits for the file-change observer before
 # answering. Generous enough for a first-call registry resolution (one server
@@ -8823,6 +8838,7 @@ def _tool_relay_handler_factory(
                 "/tool",
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
+                "/hook/claude/permission-request",
                 "/hook/pi/extension-ui",
                 "/hook/observe-tool",
                 "/hook/claude/event",
@@ -8861,6 +8877,17 @@ def _tool_relay_handler_factory(
                 return
             if self.path == "/policies/evaluate":
                 self._handle_policy_evaluate(payload)
+                return
+            if self.path == "/hook/claude/permission-request":
+                # A /clear or fork moves the bridge to a new session without
+                # restarting the relay, so park the card on the active one.
+                active = read_active_session_id(bridge_dir) if bridge_dir else None
+                self._proxy_parked_request(
+                    payload,
+                    "/hooks/permission-request",
+                    watch_disconnect=True,
+                    target_session_id=active,
+                )
                 return
             if self.path == "/hook/pi/extension-ui":
                 self._handle_pi_extension_ui(payload)
@@ -9080,12 +9107,18 @@ def _tool_relay_handler_factory(
             self._proxy_parked_request(payload, "/hooks/pi-extension-ui", watch_disconnect=True)
 
         def _proxy_parked_request(
-            self, payload: _JsonObject, path: str, *, watch_disconnect: bool = False
+            self,
+            payload: _JsonObject,
+            path: str,
+            *,
+            watch_disconnect: bool = False,
+            target_session_id: str | None = None,
         ) -> None:
-            if policy_client is None or session_id is None:
+            target = target_session_id or session_id
+            if policy_client is None or target is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
-            session_component = urllib.parse.quote(session_id, safe="")
+            session_component = urllib.parse.quote(target, safe="")
             url = f"/v1/sessions/{session_component}{path}"
             future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
             try:
@@ -9141,8 +9174,18 @@ def _tool_relay_handler_factory(
                 detail = detail[: _POLICY_PROXY_ERROR_DETAIL_MAX - 3] + "..."
             message = f"omnigent policy-eval proxy could not reach the Omnigent server: {detail}"
             body = message.encode("utf-8", "replace")
+            import httpx
+
+            never_connected = isinstance(
+                exc,
+                (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError),
+            )
             try:
                 self.send_response(HTTPStatus.BAD_GATEWAY)
+                if never_connected:
+                    # The hook rides out an unreachable server as it would a
+                    # failed connect of its own.
+                    self.send_header(RELAY_UPSTREAM_UNREACHABLE_HEADER, "1")
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
