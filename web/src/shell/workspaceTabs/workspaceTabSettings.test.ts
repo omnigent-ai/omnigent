@@ -6,7 +6,7 @@ import { parseAppliedTabSettings, tabSettingsChange } from "./workspaceTabSettin
 
 const showsAll = () => true;
 /** A strip on its empty New tab, with room for every page. */
-const fresh = { canShow: showsAll, canOpen: showsAll, untouched: true };
+const fresh = { canShow: showsAll, canOpen: showsAll, untouched: true, choseSince: false };
 const settings = (pinned: DefaultWorkspaceTab[], initial: DefaultWorkspaceTab | null) => ({
   pinned,
   initial,
@@ -77,6 +77,16 @@ describe("tabSettingsChange", () => {
     expect(
       tabSettingsChange(settings(["github", "tasks"], "github"), first.applied, fresh),
     ).toMatchObject({ pin: ["github"], select: "github" });
+  });
+
+  it("drops a waiting first page once someone picked a tab, and selects a changed one", () => {
+    const waiting = { pinned: ["tasks"] as DefaultWorkspaceTab[], initial: null };
+    const picked = { ...fresh, untouched: false, choseSince: true };
+    const change = tabSettingsChange(settings(["github", "tasks"], "github"), waiting, picked);
+    expect(change).toMatchObject({ pin: ["github"], select: null });
+    expect(change.applied.initial).toBe("github");
+    const taken = { pinned: ["tasks"] as DefaultWorkspaceTab[], initial: "tasks" as const };
+    expect(tabSettingsChange(settings(["tasks"], "files"), taken, picked).select).toBe("files");
   });
 
   it("keeps what a strip shows when it first takes the settings, taking the first page", () => {

@@ -242,6 +242,8 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   let selectedTabId: TabId | null = options.initial.selectedTabId;
   let closed: ClosedTab[] = [...options.initial.closed];
   let tabSettings: AppliedTabSettings | undefined = options.initial.tabSettings;
+  // The selection the settings last left; unknown after a reload, which counts as a pick.
+  let settingsSelection: TabId | null | undefined;
   let revision = 0;
   // Dirty-state changes bump the revision too. One made by answering the very
   // question being asked (discarding the edits) is excused, so it isn't "newer".
@@ -1203,6 +1205,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       // The first page, unpinned, opens after the pins when there is room for it too.
       canOpen: (page) => openable.has(page) || settingsPageTab(page) !== undefined || room > 0,
       untouched: empty,
+      choseSince: settingsSelection === undefined || settingsSelection !== selectedTabId,
     });
     const nothingToDo =
       change.pin.length === 0 && change.unpin.length === 0 && change.select === null;
@@ -1231,6 +1234,8 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       }
     }
     commit();
+    // After the commit, which selects the first arrival when nothing is selected.
+    settingsSelection = selectedTabId;
     return true;
   }
 

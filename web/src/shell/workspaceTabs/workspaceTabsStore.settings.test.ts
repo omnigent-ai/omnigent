@@ -123,6 +123,22 @@ describe("a strip following the Workspace settings", () => {
     expect(selectedKind(store)).toBe("pulls");
   });
 
+  it("doesn't take the selection for a waiting first page from a tab the user picked", async () => {
+    const { store } = makeStore();
+    let pullRequests = false;
+    const canShow = (page: DefaultWorkspaceTab) => page !== "github" || pullRequests;
+    store.applyTabSettings(settings(["github", "tasks"], "github"), canShow);
+    await store.open(
+      { place: { kind: "files", path: "README.md" } },
+      { opener: "user", disposition: "new" },
+    );
+    pullRequests = true;
+    store.applyTabSettings(settings(["github", "tasks"], "github"), canShow);
+    expect(strip(store)).toContain("pulls (pinned)");
+    expect(selectedKind(store)).toBe("files");
+    expect(store.applyTabSettings(settings(["github", "tasks"], "github"), canShow)).toBe(false);
+  });
+
   it("saves what it took with the strip, and a reloaded strip doesn't take it again", () => {
     const { store, save } = makeStore();
     store.applyTabSettings(settings(["tasks"], "tasks"), showsAll);
