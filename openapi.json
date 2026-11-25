@@ -28289,6 +28289,58 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell": {
+      "get": {
+        "description": "Whether a terminal runs anything besides its login shell, so closing it can skip asking.\n\nOnly a caller who may close the terminal may ask: edit access, as deleting it needs.\nEvery miss answers one fixed 404, and runner failures become fixed messages: the\nrunner's text never reaches the caller, and its answer is rebuilt field by field.\n\n**Returns:** `{\"state\", \"foreground\", \"background_jobs\"}`.",
+        "operationId": "get_session_terminal_shell_v1_sessions__session_id__resources_terminals__terminal_id__shell_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Terminal resource id, e.g. `\"terminal_bash_s1\"`.",
+            "in": "path",
+            "name": "terminal_id",
+            "required": true,
+            "schema": {
+              "title": "Terminal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Terminal Shell",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/{resource_id}": {
       "get": {
         "description": "Return a single resource by id from the unified inventory.\n\n**Returns:** The resource object regardless of type.",
