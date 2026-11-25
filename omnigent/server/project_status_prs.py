@@ -20,7 +20,7 @@ session that isn't the Lead. Anything else counts in the total but no member.
 **Storage:** the deduplicated, attributed items are kept per project in
 ``project_merged_prs`` so a window's count is one indexed query. A project's rows
 are recomputed with the rules above: on its first read, after any write that
-clears its ``"prs"`` or ``"tickets"`` status inputs (in the background, coalesced
+clears its ``"prs"`` status input (in the background, coalesced
 per project; a read of a project with such a write pending recomputes first), and
 in the background once they are older than :data:`_STALE_AFTER_S`, which also
 catches writes on another server process.
@@ -44,7 +44,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 
 from omnigent.db.db_models import (
     SqlConversationMetadata,
@@ -96,6 +96,8 @@ _STALE_AFTER_S = 900
 # A burst of writes to one project waits this long so it costs one recompute.
 _REFRESH_COALESCE_S = 2.0
 _PR_KEY_MAX_CHARS = 512
+# Stored rows removed per DELETE, under SQLite's bound-parameter limit.
+_DELETE_CHUNK = 500
 _PR_PATH = re.compile(
     r"^/(?P<repo>[^/]+/[^/]+(?:/[^/]+)*?)/(?:pull|pulls|merge_requests|-/merge_requests)/(?P<number>\d+)"
 )
@@ -327,27 +329,64 @@ class ProjectPrsMergedSource:
             items = self.compute_items(project)
 
             def write(session: Any) -> None:
-                session.execute(
-                    delete(SqlProjectMergedPr).where(
-                        SqlProjectMergedPr.workspace_id == workspace_id,
-                        SqlProjectMergedPr.project_id == project_hex,
-                    )
-                )
-                rows: dict[str, MergedItem] = {}
+                wanted: dict[str, tuple[int | None, MemberKey | None, str]] = {}
                 for item in items:
-                    rows.setdefault(_row_key(item.key), item)
-                session.add_all(
-                    SqlProjectMergedPr(
-                        workspace_id=workspace_id,
-                        project_id=project_hex,
-                        pr_key=key,
-                        merged_at=None if item.merged_at is None else int(item.merged_at),
-                        member_key=item.member,
-                        claimed_by=" ".join(item.claimed_by),
-                        updated_at=started,
+                    wanted.setdefault(
+                        _row_key(item.key),
+                        (
+                            None if item.merged_at is None else int(item.merged_at),
+                            item.member,
+                            " ".join(item.claimed_by),
+                        ),
                     )
-                    for key, item in rows.items()
+                this_project = (
+                    SqlProjectMergedPr.workspace_id == workspace_id,
+                    SqlProjectMergedPr.project_id == project_hex,
                 )
+                stored = {
+                    key: (merged_at, member, claimed_by)
+                    for key, merged_at, member, claimed_by in session.execute(
+                        select(
+                            SqlProjectMergedPr.pr_key,
+                            SqlProjectMergedPr.merged_at,
+                            SqlProjectMergedPr.member_key,
+                            SqlProjectMergedPr.claimed_by,
+                        ).where(*this_project)
+                    )
+                }
+                # Write only what changed; a refresh after one merge touches one row.
+                gone = [key for key in stored if key not in wanted]
+                for start in range(0, len(gone), _DELETE_CHUNK):
+                    session.execute(
+                        delete(SqlProjectMergedPr).where(
+                            *this_project,
+                            SqlProjectMergedPr.pr_key.in_(gone[start : start + _DELETE_CHUNK]),
+                        )
+                    )
+                for key, (merged_at, member, claimed_by) in wanted.items():
+                    if key not in stored:
+                        session.add(
+                            SqlProjectMergedPr(
+                                workspace_id=workspace_id,
+                                project_id=project_hex,
+                                pr_key=key,
+                                merged_at=merged_at,
+                                member_key=member,
+                                claimed_by=claimed_by,
+                                updated_at=started,
+                            )
+                        )
+                    elif stored[key] != (merged_at, member, claimed_by):
+                        session.execute(
+                            update(SqlProjectMergedPr)
+                            .where(*this_project, SqlProjectMergedPr.pr_key == key)
+                            .values(
+                                merged_at=merged_at,
+                                member_key=member,
+                                claimed_by=claimed_by,
+                                updated_at=started,
+                            )
+                        )
                 marker = session.get(SqlProjectMergedPrRefresh, (workspace_id, project_hex))
                 if marker is None:
                     session.add(
@@ -412,6 +451,15 @@ class ProjectPrsMergedSource:
             str(completed["name"]).lower(),
         )
         project_hex = _hex(project.id)
+        # Move dates from the indexed stage-move table, so only PR outputs need decoding.
+        latest_moves = self._tickets.latest_moves_into(
+            project.id, completed["id"], user_id=project.user_id
+        )
+        event_kinds = (
+            (EVENT_CODES["output"],)
+            if latest_moves is not None
+            else (EVENT_CODES["updated"], EVENT_CODES["output"])
+        )
         with self._ticket_db("list_merged_tickets_for_status") as session:
             ticket_ids = list(
                 session.scalars(
@@ -424,28 +472,43 @@ class ProjectPrsMergedSource:
             )
             if not ticket_ids:
                 return []
-            events = session.scalars(
-                select(SqlProjectTicketEvent)
-                .where(
-                    SqlProjectTicketEvent.workspace_id == current_workspace_id(),
-                    SqlProjectTicketEvent.project_id == project_hex,
-                    SqlProjectTicketEvent.ticket_id.in_(ticket_ids),
-                    SqlProjectTicketEvent.kind.in_(
-                        (EVENT_CODES["updated"], EVENT_CODES["output"])
-                    ),
+            # Few PR outputs and links exist per project, so read them all and filter here:
+            # a long IN list of ticket IDs costs more than the rows it saves.
+            in_stage = set(ticket_ids)
+            event_filter = (
+                ()
+                if latest_moves is not None
+                else (SqlProjectTicketEvent.ticket_id.in_(ticket_ids),)
+            )
+            events = [
+                event
+                for event in session.scalars(
+                    select(SqlProjectTicketEvent)
+                    .where(
+                        SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                        SqlProjectTicketEvent.project_id == project_hex,
+                        SqlProjectTicketEvent.kind.in_(event_kinds),
+                        *event_filter,
+                    )
+                    .order_by(SqlProjectTicketEvent.created_at)
                 )
-                .order_by(SqlProjectTicketEvent.created_at)
-            ).all()
-            links = session.execute(
-                select(SqlProjectTicketSession.ticket_id, SqlProjectTicketSession.session_id)
-                .where(
-                    SqlProjectTicketSession.workspace_id == current_workspace_id(),
-                    SqlProjectTicketSession.project_id == project_hex,
-                    SqlProjectTicketSession.ticket_id.in_(ticket_ids),
+                if event.ticket_id in in_stage
+            ]
+            links = [
+                (ticket_id, session_id)
+                for ticket_id, session_id in session.execute(
+                    select(SqlProjectTicketSession.ticket_id, SqlProjectTicketSession.session_id)
+                    .where(
+                        SqlProjectTicketSession.workspace_id == current_workspace_id(),
+                        SqlProjectTicketSession.project_id == project_hex,
+                    )
+                    .order_by(
+                        SqlProjectTicketSession.created_at, SqlProjectTicketSession.session_id
+                    )
                 )
-                .order_by(SqlProjectTicketSession.created_at, SqlProjectTicketSession.session_id)
-            ).all()
-        moved_at: dict[str, int] = {}
+                if ticket_id in in_stage
+            ]
+        moved_at: dict[str, int] = dict(latest_moves or {})
         pr_urls: dict[str, list[str]] = {}
         for event in events:
             payload: dict[str, Any] = event.payload or {}
@@ -582,7 +645,8 @@ def mark_stale(project_id: str, *, workspace_id: int | None = None) -> None:
 
 
 def _on_status_invalidated(project_id: str, inputs: tuple[str, ...]) -> None:
-    if _refreshing.get() or not ({"prs", "tickets"} & set(inputs)):
+    # Ticket writes that can change merged PRs (moves, PR outputs, links, stages) clear "prs" too.
+    if _refreshing.get() or "prs" not in inputs:
         return
     mark_stale(project_id)
 

@@ -10,7 +10,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy import update
 
-from omnigent.db.db_models import SqlProjectTicketEvent, current_workspace_id
+from omnigent.db.db_models import SqlProjectMergedPr, SqlProjectTicketEvent, current_workspace_id
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.entities.project_ticket import (
@@ -241,19 +241,84 @@ def test_a_merge_after_a_read_shows_on_the_next_read(setup) -> None:
     assert source.prs_merged(project, period).total == before + 1
 
 
-def test_only_pr_and_ticket_invalidations_leave_rows_stale(setup) -> None:
+def test_only_pr_invalidations_leave_rows_stale(setup) -> None:
     project, _tickets, _conversations, state, _db_uri = setup
     source = build_source(state)
     source.prs_merged(project, status_period("all", NOW))
     workspace = current_workspace_id()
-    project_status_cache.invalidate(project.id, ("spend",))
-    assert not project_status_prs._is_stale(workspace, project.id)
-    source.refresh(project)
-    assert not project_status_prs._is_stale(workspace, project.id)
-    project_status_cache.invalidate(project.id, ("tickets",))
+    for inputs in (("spend",), ("tickets",)):
+        project_status_cache.invalidate(project.id, inputs)
+        assert not project_status_prs._is_stale(workspace, project.id), inputs
+    project_status_cache.invalidate(project.id, ("tickets", "prs"))
     assert project_status_prs._is_stale(workspace, project.id)
     source.prs_merged(project, status_period("all", NOW))
     assert not project_status_prs._is_stale(workspace, project.id)
+
+
+def test_ticket_writes_mark_rows_stale_only_when_they_can_change_merged_prs(setup) -> None:
+    project, tickets, conversations, state, _db_uri = setup
+    worker = uuid4().hex
+    conversations.create_conversation(conversation_id=worker, project_id=project.id)
+    source = build_source(state)
+    workspace = current_workspace_id()
+    actor = TicketActor("alice")
+
+    def fresh() -> None:
+        source.prs_merged(project, status_period("all", NOW + 60))
+        assert not project_status_prs._is_stale(workspace, project.id)
+
+    fresh()
+    ticket = tickets.create(project.id, CreateTicket(title="Work"), actor)["id"]
+    tickets.update(project.id, ticket, UpdateTicket(title="Renamed"), actor)
+    assert not project_status_prs._is_stale(workspace, project.id)
+    for write in (
+        lambda: tickets.link_session(project.id, ticket, worker, "attach", actor),
+        lambda: tickets.update(project.id, ticket, UpdateTicket(stage_id="merged"), actor),
+        lambda: tickets.comment(
+            project.id,
+            ticket,
+            CommentOnTicket(text="PR", outputs=[{"type": "pull_request", "url": PR + "/files"}]),
+            actor,
+        ),
+    ):
+        fresh()
+        write()
+        assert project_status_prs._is_stale(workspace, project.id)
+    fresh()
+    stages = tickets.stages(project.id, user_id="alice")["stages"]
+    tickets.update_stages(
+        project.id,
+        UpdateTicketStages(
+            stages=[TicketStage(**{**stage, "name": stage["name"] + "!"}) for stage in stages]
+        ),
+        actor,
+    )
+    assert project_status_prs._is_stale(workspace, project.id)
+
+
+def test_merged_tickets_read_move_dates_from_the_stage_move_table(setup, monkeypatch) -> None:
+    project, tickets, _conversations, state, _db_uri = setup
+    _seed(setup)
+    source = build_source(state)
+    replayed = source._merged_tickets(project)
+    tickets.set_move_member_resolver(lambda _project: lambda _actor: user_member_key("alice"))
+    calls = []
+    real = tickets.latest_moves_into
+    monkeypatch.setattr(
+        tickets,
+        "latest_moves_into",
+        lambda *args, **kwargs: calls.append(1) or real(*args, **kwargs),
+    )
+    from_table = source._merged_tickets(project)
+    assert calls and from_table == replayed and len(from_table) == 3
+    # A later move back into the stage is the date that counts, as in the event replay.
+    reopened = from_table[0].ticket_id
+    tickets.update(project.id, reopened, UpdateTicket(stage_id="open"), TicketActor("alice"))
+    tickets.update(project.id, reopened, UpdateTicket(stage_id="merged"), TicketActor("alice"))
+    monkeypatch.setattr(tickets, "latest_moves_into", lambda *args, **kwargs: None)
+    replayed = source._merged_tickets(project)
+    monkeypatch.setattr(tickets, "latest_moves_into", real)
+    assert source._merged_tickets(project) == replayed
 
 
 def test_the_background_refresher_recomputes_a_stale_project(setup, monkeypatch) -> None:
@@ -283,3 +348,37 @@ def test_overlong_pr_keys_are_stored_hashed() -> None:
     stored = project_status_prs._row_key(long_key)
     assert stored.startswith("sha256:") and len(stored) <= 512
     assert project_status_prs._row_key(PR) == PR
+
+
+def test_a_refresh_writes_only_the_rows_that_changed(setup, monkeypatch) -> None:
+    project, tickets, _conversations, state, db_uri = setup
+    _person, other = _seed(setup)
+    source = build_source(state)
+    source.refresh(project)
+
+    def stored() -> dict[str, tuple]:
+        with get_or_create_engine(db_uri).connect() as connection:
+            rows = connection.execute(
+                sa.select(
+                    SqlProjectMergedPr.pr_key,
+                    SqlProjectMergedPr.member_key,
+                    SqlProjectMergedPr.updated_at,
+                ).where(SqlProjectMergedPr.project_id == project.id)
+            ).all()
+        return {key: (member, updated_at) for key, member, updated_at in rows}
+
+    before = stored()
+    later = int(time.time()) + 100
+    monkeypatch.setattr(project_status_prs.time, "time", lambda: later)
+    reopened = next(key for key in before if key.startswith("ticket:")).removeprefix("ticket:")
+    tickets.update(project.id, reopened, UpdateTicket(stage_id="open"), TicketActor("alice"))
+    added = _merge_ticket(tickets, project, other)
+    source.refresh(project)
+    after = stored()
+    assert f"ticket:{reopened}" not in after
+    assert after[f"ticket:{added}"][1] == later
+    unchanged = before.keys() - {f"ticket:{reopened}"}
+    assert {key: after[key] for key in unchanged} == {key: before[key] for key in unchanged}
+    assert sorted(source.merged_items(project), key=lambda item: item.key) == sorted(
+        source.compute_items(project), key=lambda item: item.key
+    )

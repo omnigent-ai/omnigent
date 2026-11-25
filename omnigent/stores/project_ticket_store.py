@@ -58,7 +58,11 @@ from omnigent.entities.project_ticket import (
 from omnigent.entities.project_ticket_legacy import legacy_ticket_notes
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.server.project_status_cache import invalidate_after_commit
+from omnigent.server.project_status_cache import (
+    STATUS_INPUTS,
+    StatusInput,
+    invalidate_after_commit,
+)
 from omnigent.stores.project_store.access import accessible_project_ids, project_role
 from omnigent.stores.project_store.sqlalchemy_store import (
     _decode_config,
@@ -115,6 +119,16 @@ def _stage(configuration: TicketStages, stage_id: str) -> TicketStage:
         if stage.id == stage_id:
             return stage
     raise OmnigentError("Stage does not belong to this project", code=ErrorCode.INVALID_INPUT)
+
+
+def _status_inputs(kind: str, payload: dict[str, Any]) -> tuple[StatusInput, ...]:
+    """The Summary inputs an event can change: field edits and creates don't move merged PRs."""
+    changes = payload.get("changes")
+    if kind == "created" or (
+        kind == "updated" and isinstance(changes, dict) and "stage_id" not in changes
+    ):
+        return ("tickets",)
+    return STATUS_INPUTS
 
 
 def _stage_snapshot(stage: TicketStage) -> dict[str, Any]:
@@ -599,12 +613,38 @@ class ProjectTicketStore:
         ticket.updated_at = now_epoch()
         if kind not in ("comment", "execution"):
             # Creates, moves and outputs change the project's Summary numbers.
-            invalidate_after_commit(session, project.id)
+            invalidate_after_commit(session, project.id, _status_inputs(kind, payload))
 
     def require_project(self, project_id: str, *, user_id: str | None) -> None:
         """Raise NOT_FOUND unless ``user_id`` owns the project."""
         with self._session("require_project_access") as session:
             self._project(session, project_id, user_id)
+
+    def latest_moves_into(
+        self, project_id: str, stage_id: str, *, user_id: str | None
+    ) -> dict[str, int] | None:
+        """Each ticket's latest move into *stage_id*, read from the stage-move table.
+
+        ``None`` when the table isn't available (no move resolver set); creations don't count.
+        """
+        if not self._ensure_moves_built(project_id, user_id):
+            return None
+        with self._session("list_latest_ticket_moves_into_stage") as session:
+            project = self._project(session, project_id, user_id)
+            rows = session.execute(
+                select(
+                    SqlProjectTicketStageMove.ticket_id,
+                    func.max(SqlProjectTicketStageMove.moved_at),
+                )
+                .where(
+                    SqlProjectTicketStageMove.workspace_id == project.workspace_id,
+                    SqlProjectTicketStageMove.project_id == project.id,
+                    SqlProjectTicketStageMove.stage_id == stage_id,
+                    SqlProjectTicketStageMove.is_creation.is_(False),
+                )
+                .group_by(SqlProjectTicketStageMove.ticket_id)
+            ).all()
+        return dict(rows)
 
     def completed_moves(
         self, project_id: str, *, user_id: str | None, since_epoch: int | None
@@ -1967,7 +2007,8 @@ class ProjectTicketStore:
                     )
             project.ticket_stages = configuration.model_dump()
             project.updated_at = now_epoch()
-            invalidate_after_commit(session, project.id, ("tickets",))
+            # Which stage is complete decides which tickets count as merged PRs.
+            invalidate_after_commit(session, project.id, ("tickets", "prs"))
             for row in affected:
                 previous = before[_stage_id(row)]
                 target = after[body.moves[previous.id]]
