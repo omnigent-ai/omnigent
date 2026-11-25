@@ -1298,3 +1298,76 @@ def test_list_keeps_the_latest_human_comment_across_later_moves_and_label_edits(
     shown = latest(ticket["id"])["latest_comment"]
     assert shown["text"] == "Which date works?" and shown["by_person"] is False
     assert shown["session_id"] == worker.session_id
+
+
+def test_an_askers_later_agent_note_does_not_replace_the_question(board):
+    tickets, _, project = board
+    worker = TicketActor("alice", uuid4().hex, uuid4().hex)
+    ticket = tickets.create(project.id, CreateTicket(title="Decide"), worker)
+    tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(labels=[{"key": "needs-human"}], comment="Ship on Friday or Monday?"),
+        worker,
+    )
+
+    def shown():
+        waiting = tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"]
+        inbox = tickets.human_requests(user_id="alice")["data"]
+        return waiting["question"], [item["question"] for item in inbox]
+
+    asked = tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"]["ask_position"]
+    tickets.comment(
+        project.id,
+        ticket["id"],
+        CommentOnTicket(text="ran the targeted tests", audience="agents"),
+        worker,
+    )
+    # The decision box and the Inbox card keep the real question and its anchor.
+    assert shown() == ("Ship on Friday or Monday?", ["Ship on Friday or Monday?"])
+    assert (
+        tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"]["ask_position"]
+        == asked
+    )
+
+    tickets.comment(
+        project.id,
+        ticket["id"],
+        CommentOnTicket(text="Update: Monday is safer. Friday or Monday?", audience="human"),
+        worker,
+    )
+    restated = "Update: Monday is safer. Friday or Monday?"
+    assert shown() == (restated, [restated])
+
+
+def test_an_asks_question_ignores_an_earlier_resolved_ask(board):
+    tickets, _, project = board
+    worker = TicketActor("alice", uuid4().hex, uuid4().hex)
+    ticket = tickets.create(project.id, CreateTicket(title="Decide"), worker)
+    # A question posted just before the label is the ask's question.
+    tickets.comment(
+        project.id,
+        ticket["id"],
+        CommentOnTicket(text="Old: which region?", audience="human"),
+        worker,
+    )
+    tickets.update(project.id, ticket["id"], UpdateTicket(labels=[{"key": "needs-human"}]), worker)
+    waiting = tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"]
+    assert waiting["question"] == "Old: which region?"
+
+    # That ask resolves; a new one is raised with the comment left as an agent note.
+    tickets.update(project.id, ticket["id"], UpdateTicket(labels=[]), worker)
+    tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(
+            labels=[{"key": "needs-human"}],
+            comment="New: OK to drop the cache?",
+            audience="agents",
+        ),
+        worker,
+    )
+    waiting = tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"]
+    assert waiting["question"] == "New: OK to drop the cache?"
+    inbox = tickets.human_requests(user_id="alice")["data"]
+    assert [item["question"] for item in inbox] == ["New: OK to drop the cache?"]

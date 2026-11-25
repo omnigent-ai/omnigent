@@ -74,6 +74,8 @@ CC_SCAN_MAX = 200
 # Outputs ride along with a comment, so only these kinds count as new activity.
 NEW_COMMENT_KINDS = (EVENT_CODES["comment"], EVENT_CODES["execution"])
 NEW_UPDATE_KINDS = (EVENT_CODES["created"], EVENT_CODES["updated"])
+# How many of an ask raiser's newest comments to check for the question it asks.
+ASK_QUESTION_SCAN = 20
 # A card's latest comment reads only each ticket's newest comments, then clips it.
 LATEST_COMMENT_SCAN = 10
 LATEST_COMMENT_MAX_CHARS = 300
@@ -1933,19 +1935,41 @@ class ProjectTicketStore:
     def _latest_ask_position(
         session: Session, ticket: SqlProjectTicket, asks: builtins.list[_HumanAsk]
     ) -> int | None:
-        """While needs-human is open, its raiser's latest comment is the question to show."""
+        """While needs-human is open, its raiser's latest comment for the human is the question.
+
+        A later agent-audience note from the raiser doesn't replace it, and comments from
+        before the previous ask ended don't count; a question posted just before the label
+        does. With no such comment in the raiser's newest few, the one sent with the label
+        stands in.
+        """
         if not _has_needs_human(ticket.labels) or not asks or asks[-1].end is not None:
             return None
         raiser = asks[-1].session_id
         if raiser is None:
             return None
+        in_ticket = (
+            SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+            SqlProjectTicketEvent.project_id == ticket.project_id,
+            SqlProjectTicketEvent.ticket_id == ticket.id,
+            SqlProjectTicketEvent.kind.in_(NEW_COMMENT_KINDS),
+            SqlProjectTicketEvent.session_id == raiser,
+        )
+        previous_end = asks[-2].end if len(asks) > 1 else None
+        if previous_end is not None:
+            in_ticket = (*in_ticket, SqlProjectTicketEvent.position > previous_end)
+        # Payloads are encrypted, so read the raiser's newest comments and check each.
+        recent = session.scalars(
+            select(SqlProjectTicketEvent)
+            .where(*in_ticket)
+            .order_by(SqlProjectTicketEvent.position.desc())
+            .limit(ASK_QUESTION_SCAN)
+        )
+        for row in recent:
+            if row.payload.get("audience") != "agents":
+                return row.position
         return session.scalar(
-            select(func.max(SqlProjectTicketEvent.position)).where(
-                SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
-                SqlProjectTicketEvent.project_id == ticket.project_id,
-                SqlProjectTicketEvent.ticket_id == ticket.id,
-                SqlProjectTicketEvent.kind.in_(NEW_COMMENT_KINDS),
-                SqlProjectTicketEvent.session_id == raiser,
+            select(func.min(SqlProjectTicketEvent.position)).where(
+                *in_ticket, SqlProjectTicketEvent.position >= asks[-1].start
             )
         )
 
