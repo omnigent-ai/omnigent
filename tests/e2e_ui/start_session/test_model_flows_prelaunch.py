@@ -20,6 +20,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _agents_body,
@@ -305,9 +306,7 @@ async def _drive_antigravity_launch_picker(
             await page.get_by_test_id("new-chat-landing-submit").click()
             # The picker only pins model_override for the first launch. No
             # session PATCH or live model-change route is involved.
-            from tests.e2e_ui.start_session.test_start_session import _wait_until
-
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_antigravity_e2e", body
             expected_model = "gemini-3.8-flash-low" if grouped_effort else "claude-sonnet-4-6"
