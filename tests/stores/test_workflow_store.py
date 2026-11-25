@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
-from sqlalchemy import Update, event, select
+from sqlalchemy import Update, event, select, update
 
 from omnigent.db import compression
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlPreference, SqlWorkflow
@@ -287,11 +287,34 @@ def test_a_description_keeps_its_time_through_writes_that_leave_it(
     assert described is not None
     assert (described.updated_at, described.description_updated_at) == (140, 140)
     assert store.get(saved.id, user_id=ALICE) == described
-    # A plan holds the time only while it's older than the last write, so a workflow from
-    # before the store kept it reads as written then.
+    # A later steps write keeps the description's time, held in the plan across a reload.
     stored = store.update(saved.id, user_id=ALICE, steps=STEPS)
     assert stored is not None and stored.description_updated_at == 140
     assert store.get(saved.id, user_id=ALICE) == stored
+
+
+def test_a_kept_description_time_goes_once_an_older_server_writes_the_description(
+    store: WorkflowStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter(range(100, 1000, 10))
+    monkeypatch.setattr(workflow_store, "now_epoch", lambda: next(clock))
+    saved = _save(store, "deploy")
+    kept = store.update(saved.id, user_id=ALICE, steps=[{"id": "only", "name": "Only"}])
+    assert kept is not None and (kept.updated_at, kept.description_updated_at) == (110, 100)
+    # A server from before the time was kept writes the description alone, leaving the plan.
+    with get_or_create_engine(store.storage_location).begin() as connection:
+        connection.execute(
+            update(SqlWorkflow)
+            .where(SqlWorkflow.id == saved.id)
+            .values(description=compression.encode("Older words."), updated_at=150)
+        )
+    reread = store.get(saved.id, user_id=ALICE)
+    assert reread is not None and reread.description == "Older words."
+    assert reread.description_updated_at == 150
+    # The next write keeps the time for the description it has now.
+    renamed = store.update(saved.id, user_id=ALICE, name="deploy-2")
+    assert renamed is not None and renamed.description_updated_at == 150
+    assert store.get(saved.id, user_id=ALICE) == renamed
 
 
 def test_a_write_from_steps_read_earlier_is_refused_once_they_change(

@@ -7,6 +7,7 @@ import {
   withTimeLimitLength,
   timeLimitLength,
   timeLimitMinutes,
+  withChosenTimeLimit,
   withSavedTimeLimits,
   withStepTimeLimit,
 } from "./stepTimeLimit";
@@ -232,6 +233,28 @@ describe("withTimeLimitLength", () => {
       "**Time limit:** 1 hour",
     );
     expect(withTimeLimitLength("Fix it.", "2 hours")).toBe("Fix it.\n\n**Time limit:** 2 hours");
+  });
+
+  it("sets the length a menu chose, and clears the line for no limit", () => {
+    const noted = "Fix it.\n\n**Time limit:** 4 hours. Tell me after.";
+    expect(withChosenTimeLimit(noted, "8 hours")).toBe(
+      "Fix it.\n\n**Time limit:** 8 hours. Tell me after.",
+    );
+    expect(withChosenTimeLimit(noted, null)).toBe("Fix it.");
+    expect(withChosenTimeLimit("**Time limit:** an afternoon", "1 hour")).toBe(
+      "**Time limit:** 1 hour",
+    );
+  });
+
+  it("leaves a Time limit line inside inline code that runs across lines alone", () => {
+    const example = "Copy `example\n**Time limit:** 2 hours\nend` unchanged.";
+    expect(stepTimeLimit(example)).toBeNull();
+    expect(withStepTimeLimit(example, null)).toBe(example);
+    const limited = withStepTimeLimit(example, "1 hour");
+    expect(limited).toBe(`${example}\n\n**Time limit:** 1 hour`);
+    expect(stepTimeLimit(limited)).toBe("1 hour");
+    expect(withStepTimeLimit(limited, "4 hours")).toBe(`${example}\n\n**Time limit:** 4 hours`);
+    expect(withStepTimeLimit(limited, null)).toBe(example);
   });
 });
 

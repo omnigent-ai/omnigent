@@ -832,6 +832,31 @@ describe("WorkflowDetailPage", () => {
     expect(patches).toHaveLength(1);
   });
 
+  it("saves a proposal with the limits saved since the page loaded", async () => {
+    const twoHours = "The suite passes\n\n**Time limit:** 2 hours";
+    const saved = [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: twoHours }];
+    const report = { id: "report", name: "Report", goal: null, depends_on: ["fix"] };
+    const { patches, server } = await workflowWithProposals(saved, [
+      plan(50, [...WORKFLOW.steps, report]),
+    ]);
+    renderPage();
+    const savePlanButton = await screen.findByRole("button", { name: "Save plan" });
+
+    // Another page sets the step's limit to 4 hours meanwhile; this page still shows 2.
+    const fourHours = "The suite passes\n\n**Time limit:** 4 hours";
+    server.stored = {
+      ...server.stored,
+      steps: [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: fourHours }],
+    };
+    fireEvent.click(savePlanButton);
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]!.steps).toEqual([
+      WORKFLOW.steps[0],
+      { ...WORKFLOW.steps[1], goal: fourHours },
+      report,
+    ]);
+  });
+
   it("redoes a time limit save over steps saved between its read and its write", async () => {
     const { patches, server } = await workflowWithProposals(WORKFLOW.steps, []);
     renderPage();
@@ -1053,6 +1078,7 @@ describe("WorkflowDetailPage", () => {
     expect(patches).toEqual([
       {
         steps: WORKFLOW.steps,
+        expected_steps: [],
         description: WORKFLOW.description,
         expected_description: "Pull the board's open tickets and group them",
         description_source: "proposal",
@@ -1080,6 +1106,7 @@ describe("WorkflowDetailPage", () => {
     await saveAndReload();
     expect(patches[1]).toEqual({
       steps: WORKFLOW.steps,
+      expected_steps: WORKFLOW.steps,
       description: "Fixes one flaky test.",
       expected_description: WORKFLOW.description,
       description_source: "revision",
@@ -1114,7 +1141,7 @@ describe("WorkflowDetailPage", () => {
     expect(description()).toBe("Edited by hand");
     expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
     await saveAndReload();
-    expect(patches[2]).toEqual({ steps: edited });
+    expect(patches[2]).toEqual({ steps: edited, expected_steps: WORKFLOW.steps });
     expect(description()).toBe("Edited by hand");
   });
 
@@ -1342,6 +1369,7 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(screen.queryByRole("radiogroup")).toBeNull());
       expect(server.patches.at(-1)).toEqual({
         steps: WORKFLOW.steps,
+        expected_steps: WORKFLOW.steps,
         description: "Fixes flaky tests, one at a time.",
         expected_description: "Fixes flaky tests, one at a time.",
         description_source: "repeat",
@@ -1377,6 +1405,7 @@ describe("WorkflowDetailPage", () => {
       expect(server.patches).toEqual([
         {
           steps: edited,
+          expected_steps: WORKFLOW.steps,
           description: "Fixes one flaky test.",
           expected_description: "Fixes one flaky test.",
           description_source: "declined",
@@ -1411,6 +1440,7 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(description()).toBe("Finds and fixes flaky tests."));
       expect(server.patches[1]).toEqual({
         steps: edited,
+        expected_steps: edited,
         description: "Finds and fixes flaky tests.",
         expected_description: "Fixes one flaky test.",
         description_source: "newest",
@@ -1450,6 +1480,7 @@ describe("WorkflowDetailPage", () => {
         expect(server.patches).toEqual([
           {
             steps: edited,
+            expected_steps: WORKFLOW.steps,
             description: choice === "Keep current" ? "Fixes one flaky test." : "Fixes flaky tests.",
             expected_description: "Fixes one flaky test.",
             description_source: "newer",

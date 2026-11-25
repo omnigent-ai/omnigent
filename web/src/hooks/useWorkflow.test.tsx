@@ -9,6 +9,7 @@ import type { WorkflowRun } from "@/lib/workflowRuns";
 
 import {
   useCloneWorkflow,
+  useSaveStepTimeLimit,
   useSaveWorkflowPlan,
   useWorkflowRunDescendants,
   useWorkflowRuns,
@@ -145,6 +146,7 @@ describe("useSaveWorkflowPlan", () => {
       detail: [{ type: "extra_forbidden", loc: ["body", "expected_description"] }],
     };
     vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(Response.json(saved))
       .mockResolvedValueOnce(Response.json(refusal, { status: 422 }))
       .mockResolvedValueOnce(Response.json(saved));
     const client = new QueryClient();
@@ -156,10 +158,51 @@ describe("useSaveWorkflowPlan", () => {
     await act(async () => {
       await expect(result.current.mutateAsync(proposal)).resolves.toEqual(saved);
     });
+    // It reads the saved plan first, then writes over the steps it read.
     const bodies = vi
       .mocked(authenticatedFetch)
-      .mock.calls.map(([, init]) => JSON.parse(init!.body as string));
-    expect(bodies).toEqual([proposal, { steps }]);
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(bodies).toEqual([{ ...proposal, expected_steps: steps }, { steps }]);
+  });
+});
+
+describe("useSaveStepTimeLimit", () => {
+  const steps = [{ id: "review", name: "Review", goal: "Read it.", depends_on: [] }];
+  const saved = { id: "workflow", name: "Review", description: "Review changes.", steps };
+  const conflict = { error: { code: "conflict", message: "the steps changed" } };
+
+  function renderSave() {
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSaveStepTimeLimit("workflow"), { wrapper });
+    return () => result.current.mutateAsync({ stepId: "review", limit: "1 hour" });
+  }
+
+  const patchCount = () =>
+    vi.mocked(authenticatedFetch).mock.calls.filter(([, init]) => init?.method === "PATCH").length;
+
+  it("writes nothing when it can't read the saved plan", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      Response.json({ error: { message: "Try again" } }, { status: 500 }),
+    );
+    const save = renderSave();
+    await act(async () => {
+      await expect(save()).rejects.toThrow("Try again");
+    });
+    expect(patchCount()).toBe(0);
+  });
+
+  it("gives up after a few writes refused because the steps kept changing", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) =>
+      init?.method === "PATCH" ? Response.json(conflict, { status: 409 }) : Response.json(saved),
+    );
+    const save = renderSave();
+    await act(async () => {
+      await expect(save()).rejects.toThrow("The plan kept changing while it saved. Try again.");
+    });
+    expect(patchCount()).toBe(3);
   });
 });
 

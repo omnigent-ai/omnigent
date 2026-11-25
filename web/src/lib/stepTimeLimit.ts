@@ -24,6 +24,8 @@ const LIMIT_LINE =
 const DETAILS_LINE = /^([ \t]*)((?:[-*+]|\d{1,9}[.)])[ \t]+)?\*\*Details(?::\*\*|\*\*[ \t]*:)/i;
 // Most descriptions name no limit, and those need no parsing.
 const LIMIT_MARK = /\*\*Time limit(?::\*\*|\*\*[ \t]*:)/i;
+// Minutes in a length's unit, by the unit's first letter.
+const UNIT_MINUTES: Readonly<Record<string, number>> = { d: 1440, h: 60, m: 1 };
 // One part of a length, e.g. "1 hour" in "1 hour 30 minutes" or "1h" in "1h30m", with what
 // separates it from the next.
 const LENGTH_PART =
@@ -40,6 +42,16 @@ interface CodeBlock {
   end: number;
 }
 
+/** Where a description holds code, as Markdown reads it. */
+interface CodeLines {
+  /** Fenced or indented code blocks, fences included. */
+  blocks: readonly CodeBlock[];
+  /** The lines that start inside an inline code span, which can run across lines. */
+  spans: readonly CodeBlock[];
+}
+
+const NO_CODE: CodeLines = { blocks: [], spans: [] };
+
 interface MarkdownNode {
   type: string;
   position?: { start: { line: number }; end: { line: number } };
@@ -47,36 +59,43 @@ interface MarkdownNode {
 }
 
 // A page reads the same descriptions on every render, and parsing is the costly part.
-const parsedCodeBlocks = new Map<string, readonly CodeBlock[]>();
-const PARSED_CODE_BLOCKS_KEPT = 200;
+const parsedCode = new Map<string, CodeLines>();
+const PARSED_CODE_KEPT = 200;
 
-/** A description's code blocks, fenced or indented, as Markdown reads them. */
-function codeBlocks(lines: readonly string[]): readonly CodeBlock[] {
+function codeLines(lines: readonly string[]): CodeLines {
   const text = lines.join("\n");
-  const parsed = parsedCodeBlocks.get(text);
+  const parsed = parsedCode.get(text);
   if (parsed) return parsed;
   const blocks: CodeBlock[] = [];
+  const spans: CodeBlock[] = [];
   const visit = (node: MarkdownNode) => {
-    if (node.type === "code" && node.position) {
-      blocks.push({ start: node.position.start.line - 1, end: node.position.end.line - 1 });
+    const { position } = node;
+    if (node.type === "code" && position) {
+      blocks.push({ start: position.start.line - 1, end: position.end.line - 1 });
+      return;
+    }
+    if (node.type === "inlineCode" && position && position.end.line > position.start.line) {
+      // From the line after the one it opens on.
+      spans.push({ start: position.start.line, end: position.end.line - 1 });
       return;
     }
     for (const child of node.children ?? []) visit(child);
   };
   visit(unified().use(remarkParse).parse(text) as MarkdownNode);
-  if (parsedCodeBlocks.size >= PARSED_CODE_BLOCKS_KEPT)
-    parsedCodeBlocks.delete(parsedCodeBlocks.keys().next().value!);
-  parsedCodeBlocks.set(text, blocks);
-  return blocks;
+  const code = { blocks, spans };
+  if (parsedCode.size >= PARSED_CODE_KEPT) parsedCode.delete(parsedCode.keys().next().value!);
+  parsedCode.set(text, code);
+  return code;
 }
 
-/** The indexes of the lines *pattern* matches outside code blocks, where an example names no limit. */
+/** The indexes of the lines *pattern* matches outside code, where an example names no limit. */
 function matchingLines(
   lines: readonly string[],
   pattern: RegExp,
-  blocks: readonly CodeBlock[] = codeBlocks(lines),
+  code: CodeLines = codeLines(lines),
 ): number[] {
-  const inCode = (index: number) => blocks.some(({ start, end }) => start <= index && index <= end);
+  const ranges = [...code.blocks, ...code.spans];
+  const inCode = (index: number) => ranges.some(({ start, end }) => start <= index && index <= end);
   return lines.flatMap((line, index) => (!inCode(index) && pattern.test(line) ? [index] : []));
 }
 
@@ -98,8 +117,7 @@ function leadingLength(limit: string): { text: string; minutes: number } | null 
   let rest = text;
   let minutes = 0;
   for (let part = LENGTH_PART.exec(rest); part; part = LENGTH_PART.exec(rest)) {
-    const unit = part[2]!.toLowerCase();
-    minutes += Number(part[1]) * (unit.startsWith("d") ? 1440 : unit.startsWith("h") ? 60 : 1);
+    minutes += Number(part[1]) * UNIT_MINUTES[part[2]![0]!.toLowerCase()]!;
     rest = rest.slice(part[0].length);
   }
   if (rest === text || minutes === 0) return null;
@@ -133,8 +151,8 @@ export function shortTimeLimit(limit: string): string | null {
 export function withStepTimeLimit(goal: string | null, limit: string | null): string | null {
   const lines = descriptionLines(goal);
   const limitLine = limit ? `**Time limit:** ${limit}` : null;
-  const blocks = limitLine || (goal && LIMIT_MARK.test(goal)) ? codeBlocks(lines) : [];
-  const found = matchingLines(lines, LIMIT_LINE, blocks);
+  const code = limitLine || (goal && LIMIT_MARK.test(goal)) ? codeLines(lines) : NO_CODE;
+  const found = matchingLines(lines, LIMIT_LINE, code);
   const kept = limitLine ? found[0] : undefined;
   // From the last, so the earlier lines keep their places.
   for (const at of [...found].reverse()) {
@@ -148,7 +166,7 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
     if (lines[at - 1]?.trim() === "" && lines[at]?.trim() === "") lines.splice(at, 1);
   }
   if (found.length === 0 && limitLine) {
-    const details = matchingLines(lines, DETAILS_LINE, blocks)[0] ?? -1;
+    const details = matchingLines(lines, DETAILS_LINE, code)[0] ?? -1;
     const detailsMatch = details < 0 ? null : DETAILS_LINE.exec(lines[details]!);
     const listMarker = detailsMatch?.[2] ? `${detailsMatch[1]}${detailsMatch[2]}` : "";
     if (listMarker) {
@@ -162,7 +180,7 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       // reads it: then just before that block.
       const tail = lines.length > 0 && lines.at(-1)!.trim() !== "" ? ["", limitLine] : [limitLine];
       const last = lines.length + tail.length - 1;
-      const open = codeBlocks([...lines, ...tail]).find(
+      const open = codeLines([...lines, ...tail]).blocks.find(
         ({ start, end }) => start < lines.length && end === last,
       );
       if (open) {

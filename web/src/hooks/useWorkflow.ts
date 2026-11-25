@@ -3,7 +3,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tansta
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { authenticatedFetch } from "@/lib/identity";
 import type { JournalEntry, JournalPlanStep } from "@/lib/sessionJournal";
-import { withChosenTimeLimit } from "@/lib/stepTimeLimit";
+import { withChosenTimeLimit, withSavedTimeLimits } from "@/lib/stepTimeLimit";
 import type { WorkflowRun } from "@/lib/workflowRuns";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
@@ -159,77 +159,100 @@ async function savePlan(workflowId: string, proposal: PlanSave): Promise<Workflo
   const path = workflowPath(workflowId);
   const res = await sendWorkflow(path, "PATCH", proposal);
   const refused = await refusedFields(res);
-  // A server too old to check the steps writes them as they are.
-  if (refused.includes("expected_steps")) {
-    const { expected_steps: _, ...unchecked } = proposal;
-    return savePlan(workflowId, unchecked);
-  }
+  // A server from before conditional descriptions gets the steps alone, so its description stays.
   if (
     proposal.expected_description !== undefined &&
     refused.some((field) => field === "expected_description" || field === "description_source")
   )
     return writeWorkflow(path, "PATCH", { steps: proposal.steps });
+  // One from before `expected_steps` writes the steps without that check.
+  if (refused.includes("expected_steps")) {
+    const { expected_steps: _, ...unchecked } = proposal;
+    return savePlan(workflowId, unchecked);
+  }
   return savedWorkflow(res);
 }
 
-/** Tries left for a time limit save whose plan changed between its read and its write. */
-const TIME_LIMIT_SAVE_TRIES = 3;
+/** Tries for a save whose steps change between its read and its write. */
+const STORED_STEPS_SAVE_TRIES = 3;
 
-async function saveStepTimeLimit(
+/**
+ * Save steps made by *edit* from the stored ones, read just before the write. The server takes
+ * the write only while its steps are still the ones read; after a save in between, the edit is
+ * redone over the newer steps, a few times.
+ */
+async function saveOverStoredSteps(
   workflowId: string,
-  { stepId, limit, ...description }: DescriptionSave & { stepId: string; limit: string | null },
-  tries = TIME_LIMIT_SAVE_TRIES,
+  edit: (stored: WorkflowStep[]) => WorkflowStep[],
+  description: DescriptionSave,
+  tries = STORED_STEPS_SAVE_TRIES,
 ): Promise<WorkflowDetail> {
   const res = await authenticatedFetch(workflowPath(workflowId));
   if (!res.ok) throw await apiErrorFromResponse(res);
-  const { steps = [] } = (await res.json()) as WorkflowDetail;
-  if (!steps.some((step) => step.id === stepId))
-    throw new Error("The step is no longer in the saved plan.");
+  const { steps: stored = [] } = (await res.json()) as WorkflowDetail;
   try {
     return await savePlan(workflowId, {
       ...description,
-      steps: steps.map((step) =>
-        step.id === stepId ? { ...step, goal: withChosenTimeLimit(step.goal, limit) } : step,
-      ),
-      expected_steps: steps,
+      steps: edit(stored),
+      expected_steps: stored,
     });
   } catch (error) {
     if (!(error instanceof ApiError) || error.code !== "conflict") throw error;
-    // Steps saved elsewhere since the read: redo the change over them.
-    if (tries > 1)
-      return saveStepTimeLimit(workflowId, { stepId, limit, ...description }, tries - 1);
+    if (tries > 1) return saveOverStoredSteps(workflowId, edit, description, tries - 1);
     throw new Error("The plan kept changing while it saved. Try again.", { cause: error });
   }
 }
 
+/** After a failed save, the page may show an older plan, so it reads the saved one again. */
+function useWorkflowReread(workflowId: string) {
+  const queryClient = useQueryClient();
+  return () => void queryClient.invalidateQueries({ queryKey: ["workflow", workflowId] });
+}
+
 /**
  * Apply the reviewed proposal, its steps and any new description, to the existing workflow.
- * The server keeps a description that is no longer `expected_description`; a server too old
- * to check that gets the steps alone, so its description stays.
+ * Each step the workflow has keeps its time limit as saved when the write is made. The server
+ * keeps a description that is no longer `expected_description`; a server too old to check that
+ * gets the steps alone, so its description stays.
  */
 export function useSaveWorkflowPlan(workflowId: string) {
   const onSuccess = useWorkflowSaved();
+  const onError = useWorkflowReread(workflowId);
   return useMutation({
-    mutationFn: (proposal: PlanSave) => savePlan(workflowId, proposal),
+    mutationFn: ({ steps, ...description }: DescriptionSave & { steps: WorkflowStep[] }) =>
+      saveOverStoredSteps(workflowId, (stored) => withSavedTimeLimits(steps, stored), description),
     onSuccess,
+    onError,
   });
 }
 
 /**
  * Set a step's time limit, or clear it for null, from the step's menu. Only that step changes,
- * in the plan read just before the write, and the server takes the write only while the steps
- * are still the ones read, so steps saved elsewhere stay; a description goes as in
- * {@link useSaveWorkflowPlan}.
+ * in the plan as saved when the write is made, so steps saved elsewhere stay; a description goes
+ * as in {@link useSaveWorkflowPlan}.
  */
 export function useSaveStepTimeLimit(workflowId: string) {
-  const queryClient = useQueryClient();
   const onSuccess = useWorkflowSaved();
+  const onError = useWorkflowReread(workflowId);
   return useMutation({
-    mutationFn: (change: DescriptionSave & { stepId: string; limit: string | null }) =>
-      saveStepTimeLimit(workflowId, change),
+    mutationFn: ({
+      stepId,
+      limit,
+      ...description
+    }: DescriptionSave & { stepId: string; limit: string | null }) =>
+      saveOverStoredSteps(
+        workflowId,
+        (stored) => {
+          if (!stored.some((step) => step.id === stepId))
+            throw new Error("The step is no longer in the saved plan.");
+          return stored.map((step) =>
+            step.id === stepId ? { ...step, goal: withChosenTimeLimit(step.goal, limit) } : step,
+          );
+        },
+        description,
+      ),
     onSuccess,
-    // The page may show an older plan, so it reads the saved one again.
-    onError: () => void queryClient.invalidateQueries({ queryKey: ["workflow", workflowId] }),
+    onError,
   });
 }
 

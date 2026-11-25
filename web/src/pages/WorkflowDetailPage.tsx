@@ -429,8 +429,9 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                           expected_description: workflow.description,
                           description_source: proposal.id,
                         };
+                  // The proposal's own steps: the save takes each saved step's limit as stored.
                   savePlan.mutate(
-                    { steps: proposedSteps, ...description },
+                    { steps: planSteps(proposal), ...description },
                     { onSuccess: () => showToast("Plan saved") },
                   );
                 }}

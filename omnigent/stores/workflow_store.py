@@ -12,6 +12,7 @@ Description and plan codecs run in batches in the store.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import uuid
@@ -94,18 +95,27 @@ def _is_name_conflict(error: IntegrityError) -> bool:
     )
 
 
+def _description_digest(description: str) -> str:
+    """A short fingerprint of a description, so a time kept for it can't pass for another's."""
+    return hashlib.sha256(description.encode("utf-8")).hexdigest()[:16]
+
+
 def _plan_text(
     steps: list[dict[str, Any]],
     description_source: str | None = None,
     description_updated_at: int | None = None,
+    description: str = "",
 ) -> str:
     """Serialize the plan before the codec, with the proposal its description came from and,
-    when it's older than the workflow's last write, the time the description was written."""
+    when it's older than the workflow's last write, the time *description* was written."""
     plan: dict[str, Any] = {"steps": steps}
     if description_source is not None:
         plan["description_source"] = description_source
     if description_updated_at is not None:
+        # With the text it was kept for: a server from before the time was kept can write the
+        # description without touching the plan.
         plan["description_updated_at"] = description_updated_at
+        plan["description_digest"] = _description_digest(description)
     return json.dumps(plan, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -209,20 +219,24 @@ class WorkflowStore:
         workflows = []
         for row, (description, plan) in zip(rows, pairs, strict=True):
             saved = json.loads(plan)
+            text = description.decode("utf-8") if isinstance(description, bytes) else description
+            # A kept time counts only for the description it was kept with.
+            kept_at = saved.get("description_updated_at")
+            kept = kept_at is not None and saved.get("description_digest") == (
+                _description_digest(text)
+            )
             workflows.append(
                 Workflow(
                     id=row.id,
                     user_id=row.user_id,
                     name=row.name,
-                    description=description.decode("utf-8")
-                    if isinstance(description, bytes)
-                    else description,
+                    description=text,
                     created_at=row.created_at,
                     updated_at=row.updated_at,
                     steps=saved["steps"],
                     planning_session_id=row.planning_session_id,
                     description_source=saved.get("description_source"),
-                    description_updated_at=saved.get("description_updated_at", row.updated_at),
+                    description_updated_at=kept_at if kept else row.updated_at,
                 )
             )
         return workflows
@@ -498,7 +512,7 @@ class WorkflowStore:
                 steps is not None or source != current.description_source or held != was_held
             )
             stored = self._stored_texts(
-                text, _plan_text(workflow_steps, source, held) if rewrites_plan else None
+                text, _plan_text(workflow_steps, source, held, text) if rewrites_plan else None
             )
             values: dict[str, Any] = {
                 "name": workflow_name,

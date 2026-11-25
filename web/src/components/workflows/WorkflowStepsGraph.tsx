@@ -3,6 +3,7 @@ import {
   type ReactNode,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -395,9 +396,12 @@ export function WorkflowStepsGraph({
   timeLimitPaused?: boolean;
 }) {
   const [fullscreen, setFullscreen] = useState(false);
-  // The latest callback, so a parent's new function each render doesn't re-render every step.
+  // The latest committed callback, so a parent's new function each render doesn't re-render
+  // every step.
   const onTimeLimitChangeRef = useRef(onTimeLimitChange);
-  onTimeLimitChangeRef.current = onTimeLimitChange;
+  useLayoutEffect(() => {
+    onTimeLimitChangeRef.current = onTimeLimitChange;
+  });
   const editable = onTimeLimitChange !== undefined;
   const timeLimit = useMemo(
     () =>
