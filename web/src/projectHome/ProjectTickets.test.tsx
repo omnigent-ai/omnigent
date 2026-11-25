@@ -1418,6 +1418,12 @@ describe("Project ticket board", () => {
         fireEvent.click(within(activity).getByRole("button", { name: "More activity" }));
       }
       expect(await screen.findByText("First update")).toBeInTheDocument();
+      // A person's comment shows their initials circle, not the generic person icon.
+      const personAvatar = screen
+        .getByText("First update")
+        .closest("li")!
+        .querySelector('[data-testid="ticket-person-avatar"]');
+      expect(personAvatar).toHaveTextContent("L");
       fireEvent.click(screen.getByRole("button", { name: "More activity" }));
       expect(await screen.findByText("Second update")).toBeInTheDocument();
       expect(screen.getByText("First update")).toBeInTheDocument();

@@ -84,6 +84,7 @@ import {
   writeTicketDraft,
 } from "./ticketTextDrafts";
 import { useProjectAgentSession } from "./useProjectAgentSession";
+import { userColor, userInitials } from "@/lib/userBadge";
 import {
   useTicket,
   useTicketActions,
@@ -1402,6 +1403,20 @@ function TicketFinalUpdateSection({
   );
 }
 
+/** A person's initials circle, the same one the app shows for people elsewhere. */
+function TicketPersonAvatar({ userId }: { userId: string }) {
+  return (
+    <span
+      aria-hidden
+      data-testid="ticket-person-avatar"
+      className="grid size-6 shrink-0 place-items-center rounded-full text-[10px] font-semibold text-white"
+      style={{ backgroundColor: userColor(userId) }}
+    >
+      {userInitials(userId)}
+    </span>
+  );
+}
+
 function TicketActivityItem({
   event,
   personaLookup,
@@ -1466,6 +1481,8 @@ function TicketActivityItem({
         ) : note ? (
           agent ? (
             <BotIcon aria-hidden className="size-3.5" />
+          ) : event.user_id ? (
+            <TicketPersonAvatar userId={event.user_id} />
           ) : (
             <UserRoundIcon aria-hidden className="size-3.5" />
           )
@@ -1485,6 +1502,8 @@ function TicketActivityItem({
           )
         ) : event.session_id ? (
           <TicketSessionAvatar sessionId={event.session_id} persona={personaName} />
+        ) : event.user_id && !agent ? (
+          <TicketPersonAvatar userId={event.user_id} />
         ) : (
           <span aria-hidden className="size-1.5 rounded-full bg-muted-foreground/50" />
         )}
