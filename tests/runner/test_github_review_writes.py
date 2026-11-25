@@ -199,6 +199,9 @@ class FakeGitHub:
             return {"data": {"addPullRequestReviewThread": {"thread": thread}}}
         if "deletePullRequestReview" in query:
             return {"data": {"deletePullRequestReview": {"pullRequestReview": {"id": "R_1"}}}}
+        if "unresolveReviewThread" in query:
+            reopened = {"thread": {"id": "T_1", "isResolved": False}}
+            return {"data": {"unresolveReviewThread": reopened}}
         if "resolveReviewThread" in query:
             return {"data": {"resolveReviewThread": {"thread": {"id": "T_1", "isResolved": True}}}}
         if "addReaction" in query:
@@ -943,12 +946,24 @@ def test_a_reaction_must_be_a_github_reaction(fake: FakeGitHub) -> None:
         )
 
 
-def test_resolving_a_thread_names_the_thread(fake: FakeGitHub) -> None:
+@pytest.mark.parametrize(
+    ("resolved", "mutation", "other"),
+    [
+        # A leading space, since "resolveReviewThread" is inside "unresolveReviewThread".
+        (True, " resolveReviewThread(", "unresolveReviewThread("),
+        (False, "unresolveReviewThread(", " resolveReviewThread("),
+    ],
+    ids=["resolve", "reopen"],
+)
+def test_resolving_a_thread_names_the_thread(
+    fake: FakeGitHub, resolved: bool, mutation: str, other: str
+) -> None:
     result = pr_actions.set_review_thread_resolved(
-        "/workspace", session_id=SESSION, pr_url=PR_URL, thread_id="T_1", resolved=True
+        "/workspace", session_id=SESSION, pr_url=PR_URL, thread_id="T_1", resolved=resolved
     )
-    assert result["resolved"] is True
-    assert fake.mutations("resolveReviewThread") == [{"input": {"threadId": "T_1"}}]
+    assert result["resolved"] is resolved
+    assert fake.mutations(mutation) == [{"input": {"threadId": "T_1"}}]
+    assert fake.mutations(other) == []
 
 
 @pytest.mark.parametrize(
