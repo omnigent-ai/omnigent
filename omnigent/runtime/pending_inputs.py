@@ -98,7 +98,10 @@ text-matched mirror skips it (see :func:`resolve_matching_text`) and the
 persist site records it as undelivered; :data:`_TTL_S` bounds a ghost no
 later message follows: stale entries are evicted lazily on the next
 :func:`record` / :func:`snapshot_for` / :func:`resolve_oldest` for the
-same conversation.
+same conversation. A vendor TUI can also accept a message and hold it until a
+later step of a long turn, so while the server's busy check
+(:func:`set_session_busy_check`) reports the session mid-turn, stale entries
+stay queued for that late mirror instead of letting it drain a newer entry.
 """
 
 from __future__ import annotations
@@ -109,7 +112,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
@@ -118,9 +121,8 @@ from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
 # A pending entry is evicted this many seconds after it was recorded
-# if it was never drained by a matching persisted message. Covers the
-# vendor-TUI-never-accepted-the-message ghost; long enough that a slow
-# transcript round-trip on a busy session still drains normally.
+# if it was never drained by a matching persisted message and its session
+# is no longer mid-turn. Covers the vendor-TUI-never-accepted-the-message ghost.
 _TTL_S: float = 600.0
 
 # Hard cap on unheld queued entries per conversation, enforced by
@@ -336,12 +338,29 @@ class _Entry:
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
+# Optional check the server wires to its cached session status; called under
+# :data:`_lock`, so it must be cheap and non-blocking. ``None`` keeps the plain TTL.
+_session_busy_check: Callable[[str], bool] | None = None
+
+
+def set_session_busy_check(check: Callable[[str], bool] | None) -> None:
+    """
+    Register (or clear) the check that defers TTL eviction mid-turn.
+
+    :param check: Callback invoked as ``check(conversation_id)``; ``True``
+        means the session still has a turn in flight, so its entries older
+        than :data:`_TTL_S` are kept. Pass ``None`` to clear.
+    """
+    global _session_busy_check
+    _session_busy_check = check
+
 
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
     """
     Drop entries older than :data:`_TTL_S` for one conversation.
 
-    Caller must hold :data:`_lock`. Pops the conversation key entirely
+    Caller must hold :data:`_lock`. Keeps them while the registered busy
+    check reports the session mid-turn. Pops the conversation key entirely
     once its last entry is evicted so :func:`snapshot_for` returns an
     empty list cleanly.
 
@@ -353,6 +372,9 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
     if entries is None:
         return
     stale = [pid for pid, entry in entries.items() if now - entry.created_at > _TTL_S]
+    busy_check = _session_busy_check
+    if stale and busy_check is not None and busy_check(conversation_id):
+        return
     for pid in stale:
         entries.pop(pid, None)
     if not entries:
@@ -957,6 +979,26 @@ def has_pending(conversation_id: str) -> bool:
         return any(not entry.interrupted for entry in _pending.get(conversation_id, {}).values())
 
 
+def has_recent_web_prompt(conversation_id: str) -> bool:
+    """
+    Report whether a web prompt recorded within :data:`_TTL_S` is still in flight.
+
+    The native request-phase policy hook (``routes_hooks``) skips its gate on this.
+    Entries kept past the TTL for a long turn don't count, so a held message cannot
+    exempt an unrelated prompt typed in the TUI.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :returns: ``True`` iff a non-interrupted entry younger than :data:`_TTL_S` exists.
+    """
+    with _lock:
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
+        return any(
+            not entry.interrupted and now - entry.created_at <= _TTL_S
+            for entry in _pending.get(conversation_id, {}).values()
+        )
+
+
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     """
     Return un-consumed messages for one session, for snapshot replay.
@@ -970,9 +1012,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     Returns deep copies of the stored content so a caller mutating the
     replayed entry cannot poison the index. Entries the person cancelled by
     interrupting (see :func:`mark_interrupted`) are left out, so a reload does
-    not redraw a bubble the web client already cleared. The native request-phase
-    policy hook (``routes_hooks``) also reads this as "a web prompt is in
-    flight", so a cancelled entry does not exempt a later prompt from its gate.
+    not redraw a bubble the web client already cleared.
 
     :param conversation_id: Conversation/session id to query, e.g.
         ``"conv_abc123"``.
