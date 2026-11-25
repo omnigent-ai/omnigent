@@ -10499,7 +10499,9 @@ def _blocked_agent_message_items(
         starts, or ``None`` for legacy line-cursor reads.
     :returns: One error item, or none when the prompt is not an agent message.
     """
-    envelope = _TEAMMATE_MESSAGE_RE.search(prompt) if _is_agent_notification_text(prompt) else None
+    # Only the outer delivery envelope names the sender; markup inside the content does not.
+    body, _wrapped = _strip_teammate_message_prefix(prompt)
+    envelope = _TEAMMATE_MESSAGE_RE.match(body) if _is_agent_notification_text(prompt) else None
     if envelope is None:
         return []
     sender = _AGENT_MESSAGE_SENDER_RE.match(envelope.group(0))
@@ -11052,17 +11054,20 @@ def _peer_message_wake_marker(
     )
 
 
+def _strip_teammate_message_prefix(text: str) -> tuple[str, bool]:
+    """Drop Claude's peer-delivery preamble and report whether one was present."""
+    stripped = text.lstrip()
+    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+        if stripped.startswith(prefix):
+            return stripped[len(prefix) :].lstrip(), True
+    return stripped, False
+
+
 def _is_agent_notification_text(text: str) -> bool:
     """Recognize possible agent context; text alone does not prove its origin."""
     if _is_trusted_agent_notification_text(text):
         return True
-    stripped = text.lstrip()
-    wrapped = False
-    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
-        if stripped.startswith(prefix):
-            stripped = stripped[len(prefix) :].lstrip()
-            wrapped = True
-            break
+    stripped, wrapped = _strip_teammate_message_prefix(text)
     if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
         return False
     while match := _TEAMMATE_MESSAGE_RE.match(stripped):

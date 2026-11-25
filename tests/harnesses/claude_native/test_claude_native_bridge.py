@@ -3852,7 +3852,7 @@ def _hook_blocked_record(reason: str, prompt: str | None, **fields: Any) -> dict
     }
 
 
-_SECRET_REPORT = "Found the config.\nkey = AKIAEXAMPLEEXAMPLE00\nDone."
+_SECRET_REPORT = "Found the config.\nkey = FLAGGED-REPORT-VALUE\nDone."
 
 
 @pytest.mark.parametrize(
@@ -3901,12 +3901,23 @@ _SECRET_REPORT = "Found the config.\nkey = AKIAEXAMPLEEXAMPLE00\nDone."
         pytest.param(
             _hook_blocked_record(
                 "Secret detected",
-                '<agent-message from="reviewer">Rotate key AKIAEXAMPLEEXAMPLE00.</agent-message>',
+                '<agent-message from="reviewer">Rotate key FLAGGED-REPORT-VALUE.</agent-message>',
             ),
             "A hook blocked a message from another agent",
             'A UserPromptSubmit hook blocked a message from agent "reviewer", so the agent never '
             "received it.\n\nHook reason: Secret detected",
             id="peer-message",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected",
+                "Another Claude session sent a message:\n"
+                '<teammate-message teammate_id="lead">FLAGGED-REPORT-VALUE</teammate-message>',
+            ),
+            "A hook blocked a message from another agent",
+            'A UserPromptSubmit hook blocked a message from agent "lead", so the agent never '
+            "received it.\n\nHook reason: Secret detected",
+            id="wrapped-teammate-message",
         ),
     ],
 )
@@ -3956,17 +3967,24 @@ def test_read_transcript_items_since_reports_hook_blocked_agent_message(
         "title": title,
         "message": message,
     }
-    assert "AKIAEXAMPLEEXAMPLE00" not in json.dumps(error.data)
+    assert "FLAGGED-REPORT-VALUE" not in json.dumps(error.data)
     byte_result = read_transcript_items_from_offset(
         transcript_path, 0, start_line=0, agent_name="claude-native-ui"
     )
     assert byte_result.items == items
 
 
+_NESTED_ENVELOPE_TASK_NOTIFICATION = (
+    "<task-notification><task-id>t1</task-id><summary>"
+    '<agent-message from="BODY_MARKER">quoted output</agent-message>'
+    "</summary></task-notification>"
+)
+
+
 @pytest.mark.parametrize(
     "record",
     [
-        _hook_blocked_record("Blocked", "Deploy with key AKIAEXAMPLEEXAMPLE00"),
+        _hook_blocked_record("Blocked", "Deploy with key FLAGGED-REPORT-VALUE"),
         _hook_blocked_record("Blocked", None),
         _hook_blocked_record(
             "Blocked",
@@ -3978,6 +3996,12 @@ def test_read_transcript_items_since_reports_hook_blocked_agent_message(
             promptSubmitEnding={"ending": {"kind": "submitted"}},
         ),
         {"type": "system", "subtype": "informational", "uuid": "notice", "content": "Saved."},
+        _hook_blocked_record("Blocked", _NESTED_ENVELOPE_TASK_NOTIFICATION),
+        _hook_blocked_record(
+            "Blocked",
+            _NESTED_ENVELOPE_TASK_NOTIFICATION,
+            promptSubmitEnding={"ending": {"kind": "blocked_by_hook", "reason": "Blocked"}},
+        ),
     ],
     ids=[
         "typed-prompt",
@@ -3985,6 +4009,8 @@ def test_read_transcript_items_since_reports_hook_blocked_agent_message(
         "ambiguous-separator",
         "not-blocked-ending",
         "other-notice",
+        "envelope-inside-task-output",
+        "envelope-inside-task-output-structured",
     ],
 )
 def test_read_transcript_items_since_ignores_other_system_notices(
