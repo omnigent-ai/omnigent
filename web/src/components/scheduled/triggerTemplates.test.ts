@@ -1059,10 +1059,10 @@ describe("Slack thread reply triggers", () => {
       "If your Slack tools offer search.messages, use it: for each channel, search for in:<channel> after:<the day before the check time's date>, writing the channel as #<name> or <#<channel ID>> for an ID, with sort timestamp, sort_dir asc and count 100",
     );
     expect(prompt).toContain(
-      "with exactly these keys: ts, thread_ts, channel (its id), user, bot_id, text (verbatim). Use null for a missing key. End with one line giving page and pages from paging.",
+      "with exactly these keys: ts, thread_ts, permalink, channel (its id), user, bot_id, text (verbatim). Use null for a missing key. End with one line giving page and pages from paging.",
     );
     expect(prompt).toContain(
-      "keep only the messages whose thread_ts is set and differs from their ts (replies), whose ts is after the check time and not after the time you noted, and read the next page only while the last result's ts is still at or before the time you noted. Group the replies by their thread_ts.",
+      "a result is a reply when its thread_ts is set and differs from its ts, or, since search often leaves thread_ts out, when its permalink has a thread_ts query parameter that differs from its ts; keep only the replies whose ts is after the check time and not after the time you noted, and read the next page only while the last result's ts is still at or before the time you noted. Group the replies by their thread ts.",
     );
     expect(prompt).toContain(
       "In both paths, use the check time itself, not 5 minutes before it: Slack shows replies at once, and the check time is what keeps a reply from being handled twice.",
