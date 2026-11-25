@@ -1001,6 +1001,26 @@ async def test_a_review_change_whose_host_drops_after_the_frame_is_unconfirmed(
     assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, _REVIEW_UNCONFIRMED)
 
 
+@pytest.mark.parametrize("method", _REVIEW_WRITES)
+async def test_a_host_failure_after_a_review_change_was_sent_is_unconfirmed(
+    tmp_path: Path, method: str
+) -> None:
+    """A host error shaping GitHub's answer may follow a change GitHub made."""
+    tunnel = _tunnel(tmp_path)
+    error = await _end_after_frame(tunnel, method, host_tests._REVIEW_CALLS[method][0], "internal")
+
+    assert (error.code, error.message) == (Code.UNKNOWN, _REVIEW_UNCONFIRMED)
+
+
+async def test_a_host_failure_on_the_pending_review_read_stays_internal(tmp_path: Path) -> None:
+    tunnel = _tunnel(tmp_path)
+    error = await _end_after_frame(
+        tunnel, "GetPendingReview", host_tests._REVIEW_CALLS["GetPendingReview"][0], "internal"
+    )
+
+    assert (error.code, error.message) == (Code.INTERNAL, "Workspace call failed")
+
+
 async def test_a_review_change_whose_answer_times_out_is_unconfirmed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
