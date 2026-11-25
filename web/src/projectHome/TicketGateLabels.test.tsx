@@ -81,8 +81,27 @@ describe("gate labels on a card", () => {
       />,
     );
     expect(screen.queryByTestId("ticket-gate-approved")).toBeNull();
-    expect(screen.getByTestId("ticket-gate-verified")).toHaveTextContent("6f3cdf4");
+    // A card says it in words; the commit moves to the tooltip.
+    const verified = screen.getByTestId("ticket-gate-verified");
+    expect(verified).toHaveTextContent(/^Verified$/);
+    expect(verified).toHaveAttribute("title", "Verified at commit 6f3cdf4");
+    // The ticket's classification is left off cards.
+    expect(screen.queryByText(/kind/)).toBeNull();
     expect(screen.queryByLabelText(/more label/)).toBeNull();
+  });
+});
+
+describe("an approval on a card", () => {
+  it("reads Reviewed, with the commit in the tooltip", () => {
+    render(<TicketLabels compact labels={[{ key: "approved", value: APPROVED }]} />);
+    const approved = screen.getByTestId("ticket-gate-approved");
+    expect(approved).toHaveTextContent(/^Reviewed$/);
+    expect(approved).toHaveAttribute("title", "Reviewed and approved at commit 6f3cdf4");
+  });
+
+  it("keeps the kind label in the ticket panel", () => {
+    render(<TicketLabels labels={[{ key: "kind", value: "fix" }]} />);
+    expect(screen.getByText("kind: fix")).toBeInTheDocument();
   });
 });
 

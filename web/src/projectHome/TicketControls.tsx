@@ -31,8 +31,12 @@ export function TicketLabels({
   waitingOn?: TicketWaitingOn | null;
 }) {
   const whom = needsWhom(waitingOn, getCurrentUserId());
-  const labels =
-    whom === null ? allLabels.filter((label) => label.key !== "needs-human") : allLabels;
+  const labels = allLabels.filter(
+    (label) =>
+      !(whom === null && label.key === "needs-human") &&
+      // A card leaves out the ticket's classification; the panel still lists it.
+      !(compact && label.key === KIND_LABEL_KEY),
+  );
   const leading = (key: string) => key === "needs-human" || key === ASSIGNEE_LABEL_KEY;
   const hasVerified = labels.some(
     (label) => label.key === VERIFIED_LABEL_KEY && isGateLabel(label),
@@ -78,6 +82,7 @@ export function TicketLabels({
 }
 
 export const APPROVED_LABEL_KEY = "approved";
+export const KIND_LABEL_KEY = "kind";
 export const VERIFIED_LABEL_KEY = "verified";
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
@@ -115,7 +120,9 @@ function GateShaBadge({
   const Icon = verified ? BadgeCheckIcon : CircleCheckIcon;
   const description = stale
     ? `verified ${label.value}, not the approved ${approvedSha}`
-    : `${label.key} ${label.value}`;
+    : compact
+      ? `${verified ? "Verified" : "Reviewed and approved"} at commit ${label.value.slice(0, 7)}`
+      : `${label.key} ${label.value}`;
   return (
     <Badge
       variant="outline"
@@ -130,9 +137,22 @@ function GateShaBadge({
       )}
     >
       <Icon aria-hidden className="size-3 shrink-0" />
-      {!compact && label.key}
-      <span className="font-mono text-[0.6875rem] tracking-tight">{label.value.slice(0, 7)}</span>
-      {stale && !compact && <span className="font-normal">≠ approved</span>}
+      {compact ? (
+        // On a card the sign-off reads in words; the commit is in the tooltip.
+        verified ? (
+          "Verified"
+        ) : (
+          "Reviewed"
+        )
+      ) : (
+        <>
+          {label.key}
+          <span className="font-mono text-[0.6875rem] tracking-tight">
+            {label.value.slice(0, 7)}
+          </span>
+          {stale && <span className="font-normal">≠ approved</span>}
+        </>
+      )}
     </Badge>
   );
 }

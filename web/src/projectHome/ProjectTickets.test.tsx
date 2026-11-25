@@ -536,6 +536,26 @@ describe("Project ticket board", () => {
     },
   );
 
+  it.each(["Moved to Review", "Updated the ticket", "Related to Other work", "Created the ticket"])(
+    "leaves the board's own event line off the card: %s",
+    async (text) => {
+      ticket.latest_update = text;
+      ticket.comment_count = 0;
+      renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+      const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+      expect(within(card).queryByText(text)).toBeNull();
+    },
+  );
+
+  it("folds new comments into the comment count", async () => {
+    ticket.comment_count = 3;
+    ticket.new_comment_count = 2;
+    renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+    const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+    expect(within(card).getByLabelText("3 comments, 2 new")).toHaveTextContent("3");
+    expect(within(card).queryByText("+2")).toBeNull();
+  });
+
   it.each(["Created the ticket", "Confirmed the issue is resolved"])(
     "retains a real comment preview: %s",
     async (text) => {

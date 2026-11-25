@@ -34,6 +34,7 @@ import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoa
 import { NEEDS_YOU_PARAM } from "./needsYouFilter";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { needsWhom } from "./ticketWaitingOn";
+import { collapsedLanes, useContentWidth, useLanePreferences } from "./boardLaneLayout";
 import {
   useRelatedTickets,
   useTicketActions,
@@ -48,36 +49,6 @@ const NO_TICKET_FILTER: string[] = [];
 const NOT_NEW = () => false;
 // Whether a card is new since the viewer last opened the board (see useNewTicketsOnOpen).
 const NewTicketContext = createContext<(ticket: ProjectTicket) => boolean>(NOT_NEW);
-
-function collapsedStageKey(projectId: string, stageId: string) {
-  return `omnigent.ticketBoard.collapsed.${projectId}.${stageId}`;
-}
-
-/** The completed stage starts collapsed; the choice is remembered per project. */
-function useStageCollapsed(projectId: string | null, stage: TicketStage) {
-  const read = () => {
-    if (!stage.is_complete) return false;
-    if (!projectId) return true;
-    try {
-      return window.localStorage.getItem(collapsedStageKey(projectId, stage.id)) !== "0";
-    } catch {
-      return true;
-    }
-  };
-  const [collapsed, setCollapsed] = useState(read);
-  useEffect(() => setCollapsed(read()), [projectId, stage.id, stage.is_complete]); // eslint-disable-line react-hooks/exhaustive-deps
-  const toggle = () => {
-    const next = !collapsed;
-    setCollapsed(next);
-    if (!projectId) return;
-    try {
-      window.localStorage.setItem(collapsedStageKey(projectId, stage.id), next ? "1" : "0");
-    } catch {
-      // Storage may be unavailable; the toggle still applies for this view.
-    }
-  };
-  return [collapsed, toggle] as const;
-}
 
 export function ProjectTicketBoard({
   projectName,
@@ -154,6 +125,15 @@ function TicketBoard({
   const lifecycle = useTicketLifecycleEnabled();
   const configuration = useTicketStages(projectId);
   const stages = configuration.data?.stages ?? [];
+  const boardRef = useRef<HTMLDivElement>(null);
+  const boardWidth = useContentWidth(boardRef);
+  const [lanePreferences, setLaneCollapsed] = useLanePreferences(projectId);
+  const collapsed = collapsedLanes(
+    stages,
+    lanePreferences,
+    configuration.data?.initial_stage_id,
+    boardWidth,
+  );
   const related = useRelatedTickets(projectId, lifecycle ? (hoveredId ?? focusedId) : null);
   const { hasNextPage, isFetching, isError, fetchNextPage } = related;
   const relatedIds = new Set(
@@ -229,6 +209,7 @@ function TicketBoard({
         }}
       >
         <div
+          ref={boardRef}
           role="region"
           aria-label={`${projectName} ticket board`}
           data-testid="project-ticket-board"
@@ -239,6 +220,8 @@ function TicketBoard({
               key={stage.id}
               stage={stage}
               initial={stage.id === configuration.data?.initial_stage_id}
+              collapsedByLayout={collapsed.has(stage.id)}
+              onCollapsedChange={(next) => setLaneCollapsed(stage.id, next)}
               projectId={projectId}
               selectedTicketId={selectedTicketId}
               dragging={dragged !== null}
@@ -277,6 +260,8 @@ function TicketColumn({
   projectId,
   stage,
   initial,
+  collapsedByLayout,
+  onCollapsedChange,
   selectedTicketId,
   dragging,
   disabled,
@@ -292,6 +277,9 @@ function TicketColumn({
   projectId: string | null;
   stage: TicketStage;
   initial: boolean;
+  /** Collapsed to a strip, by the person's choice or because the board ran out of width. */
+  collapsedByLayout: boolean;
+  onCollapsedChange: (collapsed: boolean) => void;
   selectedTicketId: string | null;
   dragging: boolean;
   disabled: boolean;
@@ -313,8 +301,9 @@ function TicketColumn({
   const total = filteredTickets === undefined ? query.data?.pages[0]?.total : undefined;
   const count = total ?? `${tickets.length}${hasNextPage ? "+" : ""}`;
   const { setNodeRef, isOver } = useDroppable({ id: stage.id, disabled });
-  const [collapsedPreference, toggleCollapsed] = useStageCollapsed(projectId, stage);
-  const collapsed = collapsedPreference && !filteredTickets?.length;
+  // A filtered board opens every lane that has a match.
+  const collapsed = collapsedByLayout && !filteredTickets?.length;
+  const toggleCollapsed = () => onCollapsedChange(!collapsed);
   const loadError =
     filteredTickets === undefined && query.isError
       ? shownLoadError(query.error, query.data !== undefined)
@@ -370,7 +359,7 @@ function TicketColumn({
       ref={setNodeRef}
       aria-label={stage.name}
       className={cn(
-        "flex min-w-60 flex-1 basis-0 flex-col rounded-xl border border-transparent bg-muted/30 px-2 pt-2 transition-colors",
+        "group/lane flex min-w-52 flex-1 basis-0 flex-col rounded-xl border border-transparent bg-muted/30 px-2 pt-2 transition-colors",
         dragging && "border-dashed border-muted-foreground/50",
         dragging && isOver && "border-primary bg-primary/10",
       )}
@@ -380,11 +369,15 @@ function TicketColumn({
         {/* Pinned to the badge's height so a complete stage's collapse button can't lower its row. */}
         <span className="flex h-5 items-center gap-1 tabular-nums">
           {count}
-          {stage.is_complete && (
+          {!filteredTickets && (
             <Button
               variant="ghost"
               size="icon"
-              className="size-6"
+              className={cn(
+                "size-6",
+                !stage.is_complete &&
+                  "opacity-0 group-hover/lane:opacity-100 focus-visible:opacity-100",
+              )}
               aria-label={`Collapse ${stage.name}`}
               title={`Collapse ${stage.name}`}
               onClick={toggleCollapsed}
@@ -532,12 +525,11 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
       {ticket.labels.length > 0 && (
         <TicketLabels labels={ticket.labels} compact waitingOn={ticket.waiting_on} />
       )}
-      {ticket.latest_update &&
-        (ticket.latest_update !== "Created the ticket" || ticket.comment_count > 0) && (
-          <p className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere">
-            {ticket.latest_update}
-          </p>
-        )}
+      {ticket.latest_update && !isSystemUpdate(ticket.latest_update, ticket.comment_count) && (
+        <p className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere">
+          {ticket.latest_update}
+        </p>
+      )}
       <div className="flex items-center justify-between gap-2 text-sm text-muted-foreground">
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           <time
@@ -548,18 +540,7 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           </time>
           <TicketRequester ticket={ticket} />
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <TicketNewActivity ticket={ticket} />
-          {ticket.comment_count > 0 && (
-            <span
-              className="flex items-center gap-1.5 tabular-nums"
-              aria-label={`${ticket.comment_count} comments`}
-            >
-              <MessageSquareIcon aria-hidden className="size-3.5" />
-              {ticket.comment_count}
-            </span>
-          )}
-        </div>
+        <TicketCommentCount ticket={ticket} />
       </div>
     </>
   );
@@ -581,19 +562,50 @@ function TicketRequester({ ticket }: { ticket: ProjectTicket }) {
   );
 }
 
-/** Comments meant for the viewer since they last opened the ticket, like the sidebar Inbox badge. */
-function TicketNewActivity({ ticket }: { ticket: ProjectTicket }) {
-  const comments = ticket.new_comment_count ?? 0;
-  if (comments === 0) return null;
-  const label = `${comments} new ${comments === 1 ? "comment" : "comments"}`;
+/**
+ * Event lines the server records for moves, label edits and links. The lane already shows
+ * the stage, so a card keeps its last real update rather than repeating them.
+ */
+const SYSTEM_UPDATE = /^(Updated the ticket|Moved to .+|Related to .+|Unlinked .+)$/;
+
+export function isSystemUpdate(update: string, commentCount: number): boolean {
+  // A comment replaces the creation line, so with comments it can only be a comment's text.
+  if (update === "Created the ticket") return commentCount === 0;
+  return SYSTEM_UPDATE.test(update);
+}
+
+/**
+ * The comment count, in the accent with a dot when some are new to the viewer since they
+ * last opened the ticket (like the sidebar Inbox badge).
+ */
+function TicketCommentCount({ ticket }: { ticket: ProjectTicket }) {
+  const total = ticket.comment_count;
+  const fresh = Math.min(ticket.new_comment_count ?? 0, total);
+  if (total === 0) return null;
+  const label =
+    fresh > 0
+      ? `${total} ${total === 1 ? "comment" : "comments"}, ${fresh} new`
+      : `${total} ${total === 1 ? "comment" : "comments"}`;
   return (
     <span
-      data-testid="ticket-new-activity"
-      title={label}
+      data-testid={fresh > 0 ? "ticket-new-activity" : undefined}
+      title={fresh > 0 ? `${fresh} new since you last opened this ticket` : undefined}
       aria-label={label}
-      className="rounded-full bg-primary px-1.5 text-xs leading-5 font-semibold text-primary-foreground tabular-nums"
+      className={cn(
+        "flex shrink-0 items-center gap-1.5 tabular-nums",
+        fresh > 0 && "font-semibold text-brand-accent",
+      )}
     >
-      +{comments}
+      <span className="relative">
+        <MessageSquareIcon aria-hidden className="size-3.5" />
+        {fresh > 0 && (
+          <span
+            aria-hidden
+            className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-brand-accent ring-2 ring-card"
+          />
+        )}
+      </span>
+      {total}
     </span>
   );
 }
