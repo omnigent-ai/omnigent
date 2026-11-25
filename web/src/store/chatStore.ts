@@ -7853,16 +7853,40 @@ function applyLiveDeltas(set: Setter, messageId: string, chunks: LiveDeltaChunk[
  * `blocks`, and reports a message's first chunk so its preview can paint
  * without waiting a frame. A drain skips messages ignored or conversations
  * disposed since their chunks arrived, so a late frame cannot recreate a
- * removed preview.
+ * removed preview. `close` drains one last time and ignores later drains; it
+ * runs when the stream's binding is aborted, before e.g. a retry drops its
+ * previews, so the replaced pump cannot recreate one from its buffered tail.
  */
 interface LiveDeltaBuffer {
   queue: (messageId: string, chunk: LiveDeltaChunk) => boolean;
   drain: () => void;
+  close: () => void;
 }
 
-function createLiveDeltaBuffer(id: string, ignored: Set<string>, set: Setter): LiveDeltaBuffer {
+function createLiveDeltaBuffer(
+  id: string,
+  ignored: Set<string>,
+  set: Setter,
+  signal: AbortSignal,
+): LiveDeltaBuffer {
   const pending = new Map<string, LiveDeltaChunk[]>();
   const seen = new Set<string>();
+  let closed = false;
+  const drain = (): void => {
+    if (closed || pending.size === 0) return;
+    const batch = [...pending];
+    pending.clear();
+    if (isConversationDisposed(id)) return;
+    for (const [messageId, chunks] of batch) {
+      if (!ignored.has(messageId)) applyLiveDeltas(set, messageId, chunks);
+    }
+  };
+  const close = (): void => {
+    drain();
+    closed = true;
+    signal.removeEventListener("abort", close);
+  };
+  signal.addEventListener("abort", close);
   return {
     queue(messageId, chunk) {
       const chunks = pending.get(messageId);
@@ -7872,15 +7896,8 @@ function createLiveDeltaBuffer(id: string, ignored: Set<string>, set: Setter): L
       seen.add(messageId);
       return true;
     },
-    drain() {
-      if (pending.size === 0) return;
-      const batch = [...pending];
-      pending.clear();
-      if (isConversationDisposed(id)) return;
-      for (const [messageId, chunks] of batch) {
-        if (!ignored.has(messageId)) applyLiveDeltas(set, messageId, chunks);
-      }
-    },
+    drain,
+    close,
   };
 }
 
@@ -8273,7 +8290,7 @@ export async function pumpStreamEvents(
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
   // Native live deltas commit once per frame with the buffered blocks below.
-  const live = createLiveDeltaBuffer(id, ignoredMessages, set);
+  const live = createLiveDeltaBuffer(id, ignoredMessages, set, controller.signal);
   const rawEvents = drainLiveDeltasBeforeOtherEvents(parseSseStream(body, sseResult), live);
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream
@@ -8644,12 +8661,12 @@ export async function pumpStreamEvents(
     flush();
     return "dropped";
   } finally {
+    // Commit buffered live text, including after a reconnect's attempt abort.
+    live.close();
     // Drop any pending frame + its buffered blocks so a queued flush
     // can't apply this stream's blocks after switchTo bound another.
     // `abortController` lifecycle is owned by `startStreamPump`'s loop,
     // not here — it must survive across reconnect attempts.
-    // Commit buffered live text on abort too; the drain drops it after a switch.
-    live.drain();
     scheduler.cancel();
     buffer.length = 0;
   }

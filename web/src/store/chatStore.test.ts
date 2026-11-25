@@ -3598,6 +3598,36 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(preview()).toEqual(["Hello world!"]);
     });
 
+    it("loads again in place when retried before buffered chunks commit", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_down_frame", []);
+      const { streams } = failSnapshots("conv_down_frame", [503, 503, 503]);
+
+      const switched = useChatStore.getState().switchTo("conv_down_frame");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await switched;
+      const entry = conversationRegistry.peek("conv_down_frame")!;
+      const preview = () =>
+        entry
+          .getState()
+          .blocks.filter((block) => block.ctx.itemId === "live:m1")
+          .map((block) => (block.type === "text_done" ? block.fullText : block.type));
+      streams[0]!.push(previewDelta("Hello ", 0));
+      streams[0]!.push(previewDelta("wor", 1));
+      // Both chunks are read, but no frame has committed the second yet.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(preview()).toEqual(["Hello "]);
+
+      await retryConversationLoad("conv_down_frame");
+      // Let the replaced pump unwind before the new stream replays the reply.
+      await vi.advanceTimersByTimeAsync(20);
+      streams[1]!.push(previewDelta("Hello world!", 2));
+      await vi.advanceTimersByTimeAsync(20);
+
+      expect(entry.getState().conversationLoadError).toBeNull();
+      expect(preview()).toEqual(["Hello world!"]);
+    });
+
     it("keeps the stream slot while the replacing bind waits on the session's host", async () => {
       vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
       const slots = makeFakeSlotManager();
@@ -20545,11 +20575,19 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     sink.push(nativeDelta("m1", 0, "one ", false));
     sink.push(nativeDelta("m1", 1, "two ", false));
     sink.push(nativeDelta("m1", 2, "three", false));
+    const seen: string[] = [];
+    const unsubscribe = useChatStore.subscribe(() => {
+      const text = provisional()?.fullText;
+      if (text !== undefined) seen.push(text);
+    });
     sink.push(messageDone("ci_1", "resp_d", "one two three", "m1"));
     await tick();
     manual.fire();
+    unsubscribe();
 
-    // The committed item replaces the preview, and no later frame recreates it.
+    // The buffered chunks land before the item, which replaces the preview
+    // without a later frame recreating it.
+    expect(seen).toContain("one two three");
     expect(provisional()).toBeUndefined();
     const text = useChatStore.getState().blocks.filter((b) => b.type === "text_done");
     expect(text).toHaveLength(1);
@@ -20572,7 +20610,12 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     await tick();
 
     // No frame has fired: the card's arrival alone must land the text before it.
+    const blocks = useChatStore.getState().blocks;
+    const textAt = blocks.findIndex((b) => b.ctx.itemId === "live:m1");
+    const cardAt = blocks.findIndex((b) => b.type === "elicitation");
     expect(provisional()?.fullText).toBe("a b c ");
+    expect(cardAt).toBeGreaterThan(-1);
+    expect(textAt).toBeLessThan(cardAt);
     controller.abort();
   });
 
