@@ -6,6 +6,7 @@ import { type TerminalSplitState, terminalLayoutKeys } from "@/lib/paneSplitLayo
 
 import {
   isPaneShellEnded,
+  markPaneShellEnded,
   resetEndedPaneShellsForTests,
   shellEndedOnClose,
   usePaneShellExit,
@@ -82,7 +83,7 @@ describe("shellEndedOnClose", () => {
 describe("usePaneShellExit", () => {
   it("removes a pane whose shell exits and gives its neighbour the keyboard", () => {
     const { target, read } = memoryTarget(THREE_PANES);
-    const { result } = renderHook(() => usePaneShellExit(target));
+    const { result } = renderHook(() => usePaneShellExit(target, true));
     act(() => result.current(ZSH_KEY, CONNECTED));
     act(() => result.current(ZSH_KEY, ENDED));
     expect(panesOf(read())).toEqual([AGENT_KEY, BASH_KEY]);
@@ -93,9 +94,21 @@ describe("usePaneShellExit", () => {
     expect(isPaneShellEnded(target.conversationId, ZSH_KEY)).toBe(false);
   });
 
+  it("without removal, leaves an exited pane and marks nothing, but still forgets on connect", () => {
+    const { target, read } = memoryTarget(THREE_PANES);
+    const { result } = renderHook(() => usePaneShellExit(target, false));
+    act(() => result.current(ZSH_KEY, CONNECTED));
+    act(() => result.current(ZSH_KEY, ENDED));
+    expect(read()).toEqual(THREE_PANES);
+    expect(isPaneShellEnded(target.conversationId, ZSH_KEY)).toBe(false);
+    markPaneShellEnded(target.conversationId, BASH_KEY);
+    act(() => result.current(BASH_KEY, CONNECTED));
+    expect(isPaneShellEnded(target.conversationId, BASH_KEY)).toBe(false);
+  });
+
   it("keeps a pane closed before it ever connected, or dropped by the transport", () => {
     const { target, read } = memoryTarget(THREE_PANES);
-    const { result } = renderHook(() => usePaneShellExit(target));
+    const { result } = renderHook(() => usePaneShellExit(target, true));
     act(() => result.current(ZSH_KEY, ENDED));
     act(() => result.current(BASH_KEY, CONNECTED));
     act(() => result.current(BASH_KEY, DROPPED));
@@ -105,7 +118,7 @@ describe("usePaneShellExit", () => {
 
   it("keeps a pane whose attach is refused after connecting, across a reconnect", () => {
     const { target, read } = memoryTarget(THREE_PANES);
-    const { result } = renderHook(() => usePaneShellExit(target));
+    const { result } = renderHook(() => usePaneShellExit(target, true));
     for (let attempt = 0; attempt < 2; attempt += 1) {
       act(() => result.current(ZSH_KEY, CONNECTED));
       act(() => result.current(ZSH_KEY, REFUSED));
@@ -116,7 +129,7 @@ describe("usePaneShellExit", () => {
 
   it("keeps the agent's own pane when its terminal ends", () => {
     const { target, read } = memoryTarget(THREE_PANES);
-    const { result } = renderHook(() => usePaneShellExit(target));
+    const { result } = renderHook(() => usePaneShellExit(target, true));
     act(() => result.current(AGENT_KEY, CONNECTED));
     act(() => result.current(AGENT_KEY, ENDED));
     expect(read()).toEqual(THREE_PANES);

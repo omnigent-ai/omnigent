@@ -38,6 +38,7 @@ import {
 import { readTerminalGroups, updateTerminalGroups, useTerminalGroups } from "./terminalGroupsStore";
 import { currentTerminalListGeneration, useTerminalListGeneration } from "./terminalListGeneration";
 import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
+import { usePaneShellExit } from "./paneShellExit";
 import { useTerminalPaneActions } from "./terminalPaneActions";
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
 import { NO_MAIN_SPLIT_MEMBERS, useMainOwnedTerminalKeys } from "./terminalPlacement";
@@ -212,6 +213,7 @@ export function SidebarTerminalPanes({
       focusSplitPane(target, shownKey);
     }
   }, [target, shownKey, savedFocus, selectionMoved, requestedMember]);
+  const observePaneShell = usePaneShellExit(target, false);
   const actions = useTerminalPaneActions(target, terminals, {
     measureSizing: () => domCellSizing(panesRef.current),
   });
@@ -379,7 +381,11 @@ export function SidebarTerminalPanes({
                 pendingFocus && focusRecipient === paneKey ? pendingFocus.id : undefined
               }
               onFocusRequestTaken={(id) => settleTerminalFocus(conversationId, "rail", id)}
-              onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
+              onStateChange={(state) => {
+                setTerminalConnectionState(terminal.id, state);
+                // A reconnect here clears a mark another surface left; only the main view removes.
+                observePaneShell(paneKey, state);
+              }}
               onActivity={() => markTerminalActive(terminal.id)}
             />
           );

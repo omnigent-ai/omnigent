@@ -15,6 +15,7 @@ import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { resetAppPanes, setAppPaneTabActions, setAppPaneTitle } from "./appPanes";
 import { ChatPaneBody } from "./ChatPaneBody";
 import { useSplitBesideChat, useSplitOnScreen } from "./chatPaneToolbarHost";
+import { isPaneShellEnded, resetEndedPaneShellsForTests } from "./paneShellExit";
 import { readPaneSplit, resetPaneSplitsCache, updatePaneSplit } from "./paneSplitStore";
 import { SidebarTerminalPanes } from "./SidebarTerminalPanes";
 import { SplitPanesMainView, type SplitPanesMainViewProps } from "./SplitPanesMainView";
@@ -139,6 +140,7 @@ afterEach(() => {
   resetTerminalPlacement();
   resetTerminalOpenRequestsForTests();
   resetPanePaletteOwnerForTests();
+  resetEndedPaneShellsForTests();
   surfaces.clear();
 });
 
@@ -171,6 +173,51 @@ describe("SplitPanesMainView", () => {
     // Still listed: the runner reports the exit seconds later.
     expect(screen.queryByTestId(`terminal-${SHELL_ID}`)).toBeNull();
     expect(screen.getByTestId(`terminal-${OTHER_ID}`)).toBeInTheDocument();
+  });
+
+  it("asks again about a shell back in its pane after floating panes turn off", async () => {
+    const conversationId = nextConversation();
+    threePanes(conversationId);
+    const { rerender } = render(<View conversationId={conversationId} cards />);
+    endShell();
+    expect(screen.queryByTestId(`terminal-${SHELL_ID}`)).toBeNull();
+
+    // Within the ended mark's memory, the same shell is back in the split and connects.
+    rerender(<View conversationId={conversationId} />);
+    act(() => threePanes(conversationId));
+    act(() => surfaces.get(SHELL_ID)!.onStateChange?.({ kind: "connected" }));
+    const closePane = Object.values(usePaletteCommandsStore.getState().groups)
+      .flatMap((group) => group.commands)
+      .find((candidate) => candidate.label === "Close Pane");
+    act(() => closePane!.run());
+    expect(await screen.findByRole("dialog", { name: "Close shell?" })).toBeInTheDocument();
+    expect(screen.getByTestId(`terminal-${SHELL_ID}`)).toBeInTheDocument();
+  });
+
+  it("forgets an ended shell once the sidebar's pane for it connects", async () => {
+    const conversationId = nextConversation();
+    threePanes(conversationId);
+    const { rerender } = render(<View conversationId={conversationId} cards />);
+    endShell();
+    expect(isPaneShellEnded(conversationId, SHELL)).toBe(true);
+
+    // The same shell, back as the sidebar's tab, connects there.
+    rerender(
+      <>
+        <View conversationId={conversationId} cards />
+        <SidebarTerminalPanes
+          conversationId={conversationId}
+          shownKey={SHELL}
+          mountedKeys={[SHELL]}
+          readOnly={false}
+          visible
+          autoFocusKey={null}
+        />
+      </>,
+    );
+    await screen.findByTestId(`terminal-${SHELL_ID}`);
+    act(() => surfaces.get(SHELL_ID)!.onStateChange?.({ kind: "connected" }));
+    expect(isPaneShellEnded(conversationId, SHELL)).toBe(false);
   });
 
   it("without floating panes, leaves an exited shell's pane to the terminals list", () => {

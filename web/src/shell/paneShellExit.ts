@@ -70,16 +70,20 @@ export function shellEndedOnClose(state: ConnectionState | null, wasConnected: b
 }
 
 /**
- * Watch the split's shell panes, given each connection change as ``observe(paneKey, state)``: a
- * pane whose shell ends leaves the split and the pane beside it takes the keyboard. Panes the
+ * Watch the split's shell panes, given each connection change as ``observe(paneKey, state)``. A
+ * pane that connects is no longer taken as ended, on every surface. With `removesEndedPanes`, a
+ * pane whose shell ends leaves the split and the pane beside it takes the keyboard; panes the
  * split can't close, such as the agent's own, stay.
  */
 export function usePaneShellExit(
   target: TerminalSplitTarget,
+  removesEndedPanes: boolean,
 ): (paneKey: string, state: ConnectionState | null) => void {
   const connected = useRef(new Set<string>());
   const latestTarget = useRef(target);
   latestTarget.current = target;
+  const latestRemoves = useRef(removesEndedPanes);
+  latestRemoves.current = removesEndedPanes;
   return useCallback((paneKey, state) => {
     if (state?.kind === "connected") {
       connected.current.add(paneKey);
@@ -87,6 +91,7 @@ export function usePaneShellExit(
       return;
     }
     if (!shellEndedOnClose(state, connected.current.has(paneKey))) return;
+    if (!latestRemoves.current) return;
     connected.current.delete(paneKey);
     const current = latestTarget.current;
     if (!current.canClosePane(paneKey)) return;

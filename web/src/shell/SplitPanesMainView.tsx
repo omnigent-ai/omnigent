@@ -178,7 +178,7 @@ function MainSplitPanes({
   const savedSplit = usePaneSplit(conversationId);
   const appPaneTitles = useAppPaneTitles(conversationId);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
-  const observePaneShell = usePaneShellExit(target);
+  const observePaneShell = usePaneShellExit(target, cards);
   const panesRef = useRef<HTMLDivElement>(null);
   // One recovery per opening: a healthy agent spends it, so a later reap waits for Resume session.
   const agentRecovery = useRef<AgentRecoveryAllowance>({ attempted: false });
@@ -569,7 +569,7 @@ function MainSplitPanes({
               onStateChange={(state) => {
                 setTerminalConnectionState(terminal.id, state);
                 // The terminals list lags a shell's exit by seconds; the attach's end is immediate.
-                if (cards) observePaneShell(paneKey, state);
+                observePaneShell(paneKey, state);
               }}
               onActivity={() => markTerminalActive(terminal.id)}
               onResume={runnerOffline ? onResume : undefined}

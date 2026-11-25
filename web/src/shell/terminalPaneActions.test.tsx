@@ -14,9 +14,9 @@ import {
 } from "./paneStartFailures";
 import {
   ENDED_SHELL_MEMORY_MS,
-  forgetPaneShellEnded,
   markPaneShellEnded,
   resetEndedPaneShellsForTests,
+  usePaneShellExit,
 } from "./paneShellExit";
 import { PREFERRED_SHELL_KEY, readPreferredShell } from "./preferredShell";
 import type { ShellCloseCheck } from "./shellCloseCheck";
@@ -237,8 +237,10 @@ describe("useTerminalPaneActions", () => {
     vi.useFakeTimers();
     const { target } = memoryTarget(SIDE_BY_SIDE);
     markPaneShellEnded(target.conversationId, ZSH_KEY);
-    // The same name and session key relaunched, its pane connected again.
-    forgetPaneShellEnded(target.conversationId, ZSH_KEY);
+    // The same name and session key relaunched, and its pane connects on a surface that
+    // doesn't remove ended panes.
+    const { result: observe } = renderHook(() => usePaneShellExit(target, false));
+    act(() => observe.current(ZSH_KEY, { kind: "connected" }));
     const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
     act(() => result.current.closePane(ZSH_KEY));
     expect(result.current.pendingClose?.terminal).toEqual(ZSH);
