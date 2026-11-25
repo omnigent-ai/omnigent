@@ -363,6 +363,7 @@ export function CommentsPanel({
                   onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
                   onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
                   now={currentTime}
+                  addressedBy={addressedByAgent(c, addressedComments)}
                 />
               );
             })}
@@ -371,6 +372,30 @@ export function CommentsPanel({
       </div>
     </div>
   );
+}
+
+const AGENT_AUTHOR_SUFFIX = " (agent)";
+
+/** Whether an agent wrote the comment; the server signs agents' comments "<role> (agent)". */
+export function isAgentComment(comment: Comment): boolean {
+  return comment.created_by?.endsWith(AGENT_AUTHOR_SUFFIX) ?? false;
+}
+
+/**
+ * The agent that handled a resolved comment: whoever replied on the same text after it.
+ * Returns ``null`` for an agent's own reply, or when no agent replied.
+ */
+export function addressedByAgent(comment: Comment, comments: Comment[]): string | null {
+  if (comment.status !== "addressed" || isAgentComment(comment)) return null;
+  const reply = comments.find(
+    (other) =>
+      other.id !== comment.id &&
+      isAgentComment(other) &&
+      other.start_index === comment.start_index &&
+      other.end_index === comment.end_index &&
+      other.created_at >= comment.created_at,
+  );
+  return reply?.created_by ? reply.created_by.slice(0, -AGENT_AUTHOR_SUFFIX.length) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +412,8 @@ interface CommentCardProps {
   onDelete?: () => void;
   onCopyLink?: () => void;
   now: Date;
+  /** The agent that replied to and resolved it, shown instead of "Sent". */
+  addressedBy?: string | null;
 }
 
 function CommentCard({
@@ -398,6 +425,7 @@ function CommentCard({
   onDelete,
   onCopyLink,
   now,
+  addressedBy,
 }: CommentCardProps) {
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState(c.body);
@@ -439,7 +467,11 @@ function CommentCard({
     if (!editing) setEditBody(c.body);
   }, [c.id, c.body, editing]);
 
-  const statusLabel = c.status === "addressed" ? "Sent" : null;
+  const statusLabel = addressedBy
+    ? `Addressed by ${addressedBy}`
+    : c.status === "addressed" && !isAgentComment(c)
+      ? "Sent"
+      : null;
 
   function startEdit() {
     setEditBody(c.body);

@@ -4,11 +4,12 @@
 // hook keeps its strict signature.
 
 import { type ReactNode, createContext, useContext, useMemo } from "react";
-import { useSendCommentsToAgent } from "@/hooks/useComments";
+import { useAddressProjectFileComments, useSendCommentsToAgent } from "@/hooks/useComments";
+import { parseProjectFileScope } from "@/lib/projectFileScope";
 
 interface CommentSender {
-  /** Fire the POST /comments/send mutation. */
-  mutate: ReturnType<typeof useSendCommentsToAgent>["mutate"];
+  /** Send these comments to the agent (a session's own, or a project file's handler). */
+  mutate: (payload: { comment_ids: string[]; instruction?: string }) => void;
   /** True while a `mutate` call is in flight. */
   isPending: boolean;
 }
@@ -37,6 +38,10 @@ export function CommentSenderProvider({
   agentId: string | null;
   children: ReactNode;
 }) {
+  // A project file has no agent of its own; the server picks who gets its comments.
+  if (parseProjectFileScope(sessionId)) {
+    return <ProjectFileSenderProvider scopeId={sessionId}>{children}</ProjectFileSenderProvider>;
+  }
   if (agentId === null) {
     return <CommentSenderContext.Provider value={null}>{children}</CommentSenderContext.Provider>;
   }
@@ -45,6 +50,21 @@ export function CommentSenderProvider({
       {children}
     </AgentBoundSenderProvider>
   );
+}
+
+function ProjectFileSenderProvider({
+  scopeId,
+  children,
+}: {
+  scopeId: string;
+  children: ReactNode;
+}) {
+  const mutation = useAddressProjectFileComments(scopeId);
+  const value = useMemo(
+    () => ({ mutate: mutation.mutate, isPending: mutation.isPending }),
+    [mutation.mutate, mutation.isPending],
+  );
+  return <CommentSenderContext.Provider value={value}>{children}</CommentSenderContext.Provider>;
 }
 
 function AgentBoundSenderProvider({

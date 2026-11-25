@@ -58,6 +58,28 @@
         "title": "AddCommentRequest",
         "type": "object"
       },
+      "AddressFileComments": {
+        "description": "Which open comments to send; omit to send all of the file's open comments.",
+        "properties": {
+          "comment_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 200,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment Ids"
+          }
+        },
+        "title": "AddressFileComments",
+        "type": "object"
+      },
       "AgentConfigObject": {
         "description": "Owner-only configuration read and PATCH result.",
         "properties": {
@@ -24285,6 +24307,70 @@
           }
         },
         "summary": "Add Project File Comment",
+        "tags": [
+          "project files"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/files/{file_id}/comments/address": {
+      "post": {
+        "description": "Send a file's open comments to the agent who should handle them.\n\nThat's the linked ticket's assignee, else the session that saved the file,\nelse the project's Lead. Only a person can send them.",
+        "operationId": "address_project_file_comments_v1_projects__project_id__files__file_id__comments_address_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "title": "File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddressFileComments"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Address Project File Comments V1 Projects  Project Id  Files  File Id  Comments Address Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Address Project File Comments",
         "tags": [
           "project files"
         ]

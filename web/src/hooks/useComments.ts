@@ -1,3 +1,4 @@
+import { toast } from "sonner";
 import {
   isLocalReviewComment,
   sameLocalReviewAnchor,
@@ -255,6 +256,34 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
       void queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });
+    },
+  });
+}
+
+/** Send a project file's open comments to the agent who should handle them. */
+export function useAddressProjectFileComments(scopeId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: { comment_ids: string[]; instruction?: string }) => {
+      const res = await authenticatedFetch(`${commentsApiBase(scopeId)}/comments/address`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ comment_ids: payload.comment_ids }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail?.error?.message ?? `${res.status} ${res.statusText}`);
+      }
+      return (await res.json()) as { sent: number; recipient: string; session_id: string };
+    },
+    onSuccess: (data) => {
+      toast.success(
+        `Sent ${data.sent} comment${data.sent === 1 ? "" : "s"} to ${data.recipient}`,
+      );
+      void queryClient.invalidateQueries({ queryKey: ["comments", scopeId] });
+    },
+    onError: (error) => {
+      toast.error(`Couldn't send the comments: ${error.message}`);
     },
   });
 }

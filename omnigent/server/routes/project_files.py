@@ -10,10 +10,12 @@ same rows.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, Form, Request, Response, UploadFile
+from pydantic import BaseModel, Field
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.entities import Conversation, StoredFile
@@ -21,6 +23,7 @@ from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import AuthProvider
+from omnigent.server.persona_mentions import person_display_name
 from omnigent.server.routes._auth_helpers import attribution_user, require_user
 from omnigent.server.routes.comments import AddCommentRequest, UpdateCommentRequest
 from omnigent.server.routes.project_ticket_attachments import PROJECT_METADATA_KEY
@@ -207,9 +210,39 @@ def create_project_files_router(
     if comment_store is not None:
         agents = _CommentAgents(auth_provider, conversation_store, permission_store, project_store)
         _add_comment_routes(
-            router, comment_store, require_project, project_file, auth_provider, agents
+            router, comment_store, require_project, project_file, auth_provider, agents, store
         )
     return router
+
+
+class AddressFileComments(BaseModel):
+    """Which open comments to send; omit to send all of the file's open comments."""
+
+    comment_ids: list[str] | None = Field(default=None, max_length=200)
+
+
+def _address_message(stored: StoredFile, rows: list[Any], user_id: str | None) -> str:
+    """The turn that hands a file's open comments to an agent."""
+    title = (stored.source_metadata or {}).get("title") or stored.filename
+    who = person_display_name(user_id) if user_id else "Someone"
+    lines = [
+        f'{who} asked you to address {len(rows)} open comment(s) on the project file "{title}" '
+        f"(file_id {stored.id}).",
+        "",
+    ]
+    for number, row in enumerate(rows, 1):
+        anchor = (row.anchor_content or "").strip().replace("\n", " ")[:200]
+        author = person_display_name(row.created_by) if row.created_by else "someone"
+        lines.append(f'{number}. On "{anchor}", {author} wrote: {row.body.strip()}')
+    lines += [
+        "",
+        "For each one, decide what to do and act on it where you can. Then use "
+        "sys_project_file_comments to reply with what you did or decided, and resolve it "
+        "(comment_ids come from its list action). Project files can't be edited in place, "
+        "so don't save a second copy of this file; if the text itself needs to change, say "
+        "so in your reply.",
+    ]
+    return "\n".join(lines)
 
 
 class _CommentAgents:
@@ -250,6 +283,55 @@ class _CommentAgents:
             )
         return source
 
+    async def recipients(
+        self, project: str, stored: StoredFile, tickets: ProjectTicketStore, user_id: str | None
+    ) -> list[tuple[str, str]]:
+        """Who a file's comments go to, in order: (name, session ID) pairs.
+
+        The linked ticket's assignee, then the session that saved the file, then the Lead.
+        """
+        if self.projects is None:
+            return []
+        entity = await asyncio.to_thread(self.projects.get, project, user_id=user_id)
+        if entity is None:
+            return []
+        identities = await asyncio.to_thread(
+            self.projects.list_identities, project, user_id=user_id
+        )
+        found: list[tuple[str, str]] = []
+        metadata = stored.source_metadata or {}
+        ticket_id = metadata.get("ticket_id")
+        if ticket_id:
+            try:
+                ticket = await asyncio.to_thread(tickets.get, project, ticket_id, user_id=user_id)
+            except OmnigentError:
+                ticket = None
+            assignee = next(
+                (
+                    label.get("value")
+                    for label in (ticket or {}).get("labels") or []
+                    if label.get("key") == "assignee"
+                ),
+                None,
+            )
+            identity = next(
+                (
+                    item
+                    for item in identities
+                    if isinstance(assignee, str)
+                    and item.name.casefold() == assignee.strip().casefold()
+                ),
+                None,
+            )
+            if identity is not None and identity.active_session_id:
+                found.append((identity.name, identity.active_session_id))
+        source = metadata.get("source_session_id")
+        if isinstance(source, str) and source:
+            found.append(("the agent that saved it", source))
+        if entity.main_session_id:
+            found.append(("Lead", entity.main_session_id))
+        return list(dict.fromkeys(found))
+
     async def author(self, source: Conversation, user_id: str | None) -> str:
         """How an agent's comment is signed: its role, marked as an agent."""
         name = "Agent"
@@ -279,6 +361,7 @@ def _add_comment_routes(
     project_file: Any,
     auth_provider: AuthProvider | None,
     agents: _CommentAgents,
+    tickets: ProjectTicketStore,
 ) -> None:
     """Review comments on a project file, in the session comments wire format.
 
@@ -355,6 +438,48 @@ def _add_comment_routes(
         if updated is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
         return asdict(updated)
+
+    @router.post("/{file_id}/comments/address")
+    async def address_project_file_comments(
+        request: Request, project_id: str, file_id: str, body: AddressFileComments
+    ) -> dict[str, Any]:
+        """Send a file's open comments to the agent who should handle them.
+
+        That's the linked ticket's assignee, else the session that saved the file,
+        else the project's Lead. Only a person can send them.
+        """
+        project = await require_project(request, project_id)
+        if await agents.source(request, project) is not None:
+            raise OmnigentError("Only a person can send comments", code=ErrorCode.FORBIDDEN)
+        stored = await project_file(project, file_id)
+        user_id = require_user(request, auth_provider)
+        rows = await asyncio.to_thread(comments.list_for_conversation, stored.id)
+        wanted = set(body.comment_ids or [])
+        open_rows = [
+            row for row in rows if row.status == "draft" and (not wanted or row.id in wanted)
+        ]
+        if not open_rows:
+            raise OmnigentError("There are no open comments to send", code=ErrorCode.INVALID_INPUT)
+        recipients = await agents.recipients(project, stored, tickets, user_id)
+        text = _address_message(stored, open_rows, user_id)
+        stable_id = hashlib.md5(
+            "|".join(
+                [stored.id, *sorted(f"{row.id}:{row.updated_at}" for row in open_rows)]
+            ).encode()
+        ).hexdigest()
+        notifications = getattr(request.app.state, "project_ticket_notifications", None)
+        if notifications is None or agents.projects is None:
+            raise OmnigentError("Agents can't be reached here", code=ErrorCode.RUNNER_UNAVAILABLE)
+        project_entity = await asyncio.to_thread(agents.projects.get, project, user_id=user_id)
+        for name, session_id in recipients:
+            if await notifications.deliver_to_session(
+                request.app, project_entity, session_id, stable_id=stable_id, text=text
+            ):
+                return {"sent": len(open_rows), "session_id": session_id, "recipient": name}
+        raise OmnigentError(
+            "No agent is available to take these comments; open the Lead and try again",
+            code=ErrorCode.CONFLICT,
+        )
 
     @router.delete("/{file_id}/comments/{comment_id}", status_code=204)
     async def delete_project_file_comment(

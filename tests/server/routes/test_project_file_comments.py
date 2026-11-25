@@ -165,3 +165,82 @@ async def test_agents_outside_the_project_or_unbound_are_refused(multi_user_clie
 
     # A person who isn't a member can't read it at all.
     assert (await client.get(path, headers=_as_user(BOB))).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_address_all_sends_open_comments_to_the_assignee_then_the_lead(
+    multi_user_app, multi_user_client, db_uri, monkeypatch
+):
+    client = multi_user_client
+    project_id, file_id, _ = await _project_with_comment(client, "Docs")
+    delivered: list[tuple[str, str]] = []
+
+    async def deliver(app, project, session_id, *, stable_id, text, automatic=None):
+        delivered.append((session_id, text))
+        return True
+
+    monkeypatch.setattr(
+        multi_user_app.state.project_ticket_notifications, "deliver_to_session", deliver
+    )
+    path = f"/v1/projects/{project_id}/files/{file_id}/comments/address"
+
+    # With no ticket and no saving session, the Lead gets them.
+    lead_id = (await client.get(f"/v1/projects/{project_id}", headers=_as_user(ALICE))).json()[
+        "main_session_id"
+    ]
+    assert lead_id
+    sent = await client.post(path, json={}, headers=_as_user(ALICE))
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["recipient"] == "Lead" and delivered[-1][0] == lead_id
+    assert '"Tuesday"' in delivered[-1][1] and "sys_project_file_comments" in delivered[-1][1]
+
+    # A file linked to a ticket goes to the ticket's assignee.
+    identity = (
+        await client.post(
+            f"/v1/projects/{project_id}/identities",
+            json={"name": "Product Designer", "instructions": "Own the docs."},
+            headers=_as_user(ALICE),
+        )
+    ).json()
+    session_id = _agent_session(db_uri, project_id, identity["id"])
+    SqlAlchemyProjectStore(db_uri).set_identity_session(
+        project_id,
+        identity["id"],
+        session_id,
+        user_id=ALICE,
+        expected_session_id=identity.get("active_session_id"),
+    )
+    ticket = (
+        await client.post(
+            f"/v1/projects/{project_id}/tickets",
+            json={
+                "title": "Review the plan",
+                "labels": [{"key": "assignee", "value": "Product Designer"}],
+            },
+            headers=_as_user(ALICE),
+        )
+    ).json()
+    linked = await client.post(
+        f"/v1/projects/{project_id}/files",
+        files={"file": ("plan2.md", _DOC.encode(), "text/markdown")},
+        data={"ticket_id": ticket["id"]},
+        headers=_as_user(ALICE),
+    )
+    linked_id = linked.json()["id"]
+    await client.post(
+        f"/v1/projects/{project_id}/files/{linked_id}/comments",
+        json={"path": "plan2.md", "body": "Shorter?", "start_index": 0, "end_index": 6},
+        headers=_as_user(ALICE),
+    )
+    sent = await client.post(
+        f"/v1/projects/{project_id}/files/{linked_id}/comments/address",
+        json={},
+        headers=_as_user(ALICE),
+    )
+    assert sent.status_code == 200, sent.text
+    assert sent.json() == {"sent": 1, "session_id": session_id, "recipient": "Product Designer"}
+
+    # Only a person sends them; an agent can't.
+    agent = {**_bind_runner(db_uri, session_id), ORCHESTRATION_SOURCE_HEADER: session_id}
+    refused = await client.post(path, json={}, headers={**_as_user(ALICE), **agent})
+    assert refused.status_code == 403
