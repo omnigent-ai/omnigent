@@ -69,6 +69,18 @@ def _settle(page: Page) -> None:
     page.evaluate(_SETTLE_JS)
 
 
+_HIDE_SIDEBAR_CONTENTS_JS = """() => {
+  for (const child of document.querySelector(".conversations-sidebar").children) {
+    child.style.visibility = "hidden";
+  }
+}"""
+
+
+def _hide_sidebar_contents(page: Page) -> None:
+    """Leave only the sidebar's surface: sessions other journeys made may fill its rows."""
+    page.evaluate(_HIDE_SIDEBAR_CONTENTS_JS)
+
+
 def _set_features(
     page: Page, floating: bool, *, tabs_sidebar: bool = True, extra: dict[str, bool] | None = None
 ) -> None:
@@ -212,10 +224,11 @@ def test_without_floating_panes_the_layout_stays_edge_to_edge_and_the_sidebar_pa
             assert geometry["chatBorder"] == "0px"
             assert geometry["sidebarBorder"] == ("1px" if scheme == "dark" else "0px")
         sidebar_right = round(geometry["sidebarRight"])
+        _hide_sidebar_contents(page)
         image = _capture(
             page, f"sidebar-{scheme}-floating" if floating else f"edge-to-edge-{scheme}"
         )
-        # The empty lower part of the sidebar, clear of its rows and its edge.
+        # The lower part of the sidebar's bare surface, clear of its edge.
         regions.append(image.crop((16, 760, sidebar_right - 16, 860)))
     floating_region, flat_region = regions
     worst = max(
