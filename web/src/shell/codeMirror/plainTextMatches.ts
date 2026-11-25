@@ -1,7 +1,5 @@
-// A fast path for find's plain-text queries: String.indexOf over the document's
-// folded text, giving exactly the matches CodeMirror's SearchCursor gives, which
-// compares one character at a time. It applies only where folding keeps every
-// position, and returns null otherwise so the caller uses CodeMirror's cursor.
+// Find's plain-text fast path: indexOf over the folded text, with exactly SearchCursor's matches.
+// Where folding would move positions it returns null, and the caller uses SearchCursor.
 
 import type { SearchQuery } from "@codemirror/search";
 import { CharCategory, EditorState, type Text } from "@codemirror/state";
@@ -110,8 +108,12 @@ export const NOTHING_FOUND = null;
  * pieces, when it reads the document. ASCII only, so each character is one cluster.
  * Candidates come in document order, so the line around them is followed forward, once.
  */
-function wordTest(doc: Text, text: string, rangeFrom: number, rangeTo: number) {
-  const categorize = EditorState.create({ doc }).charCategorizer(0);
+// The default word characters, which are all whole-word search uses; built once.
+let defaultCategorizer: ((char: string) => CharCategory) | undefined;
+
+function wordTest(text: string, rangeFrom: number, rangeTo: number) {
+  defaultCategorizer ??= EditorState.create().charCategorizer(0);
+  const categorize = defaultCategorizer;
   const isWord = (position: number, start: number, end: number) =>
     position >= start && position < end && categorize(text[position]!) === CharCategory.Word;
   // The start of the candidate's line, clipped to the range, and the first line break from it.
@@ -154,7 +156,7 @@ export function plainMatches(
   if (query.wholeWord && !foldedDocument(doc).ascii) return null;
   const haystack = foldedText(doc, query.caseSensitive);
   if (haystack === null) return null;
-  const accepts = query.wholeWord ? wordTest(doc, foldedDocument(doc).text, from, to) : () => true;
+  const accepts = query.wholeWord ? wordTest(foldedDocument(doc).text, from, to) : () => true;
   return (function* () {
     let position = from;
     for (;;) {
