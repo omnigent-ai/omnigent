@@ -378,6 +378,32 @@ def test_a_write_from_steps_read_earlier_is_refused_once_they_change(
     assert store.get(saved.id, user_id=ALICE) == elsewhere
 
 
+def test_competing_writes_from_the_same_steps_let_only_one_through(
+    store: WorkflowStore, db_uri: str
+) -> None:
+    saved = _save(store, "deploy")
+    ready = Barrier(2)
+
+    def write(goal: str) -> Workflow | None:
+        competing = WorkflowStore(db_uri)
+        ready.wait(timeout=10)
+        try:
+            return competing.update(
+                saved.id,
+                user_id=ALICE,
+                steps=[STEPS[0], {**STEPS[1], "goal": goal}],
+                expected_steps=saved.steps,
+            )
+        except WorkflowStepsChangedError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write, ["First.", "Second."]))
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    assert store.get(saved.id, user_id=ALICE) == winners[0]
+
+
 def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> None:
     with pytest.raises(InvalidWorkflowError, match="description must not be empty"):
         store.create(user_id=ALICE, name="x", description=" ", steps=STEPS)

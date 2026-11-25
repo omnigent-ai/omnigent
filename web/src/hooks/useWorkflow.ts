@@ -20,8 +20,8 @@ export interface WorkflowDetail extends SavedWorkflow {
    */
   description_source?: string | null;
   /**
-   * Epoch seconds when the description was last written; a write to the steps alone keeps it.
-   * A server from before it sends none.
+   * Epoch seconds when the description was last written; a write to the steps alone keeps it,
+   * and another write can move it to that write's time. A server from before it sends none.
    */
   description_updated_at?: number | null;
 }

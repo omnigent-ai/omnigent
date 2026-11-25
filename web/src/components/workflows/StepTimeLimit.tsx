@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { TimerIcon } from "lucide-react";
 
 import {
@@ -53,7 +53,9 @@ export function StepTimeLimit({
 }) {
   const openRef = useRef(false);
   const onOpenChangeRef = useRef(onOpenChange);
-  onOpenChangeRef.current = onOpenChange;
+  useLayoutEffect(() => {
+    onOpenChangeRef.current = onOpenChange;
+  });
   // The step's hover card waits while the menu is open; tell it the menu went if it unmounts open.
   useEffect(
     () => () => {

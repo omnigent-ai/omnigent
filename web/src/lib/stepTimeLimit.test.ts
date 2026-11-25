@@ -31,6 +31,9 @@ describe("stepTimeLimit", () => {
   it("breaks lines where Markdown does, at a lone CR too", () => {
     expect(stepTimeLimit("Fix it.\r**Time limit:** 2 hours")).toBe("2 hours");
     expect(stepTimeLimit("Example:\r\r```\r**Time limit:** 2 hours\r```")).toBeNull();
+    expect(withStepTimeLimit("Fix it.\r**Details:** run it.", "1 hour")).toBe(
+      "Fix it.\r\r**Time limit:** 1 hour\r\r**Details:** run it.",
+    );
   });
 
   it("reads a description whose lines break with CRLF", () => {

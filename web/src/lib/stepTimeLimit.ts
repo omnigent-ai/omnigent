@@ -194,11 +194,13 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       }
     }
   }
-  // Only the edited lines change: the line breaks stay, and only blank lines at the ends go.
-  const text = lines
-    .join(goal?.includes("\r\n") ? "\r\n" : "\n")
-    .replace(/^(?:[ \t]*\r?\n)+/, "")
-    .replace(/(?:\r?\n[ \t]*)+$/, "");
+  // Only the edited lines change: the description's own line break stays, and only blank lines at
+  // the ends go.
+  let first = 0;
+  while (first < lines.length && !lines[first]!.trim()) first += 1;
+  let last = lines.length;
+  while (last > first && !lines[last - 1]!.trim()) last -= 1;
+  const text = lines.slice(first, last).join(goal?.match(/\r\n|\r|\n/)?.[0] ?? "\n");
   return text.trim() ? text : null;
 }
 

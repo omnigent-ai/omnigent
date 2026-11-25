@@ -3504,8 +3504,8 @@ class WorkflowObject(WorkflowSummary):
         the description was saved from or kept over, until the description is written
         otherwise.
     :param description_updated_at: Unix epoch seconds when the description was last written;
-        a write that leaves it, such as one to the steps alone, keeps it. For a workflow last
-        written before the server kept it, its last write.
+        a write to the steps alone keeps it. Otherwise, as for a workflow last written before
+        the server kept it, it can be the workflow's last write.
     """
 
     steps: list[WorkflowStep]
