@@ -84,3 +84,34 @@
   padding: 0 4px;
   margin: 0 2px;
 }
+
+/* Indent guides: a 1px line at each indent level, one gradient tile per level; the cursor's
+   block adds a stronger line over its own guide. */
+.cm-editor {
+  --cm-indent-guide-color: color-mix(in oklch, var(--foreground) 12%, transparent);
+  --cm-indent-guide-active-color: color-mix(in oklch, var(--foreground) 34%, transparent);
+}
+.cm-line.cm-indent-guides {
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--cm-indent-guide-color) 0 1px,
+    transparent 1px var(--cm-indent-unit)
+  );
+  background-size: calc(var(--cm-indent-guides) * var(--cm-indent-unit)) 100%;
+  background-repeat: no-repeat;
+}
+.cm-line.cm-indent-guides.cm-indent-guide-active {
+  background-image:
+    linear-gradient(var(--cm-indent-guide-active-color), var(--cm-indent-guide-active-color)),
+    repeating-linear-gradient(
+      to right,
+      var(--cm-indent-guide-color) 0 1px,
+      transparent 1px var(--cm-indent-unit)
+    );
+  background-size:
+    1px 100%,
+    calc(var(--cm-indent-guides) * var(--cm-indent-unit)) 100%;
+  background-position:
+    var(--cm-indent-guide-active) 0,
+    0 0;
+}

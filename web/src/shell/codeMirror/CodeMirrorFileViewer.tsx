@@ -75,6 +75,7 @@ import { FILE_EDITOR_COMMANDS, fileEditorCommandLabel } from "@/components/fileE
 import { baseEditorKeymap, cursorHistory, EDITOR_COMMAND_RUNS } from "./codeMirrorEditorCommands";
 import { indentationFolding } from "./codeMirrorFolding";
 import { detectedIndentation } from "./codeMirrorIndentation";
+import { indentGuides } from "./indentGuides";
 import { selectionWhitespacePlugin } from "./codeMirrorSelectionWhitespace";
 import { documentRefresh } from "./documentRefresh";
 import { copyRawSelection, rawDocument, rawDocumentOf } from "./rawOffsets";
@@ -318,6 +319,7 @@ export function CodeMirrorFileViewer({
           indentationFolding(),
           detectedIndentation(initial.content),
           selectionWhitespacePlugin,
+          indentGuides,
           cursorHistory,
           drawSelection(),
           highlightActiveLine(),

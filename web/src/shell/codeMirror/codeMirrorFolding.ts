@@ -11,7 +11,8 @@ import {
 import type { EditorState, Extension, Line } from "@codemirror/state";
 import { type EditorView, gutter, GutterMarker, type ViewUpdate } from "@codemirror/view";
 
-function indentationOf(text: string, tabSize: number): number | null {
+/** The columns of `text`'s leading whitespace, or null for a blank line. */
+export function indentationOf(text: string, tabSize: number): number | null {
   let columns = 0;
   for (const character of text) {
     if (character === " ") columns += 1;

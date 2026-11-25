@@ -3,13 +3,14 @@
 With ``workspace_sidebar_v2`` on, the Files page shows a file in CodeMirror. ⌥-drag
 selects a column, one cursor per line, and ⌘K's Column select commands grow the box from
 the keyboard. A read-only file highlights matching brackets, which only an editable file
-did before. Seeded via the filesystem PUT endpoint (no agent run); the box geometry and
-the commands' edge cases are in the unit tests (``columnSelection``,
-``codeMirrorBracketMatching``).
+did before. Indented lines show a guide at each level, with the cursor's block drawn
+stronger. Seeded via the filesystem PUT endpoint (no agent run); the edge cases are in
+the unit tests (``columnSelection``, ``codeMirrorBracketMatching``, ``indentGuides``).
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 
 import httpx
@@ -29,6 +30,9 @@ from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 _COLUMNS_PATH = "src/columns.py"
 _COLUMNS_SOURCE = "alpha = 1\nbeta = 2\ngamma = 3\ndelta = 4\n"
+_BLOCKS_PATH = "src/blocks.py"
+_BLOCKS_SOURCE = "def run(ready):\n    if ready:\n        go()\n    return ready\n"
+_SEEDED = {_COLUMNS_PATH: _COLUMNS_SOURCE, _BLOCKS_PATH: _BLOCKS_SOURCE}
 # Larger than the server's 10 MiB read cap, so the file arrives truncated and opens read-only.
 _LARGE_PATH = "src/generated_tables.ts"
 _LARGE_SOURCE = "\n".join(
@@ -48,7 +52,7 @@ def code_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
         timeout=60.0,
     ).raise_for_status()
     try:
-        with seeded_workspace(seeded_session, {_COLUMNS_PATH: _COLUMNS_SOURCE}) as session:
+        with seeded_workspace(seeded_session, _SEEDED) as session:
             yield session
     finally:
         remove_seeded(workspace, [_LARGE_PATH])
@@ -112,3 +116,22 @@ def test_a_read_only_file_highlights_matching_brackets(
     page.keyboard.type("x")
     expect(line).to_have_text("export const entry000000 = { id: 0, label: 'row 0' };")
     expect(editor.locator(".cm-matchingBracket")).to_have_text(["{", "}"])
+
+
+def test_indented_lines_show_guides_with_the_cursors_block_drawn_stronger(
+    page: Page, code_session: tuple[str, str]
+) -> None:
+    base_url, session_id = code_session
+    editor = _open_file(page, base_url, session_id, _BLOCKS_PATH)
+    lines = editor.locator(".cm-line")
+    expect(lines.nth(2)).to_have_text("        go()", timeout=30_000)
+    guides = re.compile(r"\bcm-indent-guides\b")
+    active = re.compile(r"\bcm-indent-guide-active\b")
+    expect(lines.nth(0)).not_to_have_class(guides)
+    for indented in (1, 2, 3):
+        expect(lines.nth(indented)).to_have_class(guides)
+
+    # The cursor inside the if block marks that block's guide on its lines only.
+    lines.nth(2).click()
+    expect(lines.nth(2)).to_have_class(active)
+    expect(lines.nth(2)).to_have_attribute("style", re.compile(r"--cm-indent-guides:\s*2"))
