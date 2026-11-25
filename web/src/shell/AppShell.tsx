@@ -5,6 +5,7 @@ import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContex
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
   LazyFileActionHost,
+  LazyGoToFileHost,
   LazyShowAllPullRequestsCommand,
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
@@ -67,6 +68,7 @@ import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
+import { recordRecentWorkspaceFile } from "@/lib/recentWorkspaceFiles";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
@@ -1918,9 +1920,13 @@ function AppShellImpl() {
     (path: string, options?: OpenFileOptions) =>
       guardFileNavigation(path, options, () => {
         contentSearchFileRef.current = null;
+        // Go to File lists the files opened from anywhere, not only from itself.
+        if (tabsSidebar && serverConversationId) {
+          recordRecentWorkspaceFile(serverConversationId, path);
+        }
         commitFileNavigation(path, options);
       }),
-    [guardFileNavigation, commitFileNavigation],
+    [guardFileNavigation, commitFileNavigation, tabsSidebar, serverConversationId],
   );
   const openContentSearchResult = useCallback(
     (path: string, options?: OpenFileOptions) =>
@@ -3373,6 +3379,20 @@ function AppShellImpl() {
             sessionId={serverConversationId}
             pullRequestsAvailable={railTabsAvailable.github}
             showAll={() => openGithubTab()}
+          />
+        </Suspense>
+      )}
+      {/* The finder serves a desktop window with the tabs sidebar: Go to File and Search Text
+        for its session, Sessions on any page. Its code, with the preview's editor, loads only
+        then. */}
+      {tabsSidebar && !mobileViewport && (
+        <Suspense fallback={null}>
+          <LazyGoToFileHost
+            key={serverConversationId ?? "no-session"}
+            sessionId={serverConversationId ?? null}
+            openFile={openFileViewer}
+            showTextSearch={() => showTabsPage("content-search")}
+            textSearch={railTabsAvailable["content-search"]}
           />
         </Suspense>
       )}

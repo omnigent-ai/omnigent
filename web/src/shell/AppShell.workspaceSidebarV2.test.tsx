@@ -10,6 +10,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type * as TabStoreModule from "@/components/BrowserPane/agentTools/tabStore";
 import type { WorkspaceTabsHostProps } from "./workspaceTabs/WorkspaceTabsHost";
+import type { GoToFileHostProps } from "./goToFile/GoToFileHost";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useContext } from "react";
@@ -79,6 +80,15 @@ vi.mock("./fileCommands/FileActionHost", () => ({
   FileActionHost: () => {
     if (fileActionHost.throws) throw new Error("file action host broke");
     return <div data-testid="file-action-host" />;
+  },
+}));
+
+// Go to File has its own suites; these tests check where it mounts and what it's handed.
+const goToFile = vi.hoisted(() => ({ props: null as GoToFileHostProps | null }));
+vi.mock("./goToFile/GoToFileHost", () => ({
+  GoToFileHost: (props: GoToFileHostProps) => {
+    goToFile.props = props;
+    return <div data-testid="go-to-file-host" />;
   },
 }));
 
@@ -190,6 +200,7 @@ vi.mock("./InlineTerminalsSection", () => ({ InlineTerminalsSection: () => null 
 vi.mock("./TerminalsPanel", () => ({ TerminalsPanel: () => null }));
 
 import { useSessionAgent } from "@/hooks/useAgents";
+import { readRecentWorkspaceFiles } from "@/lib/recentWorkspaceFiles";
 import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
@@ -369,6 +380,7 @@ function agentTabs(request: AgentBrowserTabRequest) {
 
 beforeEach(() => {
   localStorage.clear();
+  goToFile.props = null;
   sessionStorage.clear();
   writeWorkspacePanelDefault("open");
   tabs.host = null;
@@ -429,6 +441,53 @@ describe("workspace_sidebar_v2", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
     fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
     expectTabsUntouched();
+  });
+
+  it("mounts Go to File for the session with the flag on, and lists the files it opens as recent", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props).toMatchObject({ sessionId: "conv_ws", textSearch: false });
+    fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
+    expect(readRecentWorkspaceFiles("conv_ws")).toEqual(["src/app.ts"]);
+  });
+
+  it("offers Go to File's text search when the session has content search", async () => {
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, workspace_content_search: true } });
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props?.textSearch).toBe(true);
+    act(() => goToFile.props?.showTextSearch());
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspacePage).toHaveBeenCalledWith(
+        "conv_ws",
+        "content-search",
+      ),
+    );
+  });
+
+  it.each([
+    ["off", withFlag(false)],
+    ["omitted", WITHOUT_FLAG],
+  ])("leaves Go to File out, and records no recent files, when the flag is %s", async (_, info) => {
+    setViewport(DESKTOP);
+    renderShell(info);
+    await settleRoutes();
+
+    expect(screen.queryByTestId("go-to-file-host")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
+    expect(readRecentWorkspaceFiles("conv_ws")).toEqual([]);
+  });
+
+  it("leaves Go to File out on a phone", async () => {
+    setViewport(390, "coarse");
+    renderShell(withFlag(true));
+    await settleRoutes();
+
+    expect(screen.queryByTestId("go-to-file-host")).toBeNull();
   });
 
   it("offers ⌘K's Show all pull requests with the flag on, which opens the session's list", async () => {
