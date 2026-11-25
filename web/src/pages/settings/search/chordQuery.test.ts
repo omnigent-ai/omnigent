@@ -218,7 +218,9 @@ function isBarePrintable(chord: Chord): boolean {
 /** Every environment the registry reads, as the page's own runtime can set them. */
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
-    [true, false].map((desktopMenu) => ({ mac, native, desktopMenu, submitWithModEnter: false })),
+    [true, false].flatMap((desktopMenu) =>
+      [true, false].map((submitWithModEnter) => ({ mac, native, desktopMenu, submitWithModEnter })),
+    ),
   ),
 );
 const MAC_DESKTOP: ShortcutEnvironment = {
@@ -256,6 +258,15 @@ describe("finding shortcuts by chord", () => {
   it("finds real bindings by their keys", () => {
     expect(rows("cmd k", MAC_DESKTOP)).toContain("palette.commands");
     expect(rows("cmd /", MAC_DESKTOP)).toContain("shortcuts.show");
+  });
+
+  it("finds Send and Send now by the keys the send preference gives them", () => {
+    expect(rows("cmd enter", MAC_DESKTOP)).toContain("composer.sendWithQueue");
+    expect(rows("cmd enter", MAC_DESKTOP)).not.toContain("composer.send");
+    const modEnterSends = { ...MAC_DESKTOP, submitWithModEnter: true };
+    expect(rows("cmd enter", modEnterSends)).toContain("composer.send");
+    expect(rows("cmd enter", modEnterSends)).not.toContain("composer.sendWithQueue");
+    expect(rows("shift cmd enter", modEnterSends)).toContain("composer.sendWithQueue");
   });
 
   it("never finds a bare printable key, which only works in context", () => {
