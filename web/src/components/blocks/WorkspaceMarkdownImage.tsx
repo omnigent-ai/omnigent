@@ -34,6 +34,7 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   const [loaded, setLoaded] = useState<{
     key: string;
     url: string;
+    blob: Blob;
     signal: AbortSignal;
   } | null>(null);
   const [failedKey, setFailedKey] = useState<string | null>(null);
@@ -62,7 +63,7 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
         if (blob.size > MAX_IMAGE_BYTES) return;
         objectUrl = URL.createObjectURL(blob);
         setFailedKey(null);
-        setLoaded({ key: imageKey, url: objectUrl, signal: controller.signal });
+        setLoaded({ key: imageKey, url: objectUrl, blob, signal: controller.signal });
       })
       .catch(() => {
         // Missing files, denied reads and offline hosts keep the filename chip.
@@ -88,16 +89,21 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   }
 
   return (
-    <ZoomableImage
-      src={loaded.url}
-      alt={alt || filename}
-      className="my-2 max-h-96 max-w-full rounded-md object-contain"
-      loading="lazy"
-      decoding="async"
-      onError={() => {
-        URL.revokeObjectURL(loaded.url);
-        setFailedKey(imageKey);
-      }}
-    />
+    // The margin sits outside the image so the download button hugs its corner.
+    <span className="my-2 inline-flex max-w-full">
+      <ZoomableImage
+        src={loaded.url}
+        alt={alt || filename}
+        className="max-h-96 max-w-full rounded-md object-contain"
+        downloadName={filename}
+        downloadBlob={loaded.blob}
+        loading="lazy"
+        decoding="async"
+        onError={() => {
+          URL.revokeObjectURL(loaded.url);
+          setFailedKey(imageKey);
+        }}
+      />
+    </span>
   );
 }

@@ -13,7 +13,7 @@
 import type React from "react";
 import { useInRouterContext } from "react-router-dom";
 import { Link } from "@/lib/routing";
-import { useMemo } from "react";
+import { useContext, useMemo } from "react";
 import {
   BotIcon,
   CopyIcon,
@@ -28,6 +28,12 @@ import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  parsePullRequestRefHref,
+  pullRequestRefUrl,
+  remarkPullRequestRefs,
+  type PullRequestRef,
+} from "@/components/ai-elements/pullRequestRefs";
+import {
   sameServerSessionPath,
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
@@ -35,7 +41,9 @@ import {
   WORKSPACE_IMAGE_ATTR,
 } from "@/components/ai-elements/streamdown-security";
 import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -59,6 +67,7 @@ import {
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
 import { resolveChatFilePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
+import { usePullRequestInfoSnapshot } from "@/hooks/usePullRequests";
 import { showToast } from "@/components/ui/toast";
 
 // Streamdown hands each component override the source hast node alongside the
@@ -360,6 +369,19 @@ function WorkspaceFileLink({
   const { root, home } = useWorkspacePaths();
 
   if (!path) {
+    const pullRequestRef = parsePullRequestRefHref(href);
+    if (pullRequestRef) {
+      return (
+        <PullRequestRefLink
+          pullRequestRef={pullRequestRef}
+          className={className}
+          title={title}
+          {...props}
+        >
+          {children}
+        </PullRequestRefLink>
+      );
+    }
     if (typeof href === "string" && isRemoteVideoUrl(href)) {
       return (
         <VideoPlayer
@@ -514,6 +536,39 @@ function WorkspaceFileLink({
   );
 }
 
+/** Resolve a parked PR reference once session repo data arrives; text until then. */
+function PullRequestRefLink({
+  pullRequestRef,
+  children,
+  className,
+  title,
+  ...props
+}: React.ComponentPropsWithoutRef<"a"> & { pullRequestRef: PullRequestRef }) {
+  // Side chats resolve against their own session but open links in the parent viewer.
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const fileViewerConversationId = useFileViewerConversationId();
+  const { data } = usePullRequestInfoSnapshot(scopedConversationId ?? fileViewerConversationId);
+  const url = data ? pullRequestRefUrl(pullRequestRef, data) : null;
+  if (!url) return <span className={className}>{children}</span>;
+  return (
+    <a
+      {...props}
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={cn(STREAMDOWN_LINK_CLASS, className)}
+      title={title ?? url}
+      data-streamdown="link"
+      onClick={(event) => {
+        props.onClick?.(event);
+        followLinkWithPopupFallback(event, url, fileViewerConversationId);
+      }}
+    >
+      <PullRequestLinkLabel>{children}</PullRequestLinkLabel>
+    </a>
+  );
+}
+
 /** Right-click menu that copies the path a file link names. */
 function FileLinkContextMenu({ path, children }: { path: string; children: React.ReactElement }) {
   const copyPath = () =>
@@ -631,6 +686,8 @@ interface SessionMentionPillProps {
   id: string;
   isSubagent: boolean;
   children: React.ReactNode;
+  /** Extra pill classes, e.g. ``"min-w-0"`` so a long title truncates in a flex row. */
+  className?: string;
 }
 
 /** A session pill (e.g. ``@Fix CI``) that opens session ``id`` without reloading the page. */
@@ -645,12 +702,17 @@ export function SessionMentionPill(props: SessionMentionPillProps) {
 
 // The routing seam's Link rebases the href under an embed's mount, routes plain
 // clicks in-app and leaves modified clicks (new tab) to the browser.
-function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPillProps) {
+function RoutedSessionMentionPill({
+  id,
+  isSubagent,
+  children,
+  className,
+}: SessionMentionPillProps) {
   return (
     <Link
       to={`/c/${encodeURIComponent(id)}`}
       data-testid="mention-pill"
-      className={MENTION_PILL_CLASS}
+      className={cn(MENTION_PILL_CLASS, className)}
       title={isSubagent ? "Subagent" : "Session"}
       onClick={(event) => event.stopPropagation()}
     >
@@ -659,12 +721,12 @@ function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPi
   );
 }
 
-function SessionPillLink({ id, isSubagent, children }: SessionMentionPillProps) {
+function SessionPillLink({ id, isSubagent, children, className }: SessionMentionPillProps) {
   return (
     <a
       data-testid="mention-pill"
       href={withBasePath(`/c/${encodeURIComponent(id)}`)}
-      className={MENTION_PILL_CLASS}
+      className={cn(MENTION_PILL_CLASS, className)}
       title={isSubagent ? "Subagent" : "Session"}
       onClick={(event) => event.stopPropagation()}
     >
@@ -694,6 +756,12 @@ const FILE_PATH_AWARE_COMPONENTS = {
   img: ZoomableMarkdownImage,
   a: MarkdownLink,
 };
+
+function LeadingCommandToken({ children }: WithHastNode<React.ComponentPropsWithoutRef<"kbd">>) {
+  return <span className={COMMAND_TOKEN_CLASS}>{children}</span>;
+}
+
+const LEADING_COMMAND_COMPONENTS = { ...FILE_PATH_AWARE_COMPONENTS, kbd: LeadingCommandToken };
 
 // How often the live (growing) assistant bubble re-parses its markdown. The
 // store pump commits a new, longer text up to once per animation frame (~60/s);
@@ -781,6 +849,26 @@ interface MarkdownNode {
   children?: MarkdownNode[];
 }
 
+interface MarkdownTextNode extends MarkdownNode {
+  value?: string;
+  data?: { hName?: string };
+}
+
+/** Tag the leading token in mdast, as sanitize strips classes from raw HTML. */
+function remarkLeadingCommand(token: string) {
+  return (tree: MarkdownTextNode) => {
+    const paragraph = tree.children?.[0];
+    if (paragraph?.type !== "paragraph" || !paragraph.children) return;
+    const first: MarkdownTextNode | undefined = paragraph.children[0];
+    if (first?.type !== "text" || !first.value?.startsWith(token)) return;
+    const rest = first.value.slice(token.length);
+    if (rest !== "" && !/^\s/.test(rest)) return;
+    const marked: MarkdownTextNode[] = [{ type: "text", value: token, data: { hName: "kbd" } }];
+    if (rest) marked.push({ type: "text", value: rest });
+    paragraph.children.splice(0, 1, ...marked);
+  };
+}
+
 /** Turns raw HTML nodes into text nodes holding the same source. */
 function remarkHtmlAsText() {
   const visit = (node: MarkdownNode) => {
@@ -806,28 +894,48 @@ function remarkHtmlAsText() {
  *
  * When `literalHtml` is set, raw HTML shows as written instead of rendering,
  * so markup or comments in a tool's text can't hide part of it.
+ *
+ * When `linkPullRequestRefs` is set, `#1234` and `owner/repo#12` link to the
+ * PR in the session's repo. Opt-in because tool output often contains non-PR `#N`.
+ *
+ * `leadingCommand` tints that token where it opens the text, without changing
+ * how the rest parses. Only for text whose raw HTML renders as text.
  */
 export function FilePathAwareMessageResponse({
   children,
   breaks = false,
   literalHtml = false,
+  leadingCommand,
   isStreaming = false,
+  linkPullRequestRefs = false,
   ...props
-}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
-  const components = FILE_PATH_AWARE_COMPONENTS;
+}: React.ComponentProps<typeof MessageResponse> & {
+  breaks?: boolean;
+  literalHtml?: boolean;
+  linkPullRequestRefs?: boolean;
+  leadingCommand?: string;
+}) {
+  const components =
+    leadingCommand === undefined ? FILE_PATH_AWARE_COMPONENTS : LEADING_COMMAND_COMPONENTS;
 
   // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
-  // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
+  // no option set we pass `undefined` so Streamdown uses its defaults unchanged.
   const remarkPlugins = useMemo(
     () =>
-      breaks || literalHtml
+      breaks || literalHtml || linkPullRequestRefs || leadingCommand !== undefined
         ? [
             ...Object.values(defaultRemarkPlugins),
+            // Before the leading command split: PR splitting rebuilds text nodes, which
+            // would drop its `kbd` tag, and its new nodes have no source position.
+            ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
             ...(literalHtml ? [remarkHtmlAsText] : []),
+            ...(leadingCommand !== undefined
+              ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
+              : []),
             ...(breaks ? [remarkBreaks] : []),
           ]
         : undefined,
-    [breaks, literalHtml],
+    [breaks, literalHtml, linkPullRequestRefs, leadingCommand],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few
@@ -858,6 +966,9 @@ export function FilePathAwareMessageResponse({
 
   return (
     <MessageResponse
+      // Streamdown's memo ignores plugin changes, so a command published after
+      // the first render needs a fresh tree.
+      key={leadingCommand}
       {...props}
       components={components}
       remarkPlugins={remarkPlugins}
@@ -867,5 +978,28 @@ export function FilePathAwareMessageResponse({
     >
       {isString ? throttledText : children}
     </MessageResponse>
+  );
+}
+
+// Keeps headings at the surrounding text's size; `!` beats the unlayered rules in index.css.
+const PROSE_MARKDOWN_CLASS =
+  "[&_:is(h1,h2,h3,h4,h5,h6)]:mt-3! [&_:is(h1,h2,h3,h4,h5,h6)]:mb-1! [&_[data-streamdown^=heading]]:text-sm!";
+
+/**
+ * Finished Markdown written for people outside a chat bubble, such as a tool's
+ * prose or a workflow step's description. Its headings keep the surrounding
+ * size, its line breaks stay, and raw HTML, such as a `<date>` placeholder,
+ * shows as written.
+ */
+export function ProseMarkdown({ children, className }: { children: string; className?: string }) {
+  return (
+    <FilePathAwareMessageResponse
+      mode="static"
+      breaks
+      literalHtml
+      className={cn(PROSE_MARKDOWN_CLASS, className)}
+    >
+      {children}
+    </FilePathAwareMessageResponse>
   );
 }

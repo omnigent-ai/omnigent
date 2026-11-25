@@ -121,7 +121,7 @@ def test_image_payload_gate_accepts_and_rejects() -> None:
 
 
 def test_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
-    """Only a non-empty list of text/image block dicts rehydrates; else ``None``."""
+    """Only a non-empty list of text/image/PDF block dicts rehydrates; else ``None``."""
 
     def fn(output: str) -> list[dict[str, Any]] | None:
         """Normalize *output*, asserting nothing was dropped."""
@@ -149,6 +149,30 @@ def test_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
     # A typed block the API does not accept in a tool_result stays a raw
     # string, so resume keeps sending exactly what it sent before.
     assert fn('[{"type":"file","path":"/x"}]') is None
+
+    def pdf_block(data: str, media_type: str = "application/pdf") -> dict[str, Any]:
+        """Build a base64 document block like Claude Code's PDF Read result."""
+        source = {"type": "base64", "media_type": media_type, "data": data}
+        return {"type": "document", "source": source}
+
+    pdf = base64.b64encode(b"%PDF-1.4\n" + b"0" * 301).decode()
+    wrapped = "\n".join(pdf[i : i + 76] for i in range(0, len(pdf), 76))
+    text_block = {"type": "text", "text": "PDF file read: report.pdf"}
+    # A base64 PDF rehydrates as a document block with canonical base64.
+    assert fn(json.dumps([text_block, pdf_block(wrapped)])) == [text_block, pdf_block(pdf)]
+    assert fn(json.dumps([pdf_block(pdf.rstrip("="))])) == [pdf_block(pdf)]
+    # Document blocks the API would reject keep the raw string.
+    assert fn(json.dumps([pdf_block("[application/pdf content omitted]")])) is None
+    assert fn(json.dumps([pdf_block(pdf, "text/plain")])) is None
+    assert fn(json.dumps([pdf_block("")])) is None
+    pdf_source = pdf_block(pdf)["source"]
+    for source in (
+        "not an object",
+        {"type": "url", "url": "https://example.com/report.pdf"},
+        {**pdf_source, "data": 1234},
+        {key: value for key, value in pdf_source.items() if key != "type"},
+    ):
+        assert fn(json.dumps([{"type": "document", "source": source}])) is None, source
 
 
 def test_strip_unparseable_image_output_negatives_are_byte_for_byte() -> None:
@@ -288,17 +312,23 @@ def test_unusable_payloads_stay_omitted() -> None:
     )
 
 
-def test_sanitize_replayed_image_blocks_downgrades_the_compaction_marker() -> None:
-    """A compaction-stripped image nested in a tool_result becomes text."""
-    marker = "[image/png content omitted from the compaction snapshot]"
+@pytest.mark.parametrize(
+    ("block_type", "media_type"),
+    [("image", "image/png"), ("document", "application/pdf")],
+)
+def test_sanitize_replayed_image_blocks_downgrades_the_compaction_marker(
+    block_type: str, media_type: str
+) -> None:
+    """A compaction-stripped image or PDF nested in a tool_result becomes text."""
+    marker = f"[{media_type} content omitted from the compaction snapshot]"
     content = [
         {
             "type": "tool_result",
             "tool_use_id": "toolu_img",
             "content": [
                 {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": marker},
+                    "type": block_type,
+                    "source": {"type": "base64", "media_type": media_type, "data": marker},
                 }
             ],
         }
@@ -308,18 +338,24 @@ def test_sanitize_replayed_image_blocks_downgrades_the_compaction_marker() -> No
 
     inner = sanitized[0]["content"][0]
     assert inner["type"] == "text"
-    assert "image/png" in inner["text"]
+    assert media_type in inner["text"]
     assert marker not in json.dumps(sanitized)
 
 
-def test_sanitize_replayed_image_blocks_preserves_valid_images() -> None:
-    """A still-valid image survives sanitization, canonicalized in place."""
+def test_sanitize_replayed_image_blocks_preserves_valid_payloads() -> None:
+    """A still-valid image or PDF survives sanitization, canonicalized in place."""
+    pdf_data = base64.b64encode(b"%PDF-1.4\n0").decode()
+    pdf_source = {"type": "base64", "media_type": "application/pdf", "data": pdf_data}
+    pdf_block = {"type": "document", "source": pdf_source}
+    unpadded_pdf = {"type": "document", "source": {**pdf_source, "data": pdf_data.rstrip("=")}}
     content = [
         {"type": "text", "text": "keep me"},
         {
             "type": "image",
             "source": {"type": "base64", "media_type": "image/png", "data": _TINY_PNG_BASE64},
         },
+        pdf_block,
+        unpadded_pdf,
     ]
 
     sanitized = trc.sanitize_replayed_image_blocks(content)
@@ -327,6 +363,7 @@ def test_sanitize_replayed_image_blocks_preserves_valid_images() -> None:
     assert sanitized[0] == {"type": "text", "text": "keep me"}
     assert sanitized[1]["type"] == "image"
     assert sanitized[1]["source"]["media_type"] == "image/png"
+    assert sanitized[2] == sanitized[3] == pdf_block
 
 
 def test_sanitize_replayed_image_blocks_downgrades_bare_mcp_shape() -> None:
@@ -365,11 +402,14 @@ def test_sanitize_replayed_image_blocks_leaves_tool_use_input_untouched() -> Non
 
 def test_sanitize_replayed_image_blocks_preserves_url_source() -> None:
     """A non-base64 ``source`` (e.g. url) carries no payload and is kept."""
-    content = [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}]
+    content = [
+        {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+        {"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}},
+    ]
 
     sanitized = trc.sanitize_replayed_image_blocks(content)
 
-    assert sanitized[0] == content[0]
+    assert sanitized == content
 
 
 def test_sanitize_replayed_image_blocks_downgrades_responses_compaction_marker() -> None:

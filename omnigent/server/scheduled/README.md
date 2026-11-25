@@ -445,6 +445,46 @@ deployment:
 - Each poll reads one page of pending Run now requests, so on a server with many
   pending requests for other replicas' hosts, a request can wait a few polls.
 
+## Agent timers
+
+`sys_timer_set` saves a timer of at least 120 seconds (`DURABLE_TIMER_MIN_SECONDS`) in
+a top-level session as one hidden `kind="timer"` task whose ID is the `timer_id`,
+through `POST /v1/sessions/{id}/timers`. `sys_timer_cancel` deletes it through
+`DELETE /v1/sessions/{id}/timers/{timer_id}`. Both authorize the caller as a message
+to the session would, and a cancel must come from the timer's own session and owner.
+Saving needs the database scheduler and the default-off `session_timers` release
+feature, which `/v1/info` reports; the automations gate doesn't hide these routes.
+The runner keeps every other timer in its own memory and says so in the tool's
+result: a shorter one, one on a server that doesn't save timers, and one in a
+sub-agent's session or a side chat, which the route answers with `durable: false`
+instead of saving.
+
+- **Schedule.** `FREQ=SECONDLY;INTERVAL=<n>`, plus `COUNT=1` for a one-shot, with `n`
+  the delay rounded up to whole seconds. Firings fall at `created_at + k * n`
+  (`next_timer_time`), skipping missed ones, and timers are exempt from the automation
+  minimum interval. A firing comes up to one poll (15 seconds by default) late.
+- **Delivery.** The executor skips budgets, sharing and run labels, and sends the
+  hidden (`is_meta`) wake through the continued-session dispatch, in the session's
+  current permission mode. A session that was deleted, archived or closed, or that
+  the owner can no longer send to, stops the timer (`timer_session_unavailable`).
+  The wake meets the session's REQUEST-phase input policies first: a deny, or an ASK
+  no one can answer, skips that firing (`timer_policy_denied`). A runner that can't
+  be reached or declines the wake fails the firing (`launch_failed`), which is not
+  retried.
+- **Hosts.** The replica that owns a timer's saved host claims its firings. When the
+  session has since moved to another host, or got one after the timer was saved, that
+  replica records the firing `skipped` (`timer_host_moved`) without sending it, saves
+  the session's host on the timer and makes it due a second later, so the replica
+  that owns the new host claims it at its next poll. A one-shot reopens for that.
+- **History.** A timer claims one firing at a time and keeps only its newest run. It
+  never stamps `last_run_at`, and a spent one-shot is deleted. The automations list
+  (unless `kind=all`) and the Inbox leave timers out, and PATCH, Run now, clone and
+  sharing refuse them.
+- **Limits.** A cancel can't stop a firing already claimed, and recovery marks an
+  expired startup `failed` without resending. Every server on the database must read
+  timer rows before the feature is turned on; turning it off stops new timers, while
+  existing ones keep firing and can still be cancelled.
+
 ## Custom callbacks
 
 A deployment can replace parts of the scheduler by passing
@@ -553,7 +593,7 @@ These are the defaults, set in the server YAML configuration:
 ```yaml
 scheduled_task_scheduler:
   startup_retry_seconds: 30  # Wait before retrying a failed scheduler start, in either mode
-  poll_seconds: 30       # Time between checks for due tasks and expired startups
+  poll_seconds: 15       # Time between checks for due tasks and expired startups
   renewal_seconds: 30    # Time between startup heartbeats
   lease_seconds: 120     # How long a lease lasts after each renewal
   recovery_seconds: 30   # Time limit for inspecting and recovering one run
@@ -800,9 +840,10 @@ competing-worker scenarios live in `test_managed_startup_inputs.py`.
 for UI, API, and agent-tool creates. Its top-level `user_id` is the authenticated
 owner (`local` for auth-disabled servers); attributes are `task_id`,
 `task_workspace_id`, `creation_source` (`ui`, `agent`, or `api`), `template_id`,
-`kind` (`automation` or `reminder`), `target`, and `session_mode`. `template_id`
-is `none` for agent and API creates, which have no template, and `unknown` for
-an unrecognized or missing UI template. Rejected creates emit no creation event. As with
+`kind` (`automation` or `reminder`), `target`, `session_mode`, and `mcp_services`
+(the sorted, comma-joined registry service IDs every run starts with; empty for
+none, and `other` for a value outside the registry ID format). `template_id` is `none` for agent and API creates, which have no
+template, and `unknown` for an unrecognized or missing UI template. Rejected creates emit no creation event. As with
 run logs, delivery is best-effort; reconcile current inventory against the store.
 
 Requests without a recognized source header are classified as `api`, including

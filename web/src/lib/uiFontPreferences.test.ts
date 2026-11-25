@@ -43,6 +43,13 @@ describe("uiFontPreferences", () => {
     expect(readUiFontSizePx()).toBe(12);
   });
 
+  it("keeps the desktop default in a desktop app window narrower than md", () => {
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
+    vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+    expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_DEFAULT);
+    expect(readAppliedUiFontSizePx()).toBe(UI_FONT_SIZE_DEFAULT);
+  });
+
   it.each([
     ["narrow viewport", true, true, 15],
     ["wide touch viewport", false, true, 14],

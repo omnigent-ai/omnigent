@@ -1,9 +1,13 @@
 # Workspace fast track
 
-The file viewer can read a session's workspace files through the workspace API
-(`omnigent/api/workspace/v1alpha1/workspace.proto`) instead of the REST file
-routes. The session's host answers every call with one implementation
-(`omnigent/host/workspace_service.py`), whichever route carried it.
+The file viewer and the Files tree can read a session's workspace through the
+workspace API (`omnigent/api/workspace/v1alpha1/workspace.proto`) instead of the
+REST file routes: file reads (`ReadFile`) and directory listings
+(`ListDirectory`, including the checks for files mentioned in chat). The
+session's host answers every call with one implementation
+(`omnigent/host/workspace_service.py`), whichever route carried it. Its listings
+match the runner's REST listings; `tests/runner/test_environment_filesystem.py`
+compares them.
 
 ## Routes
 
@@ -21,13 +25,56 @@ API skips the runner and streams protobuf messages through without re-encoding
 them. A route that fails for a session is skipped for five minutes. Error
 answers such as "not found" go to REST, so callers keep the errors they expect.
 
+## Methods a host serves
+
+`ListDirectory` and `ReadFile` came with the API, so every host that serves it
+has them. Before any other method (file and content search, Git comparisons)
+the page asks the route's host with `GetCapabilities`, once per route every
+five minutes, shared by concurrent calls and never cancelled by one of them.
+A method or feature the host doesn't list goes straight to REST, or reads as
+unavailable where REST has no equivalent. An `unimplemented` answer, or one the
+page can't use (a content search that ends early), skips only that method on
+that route for five minutes. Either way the route keeps serving what the host
+has, so an older host still reads files. Git comparisons have no REST
+equivalent, so a request the host refuses, such as an unknown revision, fails
+with the host's message instead.
+
+Go to File and Content search try the workspace API first and fall back to
+their REST routes. Content search is only asked for while the server's
+`workspace_content_search` flag is on; with it off, the server route answers
+`SearchText` with `unimplemented` and leaves it out of `GetCapabilities`.
+Neither route can stop a search on the host once it has started: a search the
+user abandons runs until it ends on its own, at most 20 seconds.
+
+The host answers these in plain Python, listing each in `GetCapabilities` only
+when it can:
+
+| Method | Needs | Notes |
+|---|---|---|
+| `StatPath`, `ReadLinkText` | nothing | A link's own text is returned even when it points outside the workspace; a path whose parent leads outside is refused |
+| `SearchFiles` | `git` | Substring mode (`search_files.substring`), as the REST file search answers it. Where the host can rank paths, also fuzzy mode (`search_files.fuzzy`), best first with matched characters, and a blank fuzzy query that lists files in path order (`search_files.browse`) |
+| `SearchText` | `rg` | The REST content search's ripgrep script, streamed in batches of 100 |
+| `ResolveWorkingCopyBase`, `ListWorkingCopyChanges`, `ReadBaseFile`, `ListRepositoryRefs`, `ListBranchCommits` | `git` | With `revision_comparison` and `branch_commits`. Changes and base reads stay inside the workspace when it is a subfolder of a larger repository; refs and commits are repository-wide |
+| `ResolveRepositoryContext` | `git` | Remotes leave only as host, owner and repository |
+
+The Git it runs goes through one hardened runner
+(`omnigent/host/workspace_git/runner.py`): a clean environment, configuration
+that turns off hooks, fsmonitor, filters, external diff and transports, one
+deadline per call, at most 4 Git processes per host and 2 per repository,
+capped output, and its process group killed and reaped however the call ends.
+It never writes the repository, and never looks inside a submodule: a
+submodule shows only changes to its commit, not to its working tree. Files
+with a `filter` attribute, such as LFS pointers, are listed as filtered and
+not diffed. Directory scopes in both searches are literal workspace paths; a
+scope that is a link or a special file is refused.
+
 ## Turning it on
 
 | Where       | What                                                                                                    |
 | ----------- | ------------------------------------------------------------------------------------------------------- |
 | Server      | `OMNIGENT_FEATURES=workspace_direct_access,workspace_api_server_access`                                 |
-| Server      | `omnigent[workspace-api]`, for the server API route only                                                |
-| Hosts       | `omnigent[workspace-api]`. A host with it always opens its workspace socket; it has no flag of its own. |
+| Server      | `omnigent[workspace-api]`, for the server API route only. `omnigent[databricks]` includes it.           |
+| Hosts       | `omnigent[workspace-api]`, or `omnigent[databricks]`. A host with it always opens its workspace socket. |
 | Desktop app | A release with the workspace socket bridge. Older shells fall back to the server routes.                |
 
 Both flags are off by default and appear in `/v1/info`, which is how the page
@@ -64,8 +111,14 @@ source with Rust.
      links use (`web/src/hooks/useHostSshTarget.ts`). Main first asks the user
      in a native dialog, and records the alias only after a token-checked
      `ListDirectory` call over it succeeds (`web/electron/src/sshTargets.js`).
-     "Not now" isn't asked again until the app restarts. An allowed alias that
-     fails isn't tried again for five minutes.
+     A server has one question open at a time. Its other suggestions read
+     through the server meanwhile, without the page backing off, and are asked
+     on a later read. After "Not now", that server's aliases aren't asked about
+     again until the app restarts. An allowed alias that fails isn't tried
+     again for five minutes. If the host refuses the probe's token, main
+     answers the call with a 401 itself, so the page renews its token, and the
+     call never reaches the alias. A second refusal within five minutes counts
+     as a failure.
 4. The host checks the token, then reads the file from the token's workspace.
 
 ## Security
@@ -81,7 +134,9 @@ source with Rust.
   host name. Main runs no SSH for it, so no config, proxy or `Match exec`
   either, until the user allows it in a native dialog. The user's consent is
   the only check on which destination is tried. Main records it only after the
-  host accepts that session's token over it. One question is open at a time.
+  host accepts that session's token over it. After "Not now", the server gets
+  no more questions until the app restarts, so it can't keep asking with new
+  names.
 - **No password or host-key prompts.** SSH runs with `BatchMode=yes` and the
   user's own SSH config, so a password or an unknown host key fails, and the
   read goes through the server. An SSH agent's confirmation dialog, or a
@@ -108,6 +163,5 @@ source with Rust.
 
 ## Not covered yet
 
-- Files tree listings still use REST.
 - Hosts on other machines with no record and no inferable alias use the server API route.
 - Windows has no direct route.

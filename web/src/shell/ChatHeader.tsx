@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
 import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
@@ -25,6 +26,13 @@ import {
 } from "lucide-react";
 import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import {
+  BACK_TO_CANVAS_LABEL,
+  CLOSE_CONVERSATION_PANE_LABEL,
+  FOCUS_CONVERSATION_LABEL,
+  SHOW_CANVAS_LABEL,
+} from "@/canvas/canvasHeaderActions";
+import { useCanvasHeaderPaletteCommands } from "@/canvas/useCanvasHeaderPaletteCommands";
+import {
   rightSidebarToggleAriaShortcut,
   rightSidebarToggleShortcutKeys,
 } from "@/components/KeyboardShortcut";
@@ -39,7 +47,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
-import { CreatedBySession } from "./CreatedBySession";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { HeaderProjectTag } from "./HeaderProjectTag";
@@ -55,6 +62,7 @@ import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
+import { useChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
 import { MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
@@ -145,7 +153,7 @@ interface ChatHeaderProps {
   sidebarOpen: boolean;
   /** Open the left sidebar. */
   onOpenSidebar: (peek?: boolean) => void;
-  /** Render the mobile settings-menu return affordance and fade. */
+  /** Render the mobile settings-menu toggle and fade. */
   settingsMode?: boolean;
   /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
@@ -158,7 +166,6 @@ interface ChatHeaderProps {
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
   workingDirectory?: string | null;
-  createdBySessionId?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
@@ -186,6 +193,10 @@ interface ChatHeaderProps {
    * making the title a way back out. ``undefined`` renders it as plain text.
    */
   titleLinkTo?: string;
+  /** Left-slot title for a page with no conversation, such as a project home; makes the header taller. */
+  pageTitle?: ReactNode;
+  /** Right-slot actions for a page with no conversation. */
+  pageActions?: ReactNode;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
   /**
@@ -353,13 +364,14 @@ export function ChatHeader({
   subAgentName,
   conversationId,
   workingDirectory,
-  createdBySessionId,
   permissionLevel,
   actionConversation = null,
   conversationTitle,
   projectName,
   projectIcon,
   titleLinkTo,
+  pageTitle,
+  pageActions,
   boundAgent,
   wrapperLabel,
   canShare,
@@ -380,8 +392,12 @@ export function ChatHeader({
   mobileMenu,
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
+  // Floating panes give the switch to the chat pane's own strip.
+  const viewToggleHost = useChatPaneViewToggleHost(conversationId);
   const canvas = useCanvasWorkspace();
+  useCanvasHeaderPaletteCommands(canvas);
   const { trackClick } = useOmnigentAnalytics();
+  const hasPageTitle = !conversationId && pageTitle !== undefined;
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
   // opening the matching rail tab as a full-screen drawer. Mobile only: they
   // ride in the header's single kebab rather than a second trigger of their
@@ -591,10 +607,12 @@ export function ChatHeader({
         // Desktop sessions fade scrolling content behind the header.
         // Mobile keeps only the individual glass button surfaces.
         "chat-header absolute inset-x-0 top-0 z-30 flex h-[76px] md:h-12 items-center justify-between px-4 py-4 md:py-3 md:right-[var(--workspace-panel-offset,0px)]",
-        conversationId && !isMobile && "session-header-glass",
+        (conversationId || hasPageTitle) && !isMobile && "session-header-glass",
+        // On desktop a page title gets a taller header, with room above it for hover toolbars.
+        hasPageTitle && "md:h-26 md:pt-8 md:pb-0",
         // Pages scroll under the header without a background, so only its controls take clicks.
         !conversationId && "pointer-events-none *:pointer-events-auto",
-        settingsMode && "settings-mobile-header",
+        settingsMode && !sidebarOpen && "settings-mobile-header",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -625,7 +643,7 @@ export function ChatHeader({
             variant="ghost"
             size="sm"
             onClick={canvas.closeConversation}
-            aria-label="Back to canvas"
+            aria-label={BACK_TO_CANVAS_LABEL}
             className="shrink-0 gap-1 px-1.5 text-ui"
           >
             <ArrowLeftIcon className="size-4" />
@@ -656,9 +674,7 @@ export function ChatHeader({
             className="pr-1"
           />
         )}
-        {conversationId && createdBySessionId && (
-          <CreatedBySession key={createdBySessionId} sessionId={createdBySessionId} />
-        )}
+        {hasPageTitle && pageTitle}
       </div>
 
       <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:empty:hidden">
@@ -672,7 +688,6 @@ export function ChatHeader({
         {/* Desktop (md+) action buttons. On mobile these collapse into
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
-        {!pending && conversationId && sessionOverviewControl}
         {pending && <PendingHeaderActions isMobile={isMobile} />}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
@@ -693,7 +708,13 @@ export function ChatHeader({
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
-        {!pending && conversationId && <ViewModeToggle />}
+        {!pending &&
+          conversationId &&
+          (viewToggleHost ? (
+            createPortal(<ViewModeToggle variant="pane" alwaysVisible />, viewToggleHost)
+          ) : (
+            <ViewModeToggle />
+          ))}
         {!pending && !actionConversation && canFork && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -853,6 +874,8 @@ export function ChatHeader({
             Share
           </Button>
         ) : null}
+        {/* Beside the right-panel toggle: both show or hide a panel on the right. */}
+        {!pending && conversationId && sessionOverviewControl}
         {conversationId && hasRailContent && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -878,6 +901,7 @@ export function ChatHeader({
             </TooltipContent>
           </Tooltip>
         )}
+        {!conversationId && pageActions}
         {/* Mobile-only session-actions kebab, rightmost in the cluster. Same
             menu the desktop breadcrumb hangs off its title. */}
         {isMobile && conversationMenu}
@@ -886,7 +910,7 @@ export function ChatHeader({
             <Button
               variant="ghost"
               size="icon-xs"
-              aria-label={canvas.focused ? "Show canvas beside conversation" : "Focus conversation"}
+              aria-label={canvas.focused ? SHOW_CANVAS_LABEL : FOCUS_CONVERSATION_LABEL}
               title={canvas.focused ? "Show canvas" : "Focus conversation"}
               onClick={canvas.toggleFocus}
               className="shrink-0 text-muted-foreground"
@@ -900,8 +924,8 @@ export function ChatHeader({
             <Button
               variant="ghost"
               size="icon-xs"
-              aria-label="Close conversation pane"
-              title="Close conversation pane"
+              aria-label={CLOSE_CONVERSATION_PANE_LABEL}
+              title={CLOSE_CONVERSATION_PANE_LABEL}
               onClick={canvas.closeConversation}
               className="shrink-0 text-muted-foreground"
             >

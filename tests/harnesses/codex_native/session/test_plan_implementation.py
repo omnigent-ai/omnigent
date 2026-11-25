@@ -362,6 +362,8 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
     assert state is not None
     assert state.thread_id == "thread_fresh"
     assert state.active_turn_id == "turn_fresh"
+    # The TUI is still on the planning thread; this marks the thread to move it to.
+    assert forwarder_state.forwarder_started_thread_id == "thread_fresh"
 
 
 def test_clear_context_plan_implementation_refuses_before_creating_thread_when_unconfirmed(

@@ -446,6 +446,18 @@ def test_remove_worktree_keeps_branch_when_flag_false(git_repo: Path) -> None:
     assert _branch_exists(git_repo, "feature/keep")
 
 
+@pytest.mark.parametrize("branch", ["--all", "feature name", "feature..guard"])
+def test_remove_worktree_rejects_invalid_branch_before_removing(
+    git_repo: Path, branch: str
+) -> None:
+    """A branch name git could read as an option fails before anything is removed."""
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/guard")
+    with pytest.raises(WorktreeError):
+        remove_worktree(worktree_path=created.worktree_path, branch=branch, delete_branch=True)
+    assert Path(created.worktree_path).is_dir()
+    assert _branch_exists(git_repo, "feature/guard")
+
+
 def test_remove_worktree_missing_path_fails(git_repo: Path) -> None:
     """Removing a non-existent worktree path fails loud."""
     with pytest.raises(WorktreeError) as exc:

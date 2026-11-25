@@ -14,22 +14,38 @@ a ``failed`` run (``no_online_host``). This exercises the end-to-end render
 path without needing a live host or an agent turn, exactly like
 ``test_scheduled_task_row_run_controls`` in the sibling test file.
 
+An automation that continues one session gets a run per firing in that session,
+and the runs endpoint repeats the session's running total on each. The second
+journey checks that the page lists those runs under the session, with its total
+shown once. No API writes run history or a session's recorded cost, so the test
+seeds those rows with the server's stores; the sessions and the automation come
+from the REST API.
+
 **Icon / tooltip semantics are NOT re-tested here.** The CalendarOff-for-skipped
 icon, the amber triangle for failed runs, the unread blue dot, and all tooltip
 text are already covered by the RTL unit tests in
 ``web/src/pages/TaskDetailPage.test.tsx``.
 
-This E2E test focuses on the render + navigation + run-now → run-row journey
-that only the live server path can exercise.
+These E2E tests focus on the render and navigation journeys that only the live
+server path can exercise.
 """
 
 from __future__ import annotations
 
+import time
+import uuid
+from pathlib import Path
+
+import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests._helpers.session import post_session_bundle
+from tests.e2e_ui.conftest import _build_hello_world_bundle
 from tests.e2e_ui.scheduled.test_scheduled_tasks_page import (
     _create_task,
     _open_automations_page,
@@ -141,3 +157,116 @@ def test_scheduled_task_detail_page_run_now_records_run_row(
     expect(
         _row_by_name(page, task_name).get_by_role("img", name="Last run failed")
     ).to_be_visible()
+
+
+def _create_owned_session(base_url: str, title: str) -> tuple[str, str]:
+    """Create a top-level session the local user owns; return its and its agent's ids."""
+    response = post_session_bundle(
+        httpx.post,
+        f"{base_url}/v1/sessions",
+        _build_hello_world_bundle(),
+        metadata={"title": title},
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    session_id = response.json()["session_id"]
+    session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    session.raise_for_status()
+    return session_id, session.json()["agent_id"]
+
+
+# Seeds rows with this checkout's stores, whose schema an older server may not have.
+@pytest.mark.min_server_version("0.24.0")
+def test_scheduled_task_detail_page_lists_runs_under_their_shared_session(
+    page: Page,
+    automations_v2_server: str,
+    automations_v2_server_dir: Path,
+) -> None:
+    """Runs in the continued session sit under it, which shows its total once.
+
+    The automation once started a new session per run, so its oldest run has a
+    session of its own and keeps that session's cost on its row.
+    """
+    base_url = automations_v2_server
+    database_uri = f"sqlite:///{automations_v2_server_dir / 'chat.db'}"
+    continued_title = "Factory PR triage"
+    continued_id, agent_id = _create_owned_session(base_url, continued_title)
+    own_id, _ = _create_owned_session(base_url, "Factory PR triage, first run")
+    response = httpx.post(
+        f"{base_url}/v1/scheduled-tasks",
+        json={
+            "name": "Shared session runs",
+            "prompt": "Triage the new pull requests.",
+            "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+            "agent_id": agent_id,
+            "timezone": "UTC",
+            "session_mode": "continue",
+            "session_id": continued_id,
+        },
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    task_id = response.json()["id"]
+    # Paused, so no firing can add a run while the page is checked.
+    httpx.patch(
+        f"{base_url}/v1/scheduled-tasks/{task_id}", json={"state": "paused"}, timeout=10.0
+    ).raise_for_status()
+
+    conversations = SqlAlchemyConversationStore(database_uri)
+    conversations.set_session_usage(continued_id, {"total_cost_usd": 66.24})
+    conversations.set_session_usage(own_id, {"total_cost_usd": 3.07})
+    runs = SqlAlchemyScheduledTaskStore(database_uri)
+    now = int(time.time())
+    # Newest first: three firings into the continued session, one of which failed
+    # to launch, then the run from when each run started its own session.
+    for minutes_ago, status, session_id in (
+        (10, "succeeded", continued_id),
+        (20, "failed", continued_id),
+        (30, "succeeded", continued_id),
+        (2 * 24 * 60, "succeeded", own_id),
+    ):
+        fired_at = now - minutes_ago * 60
+        failed = status == "failed"
+        runs.create_run(
+            uuid.uuid4().hex,
+            task_id,
+            status,
+            fired_at,
+            conversation_id=session_id,
+            fired_at=fired_at,
+            finished_at=fired_at + 1,
+            error="runner launch/dispatch failed" if failed else None,
+            error_code="launch_failed" if failed else None,
+        )
+
+    # The server repeats the session's total on each of its runs.
+    listed = httpx.get(f"{base_url}/v1/scheduled-tasks/{task_id}/runs", timeout=10.0)
+    listed.raise_for_status()
+    assert [run["session_cost_usd"] for run in listed.json()["runs"]] == [
+        66.24,
+        66.24,
+        66.24,
+        3.07,
+    ]
+
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(f"{base_url}/tasks/{task_id}")
+    run_list = page.get_by_test_id("task-detail-runs")
+    group = run_list.get_by_test_id("run-session-group")
+    expect(group).to_have_count(1, timeout=30_000)
+    header = group.get_by_test_id("run-session-group-open")
+    expect(header).to_contain_text(continued_title)
+    expect(group.get_by_test_id("run-session-group-cost")).to_have_text("$66.24 total")
+    grouped_runs = page.get_by_role("list", name=f"Runs in {continued_title}").get_by_test_id(
+        "task-detail-run"
+    )
+    expect(grouped_runs).to_have_count(3)
+    expect(grouped_runs.nth(1)).to_have_attribute("data-run-status", "failed")
+    expect(group.get_by_test_id("run-cost")).to_have_count(0)
+    own_run = run_list.locator(":scope > [data-testid='task-detail-run']")
+    expect(own_run).to_have_count(1)
+    expect(own_run.get_by_test_id("run-cost")).to_have_text("$3.07")
+    expect(own_run.get_by_test_id("run-open")).to_have_attribute("href", f"/c/{own_id}")
+
+    header.click()
+    page.wait_for_url(f"**/c/{continued_id}", timeout=15_000)

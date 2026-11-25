@@ -233,6 +233,11 @@ export function skillInvocationPrefix(harness: string | null | undefined): "$" |
   return harness === "codex-native" ? "$" : "/";
 }
 
+/** Whether the harness runs leading-`!` input as a shell command; exact ids, as routed. */
+export function supportsNativeShellInput(harness: string | null | undefined): boolean {
+  return harness === "claude-native" || harness === "codex-native";
+}
+
 export function isNativeCursorHarness(harness: string): boolean {
   return harness === "cursor-native" || harness === "native-cursor";
 }

@@ -194,6 +194,51 @@ that falls back to a Custom Tab.
 9. An accounts-mode server, a header-mode server, an older OIDC server (ticket
    sign-in), a Databricks workspace, and a Databricks App behave as before.
 
+## Deep links
+
+An `omnigent://<hostname>/c/<session_id>` link opens that conversation on that
+server, the same link the iOS and desktop apps open. The link carries no `http`
+or `https`: this device (`localhost`, `127.0.0.1`, `[::1]`) is reached over
+`http`, every other host over `https`. Only debug builds load `http` at all,
+and not from `[::1]`; a release build needs an `https` server. A `file` or
+`fullscreen` parameter is passed on to the conversation; any other parameter is
+dropped.
+
+`DeepLinkActivity` receives the link and hands it to the app:
+
+- **The server the app is on:** the open page goes to the conversation without
+  reloading.
+- **A server you connected to before:** the app switches to it, as you entered
+  it, and opens the conversation without asking. Signing in works as it does
+  when you open the app on that server: a workspace or a natively signed-in OIDC
+  server whose session can't be renewed shows **Sign In** instead of opening the
+  browser by itself.
+- **Any other server:** the app asks before connecting, naming the server. This
+  includes a server your organization preset but you have not picked yet.
+  Connecting gives a server's page the app's notifications, microphone and file
+  access, so a tapped link must not connect to a server of its author's choosing.
+
+A link the app does not open (another path, no host, credentials in the host, or
+an id with an escape or a dot) brings the app forward and changes nothing.
+
+`omnigent` is a custom scheme, which Android lets any installed app claim. If
+another app claims it too, Android asks which one should open the link, and that
+app sees the server host and conversation id. The id is not a secret; the server
+still decides who may read the conversation.
+
+Test from a shell, with a debug build installed on an emulator or device and a
+development server on port 8000. `adb reverse` makes the server reachable as
+`localhost`, the one host a link opens over `http`:
+
+```sh
+adb reverse tcp:8000 tcp:8000
+adb shell am start -a android.intent.action.VIEW \
+  -d 'omnigent://localhost:8000/c/<session_id>' ai.omnigent.android
+```
+
+Tests: `DeepLinkTest.kt`, `DeepLinkActivityTest.kt` and the two link cases in
+`MainActivityTest.kt`, under `app/src/test/java/ai/omnigent/android/`.
+
 ## Managed configuration (org-preset servers)
 
 Organizations can preconfigure server URLs so users don't type one. The app

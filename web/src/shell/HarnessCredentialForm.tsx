@@ -13,13 +13,12 @@
  * readiness flips and the dialog's row turns green.
  */
 
-import { Fragment, useState } from "react";
+import { Fragment, type ReactNode, useState } from "react";
 import { KeyRound, UserRound, Waypoints } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
-import { copyText } from "@/lib/clipboard";
 import {
   useDetectedCredentials,
   useStoreCredential,
@@ -29,12 +28,16 @@ import {
   type StoreCredentialInput,
 } from "@/hooks/useHosts";
 import { harnessCredentialAdoptFamilies, MIN_TMUX_VERSION } from "@/lib/harnessSetup";
+import {
+  SETTINGS_NO_TOOLTIP,
+  useSettingsOverlayParts,
+} from "@/pages/settings/search/settingsOwnership";
 
 export function HarnessCredentialForm({
   harness,
   label,
   host,
-  command,
+  subscription,
   onDone,
 }: {
   harness: string;
@@ -43,13 +46,15 @@ export function HarnessCredentialForm({
    *  and the API call. Falls back to `harness` when not supplied. */
   label?: string;
   host: Host | undefined | null;
-  /** The server's subscription-login command (e.g. `codex login`), shown as a
-   *  copy signpost — the UI can't drive browser OAuth. `null` for Pi. */
-  command: string | null;
+  /** How to sign in with the harness's own subscription, where the caller offers it; the UI
+   *  can't drive its browser login. Absent for Pi, which has no CLI login. */
+  subscription?: ReactNode;
   onDone: (result: StoreCredentialResult) => void;
 }) {
   // What the user sees in toasts — the friendly name, not the canonical id.
   const display = label ?? harness;
+  // Inside Settings the form's controls are parts of the fix dialog's opener; elsewhere they keep their names.
+  const parts = useSettingsOverlayParts();
   const store = useStoreCredential(host?.host_id ?? "");
   // Detection is only meaningful for a live host and this open form.
   const { data: detected } = useDetectedCredentials(host?.host_id, !!host);
@@ -136,29 +141,12 @@ export function HarnessCredentialForm({
       ),
     });
   }
-  if (command) {
+  if (subscription) {
     options.push({
       id: "subscription",
       node: (
         <CredentialOption icon={<UserRound />} label="Sign in with your subscription">
-          <p className="text-sm text-muted-foreground">
-            Use your existing plan — run{" "}
-            <button
-              type="button"
-              className="rounded bg-muted px-1 py-0.5 font-mono hover:text-foreground"
-              data-testid="harness-credential-login-copy"
-              onClick={() => {
-                void copyText(command)
-                  .then(() => showToast("Copied to clipboard."))
-                  .catch(() =>
-                    showToast("Couldn't copy — select and copy manually.", { duration: 0 }),
-                  );
-              }}
-            >
-              {command}
-            </button>{" "}
-            on {host?.name}.
-          </p>
+          {subscription}
         </CredentialOption>
       ),
     });
@@ -184,8 +172,14 @@ export function HarnessCredentialForm({
             onChange={(e) => setApiKey(e.target.value)}
             data-testid="harness-credential-key"
             className="h-8 font-mono text-sm"
+            {...parts.control("apiKey", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
           />
-          <SaveButton busy={busy} disabled={!apiKey.trim()} testId="harness-credential-save" />
+          <SaveButton
+            part="saveKey"
+            busy={busy}
+            disabled={!apiKey.trim()}
+            testId="harness-credential-save"
+          />
         </form>
       </CredentialOption>
     ),
@@ -219,6 +213,7 @@ export function HarnessCredentialForm({
             value={gatewayUrl}
             onChange={(e) => setGatewayUrl(e.target.value)}
             className="h-8 text-sm"
+            {...parts.control("gatewayUrl", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
           />
           <div className="flex items-center gap-2">
             <Input
@@ -228,8 +223,13 @@ export function HarnessCredentialForm({
               value={gatewayKey}
               onChange={(e) => setGatewayKey(e.target.value)}
               className="h-8 font-mono text-sm"
+              {...parts.control("gatewayKey", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
             />
-            <SaveButton busy={busy} disabled={!gatewayUrl.trim() || !gatewayKey.trim()} />
+            <SaveButton
+              part="saveGateway"
+              busy={busy}
+              disabled={!gatewayUrl.trim() || !gatewayKey.trim()}
+            />
           </div>
         </form>
       </CredentialOption>
@@ -273,14 +273,17 @@ function CredentialOption({
 /** Save button whose disabled state stays a light, clearly-inert outline
  *  (rather than a heavy dark fill that reads as an error). */
 function SaveButton({
+  part,
   busy,
   disabled,
   testId,
 }: {
+  part: "saveKey" | "saveGateway";
   busy: boolean;
   disabled: boolean;
   testId?: string;
 }) {
+  const parts = useSettingsOverlayParts();
   return (
     <Button
       type="submit"
@@ -290,6 +293,7 @@ function SaveButton({
       variant={disabled ? "outline" : "default"}
       data-testid={testId}
       className="shrink-0"
+      {...parts.control(part, { ...SETTINGS_NO_TOOLTIP, outside: {} })}
     >
       Save
     </Button>
@@ -320,6 +324,7 @@ function AdoptRow({
   busy: boolean;
   onUse: () => void;
 }) {
+  const parts = useSettingsOverlayParts();
   return (
     <div
       className="flex items-center gap-2 rounded bg-emerald-50 px-2 py-1.5 dark:bg-emerald-500/10"
@@ -328,7 +333,13 @@ function AdoptRow({
       <span className="flex-1 text-sm">
         Found <code className="font-mono">{detected.source}</code> on this host.
       </span>
-      <Button type="button" size="sm" loading={busy} onClick={onUse}>
+      <Button
+        type="button"
+        size="sm"
+        loading={busy}
+        onClick={onUse}
+        {...parts.control("adoptCredential", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
+      >
         Use it
       </Button>
     </div>

@@ -193,7 +193,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
 
       - name: Install project + test dependencies
         run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
@@ -306,7 +306,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
       - name: Install project + test dependencies
         run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
@@ -356,6 +356,27 @@ jobs:
         run: |
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build
+
+      - name: Run desktop SSH preview regression
+        if: matrix.shard_id == 0 && needs.setup.outputs.ui == 'full'
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+          OMNIGENT_PW_NO_SANDBOX: "1"
+          OMNIGENT_DESKTOP_RECORD_DIR: ${{ runner.temp }}/desktop-ssh-preview
+        run: |
+          pnpm install --frozen-lockfile --filter ./web/electron
+          pnpm --filter omnigent-desktop-electron run build:overlay
+          OMNIGENT_PYTHON="$PWD/.venv/bin/python" xvfb-run -a node --test web/electron/e2e/desktop_ssh_preview.e2e.js
+          node -e 'const fs = require("node:fs"); const path = require("node:path"); const evidence = JSON.parse(fs.readFileSync(path.join(process.env.OMNIGENT_DESKTOP_RECORD_DIR, "evidence.json"))); require("node:assert/strict").equal(evidence.result, "passed", "Desktop preview must execute, not skip");'
+
+      - name: Upload desktop SSH preview evidence
+        if: always() && matrix.shard_id == 0 && needs.setup.outputs.ui == 'full'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: desktop-ssh-preview-${{ github.run_id }}
+          path: ${{ runner.temp }}/desktop-ssh-preview/
+          retention-days: 3
+          if-no-files-found: ignore
 
       # Native coding-agent harness enablement: the next steps let the
       # native render-parity tests boot a real Claude Code / Codex CLI. The

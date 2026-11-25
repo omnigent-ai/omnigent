@@ -4,7 +4,7 @@
  */
 
 import { useMemo, useState } from "react";
-import { ChevronRightIcon, CornerLeftUpIcon } from "lucide-react";
+import { ChevronRightIcon, ClockIcon, CornerLeftUpIcon } from "lucide-react";
 
 import {
   RunGraphButton,
@@ -15,22 +15,29 @@ import {
 } from "@/components/workflows/RunTasks";
 import { Button } from "@/components/ui/button";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
+import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
+import { useAutomationsEnabled } from "@/hooks/useConversations";
 import { useNow } from "@/hooks/useNow";
+import { usePlanStopping } from "@/hooks/usePlanStopping";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useWorkflowRunDescendants, useWorkflowRuns } from "@/hooks/useWorkflow";
+import { automationPagePath } from "@/lib/automationFromSession";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
 import type { StepState } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import {
   describeWorkflowRun,
+  isWorkflowRunLaunching,
   isWorkflowRunWorking,
   runStepProgress,
   type WorkflowRun,
+  type WorkflowRunAutomation,
   type WorkflowRunStarter,
   type WorkflowRunState,
 } from "@/lib/workflowRuns";
-import { planRunControl } from "@/shell/PlanRunButton";
+import { planRunButtonState, planRunControl } from "@/shell/PlanRunButton";
 import { StepGlyph } from "@/shell/TasksPanel";
 
 // A run's glyph: the Tasks tab's, for the step state its run state matches.
@@ -69,17 +76,27 @@ export function WorkflowRunRow({
   /** For a run listed below another, that run's session, whose runs need no "Started by". */
   parentSessionId?: string;
 }) {
-  const sessionWorking = useSessionWorking(
-    run.isCurrent ? run.sessionId : null,
-    isWorkflowRunWorking(run),
+  const sessionId = run.isCurrent ? run.sessionId : null;
+  // A failed launch this page streams outranks the run list, which learns of it a refresh later.
+  const launchFailed = useConversationEntryValue(
+    sessionId,
+    (state) => state.sandboxStatus?.stage === "failed",
   );
+  const listed = launchFailed ? { ...run, sandboxLaunching: false } : run;
+  // The sidebar's status for the session leaves out a sandbox launch, so it can't settle one.
+  const sessionWorking =
+    useSessionWorking(sessionId, isWorkflowRunWorking(listed)) || isWorkflowRunLaunching(listed);
   const state = describeWorkflowRun(run, sessionWorking);
   const progress = useMemo(() => runStepProgress(run, sessionWorking), [run, sessionWorking]);
   const nested = parentSessionId !== undefined;
   // Stop while the run's session works; play once it stopped with tasks left.
   const canAct = run.isCurrent && !run.archived && owned;
+  const stopping = usePlanStopping(canAct ? run.sessionId : null, sessionWorking);
   const control = canAct
-    ? planRunControl(progress, run.statuses, sessionWorking, run.planGraphRevision)
+    ? planRunButtonState(
+        planRunControl(progress, run.statuses, sessionWorking, run.planGraphRevision),
+        stopping,
+      )
     : null;
   // An action refreshes the list showing the row, and the run's own workflow's.
   const refreshKeys = [
@@ -87,7 +104,7 @@ export function WorkflowRunRow({
     ["workflow-run-descendants", workflowId],
     ...(run.workflowId && run.workflowId !== workflowId ? [["workflow-runs", run.workflowId]] : []),
   ];
-  const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id);
+  const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id, stopping);
   const [graphOpen, setGraphOpen] = useState(false);
   const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
   const title = run.title || "Untitled session";
@@ -124,6 +141,7 @@ export function WorkflowRunRow({
             {stateLabel}
             {run.archived && <span>Archived</span>}
           </p>
+          {run.automation && <RunAutomation automation={run.automation} />}
           {startedBy && <RunStartedBy starter={startedBy} />}
           {progress.length > 0 && (
             <RunTimeline
@@ -177,6 +195,25 @@ export function WorkflowRunRow({
         />
       )}
     </li>
+  );
+}
+
+/** Links a run to the automation whose scheduled run started it. */
+function RunAutomation({ automation }: { automation: WorkflowRunAutomation }) {
+  const info = useServerInfo();
+  const automationsEnabled = useAutomationsEnabled();
+  if (!automationsEnabled) return null;
+  return (
+    <Link
+      to={automationPagePath(info, automation)}
+      className="relative z-10 mt-1 flex w-fit max-w-full items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+      data-testid="workflow-run-automation"
+    >
+      <ClockIcon aria-hidden className="size-3.5 shrink-0" />
+      <span className="truncate">
+        Scheduled · <span className="font-medium text-foreground">{automation.name}</span>
+      </span>
+    </Link>
   );
 }
 

@@ -3,17 +3,53 @@
 // is keyboardActive, and never while a text field, composer menu, dialog, or other
 // focused control owns them.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { type ReactNode, useState } from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
+import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
+import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
+import { askUserQuestionSignature, getAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { insertComposerText } from "@/lib/composerText";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { setEmbedRoot } from "@/lib/host";
 import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionForm } from "./AskUserQuestionForm";
+
+// Session rows the "@" menu lists from the sidebar; server title search is off.
+const sessionList = vi.hoisted(() => ({ loaded: [] as unknown[] }));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => {
+  // Like the app's context, the same value until the loaded list changes.
+  let cached: { list: unknown[]; value: object } | null = null;
+  return {
+    ...(await importOriginal<typeof UseSidebarDataModule>()),
+    useOptionalLoadedConversations: () => {
+      if (cached?.list !== sessionList.loaded) {
+        cached = {
+          list: sessionList.loaded,
+          value: { pages: [{ data: sessionList.loaded }], pageParams: [undefined] },
+        };
+      }
+      return cached.value;
+    },
+  };
+});
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseConversationsModule>()),
+  useSessionSearch: () => ({ data: undefined }),
+}));
 
 const framework: ClaudeQuestion = {
   id: "framework",
@@ -48,23 +84,44 @@ afterEach(() => {
 /** Renders the form; `beside` is rendered after it, outside the form's root. */
 function renderForm(
   questions: ClaudeQuestion[],
-  options: { keyboardActive?: boolean; beside?: ReactNode } = {},
+  options: { keyboardActive?: boolean; beside?: ReactNode; codeMirror?: boolean } = {},
 ) {
   const onSubmit = vi.fn();
   const onReject = vi.fn();
+  const form = (
+    <AskUserQuestionForm
+      elicitationId={nextElicitationId()}
+      questions={questions}
+      onSubmit={onSubmit}
+      onReject={onReject}
+      keyboardActive={options.keyboardActive ?? true}
+    />
+  );
   render(
     <>
-      <AskUserQuestionForm
-        elicitationId={nextElicitationId()}
-        questions={questions}
-        onSubmit={onSubmit}
-        onReject={onReject}
-        keyboardActive={options.keyboardActive ?? true}
-      />
+      {options.codeMirror ? (
+        <CapabilitiesProvider info={codeMirrorInfo}>{form}</CapabilitiesProvider>
+      ) : (
+        form
+      )}
       {options.beside}
     </>,
   );
   return { onSubmit, onReject };
+}
+
+const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+
+function sessionRow(id: string, title: string) {
+  return { id, object: "conversation", title, created_at: 0, updated_at: 0, labels: {} };
+}
+
+/** The custom answer's prompt editor, once its chunk has loaded. */
+async function promptEditor() {
+  await waitFor(() =>
+    expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+  );
+  return screen.getByTestId("ask-user-question-custom-input");
 }
 
 /** A composer card shaped like the chat composer; `sideChat` marks the side-chat composer. */
@@ -87,11 +144,23 @@ function composerCard({
     >
       <textarea
         aria-label="Message the agent"
+        data-composer-input=""
         defaultValue={text}
         data-has-draft={hasDraft ? "true" : undefined}
       />
     </div>
   );
+}
+
+/** A native edit of a textarea: the value is set, then the input event carries its type. */
+function nativeInput(field: HTMLTextAreaElement, value: string, inputType: string) {
+  act(() => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+      field,
+      value,
+    );
+    field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType }));
+  });
 }
 
 const progress = () => screen.getByTestId("ask-user-question-progress").textContent;
@@ -576,6 +645,22 @@ describe("AskUserQuestionForm — keyboard activity", () => {
     expect(document.activeElement).toBe(screen.getByTestId("ask-user-question-section"));
   });
 
+  it("arrows through the custom radio without moving focus into its input", async () => {
+    const user = userEvent.setup();
+    renderForm([framework]);
+    await user.click(screen.getByLabelText("Vue"));
+    await user.keyboard("{ArrowDown}");
+    const toggle = screen.getByTestId("ask-user-question-custom-toggle");
+    expect(toggle).toBeChecked();
+    expect(toggle).toHaveFocus();
+    // Held down, so no keyup follows, as when the window loses focus mid-press.
+    await user.keyboard("{ArrowDown>}");
+    expect(screen.getByLabelText("React")).toBeChecked();
+    expect(screen.getByLabelText("React")).toHaveFocus();
+    await user.click(toggle);
+    expect(screen.getByTestId("ask-user-question-custom-input")).toHaveFocus();
+  });
+
   it("ignores keys pressed outside a form that is not keyboard-active", () => {
     const { onReject } = renderForm([framework, snacks], { keyboardActive: false });
     pressOnPage({ key: "Enter" });
@@ -658,6 +743,40 @@ describe("AskUserQuestionForm — keyboard activity", () => {
   });
 });
 
+describe("AskUserQuestionForm — disabled Submit", () => {
+  it("names the unanswered question that keeps Submit disabled", async () => {
+    renderForm([{ ...snacks, header: "Snacks" }, framework]);
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
+    act(() => screen.getByRole("group", { name: "Submit" }).focus());
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent("Answer question 1 (Snacks) to submit"),
+    );
+
+    fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+    fireEvent.click(screen.getByLabelText("Popcorn"));
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled();
+    expect(screen.queryByRole("group", { name: "Submit" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  });
+
+  it("closes the reason on Escape before Escape cancels the questions", async () => {
+    const user = userEvent.setup();
+    const { onReject } = renderForm([snacks, framework]);
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    act(() => screen.getByRole("group", { name: "Submit" }).focus());
+    await waitFor(() => expect(screen.getByRole("tooltip")).toBeVisible());
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    expect(onReject).not.toHaveBeenCalled();
+
+    await user.keyboard("{Escape}");
+    expect(onReject).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("AskUserQuestionForm — key hints", () => {
   it("shows digit, Enter, and Esc hints on desktop", () => {
     renderForm([framework, snacks]);
@@ -686,11 +805,8 @@ describe("AskUserQuestionForm — key hints", () => {
     expect(screen.getByRole("button", { name: "Next" }).textContent).not.toContain("↵");
   });
 
-  it.each([
-    { name: "a coarse pointer", matches: (query: string) => query.includes("pointer: coarse") },
-    { name: "a narrow viewport", matches: (query: string) => query.includes("max-width") },
-  ])("hides hints and keeps Enter as a newline on $name", ({ matches }) => {
-    stubMedia(matches);
+  it("hides hints and keeps Enter as a newline on a narrow viewport", () => {
+    stubMedia((query: string) => query.includes("max-width"));
     const { onReject } = renderForm([framework, snacks]);
     expect(keyHints()).toHaveLength(0);
     expect(pressOnPage({ key: "Enter" })).toBe(true);
@@ -700,5 +816,425 @@ describe("AskUserQuestionForm — key hints", () => {
     expect(screen.getByLabelText("Vue")).toBeChecked();
     pressOnPage({ key: "Escape" });
     expect(onReject).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("AskUserQuestionForm — prompt editor", () => {
+  beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
+  afterEach(() => {
+    resetCodeMirrorComposerLoadForTests();
+    sessionList.loaded = [];
+  });
+
+  it("answers in the prompt editor when the flag is on", async () => {
+    renderForm([framework], { codeMirror: true });
+    expect(await promptEditor()).toHaveClass("cm-content");
+  });
+
+  it("keeps the textarea when the flag is off", () => {
+    renderForm([framework]);
+    expect(screen.getByTestId("ask-user-question-custom-input").tagName).toBe("TEXTAREA");
+    expect(document.querySelector("[data-composer-engine]")).toBeNull();
+  });
+
+  it("submits a typed answer from the editor", async () => {
+    const { onSubmit } = renderForm([framework], { codeMirror: true });
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Ramen"));
+    // Typing checks the custom row, so the typed answer is the one sent.
+    expect(screen.getByTestId("ask-user-question-custom-toggle")).toBeChecked();
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledWith({ framework: "Ramen" });
+  });
+
+  it("advances on Enter from the editor while answers are missing", async () => {
+    renderForm([framework, snacks], { codeMirror: true });
+    fireEvent.keyDown(await promptEditor(), { key: "Enter" });
+    expect(progress()).toBe("Question 2 of 2:");
+    // Focus follows the question, as it does from the textarea.
+    expect(screen.getByTestId("ask-user-question-section")).toHaveFocus();
+  });
+
+  it("leaves Shift+Enter in the editor to the editor, without advancing", async () => {
+    renderForm([framework, snacks], { codeMirror: true });
+    fireEvent.keyDown(await promptEditor(), { key: "Enter", shiftKey: true });
+    expect(progress()).toBe("Question 1 of 2:");
+  });
+
+  it("keeps the textarea on a narrow viewport even with the flag on", () => {
+    stubMedia((query: string) => query.includes("max-width"));
+    renderForm([framework], { codeMirror: true });
+    expect(screen.getByTestId("ask-user-question-custom-input").tagName).toBe("TEXTAREA");
+    expect(document.querySelector("[data-composer-engine]")).toBeNull();
+  });
+
+  it("leaves digits typed in the editor to the editor", async () => {
+    renderForm([framework], { codeMirror: true });
+    fireEvent.keyDown(await promptEditor(), { key: "2" });
+    expect(screen.getByLabelText("Vue")).not.toBeChecked();
+  });
+
+  it("tags a session with @ and sends its marker and the tool hint", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const { onSubmit } = renderForm([framework], { codeMirror: true });
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Use @Fix"));
+    expect(screen.getByTitle("Tag session Fix CI")).toBeInTheDocument();
+    // Enter attaches the highlighted row; the next Enter sends the answer.
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(composerTargetOf(editor)!.value).toBe("Use @Fix CI ");
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+    });
+  });
+
+  it("closes the @ menu on Escape before Escape cancels the form", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const { onReject } = renderForm([framework], { codeMirror: true });
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "@Fi"));
+    expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+    fireEvent.keyDown(editor, { key: "Escape" });
+    expect(screen.queryByTestId("file-mention-menu")).toBeNull();
+    expect(onReject).not.toHaveBeenCalled();
+    fireEvent.keyDown(editor, { key: "Escape" });
+    expect(onReject).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  const sentAnswer = (title: string, id: string) =>
+    `Base it on the fix from [Session: "${title}" id=${id} subagent=no]\n\n${SESSION_MENTION_HINT}`;
+
+  it("shows a submitted answer's session as a pill, without the marker or hint", async () => {
+    sessionList.loaded = [sessionRow("de02c3f0", "Fix flaky CI job")];
+    const { container } = render(
+      <ApprovalCard
+        elicitationId="elic_persisted"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview=""
+        requestedSchema={{}}
+        status="responded"
+        response={{
+          action: "accept",
+          content: { "Which framework?": sentAnswer("Fix flaky CI job", "de02c3f0") },
+        }}
+        askUserQuestion={{ questions: [framework] }}
+      />,
+    );
+    expect(screen.getByTestId("mention-pill")).toHaveTextContent("@Fix flaky CI job");
+    expect(container.textContent).toContain("Base it on the fix from");
+    expect(container.textContent).not.toContain("[Session:");
+    expect(container.textContent).not.toContain("Tagged sessions");
+  });
+
+  it("shows the session pill once the card is answered from the editor", async () => {
+    sessionList.loaded = [sessionRow("de02c3f0", "Fix flaky CI job")];
+    const onSubmit = vi.fn();
+    const card = (response: { action: "accept"; content: Record<string, unknown> } | null) => (
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <ApprovalCard
+          elicitationId="elic_live"
+          message="Claude wants to call AskUserQuestion"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview=""
+          requestedSchema={{}}
+          status={response ? "responded" : "pending"}
+          response={response}
+          askUserQuestion={{ questions: [framework] }}
+          onSubmit={onSubmit}
+        />
+      </CapabilitiesProvider>
+    );
+    const { rerender } = render(card(null));
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Base it on the fix from @Fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    const [, , content] = onSubmit.mock.calls[0]!;
+    // The card's answered state, as the store rebuilds it from the submitted verdict.
+    rerender(card({ action: "accept", content }));
+    expect(screen.getByTestId("mention-pill")).toHaveTextContent("@Fix flaky CI job");
+    expect(document.body.textContent).not.toContain("[Session:");
+    expect(document.body.textContent).not.toContain("Tagged sessions");
+  });
+
+  /** Tags Fix CI in the editor, then deletes its token whole with Backspace. */
+  async function tagThenDeleteToken() {
+    const onSubmit = vi.fn();
+    const elicitationId = nextElicitationId();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <AskUserQuestionForm
+          elicitationId={elicitationId}
+          questions={[framework]}
+          onSubmit={onSubmit}
+          onReject={vi.fn()}
+        />
+      </CapabilitiesProvider>,
+    );
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Use @Fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(composerTargetOf(editor)!.value).toBe("Use @Fix CI ");
+    act(() => composerTargetOf(editor)!.setSelectionRange(11, 11));
+    fireEvent.keyDown(editor, { key: "Backspace" });
+    expect(composerTargetOf(editor)!.value).toBe("Use  ");
+    return { editor, onSubmit, elicitationId };
+  }
+
+  it("sends a deleted session token typed again as plain text", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const { editor, onSubmit } = await tagThenDeleteToken();
+    act(() => insertComposerText(composerTargetOf(editor)!, "@Fix CI", 5, 5));
+    const typed = composerTargetOf(editor)!.value;
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({ framework: typed });
+    expect(typed).toBe("Use  @Fix CI");
+  });
+
+  it("restores a deleted session token with undo", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const { editor, onSubmit } = await tagThenDeleteToken();
+    act(() => void undo(EditorView.findFromDOM(editor)!));
+    expect(composerTargetOf(editor)!.value).toBe("Use @Fix CI ");
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+    });
+  });
+
+  it("keeps a session tagged in a secret answer out of the saved draft", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const secret: ClaudeQuestion = { ...color, id: "secret", isSecret: true };
+    const elicitationId = nextElicitationId();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <AskUserQuestionForm
+          elicitationId={elicitationId}
+          questions={[framework, secret]}
+          onSubmit={vi.fn()}
+          onReject={vi.fn()}
+        />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Use @Fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(composerTargetOf(editor)!.value).toBe("Use @Fix CI ");
+    const draft = getAskUserQuestionDraft(
+      elicitationId,
+      askUserQuestionSignature([framework, secret]),
+    );
+    expect(draft?.currentIndex).toBe(1);
+    expect(draft?.sessionMentions).toEqual({});
+  });
+
+  it("keeps the textarea until an IME composition ends", async () => {
+    let finishLoad = () => {};
+    const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
+      finishLoad = () => resolve(CodeMirrorModule);
+    });
+    resetCodeMirrorComposerLoadForTests(() => loaded);
+    renderForm([framework], { codeMirror: true });
+    const textarea = screen.getByTestId("ask-user-question-custom-input");
+    fireEvent.compositionStart(textarea);
+
+    await act(async () => {
+      finishLoad();
+      await loaded;
+    });
+    expect(textarea.tagName).toBe("TEXTAREA");
+    expect(document.querySelector('[data-composer-engine="codemirror"]')).toBeNull();
+
+    fireEvent.compositionEnd(textarea);
+    await promptEditor();
+  });
+
+  it("keeps the caret and focus when the editor replaces the textarea", async () => {
+    let finishLoad = () => {};
+    const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
+      finishLoad = () => resolve(CodeMirrorModule);
+    });
+    resetCodeMirrorComposerLoadForTests(() => loaded);
+    renderForm([framework], { codeMirror: true });
+    const textarea = screen.getByTestId("ask-user-question-custom-input") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "Ramen soup" } });
+    textarea.focus();
+    textarea.setSelectionRange(0, 5);
+    fireEvent.select(textarea);
+
+    act(() => finishLoad());
+    const editor = await promptEditor();
+    expect(document.activeElement).toBe(editor);
+    const target = composerTargetOf(editor)!;
+    expect([target.selectionStart, target.selectionEnd]).toEqual([0, 5]);
+    expect(target.value).toBe("Ramen soup");
+  });
+
+  it("keeps a tagged session through a narrow viewport and back", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    // A live matchMedia: narrowing notifies the mobile query's listeners, as a resize does.
+    let narrow = false;
+    const listeners = new Set<() => void>();
+    const matchMedia = window.matchMedia;
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => {
+      const real = matchMedia(query);
+      const mobile = query.includes("max-width");
+      return {
+        ...real,
+        matches: mobile ? narrow : real.matches,
+        addEventListener: (type: string, listener: () => void) =>
+          mobile ? listeners.add(listener) : real.addEventListener(type, listener),
+        removeEventListener: (type: string, listener: () => void) =>
+          mobile ? listeners.delete(listener) : real.removeEventListener(type, listener),
+      } as MediaQueryList;
+    });
+    const resize = (nowNarrow: boolean) => {
+      narrow = nowNarrow;
+      act(() => listeners.forEach((listener) => listener()));
+    };
+    const { onSubmit } = renderForm([framework], { codeMirror: true });
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Use @Fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(composerTargetOf(editor)!.value).toBe("Use @Fix CI ");
+
+    resize(true);
+    const textarea = await waitFor(() => {
+      const field = screen.getByTestId("ask-user-question-custom-input");
+      expect(field.tagName).toBe("TEXTAREA");
+      return field as HTMLTextAreaElement;
+    });
+    expect(textarea.value).toBe("Use @Fix CI ");
+    // Deleting part of the token releases it; the browser's undo brings it back.
+    nativeInput(textarea, "Use @Fix ", "deleteContentBackward");
+    nativeInput(textarea, "Use @Fix CI ", "historyUndo");
+
+    resize(false);
+    const restored = await promptEditor();
+    expect(composerTargetOf(restored)!.value).toBe("Use @Fix CI ");
+    fireEvent.keyDown(restored, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+    });
+  });
+
+  it("keeps a session tag to the answer it was picked in", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const notes: ClaudeQuestion = {
+      id: "notes",
+      question: "Any notes?",
+      multiSelect: false,
+      options: [{ label: "None" }],
+    };
+    const { onSubmit } = renderForm([framework, notes], { codeMirror: true });
+    const first = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(first)!, "Use @Fix"));
+    fireEvent.keyDown(first, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    // The second answer types the same words as plain text, so it stays literal.
+    const second = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(second)!, "Ship @Fix CI"));
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+      notes: "Ship @Fix CI",
+    });
+  });
+
+  it("keeps undo within each answer: a restore in one question stays there", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const notes: ClaudeQuestion = {
+      id: "notes",
+      question: "Any notes?",
+      multiSelect: false,
+      options: [{ label: "None" }],
+    };
+    const { onSubmit } = renderForm([framework, notes], { codeMirror: true });
+    const first = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(first)!, "Use @Fix"));
+    fireEvent.keyDown(first, { key: "Enter" });
+    act(() => composerTargetOf(first)!.setSelectionRange(11, 11));
+    fireEvent.keyDown(first, { key: "Backspace" });
+    expect(composerTargetOf(first)!.value).toBe("Use  ");
+    // Undo in the same answer brings the tag back, before any navigation.
+    act(() => void undo(EditorView.findFromDOM(first)!));
+    expect(composerTargetOf(first)!.value).toBe("Use @Fix CI ");
+
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    const second = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(second)!, "Ship"));
+    // Undo in the second answer restores nothing from the first.
+    act(() => void undo(EditorView.findFromDOM(second)!));
+    expect(composerTargetOf(second)!.value).toBe("");
+
+    fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+    expect(composerTargetOf(await promptEditor())!.value).toBe("Use @Fix CI ");
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    fireEvent.click(screen.getByLabelText("None"));
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+      notes: "None",
+    });
+  });
+
+  it("leaves the card's own session out of the @ menu", async () => {
+    sessionList.loaded = [sessionRow("s_here", "This session"), sessionRow("s_ci", "Fix CI")];
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <ConversationScopeContext.Provider value="s_here">
+          <AskUserQuestionForm
+            elicitationId={nextElicitationId()}
+            questions={[framework]}
+            onSubmit={vi.fn()}
+            onReject={vi.fn()}
+          />
+        </ConversationScopeContext.Provider>
+      </CapabilitiesProvider>,
+    );
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "@This"));
+    expect(screen.queryByTitle("Tag session This session")).toBeNull();
+    act(() => composerTargetOf(editor)!.setSelectionRange(0, 0));
+    act(() =>
+      insertComposerText(composerTargetOf(editor)!, "", 0, composerTargetOf(editor)!.value.length),
+    );
+    act(() => insertComposerText(composerTargetOf(editor)!, "@Fix"));
+    expect(screen.getByTitle("Tag session Fix CI")).toBeInTheDocument();
+  });
+
+  it("keeps a tagged session when the card remounts with its draft", async () => {
+    sessionList.loaded = [sessionRow("s_ci", "Fix CI")];
+    const elicitationId = nextElicitationId();
+    const card = (onSubmit: () => void) => (
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <AskUserQuestionForm
+          elicitationId={elicitationId}
+          questions={[framework]}
+          onSubmit={onSubmit}
+          onReject={vi.fn()}
+        />
+      </CapabilitiesProvider>
+    );
+    const first = render(card(vi.fn()));
+    const editor = await promptEditor();
+    act(() => insertComposerText(composerTargetOf(editor)!, "Use @Fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    first.unmount();
+
+    const onSubmit = vi.fn();
+    render(card(onSubmit));
+    const restored = await promptEditor();
+    expect(composerTargetOf(restored)!.value).toBe("Use @Fix CI ");
+    fireEvent.keyDown(restored, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
+    });
   });
 });

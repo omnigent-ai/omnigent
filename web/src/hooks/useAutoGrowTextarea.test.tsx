@@ -130,6 +130,29 @@ describe("useAutoGrowTextarea", () => {
     expect(ta.style.height).toBe("40px");
   });
 
+  it("measures a textarea that replaces the one it measured, as after an engine switch", () => {
+    const growth: number[] = [];
+    function Swapping({ generation }: { generation: number }) {
+      const ref = useRef<HTMLTextAreaElement>(null);
+      useAutoGrowTextarea(ref, "same draft", 10, (px) => growth.push(px));
+      return (
+        <textarea
+          key={generation}
+          ref={ref}
+          defaultValue="same draft"
+          style={{ lineHeight: "20px", paddingTop: "0px", paddingBottom: "0px" }}
+        />
+      );
+    }
+    const { rerender } = render(<Swapping generation={1} />);
+    expect(growth).toHaveLength(1);
+
+    // The draft is unchanged, but the new element still needs its height.
+    rerender(<Swapping generation={2} />);
+
+    expect(growth).toHaveLength(2);
+  });
+
   it("reports no growth while the element has no layout", () => {
     // Mid route swap scrollHeight reads 0 and the height is left alone. The
     // growth has to be published anyway: a caller offsetting its layout by the

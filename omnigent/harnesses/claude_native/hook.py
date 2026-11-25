@@ -144,7 +144,10 @@ def _env_float(name: str, default: float) -> float:
 # legitimately-parked approval behind a severing proxy is never capped, while a
 # down server can no longer re-POST for a day. Overridable for operators who
 # want more slack against a flaky upstream.
-_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 8))
+#
+# 40 failures ride out a brief outage, so the web card returns once the server
+# is back: about 17 minutes of 30s backoff, up to 40 when every connect times out.
+_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 40))
 
 
 def _never_connected_errors() -> tuple[type[Exception], ...]:

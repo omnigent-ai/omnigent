@@ -1,5 +1,4 @@
-import { useId, useState } from "react";
-import { SettingsLabel } from "@/components/SettingsLabel";
+import { Fragment, type ReactNode, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -7,63 +6,86 @@ import {
   useSetProactiveAgentSetting,
   type ProactiveAgentSettingScope,
 } from "@/hooks/useProactiveAgentSettings";
-import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
+import { PROACTIVE_AGENT_DISPLAY_NAME, PROACTIVE_AGENT_SCOPE_COPY } from "@/lib/proactiveInbox";
+import type { SettingsEntry } from "@/pages/settings/search/catalog/types";
+import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
 
-const COPY: Record<ProactiveAgentSettingScope, string> = {
-  me: `${PROACTIVE_AGENT_DISPLAY_NAME} reads your recent sessions on a schedule and posts follow-ups, related information, and reminders to your Inbox.`,
-  workspace: `Let ${PROACTIVE_AGENT_DISPLAY_NAME} post follow-ups, related information, and reminders to each user's Inbox. Users can turn it off for themselves.`,
-};
+// The row's other controls keep one identity as the settings load, so an edit in progress survives.
+const ROW_CONTROLS_KEY = "row-controls";
 
 /**
- * The viewer's or the workspace's Omni Advisor switch, gated by capability and
- * permission; a failed initial read offers a retry.
+ * One scope's switch; `entry` is that scope's Settings row, e.g. the Omni Advisor row. `children`
+ * are that row's other controls, such as an admin's prompt editor.
  */
-export function ProactiveAgentSettingControl({ scope }: { scope: ProactiveAgentSettingScope }) {
+export function ProactiveAgentSettingControl({
+  scope,
+  entry,
+  children,
+}: {
+  scope: ProactiveAgentSettingScope;
+  entry: SettingsEntry & { readonly parts: { readonly retry: string } };
+  children?: ReactNode;
+}) {
   const { available, settings, query } = useProactiveAgentSettings();
   const setSetting = useSetProactiveAgentSetting();
   const [error, setError] = useState<string | null>(null);
-  const labelId = useId();
   if (!available) return null;
   if (!settings) {
-    if (query.isError) {
-      return (
-        <div
-          role="alert"
-          className="flex items-center justify-between gap-6 text-ui text-destructive"
+    const retry = query.isError ? (
+      <>
+        <span role="alert" className="text-destructive">
+          Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings.
+        </span>
+        <Button
+          {...settingsControlProps(entry, "retry")}
+          variant="outline"
+          size="sm"
+          onClick={() => void query.refetch()}
+          disabled={query.isFetching}
+          componentId={`settings.proactive_agent.${scope}.retry`}
         >
-          <span>Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings.</span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void query.refetch()}
-            disabled={query.isFetching}
-            componentId={`settings.proactive_agent.${scope}.retry`}
-          >
-            Retry
-          </Button>
-        </div>
+          Retry
+        </Button>
+      </>
+    ) : null;
+    const loading = <p className="text-ui text-muted-foreground">Loading...</p>;
+    // The row's other controls, such as the prompt editor, don't depend on this read.
+    if (children) {
+      return (
+        <SettingsItem entry={entry} className="flex flex-col gap-6">
+          {retry ? (
+            <div className="flex items-center justify-between gap-6 text-ui">{retry}</div>
+          ) : (
+            loading
+          )}
+          <Fragment key={ROW_CONTROLS_KEY}>{children}</Fragment>
+        </SettingsItem>
       );
     }
-    return <p className="text-ui text-muted-foreground">Loading...</p>;
+    if (retry) {
+      return (
+        <SettingsItem entry={entry} className="flex items-center justify-between gap-6 text-ui">
+          {retry}
+        </SettingsItem>
+      );
+    }
+    return loading;
   }
   if (scope === "workspace" && !settings.can_manage_workspace) return null;
   const turnedOffByAdmin = scope === "me" && !settings.workspace_enabled;
   const checked =
     scope === "workspace" ? settings.workspace_enabled : settings.user_enabled && !turnedOffByAdmin;
   const description = turnedOffByAdmin
-    ? `An admin turned ${PROACTIVE_AGENT_DISPLAY_NAME} off for this workspace.`
-    : COPY[scope];
+    ? `An admin turned ${entry.label} off for this workspace.`
+    : PROACTIVE_AGENT_SCOPE_COPY[scope];
   return (
-    <div className="flex flex-col gap-2">
+    <SettingsItem entry={entry} className="flex flex-col gap-6">
       <div className="flex items-start justify-between gap-6">
-        <SettingsLabel
-          label={PROACTIVE_AGENT_DISPLAY_NAME}
-          labelId={labelId}
-          className="flex-1"
-          description={description}
-        />
+        <SettingsEntryLabel entry={entry} className="flex-1" description={description} />
         <Switch
-          aria-labelledby={labelId}
+          // The viewer's row names its switch as a part; the workspace's switch is its row's own.
+          {...settingsControlProps(entry, "toggle" in entry.parts ? "toggle" : undefined)}
           checked={checked}
           disabled={turnedOffByAdmin || setSetting.isPending}
           onCheckedChange={(enabled) => {
@@ -80,6 +102,7 @@ export function ProactiveAgentSettingControl({ scope }: { scope: ProactiveAgentS
           {error}
         </p>
       )}
-    </div>
+      <Fragment key={ROW_CONTROLS_KEY}>{children}</Fragment>
+    </SettingsItem>
   );
 }

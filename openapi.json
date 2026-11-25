@@ -1612,6 +1612,25 @@
         "title": "CloneRepositoryRequest",
         "type": "object"
       },
+      "CloneScheduledTaskRequest": {
+        "additionalProperties": false,
+        "description": "Optional body for `POST /v1/scheduled-tasks/{id}/clone`.",
+        "properties": {
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          }
+        },
+        "title": "CloneScheduledTaskRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -2572,8 +2591,15 @@
             "title": "Project Id"
           },
           "prompt": {
-            "title": "Prompt",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -2624,9 +2650,39 @@
             "title": "Source Session Id"
           },
           "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "default": "UTC",
-            "title": "Timezone",
-            "type": "string"
+            "title": "Timezone"
+          },
+          "workflow_details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Details"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
           },
           "workspace": {
             "anyOf": [
@@ -2643,7 +2699,6 @@
         },
         "required": [
           "name",
-          "prompt",
           "rrule",
           "agent_id"
         ],
@@ -5314,6 +5369,198 @@
         "title": "McpToolsResponse",
         "type": "object"
       },
+      "MemoryDeleteResponse": {
+        "description": "Response of `DELETE /v1/memory/entry`.",
+        "properties": {
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "title": "MemoryDeleteResponse",
+        "type": "object"
+      },
+      "MemoryEntryList": {
+        "description": "Response of `GET /v1/memory/entries`.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryEntryResponse"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "next_page_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Page Token"
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "title": "MemoryEntryList",
+        "type": "object"
+      },
+      "MemoryEntryResponse": {
+        "description": "One memory entry. `content` is empty in listings.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "content",
+          "description",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "MemoryEntryResponse",
+        "type": "object"
+      },
+      "MemoryHitResponse": {
+        "description": "One ranked search result.",
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/MemoryEntryResponse"
+          },
+          "score": {
+            "format": "double",
+            "title": "Score",
+            "type": "number"
+          }
+        },
+        "required": [
+          "entry",
+          "score"
+        ],
+        "title": "MemoryHitResponse",
+        "type": "object"
+      },
+      "MemorySearchRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/memory/search`.",
+        "properties": {
+          "limit": {
+            "default": 10,
+            "format": "int64",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "path_prefix": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path Prefix"
+          },
+          "query": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "MemorySearchRequest",
+        "type": "object"
+      },
+      "MemorySearchResponse": {
+        "description": "Response of `POST /v1/memory/search`.",
+        "properties": {
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryHitResponse"
+            },
+            "title": "Hits",
+            "type": "array"
+          }
+        },
+        "required": [
+          "hits"
+        ],
+        "title": "MemorySearchResponse",
+        "type": "object"
+      },
+      "MemoryWriteRequest": {
+        "additionalProperties": false,
+        "description": "Body of `PUT /v1/memory/entry`.",
+        "properties": {
+          "content": {
+            "maxLength": 16000,
+            "title": "Content",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "path": {
+            "maxLength": 512,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "title": "MemoryWriteRequest",
+        "type": "object"
+      },
       "MessageData": {
         "description": "Data for a message item (user or assistant).\n\n**Parameters**\n\n- `agent` \u2014 Agent name (required for assistant messages, absent for user). Serialized as `\"model\"` in JSON.",
         "properties": {
@@ -7890,6 +8137,11 @@
             "title": "Managed Sandboxes Enabled",
             "type": "boolean"
           },
+          "memory": {
+            "default": false,
+            "title": "Memory",
+            "type": "boolean"
+          },
           "move_to_managed_sandbox": {
             "default": false,
             "title": "Move To Managed Sandbox",
@@ -7908,6 +8160,11 @@
           "proactive_agent_available": {
             "default": false,
             "title": "Proactive Agent Available",
+            "type": "boolean"
+          },
+          "project_mute": {
+            "default": true,
+            "title": "Project Mute",
             "type": "boolean"
           },
           "public_sharing_enabled": {
@@ -7970,6 +8227,16 @@
             "title": "Scheduled Task Approval Skipping Modes",
             "type": "boolean"
           },
+          "scheduled_task_clone": {
+            "default": false,
+            "title": "Scheduled Task Clone",
+            "type": "boolean"
+          },
+          "scheduled_task_default_timezone": {
+            "default": true,
+            "title": "Scheduled Task Default Timezone",
+            "type": "boolean"
+          },
           "scheduled_task_harness_settings": {
             "default": true,
             "title": "Scheduled Task Harness Settings",
@@ -7993,6 +8260,11 @@
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
+            "type": "boolean"
+          },
+          "scheduled_task_run_pull_requests": {
+            "default": false,
+            "title": "Scheduled Task Run Pull Requests",
             "type": "boolean"
           },
           "scheduled_task_sandbox_workspaces": {
@@ -8030,6 +8302,11 @@
             "title": "Scheduled Task Trigger Headers",
             "type": "boolean"
           },
+          "scheduled_task_workflow_id": {
+            "default": true,
+            "title": "Scheduled Task Workflow Id",
+            "type": "boolean"
+          },
           "scheduled_task_worktrees": {
             "default": true,
             "title": "Scheduled Task Worktrees",
@@ -8043,6 +8320,11 @@
           "server_version": {
             "title": "Server Version",
             "type": "string"
+          },
+          "session_archive_runner_checks": {
+            "default": false,
+            "title": "Session Archive Runner Checks",
+            "type": "boolean"
           },
           "session_bundle_model_override": {
             "default": true,
@@ -8103,6 +8385,16 @@
             "title": "Session Move Source Checks",
             "type": "boolean"
           },
+          "session_mute": {
+            "default": true,
+            "title": "Session Mute",
+            "type": "boolean"
+          },
+          "session_nest_moves": {
+            "default": false,
+            "title": "Session Nest Moves",
+            "type": "boolean"
+          },
           "session_organize_source_checks": {
             "default": false,
             "title": "Session Organize Source Checks",
@@ -8121,6 +8413,11 @@
           "session_search_scope": {
             "default": true,
             "title": "Session Search Scope",
+            "type": "boolean"
+          },
+          "session_timers": {
+            "default": false,
+            "title": "Session Timers",
             "type": "boolean"
           },
           "session_title_instructions": {
@@ -8168,6 +8465,11 @@
           },
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          },
+          "workflow_sharing": {
+            "default": false,
+            "title": "Workflow Sharing",
+            "type": "boolean"
           },
           "workflows": {
             "default": false,
@@ -11797,6 +12099,12 @@
             "description": "First-class project id when one exists, or `None` for a label-only project not yet promoted to the `projects` table.",
             "title": "Id"
           },
+          "muted": {
+            "default": false,
+            "description": "Whether the owner muted notifications for every session in the project, read from its `config`; `False` for a label-only folder.",
+            "title": "Muted",
+            "type": "boolean"
+          },
           "name": {
             "description": "Project name (the folder's display name and union key).",
             "title": "Name",
@@ -12644,6 +12952,18 @@
             "description": "Per-session cost-control switch: `\"on\"` activates the spec's configured cost-control mode, `\"off\"` disables cost control for this session. `None` means no override is active (the spec default applies). Set at create time or via `PATCH /v1/sessions/{id}` (the web \"Cost Optimized\" toggle); read by the cost-control advisor pipeline.",
             "title": "Cost Control Mode Override"
           },
+          "cost_hidden": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`True` when the operator set `OMNIGENT_HIDE_COST`; clients then clear any cached cost instead of keeping it. `None` otherwise.",
+            "title": "Cost Hidden"
+          },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
             "format": "int64",
@@ -12860,7 +13180,7 @@
                 "type": "null"
               }
             ],
-            "description": "Pi's own cumulative token baseline, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
+            "description": "Own cumulative usage baseline for Pi, Claude native and Codex side chats, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
           },
           "parent_session_id": {
             "anyOf": [
@@ -12904,6 +13224,18 @@
             ],
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The permission mode the session is in, in its harness's vocabulary, e.g. `\"auto\"` or `\"approve-for-me\"` (the names `sys_session_create` takes). Follows a switch made while it runs to a mode that keeps approval; a mode that skips approval shows only when the session's launch settings select it. `None` when the harness has no permission modes or the mode cannot be told.",
+            "title": "Permission Mode"
           },
           "project_id": {
             "anyOf": [
@@ -14326,6 +14658,19 @@
             "title": "Conversation Id",
             "type": "string"
           },
+          "cost_hidden": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "`True` when the operator set `OMNIGENT_HIDE_COST`, telling the client to clear a cached cost rather than keep it.",
+            "title": "Cost Hidden"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -14431,6 +14776,21 @@
         "title": "SetCodexGoalRequest",
         "type": "object"
       },
+      "SetDefaultTimezoneRequest": {
+        "additionalProperties": false,
+        "description": "Body for `PUT /v1/scheduled-tasks/default-timezone`.",
+        "properties": {
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timezone"
+        ],
+        "title": "SetDefaultTimezoneRequest",
+        "type": "object"
+      },
       "SetProactiveAgentPrompt": {
         "additionalProperties": false,
         "description": "Body of a prompt change; `null` restores the bundled prompt.",
@@ -14526,6 +14886,40 @@
           }
         },
         "title": "SetSharingRequest",
+        "type": "object"
+      },
+      "SharedWorkflowList": {
+        "description": "One page of the workflows other people shared with the caller, for\n`GET /v1/workflows/shared`, ordered by ID.",
+        "properties": {
+          "data": {
+            "description": "The page's workflows, without their steps, each with `viewer_role` `\"viewer\"` and its owner's `owner_display_name`.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pass it as `after` for the next page; `None` on the last page. A page can be short, even empty, while it is set.",
+            "title": "Next Cursor"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "description": "Discriminator; always `\"list\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SharedWorkflowList",
         "type": "object"
       },
       "SideChatList": {
@@ -15637,6 +16031,29 @@
             ],
             "title": "Timezone"
           },
+          "workflow_details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Details"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -15805,6 +16222,17 @@
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
           },
+          "nest_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nest Source Id"
+          },
           "permission_mode": {
             "anyOf": [
               {
@@ -15940,7 +16368,7 @@
                 "type": "null"
               }
             ],
-            "description": "The journal entry ID of the planning-chat proposal `description` comes from; a description written without one clears it.",
+            "description": "The journal entry ID of the planning-chat proposal `description` was saved from or kept over; a description written without one clears it.",
             "title": "Description Source"
           },
           "expected_description": {
@@ -16393,7 +16821,7 @@
                 "type": "null"
               }
             ],
-            "description": "The planning conversation's journal entry for the proposal the description was saved from, until the description is written otherwise.",
+            "description": "The planning conversation's journal entry for the proposal the description was saved from or kept over, until the description is written otherwise.",
             "title": "Description Source"
           },
           "id": {
@@ -16415,6 +16843,17 @@
             "title": "Object",
             "type": "string"
           },
+          "owner_display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Display Name"
+          },
           "planning_session_id": {
             "anyOf": [
               {
@@ -16426,6 +16865,11 @@
             ],
             "description": "The conversation for proposing revisions, separate from runs.",
             "title": "Planning Session Id"
+          },
+          "shareable": {
+            "default": true,
+            "title": "Shareable",
+            "type": "boolean"
           },
           "steps": {
             "description": "The workflow's graph.",
@@ -16439,6 +16883,15 @@
             "format": "int64",
             "title": "Updated At",
             "type": "integer"
+          },
+          "viewer_role": {
+            "default": "owner",
+            "enum": [
+              "owner",
+              "viewer"
+            ],
+            "title": "Viewer Role",
+            "type": "string"
           }
         },
         "required": [
@@ -16452,6 +16905,69 @@
         "title": "WorkflowObject",
         "type": "object"
       },
+      "WorkflowPermissionList": {
+        "description": "One page of a workflow's grants, ordered by `user_id`.",
+        "properties": {
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowPermissionObject"
+            },
+            "title": "Permissions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "permissions",
+          "next_cursor"
+        ],
+        "title": "WorkflowPermissionList",
+        "type": "object"
+      },
+      "WorkflowPermissionObject": {
+        "description": "One grant on a workflow.",
+        "properties": {
+          "display_name": {
+            "description": "The grantee's name for display; the ID when the server has no other name.",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "level": {
+            "description": "Numeric permission level; workflows grant `1` (read) only.",
+            "format": "int64",
+            "title": "Level",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "The grantee's canonical ID, e.g. `\"alice@example.com\"`.",
+            "title": "User Id",
+            "type": "string"
+          },
+          "workflow_id": {
+            "description": "The workflow.",
+            "title": "Workflow Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "workflow_id",
+          "level",
+          "display_name"
+        ],
+        "title": "WorkflowPermissionObject",
+        "type": "object"
+      },
       "WorkflowRun": {
         "description": "One run of a saved workflow: a session that started it.",
         "properties": {
@@ -16460,6 +16976,17 @@
             "description": "Whether the session is archived.",
             "title": "Archived",
             "type": "boolean"
+          },
+          "automation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunAutomation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation whose scheduled run started its session, when the caller owns that automation or it is shared with them."
           },
           "background_work_running": {
             "default": false,
@@ -16530,6 +17057,12 @@
           "progress": {
             "$ref": "#/components/schemas/WorkflowRunProgress",
             "description": "Where the run's steps stand."
+          },
+          "sandbox_launching": {
+            "default": false,
+            "description": "Whether the session's sandbox is still launching, so the run is starting; `False` once it is up and for a failed launch.",
+            "title": "Sandbox Launching",
+            "type": "boolean"
           },
           "session_id": {
             "description": "The session that ran it.",
@@ -16612,6 +17145,27 @@
           "progress"
         ],
         "title": "WorkflowRun",
+        "type": "object"
+      },
+      "WorkflowRunAutomation": {
+        "description": "The automation whose scheduled run started a workflow run.",
+        "properties": {
+          "id": {
+            "description": "The automation's ID, e.g. `\"0123456789abcdef0123456789abcdef\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "Its name, e.g. `\"Nightly triage\"`.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "WorkflowRunAutomation",
         "type": "object"
       },
       "WorkflowRunList": {
@@ -16734,7 +17288,7 @@
                 "type": "null"
               }
             ],
-            "description": "What the step achieves, at most 300 characters, or `None`.",
+            "description": "The step's description in Markdown, e.g. what it reads, does and produces, or `None`.",
             "title": "Goal"
           },
           "id": {
@@ -16770,7 +17324,7 @@
             "type": "string"
           },
           "id": {
-            "description": "Workflow ID, a bare 32-character hex UUID.",
+            "description": "Workflow ID, bare 32-character hex.",
             "title": "Id",
             "type": "string"
           },
@@ -16792,11 +17346,39 @@
             "title": "Object",
             "type": "string"
           },
+          "owner_display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner's name for a viewer; `None` for the owner.",
+            "title": "Owner Display Name"
+          },
+          "shareable": {
+            "default": true,
+            "description": "Whether the workflow itself can be shared where the server shares workflows (`/v1/info` `workflow_sharing`); `False` for one whose grants the server cannot keep.",
+            "title": "Shareable",
+            "type": "boolean"
+          },
           "updated_at": {
             "description": "Unix epoch seconds of the last write.",
             "format": "int64",
             "title": "Updated At",
             "type": "integer"
+          },
+          "viewer_role": {
+            "default": "owner",
+            "description": "`\"owner\"`, or `\"viewer\"` for someone it is shared with, who may view, run and copy it but not change it.",
+            "enum": [
+              "owner",
+              "viewer"
+            ],
+            "title": "Viewer Role",
+            "type": "string"
           }
         },
         "required": [
@@ -19489,6 +20071,249 @@
         ]
       }
     },
+    "/v1/memory/entries": {
+      "get": {
+        "operationId": "list_entries_v1_memory_entries_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "prefix",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Prefix"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page Token"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryEntryList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Entries",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/v1/memory/entry": {
+      "delete": {
+        "operationId": "delete_entry_v1_memory_entry_delete",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryDeleteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Entry",
+        "tags": [
+          "memory"
+        ]
+      },
+      "get": {
+        "operationId": "get_entry_v1_memory_entry_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryEntryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Entry",
+        "tags": [
+          "memory"
+        ]
+      },
+      "put": {
+        "operationId": "write_entry_v1_memory_entry_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryWriteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryEntryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Write Entry",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/v1/memory/search": {
+      "post": {
+        "operationId": "search_entries_v1_memory_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemorySearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemorySearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Entries",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
     "/v1/policies": {
       "get": {
         "description": "List all default policies.\n\nRequires authentication in multi-user mode.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
@@ -20566,7 +21391,7 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders and timers agents\nset for their own sessions stay off the Automations page. The kind filter runs\nin the query, so listing automations never reads an agent's timers. There is no\nreminders-only view; a selective view needs an indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
         "parameters": [
           {
@@ -20657,6 +21482,52 @@
           }
         },
         "summary": "Create Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/default-timezone": {
+      "put": {
+        "description": "Record the caller's local zone for tasks that explicitly request the default.",
+        "operationId": "set_default_timezone_v1_scheduled_tasks_default_timezone_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetDefaultTimezoneRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Set Default Timezone V1 Scheduled Tasks Default Timezone Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Default Timezone",
         "tags": [
           "scheduled_tasks"
         ]
@@ -20934,6 +21805,68 @@
         ]
       }
     },
+    "/v1/scheduled-tasks/{scheduled_task_id}/clone": {
+      "post": {
+        "description": "Copy an owned automation under a new ID, without its runs or continued session.\n\nNeeds the database scheduler: the legacy timer re-anchors an interval\nschedule whenever it arms one, so it can't run the clone on the original's days.",
+        "operationId": "clone_scheduled_task_v1_scheduled_tasks__scheduled_task_id__clone_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/CloneScheduledTaskRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clone Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Clone Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
     "/v1/scheduled-tasks/{scheduled_task_id}/permissions": {
       "get": {
         "description": "List the grants on one of the caller's automations with cursor pagination.\n\nThe owner holds no grant and is not listed.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent or a server that cannot keep automation grants.",
@@ -21009,7 +21942,7 @@
         ]
       },
       "put": {
-        "description": "Share one of the caller's automations with a user or group.\n\nRead is the only level, and an automation is never public. A\ncontinue-session automation's session is shared with them too. Auto-creates\nthe grantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent, a server that cannot share automations or the sharing policy, 400 for an empty or over-long ID, the owner, `__public__` or a level other than read.",
+        "description": "Share one of the caller's automations with a user or group.\n\nRead is the only level, and an automation is never public. A\ncontinue-session automation's session is shared with them too. Auto-creates\nthe grantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent, a server that cannot share automations, the sharing policy or an automation its store cannot keep grants for, 400 for an empty or over-long ID, the owner, `__public__` or a level other than read.",
         "operationId": "grant_scheduled_task_permission_v1_scheduled_tasks__scheduled_task_id__permissions_put",
         "parameters": [
           {
@@ -21148,6 +22081,79 @@
           }
         },
         "summary": "Run Scheduled Task Now",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/run-pull-requests": {
+      "get": {
+        "description": "List stored PRs for a page of runs; shared viewers receive no session content.",
+        "operationId": "list_scheduled_task_run_pull_requests_v1_scheduled_tasks__scheduled_task_id__run_pull_requests_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Scheduled Task Run Pull Requests V1 Scheduled Tasks  Scheduled Task Id  Run Pull Requests Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scheduled Task Run Pull Requests",
         "tags": [
           "scheduled_tasks"
         ]
@@ -28149,9 +29155,75 @@
         ]
       }
     },
+    "/v1/workflows/shared": {
+      "get": {
+        "description": "List one page of the workflows other people shared with the caller.\n\nA grant to the caller or to any of their groups counts, and each workflow is\nlisted once, ordered by ID. Deleted workflows, those of deleted accounts and the\ncaller's own are left out, so a page can be short, or empty while\n`next_cursor` is set. Each item\nhas `viewer_role` `\"viewer\"` and the owner's `owner_display_name`. Empty\non a server that cannot share workflows and for the local user.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 403 for an agent's request, 400 for a malformed cursor.",
+        "operationId": "list_shared_workflows_v1_workflows_shared_get",
+        "parameters": [
+          {
+            "description": "Max workflows to return (1\u2013100, default 50).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: a previous page's next_cursor",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: a previous page's next_cursor",
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedWorkflowList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Shared Workflows",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
     "/v1/workflows/{workflow_id}": {
       "delete": {
-        "description": "Delete one of the caller's workflows.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "description": "Delete one of the caller's workflows, and then who it was shared with.\n\nGrants a failed cleanup leaves are inert, since readers check the workflow.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
         "operationId": "delete_workflow_v1_workflows__workflow_id__delete",
         "parameters": [
           {
@@ -28192,7 +29264,7 @@
         ]
       },
       "get": {
-        "description": "Return one of the caller's workflows, with its steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "description": "Return a workflow the caller owns or that is shared with them, with its steps.\n\n`viewer_role` says which, and someone it is shared with also gets the owner's\n`owner_display_name`. Agents read shared workflows too, so a run of one can\nload its description.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller can't read such a workflow.",
         "operationId": "get_workflow_v1_workflows__workflow_id__get",
         "parameters": [
           {
@@ -28284,9 +29356,183 @@
         ]
       }
     },
+    "/v1/workflows/{workflow_id}/permissions": {
+      "get": {
+        "description": "List the grants on one of the caller's workflows with cursor pagination.\n\nThe owner holds no grant and is not listed.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the workflow, 403 for an agent or a server that cannot keep workflow grants.",
+        "operationId": "list_workflow_permissions_v1_workflows__workflow_id__permissions_get",
+        "parameters": [
+          {
+            "description": "The workflow.",
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max grants to return (1\u20131000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: user_id to start after",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: user_id to start after",
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowPermissionList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Workflow Permissions",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "put": {
+        "description": "Share one of the caller's workflows with a user or group.\n\nRead is the only level, and a workflow is never public. They can view, run and\ncopy it; their runs stay their own. Auto-creates the grantee user if they don't\nexist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the workflow, 403 for an agent, a server that cannot share workflows, the sharing policy or a workflow its store cannot keep grants for, 400 for an empty or over-long ID, the owner, `__public__` or a level other than read.",
+        "operationId": "grant_workflow_permission_v1_workflows__workflow_id__permissions_put",
+        "parameters": [
+          {
+            "description": "The workflow.",
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantPermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowPermissionObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Grant Workflow Permission",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
+    "/v1/workflows/{workflow_id}/permissions/{target_user_id}": {
+      "delete": {
+        "description": "Stop sharing one of the caller's workflows with a user or group.\n\nTheir runs are their own sessions, so they keep those. Idempotent: 204 when they\nhold no grant.\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the workflow, 403 for an agent or a server that cannot keep workflow grants.",
+        "operationId": "revoke_workflow_permission_v1_workflows__workflow_id__permissions__target_user_id__delete",
+        "parameters": [
+          {
+            "description": "The workflow.",
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The grantee to remove, e.g. `\"alice@example.com\"`, in any spelling `PermissionStore.validate_grants` resolves.",
+            "in": "path",
+            "name": "target_user_id",
+            "required": true,
+            "schema": {
+              "title": "Target User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Workflow Permission",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
     "/v1/workflows/{workflow_id}/runs": {
       "get": {
-        "description": "List one of the caller's workflows' runs, newest first.\n\nA run is the plan that named the workflow, so a session that ran it\ntwice is listed twice. Sessions the caller can't read are left out.\nEach run names the session that started it and the workflow runs below it.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow or can't read the session, 400 for an invalid cursor.",
+        "description": "List the runs of a workflow the caller owns or that is shared with them, newest first.\n\nA run is the plan that named the workflow, so a session that ran it\ntwice is listed twice. Sessions the caller can't read are left out, so\nsomeone a workflow is shared with sees their own runs, and its owner\ndoesn't see theirs; a page can be short while `next_cursor` is set.\nEach run names the session that started it and the workflow runs below it.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller can't read such a workflow or the session, 400 for an invalid cursor.",
         "operationId": "list_workflow_runs_v1_workflows__workflow_id__runs_get",
         "parameters": [
           {

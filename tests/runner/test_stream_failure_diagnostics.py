@@ -49,6 +49,13 @@ _CONV_ID = "ac1dbeef245985f541fd686eb2a32b73"
 _AGENT_ID = "965906f5d9fb596610dda599a80faaee"
 
 
+@pytest.fixture(autouse=True)
+def _mock_harness_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_openai_agents_sdk_spawn_env", lambda spec: {}
+    )
+
+
 class _StreamErrorHarnessClient(_ScriptedHarnessClient):
     """Harness client that emits its scripted frames, then drops mid-stream."""
 
