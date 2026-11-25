@@ -215,6 +215,27 @@ export function getTicket(projectId: string, ticketId: string) {
   return request<ProjectTicket>(path(projectId, ticketId)).then(normalizeTicket);
 }
 
+/**
+ * The Merger's push-prefix report (`sys_ticket_push_prefix`): how much of the
+ * integration branch's unpushed range can ship, and the commit that stops it.
+ * Only the fields the board reads are typed; the report carries more.
+ */
+export interface PushPrefix {
+  pushable_sha: string | null;
+  /** The first commit that can't ship yet, usually a landed ticket not yet Verified. */
+  stop: { sha: string; ticket_id: string | null; reason: string } | null;
+  /** Verified tickets after the stop, held back by it. */
+  blocked_verified_ticket_ids: string[];
+}
+
+/** The project's push-prefix report, or null where the server doesn't provide one. */
+export async function getPushPrefix(projectId: string): Promise<PushPrefix | null> {
+  const response = await authenticatedFetch(`${path(projectId)}/push-prefix`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  return (await response.json()) as PushPrefix;
+}
+
 export function getTicketSummary(projectId: string) {
   return request<TicketSummary>(`${path(projectId)}/summary`);
 }

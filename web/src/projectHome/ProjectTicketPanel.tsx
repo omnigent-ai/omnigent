@@ -75,6 +75,7 @@ import {
 import { TicketSessionAvatar, TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
+import { TicketShipBlocker } from "./TicketShipBlocker";
 import { parseAskPosition, useTicketAsk } from "./useTicketAsk";
 import { useTicketSeen } from "./useTicketSeen";
 import {
@@ -499,6 +500,7 @@ function TicketDetails({
                 </Tooltip>
               </div>
             )}
+            <TicketShipBlocker projectId={projectId} ticketId={ticketId} variant="panel" />
             <TicketSignOffs
               ticket={ticket}
               pending={update.isPending || comment.isPending}

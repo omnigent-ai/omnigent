@@ -1,5 +1,5 @@
 import { useId } from "react";
-import { UserRoundIcon } from "lucide-react";
+import { BadgeCheckIcon, CircleCheckIcon, UserRoundIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
@@ -16,15 +16,24 @@ export function TicketLabels({
   compact?: boolean;
 }) {
   const leading = (key: string) => key === "needs-human" || key === ASSIGNEE_LABEL_KEY;
-  const ordered = compact
-    ? [
-        ...labels.filter((label) => label.key === "needs-human"),
-        ...labels.filter((label) => label.key === ASSIGNEE_LABEL_KEY),
-        ...labels.filter((label) => !leading(label.key)),
-      ]
-    : labels;
+  const hasVerified = labels.some(
+    (label) => label.key === VERIFIED_LABEL_KEY && isGateLabel(label),
+  );
+  const ordered = keepGatesTogether(
+    compact
+      ? [
+          ...labels.filter((label) => label.key === "needs-human"),
+          ...labels.filter((label) => label.key === ASSIGNEE_LABEL_KEY),
+          // A card's one gate chip: verified (green, or amber when stale) stands for both.
+          ...labels.filter(
+            (label) => !leading(label.key) && !(hasVerified && label.key === APPROVED_LABEL_KEY),
+          ),
+        ]
+      : labels,
+  );
+  const approvedSha = labels.find((label) => label.key === APPROVED_LABEL_KEY)?.value ?? null;
   const visible = compact ? ordered.slice(0, 2) : ordered;
-  const hiddenCount = labels.length - visible.length;
+  const hiddenCount = ordered.length - visible.length;
   return (
     <div className={cn("flex min-w-0 gap-1.5", compact ? "items-center" : "flex-wrap")}>
       {visible.map((label) =>
@@ -32,6 +41,8 @@ export function TicketLabels({
           <NeedsResponseBadge key={label.key} title={label.value || undefined} />
         ) : label.key === ASSIGNEE_LABEL_KEY && label.value ? (
           <AssigneeBadge key={label.key} name={label.value} />
+        ) : isGateLabel(label) ? (
+          <GateShaBadge key={label.key} label={label} approvedSha={approvedSha} compact={compact} />
         ) : (
           <TicketLabelBadge key={label.key} label={label} compact={compact} />
         ),
@@ -45,6 +56,66 @@ export function TicketLabels({
         </span>
       )}
     </div>
+  );
+}
+
+export const APPROVED_LABEL_KEY = "approved";
+export const VERIFIED_LABEL_KEY = "verified";
+const FULL_SHA = /^[0-9a-f]{40}$/;
+
+/** `approved` and `verified` name the exact commit they sign off. */
+function isGateLabel(label: TicketLabel): label is TicketLabel & { value: string } {
+  return (
+    (label.key === APPROVED_LABEL_KEY || label.key === VERIFIED_LABEL_KEY) &&
+    FULL_SHA.test(label.value ?? "")
+  );
+}
+
+/** `verified` reads right after `approved`, wherever approved sits. */
+function keepGatesTogether(labels: TicketLabel[]): TicketLabel[] {
+  const verified = labels.find((label) => label.key === VERIFIED_LABEL_KEY);
+  if (!verified || !labels.some((label) => label.key === APPROVED_LABEL_KEY)) return labels;
+  return labels.flatMap((label) =>
+    label === verified ? [] : label.key === APPROVED_LABEL_KEY ? [label, verified] : [label],
+  );
+}
+
+/** A sign-off on one commit: its key and short SHA, the full SHA on hover. */
+function GateShaBadge({
+  label,
+  approvedSha,
+  compact,
+}: {
+  label: TicketLabel & { value: string };
+  approvedSha: string | null;
+  /** On a card the icon names the gate; the key and the mismatch note move to the tooltip. */
+  compact: boolean;
+}) {
+  const verified = label.key === VERIFIED_LABEL_KEY;
+  // Verification is for one commit; a newer approval means it no longer covers the head.
+  const stale = verified && approvedSha !== null && approvedSha !== label.value;
+  const Icon = verified ? BadgeCheckIcon : CircleCheckIcon;
+  const description = stale
+    ? `verified ${label.value}, not the approved ${approvedSha}`
+    : `${label.key} ${label.value}`;
+  return (
+    <Badge
+      variant="outline"
+      title={description}
+      aria-label={description}
+      data-testid={`ticket-gate-${label.key}`}
+      className={cn(
+        "h-5 shrink-0 gap-1 rounded-md px-1.5 py-0 text-xs font-medium",
+        !verified && "border-border bg-muted/60 text-muted-foreground",
+        verified && !stale && "border-success/40 bg-success/10 text-success",
+        stale && "border-warning/50 bg-warning/10 text-warning",
+      )}
+    >
+      <Icon aria-hidden className="size-3 shrink-0" />
+      {!compact && label.key}
+      <span className="font-mono text-[0.6875rem] tracking-tight">{label.value.slice(0, 7)}</span>
+      {stale && !compact && <span className="font-normal">≠ approved</span>}
+    </Badge>
   );
 }
 

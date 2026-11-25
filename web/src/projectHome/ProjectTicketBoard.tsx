@@ -27,6 +27,7 @@ import { getCurrentUserId } from "@/lib/identity";
 import { requesterLabel, type ProjectTicket, type TicketStage } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 import { TicketError, TicketLabels } from "./TicketControls";
+import { TicketShipBlocker } from "./TicketShipBlocker";
 import { TicketStageBadge } from "./TicketStageAppearance";
 import { TicketAgentIcons } from "./TicketAgentIcons";
 import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoardRequesterFilter";
@@ -504,6 +505,7 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           </span>
         )}
       </div>
+      <TicketShipBlocker projectId={ticket.project_id} ticketId={ticket.id} variant="card" />
       {ticket.labels.length > 0 && <TicketLabels labels={ticket.labels} compact />}
       {ticket.latest_update &&
         (ticket.latest_update !== "Created the ticket" || ticket.comment_count > 0) && (
