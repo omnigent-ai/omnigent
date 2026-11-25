@@ -2928,6 +2928,20 @@
             "title": "Labels",
             "type": "array"
           },
+          "requested_by": {
+            "anyOf": [
+              {
+                "maxLength": 320,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Who asked for this work, when it isn't the person you act for: e.g. the requester of the ticket you're splitting or following up. Only the project owner's agents may set it, and it must name a project member. Omit to credit the person you act for.",
+            "title": "Requested By"
+          },
           "title": {
             "maxLength": 160,
             "minLength": 1,

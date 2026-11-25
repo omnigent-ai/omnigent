@@ -919,12 +919,16 @@ def create_project_tickets_router(
         cc: list[dict[str, str]] = []
         if targets is not None and "@" in body.description:
             project, mentions, cc = await text_mentions(targets, project_id, who, body.description)
+        requester = await asyncio.to_thread(
+            requester_for_create, request, project_id, body.requested_by, who.user_id
+        )
         with _storage_errors():
             ticket = await asyncio.to_thread(
                 store.create,
                 project_id,
                 body,
                 who,
+                requested_by=requester,
                 mentions=[{"id": entry.id, "name": entry.name} for entry in mentions],
                 cc=cc,
             )
@@ -943,6 +947,44 @@ def create_project_tickets_router(
                 request, targets, project, ticket, body.description, mentions, who
             )
         return ticket
+
+    def requester_for_create(
+        request: Request, project_id: str, named: str | None, caller: str | None
+    ) -> str | None:
+        """Who a new ticket credits as its requester; ``None`` credits the caller.
+
+        The owner's agent filing work for someone else, such as a split of their
+        ticket, may name a member, so that member's approval gates apply. Only the
+        owner's agents may: a member naming the owner would skip the owner-only
+        exemption from product approval. A person can only file as themselves.
+        """
+        if named is None or named == caller:
+            return None
+        if ORCHESTRATION_SOURCE_HEADER not in request.headers:
+            raise OmnigentError(
+                "Only an agent filing someone else's work can name its requester",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if projects is None:
+            raise OmnigentError("Requesters can't be named here", code=ErrorCode.INVALID_INPUT)
+        project = projects.get(project_id, user_id=caller)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        members = {
+            project.user_id,
+            *(share.user_id for share in projects.list_shares(project.id, user_id=caller)),
+        }
+        if caller != project.user_id:
+            raise OmnigentError(
+                "Only the project owner's agents can file a ticket for someone else",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if named not in members:
+            raise OmnigentError(
+                f"{named!r} isn't a member of the project, so it can't be the requester",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return named
 
     @router.post("/intake", status_code=201)
     async def file_intake_ticket(

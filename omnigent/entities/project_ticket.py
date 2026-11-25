@@ -188,6 +188,16 @@ class CreateTicket(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     description: str = Field(default="", max_length=3000)
     labels: list[TicketLabel] = Field(default_factory=list, max_length=20)
+    requested_by: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=320,
+        description=(
+            "Who asked for this work, when it isn't the person you act for: e.g. the requester "
+            "of the ticket you're splitting or following up. Only the project owner's agents may "
+            "set it, and it must name a project member. Omit to credit the person you act for."
+        ),
+    )
 
     @field_validator("title")
     @classmethod
@@ -195,6 +205,11 @@ class CreateTicket(BaseModel):
         if not value.strip():
             raise ValueError("title must not be empty")
         return value.strip()
+
+    @field_validator("requested_by")
+    @classmethod
+    def trim_requester(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
 
     @field_validator("labels")
     @classmethod

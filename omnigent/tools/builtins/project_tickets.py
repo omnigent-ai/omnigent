@@ -301,7 +301,9 @@ class SysTicketCreateTool(_TicketTool):
         "Create a ticket in the project's first stage; only title is required. "
         "Tickets persist independently of sessions and cannot be deleted. Use them for "
         "persistent work that moves through stages, not to record a conversation, question "
-        "or quick task."
+        "or quick task. When you file work someone else asked for, such as splitting or "
+        "following up their ticket, pass requested_by with that ticket's requester, so their "
+        "approvals apply."
     )
     arguments = CreateTicket
 

@@ -2095,3 +2095,60 @@ async def test_only_the_owner_or_a_product_approver_changes_the_boards_stages(
     for user in (ALICE, approver):
         saved = await client.put(path, json=renamed, headers=_as_user(user))
         assert saved.status_code == 200, (user, saved.text)
+
+
+async def test_agent_files_someone_elses_work_under_their_name(multi_user_client, db_uri):
+    """An agent splitting a member's request credits that member, so their gates apply."""
+    client = multi_user_client
+    project = (
+        await client.post("/v1/projects", json={"name": "Split"}, headers=_as_user(ALICE))
+    ).json()
+    shared = await client.post(
+        f"/v1/projects/{project['id']}/shares", json={"user_id": BOB}, headers=_as_user(ALICE)
+    )
+    assert shared.status_code in (200, 201), shared.text
+    path = f"/v1/projects/{project['id']}/tickets"
+    source = SqlAlchemyConversationStore(db_uri).create_conversation(project_id=project["id"])
+    SqlAlchemyPermissionStore(db_uri).grant(ALICE, source.id, LEVEL_OWNER)
+    agent = {
+        **_as_user(ALICE),
+        **_bind_runner(db_uri, source.id),
+        ORCHESTRATION_SOURCE_HEADER: source.id,
+    }
+
+    split = await client.post(path, json={"title": "Step 2", "requested_by": BOB}, headers=agent)
+    assert split.status_code == 201, split.text
+    assert split.json()["requested_by"] == BOB
+    own = await client.post(path, json={"title": "Mine", "requested_by": ALICE}, headers=agent)
+    assert own.json()["requested_by"] == ALICE
+    # Only project members can be named, and a person can't file as someone else.
+    outsider = await client.post(
+        path, json={"title": "Nope", "requested_by": "carol@example.com"}, headers=agent
+    )
+    assert outsider.status_code == 400
+    by_hand = await client.post(
+        path, json={"title": "Nope", "requested_by": BOB}, headers=_as_user(ALICE)
+    )
+    assert by_hand.status_code == 403
+    self_named = await client.post(
+        path, json={"title": "Fine", "requested_by": ALICE}, headers=_as_user(ALICE)
+    )
+    assert self_named.status_code == 201 and self_named.json()["requested_by"] == ALICE
+    # A member's agent can't credit the owner, which would skip product approval.
+    member_source = SqlAlchemyConversationStore(db_uri).create_conversation(
+        project_id=project["id"]
+    )
+    SqlAlchemyPermissionStore(db_uri).grant(BOB, member_source.id, LEVEL_OWNER)
+    member_agent = {
+        **_as_user(BOB),
+        **_bind_runner(db_uri, member_source.id),
+        ORCHESTRATION_SOURCE_HEADER: member_source.id,
+    }
+    as_owner = await client.post(
+        path, json={"title": "Feature", "requested_by": ALICE}, headers=member_agent
+    )
+    assert as_owner.status_code == 403
+    member_own = await client.post(
+        path, json={"title": "Feature", "requested_by": BOB}, headers=member_agent
+    )
+    assert member_own.status_code == 201 and member_own.json()["requested_by"] == BOB
