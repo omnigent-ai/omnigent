@@ -58,6 +58,31 @@ vi.mock("./FilesPageViewer", () => ({
     );
   },
 }));
+// The session's PR page route; null (classic) unless a test gives one.
+const pageRoute = vi.hoisted(() => ({
+  value: null as { route: "direct" | "server"; key: string } | null | "loading",
+  asked: 0,
+}));
+vi.mock("@/pullRequestPage/pullRequestPageRoute", () => ({
+  usePullRequestPageRoute: () => {
+    pageRoute.asked += 1;
+    return pageRoute.value;
+  },
+}));
+// Pull Requests v2: on unless a test turns it off.
+const pullRequestsV2 = vi.hoisted(() => ({ on: true }));
+vi.mock("@/lib/workspaceSurfaces", () => ({ usePullRequestsV2: () => pullRequestsV2.on }));
+const newPage = vi.hoisted(() => ({ props: null as Record<string, unknown> | null, loads: 0 }));
+// The factory runs when the page's module is first imported, which `loads` counts.
+vi.mock("./PullRequestPlaceView", () => {
+  newPage.loads += 1;
+  return {
+    PullRequestPlaceView: (props: Record<string, unknown>) => {
+      newPage.props = props;
+      return <div data-testid="new-pull-request-place" />;
+    },
+  };
+});
 vi.mock("@/shell/PullRequestPanel", () => ({
   PullRequestPanel: (props: ComponentProps<typeof PullRequestPanel>) => {
     captured.list = props;
@@ -174,11 +199,25 @@ const pressToggleChord = (target: Element | Window = window) =>
 
 beforeEach(() => {
   pageWidth.value = null;
+  pageRoute.value = null;
+  pageRoute.asked = 0;
+  pullRequestsV2.on = true;
+  newPage.props = null;
   window.localStorage.clear();
   for (const key of Object.keys(captured) as (keyof typeof captured)[]) captured[key] = null;
   usePaletteCommandsStore.setState({ groups: {} });
 });
 afterEach(cleanup);
+
+// First in the file, before any test could import the page.
+describe("with Pull Requests v2 off", () => {
+  it("loads none of the new pull request page", () => {
+    pullRequestsV2.on = false;
+    renderView({ kind: "pulls" });
+    expect(screen.getByTestId("pull-request-list")).toBeInTheDocument();
+    expect(newPage.loads).toBe(0);
+  });
+});
 
 describe("Files tab", () => {
   it("shows the tree beside an Open a file state until a file is chosen", () => {
@@ -444,6 +483,64 @@ describe("Files tab", () => {
     pressToggleChord();
     expect(screen.getAllByRole("button", { name: "Show Files Tree" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Hide Files Tree" })).toHaveLength(1);
+  });
+});
+
+describe("which pull request page a tab shows", () => {
+  const PULL = {
+    kind: "pull",
+    url: "https://github.com/acme/app/pull/7",
+    view: "summary",
+  } as const;
+
+  it.each([
+    ["the session's pull requests", { kind: "pulls" } as const],
+    ["one pull request", PULL],
+  ])("shows the new page for %s where the session's route serves it", async (_label, place) => {
+    pageRoute.value = { route: "server", key: "server:conv_1" };
+    renderView(place);
+    expect(await screen.findByTestId("new-pull-request-place")).toBeInTheDocument();
+    expect(newPage.props).toMatchObject({ conversationId: "conv_1", place, active: true });
+    expect(screen.queryByTestId("pull-request-list")).toBeNull();
+    expect(screen.queryByTestId("pull-request-page")).toBeNull();
+  });
+
+  it.each([
+    ["the session's pull requests", { kind: "pulls" } as const, "pull-request-list"],
+    ["one pull request", PULL, "pull-request-page"],
+  ])("shows the classic page for %s without such a route", async (_label, place, classic) => {
+    renderView(place);
+    expect(await screen.findByTestId(classic)).toBeInTheDocument();
+    expect(screen.queryByTestId("new-pull-request-place")).toBeNull();
+  });
+
+  it.each([
+    ["the session's pull requests", { kind: "pulls" } as const, "pull-request-list"],
+    ["one pull request", PULL, "pull-request-page"],
+  ])(
+    "shows the classic page for %s with Pull Requests v2 off, without asking for a route",
+    (_label, place, classic) => {
+      pullRequestsV2.on = false;
+      for (const route of [
+        { route: "server", key: "server:conv_1" } as const,
+        "loading" as const,
+      ]) {
+        pageRoute.value = route;
+        renderView(place);
+        expect(screen.getByTestId(classic)).toBeInTheDocument();
+        expect(screen.queryByTestId("new-pull-request-place")).toBeNull();
+        cleanup();
+      }
+      expect(pageRoute.asked).toBe(0);
+    },
+  );
+
+  it("shows neither page while the route is being decided", () => {
+    pageRoute.value = "loading";
+    renderView(PULL);
+    expect(screen.getByTestId("workspace-pull-request-place")).toBeEmptyDOMElement();
+    expect(screen.queryByTestId("pull-request-page")).toBeNull();
+    expect(screen.queryByTestId("new-pull-request-place")).toBeNull();
   });
 });
 
