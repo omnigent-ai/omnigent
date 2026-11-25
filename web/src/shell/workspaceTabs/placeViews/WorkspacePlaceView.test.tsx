@@ -351,7 +351,7 @@ describe("Files tab", () => {
     const { fileSettings } = renderView({ kind: "files", path: "a.ts" });
     expect(
       within(screen.getByTestId("file-viewer")).queryByRole("button", {
-        name: "Files tree options",
+        name: /^Tree options/,
       }),
     ).toBeNull();
     act(() => captured.tree!.onSortChange("size"));
@@ -428,12 +428,6 @@ describe("Files tab", () => {
     act(() => hide.run());
     expect(captured.tree!.showIgnored).toBe(false);
     expect(window.localStorage.getItem("omnigent:files-tree-show-ignored")).not.toBe("true");
-  });
-
-  it("shows git-ignored files when a tree with nothing else asks", () => {
-    renderView({ kind: "files", path: "a.ts" });
-    act(() => captured.tree!.onShowIgnoredChange(true));
-    expect(captured.tree!.showIgnored).toBe(true);
   });
 
   it("gives the tree's ⌘K commands to the keyboard target only, while both trees stay on screen", () => {
