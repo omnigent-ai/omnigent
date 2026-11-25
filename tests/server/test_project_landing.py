@@ -525,3 +525,58 @@ async def test_a_carried_web_change_runs_its_checks_with_the_root_packages(world
     (world.repo / "node_modules").rename(world.repo / "node_modules.off")
     missing = landing.safety_net(world.repo, rebased, tip, [])
     assert missing == "node_modules is missing in the landing checkout"
+
+
+async def test_the_verified_gate_is_off_by_default_and_needs_the_exact_sha(world) -> None:
+    sha = feature(world, "f-verified")
+    world.tickets.label("approved", sha, session_id="rs")
+    assert (await world.queue.submit(world.project, "t1", sha, None, dry_run=True))["ok"]
+    world.project.config = {"landing": {"enabled": True, "require_verified": True}}
+    with pytest.raises(OmnigentError, match="isn't verified"):
+        await world.queue.submit(world.project, "t1", sha, None, dry_run=True)
+    with pytest.raises(OmnigentError, match="isn't verified"):
+        await submit(world, sha)
+    world.tickets.label("verified", world.base, session_id="worker")
+    with pytest.raises(OmnigentError, match="verification doesn't carry"):
+        await world.queue.submit(world.project, "t1", sha, None, dry_run=True)
+    world.tickets.label("verified", sha, session_id="worker")
+    dry = await world.queue.submit(world.project, "t1", sha, None, dry_run=True)
+    assert dry["ok"] and "verified_carried_from" not in dry
+    assert (await submit(world, sha))["queued"]
+
+
+async def test_a_verification_carries_over_a_rebase_onto_untouched_files(world) -> None:
+    world.project.config = {"landing": {"enabled": True, "require_verified": True}}
+    verified, rebased = approve_then_rebase(world, {"a.txt": "a", "b.txt": "b"})
+    world.tickets.label("verified", verified, session_id="worker")
+    world.tickets.label("approved", rebased, session_id="rs")
+    dry = await world.queue.submit(world.project, "t1", rebased, None, dry_run=True)
+    assert dry["verified_carried_from"] == verified and dry["land_sha"] == rebased
+    await submit(world, rebased)
+    await world.queue.run_batch()
+    assert git(world.repo, "rev-parse", BRANCH) == rebased
+    assert {"key": "verified", "value": rebased} in world.tickets.ticket["labels"]
+    assert {"key": "approved", "value": rebased} in world.tickets.ticket["labels"]
+    assert any(
+        "verification carried" in note and verified in note and rebased in note
+        for note in world.tickets.notes
+    )
+
+
+async def test_a_verification_doesnt_carry_over_a_tip_commit_touching_its_files(world) -> None:
+    world.project.config = {"landing": {"enabled": True, "require_verified": True}}
+    lines = [f"line {number}" for number in range(30)]
+    start = write_commit(world.repo, "c.txt", "\n".join(lines) + "\n")
+    verified = branch(world, "feat", {"c.txt": "\n".join(["first", *lines[1:]]) + "\n"}, start)
+    tip = write_commit(world.repo, "c.txt", "\n".join([*lines[:-1], "last"]) + "\n")
+    git(world.repo, "checkout", "-q", "-B", "rebased", verified)
+    git(world.repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "rebase", "-q", BRANCH)
+    rebased = git(world.repo, "rev-parse", "HEAD")
+    git(world.repo, "checkout", "-q", BRANCH)
+    assert landing.patch_identity_problem(world.repo, verified, rebased, tip) is None
+    problem = landing.verification_carry_problem(world.repo, verified, rebased, tip)
+    assert problem is not None and tip[:7] in problem and "touch its files" in problem
+    world.tickets.label("verified", verified, session_id="worker")
+    world.tickets.label("approved", rebased, session_id="rs")
+    with pytest.raises(OmnigentError, match="touch its files"):
+        await world.queue.submit(world.project, "t1", rebased, None, dry_run=True)

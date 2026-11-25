@@ -17,9 +17,14 @@ When an approved SHA no longer fast-forwards, the queue cherry-picks it onto the
 in a scratch worktree. A carried approval lands only after ``tsc`` and ``oxlint``
 (when ``web/`` changed) and the ticket's ``targeted-tests`` pass on the new SHA.
 
+With ``require_verified`` on, the ``verified`` label must also be the SHA that lands. A
+verification carries across a rebase only as the identical patch whose files no commit
+it was rebased over touched; the queue then sets ``verified`` to the landed SHA.
+
 Project config ``landing`` (owner-only): ``enabled``, plus optional ``checkout``
-and ``branch`` for a throwaway target (a worktree of the same repository) and
-``restart: false`` to skip the restart. The restart command is server-side only.
+and ``branch`` for a throwaway target (a worktree of the same repository),
+``restart: false`` to skip the restart and ``require_verified: true`` for the verified
+gate (off by default). The restart command is server-side only.
 """
 
 from __future__ import annotations
@@ -59,6 +64,7 @@ _logger = logging.getLogger(__name__)
 
 CONFIG_KEY = "landing"
 APPROVED_LABEL = "approved"
+VERIFIED_LABEL = "verified"
 RISK_LABEL = "risk"
 RISK_OK_LABEL = "risk-ok"
 REVIEWER_IDENTITY = "reviewer"
@@ -192,6 +198,41 @@ def patch_identity_problem(checkout: Path, source: str, candidate: str, onto: st
         if trailers[0] != trailers[1]:
             return f"commit {position} (`{after[:12]}`) has different trailers"
     return None
+
+
+def _changed_paths(checkout: Path, base: str, head: str) -> list[str]:
+    out = _git(checkout, "diff", "--name-only", "--no-renames", "-z", base, head).stdout
+    return [path for path in out.split("\0") if path]
+
+
+def verification_carry_problem(
+    checkout: Path, verified: str, candidate: str, tip: str
+) -> str | None:
+    """Why the evidence for *verified* doesn't cover *candidate* landing on *tip*, else None.
+
+    It covers it only as the identical patch, when no commit between the verified SHA's
+    base and *tip* touched any file the patch changes.
+    """
+    problem = patch_identity_problem(checkout, verified, candidate, tip)
+    if problem is not None:
+        return problem
+    base = _git(checkout, "merge-base", tip, verified).stdout.strip()
+    paths = _changed_paths(checkout, base, verified)
+    if base == tip or not paths:
+        return None
+    touching = _git(
+        checkout,
+        "log",
+        "--format=%h",
+        f"{base}..{tip}",
+        "--",
+        *(f":(literal){path}" for path in paths),
+    ).stdout.split()
+    if not touching:
+        return None
+    shown = ", ".join(f"`{sha}`" for sha in touching[:5])
+    more = f" and {len(touching) - 5} more" if len(touching) > 5 else ""
+    return f"tip commit(s) {shown}{more} since it was verified touch its files"
 
 
 @contextlib.contextmanager
@@ -335,6 +376,7 @@ class Plan:
     land_sha: str
     carried_from: str | None = None
     rebased: bool = False
+    verified_from: str | None = None
 
 
 def resolve_target(config: dict[str, Any]) -> Target:
@@ -358,6 +400,12 @@ def resolve_target(config: dict[str, Any]) -> Target:
 def landing_enabled(config: dict[str, Any]) -> bool:
     raw = config.get(CONFIG_KEY)
     return isinstance(raw, dict) and raw.get("enabled") is True
+
+
+def verification_required(config: dict[str, Any]) -> bool:
+    """Whether the owner turned on the ``verified`` landing gate; off by default."""
+    raw = config.get(CONFIG_KEY)
+    return isinstance(raw, dict) and raw.get("require_verified") is True
 
 
 class LandingQueue:
@@ -640,9 +688,44 @@ class LandingQueue:
                 )
         outside = is_outside_requester(ticket.get("requested_by"))
         try:
-            return await asyncio.to_thread(self._plan, target, sha, source, not outside)
+            plan = await asyncio.to_thread(self._plan, target, sha, source, not outside)
+            if verification_required(project.config):
+                await asyncio.to_thread(
+                    self._check_verified, target, plan, labels.get(VERIFIED_LABEL, "").lower()
+                )
         except (GitError, subprocess.SubprocessError) as exc:
             raise refuse(f"Couldn't compare `{sha[:12]}` with the approved commit: {exc}") from exc
+        return plan
+
+    @staticmethod
+    def _check_verified(target: Target, plan: Plan, verified: str) -> None:
+        """Refuse unless ``verified`` is the landing SHA or carries to it; record a carry."""
+        land = plan.land_sha
+        if verified == land:
+            return
+        if not verified:
+            raise refuse(
+                f"`{land[:12]}` isn't verified: verify it on an isolated server, attach the "
+                f"evidence, then set the ticket's `{VERIFIED_LABEL}` label to exactly `{land}`"
+            )
+        if (
+            not _SHA.fullmatch(verified)
+            or _git(
+                target.checkout, "cat-file", "-e", f"{verified}^{{commit}}", check=False
+            ).returncode
+        ):
+            raise refuse(
+                f"The `{VERIFIED_LABEL}` label `{verified[:40]}` isn't a full commit SHA in "
+                "this repository"
+            )
+        problem = verification_carry_problem(target.checkout, verified, land, plan.tip)
+        if problem is not None:
+            raise refuse(
+                f"`{land[:12]}` isn't the verified `{verified[:12]}` unchanged on the tip "
+                f"({problem}), so the verification doesn't carry: verify `{land}` on an "
+                f"isolated server and set `{VERIFIED_LABEL}` to it"
+            )
+        plan.verified_from = verified
 
     @staticmethod
     def _plan(target: Target, sha: str, source: str, may_carry: bool) -> Plan:
@@ -806,6 +889,8 @@ class LandingQueue:
                 plan = await self._check(project, item.ticket, item.sha, target)
                 if plan.carried_from is not None:
                     await self._carry(project, item, plan, target)
+                if plan.verified_from is not None:
+                    await self._carry_verified(project, item, plan)
             except OmnigentError as exc:
                 await self._note(project, item.ticket["id"], f"refused `{item.sha[:12]}`: {exc}.")
                 await self._send(
@@ -875,6 +960,32 @@ class LandingQueue:
             "identical patch"
             f"{', cherry-picked onto the tip by the queue' if plan.rebased else ''}. "
             + (f"Passed {' and '.join(checks)}." if checks else "No checks apply.")
+        )
+        await asyncio.to_thread(
+            self._notifications.tickets.update,
+            project.id,
+            item.ticket["id"],
+            UpdateTicket(labels=labels, comment=comment, audience="agents"),
+            self._actor(project),
+        )
+
+    async def _carry_verified(self, project: Any, item: Item, plan: Plan) -> None:
+        """Record the carried verification on the SHA that lands."""
+        assert plan.verified_from is not None
+        fresh = await asyncio.to_thread(
+            self._notifications.tickets.get, project.id, item.ticket["id"], user_id=project.user_id
+        )
+        item.ticket = fresh.get("ticket", fresh)
+        labels = [
+            TicketLabel(key=label["key"], value=label.get("value"))
+            for label in item.ticket.get("labels") or []
+            if label.get("key") != VERIFIED_LABEL
+        ]
+        labels.append(TicketLabel(key=VERIFIED_LABEL, value=plan.land_sha))
+        comment = (
+            f"{NOTE_PREFIX}: verification carried from `{plan.verified_from}` to "
+            f"`{plan.land_sha}`: identical patch, and no commit it was rebased over touches "
+            "its files."
         )
         await asyncio.to_thread(
             self._notifications.tickets.update,
@@ -1037,20 +1148,29 @@ def _touches_web(target: Target, plan: Plan) -> bool:
 
 
 def _describe(plan: Plan) -> str:
+    verified = (
+        f", carrying the verification of `{plan.verified_from[:12]}`"
+        if plan.verified_from is not None
+        else ""
+    )
     if plan.carried_from is None:
-        return ""
+        return verified
     if plan.rebased:
         return (
             f", carrying the approval of `{plan.carried_from[:12]}` as `{plan.land_sha[:12]}` "
-            "(cherry-picked onto the tip, identical patch)"
+            f"(cherry-picked onto the tip, identical patch){verified}"
         )
-    return f", carrying the approval of `{plan.carried_from[:12]}` (identical patch)"
+    return f", carrying the approval of `{plan.carried_from[:12]}` (identical patch){verified}"
 
 
 def _carry(plan: Plan) -> dict[str, Any]:
+    carried: dict[str, Any] = {}
+    if plan.verified_from is not None:
+        carried.update(verified_carried_from=plan.verified_from, land_sha=plan.land_sha)
     if plan.carried_from is None:
-        return {}
+        return carried
     return {
+        **carried,
         "carried_from": plan.carried_from,
         "land_sha": plan.land_sha,
         "rebased": plan.rebased,
