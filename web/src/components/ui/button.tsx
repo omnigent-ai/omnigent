@@ -15,7 +15,9 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        default: "bg-primary-cta text-primary-cta-foreground [a]:hover:bg-primary-cta/80",
+        // Key chips take the button's text color; the muted chip colors vanish on the fill.
+        default:
+          "bg-primary-cta text-primary-cta-foreground [a]:hover:bg-primary-cta/80 **:data-[slot=kbd]:border-current/30 **:data-[slot=kbd]:bg-current/10 **:data-[slot=kbd]:text-current",
         outline:
           "border-border bg-background hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground dark:border-input dark:bg-input dark:hover:bg-muted",
         secondary:

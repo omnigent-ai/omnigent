@@ -59,6 +59,13 @@ if args[:2] == ["api", "graphql"]:
         unexpected_api()
     (root / "created").touch()
     print(json.dumps(pr))
+elif args[:4] == ["api", "--hostname", "github.com", "graphql"] and args[-8:] == [
+    "-f", "owner=example", "-f", "name=project", "-F", "number=42",
+    "-F", "includeComments=false",
+] and any(arg.startswith("query=query(") and "timelineItems(" in arg for arg in args):
+    print(json.dumps({"data": {"repository": {"pullRequest": {
+        "timelineItems": {"nodes": [], "pageInfo": {"hasPreviousPage": False}},
+    }}}}))
 elif args[:2] == ["pr", "view"]:
     explicit = "-R" in args and args[args.index("-R") + 1] == "github.com/example/project"
     if (explicit and (root / "created").exists()) or (root / "discover").exists():
@@ -256,6 +263,8 @@ def test_pr_appears_in_composer_and_workspace(
     assert info["selected_pr_url"] == _URL
     assert info["repo"]["name_with_owner"] == "example/project"
     assert info["pr"]["head_ref"] == "contributor/topic"
+    assert info["pr"]["timeline_events"] == []
+    assert not info["pr"].get("timeline_partial")
     assert info["prs"][0]["relationship"] == ("inferred" if existing else "created")
     unexpected_api = binary / "unexpected-api"
     assert not unexpected_api.exists(), unexpected_api.read_text()

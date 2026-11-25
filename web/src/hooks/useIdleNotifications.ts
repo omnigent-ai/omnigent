@@ -61,6 +61,7 @@ import {
 } from "@/lib/idleTransitions";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
+import { isInMutedProject, isSessionMuted, useMutedProjects } from "@/lib/sessionMute";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
 const ELICITATION_BODY = "Agent is asking for your input.";
@@ -121,7 +122,8 @@ function isWindowFocused(): boolean {
  */
 export function useIdleNotifications(activeConversationId?: string): void {
   const navigate = useNavigate();
-  const { data } = useLoadedConversations();
+  // `data` subtracts answers in flight; new prompts are detected on the server's counts.
+  const { data, serverRows } = useLoadedConversations();
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
   // Last badge state sent to the shell, as a `count|navigatePath|title|body` key.
@@ -151,6 +153,9 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // then reporting back) into one beep. Cleared when the user views the session
   // or it drops off the list, so a later finish can notify again.
   const notifiedSessions = useRef<Set<string>>(new Set());
+  // Each session's own last observed mute, kept after a row leaves the list so a
+  // preview still loading for a muted session stays silent. Project mutes are read live.
+  const mutedSessions = useRef<Set<string>>(new Set());
 
   useLazyPermissionRequest();
 
@@ -254,6 +259,8 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // recompute the dock badge from the current list so it agrees with the
   // dot immediately, without waiting for the next conversations poll.
   const unseenTick = useUnseenTick();
+  // Muting a project changes no row, so the badge recomputes on it directly.
+  const mutedProjects = useMutedProjects();
   useEffect(() => {
     const convs = latestConversations.current;
     if (convs === null) return;
@@ -264,8 +271,8 @@ export function useIdleNotifications(activeConversationId?: string): void {
       isConversationUnseen,
     );
     pushBadge(next, convs);
-    // pushBadge and the focus state are refs; rerun only when the map changes.
-  }, [unseenTick]);
+    // pushBadge and the focus state are refs; rerun only when the map or mutes change.
+  }, [unseenTick, mutedProjects]);
 
   useEffect(() => {
     // Still loading — don't compute a badge from an absent list (and don't
@@ -274,6 +281,10 @@ export function useIdleNotifications(activeConversationId?: string): void {
     if (data === undefined) return;
     const conversations = data.pages.flatMap((page) => page.data);
     latestConversations.current = conversations;
+    for (const conversation of conversations) {
+      if (isSessionMuted(conversation)) mutedSessions.current.add(conversation.id);
+      else mutedSessions.current.delete(conversation.id);
+    }
 
     // Badge first, before the empty-list bail below: an empty list must
     // still send 0 so a stale nonzero badge clears.
@@ -286,9 +297,9 @@ export function useIdleNotifications(activeConversationId?: string): void {
     pushBadge(unread, conversations);
 
     const idle = detectIdleTransitions(prevStatus.current, conversations);
-    const newElicitations = detectNewElicitations(prevElicitations.current, conversations);
+    const newElicitations = detectNewElicitations(prevElicitations.current, serverRows);
     prevStatus.current = buildStatusMap(conversations);
-    prevElicitations.current = buildElicitationMap(conversations);
+    prevElicitations.current = buildElicitationMap(serverRows);
 
     const windowFocused = windowFocusedRef.current;
     const grantedOrNative = isNativeShell() || getNotificationPermission() === "granted";
@@ -351,13 +362,26 @@ export function useIdleNotifications(activeConversationId?: string): void {
           setTimeout(() => {
             timers.delete(id);
             // Re-check suppression at fire time — the user may have opened the
-            // session (or refocused the window) during the settle window.
+            // session (or refocused the window), or muted it, during the settle window.
+            // A project mute changes no row, so it's read live for the session's latest row.
             if (windowFocusedRef.current && id === activeIdRef.current) return;
+            const mutedNow = () =>
+              mutedSessions.current.has(id) ||
+              isInMutedProject(
+                latestConversations.current?.find((row) => row.id === id) ?? conversation,
+              );
+            if (mutedNow()) return;
             // Mark it beeped so a later finish stays silent until the user has
             // viewed this session.
             notifiedSessions.current.add(id);
             // Agent's final words as the body when fetchable, else IDLE_BODY.
-            notifyWithPreview(conversation, navigateRef.current);
+            // Muting while the preview loads still silences it.
+            notifyWithPreview(
+              conversation,
+              navigateRef.current,
+              mutedNow,
+              notifiedSessions.current,
+            );
           }, IDLE_SETTLE_MS),
         );
       }
@@ -376,7 +400,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
         notify(conversation, ELICITATION_BODY, navigate);
       }
     }
-  }, [data, navigate, activeConversationId]);
+  }, [data, serverRows, navigate, activeConversationId]);
 }
 
 /**
@@ -450,8 +474,14 @@ function notify(
 function notifyWithPreview(
   conversation: Conversation,
   navigate: ReturnType<typeof useNavigate>,
+  muted: () => boolean,
+  notified: Set<string>,
 ): void {
   void fetchLastAssistantText(conversation.id).then((preview) => {
+    if (muted()) {
+      notified.delete(conversation.id);
+      return;
+    }
     notify(conversation, preview ?? IDLE_BODY, navigate);
   });
 }

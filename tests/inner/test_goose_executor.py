@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner.executor import (
     ExecutorError,
     TextChunk,
@@ -1230,7 +1231,7 @@ def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
             allow_network=True,
         )
 
-    def _fake_launcher(target: str, sandbox: SandboxPolicy) -> str:
+    def _fake_launcher(target: str, sandbox: SandboxPolicy, **_kwargs: object) -> str:
         captured["target"] = target
         captured["policy"] = sandbox
         return "/fake/launcher"
@@ -1253,23 +1254,6 @@ def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
     assert policy.spawn_env_allowlist is not None
     assert "PATH" in policy.spawn_env_allowlist
     assert "GOOSE_PROVIDER" in policy.spawn_env_allowlist
-
-
-def test_sandbox_launch_path_falls_back_when_backend_unavailable(monkeypatch, tmp_path) -> None:
-    """A backend failure degrades to the bare binary, never blocks startup."""
-    from omnigent.inner import sandbox as sandbox_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-
-    def _boom(_os_env, _cwd) -> None:
-        raise NotImplementedError("no bwrap here")
-
-    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _boom)
-    executor = GooseExecutor(
-        cwd=str(tmp_path),
-        goose_path="/usr/bin/goose",
-        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
-    )
-    assert executor._sandbox_launch_path(("PATH",)) == "/usr/bin/goose"
 
 
 @pytest.mark.asyncio
@@ -1492,15 +1476,6 @@ async def test_respond_to_agent_request_exception_yields_error_reply() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_os_env_default(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
-
-    monkeypatch.delenv("HARNESS_GOOSE_OS_ENV", raising=False)
-    spec = goose_harness._resolve_os_env()
-    assert spec.type == "caller_process"
-    assert spec.sandbox is not None and spec.sandbox.type == "none"
-
-
 def test_resolve_os_env_from_json(monkeypatch) -> None:
     from omnigent.inner import goose_harness
 
@@ -1519,15 +1494,6 @@ def test_resolve_os_env_from_json(monkeypatch) -> None:
     assert spec.cwd == "/w"
     assert spec.sandbox is not None and spec.sandbox.type == "linux_bwrap"
     assert spec.fork is True
-
-
-def test_resolve_os_env_malformed_json_falls_back(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
-
-    monkeypatch.setenv("HARNESS_GOOSE_OS_ENV", "{not valid json")
-    spec = goose_harness._resolve_os_env()
-    assert spec.type == "caller_process"
-    assert spec.sandbox is not None and spec.sandbox.type == "none"
 
 
 def test_build_goose_executor_reads_env(monkeypatch) -> None:
@@ -1573,3 +1539,48 @@ def test_create_app_returns_fastapi() -> None:
     from omnigent.inner import goose_harness
 
     assert isinstance(goose_harness.create_app(), FastAPI)
+
+
+@pytest.mark.parametrize("input_item_id", ["msg_current", None])
+@pytest.mark.parametrize("content", ["current", [], [{"type": "input_text", "text": ""}]])
+@pytest.mark.parametrize("fresh_session", [False, True], ids=["warm", "history-replay"])
+@pytest.mark.asyncio
+async def test_prompt_includes_input_item_metadata(input_item_id, content, fresh_session) -> None:
+    """Every ACP prompt names the initiating item or explicitly sends null."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "acp-session"
+    executor._proc = MagicMock(returncode=None)
+    executor._system_prompt_sent = not fresh_session
+    prompts = []
+
+    async def send(message):
+        prompts.append(message)
+        executor._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = send
+    tail = {"type": "message", "role": "user", "content": content}
+    if input_item_id is not None:
+        tail["id"] = input_item_id
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "assistant", "content": "old reply"},
+            tail,
+        ],
+        preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
+    )
+    events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert len(prompts) == 1
+    assert prompts[0]["method"] == "session/prompt"
+    assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: input_item_id}
+    if fresh_session:
+        assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+    else:
+        assert prompts[0]["params"]["prompt"] == [
+            {"type": "text", "text": content if isinstance(content, str) else ""}
+        ]

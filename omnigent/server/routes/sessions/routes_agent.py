@@ -16,10 +16,13 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.automations_availability import AUTOMATIONS_HEADER, USER_INBOX_HEADER
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
+from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
+from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER, POLICY_MODULES_HEADER
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -35,9 +38,12 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
+    local_single_user_enabled,
 )
-from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -198,8 +204,8 @@ def register_agent_routes(
         session_id: str,
     ) -> Response:
         """
-        Download the raw ``.tar.gz`` agent bundle for the session's
-        bound agent.
+        Download the ``.tar.gz`` agent bundle for the session's bound agent.
+        READ-only callers receive a minimal redacted bundle.
 
         Replaces ``GET /api/agents/{id}/contents``. Runners call this
         on cache miss to fetch the spec + bundled files.
@@ -207,11 +213,12 @@ def register_agent_routes(
         :param request: The incoming FastAPI request.
         :param session_id: Session identifier, e.g.
             ``"conv_abc123"``.
-        :returns: Raw bundle bytes as ``application/gzip``.
+        :returns: Bundle bytes as ``application/gzip``.
         :raises OmnigentError: If the session, agent, or bundle is
             not found.
         """
         managed_token = request.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        redacted = False
         if managed_token:
             # A sandbox host can read only bundles for sessions bound to it.
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -229,6 +236,18 @@ def register_agent_routes(
                 user_id, session_id, LEVEL_READ, permission_store, conversation_store
             )
             conv = access.conversation
+            # The bundle can carry its author's credentials, so only EDIT
+            # callers get it verbatim; READ views elsewhere mask them too.
+            if permission_store is not None:
+                redacted = not await asyncio.to_thread(
+                    check_session_access,
+                    user_id,
+                    session_id,
+                    LEVEL_EDIT,
+                    permission_store,
+                    conversation_store,
+                    conversation=conv,
+                )
         if conv is None:
             conv = conversation_store.get_conversation(session_id)
             if conv is None:
@@ -255,6 +274,13 @@ def register_agent_routes(
                 "Agent bundle not found in artifact store",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+        if redacted:
+            bundle_bytes = await asyncio.to_thread(
+                redacted_agent_bundle,
+                agent.name,
+                bundle_bytes,
+                operator_authored=agent.operator_authored,
+            )
         selection_headers = {}
         if request.headers.get(MCP_SELECTION_HEADER) == "1":
             selection_headers[MCP_SELECTION_HEADER] = json.dumps(
@@ -264,11 +290,46 @@ def register_agent_routes(
                     if key.startswith(MCP_SELECTION_PREFIX)
                 }
             )
+        automations_available = getattr(request.app.state, "automations_available", None)
+        if automations_available is not None:
+            selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
+        inbox_enabled_for = getattr(request.app.state, "inbox_items_enabled_for", None)
+        if inbox_enabled_for is not None:
+            # Evaluate the caller's deployment gate for the root owner's Inbox;
+            # a failing check turns the Inbox tools off.
+            try:
+                owner = (
+                    await asyncio.to_thread(
+                        conversation_store.get_session_owner,
+                        conv.root_conversation_id,
+                        owner_only=True,
+                    )
+                    if permission_store is not None
+                    else RESERVED_USER_LOCAL
+                )
+                inbox_on = owner is not None and await asyncio.to_thread(inbox_enabled_for, owner)
+            except Exception:
+                _logger.warning(
+                    "Inbox settings check failed for session %s; offering no Inbox tools",
+                    session_id,
+                    exc_info=True,
+                )
+                inbox_on = False
+            selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
+        memory_available = getattr(request.app.state, "memory_available", None)
+        selection_headers[MEMORY_HEADER] = (
+            "1" if memory_available is not None and memory_available() else "0"
+        )
+        memory_search_available = getattr(request.app.state, "memory_search_available", None)
+        selection_headers[MEMORY_SEARCH_HEADER] = (
+            "1" if memory_search_available is not None and memory_search_available() else "0"
+        )
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",
             headers={
                 "Cache-Control": "no-store",
+                "X-Agent-Bundle-Redacted": "true" if redacted else "false",
                 **selection_headers,
                 "X-Agent-Id": agent.id,
                 "X-Agent-Version": str(agent.version),
@@ -279,6 +340,12 @@ def register_agent_routes(
                 # agents may. The runner fails safe (treats a
                 # missing header as session-scoped → no expansion).
                 "X-Agent-Session-Scoped": "false" if agent.operator_authored else "true",
+                # Handler authority for the runner: the server's configured policy modules,
+                # and whether this is a local single-user server (the runner skips the check).
+                POLICY_MODULES_HEADER: json.dumps(
+                    getattr(request.app.state, "policy_modules", [])
+                ),
+                LOCAL_SINGLE_USER_HEADER: "1" if local_single_user_enabled() else "0",
             },
         )
 
@@ -342,6 +409,19 @@ def register_agent_routes(
         # admin may replace it.
         await asyncio.to_thread(_require_agent_owner, user_id, agent, permission_store)
 
+        # A session-scoped agent row can be bound into several sessions, so
+        # replacing its bundle through a session that does not own the row
+        # needs EDIT on the owning session; READ there must not be enough to
+        # overwrite another user's private agent.
+        if agent.session_id != session_id:
+            await _require_access(
+                user_id,
+                agent.session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+            )
+
         bundle_bytes = await bundle.read()
         # Run bundle validation (tar extraction + spec parse, both
         # blocking) off the event loop -- mirrors the POST
@@ -366,13 +446,15 @@ def register_agent_routes(
             )
 
         from omnigent.runner.routing import routing_host_id
-        from omnigent.server.mcp_compatibility import (
+        from omnigent.server.runtime_compatibility import (
             registry_services,
-            require_registry_mcp_runtime,
+            require_runtime_support,
+            uses_tcp_egress,
         )
 
-        require_registry_mcp_runtime(
+        require_runtime_support(
             registry_services(selected_mcp_spec(spec, conv.labels)),
+            tcp_egress_required=uses_tcp_egress(spec),
             host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
             runner_id=conv.runner_id,
             host_registry=getattr(request.app.state, "host_registry", None),
@@ -549,6 +631,17 @@ def register_agent_routes(
 
         if method == "tools/call":
             from omnigent.server.mcp_identity import mcp_policy_actor
+            from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+
+            tool_name = params.get("name")
+            if (
+                isinstance(tool_name, str)
+                and tool_name in {tool.name() for tool in JOURNAL_TOOLS}
+                and not getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
+                    Feature.WORKFLOWS
+                )
+            ):
+                return _mcp_error_response(rpc_id, -32601, "Workflows are disabled on this server")
 
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)

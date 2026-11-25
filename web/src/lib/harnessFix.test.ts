@@ -8,6 +8,7 @@ describe("harnessFixMode", () => {
     ["binary-missing", "install"],
     ["unconfigured", "install"],
     ["version-too-low", "update"],
+    ["tmux-unavailable", "tmux"],
     ["needs-auth", "reconfigure"],
     ["readiness-error", "reconfigure"],
     ["host-unavailable", "reconfigure"],
@@ -56,6 +57,7 @@ describe("harnessStatus", () => {
     ["binary-missing", { ready: false, needsSetup: true, reason: "binary-missing" }],
     ["needs-auth", { ready: false, needsSetup: true, reason: "needs-auth" }],
     ["version-too-low", { ready: false, needsSetup: true, reason: "version-too-low" }],
+    ["tmux-unavailable", { ready: false, needsSetup: true, reason: "tmux-unavailable" }],
     ["future-error", { ready: false, needsSetup: true, reason: "readiness-error" }],
     [undefined, { ready: false, needsSetup: false, reason: null }],
   ])("classifies %s for Settings and New Chat", (readiness, expected) => {

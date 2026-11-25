@@ -1,6 +1,8 @@
 import type { ComponentType, ReactNode, Ref } from "react";
 
 import { getBasePath, withBasePath } from "./basePath.ts";
+import { updatesRoutingKey } from "./sessionHost.ts";
+import { clientRoutingKey, SLICE_KEY_HEADER, SLICE_KEY_PARAM } from "./routingKey.ts";
 
 /**
  * Embed host integration seam.
@@ -54,7 +56,8 @@ export type OmnigentInteractionKind =
   | "list_sessions"
   | "get_session"
   | "create_session_sandbox"
-  | "create_session_computer";
+  | "create_session_computer"
+  | "create_scheduled_task";
 
 /** Terminal outcome of an interaction, set on the `complete` phase. */
 export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";
@@ -112,7 +115,10 @@ export interface OmnigentHostConfig {
    * mount. Omitted by older hosts, which retain the sandboxed srcdoc preview.
    */
   htmlPreviewFrame?: ComponentType<HtmlPreviewFrameProps>;
-  /** Stable server/workspace identity used to scope browser-local extension storage. */
+  /**
+   * Stable server/workspace identity for browser storage and goal ownership.
+   * Embedded hosts must change this when switching backends.
+   */
   serverIdentity?: string;
   /**
    * Maps an web API path (always starting with `/v1`, `/health`, or
@@ -146,6 +152,14 @@ export interface OmnigentHostConfig {
    * `window.location`.
    */
   resolveWebSocketUrl?: (path: string) => string;
+  /**
+   * Maps a web API path (e.g. a workspace file with `?download=true`) to a URL
+   * the browser can load directly as `<video src>`, carrying in the URL any
+   * auth the host's `fetcher` would add as headers. Set it when the host page's
+   * CSP blocks `blob:` media. When omitted, media is fetched through `fetcher`
+   * and played from an object URL.
+   */
+  resolveMediaUrl?: (path: string) => string;
   /**
    * Turns a relative share-link path (basename already included, e.g.
    * `<basename>/c/:id`) into the full absolute share URL — the host prepends
@@ -325,25 +339,155 @@ export function getThemeRoots(): HTMLElement[] {
   return typeof document !== "undefined" ? [document.documentElement] : [];
 }
 
+/** Routing options for a request to the Omnigent server. */
+export interface RoutingOptions {
+  /** Send no slice key, to reach a host whose tunnels connected without one. */
+  unkeyed?: boolean;
+  /** The request names no host: key it by the modal host, else this client's key. */
+  hostless?: boolean;
+}
+
+/** The fallback key for a request that names no host of its own. */
+function fallbackRoutingKey(options?: RoutingOptions): string {
+  return options?.hostless ? updatesRoutingKey() : clientRoutingKey();
+}
+
+/**
+ * `init` with the fallback slice key added when host routing is on and the
+ * request carries no key yet, so every request names a replica.
+ */
+export function withRoutingKey(
+  init?: RequestInit,
+  options?: RoutingOptions,
+): RequestInit | undefined {
+  if (options?.unkeyed || !isHostRoutingEnabled()) return init;
+  const headers = new Headers(init?.headers);
+  if (headers.has(SLICE_KEY_HEADER)) return init;
+  headers.set(SLICE_KEY_HEADER, fallbackRoutingKey(options));
+  return { ...init, headers };
+}
+
+/** `path` with the fallback slice key as a query parameter when it carries none. */
+export function withRoutingKeyParam(path: string, options?: RoutingOptions): string {
+  if (options?.unkeyed || !isHostRoutingEnabled()) return path;
+  const [base, query = ""] = path.split("?", 2);
+  const params = new URLSearchParams(query);
+  if (params.has(SLICE_KEY_PARAM)) return path;
+  params.set(SLICE_KEY_PARAM, fallbackRoutingKey(options));
+  return `${base}?${params}`;
+}
+
+/** Told how many bytes of a request body have been sent; `total` is null when unknown. */
+export type UploadProgressListener = (loaded: number, total: number | null) => void;
+
 /**
  * Single network choke point. Delegates to the host fetcher when embedded,
  * otherwise calls native `fetch` with the path unchanged (standalone).
  */
-export function hostFetch(path: string, init?: RequestInit): Promise<Response> {
+export function hostFetch(
+  path: string,
+  init?: RequestInit,
+  options?: RoutingOptions & { onUploadProgress?: UploadProgressListener },
+): Promise<Response> {
+  const routedInit = withRoutingKey(init, options);
   if (hostConfig.fetcher) {
     // The host owns path rebasing (it proxies onto its own API surface), so
     // the path is passed through untouched — `withBasePath` is standalone-only.
-    return hostConfig.fetcher(path, init);
+    // An embedding's fetcher reports no upload progress, so callers show it as indeterminate.
+    return hostConfig.fetcher(path, routedInit);
   }
-  return fetch(withBasePath(path), init);
+  if (options?.onUploadProgress) {
+    return fetchReportingUpload(withBasePath(path), routedInit, options.onUploadProgress);
+  }
+  return fetch(withBasePath(path), routedInit);
 }
 
-export function resolveWebSocketUrl(path: string): string {
+/**
+ * `fetch` for a request whose upload progress matters. XMLHttpRequest is the only way to see
+ * it, so this answers with a `Response` like `fetch` and rejects the same way.
+ */
+function fetchReportingUpload(
+  url: string,
+  init: RequestInit | undefined,
+  onUploadProgress: UploadProgressListener,
+): Promise<Response> {
+  const signal = init?.signal ?? undefined;
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
+  // XMLHttpRequest would send a stream's text as "[object ReadableStream]"; refuse it as a network failure.
+  if (typeof ReadableStream !== "undefined" && init?.body instanceof ReadableStream) {
+    return Promise.reject(new TypeError("Failed to fetch"));
+  }
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    const onAbort = () => request.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const settle = () => signal?.removeEventListener("abort", onAbort);
+    request.upload.onprogress = (event) =>
+      onUploadProgress(event.loaded, event.lengthComputable ? event.total : null);
+    request.onload = () => {
+      settle();
+      // A Response can't carry a body with a null-body status.
+      const nullBody = [101, 204, 205, 304].includes(request.status);
+      try {
+        const headers = new Headers();
+        for (const line of request
+          .getAllResponseHeaders()
+          .trim()
+          .split(/[\r\n]+/)) {
+          const at = line.indexOf(":");
+          if (at > 0) headers.append(line.slice(0, at).trim(), line.slice(at + 1).trim());
+        }
+        resolve(
+          new Response(nullBody ? null : (request.response as ArrayBuffer), {
+            status: request.status,
+            statusText: request.statusText,
+            headers,
+          }),
+        );
+      } catch {
+        // `new Response` throws for a status outside 200–599; reject as a network failure does.
+        reject(new TypeError("Failed to fetch"));
+      }
+    };
+    request.onerror = () => {
+      settle();
+      reject(new TypeError("Failed to fetch"));
+    };
+    request.onabort = () => {
+      settle();
+      reject(abortReason(signal));
+    };
+    try {
+      request.open(init?.method ?? "GET", url);
+      request.responseType = "arraybuffer";
+      request.withCredentials = init?.credentials === "include";
+      new Headers(init?.headers).forEach((value, name) => request.setRequestHeader(name, value));
+      request.send((init?.body ?? null) as XMLHttpRequestBodyInit | null);
+    } catch {
+      // `open`, a header, or `send` can throw (e.g. an invalid header); fail as `fetch` would.
+      settle();
+      reject(new TypeError("Failed to fetch"));
+    }
+  });
+}
+
+/** What an aborted request rejects with, as `fetch` does: the signal's reason when it has one. */
+function abortReason(signal: AbortSignal | undefined): unknown {
+  return signal?.reason ?? new DOMException("The operation was aborted.", "AbortError");
+}
+
+export function resolveWebSocketUrl(path: string, options?: RoutingOptions): string {
+  const routedPath = withRoutingKeyParam(path, options);
   if (hostConfig.resolveWebSocketUrl) {
-    return hostConfig.resolveWebSocketUrl(path);
+    return hostConfig.resolveWebSocketUrl(routedPath);
   }
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}${withBasePath(path)}`;
+  return `${scheme}//${window.location.host}${withBasePath(routedPath)}`;
+}
+
+/** The host's directly loadable media URL for an API path, or null to fetch through `fetcher`. */
+export function resolveMediaUrl(path: string): string | null {
+  return hostConfig.resolveMediaUrl ? hostConfig.resolveMediaUrl(path) : null;
 }
 
 /**

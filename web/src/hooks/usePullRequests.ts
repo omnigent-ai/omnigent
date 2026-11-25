@@ -1,3 +1,7 @@
+import { createComment, type Comment } from "./useComments";
+import { requestLocalReviewContext } from "@/lib/localReviewContext";
+import { createStoredChoicePreference } from "@/lib/storedChoicePreference";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
@@ -35,6 +39,7 @@
 // same way as the workspace filesystem hooks — reusing their helpers.
 
 import {
+  type Query,
   queryOptions,
   skipToken,
   useMutation,
@@ -42,6 +47,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import {
   appendReviewReply,
   type ReviewComment,
@@ -101,6 +107,18 @@ export interface PullRequestComment {
   url: string | null;
 }
 
+export interface PullRequestTimelineEvent {
+  id: string;
+  kind: "commit" | "force_push";
+  author: string | null;
+  /** Commit time for commits; event time for force pushes. */
+  created_at: string | null;
+  url: string | null;
+  sha: string | null;
+  previous_sha?: string | null;
+  message?: string | null;
+}
+
 export type PullRequestReviewerState =
   "PENDING" | "APPROVED" | "COMMENTED" | "CHANGES_REQUESTED" | "DISMISSED";
 
@@ -147,12 +165,17 @@ export interface PullRequest {
   checks_supported?: boolean;
   head_sha?: string;
   base_sha?: string;
+  /** HTTPS web URL of the source (possibly fork) repository; null when unknown or deleted. */
+  head_repository_url?: string | null;
   /** PR description (GitHub-flavored markdown); null when empty. Optional: a
    *  host predating the Summary tab omits it, so treat undefined as none. */
   body?: string | null;
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
   comments?: PullRequestComment[];
   comments_partial?: boolean;
+  /** Commit and force-push activity; absent from older hosts and other providers. */
+  timeline_events?: PullRequestTimelineEvent[];
+  timeline_partial?: boolean;
   /** Assigned reviewers and their current review state; absent from older hosts. */
   reviewers?: PullRequestReviewer[];
   /** The PR's labels; absent from older hosts and providers that don't report them. */
@@ -166,6 +189,9 @@ export interface PullRequest {
 
 export interface PullRequestRepo {
   name_with_owner: string | null;
+  /** Host of the repo's forge instance, e.g. "github.com"; absent from older hosts and
+   *  providers that don't report it. */
+  host?: string;
 }
 
 /** A `gh`-configured account — one option in the panel's account selector. */
@@ -210,8 +236,12 @@ export interface PullRequestCapabilities {
   reviewer_editing?: boolean;
   /** The PR's title and description can be edited; absent from older hosts. */
   details_editing?: boolean;
+  /** A merge runs as the account the dialog sends; absent from older hosts. */
+  merge_as_account?: boolean;
   /** Images and videos can be uploaded into the description; absent from older hosts. */
   attachment_uploads?: boolean;
+  /** The PR's commits can be listed and read one at a time; absent from older hosts. */
+  commit_history?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -273,7 +303,11 @@ export interface PullRequestInfo {
    *  @deprecated Legacy GitHub field; read `auth.authenticated`. Removal in 0.19.0. */
   authenticated?: boolean;
   branch?: string;
+  /** The selected PR's repo when one is tracked, else the workspace's. */
   repo?: PullRequestRepo | null;
+  /** The workspace checkout's own repo, whatever PR is selected; absent from older hosts,
+   *  explicit PR reads, and checkouts whose preferred remote isn't recognized. */
+  workspace_repo?: PullRequestRepo;
   /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;
   pr?: PullRequest | null;
@@ -339,13 +373,21 @@ function legacyPullRequestAuth(raw: PullRequestInfo): PullRequestAuth {
  *  workspace changed-files list, plus a "renamed" status. */
 export type PullRequestChangedFile = Omit<WorkspaceChangedFile, "status"> & {
   status: WorkspaceChangedFile["status"] | "renamed";
+  /** The old path of a renamed file. */
+  previous_path?: string | null;
 };
 
 export interface PullRequestChangedFilesResult {
   available: boolean;
   data: PullRequestChangedFile[];
+  /** True when the provider truncated the list. */
   has_more?: boolean;
   warning?: string;
+  /** The provider's total changed-file count, when known. */
+  total_count?: number | null;
+  /** The revision the list describes, when pinned. */
+  head_sha?: string | null;
+  base_sha?: string | null;
 }
 
 export interface PullRequestFileDiffResponse {
@@ -404,9 +446,15 @@ export function pullRequestNotFoundReason(
 export async function fetchPullRequestInfo(
   conversationId: string,
   prUrl?: string,
+  signal?: AbortSignal,
+  allowCached = false,
 ): Promise<PullRequestInfo> {
+  const params = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
+  if (allowCached) params.set("allow_cached", "true");
+  const search = params.toString();
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${search ? `?${search}` : ""}`,
+    { signal },
   );
   if (res.status === 404) {
     // Preserve the server's message so an outdated host (no github route) is
@@ -440,6 +488,37 @@ export async function fetchPullRequestInfo(
  *  `gh` API call but only while the panel is actually focused. */
 const PULL_REQUEST_POLL_MS = 5_000;
 const PULL_REQUEST_LIST_POLL_MS = 30_000;
+
+/**
+ * Whether a fetch of `query` is an interval poll, which may take the runner's
+ * previous read: the answer is at most one read old, and the next poll corrects it.
+ *
+ * Mount, focus and reopen refetches run only once data is stale, and Refresh, turn
+ * end and edits invalidate first, so a fetch of valid data that is still fresh for
+ * an active polling observer is that observer's timer. Polls slower than the stale
+ * time, such as list rows, read the forge every time. A user refresh must invalidate
+ * too ({@link useRefreshPullRequestInfo}); a plain `refetch()` would count as a poll.
+ */
+export function pollAcceptsCachedAnswer(
+  query: Query<PullRequestInfo> | undefined,
+  now = Date.now(),
+): boolean {
+  if (!query || query.state.data === undefined || query.state.isInvalidated) return false;
+  const age = now - query.state.dataUpdatedAt;
+  return query.observers.some(({ options }) => {
+    const interval =
+      typeof options.refetchInterval === "function"
+        ? options.refetchInterval(query)
+        : options.refetchInterval;
+    return (
+      options.enabled !== false &&
+      typeof interval === "number" &&
+      interval > 0 &&
+      typeof options.staleTime === "number" &&
+      age < options.staleTime
+    );
+  });
+}
 
 /**
  * The panel's poll interval for the current GitHub info, or `false` to stop.
@@ -505,13 +584,145 @@ function usePullRequestQueryContext(rawConversationId: string | undefined) {
   return { conversationId, enabled: !!conversationId && serveable !== false, retry };
 }
 
+/** The query key of a session's pull request info, or one of its pull requests' by URL. */
+export function pullRequestInfoQueryKey(conversationId: string | undefined, prUrl?: string) {
+  return ["github-info", conversationId, ...(prUrl ? [prUrl] : [])];
+}
+
+/** Background reads of individual pull requests in flight at once, across every session. */
+const PULL_REQUEST_READ_CONCURRENCY = 2;
+
+interface QueuedPullRequestRead {
+  key: string;
+  start: () => void;
+}
+
+/**
+ * Runs reads of individual pull requests a few at a time, oldest first.
+ *
+ * The composer and the panel's list poll one read per linked PR, and each read
+ * asks the host's git provider. Unqueued, a session that links dozens of PRs
+ * keeps enough requests open to use up the browser's concurrent requests to
+ * the server, so sends and streams in every session wait behind them. Queued,
+ * those statuses fill in gradually.
+ *
+ * A prioritized PR, the one open in a details view, goes first and may use one
+ * more slot, so it doesn't wait behind background reads. That slot is shared:
+ * a read the user has moved away from keeps it until it settles, so moving
+ * between PRs faster than they load can't add more requests.
+ */
+class PullRequestReadQueue {
+  private running = 0;
+  private readonly waiting: QueuedPullRequestRead[] = [];
+  private readonly prioritized = new Map<string, number>();
+
+  async run<T>(key: string, signal: AbortSignal, read: () => Promise<T>): Promise<T> {
+    signal.throwIfAborted();
+    const release = await this.waitForTurn(key, signal);
+    try {
+      // Closing a session frees its running reads' slots before it cancels the waiting ones,
+      // so a read can be handed a slot just as it's cancelled; it must not start then.
+      signal.throwIfAborted();
+      return await read();
+    } finally {
+      release();
+    }
+  }
+
+  /** Reads `key` ahead of the queue until the returned function is called. */
+  prioritize(key: string): () => void {
+    this.prioritized.set(key, (this.prioritized.get(key) ?? 0) + 1);
+    this.drain();
+    return () => {
+      const remaining = (this.prioritized.get(key) ?? 1) - 1;
+      if (remaining > 0) this.prioritized.set(key, remaining);
+      else this.prioritized.delete(key);
+    };
+  }
+
+  /** Resolves, once `key` may start, with a function that frees its slot. */
+  private waitForTurn(key: string, signal: AbortSignal): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      const entry: QueuedPullRequestRead = {
+        key,
+        start: () => {
+          signal.removeEventListener("abort", abandon);
+          this.running += 1;
+          let holding = true;
+          const release = () => {
+            if (!holding) return;
+            holding = false;
+            signal.removeEventListener("abort", release);
+            this.running -= 1;
+            this.drain();
+          };
+          // A read that outlives its cancelled query must not keep its slot.
+          signal.addEventListener("abort", release, { once: true });
+          resolve(release);
+        },
+      };
+      // A cancelled query, such as one whose session closed, gives up its place.
+      const abandon = () => {
+        this.waiting.splice(this.waiting.indexOf(entry), 1);
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", abandon, { once: true });
+      this.waiting.push(entry);
+      this.drain();
+    });
+  }
+
+  private drain() {
+    for (;;) {
+      const viewed = this.waiting.findIndex((entry) => this.prioritized.has(entry.key));
+      if (viewed >= 0 && this.running < PULL_REQUEST_READ_CONCURRENCY + 1) {
+        this.waiting.splice(viewed, 1)[0]!.start();
+      } else if (this.waiting.length > 0 && this.running < PULL_REQUEST_READ_CONCURRENCY) {
+        this.waiting.shift()!.start();
+      } else {
+        return;
+      }
+    }
+  }
+}
+
+const pullRequestReads = new PullRequestReadQueue();
+
+function pullRequestReadKey(conversationId: string, prUrl: string): string {
+  return JSON.stringify([conversationId, prUrl]);
+}
+
+/**
+ * Reads `prUrl` ahead of the session's other PRs while the caller shows it, so the
+ * request the user opened never waits behind background status reads.
+ */
+export function usePullRequestReadPriority(
+  rawConversationId: string | undefined,
+  prUrl: string | undefined,
+): void {
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  useEffect(() => {
+    if (!conversationId || !prUrl) return undefined;
+    return pullRequestReads.prioritize(pullRequestReadKey(conversationId, prUrl));
+  }, [conversationId, prUrl]);
+}
+
 function pullRequestInfoQueryOptions(
   { conversationId, enabled, retry }: ReturnType<typeof usePullRequestQueryContext>,
   options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
+  const prUrl = options?.prUrl;
   return queryOptions({
-    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
-    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
+    queryKey: pullRequestInfoQueryKey(conversationId, prUrl),
+    queryFn: ({ client, queryKey, signal }) => {
+      const query = client.getQueryCache().find<PullRequestInfo>({ queryKey, exact: true });
+      const allowCached = pollAcceptsCachedAnswer(query);
+      return prUrl
+        ? pullRequestReads.run(pullRequestReadKey(conversationId!, prUrl), signal, () =>
+            fetchPullRequestInfo(conversationId!, prUrl, signal, allowCached),
+          )
+        : fetchPullRequestInfo(conversationId!, undefined, undefined, allowCached);
+    },
     enabled,
     retry,
     retryDelay: runnerOfflineRetryDelay,
@@ -562,6 +773,38 @@ export function usePullRequestInfo(
   return useQuery(pullRequestInfoQueryOptions(context, options));
 }
 
+/**
+ * Reads the shared GitHub-info entry without refetching on mount or focus. An empty
+ * entry still loads, with the context's retries; a failed one waits for another
+ * reader such as {@link usePullRequestInfo} or an invalidation.
+ */
+export function usePullRequestInfoSnapshot(rawConversationId: string | undefined) {
+  const context = usePullRequestQueryContext(rawConversationId);
+  return useQuery({
+    ...pullRequestInfoQueryOptions(context),
+    refetchOnMount: false,
+    // Otherwise every newly mounted reader refetches a failed query.
+    retryOnMount: false,
+    refetchOnWindowFocus: false,
+  });
+}
+
+/**
+ * Read a session's PR info again from GitHub, as the panel's Refresh does. The
+ * queries are invalidated first, so none of these reads takes the runner's previous answer.
+ */
+export function useRefreshPullRequestInfo(rawConversationId: string | undefined) {
+  const queryClient = useQueryClient();
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  return useCallback(
+    () =>
+      conversationId
+        ? queryClient.invalidateQueries({ queryKey: pullRequestInfoQueryKey(conversationId) })
+        : Promise.resolve(),
+    [queryClient, conversationId],
+  );
+}
+
 /** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
 export function usePullRequestInfos(rawConversationId: string | undefined, prUrls: string[]) {
   const context = usePullRequestQueryContext(rawConversationId);
@@ -600,28 +843,69 @@ async function postPullRequestPreference(
 
 /**
  * Save the account / base-repo selection through the runner or host fallback,
- * update the info cache, and invalidate the selected PR's files and diff.
+ * update the info cache, and invalidate the selected PR's files, diff, and
+ * merge options (which name the account's last-used method).
  */
 export function useSetPullRequestPreference(conversationId: string | undefined) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (body: PullRequestPreferenceInput) =>
       postPullRequestPreference(conversationId!, body),
-    onSuccess: (info) => {
-      queryClient.setQueryData(["github-info", conversationId], info);
+    onSuccess: (info, body) => {
+      // A `pr_url` reply describes that PR, so it belongs in that PR's query.
+      queryClient.setQueryData(
+        ["github-info", conversationId, ...(body.pr_url ? [body.pr_url] : [])],
+        info,
+      );
+    },
+    // The host may have saved the account before the reply failed, so the cached
+    // one is no longer known to be right; nothing shows it until the refetch does.
+    onError: (_error, body) => {
+      if (body.account === undefined) return;
+      queryClient.setQueriesData<PullRequestInfo>(
+        { queryKey: ["github-info", conversationId] },
+        (info) =>
+          info && (!body.pr_url || info.selected_pr_url === body.pr_url)
+            ? withoutSelectedAccount(info)
+            : info,
+      );
+    },
+    // The host may save the choice and still fail the reply, so refetch either way.
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });
+      queryClient.invalidateQueries({ queryKey: ["github-merge-options", conversationId] });
     },
   });
+}
+
+function withoutSelectedAccount(info: PullRequestInfo): PullRequestInfo {
+  return {
+    ...info,
+    ...(info.selected_account !== undefined ? { selected_account: null } : {}),
+    ...(info.auth ? { auth: { ...info.auth, selected_account: null } } : {}),
+  };
+}
+
+/** `pr_url` plus the `base:head` revision the diff and file list are pinned to. */
+function pinnedPrQuery(prUrl?: string, revision?: string): string {
+  const query = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
+  const [baseSha, headSha] = revision?.split(":") ?? [];
+  if (prUrl && baseSha && headSha) {
+    query.set("base_sha", baseSha);
+    query.set("head_sha", headSha);
+  }
+  return query.size ? `?${query}` : "";
 }
 
 async function fetchPullRequestChangedFiles(
   conversationId: string,
   prUrl?: string,
+  revision?: string,
 ): Promise<PullRequestChangedFilesResult> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${prQuery(prUrl)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${pinnedPrQuery(prUrl, revision)}`,
   );
   if (res.status === 404) return { available: false, data: [] };
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
@@ -647,7 +931,7 @@ export function usePullRequestChangedFiles(
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
     queryKey: ["github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
-    queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl),
+    queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl, revision),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
     enabled: !!conversationId && hasPr && serveable !== false,
@@ -700,25 +984,28 @@ export interface PullRequestDiffResponse {
   message?: string;
 }
 
-async function fetchPullRequestDiff(
+/** GET one patch resource of the session's GitHub panel: the whole PR, or one commit. */
+async function fetchPullRequestPatch(
   conversationId: string,
-  prUrl?: string,
-  revision?: string,
+  resource: "diff" | "commit-diff" | "compare-diff",
+  query: string,
 ): Promise<PullRequestDiffResponse> {
-  const query = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
-  const [baseSha, headSha] = revision?.split(":") ?? [];
-  if (prUrl && baseSha && headSha) {
-    query.set("base_sha", baseSha);
-    query.set("head_sha", headSha);
-  }
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${query.size ? `?${query}` : ""}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}${query}`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
   return (await res.json()) as PullRequestDiffResponse;
+}
+
+async function fetchPullRequestDiff(
+  conversationId: string,
+  prUrl?: string,
+  revision?: string,
+): Promise<PullRequestDiffResponse> {
+  return fetchPullRequestPatch(conversationId, "diff", pinnedPrQuery(prUrl, revision));
 }
 
 /**
@@ -742,6 +1029,174 @@ export function usePullRequestDiff(
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+/** One commit of the pull request, as the Commits view lists it. */
+export interface PullRequestCommit {
+  object: "session.github.commit";
+  sha: string;
+  /** The first line of the commit message. */
+  title: string;
+  author: string | null;
+  /** The git author date, ISO 8601. */
+  date: string | null;
+  /** Other pull requests whose head is this commit, such as a stacked PR's parent. */
+  head_of?: { number: number; url: string | null; state: string | null }[];
+}
+
+/** The most commits the server lists for one pull request (GitHub's own limit). */
+export const PULL_REQUEST_COMMITS_LIMIT = 250;
+
+/**
+ * The server or runner predates the commit routes. A 404 is the only answer they give to a commit
+ * read; every other failure is a 400, 502 or 503 and keeps its own error.
+ */
+export class PullRequestCommitsUnsupportedError extends Error {
+  constructor() {
+    super(
+      "This Omnigent server doesn't support pull request commits. Update it to browse commits.",
+    );
+  }
+}
+
+// PRs whose server lacks the commit routes, kept for the page's life so the switch stays hidden.
+const commitsUnsupportedPrs = new Set<string>();
+const commitsUnsupportedListeners = new Set<() => void>();
+
+function commitsKey(conversationId: string, prUrl: string | undefined): string {
+  return JSON.stringify([conversationId, prUrl ?? ""]);
+}
+
+/** Classifies a failed commit read: a 404 marks the PR unsupported, and any other error passes through. */
+function commitReadError(error: unknown, conversationId: string, prUrl: string): unknown {
+  if (!(error instanceof PullRequestApiError) || error.status !== 404) return error;
+  commitsUnsupportedPrs.add(commitsKey(conversationId, prUrl));
+  for (const listener of commitsUnsupportedListeners) listener();
+  return new PullRequestCommitsUnsupportedError();
+}
+
+/** Whether this PR's server lacks the commit routes, so its Commits view is unavailable. */
+export function usePullRequestCommitsUnsupported(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+): boolean {
+  return useSyncExternalStore(
+    (listener) => {
+      commitsUnsupportedListeners.add(listener);
+      return () => {
+        commitsUnsupportedListeners.delete(listener);
+      };
+    },
+    () => commitsUnsupportedPrs.has(commitsKey(conversationId ?? "", prUrl)),
+  );
+}
+
+export interface PullRequestCommitsResult {
+  object: "list";
+  /** Oldest first; at most {@link PULL_REQUEST_COMMITS_LIMIT}, with `has_more` when the PR has more. */
+  data: PullRequestCommit[];
+  has_more: boolean;
+}
+
+async function fetchPullRequestCommits(
+  conversationId: string,
+  prUrl: string,
+  headSha: string,
+): Promise<PullRequestCommitsResult> {
+  const query = new URLSearchParams({ pr_url: prUrl, head_sha: headSha });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/commits?${query}`,
+  );
+  if (res.status === 503 && (await isRunnerUnavailable503(res))) {
+    throw new RunnerOfflineError();
+  }
+  if (!res.ok) throw commitReadError(await errorFromResponse(res), conversationId, prUrl);
+  return (await res.json()) as PullRequestCommitsResult;
+}
+
+/**
+ * The PR's commit list, pinned to the head the Changes list shows. Enabled only
+ * once that head is known, so the list and the file list describe one revision.
+ */
+export function usePullRequestCommits(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+  headSha: string | null,
+  enabled: boolean,
+) {
+  const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return useQuery({
+    queryKey: ["github-pr-commits", conversationId, prUrl, headSha],
+    queryFn: () => fetchPullRequestCommits(conversationId!, prUrl!, headSha!),
+    enabled: enabled && !!conversationId && !!prUrl && !!headSha && serveable !== false,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    staleTime: 30_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+async function fetchPullRequestCommitDiff(
+  conversationId: string,
+  prUrl: string,
+  commitSha: string,
+): Promise<PullRequestDiffResponse> {
+  const query = new URLSearchParams({ pr_url: prUrl, commit_sha: commitSha });
+  return fetchPullRequestPatch(conversationId, "commit-diff", `?${query}`).catch(
+    (error: unknown) => {
+      throw commitReadError(error, conversationId, prUrl);
+    },
+  );
+}
+
+async function fetchPullRequestChangesSince(
+  conversationId: string,
+  prUrl: string,
+  commitSha: string,
+  headSha: string,
+): Promise<PullRequestDiffResponse> {
+  const query = new URLSearchParams({ pr_url: prUrl, head_sha: headSha, from_sha: commitSha });
+  return fetchPullRequestPatch(conversationId, "compare-diff", `?${query}`).catch(
+    (error: unknown) => {
+      // A peer without the route still serves single commits, so only this view is unavailable.
+      if (error instanceof PullRequestApiError && error.status === 404) {
+        throw new Error(
+          "Showing changes since a commit needs an updated Omnigent server and host.",
+        );
+      }
+      throw error;
+    },
+  );
+}
+
+/**
+ * One commit's patch, read by its full id, or with `untilHeadSha` the PR's changes after
+ * that commit up to that head. Enabled only while a commit is picked. Both ends are fixed
+ * commits, so the patch never changes and stays fresh for the whole cache lifetime.
+ */
+export function usePullRequestCommitDiff(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+  commitSha: string | null,
+  untilHeadSha: string | null = null,
+) {
+  const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return useQuery({
+    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha, untilHeadSha],
+    queryFn: () =>
+      untilHeadSha
+        ? fetchPullRequestChangesSince(conversationId!, prUrl!, commitSha!, untilHeadSha)
+        : fetchPullRequestCommitDiff(conversationId!, prUrl!, commitSha!),
+    enabled: !!conversationId && !!prUrl && !!commitSha && serveable !== false,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    // Only a response that carries the patch is final; an unavailable one is retried like any other.
+    staleTime: (query) =>
+      query.state.data && !query.state.data.unavailable_reason ? Infinity : 30_000,
     gcTime: 30 * 60_000,
   });
 }
@@ -772,7 +1227,15 @@ export function useUpdateSessionPr(conversationId: string) {
       updateSessionPr(conversationId, body),
     onSuccess: async (info, body) => {
       await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
-      queryClient.setQueryData(["github-info", conversationId], info);
+      // An attach reply reads only that PR; attaching doesn't change the workspace's repo.
+      const workspaceRepo = queryClient.getQueryData<PullRequestInfo>([
+        "github-info",
+        conversationId,
+      ])?.workspace_repo;
+      queryClient.setQueryData(
+        ["github-info", conversationId],
+        info.workspace_repo || !workspaceRepo ? info : { ...info, workspace_repo: workspaceRepo },
+      );
       if (info.selected_pr_url) {
         queryClient.setQueryData(["github-info", conversationId, info.selected_pr_url], info);
       }
@@ -809,6 +1272,7 @@ async function fetchPullRequestEditResource<T>(
     | "attachments"
     | "merge-options"
     | "merge"
+    | "merge-as"
     | "disable-auto-merge",
   request: { prUrl: string } | { body: unknown } | { form: FormData },
 ): Promise<T> {
@@ -939,6 +1403,21 @@ export interface PullRequestMergeRequest {
   mergeMethod: PullRequestMergeMethod;
   /** The head commit the panel showed; GitHub refuses the merge if the branch moved. */
   expectedHead: string;
+  /** The account the dialog showed. The merge runs as it, through a route that a
+   *  server or host unable to bind it refuses, and it becomes the PR's account. */
+  account?: string;
+}
+
+const MERGE_AS_UNSUPPORTED =
+  "This Omnigent server or host can’t merge as a chosen account. Update them, or merge on GitHub.";
+
+/** An older server or runner has no merge-as route; an older host has no such op. */
+function mergeAsUnsupported(error: unknown): boolean {
+  if (!(error instanceof PullRequestApiError)) return false;
+  return (
+    (error.status === 404 && error.message === "Not Found") ||
+    error.message.startsWith("unknown fs write op")
+  );
 }
 
 /**
@@ -950,14 +1429,24 @@ export function useMergePullRequest(conversationId: string) {
   return useMutation({
     mutationKey: ["github-merge", conversationId],
     scope: { id: `github-merge-${conversationId}` },
-    mutationFn: (request: PullRequestMergeRequest) =>
-      fetchPullRequestEditResource<PullRequestMergeResult>(conversationId, "merge", {
-        body: {
-          pr_url: request.prUrl,
-          merge_method: request.mergeMethod,
-          expected_head: request.expectedHead,
-        },
-      }),
+    mutationFn: async (request: PullRequestMergeRequest) => {
+      const body = {
+        pr_url: request.prUrl,
+        merge_method: request.mergeMethod,
+        expected_head: request.expectedHead,
+      };
+      if (request.account === undefined) {
+        return fetchPullRequestEditResource<PullRequestMergeResult>(conversationId, "merge", {
+          body,
+        });
+      }
+      // Never retried as a plain merge: that would run as whichever account is saved.
+      return fetchPullRequestEditResource<PullRequestMergeResult>(conversationId, "merge-as", {
+        body: { ...body, account: request.account },
+      }).catch((error: unknown) => {
+        throw mergeAsUnsupported(error) ? new Error(MERGE_AS_UNSUPPORTED) : error;
+      });
+    },
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] }),
   });
 }
@@ -1173,7 +1662,14 @@ export interface PullRequestCommentDraft {
   pending: boolean;
   error: string | null;
   anchor?: ReviewThreadAnchor;
+  destination?: "github" | "local";
 }
+
+const reviewCommentDestination = createStoredChoicePreference(
+  "omnigent:pr-comment-destination",
+  ["github", "local"],
+  "github",
+);
 
 function usePullRequestCommentDraft(key: readonly string[]) {
   const queryClient = useQueryClient();
@@ -1303,6 +1799,8 @@ export function usePullRequestReviewThreadComposer(
   headSha: string,
   baseSha: string,
 ) {
+  const serverInfo = useServerInfo();
+  const localSupported = serverInfo !== "loading" && serverInfo.comment_anchor_metadata === true;
   const queryClient = useQueryClient();
   const key = ["github-new-review-thread", conversationId, prUrl, path];
   const { draft, updateDraft } = usePullRequestCommentDraft(key);
@@ -1316,15 +1814,45 @@ export function usePullRequestReviewThreadComposer(
       body: string;
       anchor: ReviewThreadAnchor;
       key: string[];
-    }) =>
-      fetchPullRequestEditResource<{ thread: ReviewThread }>(
-        target.conversationId,
-        "review-threads",
-        {
-          body: { pr_url: target.prUrl, body: target.body, anchor: target.anchor },
-        },
-      ),
-    onSuccess: async ({ thread }, target) => {
+      local: boolean;
+    }): Promise<{
+      thread: ReviewThread | null;
+      comment?: Comment;
+    }> =>
+      target.local
+        ? createComment(target.conversationId, {
+            path: target.anchor.path,
+            body: target.body,
+            start_index: 0,
+            end_index: 0,
+            anchor_metadata: {
+              pr_url: target.prUrl,
+              side: target.anchor.side,
+              line: target.anchor.line,
+              start_line: target.anchor.start_line,
+              head_sha: target.anchor.head_sha,
+              base_sha: target.anchor.base_sha,
+            },
+          }).then((comment) => ({ thread: null, comment }))
+        : fetchPullRequestEditResource<{ thread: ReviewThread }>(
+            target.conversationId,
+            "review-threads",
+            {
+              body: { pr_url: target.prUrl, body: target.body, anchor: target.anchor },
+            },
+          ),
+    onSuccess: async ({ thread, comment }, target) => {
+      if (target.local) {
+        queryClient.setQueryData(target.key, {
+          body: "",
+          pending: false,
+          error: null,
+        });
+        void queryClient.invalidateQueries({ queryKey: ["comments", target.conversationId] });
+        if (comment) requestLocalReviewContext(comment);
+        return;
+      }
+      if (!thread) return;
       await queryClient.cancelQueries({
         queryKey: ["github-review-threads", target.conversationId, target.prUrl],
       });
@@ -1345,25 +1873,48 @@ export function usePullRequestReviewThreadComposer(
         queryKey: ["github-review-threads", target.conversationId, target.prUrl],
       });
     },
-    onError: (error: Error, target) =>
+    onError: (error: Error, target) => {
+      if (target.local)
+        void queryClient.invalidateQueries({ queryKey: ["comments", target.conversationId] });
       queryClient.setQueryData<PullRequestCommentDraft>(
         target.key,
-        (current) => current && { ...current, pending: false, error: commentPostingError(error) },
-      ),
+        (current) =>
+          current && {
+            ...current,
+            pending: false,
+            error: target.local ? error.message : commentPostingError(error),
+          },
+      );
+    },
   });
   return {
     draft,
     stale,
     setBody: (body: string) => updateDraft({ body, error: null }),
-    selectLines: (lines: Pick<ReviewThreadAnchor, "side" | "line" | "start_line">) => {
-      if (!draft.pending)
+    setDestination: (destination: "github" | "local") => {
+      if (!draft.pending) {
+        updateDraft({ destination, error: null });
+        reviewCommentDestination.write(destination);
+      }
+    },
+    selectLines: (
+      lines: Pick<ReviewThreadAnchor, "side" | "line" | "start_line">,
+      destinationOverride?: PullRequestCommentDraft["destination"],
+    ) => {
+      const current = queryClient.getQueryData<PullRequestCommentDraft>(key);
+      if (current && !current.pending)
         updateDraft({
           anchor: { ...lines, path, head_sha: headSha, base_sha: baseSha },
+          destination:
+            destinationOverride ??
+            current.destination ??
+            (current.anchor || !localSupported ? "github" : reviewCommentDestination.read()),
           error: null,
         });
     },
     cancel: () => {
-      if (!draft.pending) updateDraft({ anchor: undefined, body: "", error: null });
+      if (!draft.pending)
+        updateDraft({ anchor: undefined, body: "", error: null, destination: undefined });
     },
     post: () => {
       const current = queryClient.getQueryData<PullRequestCommentDraft>(key);
@@ -1378,8 +1929,19 @@ export function usePullRequestReviewThreadComposer(
         updateDraft({ error: "The pull request changed. Reselect the lines before posting." });
         return;
       }
+      if (current.destination === "local" && !localSupported) {
+        updateDraft({ error: "Agent comments require a newer server. Your draft is saved." });
+        return;
+      }
       updateDraft({ pending: true, error: null });
-      mutation.mutate({ conversationId, prUrl, body: current.body, anchor: current.anchor, key });
+      mutation.mutate({
+        conversationId,
+        prUrl,
+        body: current.body,
+        anchor: current.anchor,
+        key,
+        local: current.destination === "local",
+      });
     },
   };
 }

@@ -271,6 +271,7 @@ from omnigent.server.routes._sessions.common import (
     _LAST_TASK_ERROR_CODE_LABEL_KEY as _LAST_TASK_ERROR_CODE_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY as _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _MANAGED_RESUMABLE_TUNNEL_STALE_S as _MANAGED_RESUMABLE_TUNNEL_STALE_S,
+    _MANAGED_RUNNER_REPLACEMENT_WAIT_S as _MANAGED_RUNNER_REPLACEMENT_WAIT_S,
     _MAX_TERMINAL_LAUNCH_ARGS as _MAX_TERMINAL_LAUNCH_ARGS,
     _MAX_TERMINAL_LAUNCH_ARG_LEN as _MAX_TERMINAL_LAUNCH_ARG_LEN,
     _MCP_ELICITATION_TYPE as _MCP_ELICITATION_TYPE,
@@ -336,8 +337,10 @@ from omnigent.server.routes._sessions.common import (
     _server_host_registry as _server_host_registry,
     _server_runner_router as _server_runner_router,
     _session_active_response_cache as _session_active_response_cache,
+    _session_background_agents_cache as _session_background_agents_cache,
     _session_background_task_count_cache as _session_background_task_count_cache,
     _session_background_tasks_cache as _session_background_tasks_cache,
+    _session_blocked_on_cache as _session_blocked_on_cache,
     _session_mcp_startup_cache as _session_mcp_startup_cache,
     _session_sandbox_status_cache as _session_sandbox_status_cache,
     _session_status_cache as _session_status_cache,
@@ -373,6 +376,7 @@ from omnigent.server.routes._sessions.helpers import (
     _authorize_bundled_parent_and_inherit_runner as _authorize_bundled_parent_and_inherit_runner,
     _await_settled_managed_launch as _await_settled_managed_launch,
     _background_task_delivery_status as _background_task_delivery_status,
+    _blocked_on_for as _blocked_on_for,
     _build_actor as _build_actor,
     _build_evaluation_context as _build_evaluation_context,
     _build_new_item as _build_new_item,
@@ -393,7 +397,6 @@ from omnigent.server.routes._sessions.helpers import (
     _create_session_worktree as _create_session_worktree,
     _delete_stored_session_bundle_after_failure as _delete_stored_session_bundle_after_failure,
     _derive_terminal_launch_args_from_spec as _derive_terminal_launch_args_from_spec,
-    _descendant_sessions as _descendant_sessions,
     _discovery_key as _discovery_key,
     _dispatch_skill_slash_command_to_runner as _dispatch_skill_slash_command_to_runner,
     _emit_server_routing_decision as _emit_server_routing_decision,
@@ -524,6 +527,9 @@ from omnigent.server.routes._sessions.helpers import (
     _seed_missing_title_from_user_message as _seed_missing_title_from_user_message,
     _session_status_from_cache as _session_status_from_cache,
     _session_status_with_child_rollup as _session_status_with_child_rollup,
+    _set_background_tasks as _set_background_tasks,
+    _set_background_work_running as _set_background_work_running,
+    _set_blocked_on as _set_blocked_on,
     _set_read_state as _set_read_state,
     _signal_harness_elicitation_resolved_by_id as _signal_harness_elicitation_resolved_by_id,
     _spec_config_flag_explicitly_disabled as _spec_config_flag_explicitly_disabled,
@@ -911,7 +917,7 @@ def create_sessions_router(
 
     if pull_request_refresher is None:
         pull_request_refresher = PullRequestRefresher()
-    register_core_routes(
+    clear_session_into_fresh_session = register_core_routes(
         router,
         conversation_store=conversation_store,
         agent_store=agent_store,
@@ -947,6 +953,7 @@ def create_sessions_router(
         agent_store=agent_store,
         auth_provider=auth_provider,
         permission_store=permission_store,
+        liveness_lookup=liveness_lookup,
     )
 
     register_resources_routes(
@@ -1003,6 +1010,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
         register_startup_dispatch=register_startup_dispatch,
+        clear_session_into_fresh_session=clear_session_into_fresh_session,
     )
 
     register_permissions_routes(

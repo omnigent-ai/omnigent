@@ -1,18 +1,17 @@
 "use strict";
 
 /**
- * The Arca connect console — a SHELL-OWNED modal window that replaces the
- * bare native consent dialog. It shows the exact `arca ssh` command that will
- * run and, after the user confirms, streams the command's live stdout/stderr
- * into an embedded terminal pane, so enrollment is fully transparent.
+ * The Arca connect console: a modal window owned by the shell, used in place of
+ * a native consent dialog. It shows the exact `arca ssh` command that will run
+ * and, after the user confirms, streams its live stdout/stderr into an embedded
+ * terminal pane.
  *
  * Trust model: this window is created by the main process and loads a bundled
- * file:// page with its own narrow preload. The server-served SPA can neither
- * draw over it, forge a click in it, nor reach its IPC channels — so a
- * Confirm click here carries the same authority as the old native dialog
- * (see confirmHostEnrollment for why consent must live outside the server's
- * page). Confirm/cancel messages are accepted only from this window's own
- * webContents.
+ * file:// page with its own narrow preload. The server-served page can neither
+ * draw over it, forge a click in it, nor reach its IPC channels, so a Confirm
+ * click here carries the same authority the native dialog had (see
+ * confirmHostEnrollment for why consent must live outside the server's page).
+ * Confirm/cancel messages are accepted only from this window's own webContents.
  *
  * All Electron surfaces are injected so the flow is unit-testable.
  */

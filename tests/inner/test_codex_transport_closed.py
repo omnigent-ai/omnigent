@@ -19,7 +19,6 @@ from omnigent.inner.codex_executor import (
     _tool_signature,
 )
 from omnigent.inner.executor import TurnComplete
-from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.runtime.harnesses import _executor_adapter
 from tests.inner.test_codex_executor import _FakeAppSession, _FakeProcess
 
@@ -504,7 +503,7 @@ async def test_same_session_turn_waits_for_inflight_native_close(waiters: int) -
     executor = CodexExecutor(codex_path="/bin/echo", cwd="/tmp", app_session_factory=factory)
     executor._session_states["session-1"] = _CodexSessionState(
         app_session=old_session,
-        signature=(CODEX_DEFAULT_MODEL, "", "/tmp", _tool_signature([])),
+        signature=(None, "", "/tmp", _tool_signature([])),
     )
 
     close_task = asyncio.create_task(executor.close_session("session-1"))

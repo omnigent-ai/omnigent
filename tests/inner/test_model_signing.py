@@ -63,6 +63,64 @@ def test_reconstructs_authority_and_bearer_from_frozen_inputs() -> None:
 
 
 @pytest.mark.parametrize(
+    ("binding_id", "host", "path", "surfaces"),
+    [
+        (
+            "databricks-ucode-v1",
+            "workspace.cloud.databricks.com",
+            "/ai-gateway/codex/v1/responses",
+            "omnigent-desktop, ug",
+        ),
+        (
+            "databricks-ucode-v1",
+            "workspace.ai-gateway.cloud.databricks.com",
+            "/v1/responses",
+            "omnigent-desktop, ug",
+        ),
+        ("databricks-ucode-v1", _HOST, _PATH, None),
+        (
+            "test-fake-provider-v1",
+            "workspace.cloud.databricks.com",
+            "/ai-gateway/codex/v1/responses",
+            None,
+        ),
+    ],
+    ids=["workspace", "dedicated", "serving-endpoint", "test-binding"],
+)
+def test_signer_synthesizes_gateway_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_id: str,
+    host: str,
+    path: str,
+    surfaces: str | None,
+) -> None:
+    from omnigent.inner.model_signer_service import _gateway_attribution
+
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "desktop")
+    route = FrozenModelRoute(method="POST", host=host, path=path)
+    request = reconstruct_signed_request(
+        route=route,
+        placeholder=_PLACEHOLDER,
+        bearer_token=_TOKEN,
+        method="POST",
+        connect_host=host,
+        sni_host=host,
+        request_host=host,
+        target=path,
+        headers=[
+            ("Authorization", f"Bearer {_PLACEHOLDER}"),
+            ("Content-Type", "application/json"),
+            ("databricks-custom-coding-agent", "other-agent"),
+            ("Databricks-Custom-Client-Surfaces", "other-app"),
+        ],
+        body=b'{"model":"test"}',
+        trusted_headers=_gateway_attribution(binding_id, route),
+    )
+    assert request.header("Databricks-Custom-Coding-Agent") == ("codex" if surfaces else None)
+    assert request.header("Databricks-Custom-Client-Surfaces") == surfaces
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("connect_host", "attacker.example"),
@@ -136,14 +194,15 @@ def test_ambiguous_routing_and_framing_headers_are_rejected(
 
 
 def test_placeholder_literal_in_other_header_or_target_is_rejected() -> None:
-    with pytest.raises(SigningRejected):
-        _reconstruct(
-            headers=[
-                ("Authorization", f"Bearer {_PLACEHOLDER}"),
-                ("Content-Type", "application/json"),
-                ("User-Agent", _PLACEHOLDER),
-            ]
-        )
+    for header_name in ("User-Agent", "x-api-key"):
+        with pytest.raises(SigningRejected, match="placeholder"):
+            _reconstruct(
+                headers=[
+                    ("Authorization", f"Bearer {_PLACEHOLDER}"),
+                    ("Content-Type", "application/json"),
+                    (header_name, _PLACEHOLDER),
+                ]
+            )
     with pytest.raises(SigningRejected):
         _reconstruct(target=f"{_PATH}/{_PLACEHOLDER}")
 

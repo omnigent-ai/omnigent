@@ -2,6 +2,7 @@ import { useRef, type ReactNode } from "react";
 import { CheckIcon } from "lucide-react";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
+import { useSettingsOwnership } from "@/pages/settings/search/settingsOwnership";
 
 export interface CardRadioOption<T extends string> {
   value: T;
@@ -18,6 +19,7 @@ export function CardRadioGroup<T extends string>({
   items,
   className,
   cardClassName,
+  compact = false,
 }: {
   labelledBy: string;
   value: T;
@@ -26,6 +28,7 @@ export function CardRadioGroup<T extends string>({
   items: readonly CardRadioOption<T>[];
   className?: string;
   cardClassName?: string;
+  compact?: boolean;
 }) {
   const { trackValueChange } = useOmnigentAnalytics();
   const select = componentId
@@ -35,9 +38,15 @@ export function CardRadioGroup<T extends string>({
       }
     : onSelect;
   const refs = useRef(new Map<T, HTMLButtonElement | null>());
+  // Under a Settings owner the group is that row's control, and each card one of its choices.
+  const owned = useSettingsOwnership();
 
   return (
-    <div role="radiogroup" aria-labelledby={labelledBy} className={className}>
+    <div
+      role="radiogroup"
+      {...owned.control({ outside: { "aria-labelledby": labelledBy } })}
+      className={className}
+    >
       {items.map((item, index) => {
         const selected = item.value === value;
         return (
@@ -63,9 +72,9 @@ export function CardRadioGroup<T extends string>({
               select(next);
               refs.current.get(next)?.focus();
             }}
-            className={themeCardClass(selected, cardClassName)}
+            className={themeCardClass(selected, compact, cardClassName)}
           >
-            {selected && <SelectedBadge />}
+            {selected && !compact && <SelectedBadge />}
             {item.body}
           </button>
         );
@@ -85,9 +94,12 @@ function SelectedBadge() {
   );
 }
 
-function themeCardClass(selected: boolean, layout?: string) {
+function themeCardClass(selected: boolean, compact: boolean, layout?: string) {
   return cn(
-    "relative flex flex-col rounded-lg border transition-[color,background-color,border-color,box-shadow]",
+    "relative flex rounded-lg border transition-[color,background-color,border-color,box-shadow]",
+    compact
+      ? "h-9 flex-1 flex-row items-center justify-center gap-2 px-3 whitespace-nowrap outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+      : "flex-col",
     selected
       ? "border-primary bg-primary/5"
       : "border-border hover:border-border-strong hover:bg-muted hover:shadow-sm",

@@ -97,8 +97,8 @@ export function TerminalSplitControls({
 
   const splitWith = (shell: string, axis: TerminalSplitAxis) => {
     writePreferredShell(shell);
-    create.mutate(shell, {
-      onSuccess: (info) => {
+    create.launch(shell, {
+      onOpen: (info) => {
         const newKey = terminalTabKey(info);
         updateTerminalSplit(conversationId, (current) => {
           const layout = current?.layout ?? agentKey;
@@ -107,7 +107,19 @@ export function TerminalSplitControls({
           return { layout: splitTerminalLayout(layout, target, newKey, axis), focusedKey: newKey };
         });
       },
-      onError: (error) => showToast(`Couldn't open a shell: ${error.message}`),
+      onError: (error, opened) => {
+        if (opened) {
+          const openedKey = terminalTabKey(opened);
+          updateTerminalSplit(conversationId, (current) => {
+            const layout = current && removeTerminalLayoutKey(current.layout, openedKey);
+            if (!layout || typeof layout === "string") return undefined;
+            const keys = terminalLayoutKeys(layout);
+            const focusedKey = keys.includes(current.focusedKey) ? current.focusedKey : keys[0];
+            return { layout, focusedKey };
+          });
+        }
+        showToast(`Couldn't open a shell: ${error.message}`);
+      },
     });
   };
 

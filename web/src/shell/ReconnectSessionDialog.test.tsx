@@ -353,6 +353,20 @@ describe("<ReconnectSessionDialog />", () => {
     expect(screen.queryByText(/Clone the session to continue/)).not.toBeInTheDocument();
   });
 
+  it("offers Clone for a sandbox session while keeping Switch host disabled", () => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: undefined,
+      switchHostDisabledReason: "Switching hosts is not supported for this sandbox session yet.",
+    });
+    renderDialog({ state: "host_offline", isOwner: true });
+
+    expect(screen.getByTestId("reconnect-session-switch-host")).toBeDisabled();
+    expect(screen.getByTestId("reconnect-session-tab-clone")).not.toBeDisabled();
+    switchToTab("reconnect-session-tab-clone");
+    expect(clonePanelState()).toBe("active");
+    expect(screen.queryByTestId("switch-host-dialog-stub")).not.toBeInTheDocument();
+  });
+
   it("keeps a non-owner on Clone while loading, then selects Reconnect when unsupported", () => {
     vi.mocked(useSessionActionRestrictions).mockReturnValue({
       forkDisabledReason: SESSION_ACTIONS_LOADING,

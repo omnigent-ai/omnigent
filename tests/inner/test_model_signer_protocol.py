@@ -431,6 +431,7 @@ async def test_missing_or_mismatched_sni_is_rejected(sni: str | None) -> None:
     relay = object.__new__(_SignerRelay)
     relay._route = _ROUTE
     relay._placeholder = "oa_cred_test"
+    relay._trusted_headers = ()
     relay._provider_port = 443
     relay._credential_source = Mock(token_for_request=AsyncMock(return_value="real-token"))
     relay._tls_sni_by_task = {}

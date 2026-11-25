@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { captureTranscriptViewSnapshot, resolveTranscriptViewOffset } from "./Transcript";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
+import {
+  captureTranscriptViewSnapshot,
+  pinUntilSettled,
+  resolveTranscriptViewOffset,
+} from "./Transcript";
 
 describe("transcript semantic scroll snapshots", () => {
   it("stores bottom as a mode instead of a pixel offset", () => {
@@ -49,5 +54,61 @@ describe("transcript semantic scroll snapshots", () => {
     if (snapshot.atBottom) throw new Error("expected an anchor snapshot");
 
     expect(resolveTranscriptViewOffset(snapshot, () => undefined)).toBe(4200);
+  });
+});
+
+describe("pinUntilSettled", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame", "performance"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("pins every frame until the restore budget runs out, then finishes once", () => {
+    const scrollEl = document.createElement("div");
+    const pin = vi.fn();
+    const onFinish = vi.fn();
+    pinUntilSettled(scrollEl, pin, () => true, onFinish);
+    expect(pin).toHaveBeenCalledTimes(1);
+
+    vi.advanceTimersByTime(100);
+    expect(pin.mock.calls.length).toBeGreaterThan(1);
+    expect(onFinish).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(SCROLL_RESTORE_BUDGET_MS);
+    const pinsAtDeadline = pin.mock.calls.length;
+    expect(onFinish).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(100);
+    expect(pin).toHaveBeenCalledTimes(pinsAtDeadline);
+  });
+
+  it("stops as soon as the reader takes over the scroller", () => {
+    const scrollEl = document.createElement("div");
+    const pin = vi.fn();
+    const onFinish = vi.fn();
+    pinUntilSettled(scrollEl, pin, () => true, onFinish);
+
+    scrollEl.dispatchEvent(new Event("wheel"));
+    expect(onFinish).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(100);
+    expect(pin).toHaveBeenCalledTimes(1);
+    scrollEl.dispatchEvent(new Event("keydown"));
+    expect(onFinish).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops pinning without finishing once its owner is no longer current", () => {
+    const scrollEl = document.createElement("div");
+    const pin = vi.fn();
+    const onFinish = vi.fn();
+    let current = true;
+    const stop = pinUntilSettled(scrollEl, pin, () => current, onFinish);
+
+    current = false;
+    vi.advanceTimersByTime(100);
+    expect(pin).toHaveBeenCalledTimes(1);
+    expect(onFinish).not.toHaveBeenCalled();
+    stop();
+    expect(onFinish).toHaveBeenCalledTimes(1);
   });
 });

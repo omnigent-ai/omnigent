@@ -1,13 +1,18 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  MAX_PREVIEW_MARKDOWN_BYTES,
   MAX_RICH_MARKDOWN_BYTES,
+  isMarkdownTooLargeForPreview,
   isMarkdownTooLargeForRichView,
+  resolveFileViewMode,
+  hasRawHtmlNode,
   HTML_PREVIEW_HEAD,
   HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   getModelFormat,
+  hasNoTextDiff,
   isBinaryPath,
   isImageFile,
   isModelFile,
@@ -1005,5 +1010,79 @@ describe("large Markdown routing", () => {
     ["text", "a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), false],
   ])("uses UTF-8 bytes for case %#", (lang, content, expected) => {
     expect(isMarkdownTooLargeForRichView(lang, content)).toBe(expected);
+  });
+});
+
+describe("isMarkdownTooLargeForPreview", () => {
+  it.each([
+    ["markdown", "a".repeat(MAX_PREVIEW_MARKDOWN_BYTES), false],
+    ["markdown", "a".repeat(MAX_PREVIEW_MARKDOWN_BYTES + 1), true],
+    ["markdown", "é".repeat(MAX_PREVIEW_MARKDOWN_BYTES / 2) + "a", true],
+    ["text", "a".repeat(MAX_PREVIEW_MARKDOWN_BYTES + 1), false],
+  ])("uses UTF-8 bytes for case %#", (lang, content, expected) => {
+    expect(isMarkdownTooLargeForPreview(lang, content)).toBe(expected);
+  });
+});
+
+describe("resolveFileViewMode", () => {
+  const base = {
+    isPreviewable: true,
+    lang: "markdown",
+    largeMarkdown: false,
+    deepLinkedComment: false,
+  } as const;
+
+  it.each([
+    [{ preference: "editor" }, "editor"],
+    [{ preference: "preview" }, "preview"],
+    [{ preference: "source" }, "source"],
+    [{ preference: "preview", deepLinkedComment: true }, "editor"],
+    [{ preference: "editor", largeMarkdown: true }, "preview"],
+    [{ preference: "preview", largeMarkdown: true }, "preview"],
+    [{ preference: "source", largeMarkdown: true }, "source"],
+    [{ preference: "preview", largeMarkdown: true, deepLinkedComment: true }, "source"],
+    [{ preference: "editor", largeMarkdown: true, largeMarkdownVisitMode: "source" }, "source"],
+    [
+      {
+        preference: "source",
+        largeMarkdown: true,
+        deepLinkedComment: true,
+        largeMarkdownVisitMode: "preview",
+      },
+      "preview",
+    ],
+    [{ preference: "editor", lang: "html" }, "preview"],
+    [{ preference: "source", lang: "html" }, "source"],
+    [{ preference: "preview", lang: "csv" }, "preview"],
+    [
+      { preference: "preview", lang: "csv", deepLinkedComment: true, previewHidesComments: true },
+      "source",
+    ],
+    [{ preference: "editor", lang: "python", isPreviewable: false }, "source"],
+  ] as const)("resolves %o to %s", (overrides, expected) => {
+    expect(resolveFileViewMode({ ...base, ...overrides })).toBe(expected);
+  });
+});
+
+describe("hasRawHtmlNode", () => {
+  it.each([
+    [{ type: "root", children: [{ type: "element", children: [{ type: "text" }] }] }, false],
+    [{ type: "root", children: [{ type: "element", children: [{ type: "raw" }] }] }, true],
+    [{ type: "root" }, false],
+  ])("detects raw HTML in case %#", (tree, expected) => {
+    expect(hasRawHtmlNode(tree)).toBe(expected);
+  });
+});
+
+describe("hasNoTextDiff", () => {
+  it.each(["logo.png", "logo.svg", "report.pdf", "clip.mov", "part.stl", "archive.zip"])(
+    "has no text diff for %s",
+    (path) => {
+      expect(hasNoTextDiff(path)).toBe(true);
+    },
+  );
+
+  it.each(["src/app.ts", "README.md", "config.json"])("diffs %s as text", (path) => {
+    expect(hasNoTextDiff(path)).toBe(false);
   });
 });

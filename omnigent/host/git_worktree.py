@@ -310,7 +310,10 @@ def _commit_updated_ats(repo_root: str, heads: list[str | None]) -> dict[str, in
     unique_heads = list(dict.fromkeys(head for head in heads if head is not None))
     if not unique_heads:
         return {}
-    result = _run_git(["show", "-s", "--format=%H%x00%ct", *unique_heads], cwd=repo_root)
+    result = _run_git(
+        ["log", "--no-walk=unsorted", "--format=%H%x00%ct", *unique_heads, "--"],
+        cwd=repo_root,
+    )
     if result.returncode != 0:
         return {}
     timestamps: dict[str, int] = {}
@@ -622,12 +625,12 @@ def _create_worktree(
         work_deadline -= min(_GIT_TIMEOUT_S, budget_s * _ROLLBACK_RESERVE_FRACTION)
         _CREATE_DEADLINE.set((work_deadline, budget_s))
     if base_branch is not None:
-        _ensure_base_resolvable(repo_root, base_branch, deadline=work_deadline, budget_s=budget_s)
+        _ensure_base_resolvable(repo_path, base_branch, deadline=work_deadline, budget_s=budget_s)
     validated_commit: str | None = None
     if relative_directory:
         revision = f"refs/heads/{branch_name}" if existing_branch else (base_branch or "HEAD")
         resolved = _run_git(
-            ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"], cwd=repo_root
+            ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"], cwd=repo_path
         )
         if resolved.returncode != 0:
             raise _git_error("could not resolve worktree revision", resolved)
@@ -660,8 +663,9 @@ def _create_worktree(
             add_args.insert(2, "--no-checkout")
         if base_branch is not None:
             add_args += ["--end-of-options", base_branch]
+    # Resolve HEAD in the selected checkout; placement still uses the main repository.
     result = _run_git_within_budget(
-        add_args, cwd=repo_root, deadline=work_deadline, budget_s=budget_s
+        add_args, cwd=repo_path, deadline=work_deadline, budget_s=budget_s
     )
     if result.returncode != 0:
         raise _git_error("git worktree add failed", result)
@@ -758,12 +762,15 @@ def remove_worktree(
         remaining time, which can outlast the metadata bound on a large
         worktree, and every other command keeps its own bound within it.
         ``None`` gives each command :data:`_GIT_TIMEOUT_S`.
-    :raises WorktreeError: If the worktree path is missing/invalid, a
-        git command fails, or ``deadline`` passes.
+    :raises WorktreeError: If the branch name or worktree path is invalid,
+        a git command fails, or ``deadline`` passes.
     """
 
     def bound(cap: float | None) -> float | None:
         return None if deadline is None else _rollback_timeout(deadline, cap)
+
+    if delete_branch and branch is not None:
+        validate_branch_name(branch)
 
     if not Path(worktree_path).exists():
         raise WorktreeError(f"worktree path does not exist: {worktree_path}")
@@ -778,7 +785,7 @@ def remove_worktree(
     if os.path.normcase(root.stdout.strip()) != os.path.normcase(os.path.abspath(worktree_path)):
         raise WorktreeError(f"path is not the expected worktree root: {worktree_path}")
     remove_result = _run_git(
-        ["worktree", "remove", "--force", root.stdout.strip()],
+        ["worktree", "remove", "--force", "--", root.stdout.strip()],
         cwd=main_repo,
         timeout=bound(None),
     )
@@ -786,7 +793,9 @@ def remove_worktree(
         raise _git_error("git worktree remove failed", remove_result)
     if delete_branch and branch is not None:
         branch_result = _run_git(
-            ["branch", "-D", branch], cwd=main_repo, timeout=bound(_GIT_TIMEOUT_S)
+            ["branch", "-D", "--end-of-options", branch],
+            cwd=main_repo,
+            timeout=bound(_GIT_TIMEOUT_S),
         )
         if branch_result.returncode != 0:
             raise _git_error("git branch -D failed", branch_result)

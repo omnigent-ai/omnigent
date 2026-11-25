@@ -41,14 +41,15 @@ class FakeWebSocket:
         return ""  # pragma: no cover
 
 
-def _make_hello(name: str = "test-host") -> HostHelloFrame:
+def _make_hello(name: str = "test-host", version: str = "0.1.0") -> HostHelloFrame:
     """Build a minimal HostHelloFrame for tests.
 
     :param name: Human-readable host name.
+    :param version: Host software version, e.g. ``"0.24.0"``.
     :returns: A :class:`HostHelloFrame` with default values.
     """
     return HostHelloFrame(
-        version="0.1.0",
+        version=version,
         frame_protocol_version=1,
         name=name,
     )
@@ -192,26 +193,32 @@ async def test_deregister_fails_inventory_waiters_and_ignores_settled_futures() 
     loop = asyncio.get_running_loop()
     live_skills = loop.create_future()
     live_mcp = loop.create_future()
+    live_enabled = loop.create_future()
     cancelled_skills = loop.create_future()
     cancelled_skills.cancel()
     completed_mcp = loop.create_future()
     completed_mcp.set_result(None)
+    completed_enabled = loop.create_future()
+    completed_enabled.set_result(None)
     live_create, live_remove, live_list = (loop.create_future() for _ in range(3))
     conn.pending_skills.update({"live": live_skills, "cancelled": cancelled_skills})
     conn.pending_mcp_servers.update({"live": live_mcp, "completed": completed_mcp})
+    conn.pending_mcp_server_enabled.update({"live": live_enabled, "completed": completed_enabled})
     conn.pending_create_worktrees["live"] = live_create
     conn.pending_remove_worktrees["live"] = live_remove
     conn.pending_list_worktrees["live"] = live_list
 
     assert registry.deregister(conn.host_id) is True
 
-    for future in (live_skills, live_mcp, live_create, live_remove, live_list):
+    for future in (live_skills, live_mcp, live_enabled, live_create, live_remove, live_list):
         with pytest.raises(ConnectionError, match="disconnected"):
             future.result()
     assert cancelled_skills.cancelled()
     assert completed_mcp.result() is None
+    assert completed_enabled.result() is None
     assert conn.pending_skills == {}
     assert conn.pending_mcp_servers == {}
+    assert conn.pending_mcp_server_enabled == {}
     assert conn.pending_create_worktrees == {}
     assert conn.pending_remove_worktrees == {}
     assert conn.pending_list_worktrees == {}
@@ -224,29 +231,36 @@ async def test_replacement_only_fails_old_inventory_waiters() -> None:
     loop = asyncio.get_running_loop()
     old_skills = loop.create_future()
     old_mcp = loop.create_future()
+    old_enabled = loop.create_future()
     old_create_worktree = loop.create_future()
     old.pending_skills["old"] = old_skills
     old.pending_mcp_servers["old"] = old_mcp
+    old.pending_mcp_server_enabled["old"] = old_enabled
     old.pending_create_worktrees["old"] = old_create_worktree
 
     new = registry.register("host_inventory_replace", FakeWebSocket(), _make_hello(), owner="bob")
 
-    for future in (old_skills, old_mcp, old_create_worktree):
+    for future in (old_skills, old_mcp, old_enabled, old_create_worktree):
         with pytest.raises(ConnectionError, match="disconnected"):
             future.result()
     assert old.pending_skills == {}
     assert old.pending_mcp_servers == {}
+    assert old.pending_mcp_server_enabled == {}
     assert old.pending_create_worktrees == {}
 
     new_skills = loop.create_future()
     new_mcp = loop.create_future()
+    new_enabled = loop.create_future()
     new.pending_skills["new"] = new_skills
     new.pending_mcp_servers["new"] = new_mcp
+    new.pending_mcp_server_enabled["new"] = new_enabled
     assert registry.deregister(new.host_id, conn=old) is False
     assert not new_skills.done()
     assert not new_mcp.done()
+    assert not new_enabled.done()
     new_skills.cancel()
     new_mcp.cancel()
+    new_enabled.cancel()
 
 
 async def test_inventory_waiters_on_closed_owner_loop_are_ignored() -> None:
@@ -256,15 +270,19 @@ async def test_inventory_waiters_on_closed_owner_loop_are_ignored() -> None:
     owner_loop = asyncio.new_event_loop()
     closed_skills = owner_loop.create_future()
     closed_mcp = owner_loop.create_future()
+    closed_enabled = owner_loop.create_future()
     owner_loop.close()
     conn.pending_skills["closed"] = closed_skills
     conn.pending_mcp_servers["closed"] = closed_mcp
+    conn.pending_mcp_server_enabled["closed"] = closed_enabled
 
     assert registry.deregister(conn.host_id) is True
     assert conn.pending_skills == {}
     assert conn.pending_mcp_servers == {}
+    assert conn.pending_mcp_server_enabled == {}
     closed_skills.cancel()
     closed_mcp.cancel()
+    closed_enabled.cancel()
 
 
 def test_deregister_returns_false_for_unknown() -> None:
@@ -396,6 +414,51 @@ def test_register_replaces_stale_connection() -> None:
     # The None sentinel tells the sender loop to exit.
     poison = old_conn.outbound_queue.get_nowait()
     assert poison is None
+
+
+@pytest.mark.parametrize(
+    ("registered_version", "connecting_version", "connecting_owner", "silent_s", "refused"),
+    [
+        ("0.24.0", "0.3.0", "dave", 0.0, True),
+        ("0.24.0", "0.24.0.dev20261123", "dave", 0.0, True),
+        ("0.24.0", "0.24.0", "dave", 0.0, False),
+        ("0.3.0", "0.24.0", "dave", 0.0, False),
+        ("0.24.0", "0.3.0", "dave", 91.0, False),
+        ("0.24.0", "0.3.0", "erin", 0.0, False),
+        ("0.24.0", "not-a-version", "dave", 0.0, False),
+    ],
+    ids=[
+        "older-refused",
+        "dev-build-of-same-release-refused",
+        "same-version-replaces",
+        "newer-replaces",
+        "silent-incumbent-replaced",
+        "other-owner-not-matched",
+        "unparsable-version-replaces",
+    ],
+)
+def test_live_newer_duplicate_only_matches_live_newer_same_owner_host(
+    registered_version: str,
+    connecting_version: str,
+    connecting_owner: str,
+    silent_s: float,
+    refused: bool,
+) -> None:
+    """Only a live, strictly newer connection of the same owner blocks a reconnect."""
+    registry = HostRegistry()
+    registered = registry.register(
+        "host_ddd", FakeWebSocket(), _make_hello(version=registered_version), owner="dave"
+    )
+    registered.last_frame_monotonic -= silent_s
+
+    newer = registry.live_newer_duplicate(
+        "host_ddd",
+        _make_hello(version=connecting_version),
+        connecting_owner,
+        max_silence_s=90.0,
+    )
+
+    assert newer is (registered if refused else None)
 
 
 def test_send_text_enqueues_frame() -> None:
@@ -658,3 +721,18 @@ def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     # Deregistering by any spelling removes the entry.
     registry.deregister(prefixed)
     assert registry.get(bare) is None
+
+
+def test_mcp_launch_activation_defaults_closed_and_reads_gate_per_launch():
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+
+    assert HostRegistry().mcp_disabled_servers_active_harnesses() is None
+    gates = iter([True, False])
+    registry = HostRegistry(
+        mcp_disabled_servers=lambda: next(gates),
+        feature_flags=FeatureFlags(frozenset(Feature)),
+    )
+    assert registry.mcp_disabled_servers_active_harnesses() == ["claude", "codex"]
+    assert registry.mcp_disabled_servers_active_harnesses() is None
+    # Exhausting the callable also fails closed.
+    assert registry.mcp_disabled_servers_active_harnesses() is None

@@ -22,8 +22,9 @@ import contextlib
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable
-from typing import Any
+from collections.abc import Awaitable, Callable, Coroutine
+from time import monotonic
+from typing import TYPE_CHECKING, Any
 
 import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -31,11 +32,15 @@ from sqlalchemy.exc import DataError, IntegrityError
 from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.host.frames import (
     CAP_HARNESS_ACCOUNTS,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
+    SERVER_CAPABILITIES,
+    SERVER_CAPABILITIES_HEADER,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -61,15 +66,18 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsResultFrame,
     HostProbeAccountsResultFrame,
+    HostRecoverSessionsFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceReplyFrame,
     ImportLocalSessionChunkAssembler,
     decode_host_frame,
     encode_host_frame,
@@ -88,10 +96,14 @@ from omnigent.server.host_registry import (
     HostConnection,
     HostRegistry,
     RunnerExitReports,
+    deliver_workspace_reply,
     update_harness_accounts,
 )
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import HostStore
+
+if TYPE_CHECKING:
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
 
 _logger = logging.getLogger(__name__)
 
@@ -156,9 +168,12 @@ def create_host_tunnel_router(
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: RunnerExitedCallback | None = None,
+    on_session_recovery: Callable[[HostConnection, list[str]], Coroutine[Any, Any, None]]
+    | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     harness_install: HarnessInstallGate = False,
+    sandbox_config: ManagedSandboxDeployment | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -204,6 +219,8 @@ def create_host_tunnel_router(
         minimal test wiring) drops the reports.
     :param harness_install: Static or callable harness-install gate. A capable
         host is asked for accounts after connect only when this resolves true.
+    :param sandbox_config: Provider TTLs for renewing authenticated managed
+        hosts. Missing providers keep their existing token expiry.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -222,10 +239,11 @@ def create_host_tunnel_router(
         2. Accept the WS upgrade.
         3. Receive the ``host.hello`` frame.
         4. Validate ``frame_protocol_version`` (strict-major).
-        5. Upsert in the ``hosts`` DB table.
-        6. Register in the :class:`HostRegistry`.
-        7. Start sender, receiver, and ping loops.
-        8. On disconnect: deregister, set offline in DB.
+        5. Refuse an older host while a newer one is live on the same id.
+        6. Upsert in the ``hosts`` DB table.
+        7. Register in the :class:`HostRegistry`.
+        8. Start sender, receiver, and ping loops.
+        9. On disconnect: deregister, set offline in DB.
         """
         # Legacy hosts dial in with ``host_<hex>`` — normalise to the stored
         # bare form. Malformed ids are refused here because WebSocket routes
@@ -255,6 +273,7 @@ def create_host_tunnel_router(
         # only the handshake headers/cookies, which Starlette exposes before
         # ``accept()``.
         managed_token = ws.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        managed_token_ttl_s = None
         if managed_token is not None:
             # A managed-host launch token is an explicit credential: when
             # presented, it must resolve — never fall through to user auth
@@ -270,6 +289,26 @@ def create_host_tunnel_router(
                 await ws.close(code=4004, reason="unauthenticated")
                 return
             tunnel_owner = managed.user_id
+            if sandbox_config is not None:
+                provider_config = sandbox_config.for_provider(managed.sandbox_provider)
+                if (
+                    provider_config is None
+                    and len(sandbox_config.configs) == 1
+                    and sandbox_config.default.provider is None
+                ):
+                    try:
+                        launcher = await asyncio.to_thread(sandbox_config.default.launcher_factory)
+                    except Exception:
+                        _logger.debug(
+                            "Cannot resolve sandbox provider for host %s; skipping token renewal",
+                            host_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if launcher.provider == managed.sandbox_provider:
+                            provider_config = sandbox_config.default
+                if provider_config is not None:
+                    managed_token_ttl_s = provider_config.token_ttl_s
         elif auth_provider is not None:
             authenticated_owner = auth_provider.get_user_id(ws)
             if authenticated_owner is None:
@@ -328,7 +367,14 @@ def create_host_tunnel_router(
                 )
                 return
 
-        await ws.accept()
+        await ws.accept(
+            headers=[
+                (
+                    SERVER_CAPABILITIES_HEADER.lower().encode("ascii"),
+                    ",".join(SERVER_CAPABILITIES).encode("ascii"),
+                )
+            ]
+        )
         conn: HostConnection | None = None
         host_persisted = False
         stage = "hello"
@@ -382,6 +428,44 @@ def create_host_tunnel_router(
                 )
                 await _send_connection_error(ws, stage="protocol", error=error)
                 await ws.close(code=4002, reason=error)
+                return
+
+            stage = "duplicate_host"
+            # Server-provisioned sandboxes are replaced by the server itself.
+            newer = (
+                None
+                if managed_token is not None
+                else host_registry.live_newer_duplicate(
+                    host_id,
+                    frame,
+                    tunnel_owner,
+                    max_silence_s=PING_INTERVAL_S * PING_MISS_THRESHOLD,
+                )
+            )
+            if newer is not None:
+                _logger.warning(
+                    "Refusing host %s version %s (name=%s): version %s (name=%s) is "
+                    "already connected with this host id",
+                    host_id,
+                    frame.version,
+                    frame.name,
+                    newer.hello.version,
+                    newer.hello.name,
+                )
+                # Non-retryable, so a host that understands the frame exits
+                # instead of reconnecting.
+                await _send_connection_error(
+                    ws,
+                    stage="duplicate_host",
+                    error=(
+                        f"A newer Omnigent host ({newer.hello.version}, "
+                        f"{newer.hello.name!r}) is already connected with this "
+                        f"host id, so this older host ({frame.version}) was "
+                        "refused. Stop this host process; only one host per "
+                        "host id can be connected."
+                    ),
+                )
+                await ws.close(code=4009, reason="older duplicate host")
                 return
 
             stage = "registration"
@@ -447,12 +531,16 @@ def create_host_tunnel_router(
                     name=f"host-sender:{host_id}",
                 )
                 heartbeat_requested = asyncio.Event()
+                if managed_token_ttl_s is not None:
+                    heartbeat_requested.set()
                 heartbeat_task = asyncio.create_task(
                     _heartbeat_loop(
                         heartbeat_requested,
                         host_id=host_id,
                         host_store=host_store,
                         connection_id=frame.connection_id,
+                        managed_token=managed_token,
+                        token_ttl_s=managed_token_ttl_s,
                     ),
                     name=f"host-heartbeat:{host_id}",
                 )
@@ -470,6 +558,7 @@ def create_host_tunnel_router(
                         runner_exit_reports,
                         on_runner_exited,
                         on_host_update,
+                        on_session_recovery,
                     ),
                     name=f"host-receive:{host_id}",
                 )
@@ -516,6 +605,8 @@ def create_host_tunnel_router(
                     # stalled dependency hold shutdown indefinitely.
                     try:
                         cleanup_tasks = [sender_task, ping_task, receive_task, heartbeat_task]
+                        if conn.recovery_task is not None:
+                            cleanup_tasks.append(conn.recovery_task)
                         if account_probe_task is not None:
                             cleanup_tasks.append(account_probe_task)
                         for task in cleanup_tasks:
@@ -796,6 +887,17 @@ def _import_session_queue_payload(total: int, session: HostImportedLocalSession)
     }
 
 
+async def _recover_sessions(
+    callback: Callable[[HostConnection, list[str]], Coroutine[Any, Any, None]],
+    connection: HostConnection,
+    runners: list[str],
+) -> None:
+    try:
+        await callback(connection, runners)
+    except Exception:
+        _logger.exception("Session recovery request failed for host %s", connection.host_id)
+
+
 async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
@@ -805,6 +907,8 @@ async def _receive_loop(
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: RunnerExitedCallback | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
+    on_session_recovery: Callable[[HostConnection, list[str]], Coroutine[Any, Any, None]]
+    | None = None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -877,6 +981,19 @@ async def _receive_loop(
                 host_id,
                 type(runner_frame).__name__,
             )
+            continue
+
+        if isinstance(frame, HostRecoverSessionsFrame):
+            if (
+                on_session_recovery is not None
+                and conn.hello.recover_interrupted_sessions
+                and host_registry.get(host_id) is conn
+                and (conn.recovery_task is None or conn.recovery_task.done())
+            ):
+                conn.recovery_task = asyncio.create_task(
+                    _recover_sessions(on_session_recovery, conn, frame.runners),
+                    name=f"host-recovery:{host_id}",
+                )
             continue
 
         if isinstance(frame, HostHarnessReadinessFrame):
@@ -1032,6 +1149,19 @@ async def _receive_loop(
                 )
             continue
 
+        if isinstance(frame, HostCloneRepositoryResultFrame):
+            clone_future = conn.pending_clones.pop(frame.request_id, None)
+            if clone_future is not None and not clone_future.done():
+                clone_future.set_result(
+                    {
+                        "status": frame.status,
+                        "path": frame.path,
+                        "error": frame.error,
+                        "error_code": frame.error_code,
+                    }
+                )
+            continue
+
         if isinstance(frame, HostInstallHarnessResultFrame):
             install_future = conn.pending_installs.pop(frame.request_id, None)
             if install_future is not None and not install_future.done():
@@ -1163,6 +1293,10 @@ async def _receive_loop(
                 detect_future.set_result({"credentials": frame.credentials})
             continue
 
+        if isinstance(frame, HostWorkspaceReplyFrame):
+            deliver_workspace_reply(conn, frame)
+            continue
+
         if isinstance(frame, HostFsResultFrame):
             fs_future = conn.pending_fs_requests.pop(frame.request_id, None)
             if fs_future is not None and not fs_future.done():
@@ -1198,6 +1332,11 @@ async def _receive_loop(
             startup_future = conn.pending_harness_startup.pop(frame.request_id, None)
             if startup_future is not None and not startup_future.done():
                 startup_future.set_result(frame.startup)
+            continue
+        if isinstance(frame, HostSetMcpServerEnabledResultFrame):
+            enabled_future = conn.pending_mcp_server_enabled.pop(frame.request_id, None)
+            if enabled_future is not None and not enabled_future.done():
+                enabled_future.set_result(frame)
             continue
         if isinstance(frame, HostMcpServersResultFrame):
             mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
@@ -1309,19 +1448,35 @@ async def _heartbeat_loop(
     host_id: str,
     host_store: HostStore,
     connection_id: str | None = None,
+    managed_token: str | None = None,
+    token_ttl_s: int | None = None,
 ) -> None:
-    """Serialize host-liveness writes independently of socket pings."""
+    """Persist liveness off the ping loop; renew tokens halfway through their TTL."""
     failure_count = 0
     last_failure_log_at = 0.0
+    next_token_renewal_at = 0.0
+    heartbeat_cancelled = threading.Event()
     while True:
         await requested.wait()
         requested.clear()
         started_at = time.monotonic()
+        renewal_started_at = monotonic()
+        renewal_ttl_s = token_ttl_s if renewal_started_at >= next_token_renewal_at else None
         try:
-            # Cancellation cannot stop the thread, but heartbeat only updates
-            # last-seen; a late write cannot change an offline host's status.
-            await asyncio.to_thread(host_store.heartbeat, host_id)
+            # A late managed heartbeat must still match its live credential.
+            if managed_token is not None:
+                await asyncio.to_thread(
+                    host_store.heartbeat,
+                    host_id,
+                    managed_token=managed_token,
+                    token_ttl_s=renewal_ttl_s,
+                    observed_at=now_epoch(),
+                    cancelled=heartbeat_cancelled.is_set,
+                )
+            else:
+                await asyncio.to_thread(host_store.heartbeat, host_id)
         except asyncio.CancelledError:
+            heartbeat_cancelled.set()
             raise
         except Exception as exc:  # noqa: BLE001 -- persistence must not kill the tunnel
             failure_count += 1
@@ -1350,6 +1505,8 @@ async def _heartbeat_loop(
                 last_failure_log_at = now
             continue
 
+        if renewal_ttl_s is not None:
+            next_token_renewal_at = renewal_started_at + renewal_ttl_s / 2
         if failure_count:
             _logger.info(
                 "Host %s heartbeat persistence recovered after %d failure(s)",

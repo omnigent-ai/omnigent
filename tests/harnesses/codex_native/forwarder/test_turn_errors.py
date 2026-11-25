@@ -2,52 +2,40 @@
 
 Failed turns surface their reason; authentication errors include a re-auth hint.
 Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
+A turn whose start was missed reports running from its first item.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.harnesses.codex_egress import detect_certificate_failure
 from omnigent.harnesses.codex_native import forwarder as fwd
+from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     read_bridge_state,
     read_certificate_failure,
     record_certificate_failure,
+    update_active_turn_id,
     write_bridge_state,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from tests.harnesses.codex_native.forwarder._support import (
+    _deliver_to_parent,
     _RecordingClient,
+    _seed_active_turn,
+    _status_post,
+    _turn_completed,
+    _turn_started,
 )
-
-
-def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
-    """
-    Seed bridge state so a terminal turn edge clears the active turn.
-
-    ``_terminal_turn_status_edge`` only produces an edge when the terminal
-    event clears the recorded active turn id; without this seed it returns
-    ``None`` as "stale".
-
-    :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
-    :param turn_id: Active Codex turn id to record, e.g. ``"turn_123"``.
-    :returns: None.
-    """
-    write_bridge_state(
-        bridge_dir,
-        CodexNativeBridgeState(
-            session_id="conv_x",
-            socket_path=str(bridge_dir / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(bridge_dir / "codex-home"),
-            active_turn_id=turn_id,
-        ),
-    )
 
 
 def test_classify_codex_error_auth_vs_generic() -> None:
@@ -118,6 +106,24 @@ def test_classify_codex_error_budget_exhausted_not_auth() -> None:
         fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 403}}, "access denied")
         == auth
     )
+
+
+def test_classify_codex_error_ip_access_list_refusal_not_auth() -> None:
+    """A workspace IP access list refusal (HTTP 403) is not a sign-in failure.
+
+    Signing in again cannot clear a network policy, so the re-auth status and
+    hint would point the user at the wrong fix.
+    """
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    # Synthetic address, workspace and request id; the wording is the gateway's.
+    acl_message = (
+        "unexpected status 403 Forbidden: Source IP address: 203.0.113.7 is blocked by "
+        "Databricks IP ACL for workspace: 1234567890123456 "
+        "[ReqId: 00000000-0000-4000-8000-000000000000]"
+    )
+    structured_403 = {"codexErrorInfo": {"httpStatusCode": 403}}
+    assert fwd._classify_codex_error(structured_403, acl_message) == generic
+    assert fwd._classify_codex_error({}, acl_message) == generic
 
 
 @pytest.mark.parametrize(
@@ -696,6 +702,160 @@ async def test_correlated_error_recovers_a_missed_turn_start(tmp_path: Path) -> 
     assert client.posts[0][1]["data"]["response_id"] == "codex_missed_start_turn"
 
 
+def _turn_event(
+    method: str, turn_id: str, item_type: str | None = None, *, thread_id: str = "thread_123"
+) -> dict:
+    if item_type is None:
+        return {"method": method, "params": {"threadId": thread_id, "turn": {"id": turn_id}}}
+    item = {"type": item_type, "id": f"{turn_id}_{item_type}"}
+    if item_type == "userMessage":
+        item["content"] = [{"type": "text", "text": "Review the change."}]
+    else:
+        item["text"] = "Reviewed."
+    return {
+        "method": method,
+        "params": {"threadId": thread_id, "turnId": turn_id, "item": item},
+    }
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "events", "expected_running_turns"),
+    [
+        pytest.param(
+            "turn_123",
+            [
+                _turn_event("item/started", "turn_123", "userMessage"),
+                _turn_event("item/completed", "turn_123", "userMessage"),
+                _turn_event("item/completed", "turn_123", "agentMessage"),
+            ],
+            ["turn_123"],
+            id="missed-start",
+        ),
+        pytest.param(
+            "turn_123",
+            [
+                _turn_event("turn/started", "turn_123"),
+                _turn_event("item/completed", "turn_123", "userMessage"),
+            ],
+            ["turn_123"],
+            id="observed-start",
+        ),
+        pytest.param(
+            None,
+            [_turn_event("item/completed", "turn_old", "userMessage")],
+            [],
+            id="no-active-turn",
+        ),
+        pytest.param(
+            None,
+            [
+                _turn_event("item/started", "turn_123", "userMessage"),
+                {"active_turn_id": "turn_123"},
+                _turn_event("item/completed", "turn_123", "userMessage"),
+                _turn_event("item/completed", "turn_123", "agentMessage"),
+            ],
+            ["turn_123"],
+            id="turn-id-written-after-first-item",
+        ),
+        pytest.param(
+            None,
+            [
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "turn_123_agentMessage",
+                        "delta": "Rev",
+                    },
+                },
+                _turn_event("item/completed", "turn_123", "agentMessage"),
+            ],
+            ["turn_123"],
+            id="start-recovered-from-delta",
+        ),
+        pytest.param(
+            "turn_124",
+            [_turn_event("item/completed", "turn_123", "agentMessage")],
+            [],
+            id="other-turn",
+        ),
+        pytest.param(
+            "turn_123",
+            [_turn_event("item/completed", "turn_123", "userMessage", thread_id="thread_side")],
+            [],
+            id="other-thread",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_first_item_reports_running_for_a_turn_whose_start_was_missed(
+    tmp_path: Path,
+    active_turn_id: str | None,
+    events: list[dict],
+    expected_running_turns: list[str],
+) -> None:
+    """A fresh thread subscribes after its first turn started; its first item reports running."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=active_turn_id,
+        ),
+    )
+    client = _RecordingClient()
+    forwarder_state = fwd._CodexForwarderState()
+    delta_coalescer = fwd._OutputTextDeltaCoalescer(
+        client,  # type: ignore[arg-type]
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=100_000,
+    )
+    for event in events:
+        if "active_turn_id" in event:
+            active_turn_id = event["active_turn_id"]
+            update_active_turn_id(tmp_path, active_turn_id)
+            continue
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_123",
+            event=event,
+            forwarder_state=forwarder_state,
+        )
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            delta_coalescer=delta_coalescer,
+            expected_thread_id="thread_123",
+            forwarder_state=forwarder_state,
+        )
+    await delta_coalescer.close()
+
+    statuses = [body for _, body in client.posts if body["type"] == "external_session_status"]
+    assert [body["data"]["status"] for body in statuses] == ["running"] * len(
+        expected_running_turns
+    )
+    assert [body["data"]["response_id"] for body in statuses] == [
+        f"codex_{turn_id}" for turn_id in expected_running_turns
+    ]
+    if expected_running_turns:
+        assert client.posts[0][1]["type"] == "external_session_status"
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == (
+        expected_running_turns[-1] if expected_running_turns else active_turn_id
+    )
+
+
 @pytest.mark.asyncio
 async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: Path) -> None:
     """A standalone error owns the terminal status for its turn."""
@@ -974,7 +1134,33 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
+@pytest.mark.parametrize(
+    ("message", "expected_output"),
+    [
+        ("model stream broke", "model stream broke"),
+        (
+            "Incomplete response returned, reason: max_output_tokens",
+            "Incomplete response returned, reason: max_output_tokens\n\n"
+            "The model reached its response length limit. Ask it to continue or split "
+            "the request into smaller parts.",
+        ),
+        (
+            "Incomplete response returned, reason: content_filter",
+            "Incomplete response returned, reason: content_filter",
+        ),
+        (
+            "Invalid max_output_tokens configuration",
+            "Invalid max_output_tokens configuration",
+        ),
+        (
+            "Failed to shutdown thread persistence",
+            "Failed to shutdown thread persistence",
+        ),
+    ],
+)
+async def test_post_turn_status_edge_surfaces_generic_error_output(
+    message: str, expected_output: str
+) -> None:
     """A failed edge with a generic error surfaces the message as output.
 
     The reason must reach the server (as ``output``) rather than being dropped;
@@ -986,7 +1172,7 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
         turn_id="turn_123",
         source="turn/completed:turn-error",
         error=fwd._CodexTerminalError(
-            message="model stream broke",
+            message=message,
             kind=fwd._CODEX_ERROR_KIND_GENERIC,
         ),
     )
@@ -998,7 +1184,9 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
     assert body["type"] == "external_session_status"
     data = body["data"]
     assert data["status"] == "failed"
-    assert data["output"] == "model stream broke"
+    assert data["output"] == expected_output
+    assert edge.error is not None
+    assert edge.error.message == message
     # Generic errors do not demand re-auth.
     assert "reauth_required" not in data
 
@@ -1060,7 +1248,9 @@ async def test_provider_token_command_failure_posts_without_codex_login_hint(
 
 
 @pytest.mark.asyncio
-async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
+async def test_post_turn_status_edge_clean_idle_has_no_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A normal idle edge (no error) posts status only — the success path."""
     client = _RecordingClient()
     edge = fwd._CodexTurnStatusEdge(status="idle", turn_id="turn_123", source="turn/completed")
@@ -1073,6 +1263,190 @@ async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
     assert data["status"] == "idle"
     assert "output" not in data
     assert "reauth_required" not in data
+    assert not any(
+        getattr(record, "event_name", None) == "codex_turn_status_publication_failed"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flush", ["compaction", "diff"])
+@pytest.mark.parametrize("turn_status", ["completed", "failed"])
+async def test_terminal_status_survives_flush_auth_failure(
+    tmp_path: Path, flush: str, turn_status: str
+) -> None:
+    """A pre-send output failure must not prevent the known terminal status post."""
+    _seed_active_turn(tmp_path, "turn_123")
+    state = fwd._CodexForwarderState()
+    if flush == "compaction":
+        state.compaction_status_posted = "in_progress"
+    else:
+        state.note_turn_diff("turn_123", "diff --git a/example.py b/example.py")
+    failure = DatabricksAuthError("credentials temporarily unavailable")
+    event = _turn_completed("turn_123", turn_status)
+    if turn_status == "failed":
+        event["params"]["turn"]["error"] = {"message": "native turn failed"}
+    posts: list[dict[str, Any]] = []
+    attempted_types: list[str] = []
+
+    class OutputAuthFailure(httpx.Auth):
+        def auth_flow(self, request: httpx.Request) -> Any:
+            body = json.loads(request.content)
+            attempted_types.append(body["type"])
+            if body["type"] != "external_session_status":
+                raise failure
+            yield request
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content))
+        return httpx.Response(200, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        base_url="http://server.example.test",
+        auth=OutputAuthFailure(),
+        transport=httpx.MockTransport(accept),
+    ) as client:
+        with pytest.raises(DatabricksAuthError) as caught:
+            await _deliver_to_parent(
+                client,  # type: ignore[arg-type]
+                tmp_path,
+                state,
+                event,
+            )
+
+    assert caught.value is failure
+    expected = "idle" if turn_status == "completed" else "failed"
+    expected_data = {"status": expected, "response_id": "codex_turn_123"}
+    if turn_status == "failed":
+        expected_data["output"] = "native turn failed"
+    assert posts == [{"type": "external_session_status", "data": expected_data}]
+    assert attempted_types == [
+        "external_compaction_status" if flush == "compaction" else "external_conversation_item",
+        "external_session_status",
+    ]
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None and bridge.active_turn_id is None
+    assert state.turn_failure_surfaced is (turn_status == "failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_phase",
+    [
+        "before_status",
+        "status_post",
+        "after_status",
+        "stale",
+        "cancelled",
+        "cancelled_flush",
+        "both_posts",
+        "newer_turn",
+        "newer_turn_completed",
+    ],
+)
+async def test_terminal_status_publication_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_phase: str,
+) -> None:
+    """A failed terminal publication names its edge without changing fault propagation."""
+    client = _RecordingClient()
+    active_turn = "newer_turn" if failure_phase == "stale" else "turn_123"
+    _seed_active_turn(tmp_path, active_turn)
+    cause = ValueError("private-cause-detail")
+    failure = (
+        asyncio.CancelledError("private-cancellation-detail")
+        if failure_phase in {"cancelled", "cancelled_flush"}
+        else DatabricksAuthError("private-auth-detail")
+    )
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        if failure_phase in {"newer_turn", "newer_turn_completed"}:
+            update_active_turn_id(tmp_path, "newer_turn")
+            if failure_phase == "newer_turn_completed":
+                update_active_turn_id(tmp_path, None)
+        raise failure from cause
+
+    if failure_phase in {
+        "before_status",
+        "stale",
+        "cancelled_flush",
+        "both_posts",
+        "newer_turn",
+        "newer_turn_completed",
+    }:
+        monkeypatch.setattr(fwd, "_flush_turn_diff", fail)
+    elif failure_phase in {"status_post", "cancelled"}:
+        monkeypatch.setattr(client, "post", fail)
+    else:
+        monkeypatch.setattr(
+            fwd._CodexElicitationTaskTracker, "resolve_by_terminal_turn_event", fail
+        )
+
+    if failure_phase == "both_posts":
+
+        async def fail_status(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("private-status-detail")
+
+        monkeypatch.setattr(client, "post", fail_status)
+
+    with pytest.raises(type(failure)) as caught:
+        await _deliver_to_parent(
+            client,
+            tmp_path,
+            fwd._CodexForwarderState(),
+            _turn_completed("turn_123", "completed"),
+        )
+
+    assert caught.value is failure
+    assert caught.value.__cause__ is cause
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None
+    assert bridge.active_turn_id == (
+        "newer_turn" if failure_phase in {"stale", "newer_turn"} else None
+    )
+    assert client.posts == (
+        [_status_post({"status": "idle", "response_id": "codex_turn_123"})]
+        if failure_phase in {"before_status", "after_status"}
+        else []
+    )
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_turn_status_publication_failed"
+    ]
+    if failure_phase == "both_posts":
+        assert [r.attributes["delivery_phase"] for r in records] == [
+            "before_status",
+            "status_post",
+        ]
+        assert [r.attributes["exception_type"] for r in records] == [
+            "DatabricksAuthError",
+            "RuntimeError",
+        ]
+        return
+    if failure_phase not in {"before_status", "status_post", "newer_turn", "newer_turn_completed"}:
+        assert records == []
+        return
+    (record,) = records
+    assert record.levelno == logging.WARNING
+    assert record.session_id == "conv_x"
+    assert record.turn_id == "turn_123"
+    assert record.attributes == {
+        "intended_status": "idle",
+        "protocol_source": "turn/completed",
+        "delivery_phase": (
+            "before_status"
+            if failure_phase in {"newer_turn", "newer_turn_completed"}
+            else failure_phase
+        ),
+        "exception_type": "DatabricksAuthError",
+        "exception_cause_type": "ValueError",
+    }
+    assert record.exc_info is None
+    assert "private-" not in caplog.text
+    assert "private-" not in json.dumps(record.attributes)
 
 
 _CERTIFICATE_LINE = (
@@ -1381,3 +1755,301 @@ async def test_interrupted_turn_keeps_launcher_certificate_record(tmp_path: Path
     )
 
     assert read_certificate_failure(tmp_path) is not None
+
+
+_SYSTEM_ERROR_OUTPUT = (
+    "Codex reported a system error on this thread. Open the terminal for details."
+)
+
+
+def _system_error_event(thread_id: str = "thread_123") -> dict[str, Any]:
+    """
+    Build a Codex ``thread/status/changed`` envelope reporting a system error.
+
+    :param thread_id: Thread whose status changed, e.g. ``"thread_123"``.
+    :returns: Notification envelope dict.
+    """
+    return {
+        "method": "thread/status/changed",
+        "params": {"threadId": thread_id, "status": {"type": "systemError"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_system_error_fails_a_thread_no_turn_is_running(tmp_path: Path) -> None:
+    """A system error on an idle thread fails the session, since no turn reports it."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [
+        _status_post({"status": "failed", "output": _SYSTEM_ERROR_OUTPUT}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_system_error_during_a_turn_waits_for_the_turn_outcome(tmp_path: Path) -> None:
+    """
+    A system error mid-turn can leave the turn running, so the turn's end decides.
+
+    Codex reports some non-fatal errors this way; posting failed here would
+    misreport a turn that goes on to complete.
+    """
+    _seed_active_turn(tmp_path, "turn_1")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+    assert client.posts == []
+
+    await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_1", "completed"))
+
+    assert client.posts == [_status_post({"status": "idle", "response_id": "codex_turn_1"})]
+
+
+@pytest.mark.asyncio
+async def test_system_error_after_a_reported_error_is_not_repeated(tmp_path: Path) -> None:
+    """A standalone error that already failed the turn is not failed again by the thread state."""
+    _seed_active_turn(tmp_path, "turn_1")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(
+        client,
+        tmp_path,
+        state,
+        {
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_1",
+                "willRetry": False,
+                "error": {
+                    "message": "You've hit your usage limit.",
+                    "codexErrorInfo": "usageLimitExceeded",
+                },
+            },
+        },
+    )
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [
+        _status_post(
+            {
+                "status": "failed",
+                "response_id": "codex_turn_1",
+                "output": "You've hit your usage limit.",
+            }
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_system_error_after_a_failed_turn_boundary_is_not_repeated(tmp_path: Path) -> None:
+    """A turn that already ended as failed is not failed again by the thread state."""
+    _seed_active_turn(tmp_path, "turn_1")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_1", "failed"))
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [_status_post({"status": "failed", "response_id": "codex_turn_1"})]
+
+
+@pytest.mark.asyncio
+async def test_system_error_after_a_new_turn_is_reported_again(tmp_path: Path) -> None:
+    """A turn that starts clears the earlier turn's failure, so a later system error reports."""
+    _seed_active_turn(tmp_path, "turn_1")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_1", "failed"))
+    await _deliver_to_parent(client, tmp_path, state, _turn_started("turn_2"))
+    await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_2", "completed"))
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [
+        _status_post({"status": "failed", "response_id": "codex_turn_1"}),
+        _status_post({"status": "running", "response_id": "codex_turn_2"}),
+        _status_post({"status": "idle", "response_id": "codex_turn_2"}),
+        _status_post({"status": "failed", "output": _SYSTEM_ERROR_OUTPUT}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repeated_system_error_is_reported_once(tmp_path: Path) -> None:
+    """Repeated system-error reports for an idle thread post one failure."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [
+        _status_post({"status": "failed", "output": _SYSTEM_ERROR_OUTPUT}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_system_error_on_a_child_thread_is_not_the_sessions_status(tmp_path: Path) -> None:
+    """A child thread's system error is not the parent session's failure."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    state.note_child_thread("thread_child", "conv_child")
+
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event("thread_child"))
+
+    assert client.posts == []
+
+
+_SAFETY_BLOCK_MESSAGE = (
+    "This request was blocked by our safety systems. Reason: Potentially unintended activity."
+)
+_HISTORY_METHODS = {"thread/turns/list", "thread/revert", "thread/rollback"}
+
+
+class _HistoryCodexClient:
+    """App-server stub for the history RPCs a safety-blocked turn triggers.
+
+    :param newest_turn_id: Turn ``thread/turns/list`` reports as newest.
+    :param rejections: Error payloads keyed by method, e.g. ``{"thread/revert": {...}}``.
+    :param hangs: Method that never gets an answer, e.g. ``"thread/revert"``.
+    """
+
+    def __init__(
+        self,
+        newest_turn_id: str = "turn_123",
+        rejections: dict[str, dict] | None = None,
+        hangs: str | None = None,
+    ) -> None:
+        self.requests: list[tuple[str, dict]] = []
+        self.newest_turn_id = newest_turn_id
+        self.rejections = rejections or {}
+        self.hangs = hangs
+
+    async def request(self, method: str, params: dict) -> dict:
+        self.requests.append((method, params))
+        if method == self.hangs:
+            await asyncio.Event().wait()
+        if method in self.rejections:
+            raise CodexAppServerResponseError(self.rejections[method])
+        if method == "thread/turns/list":
+            return {"result": {"data": [{"id": self.newest_turn_id}]}}
+        return {"result": {}}
+
+    def history_methods(self) -> list[str]:
+        return [method for method, _params in self.requests if method in _HISTORY_METHODS]
+
+
+def _safety_error_event() -> dict[str, Any]:
+    return {
+        "method": "error",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "willRetry": False,
+            "error": {"message": _SAFETY_BLOCK_MESSAGE},
+        },
+    }
+
+
+def _safety_failed_turn(message: str | None = _SAFETY_BLOCK_MESSAGE) -> dict[str, Any]:
+    turn: dict[str, Any] = {"id": "turn_123", "status": "failed", "items": []}
+    if message is not None:
+        turn["error"] = {"message": message}
+    return {"method": "turn/completed", "params": {"threadId": "thread_123", "turn": turn}}
+
+
+async def _forward(
+    tmp_path: Path, events: list[dict[str, Any]], codex_client: _HistoryCodexClient
+) -> _RecordingClient:
+    _seed_active_turn(tmp_path, "turn_123")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    for event in events:
+        await _deliver_to_parent(client, tmp_path, state, event, codex_client=codex_client)
+    return client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "events",
+    [[_safety_error_event(), _safety_failed_turn(None)], [_safety_failed_turn()]],
+    ids=["error-notification", "turn-error"],
+)
+async def test_safety_blocked_turn_is_dropped_from_codex_history(
+    tmp_path: Path, events: list[dict[str, Any]]
+) -> None:
+    """A safety refusal fails the turn once and drops it so follow-ups are not refused."""
+    codex_client = _HistoryCodexClient()
+
+    client = await _forward(tmp_path, events, codex_client)
+
+    assert codex_client.history_methods() == ["thread/turns/list", "thread/revert"]
+    assert ("thread/revert", {"threadId": "thread_123", "beforeTurnId": "turn_123"}) in (
+        codex_client.requests
+    )
+    statuses = [
+        body["data"] for _url, body in client.posts if body["type"] == "external_session_status"
+    ]
+    assert statuses == [
+        {"status": "failed", "response_id": "codex_turn_123", "output": _SAFETY_BLOCK_MESSAGE}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_other_turn_failures_stay_in_codex_history(tmp_path: Path) -> None:
+    """Only safety refusals are dropped; other failed turns keep their context."""
+    codex_client = _HistoryCodexClient()
+
+    await _forward(tmp_path, [_safety_failed_turn("You've hit your usage limit.")], codex_client)
+
+    assert codex_client.history_methods() == []
+
+
+@pytest.mark.asyncio
+async def test_codex_without_thread_revert_rolls_back_the_safety_blocked_turn(
+    tmp_path: Path,
+) -> None:
+    """Codex releases that predate thread/revert drop the refused turn by rollback."""
+    unknown_revert = {
+        "code": -32600,
+        "message": "Invalid request: unknown variant `thread/revert`, expected one of "
+        "`initialize`, `thread/rollback`",
+    }
+    codex_client = _HistoryCodexClient(rejections={"thread/revert": unknown_revert})
+
+    await _forward(tmp_path, [_safety_failed_turn()], codex_client)
+
+    assert codex_client.history_methods() == [
+        "thread/turns/list",
+        "thread/revert",
+        "thread/rollback",
+    ]
+    assert ("thread/rollback", {"threadId": "thread_123", "numTurns": 1}) in codex_client.requests
+
+
+@pytest.mark.asyncio
+async def test_safety_blocked_turn_is_kept_when_a_newer_turn_exists(tmp_path: Path) -> None:
+    """Dropping cuts the thread tail, so a newer turn keeps the refusal in history."""
+    codex_client = _HistoryCodexClient(newest_turn_id="turn_456")
+
+    await _forward(tmp_path, [_safety_failed_turn()], codex_client)
+
+    assert codex_client.history_methods() == ["thread/turns/list"]
+
+
+@pytest.mark.asyncio
+async def test_unanswered_drop_does_not_stall_forwarding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An app-server that never answers the drop cannot hold up later events."""
+    monkeypatch.setattr(fwd, "_CODEX_SAFETY_DROP_TIMEOUT_SECONDS", 0.01)
+    codex_client = _HistoryCodexClient(hangs="thread/revert")
+
+    with caplog.at_level(logging.WARNING, logger=fwd.__name__):
+        await asyncio.wait_for(_forward(tmp_path, [_safety_failed_turn()], codex_client), 5)
+
+    assert any("could not drop" in record.getMessage() for record in caplog.records)

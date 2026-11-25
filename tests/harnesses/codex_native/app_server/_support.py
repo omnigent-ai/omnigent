@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -16,7 +17,11 @@ from omnigent.harnesses.codex_native.app_server import (
 
 # Spell out expected approvals; deriving them from the production constant
 # would hide an unintended expansion of the approved tool surface.
-_PLAIN_TOOL_APPROVALS = {"sys_session_rename": {"approval_mode": "approve"}}
+_PLAIN_TOOL_APPROVALS = {
+    "sys_session_rename": {"approval_mode": "approve"},
+    "sys_scheduled_task_create": {"approval_mode": "approve"},
+    "sys_scheduled_task_update": {"approval_mode": "approve"},
+}
 
 
 _CWD = "/home/user/repo"
@@ -154,6 +159,10 @@ def _disable_codex_startup_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _fake_wait_until_ready)
     monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _fake_trust_policy_hooks)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._start_codex_model_discovery_process",
+        AsyncMock(side_effect=OSError("no installed CLI in app-server unit tests")),
+    )
 
 
 def _test_app_server(

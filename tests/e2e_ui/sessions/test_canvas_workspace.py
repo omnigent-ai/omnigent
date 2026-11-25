@@ -12,6 +12,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.sessions._sidebar_helpers import wait_for_sidebar_collapse
 from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
 
 
@@ -74,27 +75,20 @@ def test_canvas_controls_clear_the_macos_titlebar(
     expand = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(expand).to_have_count(1)
     expect(page.get_by_role("navigation", name="Collapsed sidebar")).to_have_count(0)
-    for control in (expand, heading) if width < 768 else (heading,):
-        bounds = control.bounding_box()
-        assert bounds is not None and bounds["y"] >= titlebar_bottom, (
-            f"Canvas control overlaps the native titlebar: {bounds}, bottom={titlebar_bottom}"
-        )
-    if width >= 768:
-        expect(
-            page.locator(".electron-sidebar-header-actions").get_by_role(
-                "button", name="Open sidebar", exact=True
-            )
-        ).to_be_visible()
-        bounds = expand.bounding_box()
-        assert bounds and bounds["y"] + bounds["height"] <= titlebar_bottom
+    bounds = heading.bounding_box()
+    assert bounds is not None and bounds["y"] >= titlebar_bottom, (
+        f"Canvas heading overlaps the native titlebar: {bounds}, bottom={titlebar_bottom}"
+    )
+    # The desktop app keeps the title-bar cluster at every window width, 720px included.
+    close_scope = ".electron-sidebar-header-actions"
+    expect(
+        page.locator(close_scope).get_by_role("button", name="Open sidebar", exact=True)
+    ).to_be_visible()
+    bounds = expand.bounding_box()
+    assert bounds and bounds["y"] + bounds["height"] <= titlebar_bottom
     expand.click()
     expect(page.get_by_test_id("canvas-nav")).to_be_visible()
-    if width < 768:
-        page.get_by_test_id("sidebar-scrim").click(position={"x": width - 28, "y": 100})
-    else:
-        page.locator(".electron-sidebar-header-actions").get_by_role(
-            "button", name="Close sidebar", exact=True
-        ).click()
+    page.locator(close_scope).get_by_role("button", name="Close sidebar", exact=True).click()
     card = page.locator(f'.react-flow__node[data-id="{first}"]').get_by_test_id("session-card")
     card.click()
     expect(expand).to_have_count(1)
@@ -107,12 +101,7 @@ def test_canvas_controls_clear_the_macos_titlebar(
     expect(expand).to_have_count(1)
     expand.click()
     expect(page.get_by_test_id("canvas-nav")).to_be_visible()
-    if width < 768:
-        page.get_by_test_id("sidebar-scrim").click(position={"x": width - 28, "y": 100})
-    else:
-        page.locator(".electron-sidebar-header-actions").get_by_role(
-            "button", name="Close sidebar", exact=True
-        ).click()
+    page.locator(close_scope).get_by_role("button", name="Close sidebar", exact=True).click()
     bounds = restore.bounding_box()
     assert bounds is not None and bounds["y"] >= titlebar_bottom
     restore.click()
@@ -173,6 +162,7 @@ def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(
     first_card.click()
     expect(composer).to_have_value("Keep this draft while I check another session")
     page.get_by_role("button", name="Close sidebar", exact=True).click()
+    wait_for_sidebar_collapse(page)
 
     divider = page.get_by_role("separator", name="Resize canvas and conversation")
     before = float(divider.get_attribute("aria-valuenow") or "0")
@@ -208,13 +198,13 @@ def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(
     expect(first_card).to_have_attribute("aria-pressed", "true")
     expect(composer).to_have_value("Keep this draft while I check another session")
     assert board.evaluate("element => element.isConnected")
-    page.set_viewport_size({"width": 1024, "height": 800})
+    page.set_viewport_size({"width": 1200, "height": 800})
     close_button = page.get_by_role("button", name="Close conversation pane", exact=True)
     expect(close_button).to_be_in_viewport()
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 
-@pytest.mark.parametrize("width", [1440, 1024])
+@pytest.mark.parametrize("width", [1440, 1200])
 def test_canvas_stays_visible_when_workspace_opens(
     page: Page, canvas_project: tuple[str, str, str, str], width: int
 ) -> None:
@@ -268,7 +258,7 @@ def test_canvas_stays_visible_when_workspace_opens(
     assert board.evaluate("element => element.isConnected")
 
 
-@pytest.mark.parametrize("width", [390, 767])
+@pytest.mark.parametrize("width", [390, 1180])
 def test_canvas_deep_link_and_mobile_return_keep_the_project(
     page: Page,
     canvas_project: tuple[str, str, str, str],
@@ -277,10 +267,19 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
     base_url, first, _second, project_id = canvas_project
     _stub_server_info(page, canvas=True)
     page.set_viewport_size({"width": width, "height": 844})
+    # A wide mobile viewport docks the sidebar beside the page, with no scrim.
+    docked = width >= 600
+
+    def close_sidebar() -> None:
+        if docked:
+            page.get_by_role("button", name="Close sidebar", exact=True).click()
+        else:
+            page.get_by_test_id("sidebar-scrim").click(position={"x": width - 28, "y": 100})
+
     page.goto(f"{base_url}/c/{first}")
     menu = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(menu).to_be_visible()
-    ordinary_icon = menu.locator("svg").inner_html()
+    ordinary_icon = menu.locator("svg.lucide").inner_html()
     ordinary_bounds = menu.bounding_box()
     assert ordinary_bounds is not None
 
@@ -298,20 +297,20 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
     expect(first_card).to_be_visible()
     expect(page.get_by_role("navigation", name="Collapsed sidebar")).not_to_be_visible()
     expect(menu).to_be_visible()
-    assert menu.locator("svg").inner_html() == ordinary_icon
+    assert menu.locator("svg.lucide").inner_html() == ordinary_icon
     board_bounds = menu.bounding_box()
     assert board_bounds is not None
     for key in ("x", "y", "width", "height"):
         assert board_bounds[key] == pytest.approx(ordinary_bounds[key], abs=1)
     menu.click()
     expect(page.get_by_test_id("canvas-nav")).to_be_visible()
-    page.get_by_test_id("sidebar-scrim").click(position={"x": width - 28, "y": 100})
+    close_sidebar()
     expect(menu).to_be_visible()
 
     first_card.click()
     expect(page.get_by_role("button", name="Back to canvas", exact=True)).to_be_visible()
     expect(menu).to_be_visible()
-    assert menu.locator("svg").inner_html() == ordinary_icon
+    assert menu.locator("svg.lucide").inner_html() == ordinary_icon
     conversation_bounds = menu.bounding_box()
     assert conversation_bounds is not None
     for key in ("x", "y", "width", "height"):
@@ -319,6 +318,8 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
     menu.click()
     page.get_by_test_id("canvas-nav").click()
     expect(page).to_have_url(re.compile(rf"/canvas\?canvas={re.escape(project_id)}$"))
+    if docked:
+        close_sidebar()
     expect(menu).to_be_visible()
     first_card.click()
     expect(page.get_by_role("button", name="Back to canvas", exact=True)).to_be_visible()

@@ -190,8 +190,27 @@ class TestInjectModelGate:
     unavailable id would press Enter against "No matches" and mis-select.
     """
 
+    @pytest.mark.parametrize(
+        ("model", "display_name", "pane"),
+        [
+            ("gpt-5.2", "GPT-5.2", f'{_IDLE}\nModels matching "gpt-5.2"\n →  GPT-5.2   High'),
+            (
+                "gemini-4-neon",
+                "Gemini 4 Neon",
+                f"{_IDLE}\n  → /model gemini-4-neon\n"
+                ' Models matching "gemini-4-neon"\n'
+                " →  Gemini 4 Neon            300K High (Tab to modify)",
+            ),
+        ],
+        ids=["picker-only", "composer-arrow-above-picker"],
+    )
     def test_presses_enter_when_picker_matches(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        model: str,
+        display_name: str,
+        pane: str,
     ) -> None:
         """A landed filter ("Models matching") commits the selection with Enter."""
         bridge_dir = _prepare_bridge(tmp_path)
@@ -200,19 +219,17 @@ class TestInjectModelGate:
             "_live_cursor_model_options",
             lambda: pytest.fail("cached display name must avoid a second CLI listing"),
         )
-        captured = _install_fake_tmux(
-            monkeypatch, pane_captures=[f'{_IDLE}\nModels matching "gpt-5.2"\n →  GPT-5.2   High']
-        )
+        captured = _install_fake_tmux(monkeypatch, pane_captures=[pane])
         monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
 
         cursor_native_bridge.inject_model_command(
             bridge_dir,
-            model="gpt-5.2",
-            expected_display_name="GPT-5.2",
+            model=model,
+            expected_display_name=display_name,
         )
 
         tails = _send_keys_calls(captured)
-        assert ["-t", _TARGET, "-l", "/model gpt-5.2"] in tails  # the filter command
+        assert ["-t", _TARGET, "-l", f"/model {model}"] in tails  # the filter command
         assert ["-t", _TARGET, "Enter"] in tails  # selection committed
         assert ["-t", _TARGET, "Escape"] not in tails  # no dismiss on a real match
 
@@ -320,6 +337,26 @@ def test_picker_row_matches_complete_display_label(
 ) -> None:
     """Variant suffixes are allowed, but longer-name prefixes are not."""
     assert cursor_native_bridge._picker_row_matches_display(row, display_name) is expected
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        ("→ /model model-a\n →  Model A   High", None),
+        ('→ /model model-a\nModels matching "model-a"\n   Model A', None),
+        ('→ /model model-a\nModels matching "model-a"\n →  Model A   High', "Model A   High"),
+        (
+            'Models matching "model-a"\n →  Model A\nModels matching "model-b"\n →  Model B',
+            "Model B",
+        ),
+    ],
+    ids=["no-header", "no-highlight-below-header", "composer-above-header", "last-header-wins"],
+)
+def test_picker_highlighted_row_reads_below_the_last_header(
+    pane: str, expected: str | None
+) -> None:
+    """Only a highlighted row under the latest picker header counts."""
+    assert cursor_native_bridge._picker_highlighted_row(pane) == expected
 
 
 class TestHooksConfig:

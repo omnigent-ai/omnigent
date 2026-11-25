@@ -1,5 +1,5 @@
 // Real initial onboarding UI, preload, main process, and subprocess runners.
-// Arca, SSH, Companion, SSO, and the destination server are local fixtures;
+// Arca, SSH, SSO, and the destination server are local fixtures;
 // this does not validate live sign-in or remote callback forwarding.
 // Run after: pnpm --filter web run build:server-selector-v2
 // Run: node --test web/electron/e2e/desktop_arca_onboarding.e2e.js

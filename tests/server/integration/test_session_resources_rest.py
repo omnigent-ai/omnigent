@@ -12,11 +12,15 @@ route-to-store pipeline without subprocesses.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from omnigent.runner.tool_dispatch import execute_tool
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -125,6 +129,79 @@ async def test_file_upload_and_download(client: httpx.AsyncClient) -> None:
     assert res_resp.status_code == 200
     res_ids = [r["id"] for r in res_resp.json()["data"]]
     assert file_id in res_ids
+
+
+# ── 4b. Session file tools through the real routes ────────
+
+
+async def _file_tool(
+    client: httpx.AsyncClient,
+    session_id: str,
+    workspace: Path,
+    name: str,
+    **args: str,
+) -> str:
+    """
+    Call a session file tool the way the runner dispatches a native relay call.
+
+    :param client: The test HTTP client, standing in for the runner's server client.
+    :param session_id: The calling session, e.g. ``"conv_abc123"``.
+    :param workspace: The session's own workspace, where its native terminal runs.
+    :param name: File tool name, e.g. ``"sys_files_upload"``.
+    :param args: Tool arguments, e.g. ``path="out/report.txt"``.
+    :returns: The tool's output string.
+    """
+    return await execute_tool(
+        tool_name=name,
+        arguments=json.dumps(args),
+        server_client=client,
+        agent_spec=AgentSpec(
+            spec_version=1,
+            skills_filter="none",
+            executor=ExecutorSpec(config={"harness": "claude-native"}),
+            tool_groups=ToolGroupsConfig(files=True),
+        ),
+        conversation_id=session_id,
+        runner_workspace=workspace,
+        session_workspace=workspace,
+        effective_harness="claude-native",
+    )
+
+
+async def test_file_tools_round_trip_through_the_real_server(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """
+    The file tools, called from a native harness whose spec turns them on,
+    upload a workspace file to the calling session, list it and read it back,
+    while another session can neither list nor read it.
+    """
+    agent = await create_test_agent(client)
+    session_id = (await _create_session(client, agent["id"]))["id"]
+    other_session_id = (await _create_session(client, agent["id"]))["id"]
+    workspace = tmp_path / "workspace"
+    (workspace / "out").mkdir(parents=True)
+    (workspace / "out" / "report.txt").write_text("quarterly report\n")
+
+    uploaded = json.loads(
+        await _file_tool(client, session_id, workspace, "sys_files_upload", path="out/report.txt")
+    )
+    listed = json.loads(await _file_tool(client, session_id, workspace, "sys_files_list"))
+    downloaded = await _file_tool(
+        client, session_id, workspace, "sys_files_download", file_id=uploaded["file_id"]
+    )
+    other_listed = json.loads(
+        await _file_tool(client, other_session_id, workspace, "sys_files_list")
+    )
+    other_downloaded = await _file_tool(
+        client, other_session_id, workspace, "sys_files_download", file_id=uploaded["file_id"]
+    )
+
+    assert uploaded["filename"] == "report.txt"
+    assert [entry["id"] for entry in listed["data"]] == [uploaded["file_id"]]
+    assert downloaded == "quarterly report\n"
+    assert other_listed["data"] == []
+    assert other_downloaded == "Error: download returned 404"
 
 
 # ── 5. File delete ────────────────────────────────────────

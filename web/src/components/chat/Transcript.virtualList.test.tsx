@@ -1,10 +1,17 @@
 import { measureElement, useVirtualizer } from "@tanstack/react-virtual";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
 import { useChatStore } from "@/store/chatStore";
-import { isNativeFindShortcut, type TranscriptGeometry, VirtualBubbleList } from "./Transcript";
+import {
+  isNativeFindShortcut,
+  type TranscriptGeometry,
+  VirtualBubbleList,
+  visibleTranscriptBubbles,
+} from "./Transcript";
 
 afterEach(cleanup);
 
@@ -22,6 +29,54 @@ const assistantBubble: Extract<Bubble, { kind: "assistant" }> = {
   error: null,
   items: [{ kind: "text", itemId: "assistant-1", text: "hello back", final: true }],
 };
+
+it("omits hidden sub-agent wakes from visible row geometry", () => {
+  const wake: Bubble = {
+    kind: "user",
+    itemId: "wake",
+    content: [
+      {
+        type: "input_text",
+        text: "[System: sub-agent Dewey finished (completed) \u2014 1 result waiting in inbox. Call sys_read_inbox to collect.]",
+      },
+    ],
+  };
+  const timer: Bubble = {
+    kind: "user",
+    itemId: "timer",
+    content: [{ type: "input_text", text: "[System: timer reminder fired]" }],
+  };
+  const bubbles = [assistantBubble, wake, timer, bubble];
+  const visible = visibleTranscriptBubbles(bubbles);
+
+  expect(visible).toEqual([assistantBubble, timer, bubble]);
+  const malformed: Bubble = {
+    kind: "user",
+    itemId: "malformed",
+    content: [{ type: "input_text", text: null as unknown as string }],
+  };
+  expect(visibleTranscriptBubbles([malformed, wake])).toEqual([malformed]);
+  const wakeWithBody: Bubble = {
+    ...wake,
+    itemId: "wake-with-body",
+    content: [...wake.content, { type: "input_text", text: "\nOther context" }],
+  };
+  expect(visibleTranscriptBubbles([wakeWithBody])).toEqual([wakeWithBody]);
+  expect(visibleTranscriptBubbles(visible)).toBe(visible);
+  render(list(false, document.createElement("div"), vi.fn(), false, visible));
+  expect(vi.mocked(useVirtualizer).mock.lastCall?.[0].count).toBe(3);
+});
+
+it("drops messages from other sessions only when they are hidden", () => {
+  const peer: Bubble = {
+    kind: "user",
+    itemId: "peer",
+    content: [{ type: "input_text", text: "[Message from session s_src]\nreport" }],
+  };
+  const bubbles = [bubble, peer, assistantBubble];
+  expect(visibleTranscriptBubbles(bubbles)).toBe(bubbles);
+  expect(visibleTranscriptBubbles(bubbles, true)).toEqual([bubble, assistantBubble]);
+});
 
 function list(
   hasTasks: boolean,
@@ -183,13 +238,31 @@ it("recognizes unhandled native find keyboard shortcuts", () => {
   ).toBe(false);
 });
 
-it("renders every bubble in normal flow after native find is detected", () => {
+it("renders every bubble in normal flow after native find, keeping the selected row", () => {
   const scrollEl = document.createElement("div");
+  const bubbles = [bubble, assistantBubble];
+  // Mount only the reply, so turning virtualization off inserts a row before it.
+  const passThrough = vi.mocked(useVirtualizer).getMockImplementation()!;
+  vi.mocked(useVirtualizer).mockImplementation((options) => {
+    const row = { index: 1, key: options.getItemKey!(1), start: 0, size: 200, end: 200, lane: 0 };
+    return { ...passThrough(options), getVirtualItems: () => [row] } as never;
+  });
+  try {
+    const view = render(list(false, scrollEl, vi.fn(), false, bubbles));
+    expect(view.container.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(1);
+    const selected = within(view.container).getByText("hello back").firstChild!;
+    const selection = window.getSelection()!;
+    selection.setBaseAndExtent(selected, 0, selected, 5);
 
-  const view = render(list(false, scrollEl, vi.fn(), true));
+    view.rerender(list(false, scrollEl, vi.fn(), true, bubbles));
 
-  expect(view.container.querySelector('[data-index="0"]')).toBeNull();
-  expect(view.container.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(1);
+    expect(view.container.querySelector("[data-index]")).toBeNull();
+    expect(view.container.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(2);
+    expect(within(view.container).getByText("hello back").firstChild).toBe(selected);
+    expect(selection.toString()).toBe("hello");
+  } finally {
+    vi.mocked(useVirtualizer).mockImplementation(passThrough);
+  }
 });
 
 it("keeps actions visible only on a final assistant message while idle", () => {
@@ -246,6 +319,91 @@ it("keeps every action row hover-only when the final message is from the user", 
 
   for (const button of screen.getAllByRole("button", { name: "Copy" })) {
     expect(actionFooter(button)).toHaveClass("md:opacity-0");
+  }
+});
+
+it("toggles mobile message actions on tap and shows the latest assistant's actions by default", async () => {
+  const user = userEvent.setup();
+  const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
+  const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+    ...mediaQuery,
+    media: query,
+    matches: query === "(max-width: 1180.98px)",
+  }));
+  try {
+    const olderReply = {
+      ...assistantBubble,
+      items: [
+        { kind: "text" as const, itemId: "assistant-1", text: "[Details](#details)", final: true },
+      ],
+    };
+    const latestReply = { ...assistantBubble, responseId: "response-2", stableId: "response-2" };
+    const followUp = { ...bubble, itemId: "user-2" };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(messageList([bubble, olderReply, latestReply, followUp], true, false), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    const footers = screen.getAllByRole("button", { name: "Copy" }).map(actionFooter);
+
+    expect(footers[0]).toHaveClass("invisible", "opacity-0");
+    expect(footers[1]).toHaveClass("invisible", "opacity-0");
+    expect(footers[2]).toHaveClass("opacity-100");
+    expect(footers[2]).not.toHaveClass("invisible");
+    expect(footers[3]).toHaveClass("invisible", "opacity-0");
+
+    const olderMessage = view.container.querySelector<HTMLElement>(
+      '[data-message-id="response-1"]',
+    )!;
+    fireEvent.click(within(olderMessage).getByRole("link", { name: "Details" }));
+    expect(footers[1]).toHaveClass("invisible");
+    const reveal = within(olderMessage).getByRole("button", { name: "Show message actions" });
+    expect(document.getElementById(reveal.getAttribute("aria-controls")!)).toBe(footers[1]);
+    reveal.focus();
+    await user.keyboard("{Enter}");
+    expect(reveal).toHaveAttribute("aria-expanded", "true");
+    expect(footers[1]).not.toHaveClass("invisible");
+    await user.click(within(olderMessage).getByRole("button", { name: "Copy" }));
+    expect(footers[1]).not.toHaveClass("invisible");
+    reveal.focus();
+    await user.keyboard(" ");
+    expect(reveal).toHaveAttribute("aria-expanded", "false");
+    expect(footers[1]).toHaveClass("invisible");
+
+    fireEvent.click(view.container.querySelector('[data-message-id="user-1"]')!);
+    fireEvent.click(view.container.querySelector('[data-message-id="response-1"]')!);
+    expect(footers[0]).not.toHaveClass("invisible");
+    expect(footers[1]).not.toHaveClass("invisible");
+    expect(footers[3]).toHaveClass("invisible");
+    fireEvent.click(view.container.querySelector('[data-message-id="user-1"]')!);
+    fireEvent.click(view.container.querySelector('[data-message-id="response-1"]')!);
+    expect(footers[0]).toHaveClass("invisible");
+    expect(footers[1]).toHaveClass("invisible");
+
+    view.rerender(
+      messageList(
+        [
+          bubble,
+          olderReply,
+          latestReply,
+          followUp,
+          { ...assistantBubble, responseId: "response-3", stableId: "response-3" },
+        ],
+        false,
+        true,
+      ),
+    );
+    const updatedFooters = screen.getAllByRole("button", { name: "Copy" }).map(actionFooter);
+    expect(updatedFooters[2]).toHaveClass("invisible");
+    expect(updatedFooters[4]).toHaveClass("opacity-100");
+    expect(updatedFooters[4]).not.toHaveClass("invisible");
+    fireEvent.click(view.container.querySelector('[data-message-id="response-3"]')!);
+    expect(updatedFooters[4]).toHaveClass("invisible");
+    fireEvent.click(view.container.querySelector('[data-message-id="response-3"]')!);
+    expect(updatedFooters[4]).not.toHaveClass("invisible");
+  } finally {
+    matchMedia.mockRestore();
   }
 });
 

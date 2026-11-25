@@ -1,19 +1,34 @@
+import { readFileSync } from "node:fs";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type * as fileContentModule from "@/hooks/useFileContent";
+import type * as rehypeSlugModule from "rehype-slug";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
-import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
+import { connectHtmlPreviewBridge, requestedScrollRestore } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+const slugRuns = vi.hoisted(() => ({ count: 0 }));
+vi.mock("rehype-slug", async (importOriginal) => {
+  const actual = await importOriginal<typeof rehypeSlugModule>();
+  return {
+    default: (...args: Parameters<typeof actual.default>) => {
+      const transform = actual.default(...args);
+      return (...transformArgs: Parameters<typeof transform>) => {
+        slugRuns.count += 1;
+        return transform(...transformArgs);
+      };
+    },
+  };
+});
 vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
   ...(await importOriginal<typeof fileContentModule>()),
   useFileContent: vi.fn(() => ({ data: undefined })),
@@ -65,12 +80,18 @@ vi.mock("./ModelViewer", () => ({
 }));
 
 import * as permissions from "@/hooks/usePermissions";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { saveScrollTop } from "./useScrollRestore";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function makeFileQuery(content: string, truncated = false): ReturnType<typeof useFileContent> {
+function makeFileQuery(
+  content: string,
+  truncated = false,
+  encoding: "utf-8" | "base64" = "utf-8",
+): ReturnType<typeof useFileContent> {
   return {
-    data: { content, encoding: "utf-8", truncated },
+    data: { content, encoding, truncated },
     isLoading: false,
     isError: false,
     isSuccess: true,
@@ -126,6 +147,11 @@ interface ViewerOptions {
   mediaActive?: boolean;
   position?: { line: number; endLine?: number };
   onRequestEditMode?: () => void;
+  /** How the server sent the content: text, or base64 for a non-UTF-8 or binary file. */
+  encoding?: "utf-8" | "base64";
+  searchOpen?: boolean;
+  setSearchOpen?: (open: boolean) => void;
+  ownsFindShortcut?: () => boolean;
 }
 
 function renderViewer(
@@ -148,20 +174,46 @@ function viewerElement(content: string, panelOpen: boolean, path: string, opts: 
       position={opts.position}
       conversationId={opts.conversationId ?? "conv_1"}
       path={path}
-      fileQuery={makeFileQuery(content, opts.truncated)}
+      fileQuery={makeFileQuery(content, opts.truncated, opts.encoding)}
       comments={[]}
       activeSelection={null}
       onSetActiveSelection={() => {}}
       panelOpen={panelOpen}
       mediaActive={opts.mediaActive}
-      searchOpen={false}
-      setSearchOpen={() => {}}
+      searchOpen={opts.searchOpen ?? false}
+      setSearchOpen={opts.setSearchOpen ?? (() => {})}
+      ownsFindShortcut={opts.ownsFindShortcut}
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
       onRequestEditMode={opts.onRequestEditMode}
     />
   );
 }
+
+describe("Cmd+F on a rendered preview", () => {
+  it.each([
+    ["the viewer is where the user is working", true],
+    ["the user is working in the chat beside it", false],
+  ])("opens the file's find only when %s", (_label, owned) => {
+    const setSearchOpen = vi.fn();
+    renderViewer("name\nalpha\n", true, "sales.csv", {
+      viewMode: "preview",
+      setSearchOpen,
+      ownsFindShortcut: () => owned,
+    });
+    const mac = isMacPlatform();
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: mac,
+      ctrlKey: !mac,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+    expect(setSearchOpen.mock.calls).toEqual(owned ? [[true]] : []);
+    // Left alone, the press reaches the browser (or the chat) as before.
+    expect(event.defaultPrevented).toBe(owned);
+  });
+});
 
 describe("video previews", () => {
   it("does not mount a player when the editor remains open in a hidden rail", () => {
@@ -842,29 +894,37 @@ describe("CodeViewer HTML preview sandbox", () => {
     expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
   });
 
+  // Each case starts from its own path: the scroll cache is module-level and outlives a test.
   it.each([
-    ["another file", "b.html", "conv_1"],
-    ["the same path in another conversation", "a.html", "conv_2"],
-  ])("opens %s at 100% zoom", async (_, nextPath, nextConversationId) => {
-    const html = "<html><head></head><body><p>report</p></body></html>";
-    const { rerender } = renderViewer(html, true, "a.html", { viewMode: "preview" });
-    const { port, send } = await connectHtmlPreviewBridge(
-      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
-    );
-    send({ type: BRIDGE_MSG.zoom, action: "in" });
-    const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
-    await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
+    ["another file", "a.html", "b.html", "conv_1"],
+    ["the same path in another conversation", "shared.html", "shared.html", "conv_2"],
+  ])(
+    "opens %s at 100% zoom and without the first preview's scroll offset",
+    async (_, path, nextPath, nextConversationId) => {
+      const html = "<html><head></head><body><p>report</p></body></html>";
+      const opened = (filePath: string, conversationId: string) =>
+        viewerElement(html, true, filePath, { viewMode: "preview", conversationId });
+      const { rerender } = render(opened(path, "conv_1"));
+      expect(requestedScrollRestore()).toBeNull();
+      const { port, send } = await connectHtmlPreviewBridge(
+        screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+      );
+      send({ type: BRIDGE_MSG.scroll, top: 760 });
+      // Port messages arrive in order, so the zoom also shows the offset was handled.
+      send({ type: BRIDGE_MSG.zoom, action: "in" });
+      const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
+      await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
 
-    // The content stays loaded, as it does for a cached file.
-    rerender(
-      viewerElement(html, true, nextPath, {
-        viewMode: "preview",
-        conversationId: nextConversationId,
-      }),
-    );
-    expect(zoomBox().style.transform).toBe("");
-    port.close();
-  });
+      // The content stays loaded, as it does for a cached file.
+      rerender(opened(nextPath, nextConversationId));
+      expect(zoomBox().style.transform).toBe("");
+      expect(requestedScrollRestore()).toBeNull();
+      port.close();
+
+      rerender(opened(path, "conv_1"));
+      expect(requestedScrollRestore()).toMatchObject({ top: 760 });
+    },
+  );
 });
 
 describe("CodeViewer rendered previews skip Shiki highlighting", () => {
@@ -1209,6 +1269,144 @@ describe("CodeViewer .ipynb routing", () => {
   });
 });
 
+describe("CodeViewer data-file routing", () => {
+  const CITIES = "city,people\nOslo,700000\n";
+
+  it("renders a CSV as a table in preview mode", () => {
+    renderViewer(CITIES, true, "sales.csv", { viewMode: "preview" });
+    expect(screen.getByRole("table", { name: "sales.csv" })).toBeDefined();
+    expect(screen.getByRole("cell", { name: "Oslo" })).toBeDefined();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("keeps the raw text in source mode", async () => {
+    renderViewer(CITIES, true, "sales.csv", { viewMode: "source" });
+    // Monaco loads lazily.
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeDefined();
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+
+  it("tables a CSV the server sent as base64 instead of calling it binary", () => {
+    // "café" in Windows-1252, which isn't valid UTF-8.
+    const latin1 = btoa("name\ncaf\u00e9");
+    renderViewer(latin1, true, "sales.csv", { viewMode: "preview", encoding: "base64" });
+    expect(screen.getByRole("cell", { name: "café" })).toBeDefined();
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+  });
+
+  it("opens find in the table and finds again after filtering, sorting or emptying", async () => {
+    // jsdom has neither layout nor the CSS Custom Highlight API the find bar uses.
+    const rangeRect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
+    const scrollBy = Object.getOwnPropertyDescriptor(Element.prototype, "scrollBy");
+    Range.prototype.getBoundingClientRect = () => ({ top: 0, bottom: 0 }) as DOMRect;
+    Element.prototype.scrollBy = () => {};
+    // The text of the cell holding the current match.
+    let currentCell: string | null = null;
+    vi.stubGlobal(
+      "Highlight",
+      class {
+        ranges: Range[];
+        constructor(...ranges: Range[]) {
+          this.ranges = ranges;
+        }
+        add(range: Range) {
+          this.ranges.push(range);
+        }
+      },
+    );
+    vi.stubGlobal("CSS", {
+      highlights: {
+        set: (name: string, highlight: { ranges: Range[] }) => {
+          if (name.endsWith("-current")) {
+            currentCell = highlight.ranges[0]?.startContainer.textContent ?? null;
+          }
+        },
+        delete: () => {},
+      },
+    });
+    try {
+      // The viewer's find request opens find in the table.
+      const options = { viewMode: "preview", searchOpen: true } as const;
+      const view = renderViewer("name\nalpha\nbeta\nalpha two\n", true, "sales.csv", options);
+      fireEvent.change(screen.getByPlaceholderText("Find…"), { target: { value: "alpha" } });
+      expect(screen.getByText("1 / 2")).toBeDefined();
+      expect(currentCell).toBe("alpha");
+
+      const filter = screen.getByRole("textbox", { name: "Filter name" });
+      fireEvent.change(filter, { target: { value: "beta" } });
+      expect(screen.getByText("No results")).toBeDefined();
+      fireEvent.change(filter, { target: { value: "" } });
+      expect(screen.getByText("1 / 2")).toBeDefined();
+
+      // Sorted descending, "alpha two" comes before "alpha", and find follows.
+      const sort = screen.getByRole("button", { name: "Sort by name" });
+      fireEvent.click(sort);
+      fireEvent.click(sort);
+      expect(screen.getByText("1 / 2")).toBeDefined();
+      expect(currentCell).toBe("alpha two");
+
+      // The file is emptied on disk and refreshed at the same path.
+      view.rerender(viewerElement("", true, "sales.csv", options));
+      expect(screen.getByText(/This file has no rows/)).toBeDefined();
+      expect(screen.getByText("No results")).toBeDefined();
+
+      // A workbook refreshed into one the preview can't read leaves no stale matches.
+      const book = { ...options, encoding: "base64" } as const;
+      const workbook = readFileSync("src/shell/__fixtures__/sales.xlsx").toString("base64");
+      view.rerender(viewerElement(workbook, true, "sales.xlsx", book));
+      await screen.findByRole("tab", { name: "Sales" });
+      fireEvent.change(screen.getByPlaceholderText("Find…"), { target: { value: "West" } });
+      expect(screen.getByText("1 / 1")).toBeDefined();
+      view.rerender(viewerElement(btoa("not a zip"), true, "sales.xlsx", book));
+      await screen.findByRole("alert");
+      expect(screen.getByText("No results")).toBeDefined();
+    } finally {
+      vi.unstubAllGlobals();
+      for (const [target, name, original] of [
+        [Range.prototype, "getBoundingClientRect", rangeRect],
+        [Element.prototype, "scrollBy", scrollBy],
+      ] as const) {
+        if (original) Object.defineProperty(target, name, original);
+        else Reflect.deleteProperty(target, name);
+      }
+    }
+  });
+
+  it("reads a workbook the server sent as UTF-8 text because its bytes allowed it", async () => {
+    // A stored workbook whose every byte is ASCII, so the file API returns it as text.
+    const workbook = readFileSync("src/shell/__fixtures__/ascii-stored.xlsx", "utf8");
+    renderViewer(workbook, true, "plain.xlsx", { viewMode: "preview", encoding: "utf-8" });
+    expect(await screen.findByRole("cell", { name: "pens" })).toBeDefined();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("restores a workbook's saved scroll position once its table has loaded", async () => {
+    // The preview first shows "Reading the file…" (no scroller); the restore
+    // must wait for the table rather than give up on the placeholder.
+    saveScrollTop("viewer-preview:conv_1:sales.xlsx", 300);
+    const workbook = readFileSync("src/shell/__fixtures__/sales.xlsx").toString("base64");
+    renderViewer(workbook, true, "sales.xlsx", { viewMode: "preview", encoding: "base64" });
+    expect(screen.getByText(/Reading the file/)).toBeDefined();
+    await screen.findByRole("tab", { name: "Sales" });
+    const scroller = document.querySelector<HTMLElement>("[data-preview-scroll]");
+    await waitFor(() => expect(scroller?.scrollTop).toBe(300));
+  });
+
+  it("opens an Excel workbook on its table even in source mode", async () => {
+    const workbook = readFileSync("src/shell/__fixtures__/sales.xlsx").toString("base64");
+    renderViewer(workbook, true, "sales.xlsx", { viewMode: "source", encoding: "base64" });
+    expect(await screen.findByRole("tab", { name: "Sales" })).toBeDefined();
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("shows the shared truncation banner for a partial file", () => {
+    renderViewer(CITIES, true, "sales.csv", { viewMode: "preview", truncated: true });
+    expect(screen.getByText(/too large to load fully/)).toBeDefined();
+    expect(screen.getByTestId("data-table-summary").textContent).toContain("At least 1 row ");
+  });
+});
+
 describe("source line navigation", () => {
   it("centers and highlights the requested Markdown source line", () => {
     const scroll = vi.fn();
@@ -1270,17 +1468,52 @@ it.each([true, false])(
 );
 
 describe("large Markdown source fallback", () => {
-  it.each(["editor", "preview", "source"] as const)("uses Monaco in %s mode", async (viewMode) => {
+  const large = "# Large heading\n\n" + "a".repeat(MAX_RICH_MARKDOWN_BYTES + 1);
+
+  it("edits in Monaco from source mode", async () => {
     vi.mocked(highlightCode).mockClear();
-    renderViewer("a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), true, "large.md", {
-      viewMode,
-      markdownSourceFallback: true,
-    });
+    renderViewer(large, true, "large.md", { viewMode: "source", markdownSourceFallback: true });
     expect(await screen.findByTestId("monaco-editor-stub")).toBeVisible();
     expect(screen.getByTestId("monaco-editor-stub")).toHaveAttribute("data-large-markdown", "true");
     expect(highlightCode).not.toHaveBeenCalled();
     expect(screen.queryByText(/too large to load fully/)).not.toBeInTheDocument();
   });
+
+  it("renders the preview, whose edit hint opens source", async () => {
+    vi.mocked(highlightCode).mockClear();
+    const onRequestEditMode = vi.fn();
+    renderViewer(large, true, "large.md", {
+      viewMode: "preview",
+      markdownSourceFallback: true,
+      onRequestEditMode,
+    });
+    expect(await screen.findByRole("heading", { name: "Large heading" })).toBeVisible();
+    expect(screen.queryByTestId("monaco-editor-stub")).not.toBeInTheDocument();
+    expect(highlightCode).not.toHaveBeenCalled();
+    expect(document.querySelector(".markdown-preview")?.className).toContain(
+      "content-visibility:auto",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /switch to edit mode/i }));
+    expect(onRequestEditMode).toHaveBeenCalledOnce();
+  });
+});
+
+it("does not re-parse the Markdown preview when only unrelated props change", async () => {
+  slugRuns.count = 0;
+  const opts = { viewMode: "preview" } as const;
+  const view = render(viewerElement("# Stable", true, "notes.md", opts));
+  expect(await screen.findByRole("heading", { name: "Stable" })).toBeVisible();
+  const parsesAfterMount = slugRuns.count;
+  expect(parsesAfterMount).toBeGreaterThan(0);
+  view.rerender(viewerElement("# Stable", true, "notes.md", { ...opts, mediaActive: false }));
+  view.rerender(viewerElement("# Stable", false, "notes.md", opts));
+  expect(slugRuns.count).toBe(parsesAfterMount);
+  expect(document.querySelector(".markdown-preview")?.className).not.toContain(
+    "content-visibility",
+  );
+  view.rerender(viewerElement("# Changed", true, "notes.md", opts));
+  expect(await screen.findByRole("heading", { name: "Changed" })).toBeVisible();
+  expect(slugRuns.count).toBeGreaterThan(parsesAfterMount);
 });
 
 describe("CodeViewer refresh failures", () => {

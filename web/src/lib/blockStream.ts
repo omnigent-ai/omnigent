@@ -42,6 +42,7 @@ import {
 import type { AssistantMessagePhase } from "./conversationItems";
 import type { StreamEvent } from "./events";
 import { routingExtras } from "./routingDecision";
+import { subagentHandbackReport } from "./subagentHandback";
 import type { Response } from "./types";
 
 const DEFAULT_FLUSH_THRESHOLD = 30;
@@ -530,6 +531,22 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       //
       // Non-MCP paths emit exactly one ToolCall per callId, so the
       // second-arrival branch never fires for them.
+      const handbackReport = subagentHandbackReport(event.name, event.arguments);
+      if (handbackReport !== null) {
+        // The handback's result only confirms delivery, so drop it like a repeat.
+        state.seenResultCallIds.add(`${event.responseId || state.responseId}:${event.callId}`);
+        if (state.seenCallIds.has(event.callId)) return;
+        state.seenCallIds.add(event.callId);
+        yield* closeReasoning(state);
+        yield* closeText(state);
+        yield {
+          type: "text_done",
+          ctx: ctx(state, event.itemId || null, event.responseId || null),
+          fullText: handbackReport,
+          hasCodeBlocks: handbackReport.includes("```"),
+        } satisfies TextDone;
+        return;
+      }
       if (state.seenCallIds.has(event.callId)) {
         // Already rendered the call line for this callId. Re-register
         // in pendingTools so the eventual `ToolResult` can pair by
@@ -927,6 +944,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
             : ctx(state),
         elicitationId: event.elicitationId,
         ...(event.nativeDelivery ? { nativeDelivery: event.nativeDelivery } : {}),
+        ...(event.isBlocking === false ? { isBlocking: false as const } : {}),
         targetSessionId: event.targetSessionId,
         message: event.message,
         phase: event.phase,
@@ -937,7 +955,9 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         status: "pending",
         response: null,
         askUserQuestion: event.askUserQuestion,
+        ...(event.journalStep ? { journalStep: event.journalStep } : {}),
         exitPlanMode: event.exitPlanMode,
+        fileEdit: event.fileEdit,
         codexCommand: event.codexCommand,
         allowAllEdits: event.allowAllEdits,
         allowAutoMode: event.allowAutoMode,

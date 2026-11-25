@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sys
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -22,7 +24,10 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
-from omnigent.harnesses.codex_native.side_chat import SideChatEffortUnavailable
+from omnigent.harnesses.codex_native.side_chat import (
+    SideChatEffortUnavailable,
+    SideChatValidationError,
+)
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
@@ -30,6 +35,8 @@ from omnigent.harnesses.kiro_native import main as kiro_native
 from omnigent.runner import create_runner_app, model_option_routes, subagent_work
 from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
+    TerminalExitEvent,
+    TerminalLifecycle,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
@@ -1758,6 +1765,9 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     cfg = tmp_path / "databrickscfg"
     cfg.write_text("[default]\nhost = https://a.example\n[other]\nhost = https://b.example\n")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
     monkeypatch.setattr(codex, "_find_codex_cli", lambda: sys.executable)
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
     profile = "default" if case == "default" else "other"
@@ -1788,7 +1798,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
 
     launch_resolver = Mock(side_effect=resolve_launch)
     monkeypatch.setattr(codex, "resolve_native_codex_launch", launch_resolver)
-    credentials = Mock(side_effect=AssertionError("cache reuse must not acquire credentials"))
+    credentials = Mock(side_effect=AssertionError("write-back must not acquire credentials"))
     monkeypatch.setattr(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
     )
@@ -1885,16 +1895,6 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
                 "codex-native", fingerprints[profile]
             ).parent
             assert len(list(catalog_dir.glob("*.json"))) == 2
-            for provider, host in (
-                ("default", "https://a.example"),
-                ("other", "https://b.example"),
-            ):
-                assert (
-                    codex._resolve_databricks_codex_model(
-                        host, provider, "shared-picker", codex_path=sys.executable
-                    )
-                    == f"{provider}.schema.model"
-                )
             credentials.assert_not_called()
     if case == "missing-spec":
         launch_resolver.assert_not_called()
@@ -2523,9 +2523,11 @@ async def test_events_codex_native_plan_mode_requires_loaded_bridge(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stalled_close", [False, True])
 async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    stalled_close: bool,
 ) -> None:
     """
     POST ``/events`` interrupt on a codex-native session calls
@@ -2565,6 +2567,19 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         transport="ws://127.0.0.1:43210",
         client_name="omnigent-codex-native-runner",
     )
+    close_cancelled: list[bool] = []
+    if stalled_close:
+        from omnigent.runner.native import interrupt as native_interrupt
+
+        monkeypatch.setattr(native_interrupt, "_CODEX_INTERRUPT_CLOSE_TIMEOUT_S", 0.02)
+
+        async def stall_close() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                close_cancelled.append(True)
+
+        monkeypatch.setattr(fake_client, "close", stall_close)
 
     def _fake_client_for_transport(
         transport: str,
@@ -2613,10 +2628,11 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         )
         assert create_resp.status_code == 201, create_resp.text
 
-        int_resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json={"type": "interrupt"},
-        )
+        async with asyncio.timeout(budget(5)):
+            int_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "interrupt"},
+            )
 
         captured_history = list(_session_histories_ref.get(conv_id, []))
         flagged = conv_id in app.state.interrupted_sessions
@@ -2628,7 +2644,8 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
     # 1) The runner reached Codex app-server's structured interrupt path. If
     # this is empty, the handler regressed to a terminal-only or no-op cancel.
     assert fake_client.connected
-    assert fake_client.closed
+    assert fake_client.closed is not stalled_close
+    assert close_cancelled == ([True] if stalled_close else [])
     assert fake_client.requests == [
         (
             "turn/interrupt",
@@ -2747,6 +2764,91 @@ async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
     )
     parent_state = codex_native_bridge.read_bridge_state(bridge_dir)
     assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+    assert pm.cancelled == []
+    assert pm.released == []
+    assert conv_id not in app.state.interrupted_sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_id", "failure", "status"),
+    [
+        ("conv_side", None, 200),
+        (None, None, 400),
+        ("", None, 400),
+        (12, None, 400),
+        ("conv_side", SideChatValidationError("Internal validation detail"), 400),
+        ("conv_side", json.JSONDecodeError("Internal parser detail", "invalid", 0), 503),
+        ("conv_side", RuntimeError("The forwarder is unavailable."), 503),
+        ("conv_side", httpx.ConnectError("Connection lost"), 503),
+    ],
+    ids=[
+        "resumed",
+        "missing-id",
+        "empty-id",
+        "invalid-id",
+        "wrong-child",
+        "invalid-history",
+        "unavailable",
+        "disconnected",
+    ],
+)
+async def test_events_resume_codex_side_chat_leaves_parent_turn_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    child_id: str | int | None,
+    failure: Exception | None,
+    status: int,
+) -> None:
+    from omnigent.harnesses.codex_native import side_chat
+
+    conv_id = "acbeddbbce38421b921a7abbe82f7176"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_parent",
+        ),
+    )
+    resume = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(side_chat, "resume_side_chat", resume)
+    app, pm = await _build_app_for_spec(_harness_spec("codex-native"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
+        )
+        assert created.status_code == 201, created.text
+        spawns_before = list(pm.get_client_calls)
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_side_chat_resume", "codex_side_session_id": child_id},
+        )
+
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {"resumed": True}
+    elif isinstance(failure, SideChatValidationError):
+        assert response.json() == {
+            "error": "invalid_request",
+            "detail": "This session is not a side chat of the active Codex parent.",
+        }
+    elif status == 503:
+        assert response.json() == {
+            "error": "codex_side_chat_unavailable",
+            "detail": "The Codex side chat could not be resumed; try again.",
+        }
+    if isinstance(child_id, str) and child_id:
+        resume.assert_awaited_once_with(bridge_dir, child_id)
+    else:
+        resume.assert_not_awaited()
+    parent_state = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+    assert pm.get_client_calls == spawns_before
     assert pm.cancelled == []
     assert pm.released == []
     assert conv_id not in app.state.interrupted_sessions
@@ -3229,6 +3331,152 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     assert int_resp.status_code == 204, int_resp.text
 
 
+@pytest.mark.parametrize("stop_event", ["interrupt", "stop_session"])
+@pytest.mark.parametrize(
+    "codex_state", ["no-thread", "idle-thread", "mcp-starting", "accepted-in-flight-labelled"]
+)
+@pytest.mark.asyncio
+async def test_events_interrupt_on_codex_native_before_its_thread_cancels_the_held_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    codex_state: str,
+    stop_event: str,
+) -> None:
+    """
+    Stop reaches the runner's turn while its message is not yet in Codex.
+
+    Before Codex has a thread, or once it has one but no turn yet (the thread
+    started while the message was still waiting to be submitted, possibly with
+    its MCP servers still starting), there is no Codex turn to interrupt: the
+    message is in the runner's own turn. Stop must interrupt and cancel that
+    turn, or the message would still be sent; a pending MCP startup is still
+    stopped as before. The runner then closes the turn's ``running`` edge itself,
+    unless Codex accepted the message while the Stop raced its submission: that
+    turn, recorded in the session's own (here CLI-labelled) bridge, keeps its own
+    status.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import app as runner_app_module
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.conftest import _BlockingHarnessClient, _sse
+
+    conv_id = "7a4e2c9b1d3f4e6a8c0b2d4f6a8c0e1b"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    accepted_in_flight = codex_state == "accepted-in-flight-labelled"
+    bridge_id = "0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f" if accepted_in_flight else conv_id
+    if accepted_in_flight:
+
+        async def _labels(*, server_client: Any, session_id: str) -> dict[str, str]:
+            del server_client, session_id
+            return {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id}
+
+        monkeypatch.setattr(runner_app_module, "_session_labels_for_runner_spawn", _labels)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(bridge_id)
+    idle_thread = codex_native_bridge.CodexNativeBridgeState(
+        session_id=conv_id,
+        socket_path="ws://127.0.0.1:43214",
+        thread_id="thread_codex_started",
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id=None,
+    )
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        """Keep Codex from starting, so the session has no bridge state."""
+        del kwargs
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    app_server = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43214", client_name="omnigent-codex-native-runner"
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda transport, **_: app_server
+    )
+
+    class _HarnessEndingOnInterrupt(_BlockingHarnessClient):
+        """Hold the turn's stream open until interrupted, then end it cancelled."""
+
+        async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+            response = await super().post(url, json=json, timeout=timeout)
+            if json == {"type": "interrupt"}:
+                if accepted_in_flight:
+                    # The submission the Stop raced completes: Codex's turn is recorded.
+                    codex_native_bridge.write_bridge_state(
+                        bridge_dir, replace(idle_thread, active_turn_id="turn_accepted")
+                    )
+                self._gate.set()
+            return response
+
+    harness = _HarnessEndingOnInterrupt(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_held"}}),
+            _sse({"type": "response.cancelled", "response": {"id": "resp_held"}}),
+        ],
+        asyncio.Event(),
+    )
+    codex_native_spec = _harness_spec("codex-native")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return codex_native_spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        sent = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        )
+        assert sent.status_code == 202, sent.text
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5)
+        turn = app.state.active_turns[conv_id]
+        queue = _session_event_queues_ref.get(conv_id)
+        _drain_session_event_queue(queue)
+        if codex_state != "no-thread":
+            codex_native_bridge.write_bridge_state(bridge_dir, idle_thread)
+        if codex_state == "mcp-starting":
+            codex_native_bridge.update_mcp_server_startup(
+                bridge_dir, "storage-console", "starting"
+            )
+
+        stopped = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": stop_event})
+        assert stopped.status_code == 204, stopped.text
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(turn, timeout=5)
+        events = _drain_session_event_queue(queue)
+
+    # The harness was told to stop the held turn, which ended cancelled, and the Stop settled.
+    assert {"type": "interrupt"} in harness.patched_events
+    assert turn.done()
+    assert conv_id not in app.state.interrupted_sessions
+    # With no Codex turn, nothing else closes the turn's ``running`` edge, so the runner does.
+    statuses = [e.get("status") for e in events if e.get("type") == "session.status"]
+    assert statuses == ([] if accepted_in_flight else ["idle"]), events
+    if codex_state == "mcp-starting":
+        # The MCP startup is still stopped: its servers cancelled and the startup interrupt sent.
+        assert codex_native_bridge.read_mcp_startup(bridge_dir) == {
+            "storage-console": {"status": "cancelled", "error": None}
+        }
+        assert app_server.requests == [
+            ("turn/interrupt", {"threadId": "thread_codex_started", "turnId": ""})
+        ]
+    else:
+        assert app_server.requests == []
+
+
 class _StaleTurnCodexAppServerClient(_RecordingCodexAppServerClient):
     """Codex app-server double that faults the recorded-turn interrupt.
 
@@ -3449,11 +3697,15 @@ async def test_events_codex_native_stop_after_completed_turn_is_noop_not_503(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["response_error", "connect", "request", "close"])
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
 async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    failure_stage: str,
+    event_type: str,
 ) -> None:
-    """A genuine Codex interrupt failure still surfaces as a 503.
+    """Failed and unanswered Codex controls return 503 without clearing the turn.
 
     The reconcile is narrow: only Codex's recognized stale-turn rejection is
     swallowed. Any other error (e.g. ``-32603`` thread-store) means the stop did
@@ -3461,6 +3713,10 @@ async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
     intact instead of falsely reporting idle.
     """
     from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.runner.native import interrupt as native_interrupt
+
+    monkeypatch.setattr(native_interrupt, "_CODEX_INTERRUPT_TIMEOUT_S", 0.1, raising=False)
+    monkeypatch.setattr(native_interrupt, "_CODEX_INTERRUPT_CLOSE_TIMEOUT_S", 0.02, raising=False)
 
     conv_id = "c0dec0dec0dec0dec0dec0dec0de9411"
     fake_client = _StaleTurnCodexAppServerClient(
@@ -3470,6 +3726,16 @@ async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
             {"code": -32603, "message": "thread-store internal error"}
         ),
     )
+    cancelled: list[str] = []
+
+    async def stall(*_args: object, **_kwargs: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(failure_stage)
+
+    if failure_stage != "response_error":
+        monkeypatch.setattr(fake_client, failure_stage, stall)
     app, _server_client, bridge_dir = _build_codex_native_runner_for_stale_turn(
         monkeypatch,
         tmp_path,
@@ -3487,16 +3753,19 @@ async def test_events_codex_native_interrupt_genuine_app_server_error_still_503(
         )
         assert create_resp.status_code == 201, create_resp.text
 
-        stop_resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json={"type": "interrupt"},
-        )
+        async with asyncio.timeout(budget(5)):
+            stop_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": event_type},
+            )
 
     assert stop_resp.status_code == 503, (
         f"a genuine interrupt failure must stay a 503; "
         f"got {stop_resp.status_code}: {stop_resp.text}"
     )
     assert stop_resp.json().get("error") == "codex_native_interrupt_failed"
+    assert cancelled == ([] if failure_stage == "response_error" else [failure_stage])
+    assert fake_client.closed is (failure_stage != "close")
     # The turn is still recorded: a genuine failure must not drop it.
     state = codex_native_bridge.read_bridge_state(bridge_dir)
     assert state is not None and state.active_turn_id == "turn_codex_live", (
@@ -4441,6 +4710,70 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "replacement", ["running_turn", "completed_turn", "terminal", "app_server", None]
+)
+async def test_terminal_exit_release_preserves_a_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str | None
+) -> None:
+    """A queued exit cleanup owns its old runtime, even after a fast retry finishes."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.native import orchestration
+    from tests.runner.helpers import make_test_terminal_instance
+
+    monkeypatch.setattr(runner_app, "_TERMINAL_EXIT_RELEASE_GRACE_S", 0.0)
+    teardown = AsyncMock()
+    monkeypatch.setattr(orchestration, "teardown_codex_native_app_server", teardown)
+    session_id = uuid.uuid4().hex
+    terminals = TerminalRegistry()
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    manager._sessions.add(session_id)
+    app = create_runner_app(
+        process_manager=manager, terminal_registry=terminals, server_client=NullServerClient()
+    )
+    resources = app.state.session_resource_registry
+    publish_exit = resources._terminal_exit_publisher
+    assert publish_exit is not None
+    publish_exit(
+        TerminalExitEvent(
+            session_id=session_id,
+            terminal_id="terminal_worker_main",
+            terminal_name="worker",
+            session_key="main",
+            lifecycle=TerminalLifecycle.REQUIRED,
+            session_was_idle=True,
+        )
+    )
+    release = next(
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == f"required-terminal-release:{session_id}"
+    )
+    try:
+        if replacement in {"running_turn", "completed_turn"}:
+            app.state.turn_bind_epoch[session_id] = 1
+            if replacement == "running_turn":
+                app.state.live_response_id[session_id] = "replacement-response"
+        elif replacement == "terminal":
+            terminals._by_conversation[session_id] = {
+                ("worker", "main"): make_test_terminal_instance("worker", "main", tmp_path)
+            }
+        elif replacement == "app_server":
+            monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, session_id, object())
+        await asyncio.wait_for(release, timeout=budget(1.0))
+        keep_harness = replacement in {"running_turn", "completed_turn", "terminal"}
+        assert manager.released == ([] if keep_harness else [session_id])
+        assert manager.has_session(session_id) == keep_harness
+        if replacement is None:
+            teardown.assert_awaited_once_with(session_id)
+        else:
+            teardown.assert_not_awaited()
+    finally:
+        _session_event_queues_ref.pop(session_id, None)
+
+
+@pytest.mark.asyncio
 async def test_required_terminal_exit_publishes_deleted_and_failed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -5179,11 +5512,13 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         on_activity: object | None = None,
         on_exit: object | None = None,
         on_tick: object | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_poll_backoff_allowed
+        del idle_threshold_s, poll_interval_s, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -5590,12 +5925,16 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "command,inherited",
-    [(False, False), (False, True), (True, False)],
-    ids=["follow-up", "inherited-default", "side-command"],
+    "command,inherited,attachment",
+    [(False, False, False), (False, True, False), (True, False, False), (True, False, True)],
+    ids=["follow-up", "inherited-default", "side-command", "side-command-attachment"],
 )
 async def test_events_codex_side_chat_preserves_indentation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool, inherited: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: bool,
+    inherited: bool,
+    attachment: bool,
 ) -> None:
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
@@ -5651,6 +5990,8 @@ async def test_events_codex_side_chat_preserves_indentation(
         payload["model_override"] = "gpt-6-sol"
         if not inherited:
             payload["reasoning_effort"] = "max"
+    if attachment:
+        payload["content"].append({"type": "input_file", "file_id": "attached-file"})
     async with _runner_client(app) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
@@ -5660,6 +6001,12 @@ async def test_events_codex_side_chat_preserves_indentation(
         if not command:
             repeated = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
             assert repeated.status_code == 202, repeated.text
+    if attachment:
+        assert response.status_code == 400, response.text
+        assert "attachments" in response.json()["error"]["message"]
+        assert side_chat.peek_side_chat_requests(bridge_dir) == []
+        assert fake_client.requests == []
+        return
     assert response.status_code == 202, response.text
     if command:
         assert [request.question for request in side_chat.peek_side_chat_requests(bridge_dir)] == [

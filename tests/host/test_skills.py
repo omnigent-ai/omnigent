@@ -22,6 +22,7 @@ from omnigent.host.skills import (
     SKILLS_CACHE_TTL_SECONDS,
     HostSkillDiscovery,
 )
+from omnigent.memory_availability import MEMORY_HEADER, without_memory_tools
 from omnigent.spec import load
 from omnigent.spec.skill_sources import resolve_session_skills
 
@@ -34,11 +35,13 @@ def _skill(name: str, *, hidden: bool = False) -> str:
 
 
 def _bundle(files: dict[str, str], **config: object) -> bytes:
+    """A gzipped agent bundle; it leaves out the framework ``workflow`` skill unless asked."""
     config = {
         "spec_version": 1,
         "name": "test-agent",
         "llm": {"model": "test", "connection": {"api_key": "test-key"}},
         "executor": {"config": {"harness": "claude-sdk"}},
+        "tool_groups": {"journal": False},
         **config,
     }
     output = io.BytesIO()
@@ -98,9 +101,61 @@ def test_session_catalog_matches_invocation_scope(
 
     runner_bundle = tmp_path / "runner-bundle"
     spec = load(bundle, dest=runner_bundle, expand_env=False)
-    resolved = resolve_session_skills(spec, (tmp_path, runner_bundle), runner_bundle)
+    # The response carries no memory header, so the host has memory off; so does the runner.
+    resolved = resolve_session_skills(
+        without_memory_tools(spec), (tmp_path, runner_bundle), runner_bundle
+    )
     assert catalog == [{"name": s.name, "description": s.description} for s in resolved]
     assert resolved[0].skill_dir == runner_bundle / "skills" / "bundled"
+
+
+def test_session_catalog_ends_with_the_framework_workflow_skills(tmp_path: Path) -> None:
+    """Agents with the journal tools get ``/workflow`` and ``/save-workflow``; their own wins."""
+    plain = _bundle({"skills/bundled/SKILL.md": _skill("bundled")}, tool_groups={})
+    own = _bundle({"skills/workflow/SKILL.md": _skill("workflow")}, tool_groups={})
+    frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
+    discovery = HostSkillDiscovery(lambda _: _response(plain))
+    spec = load(plain, dest=tmp_path / "runner-bundle", expand_env=False)
+    custom = HostSkillDiscovery(lambda _: _response(own))
+    for enabled in (False, True, False):
+        current = replace(frame, workflows_enabled=enabled)
+        catalog = discovery.discover(current, tmp_path)
+        expected = ["bundled", "save-workflow", "workflow"] if enabled else ["bundled"]
+        assert [skill["name"] for skill in catalog] == expected
+        if enabled:
+            assert catalog[1]["description"].startswith(
+                "Design, revise, or save a reusable workflow"
+            )
+            assert catalog[2]["description"].startswith("Run a multi-step workflow")
+        resolved = resolve_session_skills(
+            without_memory_tools(spec),
+            (tmp_path,),
+            tmp_path / "runner-bundle",
+            workflows_enabled=enabled,
+        )
+        assert catalog == [{"name": s.name, "description": s.description} for s in resolved]
+        overridden = custom.discover(current, tmp_path)
+        assert {"name": "workflow", "description": "workflow description"} in overridden
+        assert [skill["name"] for skill in overridden].count("workflow") == 1
+
+
+@pytest.mark.parametrize("memory_header", [None, "0", "1"])
+def test_session_catalog_offers_the_memory_skill_only_when_the_server_has_memory(
+    tmp_path: Path, memory_header: str | None
+) -> None:
+    """The session's memory group follows the bundle response's memory header, as in the runner."""
+    bundle = _bundle(
+        {"skills/bundled/SKILL.md": _skill("bundled")}, tool_groups={"journal": False}
+    )
+    response = _response(bundle)
+    if memory_header is not None:
+        response.headers[MEMORY_HEADER] = memory_header
+    frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
+
+    catalog = HostSkillDiscovery(lambda _: response).discover(frame, tmp_path)
+
+    expected = ["bundled", "import-memory"] if memory_header == "1" else ["bundled"]
+    assert [skill["name"] for skill in catalog] == expected
 
 
 @pytest.mark.parametrize("remove_link", [True, False], ids=["removed", "permission-denied"])
@@ -157,6 +212,7 @@ def test_nested_subagent_uses_directory_name_and_own_filter(tmp_path: Path) -> N
             "llm": {"model": "test", "connection": {"api_key": "test"}},
             "skills": "none",
             "executor": {"config": {"harness": "claude-sdk"}},
+            "tool_groups": {"journal": False},
         }
     )
     bundle = _bundle(
@@ -198,12 +254,14 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     (directory / "SKILL.md").write_text(_skill("custom"))
     monkeypatch.setenv(variable, str(config_dir))
     expected_names = {"custom"}
+    tiers = [(".agents", "portable")]
     if harness == "claude-native":
-        for tier, name in ((".claude", "native"), (".agents", "portable")):
-            skill = tmp_path / tier / "skills" / name / "SKILL.md"
-            skill.parent.mkdir(parents=True)
-            skill.write_text(_skill(name))
-            expected_names.add(name)
+        tiers.append((".claude", "native"))
+    for tier, name in tiers:
+        skill = tmp_path / tier / "skills" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(_skill(name))
+        expected_names.add(name)
     discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
     frame = HostSkillsFrame("request", harness, str(tmp_path))
     host_catalog = discovery.discover(frame, tmp_path)
@@ -219,7 +277,7 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     monkeypatch.setenv(variable, env[variable])
     bundle = _bundle({}, executor={"config": {"harness": harness}})
     spec = load(bundle, dest=tmp_path / "runner-bundle", expand_env=False)
-    resolved = resolve_session_skills(spec, (tmp_path,), None)
+    resolved = resolve_session_skills(without_memory_tools(spec), (tmp_path,), None)
     assert host_catalog == [{"name": s.name, "description": s.description} for s in resolved]
     assert {s["name"] for s in host_catalog} == expected_names
 

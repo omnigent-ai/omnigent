@@ -1,5 +1,5 @@
 // Tests for ScheduledTaskRow: the server-sourced next-run text and the ⋯ menu
-// actions (Run now / Pause-Resume / Edit / Delete) dispatching their callbacks.
+// actions (Run now / Pause-Resume / Edit / Share / Clone / Delete) dispatching their callbacks.
 //
 // The row is fully props-driven, so these render it directly with a built task
 // object — no hook mocking needed. The ⋯ menu is a Radix dropdown; opening it
@@ -9,6 +9,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ScheduledTaskRow } from "./ScheduledTaskRow";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as RoutingModule from "@/lib/routing";
@@ -37,6 +38,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    mcpServices: [],
     sessionMode: "new",
     sessionId: null,
     workspace: null,
@@ -74,10 +76,15 @@ function renderRow(
   };
   render(
     <CapabilitiesProvider
-      info={{ ...FALLBACK_SERVER_INFO, features: { automations_v2: detailPage } }}
+      info={{
+        ...FALLBACK_SERVER_INFO,
+        features: { automations_v2: detailPage },
+      }}
     >
       <MemoryRouter>
-        <ScheduledTaskRow {...props} />
+        <TooltipProvider>
+          <ScheduledTaskRow {...props} />
+        </TooltipProvider>
       </MemoryRouter>
     </CapabilitiesProvider>,
   );
@@ -127,9 +134,114 @@ describe("⋯ menu actions", () => {
     expect(onRunNow).toHaveBeenCalledWith(t);
   });
 
+  it("offers Share only when the page passes onShare, and dispatches it", () => {
+    const onShare = vi.fn();
+    const t = task();
+    renderRow(t, { onShare });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    expect(onShare).toHaveBeenCalledWith(t);
+
+    cleanup();
+    renderRow(t);
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-share")).toBeNull();
+  });
+
+  // The page passes the reason, e.g. for a legacy automation.
+  it.each([
+    ["⋯ menu", () => fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 })],
+    ["right-click menu", () => fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"))],
+  ])("shows Share disabled with its reason in the %s, without dispatching", async (_, open) => {
+    const onShare = vi.fn();
+    const reason = "This is a legacy automation. Recreate it to share it.";
+    renderRow(task(), { onShare, shareDisabledReason: reason });
+    open();
+    const share = screen.getByRole("menuitem", { name: "Share" });
+    expect(share).toHaveAttribute("aria-disabled", "true");
+    fireEvent.focus(share);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+    fireEvent.click(share);
+    expect(onShare).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["⋯ menu", () => fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 })],
+    ["right-click menu", () => fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"))],
+  ])("offers Clone in the %s only when the page passes onClone", (_label, open) => {
+    const onClone = vi.fn();
+    const t = task();
+    renderRow(t, { onClone });
+    open();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+    expect(onClone).toHaveBeenCalledWith(t);
+
+    cleanup();
+    renderRow(t);
+    open();
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-clone")).toBeNull();
+  });
+
   it("disables the menu trigger while the row is busy", () => {
     renderRow(task(), { busy: true });
     expect(screen.getByTestId("task-row-menu")).toBeDisabled();
+  });
+});
+
+describe("an automation shared with the viewer", () => {
+  const shared = (overrides: Partial<ScheduledTask> = {}) =>
+    task({
+      ownerUserId: "alice@example.com",
+      viewerRole: "viewer",
+      ownerDisplayName: "Alice",
+      ...overrides,
+    });
+  const ACTIONS = [
+    "task-run-now",
+    "task-edit",
+    "task-share",
+    "task-clone",
+    "task-pause-toggle",
+    "task-delete",
+  ];
+
+  it("names the owner before the schedule", () => {
+    renderRow(shared({ ownerDisplayName: null }));
+    expect(screen.getByTestId("task-schedule-line").textContent).toMatch(
+      /^Shared by alice@example\.com · Weekdays/,
+    );
+    cleanup();
+    renderRow(task({ ownerUserId: "alice@example.com" }));
+    expect(screen.queryByTestId("task-owner")).toBeNull();
+  });
+
+  it.each([
+    ["⋯ menu", () => fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 })],
+    ["right-click menu", () => fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"))],
+  ])("shows every action disabled in the %s, saying only the owner can", async (_l, open) => {
+    const handlers = {
+      onEdit: vi.fn(),
+      onPauseToggle: vi.fn(),
+      onRunNow: vi.fn(),
+      onDelete: vi.fn(),
+      onShare: vi.fn(),
+      onClone: vi.fn(),
+    };
+    renderRow(shared({ state: "paused" }), handlers);
+    open();
+    for (const testId of ACTIONS) {
+      const item = screen.getByTestId(testId);
+      expect(item).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(item);
+    }
+    expect(screen.getByTestId("task-pause-toggle")).toHaveTextContent("Resume");
+    for (const handler of Object.values(handlers)) expect(handler).not.toHaveBeenCalled();
+    fireEvent.focus(screen.getByTestId("task-delete").parentElement!);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Only the automation's owner can delete it.",
+    );
   });
 });
 
@@ -165,5 +277,85 @@ describe("card-body navigation", () => {
     fireEvent.click(screen.getByTestId("task-run-now"));
     expect(onRunNow).toHaveBeenCalledWith(t);
     expect(navigate).not.toHaveBeenCalled();
+  });
+});
+
+describe("last-run failure warning", () => {
+  it.each(["active", "paused"] as const)("shows a red warning on a %s automation", (state) => {
+    renderRow(task({ state, lastRunStatus: "failed" }), {}, { detailPage: true });
+    const warning = screen.getByRole("img", { name: "Last run failed" });
+    expect(warning).toHaveClass("text-status-red");
+    expect(warning).toHaveAttribute("title", "Last run failed");
+    expect(screen.getByTestId("task-row-open")).toHaveAccessibleDescription("Last run failed");
+    expect(screen.getByTestId("task-row-open")).toHaveAttribute("aria-describedby", warning.id);
+    fireEvent.click(warning);
+    expect(navigate).toHaveBeenCalledWith("/tasks/st_1");
+  });
+
+  it.each([null, "succeeded", "running", "skipped"] as const)(
+    "does not warn for %s",
+    (lastRunStatus) => {
+      renderRow(task({ lastRunStatus }));
+      expect(screen.queryByRole("img", { name: "Last run failed" })).toBeNull();
+    },
+  );
+
+  it("also warns when the detail page is disabled", () => {
+    renderRow(task({ state: "paused", lastRunStatus: "failed" }));
+    expect(screen.getByRole("img", { name: "Last run failed" })).toBeInTheDocument();
+  });
+});
+
+it.each(["continue", "new"] as const)(
+  "uses trigger controls only for continued templates: %s",
+  async (sessionMode) => {
+    renderRow(
+      task({
+        prompt: "This automation watches Slack and starts one Omnigent session",
+        rrule: "FREQ=MINUTELY;INTERVAL=10",
+        sessionMode,
+        nextRunAt: "2026-03-10T14:00:00Z",
+      }),
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(await screen.findByTestId("task-edit")).toBeInTheDocument();
+    const scheduleLine = screen.getByTestId("task-schedule-line");
+    if (sessionMode === "continue") {
+      expect(scheduleLine).toHaveTextContent("Runs when new items match");
+      expect(scheduleLine).not.toHaveTextContent("Every 10 minutes");
+      expect(screen.queryByTestId("task-next-run")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-run-now")).not.toBeInTheDocument();
+    } else {
+      expect(scheduleLine).toHaveTextContent("Every 10 minutes");
+      expect(screen.getByTestId("task-next-run")).toBeInTheDocument();
+      expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    }
+  },
+);
+
+describe("right-click context menu", () => {
+  it("opens the same actions on right-click and dispatches the selection", () => {
+    const onDelete = vi.fn();
+    const t = task();
+    renderRow(t, { onDelete });
+    fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"));
+    expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.getByTestId("task-pause-toggle").textContent).toBe("Pause");
+    fireEvent.click(screen.getByTestId("task-delete"));
+    expect(onDelete).toHaveBeenCalledWith(t);
+  });
+
+  it("opens on the clickable card body without navigating", () => {
+    renderRow(task({ id: "st_42" }), {}, { detailPage: true });
+    fireEvent.contextMenu(screen.getByTestId("task-row-open"));
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("does not open while the row is busy", () => {
+    renderRow(task(), { busy: true });
+    fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"));
+    expect(screen.queryByTestId("task-run-now")).toBeNull();
   });
 });

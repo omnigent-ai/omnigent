@@ -12,13 +12,17 @@ and the recording protocol for comparing revisions.
 - `find`: search finds edited content without typing into the document.
 - `modes`: Edit, Source, and Preview retain the same saved content.
 - `review`: selected text anchors a comment; an unsent draft remains editable.
+- `copy`: copying in Edit pastes as Markdown into plain-text targets (inline
+  Markdown for part of a block, the file's source for the whole document) and
+  as formatting into rich-text targets. Preview still copies rendered text.
 - `responsive`: desktop and mobile show the file and retain edits and drafts.
 - `load`: fixed mixed-content documents expose parsing and rendering costs.
 - `offline`: unsaved edits remain guarded when the workspace cannot save.
 - `live-refresh`: an open file shows saves from other sessions and processes
   in place, keeping the caret; unsaved edits raise a conflict instead.
-- `large-files`: files above 1 MiB open as editable source; truncated files
-  remain read-only, with full-file download available.
+- `large-files`: files above 256 KiB open in Preview, and Edit opens editable
+  source; files above 1 MiB open directly in source. Truncated files remain
+  read-only, with full-file download available.
 
 ## How to get to it (user POV)
 
@@ -26,6 +30,9 @@ and the recording protocol for comparing revisions.
 - `changes`: select an existing changed Markdown file, then exit diff to edit it.
   Deleted files stay in diff; select another file to continue editing.
 - `direct-link`: open a session URL with a selected Markdown file.
+- Desktop with `workspace_direct_access` on, for a host on another machine:
+  the first file opened may ask, in a native dialog, to read that host's files
+  over SSH. "Not now" keeps reading through the server.
 - `chat-link`: follow a Markdown file link in a message; a line citation opens
   Source at that line, rather than the rich editor, and a range (`:12-18`,
   `#L12-L18`) highlights every cited line. Right-clicking or long-pressing the
@@ -39,6 +46,14 @@ and the recording protocol for comparing revisions.
   background requests are not replayed.
 - `document-link`: click a web or relative file link directly in the editor;
   Alt-click or move the caret with the keyboard to edit it and use its link popup.
+- `tabs-sidebar`: with `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a
+  touch client), file links, tool rows and `?file=` links open
+  the file in its Files tab, at the cited line. A `?comment=` link opens the file
+  at that comment's thread, a `?diff=1` link opens its diff in the Changes tab,
+  and `?fullscreen=1` fills the window with the sidebar. The strip's All tabs list
+  groups file tabs under **Files**, whose **Close all** (⌘K: **Close all file tabs**)
+  keeps pinned tabs and asks once about unsaved edits; cancelling closes none. A file tab's
+  breadcrumb lists each folder's files; picking one opens it in the same tab.
 - `mobile`: use the session Files surface or a file link at a phone width.
 
 ## Driving it with the repro environment
@@ -115,7 +130,7 @@ Results carry `readiness_probe: terminal-marker`; older results without this
 field include assertion overhead and must be remeasured for comparisons.
 The load runs use real time and no slow-motion or simulated clock.
 Report repeated samples for performance decisions; a single video is illustrative.
-This does not cover every Markdown shape or establish a safe 1 MiB limit.
+These runs do not cover every Markdown shape or establish the limits for every machine.
 
 ### Complementary correctness journeys
 
@@ -128,13 +143,15 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   prefix must render read-only, and downloading must preserve the entire file.
 - `direct-link`, `large-files`, `edit-save`:
   `tests/e2e_ui/files/test_file_autosave.py::test_large_markdown_source_autosaves`
-  edits a complete file above 1 MiB in source, verifies every saved byte through
-  the real server, finds its final line, and shrinks it below the limit. Source
-  stays mounted until reload, which then restores the rich editor.
+  opens a 512 KiB file in Preview, chooses Edit, edits it in source, verifies
+  every saved byte through the real server, finds its final line, and shrinks it
+  below the limit. Source stays mounted until reload, which then restores the
+  rich editor.
 - `chat-link`, `large-files`, `mobile`:
   `tests/browser_ui/files/test_file_line_navigation.py::test_large_markdown_citation_and_unsaved_resize`
-  follows a final-line citation, rejects saves, and preserves the unsaved source
-  editor through phone/desktop resizing and the mobile close guard.
+  opens in Preview, follows a final-line citation into source, rejects saves, and
+  preserves the unsaved source editor through phone/desktop resizing and the
+  mobile close guard.
 - `direct-link`, `edit-save`:
   `tests/e2e_ui/files/test_file_autosave.py::test_markdown_edit_autosaves`
   confirms the edit, undo, and redo through fresh filesystem API reads from
@@ -224,11 +241,19 @@ instead of treating one comparison clip as complete feature verification.
 - Older clients can display a formatted comment on a plain literal copy.
   Refresh those tabs to load the source-map behavior; this display difference
   does not overwrite the comment's saved offsets.
-- The automatic source fallback uses UTF-8 bytes, not JavaScript string length.
-  It applies above 1 MiB regardless of the saved view preference. The choice
-  stays fixed for that file visit so an autosave cannot replace an editor with
-  newer unsaved edits. Reopen another file and return, or reload, to reassess.
-  This is an initial-load guard, not a live cap on edits or external updates.
+- The large-file limits use UTF-8 bytes, not JavaScript string length. Above
+  256 KiB the rich editor is unavailable regardless of the saved view preference:
+  the file opens in Preview (or source when Source is the saved preference, or a
+  comment link or line citation needs source), and Edit opens source for that
+  visit only, without changing the saved preference. Above 1 MiB, or when the
+  file is truncated, it opens in source with no Preview. The routing stays fixed
+  for that file visit so an autosave cannot replace an editor with newer unsaved
+  edits. Reopen another file and return, or reload, to reassess. This is an
+  initial-load guard, not a live cap on edits or external updates.
+- The large-file Preview reuses its rendered tree across re-renders, skips
+  raw-HTML parsing when the document has none, and skips layout of off-screen
+  blocks; a single paragraph spanning tens of thousands of lines still parses
+  slowly in GFM.
 - File editing uses TipTap. Chat Markdown, read-only Preview, and Source use
   different rendering paths; speeding up one does not validate the others.
 - Task-list tokenization and table-start detection bound the source passed to
