@@ -7727,6 +7727,79 @@ def test_permission_mode_from_pane_returns_none_without_a_footer() -> None:
     )
 
 
+_BUDGET_RETRY_ROW = (
+    '✻ 403 Budget "example-budget" (00000000-0000-0000-0000-000000000000) has reached'
+    " its limit of $0.1. To continue, contact an admin to increase the budget."
+    " · Retrying in 2s · attempt 3/10"
+)
+
+
+@pytest.mark.parametrize(
+    ("row", "expected_error"),
+    [
+        pytest.param(
+            _BUDGET_RETRY_ROW,
+            '403 Budget "example-budget" (00000000-0000-0000-0000-000000000000) has reached'
+            " its limit of $0.1. To continue, contact an admin to increase the budget.",
+            id="full-width",
+        ),
+        pytest.param(
+            '✻ 403 Budget "example-budget" (00000000-0000-… · Retrying in 3s · attempt 3/10',
+            '403 Budget "example-budget" (00000000-0000-…',
+            id="cut-to-80-columns",
+        ),
+    ],
+)
+def test_api_retry_from_pane_reads_the_retry_row(row: str, expected_error: str) -> None:
+    """
+    Claude Code's retry row yields its status, error text and attempt count.
+
+    Both rows were captured from Claude Code 2.1.283 retrying a gateway budget
+    rejection; an 80-column pane cuts the error text but keeps the status.
+    """
+    pane = (
+        "❯ say hi\n"
+        "\n"
+        f"{row}\n"
+        "                                                            ◐ medium · /effort\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt\n"
+    )
+
+    assert claude_native_bridge._api_retry_from_pane(pane) == claude_native_bridge.ApiRetry(
+        status=403,
+        error=expected_error,
+        attempt=3,
+        max_retries=10,
+    )
+
+
+def test_api_retry_from_pane_reports_no_status_for_a_generic_retry() -> None:
+    """A retry row that names no HTTP status still parses, with ``status=None``."""
+    pane = "✻ Waiting for API response · Retrying in 4s · attempt 1/10\n❯ \n"
+
+    retry = claude_native_bridge._api_retry_from_pane(pane)
+
+    assert retry is not None
+    assert retry.status is None
+    assert (retry.attempt, retry.max_retries) == (1, 10)
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("✻ Billowing…\n❯ \n", id="spinner"),
+        pytest.param(f"● The row read:\n  {_BUDGET_RETRY_ROW}\n❯ \n", id="quoted-in-transcript"),
+    ],
+)
+def test_api_retry_from_pane_ignores_panes_without_a_retry_row(pane: str) -> None:
+    """The working spinner and indented transcript text are not a live retry."""
+    assert claude_native_bridge._api_retry_from_pane(pane) is None
+
+
 def test_read_permission_mode_reports_the_pane_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
