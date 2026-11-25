@@ -12,6 +12,7 @@ import {
   recordPaneStartFailure,
   resetPaneStartFailuresForTests,
 } from "./paneStartFailures";
+import { markPaneShellEnded, resetEndedPaneShellsForTests } from "./paneShellExit";
 import { PREFERRED_SHELL_KEY, readPreferredShell } from "./preferredShell";
 import { PANE_CLOSED_MESSAGE } from "./splitTargetActions";
 import { resetPendingPaneClosesForTests, useTerminalPaneActions } from "./terminalPaneActions";
@@ -73,6 +74,7 @@ beforeEach(() => {
 afterEach(() => {
   resetPaneStartFailuresForTests();
   resetPendingPaneClosesForTests();
+  resetEndedPaneShellsForTests();
   window.localStorage.clear();
 });
 
@@ -185,6 +187,16 @@ describe("useTerminalPaneActions", () => {
     act(() => result.current.confirmClose());
     expect(read()).toBeUndefined();
     expect(fixture.endShell).toHaveBeenCalledExactlyOnceWith(ZSH.id);
+  });
+
+  it("closes a pane whose shell already exited without asking, while it's still listed", () => {
+    const { target, read } = memoryTarget(SIDE_BY_SIDE);
+    markPaneShellEnded(target.conversationId, ZSH_KEY);
+    const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
+    act(() => result.current.closePane(ZSH_KEY));
+    expect(result.current.pendingClose).toBeNull();
+    expect(read()).toBeUndefined();
+    expect(fixture.endShell).not.toHaveBeenCalled();
   });
 
   it("closes a pane whose shell didn't start without asking, since it ends nothing", () => {

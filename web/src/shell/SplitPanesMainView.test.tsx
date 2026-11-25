@@ -70,7 +70,16 @@ vi.mock("./MainTerminalView", () => ({
     <div data-testid="main-terminal-view" data-splittable={String(props.splittable ?? false)} />
   ),
 }));
-const surfaces = vi.hoisted(() => new Map<string, { onResume?: () => void | Promise<void> }>());
+const surfaces = vi.hoisted(
+  () =>
+    new Map<
+      string,
+      {
+        onResume?: () => void | Promise<void>;
+        onStateChange?: TerminalPaneSurfaceProps["onStateChange"];
+      }
+    >(),
+);
 vi.mock("./TerminalPaneSurface", () => ({
   TerminalPaneSurface: (props: TerminalPaneSurfaceProps) => {
     const { terminal, active, focusRequest } = props;
@@ -134,6 +143,61 @@ afterEach(() => {
 });
 
 describe("SplitPanesMainView", () => {
+  /** The agent's pane with SHELL and OTHER stacked beside it, SHELL focused. */
+  const threePanes = (conversationId: string) => {
+    listed.terminals = [...TERMINALS, { id: OTHER_ID, name: "zsh", session: "s2", running: true }];
+    updatePaneSplit(conversationId, () => ({
+      layout: {
+        axis: "columns",
+        ratio: 0.5,
+        children: [AGENT, { axis: "rows", ratio: 0.5, children: [SHELL, OTHER] }],
+      },
+      focusedKey: SHELL,
+    }));
+  };
+  const endShell = () => {
+    const shell = surfaces.get(SHELL_ID)!;
+    act(() => shell.onStateChange?.({ kind: "connected" }));
+    act(() =>
+      shell.onStateChange?.({ kind: "closed", code: 4404, reason: "terminal session ended" }),
+    );
+  };
+
+  it("with floating panes, closes a pane as soon as its shell exits, before the list drops it", () => {
+    const conversationId = nextConversation();
+    threePanes(conversationId);
+    render(<View conversationId={conversationId} cards />);
+    endShell();
+    // Still listed: the runner reports the exit seconds later.
+    expect(screen.queryByTestId(`terminal-${SHELL_ID}`)).toBeNull();
+    expect(screen.getByTestId(`terminal-${OTHER_ID}`)).toBeInTheDocument();
+  });
+
+  it("without floating panes, leaves an exited shell's pane to the terminals list", () => {
+    const conversationId = nextConversation();
+    threePanes(conversationId);
+    render(<View conversationId={conversationId} />);
+    endShell();
+    expect(screen.getByTestId(`terminal-${SHELL_ID}`)).toBeInTheDocument();
+  });
+
+  it("keeps a pane whose attach the server accepts and then refuses", () => {
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => SIDE_BY_SIDE);
+    render(<View conversationId={conversationId} cards />);
+    const shell = surfaces.get(SHELL_ID)!;
+    act(() => shell.onStateChange?.({ kind: "connected" }));
+    act(() =>
+      shell.onStateChange?.({
+        kind: "closed",
+        code: 4404,
+        reason: "terminal resource not found or not running",
+      }),
+    );
+    expect(screen.getByTestId(`terminal-${SHELL_ID}`)).toBeInTheDocument();
+    expect(readPaneSplit(conversationId)).toEqual(SIDE_BY_SIDE);
+  });
+
   it.each([
     ["a viewer who can't split", { readOnly: true }],
     ["a shell the sidebar opened", { initialTerminalKey: SHELL }],

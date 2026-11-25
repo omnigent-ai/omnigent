@@ -90,6 +90,7 @@ import {
 import { usePublishMainTerminalKeys } from "./terminalPlacement";
 import { PublishedTerminalView } from "./PublishedTerminalView";
 import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
+import { usePaneShellExit } from "./paneShellExit";
 import { mainSplitTarget } from "./terminalSplitTarget";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { BELOW_SESSION_HEADER } from "./sessionHeaderInset";
@@ -177,6 +178,7 @@ function MainSplitPanes({
   const savedSplit = usePaneSplit(conversationId);
   const appPaneTitles = useAppPaneTitles(conversationId);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
+  const observePaneShell = usePaneShellExit(target);
   const panesRef = useRef<HTMLDivElement>(null);
   // One recovery per opening: a healthy agent spends it, so a later reap waits for Resume session.
   const agentRecovery = useRef<AgentRecoveryAllowance>({ attempted: false });
@@ -564,7 +566,11 @@ function MainSplitPanes({
               }
               focusRequest={requestFor(paneKey)}
               onFocusRequestTaken={(id) => settleTerminalFocus(conversationId, "main", id)}
-              onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
+              onStateChange={(state) => {
+                setTerminalConnectionState(terminal.id, state);
+                // With floating panes a pane whose shell exits closes at once.
+                if (cards) observePaneShell(paneKey, state);
+              }}
               onActivity={() => markTerminalActive(terminal.id)}
               onResume={runnerOffline ? onResume : undefined}
             />

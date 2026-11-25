@@ -26,6 +26,7 @@ import {
 } from "@/lib/terminals";
 
 import { closePaneShell, removePaneFocusingNeighbor } from "./paneShellClose";
+import { isPaneShellEnded } from "./paneShellExit";
 import {
   closeFailedPaneStart,
   isSplitPane,
@@ -301,7 +302,8 @@ export function useTerminalPaneActions(
       return;
     }
     const terminal = latestTerminals.current.find((candidate) => terminalTabKey(candidate) === key);
-    if (!terminal) removePaneFocusingNeighbor(target, key);
+    // A shell that already exited is still listed for a few seconds, with nothing left to end.
+    if (!terminal || isPaneShellEnded(conversationId, key)) removePaneFocusingNeighbor(target, key);
     else setPendingClose(target.id, { key, terminal });
   };
 
