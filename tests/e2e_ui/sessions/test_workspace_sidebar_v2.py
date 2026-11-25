@@ -302,6 +302,27 @@ def test_all_tabs_groups_the_tabs_and_closes_them_by_row_and_by_group(
     expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
 
 
+def test_full_screen_chord_opens_the_sidebar_full_screen_and_leaves_it(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """⇧⌘F fills the window with the workspace and leaves it again."""
+    base_url, session_id = workspace_session
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    full_screen = page.get_by_role("button", name=re.compile(r"full screen", re.IGNORECASE))
+    expect(page.locator("[data-maximized]")).to_have_count(0)
+    # The chord loads with the tabs sidebar's code, which the open sidebar has shown by now.
+    expect(full_screen).to_be_visible(timeout=60_000)
+
+    page.keyboard.press("ControlOrMeta+Shift+F")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    expect(full_screen).to_have_attribute("aria-pressed", "true")
+
+    page.keyboard.press("ControlOrMeta+Shift+F")
+    expect(full_screen).to_have_attribute("aria-pressed", "false")
+
+
 def test_files_menu_copies_the_path_and_a_link_to_the_file(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:

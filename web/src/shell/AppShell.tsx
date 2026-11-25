@@ -58,6 +58,7 @@ import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useFloatingComposerSupport } from "@/hooks/useFloatingComposerSupport";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+import { useWorkspaceFullScreenCommand } from "@/shell/workspaceCommands/useWorkspaceFullScreenCommand";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
@@ -3280,6 +3281,24 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // ⇧⌘F and its ⌘K row: a hidden workspace opens straight into full screen.
+  const toggleWorkspaceFullScreen = useCallback(() => {
+    if (!workspacePanelVisible) {
+      revealRightPanel();
+      if (!rightPanelMaximized) toggleRightPanelMaximized();
+      return;
+    }
+    toggleRightPanelMaximized();
+  }, [workspacePanelVisible, revealRightPanel, rightPanelMaximized, toggleRightPanelMaximized]);
+  // Only the tabs sidebar fills the window; a phone shows the workspace as its own screen, and
+  // a grid route has its own rail.
+  const workspaceCanFillWindow =
+    tabsSidebar && !!conversationId && hasRailContent && !gridRoute && !mobileViewport;
+  useWorkspaceFullScreenCommand({
+    conversationId: conversationId ?? null,
+    fullScreen: workspaceCanFillWindow ? rightPanelMaximized && workspacePanelVisible : null,
+    toggle: toggleWorkspaceFullScreen,
+  });
   // WIP(session_overview): docks beside chat when a wide window leaves the right side
   // free; otherwise it opens as a popover from the header cost.
   const sessionOverviewEnabled =
