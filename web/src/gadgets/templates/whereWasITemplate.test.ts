@@ -119,6 +119,13 @@ function startRadar({
   let actionListener: Listener | null = null;
   const requests: { action: string; params: unknown }[] = [];
   const automations: unknown[] = [];
+  // Whether the viewer's gadget session is being created, as the host tells the SDK.
+  let sessionStarting = false;
+  const startingListeners = new Set<(starting: boolean) => void>();
+  const setStarting = (starting: boolean) => {
+    sessionStarting = starting;
+    for (const listener of startingListeners) listener(starting);
+  };
   const client = {
     context: {
       app: { id: "app1", name: "Where was I?" },
@@ -148,6 +155,11 @@ function startRadar({
         actionListener = listener;
         return { dispose: () => undefined, refresh: () => undefined };
       },
+      starting: () => sessionStarting,
+      onStarting: (listener: (starting: boolean) => void) => {
+        startingListeners.add(listener);
+        return () => startingListeners.delete(listener);
+      },
     },
   };
   bootTemplatePage(html, client, { allowErrors });
@@ -160,6 +172,7 @@ function startRadar({
     emit,
     emitSnapshot,
     emitActions,
+    setStarting,
     pages,
     failing,
     writes,
@@ -350,6 +363,28 @@ describe("where was I template", () => {
     await waitFor(() => expect(byId("scan-empty").textContent).toBe("Create my gadget session"));
     expect((byId("scan-empty") as HTMLButtonElement).disabled).toBe(false);
     expect(byId("empty-run").textContent).toContain("Create your gadget session, and it");
+  });
+
+  it("shows a scan waiting while its gadget session is being created, then ready again", async () => {
+    const { emit, ready, requests, setStarting } = startRadar({ delivery: "starting" });
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", []);
+    byId("scan-empty").click();
+    await waitFor(() => expect(byId("scan-empty").textContent).toBe("Create my gadget session"));
+
+    // The viewer clicked Create session: the scan waits instead of asking again.
+    setStarting(true);
+    await waitFor(() => expect(byId("scan-empty").textContent).toBe("Starting session…"));
+    const scan = byId("scan-empty") as HTMLButtonElement;
+    expect(scan.disabled).toBe(true);
+    expect(scan.hasAttribute("aria-busy")).toBe(true);
+    scan.click();
+    expect(requests).toHaveLength(1);
+
+    // The create failed or was left: the viewer can start it again.
+    setStarting(false);
+    await waitFor(() => expect(byId("scan-empty").textContent).toBe("Create my gadget session"));
+    expect((byId("scan-empty") as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("follows the scan still running when a later one was merged into it", async () => {

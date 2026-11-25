@@ -505,6 +505,11 @@ ${GADGET_KIT_HELPERS}
   var REASON_TEXT = { not_relevant: 'Not relevant', already_done: 'Already done' };
 
   var client = null;
+  // Shown on the control that asked for the gadget session while that session is being created.
+  var STARTING_TEXT = 'Starting session…';
+  function sessionStarting() {
+    return Boolean(client && client.agent && typeof client.agent.starting === 'function' && client.agent.starting());
+  }
   var preview = false;
   var canWrite = false;
   var canAct = false;
@@ -902,10 +907,11 @@ ${GADGET_KIT_HELPERS}
     var action = latestAction('do_next_step', step.id);
     // The ledger can report the action before request() resolves, so match either way round.
     if (pending && (Date.now() - pending.at > PENDING_MS || (action && pending.actionId === action.id))) { delete pendingSteps[step.id]; pending = null; }
+    if (pending && !pending.error && pending.starting && sessionStarting()) return { run: 'sending', text: STARTING_TEXT, spin: true };
     if (pending) return pending.error ? { run: 'failed', text: pending.error, retry: true } : { run: 'sending', text: pending.text, spin: !pending.starting, retry: pending.starting };
     var record = runDocs[step.id] ? runDocs[step.id].value : null;
     if (isOpen(action)) {
-      if (action.status === 'pending') return { run: 'sending', text: STEP_TEXT.pending, retry: true };
+      if (action.status === 'pending') return sessionStarting() ? { run: 'sending', text: STARTING_TEXT, spin: true } : { run: 'sending', text: STEP_TEXT.pending, retry: true };
       return { run: 'running', text: STEP_TEXT[action.status], spin: action.status !== 'needs_input', session: action.sessionId };
     }
     // A step this page saw finish stays finished, even while its step_runs record still says
@@ -1474,8 +1480,10 @@ ${GADGET_KIT_HELPERS}
     // Records this scan already wrote: the radar is newer than the request.
     var written = working && value && !value.example && !isNaN(requested) && Date.parse(value.scanned_at) >= requested;
     [$('scan'), $('scan-empty')].forEach(function (button) {
-      button.disabled = !canAct || (open && !undelivered);
-      button.textContent = open ? 'Scanning…' : undelivered ? 'Create my gadget session' : button.id === 'scan' ? 'Rescan' : 'Scan my recent work';
+      var scanStarting = undelivered && sessionStarting();
+      button.disabled = !canAct || (open && !undelivered) || scanStarting;
+      button.toggleAttribute('aria-busy', scanStarting);
+      button.textContent = open ? 'Scanning…' : scanStarting ? STARTING_TEXT : undelivered ? 'Create my gadget session' : button.id === 'scan' ? 'Rescan' : 'Scan my recent work';
     });
     // The first scan also designs the page: once its records are written and until a layout
     // exists, a running scan is designing.
@@ -1799,6 +1807,7 @@ ${GADGET_KIT_HELPERS}
       preview = client.context.preview === true;
       canWrite = client.hasCapability('data.write') && client.can('write');
       canAct = Boolean(client.agent) && client.can('action') && !preview;
+      if (client.agent && typeof client.agent.onStarting === 'function') client.agent.onStarting(function () { schedule(); });
       $('daily').hidden = !canAct;
       $('automate').hidden = !canAct;
       if (!preview && !client.can('action')) notice('You can look at this page. Scanning and next steps run in the owner’s gadget session.');

@@ -60,6 +60,43 @@ export function gadgetIdFromRailKey(key: string): string | null {
   return key.startsWith(RAIL_KEY_PREFIX) ? key.slice(RAIL_KEY_PREFIX.length) : null;
 }
 
+// Gadgets whose gadget session is being created now: from the viewer's Create session until the
+// session is linked and its first message counted, or the create fails. Requests wait for it, so
+// the session isn't started twice and the gadget can show it is starting.
+const STARTING_TIMEOUT_MS = 2 * 60 * 1000;
+const startingSessions = new Map<string, ReturnType<typeof setTimeout>>();
+const startingListeners = new Set<(appId: string, starting: boolean) => void>();
+
+/** Marks the gadget's session as being created (`true`) or no longer (`false`). */
+export function setGadgetSessionStarting(appId: string, starting: boolean): void {
+  const timer = startingSessions.get(appId);
+  if (starting === (timer !== undefined)) return;
+  if (timer !== undefined) clearTimeout(timer);
+  if (starting) {
+    // A create that never reports back can't keep the gadget waiting.
+    startingSessions.set(
+      appId,
+      setTimeout(() => setGadgetSessionStarting(appId, false), STARTING_TIMEOUT_MS),
+    );
+  } else {
+    startingSessions.delete(appId);
+  }
+  for (const listener of [...startingListeners]) listener(appId, starting);
+}
+
+/** Whether the gadget's session is being created now. */
+export function gadgetSessionStarting(appId: string): boolean {
+  return startingSessions.has(appId);
+}
+
+/** Calls `listener` as gadgets' sessions start and finish starting. Returns an unsubscribe. */
+export function onGadgetSessionStarting(
+  listener: (appId: string, starting: boolean) => void,
+): () => void {
+  startingListeners.add(listener);
+  return () => startingListeners.delete(listener);
+}
+
 type SessionGadgetsListener = (sessionId: string, apps: Gadget[]) => void;
 const sessionGadgetsListeners = new Set<SessionGadgetsListener>();
 
@@ -164,6 +201,8 @@ export function gadgetActionMessage(entry: {
 export function forgetGadgetSessionStarts(): void {
   pendingStarts.clear();
   unrecordedDeliveries.clear();
+  for (const timer of startingSessions.values()) clearTimeout(timer);
+  startingSessions.clear();
 }
 
 /** Remembers that this tab opened New session for the gadget's session, so it is adopted once started. */
@@ -509,6 +548,11 @@ export async function requestGadgetAction(
       "PERMISSION_DENIED",
       "Running actions on this gadget needs Can edit gadget access.",
     );
+  }
+  // The session being created carries the requests made before Create session; another one
+  // now would miss it, and ask for a second session.
+  if (gadgetSessionStarting(app.id)) {
+    throw new BridgeError("UNAVAILABLE", "Your gadget session is starting. Try again once it has.");
   }
   // Server refusals (an undeclared action, params that do not match) reach the frame with their code.
   // The caller's key makes a retry (after a timeout, say) the same request, answered from the

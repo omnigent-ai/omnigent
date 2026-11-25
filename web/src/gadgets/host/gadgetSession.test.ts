@@ -10,6 +10,8 @@ import {
   recordGadgetDeliveries,
   adoptStartedGadgetSession,
   forgetGadgetSessionStarts,
+  gadgetSessionStarting,
+  setGadgetSessionStarting,
   onSessionGadgetsChanged,
   openGadgetFullScreen,
   openGadgetInSession,
@@ -198,6 +200,30 @@ describe("gadget session", () => {
     fillsScreen = false;
     forgetGadgetSessionStarts();
     navigate.mockClear();
+  });
+
+  it("asks again for nothing while the viewer's gadget session is being created", async () => {
+    const queued = vi.fn();
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => {
+        queued();
+        return res(ctx.json({ id: "act1", delivered: false, merged: false }));
+      }),
+    );
+    setGadgetSessionStarting("app-1", true);
+    expect(gadgetSessionStarting("app-1")).toBe(true);
+
+    // The session being created carries the earlier requests; a new one now would ask for
+    // another session.
+    await expect(
+      requestGadgetAction(EDITOR, { action: "run_card", params: { cardId: "c1" } }, navigate),
+    ).rejects.toMatchObject({ code: "UNAVAILABLE" });
+    expect(queued).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
+    expect(requestGadgetCreateSessionMenu).not.toHaveBeenCalled();
+
+    setGadgetSessionStarting("app-1", false);
+    expect(gadgetSessionStarting("app-1")).toBe(false);
   });
 
   it("opens the gadget in full screen in the viewer's gadget session", async () => {

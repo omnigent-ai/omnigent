@@ -945,6 +945,70 @@ describe("omnigent SDK permission guards", () => {
 });
 
 // The bootstrap builder's output string is the observable.
+describe("omnigent SDK while the gadget session starts", () => {
+  function page(html: string) {
+    const doc = document.implementation.createHTMLDocument("gadget");
+    doc.body.innerHTML = html;
+    const runtime = loadRuntime({ document: doc, MutationObserver });
+    return { doc, runtime };
+  }
+
+  // The stand-in port delivers on the next microtask, as a real one does asynchronously.
+  async function delivered() {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  it("says the session is starting, holds clicks on action controls and lets go after", async () => {
+    const { doc, runtime } = page(
+      '<button id="run" data-omnigent-requires="action">Run</button><button id="other">Other</button>',
+    );
+    const { hostPort, client } = await connected(runtime, {
+      ...CONTEXT,
+      permissions: { writeData: true, publish: true },
+    });
+    const changes: boolean[] = [];
+    const stop = client.agent.onStarting((starting) => changes.push(starting));
+    const clicks: string[] = [];
+    for (const id of ["run", "other"]) {
+      doc.getElementById(id)?.addEventListener("click", () => clicks.push(id));
+    }
+
+    expect(client.agent.starting()).toBe(false);
+    hostPort.postMessage({ v: 1, kind: "event", event: "agent.starting", starting: true });
+    await delivered();
+    expect(client.agent.starting()).toBe(true);
+    expect(doc.documentElement.hasAttribute("data-omnigent-session-starting")).toBe(true);
+    doc.getElementById("run")?.click();
+    doc.getElementById("other")?.click();
+    // Only the control that runs an action waits; the page's own disabled state is untouched.
+    expect(clicks).toEqual(["other"]);
+    expect((doc.getElementById("run") as HTMLButtonElement).disabled).toBe(false);
+
+    hostPort.postMessage({ v: 1, kind: "event", event: "agent.starting", starting: false });
+    await delivered();
+    expect(client.agent.starting()).toBe(false);
+    expect(doc.documentElement.hasAttribute("data-omnigent-session-starting")).toBe(false);
+    doc.getElementById("run")?.click();
+    expect(clicks).toEqual(["other", "run"]);
+    expect(changes).toEqual([true, false]);
+
+    stop();
+    hostPort.postMessage({ v: 1, kind: "event", event: "agent.starting", starting: true });
+    await delivered();
+    expect(changes).toEqual([true, false]);
+  });
+
+  it("ignores a malformed starting event", async () => {
+    const { runtime } = page("");
+    const { hostPort, client } = await connected(runtime);
+    hostPort.postMessage({ v: 1, kind: "event", event: "agent.starting", starting: "yes" });
+    hostPort.postMessage({ v: 1, kind: "event", event: "other", starting: true });
+    await delivered();
+    expect(client.agent.starting()).toBe(false);
+  });
+});
+
 describe("buildOmnigentSdkBootstrapScript", () => {
   it("escapes markup in its configuration so it cannot close the script element", () => {
     const script = buildOmnigentSdkBootstrapScript({ frameId: "</script><img>", nonce: NONCE });

@@ -233,8 +233,20 @@ export type GadgetResponseMessage =
       error: GadgetWireError;
     };
 
+/**
+ * Tells the frame whether the viewer's gadget session is being created: from their Create session
+ * until that session has the requests made before it. Requests wait for it meanwhile.
+ */
+export interface GadgetAgentStartingMessage {
+  v: typeof GADGET_PROTOCOL_VERSION;
+  kind: "event";
+  event: "agent.starting";
+  starting: boolean;
+}
+
 export type GadgetFrameMessage = GadgetRequestMessage | GadgetCancelMessage;
-export type GadgetHostMessage = GadgetInitMessage | GadgetResponseMessage;
+export type GadgetHostMessage =
+  GadgetInitMessage | GadgetResponseMessage | GadgetAgentStartingMessage;
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 

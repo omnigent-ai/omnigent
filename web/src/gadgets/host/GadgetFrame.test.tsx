@@ -12,6 +12,7 @@ import type { Gadget, GadgetContent } from "../api/gadgetApi";
 import { GADGET_CONNECT_MESSAGE_TYPE, GADGET_HELLO_MESSAGE_TYPE } from "../sdk/gadgetProtocol";
 import { setOmnigentHostConfig, type GadgetFrameHostProps } from "@/lib/host";
 import { resetGadgetRailRequests, useGadgetRailRequest } from "@/lib/gadgetRailTabs";
+import { forgetGadgetSessionStarts, setGadgetSessionStarting } from "./gadgetSession";
 
 class FakePort {
   postMessage = vi.fn();
@@ -187,6 +188,36 @@ describe("GadgetFrame", () => {
     // One port per document: a second hello gets nothing.
     greet(frameWindow, { type: GADGET_HELLO_MESSAGE_TYPE, frameId, nonce });
     expect(posted).toHaveBeenCalledTimes(1);
+  });
+
+  it("tells the frame its gadget session is starting, at connect and as it changes", () => {
+    setGadgetSessionStarting("app-1", true);
+    try {
+      const { frame } = renderFrame();
+      const frameWindow = frame().contentWindow as Window;
+      vi.spyOn(frameWindow, "postMessage").mockImplementation(() => {});
+      const { frameId, nonce } = mountOf(frame());
+      greet(frameWindow, { type: GADGET_HELLO_MESSAGE_TYPE, frameId, nonce });
+      const port = FakeMessageChannel.created[0].port1;
+      const events = () =>
+        port.postMessage.mock.calls
+          .map(([message]) => message as { kind?: string; starting?: boolean })
+          .filter((message) => message.kind === "event");
+
+      expect(events()).toEqual([{ v: 1, kind: "event", event: "agent.starting", starting: true }]);
+      // Another gadget's session doesn't concern this frame.
+      act(() => setGadgetSessionStarting("app-2", true));
+      expect(events()).toHaveLength(1);
+      act(() => setGadgetSessionStarting("app-1", false));
+      expect(events().at(-1)).toEqual({
+        v: 1,
+        kind: "event",
+        event: "agent.starting",
+        starting: false,
+      });
+    } finally {
+      forgetGadgetSessionStarts();
+    }
   });
 
   it("tells gadget code only the gadget-scoped viewer ID and a real name, never the login", () => {

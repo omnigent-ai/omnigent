@@ -290,14 +290,16 @@ export function GadgetOpenSessionButton({
       ) : (
         sessionId !== null && <SessionStatus sessionId={sessionId} />
       )}
-      {/* Below the menu (z-50), above the gadget and everything else. A press on it is a press
-      outside the menu, which closes it. */}
+      {/* Below the menu (z-50), above the gadget and everything else, the sidebar included. A
+      press on it is a press outside the menu, which closes it. */}
       {open &&
         modal &&
         createPortal(
           <div
             aria-hidden
             data-testid="gadget-open-session-scrim"
+            // index.css drops the sidebar under this while it shows, so only the menu stands out.
+            data-gadget-session-scrim=""
             className="fixed inset-0 z-[49] bg-black/40 duration-150 animate-in fade-in-0"
           />,
           getEmbedRoot() ?? document.body,

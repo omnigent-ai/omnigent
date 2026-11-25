@@ -108,6 +108,8 @@ export interface StartGadgetBridgeOptions {
 
 export interface GadgetBridge {
   dispose: () => void;
+  /** Tells the frame whether the viewer's gadget session is being created now. */
+  setAgentStarting: (starting: boolean) => void;
 }
 
 const MAX_ERROR_MESSAGE_LENGTH = 500;
@@ -844,7 +846,18 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
   port.start?.();
   port.postMessage({ v: GADGET_PROTOCOL_VERSION, kind: "init", context });
 
+  let agentStarting = false;
   return {
     dispose: () => close("disposed"),
+    setAgentStarting: (starting) => {
+      if (closed || starting === agentStarting) return;
+      agentStarting = starting;
+      port.postMessage({
+        v: GADGET_PROTOCOL_VERSION,
+        kind: "event",
+        event: "agent.starting",
+        starting,
+      });
+    },
   };
 }

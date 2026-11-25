@@ -316,6 +316,11 @@ ${GADGET_KIT_HELPERS}
   var RESTORE_TEXT = { pending: 'Create your gadget session, and it goes back.', running: 'Going back to the previous look…' };
 
   var client = null;
+  // Shown on the control that asked for the gadget session while that session is being created.
+  var STARTING_TEXT = 'Starting session…';
+  function sessionStarting() {
+    return Boolean(client && client.agent && typeof client.agent.starting === 'function' && client.agent.starting());
+  }
   var preview = false;
   var canWrite = false;
   var canAct = false;
@@ -763,8 +768,10 @@ ${GADGET_KIT_HELPERS}
     $('headline').hidden = !(value && value.question);
     var button = $('refresh');
     button.hidden = !value || !canAct || Boolean(value.example);
-    button.disabled = refresh.open && !refresh.undelivered;
-    button.textContent = refresh.open ? 'Refreshing…' : refresh.undelivered ? 'Create my gadget session' : 'Refresh data';
+    var refreshStarting = refresh.undelivered && sessionStarting();
+    button.disabled = (refresh.open && !refresh.undelivered) || refreshStarting;
+    button.toggleAttribute('aria-busy', refreshStarting);
+    button.textContent = refresh.open ? 'Refreshing…' : refreshStarting ? STARTING_TEXT : refresh.undelivered ? 'Create my gadget session' : 'Refresh data';
   }
 
   function stages(listId, now) {
@@ -777,8 +784,10 @@ ${GADGET_KIT_HELPERS}
   // Finding ideas: under the empty state's button before there are any, on the ideas box after.
   function renderFindStatus(found, find, empty) {
     [$('find-empty'), $('find')].forEach(function (button) {
-      button.disabled = !canAct || (find.open && !find.undelivered);
-      button.textContent = find.open ? 'Looking…' : find.undelivered ? 'Create my gadget session' : button.id === 'find' ? 'Suggest others' : 'Find stories in my work';
+      var findStarting = find.undelivered && sessionStarting();
+      button.disabled = !canAct || (find.open && !find.undelivered) || findStarting;
+      button.toggleAttribute('aria-busy', findStarting);
+      button.textContent = find.open ? 'Looking…' : findStarting ? STARTING_TEXT : find.undelivered ? 'Create my gadget session' : button.id === 'find' ? 'Suggest others' : 'Find stories in my work';
     });
     // Once a story is built the page is that story: another story is a new gadget.
     var built = Boolean(story() && !story().example);
@@ -895,7 +904,7 @@ ${GADGET_KIT_HELPERS}
     if (box.hidden) return;
     if (wasHidden) box.open = !value;
     var list = ideaList();
-    var busy = build.open && !build.undelivered;
+    var busy = (build.open && !build.undelivered) || (build.undelivered && sessionStarting());
     var note = [];
     if (found.example) note.push('Example ideas.');
     else if (found.scanned_at) note.push('From ' + (found.sessions_read || 0) + ' sessions in the last ' + found.window_days + ' days, ' + ago(found.scanned_at) + '.');
@@ -1052,6 +1061,7 @@ ${GADGET_KIT_HELPERS}
       preview = client.context.preview === true;
       canWrite = client.hasCapability('data.write') && client.can('write');
       canAct = Boolean(client.agent) && client.can('action') && !preview;
+      if (client.agent && typeof client.agent.onStarting === 'function') client.agent.onStarting(function () { schedule(); });
       $('weekly').hidden = !canAct;
       if (!preview && !client.can('action')) notice('You can read this story. Finding, building and refreshing stories run in the owner’s gadget session.');
       ['ideas', 'story', 'series', 'layout', 'render_reports'].forEach(function (name) { collections[name] = client.data.collection(name); });

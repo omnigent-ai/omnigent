@@ -284,6 +284,16 @@ export interface OmnigentAgent {
    * `watch(listener, actionId)`, `watch(receipt, listener)` or `watch(listener, { actionId })`.
    */
   watch: OmnigentWatch;
+  /**
+   * Whether the viewer's gadget session is being created now: from their Create session until
+   * that session has the requests made before it. Meanwhile requests are refused with
+   * `UNAVAILABLE`, and the SDK holds clicks on controls marked `data-omnigent-requires="action"`
+   * and marks the page root `data-omnigent-session-starting`. Show those controls as waiting,
+   * for example "Starting session…".
+   */
+  starting: () => boolean;
+  /** Calls `listener` with `starting()` each time it changes. Returns an unsubscribe. */
+  onStarting: (listener: (starting: boolean) => void) => () => void;
 }
 
 type OmnigentWatchListener = (snapshot: OmnigentActionWatchSnapshot) => void;

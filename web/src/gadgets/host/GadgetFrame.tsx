@@ -41,6 +41,8 @@ import { createPreviewRpc } from "./previewRpc";
 import type { GadgetGestureGate } from "./gadgetGestureGate";
 import { createGadgetGestureGate } from "./gadgetGestureGate";
 import {
+  gadgetSessionStarting,
+  onGadgetSessionStarting,
   openGadgetInSession,
   quoteInGadgetSession,
   requestGadgetAction,
@@ -457,7 +459,10 @@ export function GadgetFrame({
           }
         },
       });
-      if (!preview) noteGadgetFrameConnected(latest.app.id);
+      if (!preview) {
+        bridgeRef.current.setAgentStarting(gadgetSessionStarting(latest.app.id));
+        noteGadgetFrameConnected(latest.app.id);
+      }
       frameWindow.postMessage(
         { type: GADGET_CONNECT_MESSAGE_TYPE, frameId: mount.frameId, nonce: mount.nonce },
         // The frame's origin is opaque; the nonce and the transferred port are the boundary.
@@ -515,6 +520,15 @@ export function GadgetFrame({
     },
     [handleFrameMessage],
   );
+
+  // The frame shows its actions as waiting while the viewer's gadget session is being created.
+  const appId = app.id;
+  useEffect(() => {
+    if (preview) return undefined;
+    return onGadgetSessionStarting((startedFor, starting) => {
+      if (startedFor === appId) bridgeRef.current?.setAgentStarting(starting);
+    });
+  }, [appId, preview]);
 
   // A new mount is a new document: start its handshake from scratch.
   useEffect(() => {

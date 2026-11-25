@@ -1901,3 +1901,38 @@ describe("index.css pane strip window-corner inset", () => {
     ).toContain("height: var(--pane-window-top-row)");
   });
 });
+
+describe("gadget Create session dimming", () => {
+  const rule = topLevelRules(indexCssSource).find((candidate) =>
+    candidate.selector.includes("[data-gadget-session-scrim]"),
+  );
+
+  it("drops the sidebar under the dimming while a gadget's Create session menu is open", () => {
+    // The sidebar carries z-50 on desktop, above the menu's z-49 scrim; without this it stays
+    // bright while everything else dims.
+    expect(rule?.selector.replace(/\s+/g, " ")).toBe(
+      ":root:has([data-gadget-session-scrim]) .conversations-sidebar",
+    );
+    expect(rule?.body).toMatch(/z-index:\s*auto/);
+  });
+
+  it("applies only while the scrim is in the page", () => {
+    const sidebar = document.createElement("aside");
+    sidebar.className = "conversations-sidebar";
+    sidebar.style.position = "relative";
+    document.body.appendChild(sidebar);
+    withStyle(
+      `.conversations-sidebar { z-index: 50; }\n${rule?.selector} { ${rule?.body} }`,
+      () => {
+        expect(getComputedStyle(sidebar).zIndex).toBe("50");
+        const scrim = document.createElement("div");
+        scrim.setAttribute("data-gadget-session-scrim", "");
+        document.body.appendChild(scrim);
+        expect(getComputedStyle(sidebar).zIndex).toBe("auto");
+        scrim.remove();
+        expect(getComputedStyle(sidebar).zIndex).toBe("50");
+      },
+    );
+    sidebar.remove();
+  });
+});

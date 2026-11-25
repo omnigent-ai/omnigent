@@ -131,6 +131,10 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
       });
       return;
     }
+    if (data.kind === 'event' && data.event === 'agent.starting' && typeof data.starting === 'boolean') {
+      setAgentStarting(data.starting);
+      return;
+    }
     if (data.kind !== 'response' || typeof data.id !== 'string') {
       return;
     }
@@ -760,6 +764,59 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
   var DISABLEABLE = ['BUTTON', 'SELECT', 'FIELDSET', 'OPTGROUP', 'OPTION'];
   var TYPED_INPUTS = ['text', 'search', 'email', 'url', 'tel', 'password', 'number', 'date', 'time', 'datetime-local', 'month', 'week'];
   var BLOCKED_EVENTS = ['click', 'dblclick', 'auxclick', 'dragstart', 'drop', 'paste', 'cut', 'input', 'change', 'submit'];
+
+  // While the viewer's gadget session is being created, controls that run an action wait: the
+  // session carries the requests made before Create session, and another would ask for a second
+  // one. Only clicks are held and the root marked; the page's own disabled state is left alone,
+  // so nothing needs restoring when the session is ready.
+  var agentStarting = false;
+  var startingListeners = [];
+  var startingGuardInstalled = false;
+  function holdActionWhileStarting(event) {
+    if (!agentStarting) {
+      return;
+    }
+    var target = event.target;
+    var control = target && target.closest ? target.closest('[data-omnigent-requires~="action"]') : null;
+    if (!control) {
+      return;
+    }
+    if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') {
+      return;
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }
+  function setAgentStarting(starting) {
+    if (starting === agentStarting) {
+      return;
+    }
+    agentStarting = starting;
+    if (typeof document !== 'undefined' && document.documentElement) {
+      if (!startingGuardInstalled && typeof document.addEventListener === 'function') {
+        startingGuardInstalled = true;
+        ['click', 'dblclick', 'submit', 'keydown'].forEach(function (type) {
+          document.addEventListener(type, holdActionWhileStarting, true);
+        });
+        if (document.head) {
+          var style = document.createElement('style');
+          // :where keeps this at zero specificity, so the app's own styles win.
+          style.textContent = ':where([data-omnigent-session-starting] [data-omnigent-requires~="action"]) { opacity: 0.55; cursor: progress; }';
+          document.head.appendChild(style);
+        }
+      }
+      if (starting) {
+        document.documentElement.setAttribute('data-omnigent-session-starting', '');
+        document.documentElement.setAttribute('aria-busy', 'true');
+      } else {
+        document.documentElement.removeAttribute('data-omnigent-session-starting');
+        document.documentElement.removeAttribute('aria-busy');
+      }
+    }
+    startingListeners.slice().forEach(function (listener) {
+      try { listener(starting); } catch (error) { /* A failing listener can't stop the others. */ }
+    });
+  }
   var guardContext = null;
   function blockedReason(context, requirement) {
     if (!context) {
@@ -953,6 +1010,21 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
         watch: function (first, second, third) {
           var watched = actionWatchArguments(first, second, third);
           return watchActions(watched.listener, watched.options);
+        },
+        starting: function () {
+          return agentStarting;
+        },
+        onStarting: function (listener) {
+          if (typeof listener !== 'function') {
+            throw new OmnigentError('INVALID_ARGUMENT', 'onStarting needs a listener function');
+          }
+          startingListeners.push(listener);
+          return function () {
+            var index = startingListeners.indexOf(listener);
+            if (index !== -1) {
+              startingListeners.splice(index, 1);
+            }
+          };
         },
       }),
       ui: Object.freeze({

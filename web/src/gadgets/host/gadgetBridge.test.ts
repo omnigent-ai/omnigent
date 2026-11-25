@@ -785,4 +785,28 @@ describe("startGadgetBridge", () => {
     expect(port.closed).toBe(true);
     expect(onClosed).toHaveBeenCalledWith("protocol_violations");
   });
+
+  it("tells the frame when the gadget session starts and stops starting, once each", () => {
+    const { port, bridge } = start();
+    bridge.setAgentStarting(false);
+    bridge.setAgentStarting(true);
+    bridge.setAgentStarting(true);
+    bridge.setAgentStarting(false);
+    const events = port.posted.filter(
+      (message) =>
+        typeof message === "object" &&
+        message !== null &&
+        "kind" in message &&
+        message.kind === "event",
+    );
+    expect(events).toEqual([
+      { v: 1, kind: "event", event: "agent.starting", starting: true },
+      { v: 1, kind: "event", event: "agent.starting", starting: false },
+    ]);
+    bridge.dispose();
+    bridge.setAgentStarting(true);
+    expect(
+      port.posted.filter((message) => (message as { kind?: string }).kind === "event"),
+    ).toHaveLength(2);
+  });
 });

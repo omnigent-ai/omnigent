@@ -14,6 +14,7 @@ import {
   gadgetRailKey,
   keepUnrecordedDeliveries,
   recordUnrecordedDeliveries,
+  setGadgetSessionStarting,
 } from "@/gadgets/host/gadgetSession";
 import {
   acceptedFirstInput,
@@ -110,6 +111,8 @@ export function leaveGadgetStart(gadgetId: string, queryClient: QueryClient): vo
 
 /** Forgets every started gadget; for tests. */
 export function resetGadgetStarts(): void {
+  for (const attempt of attempts.values()) setGadgetSessionStarting(attempt.gadgetId, false);
+  for (const waiting of awaitingInput.values()) setGadgetSessionStarting(waiting.gadgetId, false);
   starting = null;
   attempts.clear();
   madeFor.clear();
@@ -137,12 +140,17 @@ function onAttempt(attempt: number, outcome: "begun" | "failed"): void {
     attempts.delete(attempt);
     // Build's gadget stays unbuilt: leaving New session deletes it as if Build was never sent.
     if (failed?.wasUnbuilt) unbuilt.add(failed.gadgetId);
+    if (failed !== undefined && !creating(failed.gadgetId)) {
+      setGadgetSessionStarting(failed.gadgetId, false);
+    }
     return;
   }
   if (starting === null) return;
   const gadgetId = starting.gadgetId;
   const wasUnbuilt = unbuilt.delete(gadgetId) || stopDiscard(gadgetId);
   attempts.set(attempt, { gadgetId, fullScreen: fullScreenStarts.has(gadgetId), wasUnbuilt });
+  // The gadget waits from Create session until its session has its requests.
+  setGadgetSessionStarting(gadgetId, true);
 }
 
 function adopt(gadgetId: string, sessionId: string, fullScreen: boolean) {
@@ -177,6 +185,8 @@ function adopt(gadgetId: string, sessionId: string, fullScreen: boolean) {
     // session links it again.
     .catch(() => {
       adopted.delete(pair);
+      awaitingInput.delete(sessionId);
+      setGadgetSessionStarting(gadgetId, false);
       if (fullScreen) noteGadgetStartFailed(gadgetId);
     });
 }
@@ -194,11 +204,14 @@ function acknowledgeIfReady(sessionId: string): void {
   const waiting = awaitingInput.get(sessionId);
   if (waiting === undefined || !waiting.linked || waiting.accepted === undefined) return;
   awaitingInput.delete(sessionId);
-  void acknowledgeStartedGadgetInput(waiting.gadgetId, sessionId, waiting.accepted).then(
-    // Deliveries whose records failed are kept, and tried again when the session shows.
-    (failed) => keepUnrecordedDeliveries(waiting.gadgetId, sessionId, failed),
-    () => undefined,
-  );
+  void acknowledgeStartedGadgetInput(waiting.gadgetId, sessionId, waiting.accepted)
+    .then(
+      // Deliveries whose records failed are kept, and tried again when the session shows.
+      (failed) => keepUnrecordedDeliveries(waiting.gadgetId, sessionId, failed),
+      () => undefined,
+    )
+    // Its requests are counted: the gadget's own actions show where they are from here.
+    .finally(() => setGadgetSessionStarting(waiting.gadgetId, false));
 }
 
 // A session this tab created: the gadget's when the create that made it was the gadget's.

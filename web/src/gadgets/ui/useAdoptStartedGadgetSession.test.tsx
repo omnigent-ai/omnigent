@@ -16,6 +16,7 @@ import {
 import {
   acknowledgeStartedGadgetInput,
   adoptStartedGadgetSession,
+  gadgetSessionStarting,
 } from "@/gadgets/host/gadgetSession";
 import {
   noteGadgetStartFullScreen,
@@ -130,6 +131,34 @@ afterEach(() => {
 });
 
 describe("a session started beside a gadget", () => {
+  it("shows the gadget's session as starting from its create until its requests are counted", async () => {
+    renderShell();
+    expect(gadgetSessionStarting("board")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    // From Create session on, the gadget's own buttons wait instead of asking again.
+    expect(gadgetSessionStarting("board")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    expect(gadgetSessionStarting("board")).toBe(true);
+    noteFirstInputAccepted("conv_9", "Build");
+    await waitFor(() => expect(gadgetSessionStarting("board")).toBe(false));
+  });
+
+  it("stops showing the gadget's session as starting when its create fails", () => {
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    expect(gadgetSessionStarting("board")).toBe(true);
+    noteSessionCreationFailed(pendingAttempt!);
+    expect(gadgetSessionStarting("board")).toBe(false);
+  });
+
+  it("stops showing the gadget's session as starting when linking it fails", async () => {
+    vi.mocked(adoptStartedGadgetSession).mockRejectedValueOnce(new Error("offline"));
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Creating" }));
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    await waitFor(() => expect(gadgetSessionStarting("board")).toBe(false));
+  });
+
   it("shows the gadget in the session once it has its real ID", async () => {
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Creating" }));
