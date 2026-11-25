@@ -720,16 +720,49 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     const { editor, target } = mountQuoted();
     caretAt(editor, replyStart);
     act(() => void deleteCharBackward(editor));
-    // The text around the quote joins as paragraphs, as the textarea's removal does.
-    expect(target().value).toBe("Intro\n\nReply");
+    // The lines around the quote stay as they were: only the quote's line and its break go.
+    expect(target().value).toBe("Intro\nReply");
     expect(editor.dom.querySelectorAll('[data-testid="composer-reply-quote"]')).toHaveLength(0);
+  });
+
+  it("ArrowLeft at the start of the line after a quote moves to the end of the line above it", () => {
+    const { editor } = mountQuoted();
+    caretAt(editor, replyStart);
+    fireEvent.keyDown(editor.contentDOM, { key: "ArrowLeft" });
+    expect(editor.state.selection.main.head).toBe("Intro".length);
+  });
+
+  it("ArrowRight at the end of the line above a quote moves to the start of the line after it", () => {
+    const { editor } = mountQuoted();
+    caretAt(editor, "Intro".length);
+    fireEvent.keyDown(editor.contentDOM, { key: "ArrowRight" });
+    expect(editor.state.selection.main.head).toBe(replyStart);
+  });
+
+  it("leaves ArrowLeft and ArrowRight to the default step away from a quote", () => {
+    const { editor } = mountQuoted();
+    caretAt(editor, 2);
+    fireEvent.keyDown(editor.contentDOM, { key: "ArrowLeft" });
+    expect(editor.state.selection.main.head).toBe(1);
+    caretAt(editor, 2);
+    fireEvent.keyDown(editor.contentDOM, { key: "ArrowRight" });
+    expect(editor.state.selection.main.head).toBe(3);
+  });
+
+  it("paints the card row and its text inside the editor's width, truncating the preview", () => {
+    const { container } = mountQuoted();
+    const row = quoteCards(container)[0]!;
+    expect(row.className).toContain("min-w-0");
+    expect(row.className).toContain("w-full");
+    expect(row.querySelector("blockquote")!.className).toContain("min-w-0");
+    expect(row.querySelector('[aria-hidden="true"]')!.className).toContain("truncate");
   });
 
   it("Delete at the end of the line before a quote removes the quote", () => {
     const { editor, target } = mountQuoted();
     caretAt(editor, "Intro".length);
     act(() => void deleteCharForward(editor));
-    expect(target().value).toBe("Intro\n\nReply");
+    expect(target().value).toBe("Intro\nReply");
   });
 
   it("a selection across a quote removes it with the text it covers", () => {
@@ -753,7 +786,7 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     const onChange = vi.fn();
     const { container, target } = mountQuoted({ onChange });
     fireEvent.click(quoteCards(container)[0]!.querySelector("button")!);
-    expect(target().value).toBe("Intro\n\nReply");
+    expect(target().value).toBe("Intro\nReply");
     expect(onChange).toHaveBeenCalledTimes(1);
   });
 
@@ -768,7 +801,7 @@ describe("CodeMirrorComposerInput reply quotes", () => {
       "Quoted line",
     );
     act(() => void redo(editor));
-    expect(target().value).toBe("Intro\n\nReply");
+    expect(target().value).toBe("Intro\nReply");
   });
 
   it("Delete on a blank line above a quote deletes the blank line and keeps the quote", () => {

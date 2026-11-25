@@ -30,7 +30,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   unchanged.
   Reply quotes are lines of the same editor, not separate boxes: each is a card
   the caret steps over, Backspace or Delete at its edge removes it (as its X
-  does, joining the text around it into paragraphs), and a selection covering it
+  does, leaving the lines around it as they were, though a blank line that only separates it from the start or another quote goes too), and a selection covering it
   removes it with the text. Undo brings it back with its text. A slash menu
   typed after a quote lists only skills, since the text before a quote is part of
   the same document.

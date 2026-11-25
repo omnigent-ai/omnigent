@@ -279,7 +279,8 @@ function theme(heightMode: ComposerInputHeightMode): Extension {
     "&[data-scrolled] .cm-scroller": {
       maskImage: "linear-gradient(to bottom, transparent, black 18px)",
     },
-    ".cm-content": { padding: "0", caretColor: "currentColor", minHeight: "1lh" },
+    // A flex item sizes to its content: without min-width 0, a long card stretches the line past the editor.
+    ".cm-content": { padding: "0", minWidth: "0", caretColor: "currentColor", minHeight: "1lh" },
     ".cm-content:focus-visible": { outline: "none" },
     ".cm-line": { padding: "0" },
     ".cm-placeholder": { color: "var(--muted-foreground)" },

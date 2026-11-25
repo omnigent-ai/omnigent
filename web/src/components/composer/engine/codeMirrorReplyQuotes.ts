@@ -6,6 +6,7 @@ import { isolateHistory } from "@codemirror/commands";
 import {
   ChangeSet,
   EditorSelection,
+  Prec,
   StateField,
   Transaction,
   type Annotation,
@@ -15,7 +16,7 @@ import {
   type Text,
   type TransactionSpec,
 } from "@codemirror/state";
-import { Decoration, EditorView, WidgetType, type DecorationSet } from "@codemirror/view";
+import { Decoration, EditorView, keymap, WidgetType, type DecorationSet } from "@codemirror/view";
 import {
   parseReplyQuoteLine,
   REPLY_QUOTE_END,
@@ -60,37 +61,21 @@ function tokenSpans(doc: Text): Span[] {
 }
 
 /**
- * The change that removes the quote on line `lineNumber`, as `removeReplyQuoteLine` does: the same
- * lines go, and nothing else is touched.
+ * The change that removes the quote on line `lineNumber`: its line and the break after it, so the
+ * lines around it stay as they were. The blank line above it goes too when it only separates the
+ * quote from the document's start or from another quote. A last line has no break after it, so
+ * the break before goes.
  */
 function lineRemoval(doc: Text, lineNumber: number): Edit {
-  const textOf = (number: number) =>
-    number >= 1 && number <= doc.lines ? doc.line(number).text : undefined;
-  const isQuote = (number: number) =>
-    textOf(number) !== undefined && parseReplyQuoteLine(textOf(number)!) !== null;
   const line = doc.line(lineNumber);
-  const above = textOf(lineNumber - 1);
-  const below = textOf(lineNumber + 1);
-  const beforeIsBlank = above === "" && (lineNumber < 3 || isQuote(lineNumber - 2));
-  const textAbove =
-    !beforeIsBlank && above !== undefined && above !== "" && !isQuote(lineNumber - 1);
-  if (textAbove && below === "") {
-    // The blank line below is the empty tail, or a next quote's empty before: the join absorbs it.
-    const blank = doc.line(lineNumber + 1);
-    if (lineNumber + 1 === doc.lines) {
-      return { from: line.from - 1, to: blank.to, insert: "" };
-    }
-    return { from: line.from, to: blank.to + 1, insert: "" };
-  }
-  if (textAbove && below !== undefined && below !== "" && !isQuote(lineNumber + 1)) {
-    return { from: line.from, to: line.to + 1, insert: "\n" };
-  }
-  const first = beforeIsBlank ? doc.line(lineNumber - 1) : line;
-  if (lineNumber === doc.lines) {
-    // A last line has no break after it, so the removal takes the break before the first line.
-    return { from: Math.max(0, first.from - 1), to: line.to, insert: "" };
-  }
-  return { from: first.from, to: line.to + 1, insert: "" };
+  const above = lineNumber > 1 ? doc.line(lineNumber - 1) : null;
+  const separator =
+    above !== null &&
+    above.text === "" &&
+    (lineNumber === 2 || parseReplyQuoteLine(doc.line(lineNumber - 2).text) !== null);
+  const first = separator ? above : line;
+  if (lineNumber < doc.lines) return { from: first.from, to: line.to + 1, insert: "" };
+  return { from: Math.max(0, first.from - 1), to: line.to, insert: "" };
 }
 
 /**
@@ -334,8 +319,47 @@ const replyQuoteField = StateField.define<DecorationSet>({
   ],
 });
 
+/**
+ * Left or right past a card, to the text beside it: from the start of the line after a quote to
+ * the end of the line above, and from the end of a line to the start of the line after a quote.
+ * Returns false where the default step is already right, so ArrowUp and ArrowDown are untouched.
+ */
+function stepOverQuote(view: EditorView, direction: -1 | 1): boolean {
+  const range = view.state.selection.main;
+  if (!range.empty) return false;
+  const doc = view.state.doc;
+  const line = doc.lineAt(range.head);
+  const isQuote = (number: number) => parseReplyQuoteLine(doc.line(number).text) !== null;
+  let target: number;
+  if (direction < 0) {
+    if (range.head !== line.from || line.number === 1 || !isQuote(line.number - 1)) return false;
+    let number = line.number - 1;
+    while (number >= 1 && isQuote(number)) number -= 1;
+    if (number < 1) return false;
+    target = doc.line(number).to;
+  } else {
+    if (range.head !== line.to || line.number === doc.lines || !isQuote(line.number + 1)) {
+      return false;
+    }
+    let number = line.number + 1;
+    while (number <= doc.lines && isQuote(number)) number += 1;
+    if (number > doc.lines) return false;
+    target = doc.line(number).from;
+  }
+  view.dispatch({ selection: { anchor: target }, scrollIntoView: true });
+  return true;
+}
+
+const replyQuoteKeys = Prec.highest(
+  keymap.of([
+    { key: "ArrowLeft", run: (view) => stepOverQuote(view, -1) },
+    { key: "ArrowRight", run: (view) => stepOverQuote(view, 1) },
+  ]),
+);
+
 /** Quote cards and their atomic caret, plus the clipboard's `> ` markdown for copy, cut and drag. */
 export const replyQuoteExtensions: Extension = [
   replyQuoteField,
+  replyQuoteKeys,
   EditorView.clipboardOutputFilter.of((text) => replyQuoteClipboardText(text)),
 ];
