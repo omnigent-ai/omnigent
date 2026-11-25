@@ -823,6 +823,27 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
             _pending.pop(conversation_id, None)
 
 
+def mirror_matches_content(text: str, content: list[dict[str, Any]]) -> bool:
+    """
+    Whether a transcript mirror ``text`` is the message ``content`` was sent as.
+
+    Uses the same rules as :func:`resolve_matching_text`: whitespace collapsed,
+    and the executor's generated attachment marker lines ignored.
+
+    :param text: The mirrored user message text.
+    :param content: A saved input's content blocks.
+    """
+    expected = _collapse_whitespace(_content_text(content))
+    if not expected:
+        return False
+    if _collapse_whitespace(text) == expected:
+        return True
+    attachments = _attachment_count(content)
+    return bool(attachments) and (
+        _collapse_whitespace(_strip_generated_markers(text, attachments)) == expected
+    )
+
+
 def resolve_matching_text(
     conversation_id: str,
     text: str,

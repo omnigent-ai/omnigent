@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import (
     APIRouter,
@@ -24,6 +25,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
@@ -34,6 +36,9 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._auth_helpers import (
     is_session_owner as _is_session_owner,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
@@ -56,6 +61,7 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import (
     AgentCostList,
     ChildSessionList,
+    FailedInputActionResponse,
     PaginatedList,
     SessionItemList,
     SideChatList,
@@ -560,3 +566,37 @@ def register_items_routes(
             last_id=ids[-1] if ids else None,
             has_more=has_more,
         )
+
+    async def _startup_inputs_for(request: Request, session_id: str) -> Any:
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        startup = getattr(request.app.state, "startup_inputs", None)
+        if startup is None:
+            raise _session_not_found()
+        return startup
+
+    @router.post(
+        "/sessions/{session_id}/failed-inputs/{pending_id}/retry",
+        response_model=FailedInputActionResponse,
+    )
+    async def retry_failed_input(
+        request: Request, session_id: str, pending_id: str
+    ) -> FailedInputActionResponse:
+        """Send one undelivered message again, behind anything still queued."""
+        startup = await _startup_inputs_for(request, session_id)
+        return FailedInputActionResponse(
+            changed=await startup.retry_one(request.app, session_id, pending_id)
+        )
+
+    @router.delete(
+        "/sessions/{session_id}/failed-inputs/{pending_id}",
+        response_model=FailedInputActionResponse,
+    )
+    async def dismiss_failed_input(
+        request: Request, session_id: str, pending_id: str
+    ) -> FailedInputActionResponse:
+        """Remove one undelivered message from the session without sending it."""
+        startup = await _startup_inputs_for(request, session_id)
+        return FailedInputActionResponse(changed=await startup.dismiss(session_id, pending_id))

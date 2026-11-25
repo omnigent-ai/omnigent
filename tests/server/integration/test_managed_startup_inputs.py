@@ -1587,6 +1587,129 @@ async def test_unconfirmed_native_submission_times_out_after_a_server_restart(
         await restarted.shutdown()
 
 
+async def _native_queue_with_follow_up(env: _Env) -> tuple[str, Any, Any, Any, list[str]]:
+    """A native session on a connected host with one saved input and one queued behind it."""
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name)
+    host_id = uuid4().hex
+    env.conv_store.set_host_id(session_id, host_id, "/tmp/managed-workspace")
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    connection = _connect_host(env, host_id)
+    startup = env.app.state.startup_inputs
+    first = env.conv_store.list_pending_inputs(session_id)[0]
+    await startup.enqueue(
+        session_id,
+        SessionEventInput.model_validate(
+            {
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "Next"}]},
+            }
+        ),
+        user_id=None,
+        headers=Headers(),
+        first=False,
+    )
+    sent: list[str] = []
+
+    async def dispatch(context: StartupInputContext, session_id: str, event: SessionEventInput):
+        assert await context.claim(env.conv_store, session_id)
+        sent.append(event.data["content"][-1]["text"])
+        return {"queued": True, "pending_id": f"pending_{len(sent)}"}
+
+    startup.dispatch = dispatch
+    return session_id, connection, startup, first, sent
+
+
+async def test_receipt_timeout_waits_out_a_busy_turn(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude holds a prompt typed mid-turn until the turn ends; it isn't failed meanwhile."""
+    env = startup_env
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_TIMEOUT_S", 0)
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_BUSY_RECHECK_S", 0.01)
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_IDLE_GRACE_S", 0.01)
+    monkeypatch.setattr("omnigent.server.startup_inputs.wake_startup_worker", lambda _: None)
+    session_id, _connection, startup, first, sent = await _native_queue_with_follow_up(env)
+    status = {"value": "running"}
+    monkeypatch.setattr(
+        "omnigent.server.startup_inputs.session_is_busy",
+        lambda _conv: status["value"] == "running",
+    )
+    await startup._deliver(env.app, session_id, first)
+    [watch] = startup._receipt_watches.values()
+    await asyncio.sleep(0.1)
+    assert not watch.done()
+    assert env.conv_store.list_pending_inputs(session_id)[0].status == "incomplete"
+
+    status["value"] = "idle"
+    await asyncio.wait_for(watch, timeout=5)
+    assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
+    assert sent == [_TEXT]
+
+
+async def test_late_echo_settles_an_input_failed_for_want_of_it(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An echo after the timeout marks the input delivered and leaves the next one queued."""
+    env = startup_env
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_TIMEOUT_S", 0)
+    monkeypatch.setattr("omnigent.server.startup_inputs.wake_startup_worker", lambda _: None)
+    session_id, _connection, startup, first, _sent = await _native_queue_with_follow_up(env)
+    await startup._deliver(env.app, session_id, first)
+    await asyncio.gather(*startup._receipt_watches.values())
+    assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == [
+        "failed",
+        "in_progress",
+    ]
+    pending_inputs.record(session_id, [{"type": "input_text", "text": "Next"}])
+
+    await _simulate_transcript_forwarder_echo(env.client, session_id, _TEXT)
+
+    [still_queued] = env.conv_store.list_pending_inputs(session_id)
+    assert still_queued.status == "in_progress"
+    assert still_queued.data.content[0]["text"] == "Next"
+    assert pending_inputs.has_pending(session_id)
+    [delivered] = [
+        item
+        for item in env.conv_store.list_items(session_id).data
+        if item.type == "message" and item.response_id != "pending"
+    ]
+    assert delivered.data.content[-1]["text"] == _TEXT
+
+
+async def test_undelivered_input_can_be_sent_again_or_dismissed(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = startup_env
+    monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_TIMEOUT_S", 0)
+    monkeypatch.setattr("omnigent.server.startup_inputs.wake_startup_worker", lambda _: None)
+    inputs_failed: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._publish_inputs_failed", inputs_failed.append
+    )
+    session_id, _connection, startup, first, _sent = await _native_queue_with_follow_up(env)
+    await startup._deliver(env.app, session_id, first)
+    await asyncio.gather(*startup._receipt_watches.values())
+    pending_id = pending_inputs.make_pending_id(session_id, first.id)
+    base = f"/v1/sessions/{session_id}/failed-inputs/{pending_id}"
+
+    retried = await env.client.post(f"{base}/retry")
+    assert retried.status_code == 200, retried.text
+    assert retried.json() == {"changed": True}
+    assert env.conv_store.get_item(session_id, first.id).status == "in_progress"
+    again = await env.client.post(f"{base}/retry")
+    assert again.json() == {"changed": False}
+
+    env.conv_store.transition_pending_input(
+        session_id, first.id, expected="in_progress", status="failed"
+    )
+    inputs_failed.clear()
+    dismissed = await env.client.delete(base)
+    assert dismissed.json() == {"changed": True}
+    assert env.conv_store.get_item(session_id, first.id) is None
+    assert inputs_failed == [session_id]
+    assert (await env.client.delete(base)).json() == {"changed": False}
+
+
 async def test_confirmed_native_submission_is_not_failed_by_its_receipt_watch(
     startup_env: _Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:

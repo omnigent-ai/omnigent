@@ -1961,6 +1961,34 @@ export function sendUserMessage(
   });
 }
 
+function failedInputPath(sessionId: string, pendingId: string): string {
+  return `/v1/sessions/${encodeURIComponent(sessionId)}/failed-inputs/${encodeURIComponent(pendingId)}`;
+}
+
+/**
+ * Send one undelivered message again, behind anything still queued.
+ *
+ * @returns `false` when it was no longer undelivered (another client acted on it).
+ */
+export async function retryFailedInput(sessionId: string, pendingId: string): Promise<boolean> {
+  const res = await authenticatedFetch(`${failedInputPath(sessionId, pendingId)}/retry`, {
+    method: "POST",
+  });
+  return (await readJsonOrThrow<{ changed: boolean }>(res)).changed;
+}
+
+/**
+ * Remove one undelivered message without sending it.
+ *
+ * @returns `false` when it was no longer undelivered (another client acted on it).
+ */
+export async function dismissFailedInput(sessionId: string, pendingId: string): Promise<boolean> {
+  const res = await authenticatedFetch(failedInputPath(sessionId, pendingId), {
+    method: "DELETE",
+  });
+  return (await readJsonOrThrow<{ changed: boolean }>(res)).changed;
+}
+
 /** Reconnect or relaunch the existing runner without replaying user input. */
 export function retrySession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "retry_session", data: {} });

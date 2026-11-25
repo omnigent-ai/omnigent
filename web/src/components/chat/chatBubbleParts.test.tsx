@@ -1403,6 +1403,29 @@ describe("undelivered startup messages", () => {
     expect(await notes?.text()).toBe("meeting notes");
     expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);
   });
+
+  it.each([
+    ["Send again", "POST", "/v1/sessions/conv_failed/failed-inputs/pending_first/retry"],
+    ["Dismiss", "DELETE", "/v1/sessions/conv_failed/failed-inputs/pending_first"],
+  ])("%s settles the message on the server and drops its bubble", async (label, method, path) => {
+    fetchMock.mockImplementation(async () => jsonResponse({ changed: true }));
+    useChatStore.setState({ conversationId: "conv_failed", failedInputs: [lost] });
+    const [bubble] = buildUndeliveredBubbles([lost], null);
+    render(
+      <MemoryRouter initialEntries={["/c/conv_failed"]}>
+        <ConversationScopeContext.Provider value="conv_failed">
+          <BubbleView bubble={bubble!} isLastAssistant={false} />
+        </ConversationScopeContext.Provider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: label }));
+
+    await waitFor(() => expect(useChatStore.getState().failedInputs).toEqual([]));
+    const [url, init] = fetchMock.mock.calls.at(-1)!;
+    expect(String(url)).toContain(path);
+    expect((init as RequestInit | undefined)?.method).toBe(method);
+  });
 });
 
 describe("keyboardActiveQuestionId", () => {

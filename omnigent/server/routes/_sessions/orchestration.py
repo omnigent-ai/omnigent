@@ -431,6 +431,8 @@ from omnigent.server.session_mcp_selection import (
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
     StartupInputContext,
+    input_content,
+    late_native_receipt,
     restore_pending_inputs,
     wake_startup_worker,
 )
@@ -3522,6 +3524,8 @@ async def _persist_external_conversation_item_unlocked(
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
+    # A saved input already failed for want of this echo, submitted late.
+    late_receipt: ConversationItem | None = None
     if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
         # Match the mirror to its entry by text: a pasted message the TUI never
         # recorded leaves a stale head entry, and draining by position would
@@ -3556,7 +3560,18 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
+        if drained is None and not agent_message_candidate and STARTUP_LABEL in conv.labels:
+            late_receipt = await late_native_receipt(conversation_store, session_id, text)
+        if late_receipt is not None:
+            # Settles the failed input as delivered, before a FIFO drain could
+            # hand this echo to a newer message still queued.
+            cleared_pending_id = pending_inputs.make_pending_id(session_id, late_receipt.id)
+            item = _merge_pending_file_blocks(item, input_content(late_receipt)).model_copy(
+                update={"replaces_pending_id": late_receipt.id}
+            )
+            if item.created_by is None and late_receipt.created_by is not None:
+                item = item.model_copy(update={"created_by": late_receipt.created_by})
+        elif drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 match_method = "fifo_fallback"
@@ -3579,7 +3594,7 @@ async def _persist_external_conversation_item_unlocked(
             # source_id from the forwarder takes precedence when both are set.
             if drained.stable_id is not None and item.stable_id is None:
                 item = item.model_copy(update={"stable_id": drained.stable_id})
-        elif item.created_by is None and created_by is not None:
+        elif late_receipt is None and item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
@@ -3656,6 +3671,7 @@ async def _persist_external_conversation_item_unlocked(
         on_direct_input is not None
         and drains_pending_inputs
         and drained is None
+        and late_receipt is None
         and body.data.get("agent_message_candidate") is not True
     ):
         try:

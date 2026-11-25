@@ -1362,7 +1362,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </div>
         </div>
         {bubble.undelivered && (
-          <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
+          <UndeliveredMessageNotice
+            sessionId={sessionId}
+            pendingId={bubble.itemId}
+            text={text}
+            content={bubble.content}
+          />
         )}
         {bubble.pending && bubble.stillSending && (
           <div

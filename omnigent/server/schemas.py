@@ -2883,6 +2883,17 @@ class AutomaticSessionRenameResponse(BaseModel):
     reason: Literal["not_top_level", "no_seed", "title_changed", "generation_failed"] | None = None
 
 
+class FailedInputActionResponse(BaseModel):
+    """
+    Result of sending again or dismissing one undelivered message.
+
+    :param changed: ``False`` when the message was no longer undelivered,
+        e.g. another client already acted on it; clients re-read the session.
+    """
+
+    changed: bool
+
+
 class ResetSessionModelOverrideRequest(BaseModel):
     """Reset a launch-time model selection only while that selection is current."""
 

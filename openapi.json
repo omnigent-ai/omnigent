@@ -3782,6 +3782,21 @@
         "title": "FailedEvent",
         "type": "object"
       },
+      "FailedInputActionResponse": {
+        "description": "Result of sending again or dismissing one undelivered message.",
+        "properties": {
+          "changed": {
+            "description": "`False` when the message was no longer undelivered, e.g. another client already acted on it; clients re-read the session.",
+            "title": "Changed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "changed"
+        ],
+        "title": "FailedInputActionResponse",
+        "type": "object"
+      },
       "FailedResponseObject": {
         "description": "Response payload for failures raised before response allocation.\n\nTransport and setup failures can terminate a turn before the harness has\nassigned the metadata required by `ResponseObject`. The remaining\nfields mirror that model so fully allocated failures retain their complete\nwire representation.",
         "properties": {
@@ -29634,6 +29649,110 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/failed-inputs/{pending_id}": {
+      "delete": {
+        "description": "Remove one undelivered message from the session without sending it.",
+        "operationId": "dismiss_failed_input_v1_sessions__session_id__failed_inputs__pending_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "pending_id",
+            "required": true,
+            "schema": {
+              "title": "Pending Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FailedInputActionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dismiss Failed Input",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/failed-inputs/{pending_id}/retry": {
+      "post": {
+        "description": "Send one undelivered message again, behind anything still queued.",
+        "operationId": "retry_failed_input_v1_sessions__session_id__failed_inputs__pending_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "pending_id",
+            "required": true,
+            "schema": {
+              "title": "Pending Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FailedInputActionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retry Failed Input",
+        "tags": [
+          "sessions"
         ]
       }
     },

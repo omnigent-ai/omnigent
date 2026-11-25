@@ -67,6 +67,12 @@ _FAILED_INPUT_NOTE = (
 # recording it (e.g. a slash command Claude Code answers only in its TUI), and then
 # no echo comes. Matches the in-memory pending-input TTL.
 _RECEIPT_TIMEOUT_S = 600.0
+# Claude submits a prompt typed during a busy turn only at the next tool boundary
+# or when the turn ends, so the timeout waits out a turn still running, up to this
+# long after the send, then allows the echo a moment to arrive.
+_RECEIPT_BUSY_CAP_S = 3600.0
+_RECEIPT_BUSY_RECHECK_S = 15.0
+_RECEIPT_IDLE_GRACE_S = 30.0
 # "<item id>:<unix time>" of the input last submitted to a native harness, so the
 # receipt timeout survives a server restart.
 SENT_AT_LABEL = "omnigent.startup.sent"
@@ -170,6 +176,33 @@ def input_content(item: ConversationItem) -> list[dict[str, Any]]:
             {"type": "input_text", "text": f"/{data['name']} {data.get('arguments', '')}".strip()}
         ]
     return data.get("content", [])
+
+
+def session_is_busy(conv: Conversation) -> bool:
+    """Whether the session's agent is mid-turn, by this replica's status or the saved one."""
+    from omnigent.server.routes._sessions.common import _session_status_cache
+
+    return _session_status_cache.get(conv.id, conv.live_status) in ("running", "waiting")
+
+
+async def late_native_receipt(
+    store: ConversationStore, session_id: str, text: str
+) -> ConversationItem | None:
+    """
+    The failed saved input a transcript mirror with no queued match belongs to.
+
+    An input failed for want of its receipt may still be submitted later, e.g.
+    after a turn that outlasted the timeout; its echo then settles it as delivered.
+
+    :param text: The mirrored user message text.
+    :returns: The oldest failed input whose text matches, or ``None``.
+    """
+    for item in await asyncio.to_thread(store.list_pending_inputs, session_id):
+        if item.status == "failed" and pending_inputs.mirror_matches_content(
+            text, input_content(item)
+        ):
+            return item
+    return None
 
 
 async def restore_pending_inputs(store: ConversationStore, session_id: str) -> None:
@@ -763,7 +796,11 @@ class ManagedStartupInputs:
                     )
                 elif pending_id := response.get("pending_id"):
                     self._start_receipt_watch(
-                        session_id, item.id, str(pending_id), _RECEIPT_TIMEOUT_S
+                        session_id,
+                        item.id,
+                        str(pending_id),
+                        _RECEIPT_TIMEOUT_S,
+                        sent_at=context.submitted_at or time.time(),
                     )
                 await asyncio.to_thread(
                     self.conversations.set_labels,
@@ -863,14 +900,16 @@ class ManagedStartupInputs:
         return True
 
     def _start_receipt_watch(
-        self, session_id: str, item_id: str, pending_id: str, delay: float
+        self, session_id: str, item_id: str, pending_id: str, delay: float, *, sent_at: float
     ) -> None:
         key = (current_workspace_id(), session_id, item_id)
         existing = self._receipt_watches.get(key)
         if existing is not None and not existing.done():
             existing.cancel()
         watch = asyncio.create_task(
-            self._expire_unconfirmed(session_id, item_id, pending_id, delay=delay),
+            self._expire_unconfirmed(
+                session_id, item_id, pending_id, delay=delay, sent_at=sent_at
+            ),
             name=f"startup-input-receipt-{session_id}",
         )
         self._receipt_watches[key] = watch
@@ -908,13 +947,33 @@ class ManagedStartupInputs:
             item.id,
             pending_inputs.make_pending_id(conv.id, item.id),
             max(0.0, sent_at + _RECEIPT_TIMEOUT_S - now),
+            sent_at=sent_at,
         )
 
+    async def _wait_out_busy_turn(self, session_id: str, sent_at: float) -> None:
+        """Wait while the session is mid-turn, so an input Claude holds for it isn't failed."""
+        waited = False
+        while time.time() - sent_at < _RECEIPT_BUSY_CAP_S:
+            conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+            if conv is None or not session_is_busy(conv):
+                break
+            waited = True
+            await asyncio.sleep(_RECEIPT_BUSY_RECHECK_S)
+        if waited:
+            await asyncio.sleep(_RECEIPT_IDLE_GRACE_S)
+
     async def _expire_unconfirmed(
-        self, session_id: str, item_id: str, pending_id: str, *, delay: float
+        self,
+        session_id: str,
+        item_id: str,
+        pending_id: str,
+        *,
+        delay: float,
+        sent_at: float | None = None,
     ) -> None:
         """Fail a submitted input whose transcript echo never came, freeing the ones behind it."""
         await asyncio.sleep(delay)
+        await self._wait_out_busy_turn(session_id, time.time() if sent_at is None else sent_at)
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
             return
@@ -1040,6 +1099,49 @@ class ManagedStartupInputs:
             automatic=CATCH_UP,
         )
         await self.deliver_pending(app, session_id)
+
+    async def _failed_input(self, session_id: str, pending_id: str) -> ConversationItem | None:
+        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+            if (
+                item.status == "failed"
+                and pending_inputs.make_pending_id(session_id, item.id) == pending_id
+            ):
+                return item
+        return None
+
+    async def retry_one(self, app: Any, session_id: str, pending_id: str) -> bool:
+        """Queue one undelivered input again; ``False`` when it isn't undelivered any more."""
+        from omnigent.server.routes.sessions import _publish_inputs_failed
+
+        item = await self._failed_input(session_id, pending_id)
+        if item is None or not await asyncio.to_thread(
+            self.conversations.transition_pending_input,
+            session_id,
+            item.id,
+            expected="failed",
+            status="in_progress",
+        ):
+            return False
+        _publish_inputs_failed(session_id)
+        await self.deliver_pending(app, session_id)
+        return True
+
+    async def dismiss(self, session_id: str, pending_id: str) -> bool:
+        """Remove one undelivered input; ``False`` when it isn't undelivered any more."""
+        from omnigent.server.routes.sessions import _publish_inputs_failed
+
+        item = await self._failed_input(session_id, pending_id)
+        if item is None or not await asyncio.to_thread(
+            self.conversations.transition_pending_input,
+            session_id,
+            item.id,
+            expected="failed",
+            status=None,
+        ):
+            return False
+        # Other open chats re-read the undelivered list and drop it too.
+        _publish_inputs_failed(session_id)
+        return True
 
     async def retry(self, session_id: str) -> bool:
         changed = False

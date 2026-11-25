@@ -530,6 +530,9 @@ Fields:
     When the server fails a queued input without a status change (e.g. a
     native receipt that never came), it emits `session.inputs.failed` with
     `conversation_id`; open clients re-read this list.
+    `POST /v1/sessions/{id}/failed-inputs/{pending_id}/retry` queues one of
+    them again and `DELETE /v1/sessions/{id}/failed-inputs/{pending_id}`
+    removes it; both need edit access and return `{"changed": bool}`.
 
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.

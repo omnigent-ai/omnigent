@@ -4,6 +4,8 @@ import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
 import { PENDING_FILE_PREFIX, type MessageContentBlock } from "@/lib/blocks";
 import { downloadSessionFile } from "@/lib/filesApi";
+import { dismissFailedInput, retryFailedInput } from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import { useNavigate } from "@/lib/routing";
 
@@ -39,20 +41,37 @@ async function recoverAttachments(
  * Recovery actions for a startup input that was never delivered.
  *
  * @param sessionId - The session the message was saved in.
+ * @param pendingId - The undelivered message's id, for Send again and Dismiss.
  * @param text - The message text, as the bubble's Copy action copies it.
  * @param content - The message blocks; uploaded attachments are downloaded.
  */
 export function UndeliveredMessageNotice({
   sessionId,
+  pendingId,
   text,
   content,
 }: {
   sessionId: string | null;
+  pendingId?: string | null;
   text: string;
   content: MessageContentBlock[];
 }) {
   const navigate = useNavigate();
   const [starting, setStarting] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  async function settle(action: typeof retryFailedInput, failure: string) {
+    if (sessionId === null || !pendingId) return;
+    setBusy(true);
+    try {
+      // Unchanged means another client already acted on it: drop it here too.
+      await action(sessionId, pendingId);
+      useChatStore.getState().forgetFailedInput(sessionId, pendingId);
+    } catch {
+      showToast(failure);
+      setBusy(false);
+    }
+  }
 
   async function startNewSession() {
     setStarting(true);
@@ -70,6 +89,28 @@ export function UndeliveredMessageNotice({
     >
       <CircleAlertIcon size={12} aria-hidden />
       Not delivered
+      {sessionId !== null && pendingId ? (
+        <>
+          <Button
+            variant="link"
+            size="xs"
+            className="h-auto px-1 text-[11px] text-destructive underline underline-offset-2"
+            disabled={busy}
+            onClick={() => void settle(retryFailedInput, "Couldn't send it again. Try again.")}
+          >
+            Send again
+          </Button>
+          <Button
+            variant="link"
+            size="xs"
+            className="h-auto px-1 text-[11px] text-destructive underline underline-offset-2"
+            disabled={busy}
+            onClick={() => void settle(dismissFailedInput, "Couldn't dismiss it. Try again.")}
+          >
+            Dismiss
+          </Button>
+        </>
+      ) : null}
       <Button
         variant="link"
         size="xs"

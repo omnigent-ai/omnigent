@@ -1517,6 +1517,8 @@ export interface ChatActions {
    * snapshot. No-ops for inactive or missing conversations.
    */
   refreshSessionState: (conversationId?: string) => Promise<void>;
+  /** Drop one "Not delivered" message the person sent again or dismissed. */
+  forgetFailedInput: (conversationId: string, pendingId: string) => void;
   /** Dismiss the too-many-tabs banner for the current over-budget episode. */
   dismissStreamBudgetBanner: () => void;
   /** Hide the launch's `action_required` banner while the launch keeps asking for *details*. */
@@ -3807,6 +3809,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const draft: SessionDraft = { ...text, files };
     setSessionDraft(target, draft);
     useChatStore.setState({ rewindPrefill: { ...draft, conversationId: target } });
+  },
+
+  forgetFailedInput: (conversationId, pendingId) => {
+    setterFor(conversationId)((s) => ({
+      failedInputs: s.failedInputs.filter((input) => input.pendingId !== pendingId),
+    }));
   },
 
   refreshSessionState: async (conversationId) => {
