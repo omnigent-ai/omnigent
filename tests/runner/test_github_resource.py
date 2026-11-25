@@ -1135,6 +1135,80 @@ def test_github_pr_diff_resolves_number_then_diffs(
     assert [c for c in calls if c[:2] == ("pr", "diff")] == [("pr", "diff", "9")]
 
 
+_DIFF_TOO_LARGE = (
+    "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum"
+    " number of lines (20000)\nPullRequest.diff too_large"
+)
+
+
+def test_github_pr_diff_too_large_rebuilds_patch_from_file_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A diff GitHub refuses for its size is rebuilt from each file's patch, across pages."""
+    pages = [
+        [
+            {"filename": "app.py", "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b"},
+            {"filename": "new.txt", "status": "added", "patch": "@@ -0,0 +1 @@\n+hi\n"},
+        ],
+        [
+            {"filename": "old.txt", "status": "removed", "patch": "@@ -1 +0,0 @@\n-bye"},
+            {
+                "filename": "moved.py",
+                "previous_filename": "was.py",
+                "status": "renamed",
+                "changes": 2,
+                "patch": "@@ -1 +1 @@\n-x\n+y",
+            },
+            {"filename": "same.py", "previous_filename": "kept.py", "status": "renamed"},
+            {"filename": "logo.png", "status": "modified", "changes": 0},
+        ],
+    ]
+    calls: list[list[str]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        if argv[:2] == ["pr", "diff"]:
+            return 1, "", _DIFF_TOO_LARGE
+        return 0, json.dumps(pages), ""
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+
+    result = github_resource._pr_patch("/root", _PR)
+
+    assert result["patch"] == (
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-a\n+b\n"
+        "diff --git a/new.txt b/new.txt\nnew file mode 100644\n"
+        "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n"
+        "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n"
+        "--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n"
+        "diff --git a/was.py b/moved.py\nsimilarity index 50%\n"
+        "rename from was.py\nrename to moved.py\n"
+        "--- a/was.py\n+++ b/moved.py\n@@ -1 +1 @@\n-x\n+y\n"
+        "diff --git a/kept.py b/same.py\nsimilarity index 100%\n"
+        "rename from kept.py\nrename to same.py\n"
+        "diff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n"
+    )
+    listing = calls[-1]
+    assert listing[0] == "api" and "--slurp" in listing
+    assert listing[-1] == "repos/example/two/pulls/42/files?per_page=100"
+
+
+def test_github_pr_diff_too_large_fails_when_file_entries_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the per-file fallback also fails, the diff error stands rather than an empty patch."""
+    _stub_gh(
+        monkeypatch,
+        {("pr", "diff"): (1, "", _DIFF_TOO_LARGE), ("api",): (1, "", "denied")},
+    )
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+    with pytest.raises(ValueError, match="could not load the PR diff"):
+        github_resource._pr_patch("/root", _PR)
+
+
 # ── Pull request commits ─────────────────────────────────────────────────────
 
 _PR = PullRequestRef.from_url("https://github.com/example/two/pull/42")
