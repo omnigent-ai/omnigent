@@ -623,10 +623,11 @@ async def test_side_chat_recovery_errors_reach_both_routes(
     assert store.list_items(side.id).data == []
 
 
+@pytest.mark.parametrize("shared_runner", ["side-chat", "sub-agent"])
 async def test_resume_single_flight_is_shared_only_within_one_caller(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, shared_runner: str
 ) -> None:
-    """Concurrent Resume calls on a side chat share an attempt only within one caller.
+    """Concurrent Resume calls on a side chat or sub-agent share an attempt per caller.
 
     Both callers may edit the source, but only one owns its runner. The other
     editor starts recovery first and is held open; the runner owner arriving
@@ -635,6 +636,10 @@ async def test_resume_single_flight_is_shared_only_within_one_caller(
     """
     store = SqlAlchemyConversationStore(db_uri)
     source, side = _source_and_side_chat(store, db_uri)
+    if shared_runner == "sub-agent":
+        side = store.create_conversation(
+            kind="sub_agent", agent_id=source.agent_id, parent_conversation_id=source.id
+        )
     permissions = SqlAlchemyPermissionStore(db_uri)
     for user in (_OWNER, _OTHER):
         permissions.ensure_user(user)

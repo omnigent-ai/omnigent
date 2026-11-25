@@ -284,6 +284,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _heal_subagent_runner_binding_via_parent,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
+    _may_relaunch_runner_of,
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
     _native_pane_harness,
@@ -841,6 +842,60 @@ async def _resume_codex_side_chat(
     return conv
 
 
+async def _reattach_subagent_runner(
+    conv: Conversation,
+    *,
+    app_state: Any,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+    raise_host_refusal: bool = False,
+    request: Any = None,
+) -> httpx.AsyncClient | None:
+    from omnigent.server.child_session_recovery import _restorable
+
+    tunnel_registry = getattr(app_state, "tunnel_registry", None)
+    client = await _heal_subagent_runner_binding_via_parent(
+        conv, runner_router, tunnel_registry, conversation_store
+    )
+    root_id = conv.root_conversation_id
+    if (
+        client is not None
+        or not root_id
+        or root_id == conv.id
+        or _side_chat_source_id(conv) is not None
+    ):
+        return client
+    root = await asyncio.to_thread(conversation_store.get_conversation, root_id)
+    if (
+        root is None
+        or not _restorable(root)
+        or not await _may_relaunch_runner_of(
+            root_id,
+            conversation_store=conversation_store,
+            user_id=user_id,
+            permission_store=permission_store,
+            source=root,
+        )
+    ):
+        return None
+    root_client, _ = await ensure_runner_connected(
+        session_id=root_id,
+        conv=root,
+        app_state=app_state,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        raise_host_refusal=raise_host_refusal,
+        request=request,
+    )
+    if root_client is None:
+        return None
+    return await _heal_subagent_runner_binding_via_parent(
+        conv, runner_router, tunnel_registry, conversation_store
+    )
+
+
 async def _recover_retry_session(
     *,
     request: Request,
@@ -871,6 +926,28 @@ async def _recover_retry_session(
             runner_router=runner_router,
             raise_host_refusal=True,
         )
+        if (
+            runner_client is None
+            and conv.kind == "sub_agent"
+            and _side_chat_source_id(conv) is None
+        ):
+            runner_client = await _reattach_subagent_runner(
+                conv,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                user_id=user_id,
+                permission_store=permission_store,
+                raise_host_refusal=True,
+                request=request,
+            )
+            if runner_client is not None:
+                refreshed = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                if refreshed is None:
+                    raise _session_not_found()
+                conv = refreshed
         if runner_client is None:
             runner_client, conv = await _recover_side_chat_runner_via_source(
                 conv,
@@ -958,11 +1035,13 @@ async def _retry_session_single_flight(
     """Share one in-flight recovery attempt across concurrent callers.
 
     A side chat's recovery depends on the caller's access to its source and
-    ownership of the source's runner, so it is shared only by one caller's
-    concurrent requests.
+    ownership of the source's runner, and a sub-agent's on the caller's access
+    to its root, so each is shared only by one caller's concurrent requests.
     """
-    is_side_chat = conversation is not None and _side_chat_source_id(conversation) is not None
-    flight: _RetryFlight = (session_id, user_id if is_side_chat else None)
+    per_caller = conversation is not None and (
+        conversation.kind == "sub_agent" or _side_chat_source_id(conversation) is not None
+    )
+    flight: _RetryFlight = (session_id, user_id if per_caller else None)
     lock = _retry_recovery_lock(session_id)
     async with lock:
         task = _retry_recovery_tasks.get(flight)
@@ -3454,15 +3533,17 @@ def register_events_routes(
         if runner_client is None and conv.kind == "sub_agent":
             # A sub-agent copies its parent's runner_id at creation and is
             # never repointed when the parent's runner is relaunched.  If the
-            # runner is dead but the parent has a live replacement, repair the
-            # stale binding via the ancestor chain and continue through the
-            # normal init+dispatch flow.
-            _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
-            healed_client = await _heal_subagent_runner_binding_via_parent(
+            # runner is dead, repair the stale binding via the ancestor chain,
+            # relaunching the root's runner when no ancestor runner is live,
+            # and continue through the normal init+dispatch flow.
+            healed_client = await _reattach_subagent_runner(
                 conv,
-                runner_router,
-                _tunnel_registry,
-                conversation_store,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                user_id=user_id,
+                permission_store=permission_store,
+                request=request,
             )
             if healed_client is not None:
                 runner_client = healed_client

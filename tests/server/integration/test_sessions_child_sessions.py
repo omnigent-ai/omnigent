@@ -2517,6 +2517,57 @@ async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
 
 
 @pytest.mark.parametrize("event_type", ["message", "retry_session"])
+async def test_subagent_wakes_root_runner_when_no_ancestor_runner_is_live(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+) -> None:
+    """A message or Retry on a sub-agent relaunches its root's runner, then rebinds to it."""
+    child = await _create_native_child(client, name=f"wake-root-{event_type.replace('_', '-')}")
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
+        base_url="http://runner",
+    )
+    relaunched = False
+
+    async def _ensure(*, session_id: str, conv: Conversation, **_kwargs: object):
+        nonlocal relaunched
+        if session_id == child["id"]:
+            return None, conv
+        relaunched = True
+        return fake_runner, conv
+
+    async def _live_after_relaunch(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient | None:
+        return fake_runner if relaunched else None
+
+    ensure = AsyncMock(side_effect=_ensure)
+    monkeypatch.setattr(routes_events_module, "ensure_runner_connected", ensure)
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _live_after_relaunch)
+    monkeypatch.setattr(
+        routes_events_module, "_heal_subagent_runner_binding_via_parent", _live_after_relaunch
+    )
+    monkeypatch.setattr(
+        routes_events_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(routes_events_module, "_ensure_runner_relay_ready", AsyncMock())
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": event_type,
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+            if event_type == "message"
+            else {},
+        },
+    )
+
+    assert resp.status_code in {200, 202}, resp.text
+    woken = [call.kwargs["session_id"] for call in ensure.await_args_list]
+    root_id = child["parent_session_id"]
+    assert woken == ([root_id] if event_type == "message" else [child["id"], root_id])
+
+
+@pytest.mark.parametrize("event_type", ["message", "retry_session"])
 @pytest.mark.parametrize("closed", [False, True])
 async def test_side_chat_recovers_on_parent_runner(
     client: httpx.AsyncClient,

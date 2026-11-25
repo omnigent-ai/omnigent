@@ -6357,7 +6357,7 @@ def _side_chat_source_id(conv: Conversation) -> str | None:
 _SIDE_CHAT_RECOVERY_ATTEMPTS = 3
 
 
-async def _may_edit_side_chat_source(
+async def _may_relaunch_runner_of(
     source_id: str,
     *,
     conversation_store: ConversationStore,
@@ -6365,9 +6365,10 @@ async def _may_edit_side_chat_source(
     permission_store: PermissionStore | None,
     source: Conversation | None = None,
 ) -> bool:
-    """Return whether the caller may relaunch a side chat's source runner.
+    """Return whether the caller may relaunch the runner a side chat or sub-agent shares.
 
-    Recovery restarts the source's runner, so it needs the same edit access a
+    The runner belongs to *source_id*: a side chat's source or a sub-agent's
+    root. Recovery restarts that runner, so it needs the same edit access a
     message to the source would. Always ``True`` when auth is off.
     """
     if permission_store is None:
@@ -6412,7 +6413,7 @@ async def _recover_side_chat_runner_via_source(
     source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
     if source is None:
         return None, side_chat
-    if not await _may_edit_side_chat_source(
+    if not await _may_relaunch_runner_of(
         source_id,
         conversation_store=conversation_store,
         user_id=user_id,
