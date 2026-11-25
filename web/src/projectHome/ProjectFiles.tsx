@@ -48,7 +48,8 @@ export function ProjectFiles({ projectId }: { projectId: string | null }) {
           </ul>
         ) : (
           <p className="p-3 text-sm text-muted-foreground">
-            No files yet. Agents save documents and evidence here with sys_project_artifact_save.
+            No files yet. Plans, reports, screenshots and other files your team attaches to tickets
+            show up here.
           </p>
         )}
       </PopoverContent>

@@ -24,6 +24,7 @@ import {
 } from "@/lib/projectStatusApi";
 import { cn } from "@/lib/utils";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
+import { MemberName, memberDisplayName } from "./MemberName";
 import { ProjectKpiTiles } from "./ProjectKpis";
 import { ProjectStatusItemsDialog, type StatusDrilldown } from "./ProjectStatusItems";
 import { useProjectMandate } from "./ProjectMandateDialog";
@@ -43,7 +44,10 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
     staleTime: 30_000,
   });
   const memberNames = useMemo(
-    () => new Map((summary.data?.members ?? []).map((member) => [member.key, member.name])),
+    () =>
+      new Map(
+        (summary.data?.members ?? []).map((member) => [member.key, memberDisplayName(member)]),
+      ),
     [summary.data],
   );
   if (projects.isLoading) return <Spinner aria-label="Loading project" />;
@@ -209,7 +213,7 @@ function HeadlineNumbers({
             : () => onDrill({ label: "Spent", metric: "spend_usd", range })
         }
       />
-      <StatTile label="Team members" value={String(totals.members)} />
+      <StatTile label="Team" value={teamCount(summary.members)} />
       <StatTile
         label="Tickets done"
         value={String(totals.tickets_done)}
@@ -217,6 +221,15 @@ function HeadlineNumbers({
       />
     </dl>
   );
+}
+
+/** "2 people · 10 roles": the Lead and named roles count as roles; the agents pool doesn't. */
+export function teamCount(members: readonly ProjectStatusMember[]): string {
+  const people = members.filter((member) => member.kind === "human").length;
+  const roles = members.filter((member) => member.kind === "identity").length;
+  const plural = (count: number, one: string, many: string) =>
+    `${count} ${count === 1 ? one : many}`;
+  return `${plural(people, "person", "people")} · ${plural(roles, "role", "roles")}`;
 }
 
 function StatTile({
@@ -330,14 +343,14 @@ function MembersTable({
             <tr key={member.key}>
               <th scope="row" className="px-3 py-2 text-left font-normal">
                 <span className="flex items-center gap-2">
-                  <span className="wrap-anywhere">{member.name}</span>
+                  <MemberName member={member} />
                   <Badge variant="outline" className="shrink-0 text-xs font-normal">
-                    {member.kind === "human" ? "Human" : "Agent"}
+                    {member.kind === "human" ? "Person" : "Agent"}
                   </Badge>
                 </span>
               </th>
               <NumberCell
-                label={`Tickets done by ${member.name}`}
+                label={`Tickets done by ${memberDisplayName(member)}`}
                 onOpen={() =>
                   onDrill({
                     label: "Tickets done",
@@ -350,7 +363,7 @@ function MembersTable({
                 {String(member.tickets_done)}
               </NumberCell>
               <NumberCell
-                label={`PRs merged by ${member.name}`}
+                label={`PRs merged by ${memberDisplayName(member)}`}
                 onOpen={
                   member.prs_merged === null
                     ? undefined
@@ -366,7 +379,7 @@ function MembersTable({
                 {member.prs_merged === null ? "—" : String(member.prs_merged)}
               </NumberCell>
               <NumberCell
-                label={`Spend by ${member.name}`}
+                label={`Spend by ${memberDisplayName(member)}`}
                 onOpen={
                   member.spend_cents === null
                     ? undefined
