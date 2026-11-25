@@ -4702,6 +4702,8 @@ def create_app(
                 register_mention_targets=lambda targets: setattr(
                     app.state, "persona_mention_targets", targets
                 ),
+                agent_store=agent_store,
+                artifact_store=artifact_store,
             ),
             prefix="/v1",
             tags=["projects"],

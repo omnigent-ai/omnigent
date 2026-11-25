@@ -44,6 +44,7 @@ from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.persona_mentions import Mention, PersonaMentionTargets
 from omnigent.server.product_approval import OWNER_ONLY_CONFIG_KEYS
+from omnigent.server.project_agents import create_role_agent
 from omnigent.server.project_identities import (
     ORCHESTRATOR_IDENTITY_ID,
     identity_response,
@@ -69,6 +70,7 @@ from omnigent.server.project_router import (
 )
 from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._session_create_validation import agent_owner_id
 from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
     CreateProjectRequest,
@@ -84,6 +86,8 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_orchestration import require_named_source_private
 from omnigent.server.usage_events import record_usage_event
+from omnigent.stores.agent_store import AgentStore
+from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
@@ -366,6 +370,8 @@ def create_projects_router(
     permission_store: PermissionStore | None = None,
     create_session: ProjectSessionCreator | None = None,
     register_mention_targets: Callable[[PersonaMentionTargets], None] | None = None,
+    agent_store: AgentStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
 
@@ -374,6 +380,8 @@ def create_projects_router(
         ``None`` in single-user mode (owner scope is ``None``).
     :param conversation_store: Resolves the calling session an agent tool names.
     :param permission_store: Checks whether that session is shared with edit access.
+    :param agent_store: Stores each role's project agent; ``None`` keeps roles on their base.
+    :param artifact_store: Holds the project agents' bundles.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
@@ -945,10 +953,11 @@ def create_projects_router(
             for field in ("agent_id", "model", "effort")
             if getattr(body, field) == "" and field in body.model_fields_set
         )
+        current = await asyncio.to_thread(
+            project_store.get_identity, project.id, _identity_id(identity_id), user_id=user_id
+        )
+        base_before = current.agent_id if current is not None else None
         if "agent_id" in body.model_fields_set and project.user_id != user_id:
-            current = await asyncio.to_thread(
-                project_store.get_identity, project.id, _identity_id(identity_id), user_id=user_id
-            )
             _refuse_member_agent_choice(
                 project,
                 user_id,
@@ -970,6 +979,18 @@ def create_projects_router(
         )
         if identity is None:
             raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+        if identity.project_agent_id and identity.agent_id != base_before:
+            # A new base means a new copy, which the role's next session makes.
+            stale = identity.project_agent_id
+            identity = await asyncio.to_thread(
+                project_store.set_identity_project_agent,
+                project.id,
+                identity.id,
+                None,
+                user_id=project.user_id,
+                expected=stale,
+            )
+            await asyncio.to_thread(_discard_role_agent, stale)
         await _record_role_event(request, project, user_id, "role.updated", identity.id, body)
         announce_projects_changed(user_id)
         return await _identity_payload(project, identity)
@@ -987,15 +1008,73 @@ def create_projects_router(
                 "The Lead can't be deleted; choose another router to remove it",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if project.user_id != user_id:
+            raise OmnigentError(
+                "Only the project owner can remove a project's identities",
+                code=ErrorCode.FORBIDDEN,
+            )
         normalized = _identity_id(identity_id)
+        identity = await asyncio.to_thread(
+            project_store.get_identity, project.id, normalized, user_id=user_id
+        )
         deleted = await asyncio.to_thread(
             project_store.delete_identity, project.id, normalized, user_id=user_id
         )
         if not deleted:
             raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+        if identity is not None and identity.project_agent_id:
+            await asyncio.to_thread(_discard_role_agent, identity.project_agent_id)
         await _record_role_event(request, project, user_id, "role.deleted", normalized, None)
         announce_projects_changed(user_id)
         return {"id": normalized, "object": "project.identity.deleted", "deleted": True}
+
+    def _discard_role_agent(agent_id: str) -> None:
+        """Delete a role's project agent once no session uses it; in-use ones stay hidden."""
+        if agent_store is None or conversation_store is None:
+            return
+        if conversation_store.count_sessions_for_agent(agent_id, cap=1) == 0:
+            agent_store.delete(agent_id)
+
+    async def _role_agent_id(
+        project: Project, identity: ProjectIdentity, base_agent_id: str
+    ) -> tuple[ProjectIdentity, str | None]:
+        """The identity's project agent, copied from *base_agent_id* on first use.
+
+        ``None`` keeps the role on its base: no store, an ineligible base, or a
+        failed copy, which retries on the role's next session.
+        """
+        if agent_store is None or artifact_store is None:
+            return identity, None
+        if identity.project_agent_id:
+            current = await asyncio.to_thread(agent_store.get, identity.project_agent_id)
+            if current is not None and current.project_id == project.id:
+                return identity, current.id
+        base = await asyncio.to_thread(agent_store.get, base_agent_id)
+        if base is None:
+            return identity, None
+        try:
+            role_agent = await asyncio.to_thread(
+                create_role_agent,
+                agent_store,
+                artifact_store,
+                owner=agent_owner_id(project.user_id),
+                project_id=project.id,
+                base=base,
+                role_name=identity.name,
+                instructions="",
+            )
+            identity = await asyncio.to_thread(
+                project_store.set_identity_project_agent,
+                project.id,
+                identity.id,
+                role_agent.id,
+                user_id=project.user_id,
+                expected=identity.project_agent_id,
+            )
+        except OmnigentError:
+            logger.warning("Kept identity %s on its base agent", identity.id, exc_info=True)
+            return identity, None
+        return identity, identity.project_agent_id
 
     # Single-flight per identity, so concurrent opens and heals never start two sessions.
     identity_locks: dict[str, asyncio.Lock] = {}
@@ -1051,6 +1130,10 @@ def create_projects_router(
                     getattr(request.app.state, "agent_store", None),
                     payload.get("host_id"),
                 )
+            # The role runs its own copy of the base, which carries the tools the owner set.
+            identity, role_agent_id = await _role_agent_id(project, identity, payload["agent_id"])
+            if role_agent_id:
+                payload["agent_id"] = role_agent_id
             store = conversation_store
 
             async def label_identity_session(session_id: str) -> None:

@@ -375,6 +375,7 @@ def _identity_entity(row: SqlProjectIdentity) -> ProjectIdentity:
         active_session_id=row.active_session_id,
         created_by_session_id=row.created_by_session_id,
         scope=row.scope,
+        project_agent_id=row.project_agent_id,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -1459,6 +1460,43 @@ class SqlAlchemyProjectStore(ProjectStore):
         return run_write_transaction(
             self._session_immediate, "set_project_identity_session", write
         )
+
+    def set_identity_project_agent(
+        self,
+        project_id: str,
+        identity_id: str,
+        project_agent_id: str | None,
+        *,
+        user_id: str | None,
+        expected: str | None,
+    ) -> ProjectIdentity:
+        """Point an identity at its project agent, or clear it, if it still has *expected*.
+
+        :raises OmnigentError: ``CONFLICT`` when another writer changed it first.
+        """
+
+        def write(session: Session) -> ProjectIdentity:
+            require_active_account(session, user_id)
+            if not self._owned_project(session, project_id, user_id):
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            row = session.get(
+                SqlProjectIdentity,
+                (current_workspace_id(), project_id, identity_id),
+                with_for_update=True,
+            )
+            if row is None:
+                raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+            if row.project_agent_id != project_agent_id:
+                if row.project_agent_id != expected:
+                    raise OmnigentError(
+                        "The identity's agent changed; reload the project",
+                        code=ErrorCode.CONFLICT,
+                    )
+                row.project_agent_id = project_agent_id
+            session.flush()
+            return _identity_entity(row)
+
+        return run_write_transaction(self._session_immediate, "set_project_identity_agent", write)
 
     def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
         """Return the active order used by project-list endpoints."""

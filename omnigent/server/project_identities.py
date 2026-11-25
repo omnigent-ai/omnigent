@@ -66,6 +66,7 @@ def identity_response(identity: ProjectIdentity, state: IdentitySessionState) ->
         "active_session_id": identity.active_session_id,
         "active_session_state": state,
         "created_by_session_id": identity.created_by_session_id,
+        "project_agent_id": identity.project_agent_id,
         "created_at": identity.created_at,
         "updated_at": identity.updated_at,
     }

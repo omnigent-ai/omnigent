@@ -357,6 +357,18 @@ class ProjectStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def set_identity_project_agent(
+        self,
+        project_id: str,
+        identity_id: str,
+        project_agent_id: str | None,
+        *,
+        user_id: str | None,
+        expected: str | None,
+    ) -> ProjectIdentity:
+        """Point an identity at its project agent, or clear it, if it still has *expected*."""
+        raise NotImplementedError
+
     def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
         """Read saved IDs; None means alphabetical order."""
         raise NotImplementedError

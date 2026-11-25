@@ -191,6 +191,16 @@ def validate_session_model_metadata(
     return validated_model, validated_effort
 
 
+def agent_owner_id(user_id: str | None) -> str | None:
+    """The ``created_by`` a user agent carries for *user_id*.
+
+    Single-user schedules store the local owner as None; installs stamp "local".
+    """
+    if user_id is None and local_single_user_enabled():
+        return RESERVED_USER_LOCAL
+    return user_id
+
+
 def require_user_agent_visible(agent: Any, user_id: str | None) -> None:
     """404 a user agent no session uses (an install, or one whose sessions were
     deleted) for anyone but its owner.
@@ -200,9 +210,7 @@ def require_user_agent_visible(agent: Any, user_id: str | None) -> None:
     binds for no one. Server agents pass through, and so do agents a session
     uses: those are authorized against that session instead.
     """
-    # Single-user schedules store the local owner as None; installs stamp "local".
-    if user_id is None and local_single_user_enabled():
-        user_id = RESERVED_USER_LOCAL
+    user_id = agent_owner_id(user_id)
     if not agent.operator_authored and agent.session_id is None and agent.created_by != user_id:
         raise OmnigentError(f"Agent not found: {agent.id!r}", code=ErrorCode.NOT_FOUND)
 

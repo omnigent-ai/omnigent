@@ -35,7 +35,7 @@ from omnigent.db.utils import builtin_agent_id, installed_agent_id
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native.permission_modes import APPROVAL_SKIPPING_PERMISSION_MODES
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
 from omnigent.server.auth import AuthProvider
@@ -411,6 +411,16 @@ def create_builtin_agents_router(
     ) -> AgentConfigObject | JSONResponse:
         """Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config."""
         agent = await editable_agent(request, agent_id)
+        agent_call = (
+            ORCHESTRATION_SOURCE_HEADER in request.headers
+            or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+        )
+        if agent_call and agent.project_id is not None:
+            # A role's tools and permission mode run code as the project owner.
+            raise OmnigentError(
+                "Only the project owner can change a project role's agent; agents can't",
+                code=ErrorCode.FORBIDDEN,
+            )
         if (
             ORCHESTRATION_SOURCE_HEADER in request.headers
             and body.permission_mode in APPROVAL_SKIPPING_PERMISSION_MODES

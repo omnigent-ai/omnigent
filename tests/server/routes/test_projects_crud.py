@@ -1754,3 +1754,97 @@ async def test_a_role_has_an_editable_owns_and_does_not_own_scope(
     assert full.json()["scope"]["owns"] == widest
     cleared = await project_client.patch(path, json={"scope": {"owns": [], "excludes": []}})
     assert cleared.json()["scope"] is None
+
+
+async def test_a_role_runs_its_own_project_agent_copied_from_its_base(
+    multi_user_client: httpx.AsyncClient, project_agents: SqlAlchemyAgentStore
+) -> None:
+    """A role's session binds a project-scoped copy of its base; a new base makes a new copy."""
+    owner = _as_user(ALICE)
+    created = (
+        await multi_user_client.post("/v1/projects", json={"name": "Roles"}, headers=owner)
+    ).json()
+    path = f"/v1/projects/{created['id']}"
+    claude = project_agents.get_by_name("claude-native-ui")
+    codex = project_agents.get_by_name("codex-native-ui")
+    assert claude is not None and codex is not None
+    pm = (
+        await multi_user_client.post(
+            f"{path}/identities",
+            json={"name": "PM", "instructions": "Plan.", "agent_id": claude.id},
+            headers=owner,
+        )
+    ).json()
+
+    role_agent = project_agents.get(pm["project_agent_id"])
+    assert role_agent is not None
+    assert (role_agent.project_id, role_agent.created_by, role_agent.name) == (
+        created["id"],
+        ALICE,
+        "PM",
+    )
+    session = await multi_user_client.get(f"/v1/sessions/{pm['active_session_id']}", headers=owner)
+    assert session.json()["agent_id"] == role_agent.id
+    assert role_agent.id not in {a.id for a in project_agents.list_user_agents(ALICE).data}
+
+    # Changing the base drops the old copy; the role's next session makes a new one.
+    rebased = await multi_user_client.patch(
+        f"{path}/identities/{pm['id']}", json={"agent_id": codex.id}, headers=owner
+    )
+    assert rebased.status_code == 200, rebased.text
+    assert rebased.json()["project_agent_id"] is None
+
+
+async def test_project_agents_stay_with_their_role_and_owner(
+    multi_user_client: httpx.AsyncClient, project_agents: SqlAlchemyAgentStore
+) -> None:
+    """Members can't delete roles; a role's agent runs only for its owner, in its project."""
+    owner, member = _as_user(ALICE), _as_user(BOB)
+    created = (
+        await multi_user_client.post("/v1/projects", json={"name": "Roles"}, headers=owner)
+    ).json()
+    other = (
+        await multi_user_client.post("/v1/projects", json={"name": "Other"}, headers=owner)
+    ).json()
+    path = f"/v1/projects/{created['id']}"
+    await multi_user_client.post(f"{path}/shares", json={"user_id": BOB}, headers=owner)
+    claude = project_agents.get_by_name("claude-native-ui")
+    assert claude is not None
+    pm = (
+        await multi_user_client.post(
+            f"{path}/identities",
+            json={"name": "PM", "instructions": "Plan.", "agent_id": claude.id},
+            headers=owner,
+        )
+    ).json()
+    role_agent_id = pm["project_agent_id"]
+    assert role_agent_id
+
+    refused = await multi_user_client.delete(f"{path}/identities/{pm['id']}", headers=member)
+    assert refused.status_code == 403, refused.text
+    for headers, project_id in ((member, created["id"]), (owner, other["id"])):
+        started = await multi_user_client.post(
+            "/v1/sessions",
+            json={"agent_id": role_agent_id, "project_id": project_id},
+            headers=headers,
+        )
+        assert started.status_code == 403, (project_id, started.text)
+        assert "project role" in started.text
+    for agent_headers in (
+        {ORCHESTRATION_SOURCE_HEADER: pm["active_session_id"]},
+        {RUNNER_TUNNEL_TOKEN_HEADER: "runner-token"},
+    ):
+        agent_edit = await multi_user_client.patch(
+            f"/v1/agents/{role_agent_id}",
+            json={"description": "x"},
+            headers={**owner, **agent_headers},
+        )
+        assert agent_edit.status_code == 403, (agent_headers, agent_edit.text)
+        assert "project role" in agent_edit.text
+    owner_edit = await multi_user_client.patch(
+        f"/v1/agents/{role_agent_id}", json={"description": "Owner note."}, headers=owner
+    )
+    assert owner_edit.status_code == 200, owner_edit.text
+
+    deleted = await multi_user_client.delete(f"{path}/identities/{pm['id']}", headers=owner)
+    assert deleted.status_code == 200, deleted.text

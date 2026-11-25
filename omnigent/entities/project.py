@@ -175,6 +175,8 @@ class ProjectIdentity:
         when the owner did; agents may edit only agent-created identities.
     :param scope: The role's ``{"owns": [...], "excludes": [...]}`` lists, or
         ``None`` when it has none.
+    :param project_agent_id: The role's own agent, a project-scoped copy of
+        ``agent_id`` (or the project default), or ``None`` until it is made.
     :param created_at: Unix epoch seconds at creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None``.
     """
@@ -189,6 +191,7 @@ class ProjectIdentity:
     active_session_id: str | None = None
     created_by_session_id: str | None = None
     scope: dict[str, list[str]] | None = None
+    project_agent_id: str | None = None
     created_at: int = 0
     updated_at: int | None = None
 

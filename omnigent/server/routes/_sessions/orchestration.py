@@ -13589,8 +13589,24 @@ async def _create_session_from_existing_agent(
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
     )
+    from omnigent.server.routes._session_create_validation import agent_owner_id
     from omnigent.stores.conversation_store.overrides import encode_session_overrides
 
+    # A project role's agent starts sessions only for its owner, in its own project:
+    # a copy would hand the owner's tool configuration to someone else. A child
+    # reusing its parent's agent is the role's own session tree.
+    reuses_parent_agent = (
+        _parent_for_routing is not None and _parent_for_routing.agent_id == agent.id
+    )
+    if (
+        agent.project_id is not None
+        and not reuses_parent_agent
+        and (agent.created_by != agent_owner_id(user_id) or project_id != agent.project_id)
+    ):
+        raise OmnigentError(
+            "This agent belongs to a project role and can only start that role's sessions",
+            code=ErrorCode.FORBIDDEN,
+        )
     # A new session from another user's agent runs on the caller's own copy, so
     # that user can never change code running here. A child reusing its parent's
     # agent stays on it: collaborators act in the owner's session. A failed create
