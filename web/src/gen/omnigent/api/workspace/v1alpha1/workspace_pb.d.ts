@@ -4744,8 +4744,8 @@ export declare const WorkspaceService: GenService<{
     output: typeof DisableAutoMergeResponseSchema;
   },
   /**
-   * Adds a draft comment on a line or range to the pending review, starting one if needed,
-   * or a draft reply in a review conversation to the viewer's pending review.
+   * Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+   * viewer's pending review; it must already exist, so start one with StartPendingReview.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.AddPendingReviewComment
    */

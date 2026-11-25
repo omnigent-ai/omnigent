@@ -249,8 +249,8 @@ class WorkspaceService(Protocol):
 
     async def add_pending_review_comment(self, request: AddPendingReviewCommentRequest, ctx: RequestContext[AddPendingReviewCommentRequest, AddPendingReviewCommentResponse], /) -> AddPendingReviewCommentResponse:
         """
-        Adds a draft comment on a line or range to the pending review, starting one if needed,
-        or a draft reply in a review conversation to the viewer's pending review.
+        Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+        viewer's pending review; it must already exist, so start one with StartPendingReview.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -2039,8 +2039,8 @@ class WorkspaceServiceClient(ConnectClient):
         timeout_ms: int | None = None,
     ) -> AddPendingReviewCommentResponse:
         """
-        Adds a draft comment on a line or range to the pending review, starting one if needed,
-        or a draft reply in a review conversation to the viewer's pending review.
+        Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+        viewer's pending review; it must already exist, so start one with StartPendingReview.
         """
         return await self.execute_unary(
             request=request,
@@ -2977,8 +2977,8 @@ class WorkspaceServiceSync(Protocol):
 
     def add_pending_review_comment(self, request: AddPendingReviewCommentRequest, ctx: RequestContext[AddPendingReviewCommentRequest, AddPendingReviewCommentResponse], /) -> AddPendingReviewCommentResponse:
         """
-        Adds a draft comment on a line or range to the pending review, starting one if needed,
-        or a draft reply in a review conversation to the viewer's pending review.
+        Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+        viewer's pending review; it must already exist, so start one with StartPendingReview.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -4765,8 +4765,8 @@ class WorkspaceServiceClientSync(ConnectClientSync):
         timeout_ms: int | None = None,
     ) -> AddPendingReviewCommentResponse:
         """
-        Adds a draft comment on a line or range to the pending review, starting one if needed,
-        or a draft reply in a review conversation to the viewer's pending review.
+        Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+        viewer's pending review; it must already exist, so start one with StartPendingReview.
         """
         return self.execute_unary(
             request=request,
