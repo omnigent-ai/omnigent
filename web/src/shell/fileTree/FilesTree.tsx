@@ -3,16 +3,7 @@
 // and the panel's sort, change marks, sizes, menus and ⌘K target carry over.
 // Row interactions the tree doesn't offer are delegated from its root.
 
-import {
-  type CSSProperties,
-  type FocusEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { type CSSProperties, type FocusEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   FileTree,
   type FileTreeDirectoryHandle,
@@ -215,12 +206,19 @@ function FilesTreeRows(props: FilesTreeProps) {
 
   // Folders beyond the root load as they're wanted, through the panel's listing queries.
   const [loadingFolders, setLoadingFolders] = useState<string[]>([]);
+  const openFolders = useOpenFolders(model);
+  // A closed folder keeps its cached rows, and a listing still being read for it stops.
+  const closedFolders = useMemo(
+    () => new Set(loadingFolders.filter((folder) => !openFolders.has(folder))),
+    [loadingFolders, openFolders],
+  );
   const directories = useWorkspaceDirectories(
     conversationId,
     loadingFolders,
     browseLocation,
     refreshToken,
     !showIgnored,
+    closedFolders,
   );
   // Keyed on the listings' own data, so a fresh result map holding the same data changes nothing.
   const rawListings: FolderListing[] = [{ folder: "", entries: props.rootEntries }];
@@ -470,11 +468,7 @@ function FilesTreeRows(props: FilesTreeProps) {
   );
   const cutOffListings = rawListings.filter(({ entries }) => listingCutOff(entries));
   // Only a cut-off folder whose entries show is named; one status line has room for one.
-  const shownCutOffFolder = useShownFolder(
-    model,
-    cutOffListings.map(({ folder }) => folder),
-  );
-  const cutOffListing = cutOffListings.find(({ folder }) => folder === shownCutOffFolder);
+  const cutOffListing = cutOffListings.find(({ folder }) => openFolders.has(folder));
   const status = treeStatus({
     failed,
     pending,
@@ -558,22 +552,35 @@ function treeStatus({
   return null;
 }
 
-/** Whether `folder`'s entries show now: the root's always do, another's while it's open in view. */
-function folderShown(model: FileTreeModel, folder: string): boolean {
-  if (folder === "") return true;
-  const path = folderTreePath(folder);
-  return (
-    model.getVisibleIndexOfPath(path) >= 0 && (asFolder(model.getItem(path))?.isExpanded() ?? false)
-  );
+/**
+ * The folders whose entries show: the root, each open row's folder, and the folders an open row
+ * stands for as a chain of only-child folders.
+ */
+function openFolderSet(model: FileTreeModel): Set<string> {
+  const open = new Set([""]);
+  for (const row of model.getVisibleRows(0, model.getVisibleCount())) {
+    if (row.kind !== "directory" || !row.isExpanded) continue;
+    open.add(row.path.replace(/\/$/, ""));
+    for (const segment of row.flattenedSegments ?? []) open.add(segment.path.replace(/\/$/, ""));
+  }
+  return open;
 }
 
-/** The first of `folders` whose entries show, followed as folders open and close; null for none. */
-function useShownFolder(model: FileTreeModel, folders: readonly string[]): string | null {
-  const subscribe = useCallback((onChange: () => void) => model.subscribe(onChange), [model]);
-  return useSyncExternalStore(
-    subscribe,
-    () => folders.find((folder) => folderShown(model, folder)) ?? null,
-  );
+/** {@link openFolderSet}, followed as folders open and close. */
+function useOpenFolders(model: FileTreeModel): ReadonlySet<string> {
+  const [open, setOpen] = useState<ReadonlySet<string>>(() => openFolderSet(model));
+  useEffect(() => {
+    const update = () =>
+      setOpen((current) => {
+        const next = openFolderSet(model);
+        return next.size === current.size && [...next].every((folder) => current.has(folder))
+          ? current
+          : next;
+      });
+    update();
+    return model.subscribe(update);
+  }, [model]);
+  return open;
 }
 
 /**

@@ -101,6 +101,9 @@ function renderTree(
     /** Ask, with the listings unchanged, to reveal a folder. */
     reveal: (entries: readonly WorkspaceFile[], reveal: FilesTreeReveal) =>
       view.rerender(<FilesTree {...props(entries, reveal)} />),
+    /** Change the tree's settings, with the root listing unchanged. */
+    setProps: (changes: Partial<FilesTreeProps>) =>
+      view.rerender(<FilesTree {...props(rootEntries)} {...changes} />),
   };
 }
 
@@ -283,13 +286,17 @@ describe("FilesTree", () => {
     vi.mocked(authenticatedFetch).mockImplementation(
       async (_input: RequestInfo | URL, init?: RequestInit) => {
         signals.push(init?.signal);
-        await new Promise<void>((resolve) => {
-          releaseFirstPage = resolve;
-        });
+        // The first listing waits, then says more follow; a later one is whole at once.
+        const first = signals.length === 1;
+        if (first) {
+          await new Promise<void>((resolve) => {
+            releaseFirstPage = resolve;
+          });
+        }
         return Response.json({
           object: "list",
           data: [{ id: "closing/a.txt", ...file("closing/a.txt") }],
-          has_more: true,
+          has_more: first,
           last_id: "closing/a.txt",
         });
       },
@@ -303,7 +310,63 @@ describe("FilesTree", () => {
     await waitFor(() => expect(signals[0]?.aborted).toBe(true));
     await act(async () => releaseFirstPage?.());
     expect(signals).toHaveLength(1);
+
+    // Opening it again lists it afresh.
+    fireEvent.click(screen.getByRole("treeitem", { name: "closing" }));
+    expect(await screen.findByRole("treeitem", { name: "a.txt" })).toBeInTheDocument();
+    expect(signals).toHaveLength(2);
   });
+
+  it.each([
+    ["the folder", "direct", false],
+    ["a folder above it", "above", true],
+  ])(
+    "asks for no further page of a listed folder's new listing once %s closes",
+    async (_case, outer, closesFolderAbove) => {
+      // Once `holding`, the folder's listing waits for its release, then says more follow.
+      let holding = false;
+      let release: (() => void) | undefined;
+      const held: (AbortSignal | null | undefined)[] = [];
+      vi.mocked(authenticatedFetch).mockImplementation(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const { pathname } = new URL(String(input), "http://localhost");
+          const listed = decodeURIComponent(pathname.split("/filesystem/")[1] ?? "");
+          const entries =
+            listed === outer
+              ? [folder(`${outer}/swap`), file(`${outer}/z.txt`)]
+              : [file(`${outer}/swap/a.txt`)];
+          if (listed === `${outer}/swap` && holding) {
+            held.push(init?.signal);
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+          }
+          return Response.json({
+            object: "list",
+            data: entries.map((entry) => ({ id: entry.path, ...entry })),
+            has_more: listed === `${outer}/swap` && holding,
+            last_id: entries.at(-1)!.path,
+          });
+        },
+      );
+      // Folders no other case opens: the tree remembers open folders per session.
+      const tree = renderTree([folder(outer), file("README.md")]);
+      fireEvent.click(await screen.findByRole("treeitem", { name: outer }));
+      fireEvent.click(await screen.findByRole("treeitem", { name: "swap" }));
+      await screen.findByRole("treeitem", { name: "a.txt" });
+
+      // Hiding ignored files lists the folder again, showing its cached rows meanwhile.
+      holding = true;
+      tree.setProps({ showIgnored: false });
+      await waitFor(() => expect(held).toHaveLength(1));
+      expect(screen.getByRole("treeitem", { name: "a.txt" })).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("treeitem", { name: closesFolderAbove ? outer : "swap" }));
+      await waitFor(() => expect(held[0]?.aborted).toBe(true));
+      await act(async () => release?.());
+      expect(held).toHaveLength(1);
+    },
+  );
 
   it("says nothing of a complete listing as long as the entry limit", async () => {
     // A host that ignores the page size can list a whole folder of this size in one go.
