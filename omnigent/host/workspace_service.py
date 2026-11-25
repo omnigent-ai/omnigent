@@ -82,6 +82,7 @@ from omnigent.host import workspace_fuzzy
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
 from omnigent.host.workspace_git import comparison, context, working_copy
 from omnigent.host.workspace_git.ignored import DirectoryIgnores
+from omnigent.host.workspace_git.repository_folder import repository_folder
 from omnigent.host.workspace_git.runner import Deadline, GitError, runs_on_this_host
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_struct
@@ -145,7 +146,9 @@ _SERVED: dict[str, _Served] = {
         optional_features=workspace_fuzzy.features,
     ),
     "SearchText": _Served(features=("text_search_priority",), tool="rg"),
-    "ResolveWorkingCopyBase": _Served(features=("revision_comparison",), tool="git"),
+    "ResolveWorkingCopyBase": _Served(
+        features=("revision_comparison", "comparison.repository"), tool="git"
+    ),
     "ListWorkingCopyChanges": _Served(tool="git"),
     "ReadBaseFile": _Served(tool="git"),
     "ListRepositoryRefs": _Served(tool="git"),
@@ -331,7 +334,10 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse] | None,
     ) -> ResolveWorkingCopyBaseResponse:
         reader = await _read(self._reader_for, ctx)
-        return await working_copy.resolve_working_copy_base(reader.root, request)
+        folder = await repository_folder(reader, request.repository)
+        return await working_copy.resolve_working_copy_base(
+            folder.path, request, folder.repository
+        )
 
     async def list_working_copy_changes(
         self,
@@ -339,7 +345,10 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse] | None,
     ) -> ListWorkingCopyChangesResponse:
         reader = await _read(self._reader_for, ctx)
-        return await working_copy.list_working_copy_changes(reader.root, request)
+        folder = await repository_folder(reader, request.repository)
+        return await working_copy.list_working_copy_changes(
+            folder.path, request, folder.repository
+        )
 
     async def read_base_file(
         self,
@@ -347,7 +356,10 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ReadBaseFileRequest, ReadBaseFileResponse] | None,
     ) -> AsyncIterator[ReadBaseFileResponse]:
         reader = await _read(self._reader_for, ctx)
-        async with aclosing(working_copy.read_base_file(reader.root, request)) as responses:
+        folder = await repository_folder(reader, request.repository)
+        async with aclosing(
+            working_copy.read_base_file(folder.path, request, folder.repository)
+        ) as responses:
             async for response in responses:
                 yield response
 
@@ -357,7 +369,8 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ListRepositoryRefsRequest, ListRepositoryRefsResponse] | None,
     ) -> ListRepositoryRefsResponse:
         reader = await _read(self._reader_for, ctx)
-        return await comparison.list_repository_refs(reader.root, request)
+        folder = await repository_folder(reader, request.repository)
+        return await comparison.list_repository_refs(folder.path, request, folder.repository)
 
     async def list_branch_commits(
         self,
@@ -365,7 +378,8 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ListBranchCommitsRequest, ListBranchCommitsResponse] | None,
     ) -> ListBranchCommitsResponse:
         reader = await _read(self._reader_for, ctx)
-        return await comparison.list_branch_commits(reader.root, request)
+        folder = await repository_folder(reader, request.repository)
+        return await comparison.list_branch_commits(folder.path, request, folder.repository)
 
     async def resolve_repository_context(
         self,

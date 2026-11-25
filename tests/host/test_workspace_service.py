@@ -957,6 +957,7 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
         "text_search_priority",
         "ResolveWorkingCopyBase",
         "revision_comparison",
+        "comparison.repository",
         "ListWorkingCopyChanges",
         "ReadBaseFile",
         "ListRepositoryRefs",
