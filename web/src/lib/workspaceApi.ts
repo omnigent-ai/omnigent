@@ -413,13 +413,13 @@ async function listDirectory(
       },
       { signal },
     );
-    // A host that hands back the token it was given is resending a page; stop before keeping it.
-    if (pageToken && page.nextPageToken === pageToken) break;
+    // A page ending on a token already asked for resends one the listing holds; stop before keeping it.
+    if (page.nextPageToken && requested.has(page.nextPageToken)) break;
     data.push(...page.entries.map(listedEntry));
     pageToken = page.nextPageToken;
     // A page that adds nothing would never end the listing; report the rest as more.
     if (page.entries.length === 0) break;
-  } while (pageToken && !requested.has(pageToken) && data.length < maxEntries);
+  } while (pageToken && data.length < maxEntries);
   /* oxlint-enable no-await-in-loop */
   // A host may ignore the page size; keep to the caller's limit and report the rest as more.
   const overLimit = data.length > maxEntries;

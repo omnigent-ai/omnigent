@@ -504,12 +504,17 @@ describe("readFileViaWorkspaceApi", () => {
 
   it("stops before asking again for a page token it already asked for, and reports more", async () => {
     enable("workspace_api_server_access");
-    // The host cycles: "" → A → B → A.
-    const next: Record<string, string> = { "": "A", A: "B", B: "A" };
-    scriptPages((token) => ({ paths: [`src/${token || "first"}.ts`], next: next[token]! }));
+    // The host cycles: "" → A → B → A, resending the first page for B.
+    const pages: Record<string, { paths: string[]; next: string }> = {
+      "": { paths: ["src/a.ts"], next: "A" },
+      A: { paths: ["src/b.ts"], next: "B" },
+      B: { paths: ["src/a.ts"], next: "A" },
+    };
+    scriptPages((token) => pages[token]!);
 
     const listed = await listDirectoryViaWorkspaceApi("s-list-cycle", "src", 1000);
 
+    expect(listed?.data.map((entry) => entry.path)).toEqual(["src/a.ts", "src/b.ts"]);
     expect(listed?.hasMore).toBe(true);
     expect(
       methodCalls("ListDirectory").map(
