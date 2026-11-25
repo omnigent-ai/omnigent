@@ -236,8 +236,11 @@ describe("FilesTree", () => {
   it("lists every entry of an opened folder longer than one page", async () => {
     const names = Array.from({ length: 1500 }, (_, i) => `big/f${String(i).padStart(4, "0")}.txt`);
     const asked = serveListings({ big: names.map(file) });
+    const reset = vi.spyOn(FileTreeModel.prototype, "resetPaths");
     renderTree([folder("big")]);
-    fireEvent.click(await screen.findByRole("treeitem", { name: "big" }));
+    const opened = await screen.findByRole("treeitem", { name: "big" });
+    reset.mockClear();
+    fireEvent.click(opened);
 
     // Rows are virtualized, so the first row's set size says how many the folder holds.
     await waitFor(() =>
@@ -248,6 +251,9 @@ describe("FilesTree", () => {
     );
     // Two pages of the endpoint's 1,000, the second after the first's last entry.
     expect(asked).toEqual(["big", "big"]);
+    // Both pages arrive as one listing, so the tree rebuilds once, not per page.
+    expect(reset).toHaveBeenCalledTimes(1);
+    reset.mockRestore();
   });
 
   it("says when a folder's listing stopped with more entries past it", async () => {
