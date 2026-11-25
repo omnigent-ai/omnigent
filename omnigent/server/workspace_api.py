@@ -46,6 +46,11 @@ from omnigent.host.workspace_pull_request_input import (
     refuse_unserved_request,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.pull_request_viewers import (
+    PullRequestViewer,
+    review_comments_for_viewer,
+    review_threads_for_viewer,
+)
 
 # Each reply must arrive within this; a whole ReadFile can take longer.
 _REPLY_TIMEOUT_S = 30.0
@@ -79,6 +84,12 @@ _REVIEW_WRITES = frozenset(
 PULL_REQUEST_FAILURE_REASONS = frozenset(
     {"comment_changed", "pull_request_changed", "invalid_input"}
 )
+# The reads whose answer the server shapes for who reads it: the host account's rights.
+_VIEWER_SHAPES: dict[str, Callable[[dict[str, Any], PullRequestViewer], dict[str, Any]]] = {
+    "ListReviewThreads": review_threads_for_viewer,
+    "ListReviewThreadComments": review_comments_for_viewer,
+}
+VIEWER_SHAPED_METHODS = frozenset(_VIEWER_SHAPES)
 # Served only while the workspace_content_search flag is on.
 _CONTENT_SEARCH_METHOD = "SearchText"
 
@@ -108,11 +119,14 @@ class PullRequestRoute:
     :param overview: Stores the PRs an overview payload reports (GetPullRequest's and
         SetPullRequestAccount's) and answers with the server's list, given the time the
         call was sent.
+    :param viewer: Who reads; anyone but the owner gets the thread reads without the
+        host account's rights. The least trusted by default.
     """
 
     session_id: str
     vouch: Callable[[str], Awaitable[PullRequestVouch | None]]
     overview: Callable[[dict[str, Any], float], Awaitable[dict[str, Any]]]
+    viewer: PullRequestViewer = PullRequestViewer.VIEWER
 
 
 class HostWorkspaceService(WorkspaceServiceMethods):
@@ -196,6 +210,10 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         )
         # Every pull request response is one ``payload`` Struct, the REST route's JSON.
         response: Any = method.response_type.FromString(message)
+        shape = _VIEWER_SHAPES.get(method.name)
+        if shape is not None and route.viewer is not PullRequestViewer.OWNER:
+            shaped = shape(payload_dict(response.payload), route.viewer)
+            return method.response_type(payload=payload_struct(shaped))
         if method.name not in _OVERVIEW_METHODS:
             return response
         payload = await route.overview(payload_dict(response.payload), sent_at)
