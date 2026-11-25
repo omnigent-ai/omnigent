@@ -71,10 +71,14 @@ def sends(monkeypatch: pytest.MonkeyPatch) -> list[GhCall]:
     """Every ``gh`` call other than a token lookup; ``gh`` has no token for any login."""
     calls: list[GhCall] = []
 
-    def gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
+    def gh(
+        argv: list[str], *, cwd: str, token: str | None = None, **_options: Any
+    ) -> tuple[int, str, str]:
         assert cwd == "/workspace"
         if argv[:2] == ["auth", "token"]:
             return 1, "", f"no oauth token found for github.com account {argv[3]}"
+        if argv[-2:] == ["--jq", ".id"]:
+            return 0, "12345\n", ""  # The repository read an attachment upload starts with.
         calls.append((argv, token))
         return 1, "", "HTTP 403: Resource not accessible"
 
@@ -114,5 +118,20 @@ def test_a_write_without_a_chosen_login_or_in_a_sandbox_runs_as_the_active_accou
             write()
 
     assert "isn't signed in" not in str(refused.value)
-    [(_argv, token)] = sends
+    [(argv, token)] = sends
+    assert "-X" in argv
     assert token is None
+
+
+def test_a_login_cleared_during_the_token_lookup_still_refuses(
+    monkeypatch: pytest.MonkeyPatch, sends: list[GhCall]
+) -> None:
+    """Another request clearing the saved login mid-write must not let this one run as another."""
+    saved = ["octocat", None]
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: saved.pop(0))
+
+    with pytest.raises(ValueError, match="account octocat isn't signed in on the host"):
+        with github._gh_deadline_scope(time.monotonic() + 30):
+            WRITES["post a comment"]()
+
+    assert sends == []

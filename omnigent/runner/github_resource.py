@@ -1190,13 +1190,13 @@ def _write_token(root: str, reference: PullRequestRef, *, timed_out: str) -> str
     Call it inside the write's deadline scope. Without the token of the login chosen for the
     repository, ``gh`` would run as whichever account is active on the host.
     """
+    # Read the login before the lookup, so clearing it mid-write can't let this one through.
+    login = None if _in_sandbox() else _config.github_account_preference(_repo_argument(reference))
     token = _pr_token(root, reference)
     if _gh_timed_out.get():
         raise ValueError(timed_out)
-    if token is None and not _in_sandbox():
-        login = _config.github_account_preference(_repo_argument(reference))
-        if login:
-            raise ValueError(_signed_out_account(login))
+    if login and token is None:
+        raise ValueError(_signed_out_account(login))
     return token
 
 
