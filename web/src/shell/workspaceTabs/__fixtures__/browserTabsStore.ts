@@ -2,6 +2,8 @@
 // the shell probes and reports, and a check that every published state keeps the
 // cursor on the selected tab.
 
+import { onTestFinished } from "vitest";
+
 import { noteBrowserPageControl } from "@/lib/browserPageControls";
 import { browserViewId } from "@/lib/browserTabs";
 
@@ -137,7 +139,15 @@ export function setup({
   });
   const shell = new FakeShell(mode);
   for (const [viewKey, view] of Object.entries(views)) shell.views.set(viewKey, view);
-  const detach = attachBrowserTabNavigation(store, SESSION, shell);
+  const attached = attachBrowserTabNavigation(store, SESSION, shell);
+  let detached = false;
+  const detach = () => {
+    if (detached) return;
+    detached = true;
+    attached();
+  };
+  // Page-control subscriptions are module-wide, so a test that doesn't detach would leak its owners.
+  onTestFinished(detach);
   return { store, shell, detach, incoherent };
 }
 

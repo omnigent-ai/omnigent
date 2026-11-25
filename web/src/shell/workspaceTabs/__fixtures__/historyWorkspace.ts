@@ -18,8 +18,6 @@ import {
   historyStartingAt,
   recordStep,
   removeTab,
-  replaceCurrent,
-  replaceNewTab,
   type WorkspaceHistoryState,
 } from "../workspaceHistory";
 import type { BrowserEntry, TabId, Visit, WorkspacePlace } from "../workspacePlace";
@@ -29,12 +27,6 @@ export interface FakeTab {
   place: WorkspacePlace;
   entry?: BrowserEntry;
   dirty?: boolean;
-  /** Shown after a background open into an unselected, clean tab. */
-  dot?: boolean;
-  /** The one Files tab, which navigates in place and which agents never move. */
-  role?: "files";
-  /** A background open waiting to be shown in a selected, dirty or Files tab. */
-  attention?: WorkspacePlace;
 }
 
 export class FakeBrowserBridge implements BrowserNavigationBridge {
@@ -112,18 +104,6 @@ export class HistoryWorkspace {
     this.history = recordStep(this.history, this.visitOf(tab));
   }
 
-  /** An agent's open: never selects and never a step. */
-  openInBackground(tab: FakeTab): void {
-    const existing = this.tabs.find((candidate) => candidate.id === tab.id);
-    if (!existing) {
-      this.insertAfterSelected({ ...tab, dot: true });
-      return;
-    }
-    if (existing.id === this.selectedTabId || existing.dirty || existing.role === "files") {
-      existing.attention = tab.place;
-    } else Object.assign(existing, { place: tab.place, dot: true });
-  }
-
   /** The user selects a tab: a step for whatever it shows. */
   select(id: TabId): void {
     if (id === this.selectedTabId) return;
@@ -131,35 +111,7 @@ export class HistoryWorkspace {
     this.selectedTabId = id;
     this.browsers.get(previous)?.deselected();
     const tab = this.tab(id);
-    tab.dot = false;
     this.history = recordStep(this.history, this.visitOf(tab));
-  }
-
-  /** In-tab navigation (a PR sub-view, a file from the tree): a step through the guard. */
-  async navigate(id: TabId, place: WorkspacePlace): Promise<"leave" | "cancel"> {
-    const tab = this.tab(id);
-    if (tab.dirty && (await this.askToLeave([id])) === "cancel") return "cancel";
-    tab.place = place;
-    tab.dirty = false;
-    if (id === this.selectedTabId) this.history = recordStep(this.history, this.visitOf(tab));
-    else this.select(id);
-    return "leave";
-  }
-
-  /** A line or comment move within the same tab and path: replaces the cursor visit when that tab is selected. */
-  moveWithin(id: TabId, place: WorkspacePlace): void {
-    const tab = this.tab(id);
-    tab.place = place;
-    if (id === this.selectedTabId) this.history = replaceCurrent(this.history, this.visitOf(tab));
-    else this.select(id);
-  }
-
-  /** The new-tab page became an app, in the same tab or a bound tab in its slot. */
-  pickApp(newTabId: TabId, app: FakeTab): void {
-    const index = this.tabs.findIndex((tab) => tab.id === newTabId);
-    this.tabs.splice(index, 1, app);
-    if (this.selectedTabId === newTabId) this.selectedTabId = app.id;
-    this.history = replaceNewTab(this.history, newTabId, this.visitOf(app));
   }
 
   /** Back or Forward: guard, then move the cursor, select and land. Resolves once landing has started. */
