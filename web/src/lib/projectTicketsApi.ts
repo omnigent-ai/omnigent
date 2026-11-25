@@ -81,6 +81,11 @@ export interface ProjectTicket {
   }[];
   agents_has_more?: boolean;
   latest_update: string;
+  /**
+   * Newest comment by a person or for the human; stage moves and label edits don't
+   * replace it. Null when there is none; absent on single-ticket reads and older servers.
+   */
+  latest_comment?: TicketLatestComment | null;
   comment_count: number;
   /** Who asked for the work: a user ID, or `github:<login>` for an imported PR. */
   requested_by?: string | null;
@@ -100,6 +105,15 @@ export interface ProjectTicket {
   sign_offs?: TicketLabel[];
   /** Who the open needs-human ask waits on, routed as in the Inbox; null once answered. */
   waiting_on?: TicketWaitingOn | null;
+}
+export interface TicketLatestComment {
+  text: string;
+  user_id: string | null;
+  session_id: string | null;
+  /** Written by a person rather than an agent. */
+  by_person: boolean;
+  position: number;
+  created_at: number;
 }
 export interface TicketWaitingOn {
   reason: string;

@@ -525,11 +525,7 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
       {ticket.labels.length > 0 && (
         <TicketLabels labels={ticket.labels} compact waitingOn={ticket.waiting_on} />
       )}
-      {ticket.latest_update && !isSystemUpdate(ticket.latest_update, ticket.comment_count) && (
-        <p className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere">
-          {ticket.latest_update}
-        </p>
-      )}
+      <TicketStatusLine ticket={ticket} />
       <div className="flex items-center justify-between gap-2 text-sm text-muted-foreground">
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           <time
@@ -543,6 +539,39 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
         <TicketCommentCount ticket={ticket} />
       </div>
     </>
+  );
+}
+
+/**
+ * The card's second line: the newest comment for the human, so a later move or label
+ * edit doesn't hide it. Without one (older servers, or one past the server's scan), the
+ * last update shows unless it is an event line.
+ */
+function TicketStatusLine({ ticket }: { ticket: ProjectTicket }) {
+  const comment = ticket.latest_comment;
+  const text =
+    comment?.text ||
+    (ticket.latest_update && !isSystemUpdate(ticket.latest_update, ticket.comment_count)
+      ? ticket.latest_update
+      : null);
+  if (!text) return null;
+  const author = comment
+    ? comment.by_person
+      ? requesterLabel(comment.user_id, getCurrentUserId())
+      : "an agent"
+    : null;
+  return (
+    <p
+      data-testid="ticket-status-line"
+      title={
+        comment
+          ? `Latest comment${author ? ` by ${author}` : ""}, ${absoluteTime(comment.created_at * 1000)}`
+          : undefined
+      }
+      className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere"
+    >
+      {text}
+    </p>
   );
 }
 

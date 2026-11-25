@@ -547,6 +547,36 @@ describe("Project ticket board", () => {
     },
   );
 
+  it("shows the latest comment for the human after a later move or label edit", async () => {
+    ticket.latest_update = "Moved to Review";
+    ticket.comment_count = 2;
+    ticket.latest_comment = {
+      text: "Ship it Friday",
+      user_id: "alice@example.com",
+      session_id: null,
+      by_person: true,
+      position: 3,
+      created_at: 1_700_000_000,
+    };
+    renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+    const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+    const line = within(card).getByTestId("ticket-status-line");
+    expect(line).toHaveTextContent("Ship it Friday");
+    expect(line.title).toMatch(/^Latest comment by alice@example\.com, /);
+    expect(within(card).queryByText("Moved to Review")).toBeNull();
+  });
+
+  it("falls back to the last real update when the server found no comment", async () => {
+    ticket.latest_update = "Confirmed the issue is resolved";
+    ticket.comment_count = 1;
+    ticket.latest_comment = null;
+    renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+    const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+    const line = within(card).getByTestId("ticket-status-line");
+    expect(line).toHaveTextContent("Confirmed the issue is resolved");
+    expect(line).not.toHaveAttribute("title");
+  });
+
   it("folds new comments into the comment count", async () => {
     ticket.comment_count = 3;
     ticket.new_comment_count = 2;
