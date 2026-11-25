@@ -1,0 +1,171 @@
+import type { FeatureKey, ServerInfo } from "./capabilities";
+import { getOmnigentServerIdentity } from "./host";
+
+export interface OverridableUiFeature {
+  feature: FeatureKey;
+  label: string;
+  description: string;
+}
+
+export const OVERRIDABLE_UI_FEATURES: readonly OverridableUiFeature[] = [
+  {
+    feature: "chat_composer_codemirror",
+    label: "CodeMirror chat input",
+    description: "Write chat messages in a CodeMirror editor that scrolls long drafts.",
+  },
+  {
+    feature: "workspace_sidebar_v2",
+    label: "Workspace tabs sidebar",
+    description: "Show the workspace sidebar as tabs: Files, Changes and pull request pages.",
+  },
+  {
+    feature: "quick_pick_palette",
+    label: "QuickPick command palette",
+    description: "Run ⌘K and the session switcher on the fuzzy-matching QuickPick list.",
+  },
+  {
+    feature: "sidebar_saved_views",
+    label: "Sidebar saved views",
+    description: "Filter the sidebar's sessions by pull request, and save views.",
+  },
+  {
+    feature: "sidebar_grouping_ui",
+    label: "Sidebar grouping",
+    description: "Grouping, ordering and row details in the sidebar, and a Shared section.",
+  },
+  {
+    feature: "sidebar_windowed_rows",
+    label: "Windowed sidebar rows",
+    description: "Mount only the sidebar rows near the viewport, so long lists stay fast.",
+  },
+  {
+    feature: "grid_sessions_display_ui",
+    label: "Session grids",
+    description: "Drag sessions into a conversation to see up to four live chats at once.",
+  },
+  {
+    feature: "splittable_terminal_view_ui",
+    label: "Split terminal view",
+    description: "Split the main terminal view into several shell panes.",
+  },
+  {
+    feature: "canvas",
+    label: "Canvas",
+    description: "A Canvas page with sessions as draggable cards, grouped by project.",
+  },
+  {
+    feature: "session_overview",
+    label: "Session cost sidebar",
+    description: "Show session cost and token usage in a sidebar beside chat.",
+  },
+  {
+    feature: "project_kanban",
+    label: "Project home",
+    description:
+      "Open a project's home page, with its sessions in status columns. An older server may not support it.",
+  },
+  {
+    feature: "project_repository_creation",
+    label: "Projects from a repository",
+    description:
+      "Create a project by cloning a repository on a host. An older server may not support it.",
+  },
+  {
+    feature: "floating_composer",
+    label: "Floating composer",
+    description: "Open the floating New Agent panel from the desktop app.",
+  },
+  {
+    feature: "import_review",
+    label: "Import review",
+    description: "Open the import review automatically when a new host connects.",
+  },
+];
+
+export type UiFeatureOverrides = Readonly<Partial<Record<FeatureKey, boolean>>>;
+const OVERRIDABLE = new Set<string>(OVERRIDABLE_UI_FEATURES.map(({ feature }) => feature));
+const STORAGE_PREFIX = "omnigent:ui-feature-overrides:v1:";
+// Read once per page load: every change reloads the page.
+const cache = new Map<string, UiFeatureOverrides | null>();
+
+function storageKey(): string | null {
+  if (typeof window === "undefined") return null;
+  const server = getOmnigentServerIdentity();
+  return server ? `${STORAGE_PREFIX}${JSON.stringify(server)}` : null;
+}
+
+export function canOverrideUiFeatures(): boolean {
+  return storageKey() !== null;
+}
+
+export function readUiFeatureOverrides(): UiFeatureOverrides {
+  const key = storageKey();
+  if (key === null) return {};
+  if (cache.has(key)) return cache.get(key) ?? {};
+  let stored: string | null;
+  try {
+    stored = window.localStorage.getItem(key);
+  } catch {
+    cache.set(key, null);
+    return {};
+  }
+  const overrides: Partial<Record<FeatureKey, boolean>> = {};
+  try {
+    const raw: unknown = JSON.parse(stored ?? "null");
+    if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+      for (const [name, value] of Object.entries(raw)) {
+        if (OVERRIDABLE.has(name) && typeof value === "boolean") {
+          overrides[name as FeatureKey] = value;
+        }
+      }
+    }
+  } catch {
+    // Ignore malformed storage.
+  }
+  cache.set(key, overrides);
+  return overrides;
+}
+
+export function writeUiFeatureOverride(feature: FeatureKey, value: boolean | null): boolean {
+  const key = storageKey();
+  if (key === null || !OVERRIDABLE.has(feature)) return false;
+  const previous = readUiFeatureOverrides();
+  if (cache.get(key) === null) return false;
+  const overrides =
+    value === null
+      ? Object.fromEntries(Object.entries(previous).filter(([name]) => name !== feature))
+      : { ...previous, [feature]: value };
+  try {
+    if (Object.keys(overrides).length === 0) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, JSON.stringify(overrides));
+  } catch {
+    return false;
+  }
+  cache.set(key, overrides);
+  return true;
+}
+
+export function effectiveQuickPickEnabled(
+  info: ServerInfo | "loading",
+  overrides: UiFeatureOverrides,
+): boolean {
+  if (info === "loading" || !info.features || !Object.hasOwn(info.features, "quick_pick_palette"))
+    return false;
+  return overrides.quick_pick_palette ?? info.features.quick_pick_palette === true;
+}
+
+export function activeUiFeatureOverrides(info: ServerInfo | "loading") {
+  if (info === "loading") return [];
+  const overrides = readUiFeatureOverrides();
+  if (!effectiveQuickPickEnabled(info, overrides)) return [];
+  return OVERRIDABLE_UI_FEATURES.flatMap((entry) => {
+    const value = overrides[entry.feature];
+    return Object.hasOwn(info.features, entry.feature) && value !== undefined
+      ? [{ ...entry, value }]
+      : [];
+  });
+}
+
+export function resetUiFeatureOverridesForTests(): void {
+  cache.clear();
+}

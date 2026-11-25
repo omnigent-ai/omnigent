@@ -6,6 +6,8 @@ import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import * as host from "@/lib/host";
+import { resetUiFeatureOverridesForTests } from "@/lib/uiFeatureOverrides";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
 import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
@@ -118,6 +120,7 @@ afterEach(() => {
   cleanup();
   // QuickPick records accepted commands under Recent; a later case starts without them.
   localStorage.clear();
+  resetUiFeatureOverridesForTests();
 });
 
 /** Every non-empty live region's text, so both palettes' status messages read the same. */
@@ -1250,6 +1253,97 @@ describe("CommandPalette — actions", () => {
     expect(screen.getByRole("option", { name: /Go to Settings/ })).toBeTruthy();
     expect(screen.queryByRole("option", { name: /New chat/ })).toBeNull();
   });
+});
+
+describe("CommandPalette — QuickPick preview bootstrap", () => {
+  const label = "Enable feature preview: new QuickPick command palette";
+  const key = `omnigent:ui-feature-overrides:v1:${JSON.stringify(window.location.origin)}`;
+  const legacyOnly = "QUICK_PICK_PALETTE" in commandPaletteModule;
+
+  function searchPreview() {
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "preview" } });
+  }
+
+  function mockReload() {
+    const reload = vi.fn();
+    const actualWindow = window;
+    vi.stubGlobal(
+      "window",
+      new Proxy(actualWindow, {
+        get(target, property) {
+          return property === "location"
+            ? { origin: target.location.origin, reload }
+            : Reflect.get(target, property, target);
+        },
+      }),
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    return reload;
+  }
+
+  it.skipIf(legacyOnly)(
+    "offers the command only in search and saves the opt-in before reloading",
+    () => {
+      serverInfo.mockReturnValue({
+        session_search_scope: true,
+        features: { quick_pick_palette: false },
+      });
+      renderPalette();
+      expect(screen.queryByRole("option", { name: label })).toBeNull();
+      searchPreview();
+      const command = screen.getByRole("option", { name: label });
+      const reload = mockReload();
+      fireEvent.click(command);
+      expect(localStorage.getItem(key)).toBe('{"quick_pick_palette":true}');
+      expect(reload).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.skipIf(legacyOnly)("offers the command when an override turns QuickPick off", () => {
+    localStorage.setItem(key, '{"quick_pick_palette":false}');
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { quick_pick_palette: true },
+    });
+    renderPalette();
+    searchPreview();
+    expect(screen.getByRole("option", { name: label })).toBeVisible();
+  });
+
+  it.skipIf(legacyOnly)("does not reload if storage refuses the opt-in", () => {
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { quick_pick_palette: false },
+    });
+    renderPalette();
+    searchPreview();
+    const reload = mockReload();
+    const storage = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    onTestFinished(() => storage.mockRestore());
+    fireEvent.click(screen.getByRole("option", { name: label }));
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(legacyOnly).each(["server-on", "override-on", "unreported", "no-identity"])(
+    "does not offer the bootstrap for %s",
+    (scenario) => {
+      if (scenario === "override-on") localStorage.setItem(key, '{"quick_pick_palette":true}');
+      if (scenario === "no-identity") {
+        const identity = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue(null);
+        onTestFinished(() => identity.mockRestore());
+      }
+      const features =
+        scenario === "unreported" ? {} : { quick_pick_palette: scenario === "server-on" };
+      serverInfo.mockReturnValue({ session_search_scope: true, features });
+      renderPalette();
+      searchPreview();
+      expect(screen.queryByRole("option", { name: label })).toBeNull();
+    },
+  );
 });
 
 describe("CommandPalette — empty state", () => {

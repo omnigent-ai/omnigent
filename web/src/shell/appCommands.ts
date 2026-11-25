@@ -9,6 +9,7 @@ import {
   PanelLeftIcon,
   PanelRightIcon,
   SettingsIcon,
+  SparklesIcon,
   SquarePenIcon,
 } from "lucide-react";
 
@@ -20,6 +21,9 @@ import {
 } from "@/components/KeyboardShortcut";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useLocation, useNavigate } from "@/lib/routing";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { canOverrideUiFeatures, writeUiFeatureOverride } from "@/lib/uiFeatureOverrides";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { settingsSearchCommand } from "@/shell/settingsSearch/settingsSearchCommand";
 
@@ -33,6 +37,8 @@ export interface ActionCommand {
   run: () => void;
   /** Chord shown beside the row when the same action has a shortcut. */
   shortcut?: readonly string[];
+  /** Only show this command when the user types a matching query. */
+  searchOnly?: boolean;
 }
 
 export interface AppCommandOptions {
@@ -54,6 +60,13 @@ export function useAppCommands({
   const { inSettings } = useSettingsRoute();
   const { pathname, search } = useLocation();
   const mobile = useIsMobileViewport();
+  const info = useServerInfo();
+  const canEnableQuickPick =
+    info !== "loading" &&
+    !!info.features &&
+    Object.hasOwn(info.features, "quick_pick_palette") &&
+    !isFeatureEnabled(info, "quick_pick_palette") &&
+    canOverrideUiFeatures();
   return useMemo<ActionCommand[]>(
     () => [
       {
@@ -107,6 +120,28 @@ export function useAppCommands({
         run: onToggleRightSidebar,
         shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
       },
+      ...(canEnableQuickPick
+        ? [
+            {
+              id: "enable-quick-pick-preview",
+              label: "Enable feature preview: new QuickPick command palette",
+              icon: SparklesIcon,
+              keywords: [
+                "feature preview",
+                "preview",
+                "quickpick",
+                "quick pick",
+                "command palette",
+                "new palette",
+                "feature flag",
+              ],
+              searchOnly: true,
+              run: () => {
+                if (writeUiFeatureOverride("quick_pick_palette", true)) window.location.reload();
+              },
+            },
+          ]
+        : []),
     ],
     [
       navigate,
@@ -117,17 +152,20 @@ export function useAppCommands({
       onToggleLeftSidebar,
       onToggleRightSidebar,
       rightSidebarShortcutEnabled,
+      canEnableQuickPick,
     ],
   );
 }
 
-/** The commands whose label or a keyword contains `query`, ignoring case; all of them for a blank query. */
-export function filterAppCommands<Command extends { label: string; keywords: readonly string[] }>(
-  commands: readonly Command[],
-  query: string,
-): readonly Command[] {
+/** The commands whose label or a keyword contains `query`, ignoring case. */
+export function filterAppCommands<
+  Command extends { label: string; keywords: readonly string[]; searchOnly?: boolean },
+>(commands: readonly Command[], query: string): readonly Command[] {
   const q = query.trim().toLowerCase();
-  if (q === "") return commands;
+  if (q === "")
+    return commands.some((command) => command.searchOnly)
+      ? commands.filter((command) => !command.searchOnly)
+      : commands;
   return commands.filter(
     (command) =>
       command.label.toLowerCase().includes(q) ||

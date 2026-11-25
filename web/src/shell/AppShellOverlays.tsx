@@ -17,6 +17,9 @@ const QuickPickCommandPalette = lazy(() =>
     default: module.QuickPickCommandPalette,
   })),
 );
+const FeatureFlagsPicker = lazy(() =>
+  import("./FeatureFlagsPicker").then((module) => ({ default: module.FeatureFlagsPicker })),
+);
 const ThemePicker = lazy(() =>
   import("./ThemePicker").then((module) => ({ default: module.ThemePicker })),
 );
@@ -97,6 +100,7 @@ export function AppShellOverlays({
       {quickPick && (
         <Suspense fallback={null}>
           <ThemePicker />
+          <FeatureFlagsPicker />
         </Suspense>
       )}
       <RecentSessionsSwitcher
