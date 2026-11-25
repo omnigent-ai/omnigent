@@ -13,7 +13,7 @@
 import type React from "react";
 import { useInRouterContext } from "react-router-dom";
 import { Link } from "@/lib/routing";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   BotIcon,
   CopyIcon,
@@ -46,6 +46,9 @@ import { VideoPlayer } from "@/components/VideoPlayer";
 import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
+import { parseProjectContentLink, type ProjectContentTarget } from "@/lib/projectFileScope";
+import { OPEN_PROJECT_FILE_EVENT, openProjectFile } from "@/lib/projectTicketsApi";
+import { ProjectFileDialog, projectFileErrorText } from "@/projectHome/ProjectFileViewer";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
@@ -369,6 +372,14 @@ function WorkspaceFileLink({
         />
       );
     }
+    const projectContent = typeof href === "string" ? parseProjectContentLink(href) : null;
+    if (projectContent) {
+      return (
+        <ProjectContentLink target={projectContent} className={className} title={title}>
+          {children}
+        </ProjectContentLink>
+      );
+    }
     const sessionPath = currentServerSessionPath(href);
     if (sessionPath) {
       return (
@@ -515,6 +526,62 @@ function WorkspaceFileLink({
 }
 
 /** Right-click menu that copies the path a file link names. */
+/**
+ * A link to a project file or ticket attachment. It opens with the viewer's own
+ * credentials, like the project Files panel, whatever host runs the session.
+ */
+function ProjectContentLink({
+  target,
+  className,
+  title,
+  children,
+}: {
+  target: ProjectContentTarget;
+  className?: string;
+  title?: string;
+  children: React.ReactNode;
+}) {
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const label = typeof children === "string" ? children : "file";
+  return (
+    <>
+      <a
+        href={withBasePath(target.contentPath)}
+        className={cn(STREAMDOWN_LINK_CLASS, className)}
+        title={title}
+        data-streamdown="link"
+        data-testid="project-content-link"
+        onClick={(event) => {
+          // The project page's own viewer may already have taken the click.
+          if (event.defaultPrevented || event.button !== 0) return;
+          if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+          event.preventDefault();
+          if (target.kind === "file") {
+            const request = new CustomEvent(OPEN_PROJECT_FILE_EVENT, {
+              cancelable: true,
+              detail: { contentPath: target.contentPath },
+            });
+            if (window.dispatchEvent(request)) setDialogOpen(true);
+            return;
+          }
+          openProjectFile(target.contentPath, label).catch((error: unknown) =>
+            showToast(projectFileErrorText(error)),
+          );
+        }}
+      >
+        {children}
+      </a>
+      {dialogOpen && (
+        <ProjectFileDialog
+          projectId={target.projectId}
+          fileId={target.fileId}
+          onClose={() => setDialogOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
 function FileLinkContextMenu({ path, children }: { path: string; children: React.ReactElement }) {
   const copyPath = () =>
     void copyText(path).then(

@@ -1,4 +1,5 @@
 import { cjk } from "@streamdown/cjk";
+import { PROJECT_CONTENT_PATH } from "@/lib/projectFileScope";
 import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "./mermaidPlugin";
 import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
@@ -275,6 +276,8 @@ export function markWorkspaceFileLinks() {
       if (NON_FILE_HREF.test(href) || href.includes("?")) return;
       // Continuation notices link to another chat, not a workspace file.
       if (/^\/c\/[A-Za-z0-9_-]+\/?$/.test(href)) return;
+      // Project files and ticket attachments are served by the API, not the workspace.
+      if (PROJECT_CONTENT_PATH.test(href)) return;
       const cited = splitWorkspaceFileCitation(href);
       if (href.includes("#") && !cited.hasPosition) return;
       node.properties = {

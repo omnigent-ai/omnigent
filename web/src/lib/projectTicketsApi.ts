@@ -470,6 +470,8 @@ const INLINE_FILE_TYPES = new Set([
   "image/webp",
   "application/pdf",
   "text/plain",
+  "video/mp4",
+  "video/webm",
 ]);
 
 /** Dispatched on `window` to open a project file in the project page's viewer. */

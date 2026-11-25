@@ -44,3 +44,37 @@ export function parseProjectFileContentPath(href: string): ProjectFileScope | nu
     ? { projectId: decodeURIComponent(match[1]), fileId: decodeURIComponent(match[2]) }
     : null;
 }
+
+/** A project file or ticket attachment named by its `.../content` URL. */
+export interface ProjectContentTarget extends ProjectFileScope {
+  kind: "file" | "attachment";
+  /** The same-origin API path to fetch it with the viewer's credentials. */
+  contentPath: string;
+}
+
+// `/v1/projects/{project}/files/{id}/content` or `.../ticket-attachments/{id}/content`.
+export const PROJECT_CONTENT_PATH =
+  /^\/v1\/projects\/([^/?#]+)\/(files|ticket-attachments)\/([^/?#]+)\/content$/;
+
+/** Parse a same-origin project file or ticket-attachment content link. */
+export function parseProjectContentLink(href: string): ProjectContentTarget | null {
+  let url: URL;
+  try {
+    url = new URL(href, window.location.origin);
+  } catch {
+    return null;
+  }
+  if (url.origin !== window.location.origin || url.search || url.hash) return null;
+  const match = PROJECT_CONTENT_PATH.exec(url.pathname);
+  if (!match) return null;
+  try {
+    return {
+      projectId: decodeURIComponent(match[1]),
+      fileId: decodeURIComponent(match[3]),
+      kind: match[2] === "files" ? "file" : "attachment",
+      contentPath: url.pathname,
+    };
+  } catch {
+    return null;
+  }
+}

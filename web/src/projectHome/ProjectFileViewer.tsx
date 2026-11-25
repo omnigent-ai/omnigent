@@ -10,6 +10,7 @@ import {
 } from "@/lib/projectFileScope";
 import { useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { FileViewer } from "@/shell/FileViewer";
+import { ApiError } from "@/lib/sessionsApi";
 
 /** The project home's query parameter naming the project file open in the viewer. */
 export const PROJECT_FILE_PARAM = "artifact";
@@ -69,15 +70,27 @@ export function ProjectFileViewerHost({ projectId }: { projectId: string | null 
     };
   }, [projectId, openFile]);
 
+  if (!projectId || !fileId) return null;
+  return <ProjectFileDialog projectId={projectId} fileId={fileId} onClose={close} />;
+}
+
+/** A project file in the session FileViewer, in a dialog; access is checked by the server. */
+export function ProjectFileDialog({
+  projectId,
+  fileId,
+  onClose,
+}: {
+  projectId: string;
+  fileId: string;
+  onClose: () => void;
+}) {
   const file = useQuery({
     queryKey: ["project-file", projectId, fileId],
-    queryFn: () => getProjectFile(projectFileApiPath({ projectId: projectId!, fileId: fileId! })),
-    enabled: projectId !== null && fileId !== null,
+    queryFn: () => getProjectFile(projectFileApiPath({ projectId, fileId })),
+    retry: false,
   });
-
-  if (!projectId || !fileId) return null;
   return (
-    <Dialog open onOpenChange={(open) => !open && close()}>
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent
         showCloseButton={false}
         aria-describedby={undefined}
@@ -92,11 +105,11 @@ export function ProjectFileViewerHost({ projectId }: { projectId: string | null 
             agentId={null}
             conversationId={projectFileScopeId(projectId, fileId)}
             path={file.data.filename}
-            onClose={close}
-            onCloseTab={close}
+            onClose={onClose}
+            onCloseTab={onClose}
           />
         ) : file.error ? (
-          <p className="p-4 text-sm text-destructive">{file.error.message}</p>
+          <p className="p-4 text-sm text-destructive">{projectFileErrorText(file.error)}</p>
         ) : (
           <div className="flex flex-1 items-center justify-center">
             <Spinner />
@@ -105,4 +118,12 @@ export function ProjectFileViewerHost({ projectId }: { projectId: string | null 
       </DialogContent>
     </Dialog>
   );
+}
+
+/** A missing project reads the same as no access, so say both. */
+export function projectFileErrorText(error: unknown): string {
+  const status = error instanceof ApiError ? error.status : null;
+  if (status === 403 || status === 404)
+    return "You don't have access to this project's files, or the file was removed.";
+  return error instanceof Error ? error.message : "Couldn't open the file.";
 }

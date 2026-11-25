@@ -833,3 +833,60 @@ describe("copying a file link's path", () => {
     expect(screen.queryByRole("menuitem")).toBeNull();
   });
 });
+
+describe("links to project files and ticket attachments", () => {
+  const FILE = "/v1/projects/p1/files/f1/content";
+  const ATTACHMENT = "/v1/projects/p1/ticket-attachments/a1/content";
+
+  it("keeps them as real links instead of looking them up in the workspace", () => {
+    renderMarkdown(
+      `[report.md](${FILE}) and [shot.png](${ATTACHMENT})`,
+      [],
+      FILE_VIEWER_WITH_SESSION,
+    );
+    const links = screen.getAllByTestId("project-content-link");
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([FILE, ATTACHMENT]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("lets the project page's own viewer take a file link", () => {
+    const takeIt = (event: Event) => event.preventDefault();
+    window.addEventListener("omnigent:open-project-file", takeIt);
+    try {
+      renderMarkdown(`[report.md](${FILE})`);
+      fireEvent.click(screen.getByRole("link", { name: "report.md" }));
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("omnigent:open-project-file", takeIt);
+    }
+  });
+
+  it("opens a file link in the project file viewer, saying so when there's no access", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: { code: "not_found", message: "Project not found" } }, 404),
+    );
+    renderMarkdown(`[report.md](${FILE})`);
+    fireEvent.click(screen.getByRole("link", { name: "report.md" }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "You don't have access to this project's files, or the file was removed.",
+      ),
+    ).toBeInTheDocument();
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/v1/projects/p1/files/f1");
+  });
+
+  it("fetches a ticket attachment with the viewer's credentials, with a clear no-access toast", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ error: { message: "Project not found" } }, 404));
+    renderMarkdown(`[shot.png](${ATTACHMENT})`);
+    fireEvent.click(screen.getByRole("link", { name: "shot.png" }));
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith(
+        "You don't have access to this project's files, or the file was removed.",
+      ),
+    );
+    expect(String(fetchMock.mock.calls[0][0])).toContain(ATTACHMENT);
+  });
+});

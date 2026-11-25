@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { isTempConvId } from "./tempConversationId";
 import {
   commentsApiBase,
+  parseProjectContentLink,
   parseProjectFileContentPath,
   parseProjectFileScope,
   projectFileScopeId,
@@ -27,5 +28,22 @@ describe("project file scope", () => {
       fileId: "f1",
     });
     expect(parseProjectFileContentPath("https://example.com/v1/projects/p1/files/f1")).toBeNull();
+  });
+
+  it("recognizes same-origin project file and ticket-attachment content links", () => {
+    expect(parseProjectContentLink("/v1/projects/p1/files/f1/content")).toEqual({
+      projectId: "p1",
+      fileId: "f1",
+      kind: "file",
+      contentPath: "/v1/projects/p1/files/f1/content",
+    });
+    expect(parseProjectContentLink("/v1/projects/p1/ticket-attachments/a1/content")?.kind).toBe(
+      "attachment",
+    );
+    expect(
+      parseProjectContentLink("https://example.com/v1/projects/p1/files/f1/content"),
+    ).toBeNull();
+    expect(parseProjectContentLink("/v1/projects/p1/files/f1")).toBeNull();
+    expect(parseProjectContentLink("/home/u/ws/report.md")).toBeNull();
   });
 });
