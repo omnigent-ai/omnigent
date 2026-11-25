@@ -29,7 +29,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.pull_request_viewers import OWNER_ONLY_CHANGES_MESSAGE, READ_CAPABILITIES
 from omnigent.server.routes import _host_filesystem
-from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.routes.sessions import create_sessions_router, routes_resources
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.routes.test_session_resources import (
     _FakeRunnerRouter,
@@ -422,21 +422,34 @@ async def test_a_refused_link_never_checks_the_session_s_room(
     assert host.writes == [f"{_ROOT}:github_prs_update"]
 
 
+def _lookup_fails(*_args: object, **_kwargs: object) -> bool:
+    raise RuntimeError("permission store unavailable")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("caller", "selected"),
+    ("caller", "selected", "failing_lookup"),
     [
-        (_EDITOR, "owner-login"),
-        (_MANAGER, "owner-login"),
-        (_ADMIN, "owner-login"),
-        (_ADMIN_NO_GRANT, "owner-login"),
-        (_VIEWER, None),
+        (_EDITOR, "owner-login", None),
+        (_MANAGER, "owner-login", None),
+        (_ADMIN, "owner-login", None),
+        (_ADMIN_NO_GRANT, "owner-login", None),
+        (_VIEWER, None, None),
+        # Unsure who's asking, the server shows the least: even the owner, or an editor.
+        (_OWNER, None, "_is_session_owner"),
+        (_EDITOR, None, "check_session_access"),
     ],
 )
 async def test_only_the_owner_sees_the_host_s_accounts_and_change_controls(
-    client: httpx.AsyncClient, caller: str, selected: str | None
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+    selected: str | None,
+    failing_lookup: str | None,
 ) -> None:
     """An editor still sees which login the owner's changes run as; a viewer doesn't."""
+    if failing_lookup is not None:
+        monkeypatch.setattr(routes_resources, failing_lookup, _lookup_fails)
     response = await _call(client, "GET", "/resources/github", {}, caller=caller)
 
     assert response.status_code == 200, response.text
