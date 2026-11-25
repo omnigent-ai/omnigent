@@ -724,11 +724,25 @@ function previewSetup({
   return { state, navigate, registry, ipcMain };
 }
 
-describe("browser IPC localhost previews from hosts reached over SSH", () => {
-  it("asks about the source host, then requires fresh provenance before retrying", async () => {
+for (const { transport, protocol, requestKey, requestStep } of [
+  {
+    transport: "SSH",
+    protocol: "sshPreviewProtocol",
+    requestKey: "request",
+    requestStep: "request",
+  },
+  {
+    transport: "explicit trust",
+    protocol: "trustedRemotePreviewProtocol",
+    requestKey: "requestTrusted",
+    requestStep: "request-trusted",
+  },
+]) {
+  it(`asks about the source host via ${transport}, then requires fresh provenance before retrying`, async () => {
     const seen = [];
     const { state, navigate } = previewSetup({
-      request: (current, _event, url, opts) => {
+      protocols: { [protocol]: 1 },
+      [requestKey]: (current, _event, url, opts) => {
         seen.push([url, opts.sourceHostId]);
         current.allowed = true;
         return true;
@@ -739,13 +753,15 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
     assert.equal(result.retryWithFreshHost, true);
     assert.equal(typeof result.navigationRetryToken, "string");
     assert.deepEqual(seen, [["http://127.0.0.1:8787/", "host-1"]]);
-    assert.deepEqual(state.calls, ["denied", "request"]);
+    assert.deepEqual(state.calls, ["denied", requestStep]);
     const retry = { sourceHostId: "host-1", navigationRetryToken: result.navigationRetryToken };
     assert.equal((await navigate(retry)).ok, true);
     assert.equal((await navigate(retry)).superseded, true, "a retry token is single-use");
-    assert.deepEqual(state.calls, ["denied", "request", "allowed", "navigate"]);
+    assert.deepEqual(state.calls, ["denied", requestStep, "allowed", "navigate"]);
   });
+}
 
+describe("browser IPC localhost previews from hosts reached over SSH", () => {
   for (const action of [
     "newer navigation",
     "close",
@@ -913,20 +929,6 @@ describe("browser IPC localhost previews from trusted remote hosts", () => {
       assert.deepEqual(state.calls, ["denied", "recover"]);
     });
   }
-  it("asks to trust the host when no SSH protocol was offered, then retries", async () => {
-    const { state, navigate } = previewSetup({
-      protocols: { trustedRemotePreviewProtocol: 1 },
-      requestTrusted: (current) => {
-        current.allowed = true;
-        return true;
-      },
-    });
-    const result = await navigate({ sourceHostId: "host-1" });
-    assert.equal(result.ok, false);
-    assert.equal(result.retryWithFreshHost, true);
-    assert.deepEqual(state.calls, ["denied", "request-trusted"]);
-  });
-
   it("falls back to trust when SSH is unavailable", async () => {
     const { state, navigate } = previewSetup({
       protocols: { trustedRemotePreviewProtocol: 1 },

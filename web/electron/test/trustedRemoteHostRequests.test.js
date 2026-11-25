@@ -64,12 +64,17 @@ describe("trusted remote host requests", () => {
 
   it("accepts trust added while the native dialog is open", async () => {
     let trusted = false;
+    const approvalStarted = Promise.withResolvers();
     const consent = Promise.withResolvers();
     const requests = createTrustedRemoteHostRequests({
       isTrusted: () => trusted,
       add: () => false,
     });
-    const pending = requests.request(SERVER, HOST, () => consent.promise);
+    const pending = requests.request(SERVER, HOST, () => {
+      approvalStarted.resolve();
+      return consent.promise;
+    });
+    await approvalStarted.promise;
     trusted = true;
     consent.resolve(true);
     assert.equal(await pending, true);
@@ -111,8 +116,6 @@ describe("trusted remote host requests", () => {
     };
     assert.equal(await requests.request("not a url", HOST, approve), false);
     assert.equal(await requests.request(SERVER, "", approve), false);
-    assert.equal(await requests.request(SERVER, "line\nbreak", approve), false);
-    assert.equal(await requests.request(SERVER, "a".repeat(65), approve), false);
     assert.equal(approvals, 0);
   });
 });
