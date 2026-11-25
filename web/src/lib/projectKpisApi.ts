@@ -59,6 +59,8 @@ export interface KpiMetric {
 
 export interface ProjectKpis {
   object: "project.kpis";
+  /** The role these KPIs belong to; absent or `null` for the project's own. */
+  identity_id?: string | null;
   project_id: string;
   window: ProjectStatusWindow;
   today_utc: string;
@@ -74,22 +76,31 @@ export interface ProjectKpis {
   metrics: KpiMetric[];
 }
 
-export function projectKpisKey(projectId: string | null, window?: ProjectStatusWindow) {
-  return window
-    ? (["project-kpis", projectId, window] as const)
-    : (["project-kpis", projectId] as const);
+export function projectKpisKey(
+  projectId: string | null,
+  window?: ProjectStatusWindow,
+  identityId?: string,
+) {
+  if (!window) return ["project-kpis", projectId] as const;
+  return identityId
+    ? (["project-kpis", projectId, window, identityId] as const)
+    : (["project-kpis", projectId, window] as const);
 }
 
-function kpisPath(projectId: string, window: ProjectStatusWindow) {
-  return `/v1/projects/${encodeURIComponent(projectId)}/kpis?window=${window}`;
+function kpisPath(projectId: string, window: ProjectStatusWindow, identityId?: string) {
+  const project = `/v1/projects/${encodeURIComponent(projectId)}`;
+  const scope = identityId ? `${project}/identities/${encodeURIComponent(identityId)}` : project;
+  return `${scope}/kpis?window=${window}`;
 }
 
+/** The project's KPIs, or one role's when `identityId` is given. */
 export async function getProjectKpis(
   projectId: string,
   window: ProjectStatusWindow,
   signal?: AbortSignal,
+  identityId?: string,
 ): Promise<ProjectKpis> {
-  const res = await authenticatedFetch(kpisPath(projectId, window), { signal });
+  const res = await authenticatedFetch(kpisPath(projectId, window, identityId), { signal });
   if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as ProjectKpis;
 }
@@ -100,8 +111,9 @@ export async function setProjectKpis(
   kpis: ProjectKpiDefinition[],
   baseRevision: number,
   window: ProjectStatusWindow,
+  identityId?: string,
 ): Promise<ProjectKpis> {
-  const res = await authenticatedFetch(kpisPath(projectId, window), {
+  const res = await authenticatedFetch(kpisPath(projectId, window, identityId), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ kpis, base_revision: baseRevision }),

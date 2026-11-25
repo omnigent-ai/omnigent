@@ -55,22 +55,38 @@ const TIME_METRICS = new Set<KpiMetricId>([
 export function ProjectKpiTiles({
   projectId,
   onDrill,
+  identityId,
+  title = "KPIs",
+  hideWhenEmpty = false,
 }: {
   projectId: string;
-  /** Opens the items behind a tile. */
+  /** Opens the items behind a tile; project KPIs only. */
   onDrill?: (drilldown: StatusDrilldown) => void;
+  /** Shows this role's KPIs, measured over its own tickets and sessions. */
+  identityId?: string;
+  title?: string;
+  /** Renders nothing once loaded with no KPIs, e.g. for roles in a list. */
+  hideWhenEmpty?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   // Tiles always show the last 7 full days, whatever window the page shows.
   const kpis = useQuery({
-    queryKey: projectKpisKey(projectId, KPI_WINDOW),
-    queryFn: ({ signal }) => getProjectKpis(projectId, KPI_WINDOW, signal),
+    queryKey: projectKpisKey(projectId, KPI_WINDOW, identityId),
+    queryFn: ({ signal }) => getProjectKpis(projectId, KPI_WINDOW, signal, identityId),
     staleTime: 30_000,
   });
+  if (hideWhenEmpty && kpis.data?.kpis.length === 0) return null;
+  const drill = identityId ? undefined : onDrill;
   return (
-    <section aria-label="KPIs" className="space-y-3" data-testid="project-kpi-slot">
+    <section
+      aria-label={title}
+      className="space-y-3"
+      data-testid={identityId ? "role-kpi-slot" : "project-kpi-slot"}
+    >
       <div className="flex items-center gap-2">
-        <h2 className="min-w-0 flex-1 text-[length:calc(var(--text-ui)+2px)] font-bold">KPIs</h2>
+        <h2 className="min-w-0 flex-1 text-[length:calc(var(--text-ui)+2px)] font-bold">
+          {title}
+        </h2>
         {kpis.data?.can_edit && (
           <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
             <PencilIcon aria-hidden />
@@ -89,15 +105,19 @@ export function ProjectKpiTiles({
         </div>
       ) : kpis.data.kpis.length === 0 ? (
         <p className="rounded-lg border border-dashed border-border/70 p-4 text-sm text-muted-foreground">
-          {kpis.data.can_edit
-            ? "No KPIs yet. Add 3 or 4 numbers that show whether this project is working."
-            : "No KPIs yet. The project owner or its Lead sets them."}
+          {identityId
+            ? kpis.data.can_edit
+              ? "No KPIs yet. Add a few numbers that show whether this role is working; they count its own tickets and sessions."
+              : "No KPIs yet. The project owner or its Lead sets them."
+            : kpis.data.can_edit
+              ? "No KPIs yet. Add 3 or 4 numbers that show whether this project is working."
+              : "No KPIs yet. The project owner or its Lead sets them."}
         </p>
       ) : (
         <>
           <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {kpis.data.kpis.map((kpi) => (
-              <KpiTile key={kpi.position} kpi={kpi} onDrill={onDrill} />
+              <KpiTile key={kpi.position} kpi={kpi} onDrill={drill} />
             ))}
           </ul>
           <KpiFooter kpis={kpis.data} />
@@ -106,6 +126,8 @@ export function ProjectKpiTiles({
       {editing && kpis.data && (
         <ProjectKpisDialog
           projectId={projectId}
+          identityId={identityId}
+          title={title}
           current={kpis.data}
           onClose={() => setEditing(false)}
         />
@@ -306,10 +328,14 @@ export function draftToDefinition(draft: Omit<DraftKpi, "key">): ProjectKpiDefin
 
 function ProjectKpisDialog({
   projectId,
+  identityId,
+  title,
   current,
   onClose,
 }: {
   projectId: string;
+  identityId?: string;
+  title: string;
   current: ProjectKpis;
   onClose: () => void;
 }) {
@@ -320,9 +346,9 @@ function ProjectKpisDialog({
   const client = useQueryClient();
   const save = useMutation({
     mutationFn: (kpis: ProjectKpiDefinition[]) =>
-      setProjectKpis(projectId, kpis, current.revision, KPI_WINDOW),
+      setProjectKpis(projectId, kpis, current.revision, KPI_WINDOW, identityId),
     onSuccess: (saved) => {
-      client.setQueryData(projectKpisKey(projectId, KPI_WINDOW), saved);
+      client.setQueryData(projectKpisKey(projectId, KPI_WINDOW, identityId), saved);
       void client.invalidateQueries({ queryKey: projectKpisKey(projectId) });
       onClose();
     },
@@ -350,7 +376,7 @@ function ProjectKpisDialog({
     >
       <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Project KPIs</DialogTitle>
+          <DialogTitle>{identityId ? title : "Project KPIs"}</DialogTitle>
           <DialogDescription>
             Pick 3 or 4 numbers that show whether this project is working, each with a target.
             Saving keeps the earlier set in the history. Only you and the project&rsquo;s Lead can

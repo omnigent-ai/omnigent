@@ -282,6 +282,8 @@ describe("ProjectSummary", () => {
       ],
       3,
       "7d",
+      // The project's own set, not a role's.
+      undefined,
     );
   });
 });

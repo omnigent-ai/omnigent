@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
 import { MemberName, memberDisplayName } from "./MemberName";
 import { ProjectKpiTiles } from "./ProjectKpis";
+import { useProjectIdentities } from "./useProjectIdentities";
 import { ProjectStatusItemsDialog, type StatusDrilldown } from "./ProjectStatusItems";
 import { useProjectMandate } from "./ProjectMandateDialog";
 import { type ProjectHomeView, projectRulesPath } from "./projectHomeNavigation";
@@ -86,6 +87,7 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
         ) : null}
       </section>
       <ProjectKpiTiles projectId={projectId} onDrill={setDrilldown} />
+      <RoleKpis projectId={projectId} />
       <section aria-label="Agents" className="space-y-3">
         <div>
           <h2 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Agents</h2>
@@ -644,6 +646,26 @@ export function ProjectHomeTabs({
         </>
       )}
       {end && <div className="ml-auto flex min-w-0 items-center gap-1">{end}</div>}
+    </div>
+  );
+}
+
+/** Each role's own KPIs, by role; roles without KPIs are left out. */
+function RoleKpis({ projectId }: { projectId: string }) {
+  const identities = useProjectIdentities(projectId);
+  const roles = (identities.data ?? []).filter((identity) => !identity.builtin);
+  if (roles.length === 0) return null;
+  return (
+    <div className="space-y-6" data-testid="project-role-kpis">
+      {roles.map((role) => (
+        <ProjectKpiTiles
+          key={role.id}
+          projectId={projectId}
+          identityId={role.id}
+          title={`${role.name} KPIs`}
+          hideWhenEmpty
+        />
+      ))}
     </div>
   );
 }

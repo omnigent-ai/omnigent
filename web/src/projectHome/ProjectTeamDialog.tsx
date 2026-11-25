@@ -23,6 +23,7 @@ import {
   type ProjectIdentityInput,
 } from "@/lib/projectsApi";
 import { IdentityModelEffortFields, type IdentitySessionChoice } from "./IdentityModelEffortFields";
+import { ProjectKpiTiles } from "./ProjectKpis";
 import { ProjectRoutingSection } from "./ProjectRoutingSection";
 import { TicketError } from "./TicketControls";
 import { useProjectRecord } from "./useProjectAgentSession";
@@ -241,155 +242,170 @@ export function ProjectTeamDialog({
                   </Button>
                 ))}
               </nav>
-              <form onSubmit={onSubmit} className="flex min-w-0 flex-1 flex-col gap-3">
-                {selected === null && (
-                  <div
-                    role="group"
-                    aria-label="Team member templates"
-                    className="flex flex-wrap items-center gap-1.5 text-sm"
-                  >
-                    <span className="text-muted-foreground">Start from a template:</span>
-                    {ROLE_TEMPLATES.map((template) => (
-                      <Button
-                        key={template.name}
-                        type="button"
-                        variant="outline"
-                        size="xs"
-                        disabled={busy}
-                        onClick={() => setDraft({ ...draft, ...template })}
-                      >
-                        {template.name}
-                      </Button>
-                    ))}
-                  </div>
-                )}
-                <label className="flex flex-col gap-1 text-sm">
-                  Name
-                  <Input
-                    data-testid="project-team-name"
-                    value={draft.name}
-                    maxLength={60}
-                    placeholder="e.g. PM, Designer"
-                    onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                    disabled={busy || isLead}
-                  />
-                </label>
-                <label className="flex flex-col gap-1 text-sm">
-                  {isLead ? "Charter" : "Instructions"}
-                  <Textarea
-                    data-testid="project-team-persona"
-                    value={draft.instructions}
-                    placeholder={
-                      isLead
-                        ? "e.g. Batch reviews into one daily summary. Prefer fewer, larger tickets."
-                        : "e.g. You are the product manager. Own scope, priorities and acceptance criteria; write tickets, don't write code."
-                    }
-                    className="min-h-36 max-h-[45dvh] text-sm"
-                    aria-invalid={tooLarge || undefined}
-                    onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
-                    disabled={busy || charterReadOnly}
-                  />
-                  <span
-                    className={
-                      tooLarge ? "text-xs text-destructive" : "text-xs text-muted-foreground"
-                    }
-                  >
-                    {bytes.toLocaleString()} /{" "}
-                    {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES.toLocaleString()} bytes
-                  </span>
-                </label>
-                {!isLead && (
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <label className="flex flex-col gap-1 text-sm">
-                      Owns
-                      <Textarea
-                        data-testid="project-team-owns"
-                        value={draft.owns}
-                        placeholder={"One per line, e.g.\nVisual design\nUX reviews"}
-                        className="min-h-20 text-sm"
-                        onChange={(event) => setDraft({ ...draft, owns: event.target.value })}
-                        disabled={busy}
-                      />
-                    </label>
-                    <label className="flex flex-col gap-1 text-sm">
-                      Doesn&apos;t own
-                      <Textarea
-                        data-testid="project-team-excludes"
-                        value={draft.excludes}
-                        placeholder={"One per line, e.g.\nThe roadmap\nCode review"}
-                        className="min-h-20 text-sm"
-                        onChange={(event) => setDraft({ ...draft, excludes: event.target.value })}
-                        disabled={busy}
-                      />
-                    </label>
-                  </div>
-                )}
-                <IdentityModelEffortFields
-                  config={project?.config}
-                  agentId={draft.agentId}
-                  model={draft.model}
-                  effort={draft.effort}
-                  disabled={busy}
-                  agentLocked={shared}
-                  defaultLabel={isLead ? "Default" : "Project default"}
-                  onChange={(next) => setDraft({ ...draft, ...next })}
-                />
-                {shared && (
-                  <p
-                    className="text-xs text-muted-foreground"
-                    data-testid="project-team-agent-owner"
-                  >
-                    Only the project owner chooses the agent, since these sessions run as them.
-                  </p>
-                )}
-                {isLead && (
-                  <p className="text-xs text-muted-foreground" data-testid="project-team-lead-note">
-                    The Lead is the project's built-in coordinator and can't be renamed or deleted.
-                    {charterReadOnly
-                      ? " Only the project owner edits its charter."
-                      : " Only you can edit its charter; agents can't."}{" "}
-                    The charter applies on its next turn or session start. Its agent, model and
-                    effort are also the project's defaults for new sessions, and they apply from the
-                    Lead's next session or rollover.
-                  </p>
-                )}
-                {selectedIdentity?.created_by_session_id && (
-                  <p
-                    className="text-xs text-muted-foreground"
-                    data-testid="project-team-agent-made"
-                  >
-                    Created by an agent, so agents can also edit it. Team members you create stay
-                    yours to edit.
-                  </p>
-                )}
-                <TicketError error={save.error ?? remove.error ?? identities.error} />
-                <DialogFooter className="border-t-0 bg-transparent">
-                  {selected !== null && !isLead && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      className="mr-auto text-destructive"
-                      loading={remove.isPending}
-                      disabled={busy}
-                      onClick={() => remove.mutate(selected)}
+              <div className="flex min-w-0 flex-1 flex-col">
+                <form onSubmit={onSubmit} className="flex min-w-0 flex-col gap-3">
+                  {selected === null && (
+                    <div
+                      role="group"
+                      aria-label="Team member templates"
+                      className="flex flex-wrap items-center gap-1.5 text-sm"
                     >
-                      <Trash2Icon />
-                      Remove
-                    </Button>
+                      <span className="text-muted-foreground">Start from a template:</span>
+                      {ROLE_TEMPLATES.map((template) => (
+                        <Button
+                          key={template.name}
+                          type="button"
+                          variant="outline"
+                          size="xs"
+                          disabled={busy}
+                          onClick={() => setDraft({ ...draft, ...template })}
+                        >
+                          {template.name}
+                        </Button>
+                      ))}
+                    </div>
                   )}
-                  <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
-                    Close
-                  </Button>
-                  <Button
-                    type="submit"
-                    data-testid="project-team-save"
-                    loading={save.isPending}
-                    disabled={!draft.name.trim() || tooLarge || remove.isPending}
-                  >
-                    {selected === null ? "Add" : "Save"}
-                  </Button>
-                </DialogFooter>
-              </form>
+                  <label className="flex flex-col gap-1 text-sm">
+                    Name
+                    <Input
+                      data-testid="project-team-name"
+                      value={draft.name}
+                      maxLength={60}
+                      placeholder="e.g. PM, Designer"
+                      onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                      disabled={busy || isLead}
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 text-sm">
+                    {isLead ? "Charter" : "Instructions"}
+                    <Textarea
+                      data-testid="project-team-persona"
+                      value={draft.instructions}
+                      placeholder={
+                        isLead
+                          ? "e.g. Batch reviews into one daily summary. Prefer fewer, larger tickets."
+                          : "e.g. You are the product manager. Own scope, priorities and acceptance criteria; write tickets, don't write code."
+                      }
+                      className="min-h-36 max-h-[45dvh] text-sm"
+                      aria-invalid={tooLarge || undefined}
+                      onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
+                      disabled={busy || charterReadOnly}
+                    />
+                    <span
+                      className={
+                        tooLarge ? "text-xs text-destructive" : "text-xs text-muted-foreground"
+                      }
+                    >
+                      {bytes.toLocaleString()} /{" "}
+                      {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES.toLocaleString()} bytes
+                    </span>
+                  </label>
+                  {!isLead && (
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <label className="flex flex-col gap-1 text-sm">
+                        Owns
+                        <Textarea
+                          data-testid="project-team-owns"
+                          value={draft.owns}
+                          placeholder={"One per line, e.g.\nVisual design\nUX reviews"}
+                          className="min-h-20 text-sm"
+                          onChange={(event) => setDraft({ ...draft, owns: event.target.value })}
+                          disabled={busy}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1 text-sm">
+                        Doesn&apos;t own
+                        <Textarea
+                          data-testid="project-team-excludes"
+                          value={draft.excludes}
+                          placeholder={"One per line, e.g.\nThe roadmap\nCode review"}
+                          className="min-h-20 text-sm"
+                          onChange={(event) => setDraft({ ...draft, excludes: event.target.value })}
+                          disabled={busy}
+                        />
+                      </label>
+                    </div>
+                  )}
+                  <IdentityModelEffortFields
+                    config={project?.config}
+                    agentId={draft.agentId}
+                    model={draft.model}
+                    effort={draft.effort}
+                    disabled={busy}
+                    agentLocked={shared}
+                    defaultLabel={isLead ? "Default" : "Project default"}
+                    onChange={(next) => setDraft({ ...draft, ...next })}
+                  />
+                  {shared && (
+                    <p
+                      className="text-xs text-muted-foreground"
+                      data-testid="project-team-agent-owner"
+                    >
+                      Only the project owner chooses the agent, since these sessions run as them.
+                    </p>
+                  )}
+                  {isLead && (
+                    <p
+                      className="text-xs text-muted-foreground"
+                      data-testid="project-team-lead-note"
+                    >
+                      The Lead is the project's built-in coordinator and can't be renamed or
+                      deleted.
+                      {charterReadOnly
+                        ? " Only the project owner edits its charter."
+                        : " Only you can edit its charter; agents can't."}{" "}
+                      The charter applies on its next turn or session start. Its agent, model and
+                      effort are also the project's defaults for new sessions, and they apply from
+                      the Lead's next session or rollover.
+                    </p>
+                  )}
+                  {selectedIdentity?.created_by_session_id && (
+                    <p
+                      className="text-xs text-muted-foreground"
+                      data-testid="project-team-agent-made"
+                    >
+                      Created by an agent, so agents can also edit it. Team members you create stay
+                      yours to edit.
+                    </p>
+                  )}
+                  <TicketError error={save.error ?? remove.error ?? identities.error} />
+                  <DialogFooter className="border-t-0 bg-transparent">
+                    {selected !== null && !isLead && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        className="mr-auto text-destructive"
+                        loading={remove.isPending}
+                        disabled={busy}
+                        onClick={() => remove.mutate(selected)}
+                      >
+                        <Trash2Icon />
+                        Remove
+                      </Button>
+                    )}
+                    <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+                      Close
+                    </Button>
+                    <Button
+                      type="submit"
+                      data-testid="project-team-save"
+                      loading={save.isPending}
+                      disabled={!draft.name.trim() || tooLarge || remove.isPending}
+                    >
+                      {selected === null ? "Add" : "Save"}
+                    </Button>
+                  </DialogFooter>
+                </form>
+                {selectedIdentity && !isLead && (
+                  <div className="mt-4 border-t border-border/60 pt-4">
+                    <ProjectKpiTiles
+                      projectId={projectId}
+                      identityId={selectedIdentity.id}
+                      title={`${selectedIdentity.name} KPIs`}
+                    />
+                  </div>
+                )}
+              </div>
             </div>
             <ProjectRoutingSection projectId={projectId} personas={roles} />
           </>
