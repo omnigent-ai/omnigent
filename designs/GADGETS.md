@@ -77,7 +77,10 @@ action ledger, rule state, and each viewer's shelf) is a revisioned JSON documen
   digest-chained revisions that fail closed on damage need no transactions or locks, and the
   interface a deployment implements is four calls (`read_json`, `create_json`, `list_paths`,
   `mkdirs`, plus an optional `delete_tree`; a store that deletes must also supply
-  `exclusive`, a lock shared by every process using the storage).
+  `exclusive`, a lock shared by every process using the storage). A store that can't delete
+  never gives capacity back: a deleted record's slot stays used, and the rules' bookkeeping
+  starts a new record only when the current one nears its revision limit, so a gadget with
+  rules can take about 10,000 × 5 million guarded writes there.
 - **Deployments replace it whole.** The default keeps files under `<data_dir>/gadgets`; a
   deployment that stores user content elsewhere (for example in a workspace file system,
   where gadgets inherit that system's permissions and quotas) implements `GadgetStore` without

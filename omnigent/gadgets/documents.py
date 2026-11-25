@@ -476,7 +476,16 @@ class ImmutableDocumentStore:
         self._limits = limits
         self._clock = clock or (lambda: datetime.now(UTC))
 
+    @property
+    def limits(self) -> StoreLimits:
+        return self._limits
+
     # -- reads --------------------------------------------------------------
+
+    def revision_count(self, collection: str, id: str) -> int:
+        """How many revisions the record has, deletes included; 0 when it has none."""
+        head = self._load_head(self._ref(collection, id))
+        return 0 if head is None else head.count
 
     def get(self, collection: str, id: str) -> Document | None:
         """Newest live version of a document, or ``None`` if absent or deleted."""

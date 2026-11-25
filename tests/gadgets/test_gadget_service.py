@@ -1799,6 +1799,81 @@ def test_the_rule_state_rotates_without_losing_counts(
         move(gadgets.service(), app, todo[3], "doing", "m-4")
 
 
+def test_the_rule_state_keeps_working_on_a_store_that_cannot_delete(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A store that can't delete never gets an old epoch's record back. With room for three
+    # epoch records and a write limit of four, rotating every four writes would fill the
+    # guard after a few edits; there an epoch must last until its record is nearly full.
+    monkeypatch.setattr(HookedFiles, "supports_delete", property(lambda self: False))
+    monkeypatch.setattr(constraints_module, "EPOCH_WRITES", 4)
+    monkeypatch.setattr(
+        constraints_module,
+        "GUARD_LIMITS",
+        StoreLimits(max_records_per_collection=3, max_list_entries=3),
+    )
+    service = gadgets.service()
+    one_title = {
+        "name": "one_title",
+        "kind": "unique",
+        "collection": "cards",
+        "fields": ["title"],
+        "message": "Titles are unique.",
+    }
+    app = publish_ruled_board(service, [{**WIP_LIMIT, "max": 1}, one_title])
+    document = card(service, app, "a", "todo")
+    other = card(service, app, "b", "todo")
+    for index in range(40):
+        document = move(
+            service, app, document, "doing" if index % 2 == 0 else "todo", f"e-{index}"
+        )
+    assert document["value"]["column"] == "todo"
+    # The rules still hold after all those edits: one card in progress, titles unique.
+    document = move(service, app, document, "doing", "e-last")
+    with pytest.raises(ConstraintViolation):
+        move(service, app, other, "doing", "o-doing")
+    with pytest.raises(ConstraintViolation):
+        rpc(
+            service,
+            app,
+            "create",
+            id="c",
+            value={"title": "a", "column": "todo"},
+            operation_id="c-dup",
+        )
+    epochs = gadgets.store.gadget_files(app["id"]).list_paths("data/_guard/epochs")
+    assert len(epochs) == 1
+
+
+def test_an_epoch_on_a_store_that_cannot_delete_rotates_before_its_record_is_full(
+    gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(HookedFiles, "supports_delete", property(lambda self: False))
+    monkeypatch.setattr(
+        constraints_module,
+        "GUARD_LIMITS",
+        StoreLimits(
+            max_revisions_per_record=30,
+            revisions_per_segment=10,
+            max_records_per_collection=3,
+            max_list_entries=3,
+        ),
+    )
+    service = gadgets.service()
+    app = publish_ruled_board(service, [{**WIP_LIMIT, "max": 1}])
+    document = card(service, app, "a", "todo")
+    for index in range(10):
+        document = move(
+            service, app, document, "doing" if index % 2 == 0 else "todo", f"e-{index}"
+        )
+    epochs = gadgets.store.gadget_files(app["id"]).list_paths("data/_guard/epochs")
+    # Sealed before each record's revision limit, so no write was refused for a full epoch.
+    assert len(epochs) >= 2
+    move(service, app, document, "doing", "e-last")
+    with pytest.raises(ConstraintViolation):
+        card(service, app, "b", "doing")
+
+
 @pytest.mark.parametrize(
     "constraint",
     [

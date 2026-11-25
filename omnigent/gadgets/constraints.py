@@ -20,10 +20,13 @@ first: a writer that stops half-way leaves neither a rule nor the derived state
 broken. A rule only refuses writes that make it worse, so data that predates a
 rule stays editable.
 
-The guard record rotates every ``EPOCH_WRITES`` writes because a record holds a
-bounded number of revisions; an epoch two behind the current one is retired (deleted
-and removed through the document store's fenced removal), so a gadget keeps at most
-a few epoch records however many writes it takes. Its state, with a change in flight,
+The guard record rotates every ``EPOCH_WRITES`` writes on a store that can delete; an
+epoch two behind the current one is retired (deleted and removed through the document
+store's fenced removal), so a gadget keeps at most a few epoch records however many
+writes it takes. A store that can't delete gives nothing back for a retired epoch, so
+there an epoch lasts until its record nears its revision limit, and the guard's records
+times that limit (10,000 times 10 million revisions by default, about two per write)
+bounds how many guarded writes a gadget can ever take. Its state, with a change in flight,
 must fit in ``MAX_GUARD_BYTES``: each unique key costs its digest plus the holding
 record's ID, so how many records a ``unique`` rule allows depends on their IDs and on
 the size of the record being written, not only on the collection's record limit.
@@ -84,6 +87,10 @@ MAX_STALE_INDEX_ENTRIES = 3 * (MAX_PLAN_OPERATIONS + 1)
 # Guard state, including an in-flight change, must fit in one store document.
 MAX_GUARD_BYTES = 30 * 1024
 EPOCH_WRITES = 100
+# On a store that can't delete, an epoch is sealed this many revisions before its record's
+# revision limit: one pass of the write loop adds a couple of revisions at most before it
+# checks again, and a stale mark adds one outside it.
+_ROTATION_HEADROOM = 64
 # Tries at taking the guard; between lost races a writer waits a random, growing time, so a
 # burst of writers spreads out instead of colliding again (under 5 s in total).
 GUARD_ATTEMPTS = 16
@@ -363,7 +370,7 @@ class ConstraintGuard:
                 self._rebuild_step(epoch, state)
                 continue
             attempts += 1
-            if current.get("writes", 0) >= EPOCH_WRITES:
+            if self._rotation_due(epoch, current):
                 self._seal(epoch, state)
                 continue
             primary = {
@@ -1065,6 +1072,20 @@ class ConstraintGuard:
             self.guard.create(
                 _GUARD_COLLECTION, epoch, value, f"g-epoch-{epoch}", "omnigent-gadget-rules"
             )
+
+    def _rotation_due(self, epoch: str, current: dict) -> bool:
+        """Whether the epoch is sealed before this write.
+
+        Where old epochs can be retired, rotating often keeps the guard's history short. A
+        store that can't delete gives nothing back for a retired epoch, so each new epoch
+        would use up one of the guard's records for good: there an epoch lasts until its
+        record is nearly full of revisions.
+        """
+        if self.files.supports_delete:
+            return current.get("writes", 0) >= EPOCH_WRITES
+        limit = self.guard.limits.max_revisions_per_record
+        threshold = limit - min(_ROTATION_HEADROOM, limit // 2)
+        return self.guard.revision_count(_GUARD_COLLECTION, epoch) >= threshold
 
     def _seal(self, epoch: str, state: Document) -> None:
         with contextlib.suppress(Conflict):
