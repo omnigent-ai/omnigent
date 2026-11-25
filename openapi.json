@@ -26198,14 +26198,17 @@
             }
           },
           {
-            "description": "`workspace` also confines owner reads, including symlinks.",
+            "description": "`workspace` also confines owner reads, including symlinks. `family` takes a host-absolute path and reads it from the family session whose workspace holds it, confined like `workspace`.",
             "in": "query",
             "name": "scope",
             "required": false,
             "schema": {
               "anyOf": [
                 {
-                  "const": "workspace",
+                  "enum": [
+                    "workspace",
+                    "family"
+                  ],
                   "type": "string"
                 },
                 {

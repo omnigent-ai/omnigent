@@ -39,15 +39,17 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   const root = usesViewerWorkspace ? viewerPaths.root : (environment.data?.root ?? null);
   const home = usesViewerWorkspace ? viewerPaths.home : (environment.data?.home ?? null);
   const resolved = root ? resolveChatFilePath(path.replace(/^(\.\/)+/, ""), root, home) : null;
-  const relativePath = resolved && !resolved.path.startsWith("/") ? resolved.path : null;
+  // A path outside the workspace may sit in a nested worker's workspace (e.g. its sibling
+  // worktree); the server serves it only from a family session's workspace.
+  const previewPath = resolved?.path ?? null;
+  const previewScope = previewPath?.startsWith("/") ? "family" : "workspace";
   const openFile = useFileViewer();
-  // The viewer opens paths in its own session, so another session's image stays inert. An image
-  // outside the workspace (e.g. a worker's worktree) opens on click only; previews never read it.
+  // The viewer opens paths in its own session, so another session's image stays inert.
   const openInViewer =
     openFile && conversationId && usesViewerWorkspace && resolved && rasterImageType(resolved.path)
       ? () => openFile(resolved.path)
       : null;
-  const imageKey = `${conversationId ?? ""}\0${root ?? ""}\0${relativePath ?? ""}`;
+  const imageKey = `${conversationId ?? ""}\0${root ?? ""}\0${previewPath ?? ""}`;
   const [loaded, setLoaded] = useState<{
     key: string;
     url: string;
@@ -58,12 +60,12 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   const filename = path.split("/").pop() || alt || "Image";
 
   useEffect(() => {
-    if (!conversationId || !relativePath) return;
-    const extensionType = rasterImageType(relativePath);
+    if (!conversationId || !previewPath) return;
+    const extensionType = rasterImageType(previewPath);
     if (!extensionType) return;
     const controller = new AbortController();
     let objectUrl: string | undefined;
-    void fetchFileContent(conversationId, relativePath, controller.signal, { scope: "workspace" })
+    void fetchFileContent(conversationId, previewPath, controller.signal, { scope: previewScope })
       .then((data) => {
         if (controller.signal.aborted) return;
         const contentType = data.content_type?.split(";")[0].trim().toLowerCase() ?? extensionType;
@@ -88,7 +90,7 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [conversationId, relativePath, imageKey]);
+  }, [conversationId, previewPath, previewScope, imageKey]);
 
   if (loaded?.key !== imageKey || loaded.signal.aborted || failedKey === imageKey) {
     const chipClassName =
