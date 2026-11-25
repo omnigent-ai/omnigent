@@ -21,16 +21,16 @@ def ticket(*labels: dict, requested_by: str = OWNER) -> dict:
     return {"labels": list(labels), "requested_by": requested_by}
 
 
-def test_risk_ok_is_offered_to_the_owner_and_approvers_but_not_on_their_own_request() -> None:
+def test_risk_ok_is_offered_to_the_owner_and_approvers_even_on_their_own_request() -> None:
     risky = ticket({"key": "risk", "value": "auth"}, ASK, requested_by=MEMBER)
     risk_ok = [{"key": "risk-ok", "value": None}]
     assert sign_offs_for(PROJECT, risky, OWNER) == risk_ok
     assert sign_offs_for(PROJECT, risky, APPROVER) == risk_ok
     assert sign_offs_for(PROJECT, risky, MEMBER) == []
     assert sign_offs_for(PROJECT, risky, None) == []
-    # An approver never signs off risk on a ticket they asked for; the owner always may.
+    # An approver may sign off risk on a ticket they asked for, as the owner may.
     own = ticket({"key": "risk", "value": "auth"}, ASK, requested_by=APPROVER)
-    assert sign_offs_for(PROJECT, own, APPROVER) == []
+    assert sign_offs_for(PROJECT, own, APPROVER) == risk_ok
     assert sign_offs_for(PROJECT, ticket({"key": "risk", "value": "auth"}, ASK), OWNER) == risk_ok
     # A single-user server has no user ID; its one person is the owner.
     solo = SimpleNamespace(user_id=None, config={})
@@ -41,13 +41,11 @@ def test_risk_ok_is_offered_to_the_owner_and_approvers_but_not_on_their_own_requ
 
 
 def test_risk_ok_givers_routing_and_what_is_still_owed() -> None:
-    assert risk_ok_givers(PROJECT, MEMBER) == {OWNER, APPROVER}
-    assert risk_ok_givers(PROJECT, APPROVER) == {OWNER}
-    assert risk_ok_givers(PROJECT, OWNER) == {OWNER, APPROVER}
+    # Every product approver may sign off risk, the requester included.
+    assert risk_ok_givers(PROJECT) == {OWNER, APPROVER}
     risk = [{"key": "risk", "value": "auth"}, ASK]
-    assert human_request_routing(PROJECT, risk, MEMBER)[1] == {OWNER, APPROVER}
-    assert human_request_routing(PROJECT, risk, APPROVER)[1] == {OWNER}
-    assert human_request_routing(PROJECT, [ASK], MEMBER)[1] == {OWNER}
+    assert human_request_routing(PROJECT, risk)[1] == {OWNER, APPROVER}
+    assert human_request_routing(PROJECT, [ASK])[1] == {OWNER}
     feature = [{"key": "kind", "value": "feature"}, {"key": "risk", "value": "a"}]
     assert pending_sign_offs(PROJECT, feature, MEMBER) == ["risk-ok", "product-ok"]
     assert pending_sign_offs(PROJECT, [*feature, {"key": "product-ok"}], MEMBER) == ["risk-ok"]

@@ -1168,7 +1168,7 @@ def test_each_requested_sign_off_is_given_independently(board, db_uri):
     assert tickets.human_requests(user_id="alice")["data"] == []
 
     # An approver's product-ok, given first, leaves risk-ok offered to the owner and to
-    # that approver (who may give it on a ticket they didn't request).
+    # that approver (who may give it on any ticket).
     other = tickets.create(
         project.id, CreateTicket(title="Approver first", labels=asked), worker, requested_by="bob"
     )["id"]

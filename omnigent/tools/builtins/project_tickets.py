@@ -287,8 +287,8 @@ class SysTicketGetTool(_TicketTool):
         "Compare the stage's meaning with actual work and the next step at progress and "
         "handoff checkpoints. "
         "The ticket's product_approvers lists the only people whose product-ok counts; ask "
-        "all of them, by those names, when it needs product approval, its requester "
-        "included (only risk-ok excludes the requester). "
+        "all of them, by those names, when it needs product approval or risk-ok, its "
+        "requester included. "
         "Use kind=output to read PRs and other links. For routine re-reads, pass "
         "include_description=false and include_stages=false to keep the response small."
     )

@@ -582,7 +582,7 @@ async def test_a_verification_doesnt_carry_over_a_tip_commit_touching_its_files(
         await world.queue.submit(world.project, "t1", rebased, None, dry_run=True)
 
 
-async def test_a_product_approver_can_give_risk_ok_but_not_on_their_own_request(world) -> None:
+async def test_a_product_approver_can_give_risk_ok_even_on_their_own_request(world) -> None:
     world.project.user_id = "owner@example.com"
     world.project.config = {
         "landing": {"enabled": True},
@@ -594,8 +594,7 @@ async def test_a_product_approver_can_give_risk_ok_but_not_on_their_own_request(
     world.tickets.label("kind", "fix", session_id="rs")
     world.tickets.ticket["requested_by"] = "approver@example.com"
     world.tickets.label("risk-ok", "yes", user_id="approver@example.com")
-    with pytest.raises(OmnigentError, match="didn't request it"):
-        await world.queue.submit(world.project, "t1", sha, None, dry_run=True)
+    assert (await world.queue.submit(world.project, "t1", sha, None, dry_run=True))["ok"]
     world.tickets.ticket["requested_by"] = "owner@example.com"
     assert (await world.queue.submit(world.project, "t1", sha, None, dry_run=True))["ok"]
     # A member who isn't an approver still can't stand in.

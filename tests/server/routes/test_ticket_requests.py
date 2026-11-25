@@ -266,7 +266,8 @@ async def test_an_approver_cannot_clear_what_only_the_owner_can_answer(multi_use
         )
         return f"{base}/{ticket['id']}"
 
-    # One ask covering product-ok and risk-ok: Bob's product-ok leaves Alice the risk-ok part.
+    # One ask covering product-ok and risk-ok: Bob's product-ok leaves the risk-ok part,
+    # which Alice or Bob (a product approver, though he requested it) may still give.
     risky = raise_ask("Risky feature", [*feature, risk])
     assert await _requests(client, BOB) == ["Risky feature"]
     approved = await client.patch(
@@ -284,7 +285,7 @@ async def test_an_approver_cannot_clear_what_only_the_owner_can_answer(multi_use
     assert commented.status_code == 201, commented.text
 
     assert await _requests(client, ALICE) == ["Owner question", "Risky feature"]
-    assert await _requests(client, BOB) == []
+    assert await _requests(client, BOB) == ["Risky feature"]
 
 
 async def test_a_persons_cc_lists_the_ticket_in_a_members_inbox_until_read(
@@ -363,7 +364,9 @@ async def test_a_new_tickets_description_ccs_the_people_it_names(multi_user_clie
     assert [mention["name"] for mention in event["payload"]["mentions"]] == ["Lead"]
 
 
-async def test_an_approver_gives_risk_ok_on_others_tickets_only(multi_user_client, db_uri):
+async def test_an_approver_gives_risk_ok_on_any_ticket_their_own_included(
+    multi_user_client, db_uri
+):
     client = multi_user_client
     project = (
         await client.post("/v1/projects", json={"name": "Approver risk"}, headers=_as_user(ALICE))
@@ -388,18 +391,15 @@ async def test_an_approver_gives_risk_ok_on_others_tickets_only(multi_user_clien
 
     alices = ask("Alice's risky fix", ALICE), "Alice's risky fix"
     bobs = ask("Bob's risky fix", BOB), "Bob's risky fix"
-    # Bob is asked for risk-ok only where he didn't request the work.
-    assert await _requests(client, BOB) == [alices[1]]
-    refused = await client.patch(
-        bobs[0], json={"add_labels": [{"key": "risk-ok"}]}, headers=_as_user(BOB)
-    )
-    assert refused.status_code == 403, refused.text
-    given = await client.patch(
-        alices[0], json={"add_labels": [{"key": "risk-ok"}]}, headers=_as_user(BOB)
-    )
-    assert given.status_code == 200, given.text
-    assert {label["key"] for label in given.json()["labels"]} == {"risk", "risk-ok"}
-    assert await _requests(client, ALICE) == [bobs[1]]
+    # Bob, a product approver, is asked for risk-ok on both, his own request included.
+    assert sorted(await _requests(client, BOB)) == sorted([alices[1], bobs[1]])
+    for path, _ in (bobs, alices):
+        given = await client.patch(
+            path, json={"add_labels": [{"key": "risk-ok"}]}, headers=_as_user(BOB)
+        )
+        assert given.status_code == 200, given.text
+        assert {label["key"] for label in given.json()["labels"]} == {"risk", "risk-ok"}
+    assert await _requests(client, ALICE) == []
 
 
 async def test_a_plain_question_goes_to_the_member_who_requested_the_ticket(

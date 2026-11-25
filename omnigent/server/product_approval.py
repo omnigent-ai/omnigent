@@ -100,10 +100,9 @@ def human_request_routing(
 ) -> tuple[str, set[str | None]]:
     """Who answers a ticket's ``needs-human`` ask, and why.
 
-    A feature that still needs ``product-ok`` (:func:`needs_product_ok`: not the owner's
-    own) waits on any product approver (the owner plus ``product_approvers``). A ``risk``
-    ticket still missing ``risk-ok`` also waits on whoever may give it
-    (:func:`risk_ok_givers`). Every other ask waits on the owner.
+    A feature still missing ``product-ok`` waits on any product approver (the owner
+    plus ``product_approvers``). A ``risk`` ticket still missing ``risk-ok`` also waits on
+    any product approver (:func:`risk_ok_givers`). Every other ask waits on the owner.
     """
     keys = {label.get("key") for label in labels or []}
     ticket = {"labels": labels or [], "requested_by": requested_by}
@@ -111,7 +110,7 @@ def human_request_routing(
     reason = REQUEST_OWNER
     if RISK_LABEL in keys and RISK_OK_LABEL not in keys:
         reason = REQUEST_RISK_OK
-        responders |= risk_ok_givers(project, requested_by)
+        responders |= risk_ok_givers(project)
     if needs_product_ok(project, ticket) and PRODUCT_OK_LABEL not in keys:
         reason = REQUEST_PRODUCT_OK
         responders |= {*product_approvers(project), project.user_id}
@@ -190,24 +189,19 @@ def pending_sign_offs(
     return pending
 
 
-def risk_ok_givers(project: Any, requested_by: str | None) -> set[str | None]:
-    """Who may give ``risk-ok``: the owner, and product approvers on tickets they didn't request.
+def risk_ok_givers(project: Any) -> set[str | None]:
+    """Who may give ``risk-ok``: the owner and every product approver, on any ticket.
 
-    Keeping the requester out means nobody but the owner signs off risk on their own change.
+    A requester who is a product approver may sign off risk on their own ticket.
     """
-    givers: set[str | None] = {
-        approver for approver in product_approvers(project) if approver != requested_by
-    }
-    givers.add(project.user_id)
-    return givers
+    return {*product_approvers(project), project.user_id}
 
 
-def risk_ok_refusal(project: Any, requested_by: str | None) -> str:
-    """Why a person can't give ``risk-ok`` on this ticket, and who can."""
-    givers = sorted(giver for giver in risk_ok_givers(project, requested_by) if giver)
-    return (
-        f"Only the project owner or a product approver who didn't request this ticket can add "
-        f"`{RISK_OK_LABEL}`" + (f": {', '.join(givers)}" if givers else "")
+def risk_ok_refusal(project: Any) -> str:
+    """Why a person can't give ``risk-ok``, and who can."""
+    givers = sorted(giver for giver in risk_ok_givers(project) if giver)
+    return f"Only the project owner or a product approver can add `{RISK_OK_LABEL}`" + (
+        f": {', '.join(givers)}" if givers else ""
     )
 
 
@@ -221,7 +215,7 @@ def pending_sign_off_approvers(
     """
     givers = {
         PRODUCT_OK_LABEL: {*product_approvers(project), project.user_id},
-        RISK_OK_LABEL: risk_ok_givers(project, requested_by),
+        RISK_OK_LABEL: risk_ok_givers(project),
         OWNER_OK_LABEL: {project.user_id},
     }
     return [
@@ -248,11 +242,7 @@ def sign_offs_for(
     # Single-user servers have no user ID: there the one person is the owner.
     owner = viewer == project.user_id
     offers: list[dict[str, Any]] = []
-    if (
-        RISK_LABEL in values
-        and RISK_OK_LABEL not in values
-        and viewer in risk_ok_givers(project, ticket.get("requested_by"))
-    ):
+    if RISK_LABEL in values and RISK_OK_LABEL not in values and viewer in risk_ok_givers(project):
         offers.append({"key": RISK_OK_LABEL, "value": None})
     if (
         needs_product_ok(project, ticket)

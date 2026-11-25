@@ -44,7 +44,7 @@ const SIGN_OFFS: { label: string; name: string; when: string; who: string }[] = 
     label: "risk-ok",
     name: "Risk approval",
     when: "Changes to permissions, database migrations, data deletion or these rules.",
-    who: "The owner, or a product approver who didn't ask for that change.",
+    who: "The owner or a product approver, even on a change they asked for.",
   },
   {
     label: "owner-ok",

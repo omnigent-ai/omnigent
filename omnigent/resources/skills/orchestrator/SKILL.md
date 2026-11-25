@@ -328,8 +328,8 @@ When the project has a **Reviewer** identity and a Review stage (id
   lead with the new head SHA. Land only the exact approved SHA.
 - `risk` = `<area>` (auth or permissions, who can approve or sign off, deleting
   user data, the Mandate or review rules, or another major security issue the
-  Reviewer flags) needs `risk-ok` before landing, from a product approver who
-  didn't request the ticket. Migrations and performance work alone don't.
+  Reviewer flags) needs `risk-ok` before landing, set by a product approver
+  (the requester counts). Migrations and performance work alone don't.
 - After 3 rounds without agreement, the Reviewer escalates to you with a
   human-audience comment. Decide or ask the owner.
 
@@ -540,8 +540,8 @@ updates and worker reports promptly between checks.
 
 When the project's `landing` setting is on, workers land their own approved
 commits with `sys_ticket_land` after the Reviewer sets `approved` to the exact
-SHA; any `risk` label needs `risk-ok` from the owner or a product approver
-who didn't request the ticket, and an imported outside PR needs the owner's
+SHA; any `risk` label needs `risk-ok` from the owner or a product approver,
+the requester included, and an imported outside PR needs the owner's
 `owner-ok` for the same SHA. The server fast-forwards,
 rebuilds the web app when needed, restarts once per batch, moves the ticket to
 the stage before completed and tells the worker to verify. Don't land those by
@@ -564,8 +564,8 @@ it.
   can't add `product-ok`. Ask exactly the people in the ticket's
   `product_approvers` (from `sys_ticket_get`), by those names; don't name
   anyone else as able to approve. Name all of them, the ticket's requester
-  included: a product approver may give `product-ok` on a feature they asked
-  for. Only `risk-ok` excludes the requester.
+  included: a product approver may give `product-ok` or `risk-ok` on a ticket
+  they asked for.
 - `fix`, `perf` and `ux` land on approval like any change.
 - A ticket you file records you as its requester, which counts as the owner.
   When you file or split one on a member's behalf, say so in its description
@@ -583,8 +583,8 @@ requested it (`requested_by`), and the board shows it.
   Dispatch their tickets the same way, through the same worker, Reviewer and
   landing flow. A member can't approve, give `owner-ok`, change the Mandate's
   rules or share the project; those stay with the owner. Only the owner and
-  product approvers can give `risk-ok`, and never on a ticket they requested
-  themselves (except the owner). Take
+  product approvers can give `risk-ok`, including on a ticket they requested
+  themselves. Take
   decisions that are the owner's to the owner, not to the member who asked.
 - **Outside GitHub pull requests:** file one with `sys_ticket_import_pr` and
   its URL. That's read-only, and importing again returns the same ticket. The
