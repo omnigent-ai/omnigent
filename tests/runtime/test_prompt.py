@@ -469,3 +469,35 @@ def test_native_startup_instructions_keep_only_stable_image_guidance() -> None:
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
     assert SUBAGENT_WAKE_NOTICE_INSTRUCTION not in result
     assert build_native_startup_instructions(None) == WORKSPACE_IMAGE_INSTRUCTION
+
+
+def test_history_names_only_senders_the_model_saw() -> None:
+    """Replay repeats the sender line exactly where the live turn carried it."""
+
+    def user(text: str, created_by: str, sender_in_context: bool) -> ConversationItem:
+        return ConversationItem(
+            id=f"msg_{text}",
+            status="completed",
+            response_id="r1",
+            created_at=1,
+            type="message",
+            created_by=created_by,
+            data=MessageData(
+                role="user",
+                content=[{"type": "input_text", "text": text}],
+                sender_in_context=sender_in_context,
+            ),
+        )
+
+    items = [user("mine", "alice@example.com", False), user("theirs", "bob@example.com", True)]
+
+    assert history_to_input_items(items) == [
+        {"role": "user", "content": [{"type": "input_text", "text": "mine"}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": '[Message sender: "bob@example.com"]'},
+                {"type": "input_text", "text": "theirs"},
+            ],
+        },
+    ]

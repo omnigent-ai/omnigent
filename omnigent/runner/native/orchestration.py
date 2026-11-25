@@ -117,6 +117,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+from omnigent.runtime.message_sender import replayed_content
 from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -2535,7 +2536,7 @@ def _render_opencode_transcript_text(items: list[object]) -> str:
         if not isinstance(item, dict) or item.get("type") != "message":
             continue
         role = item.get("role")
-        content = item.get("content")
+        content = replayed_content(item)
         if role not in ("user", "assistant") or not isinstance(content, list):
             continue
         texts = [
@@ -8354,7 +8355,7 @@ def _cursor_fork_history_preamble(items: list[_JsonObject]) -> str:
         role = item.get("role")
         if role not in _CURSOR_FORK_ROLE_LABELS:
             continue
-        text = _cursor_message_item_text(item.get("content"))
+        text = _cursor_message_item_text(replayed_content(item))
         if text:
             turns.append(f"{_CURSOR_FORK_ROLE_LABELS[role]}: {text}")
     return "\n\n".join(turns)

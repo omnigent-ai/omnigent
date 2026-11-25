@@ -16,6 +16,7 @@ from omnigent.entities import (
 )
 from omnigent.inner.native_attachments import expand_framework_notices
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.runtime.message_sender import with_message_sender
 from omnigent.runtime.tool_result_replay import (
     image_omitted_placeholder,
     strip_unparseable_image_output,
@@ -399,6 +400,8 @@ def history_to_input_items(
             # the LLM. The text description survives and gives
             # the LLM context about files it previously produced.
             content = _strip_output_annotations(item.data.content)
+            if item.data.role == "user" and item.data.sender_in_context:
+                content = with_message_sender(content, item.created_by)
             result.append({"role": item.data.role, "content": content})
 
         elif item.type == "function_call":

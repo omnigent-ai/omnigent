@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent._platform import stable_user_id
+from omnigent.runtime.message_sender import replayed_content
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -260,7 +261,7 @@ def qwen_session_records_from_session_items(
             continue
         role = item.get("role")
         if role == "user":
-            text = _qwen_text_from_api_content(item.get("content"), "input_text")
+            text = _qwen_text_from_api_content(replayed_content(item), "input_text")
             if not text:
                 continue
             rec_uuid = _qwen_synth_uuid(qwen_session_id, index)

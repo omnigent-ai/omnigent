@@ -1664,6 +1664,14 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
             "role": "user",
             "content": [{"type": "input_text", "text": "hello"}],
         },
+        {
+            "id": "item_2",
+            "type": "message",
+            "role": "user",
+            "created_by": "bob@example.com",
+            "sender_in_context": True,
+            "content": [{"type": "input_text", "text": "and me"}],
+        },
     ]
     app, _pm, hc = _build_recovery_app(history)
 
@@ -1705,6 +1713,14 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
         "from history. Empty content means _load_history_as_input "
         "failed or _session_histories wasn't populated."
     )
+    # Replay names the collaborator the model saw, and only them.
+    assert [item["content"] for item in body_content if item.get("role") == "user"] == [
+        [{"type": "input_text", "text": "hello"}],
+        [
+            {"type": "input_text", "text": '[Message sender: "bob@example.com"]'},
+            {"type": "input_text", "text": "and me"},
+        ],
+    ]
 
 
 @pytest.mark.asyncio

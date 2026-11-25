@@ -357,6 +357,29 @@ async def test_ensure_local_codex_resume_rollout_restores_a_zip_outside_the_work
     ]
 
 
+@pytest.mark.parametrize("named", [False, True], ids=["owner", "collaborator"])
+def test_resume_payload_names_the_sender_the_model_saw(named: bool) -> None:
+    """A rebuilt Codex thread repeats the sender line only where the live turn had it."""
+    item = {
+        "id": "msg_user_1",
+        "type": "message",
+        "role": "user",
+        "created_by": "bob@example.com",
+        "content": [{"type": "input_text", "text": "open TODO.md"}],
+    }
+    if named:
+        item["sender_in_context"] = True
+
+    payload = codex_native._codex_message_payload_from_session_item(item)
+
+    line = [{"type": "input_text", "text": '[Message sender: "bob@example.com"]'}] if named else []
+    assert payload == {
+        "type": "message",
+        "role": "user",
+        "content": [*line, {"type": "input_text", "text": "open TODO.md"}],
+    }
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
     tmp_path: Path,

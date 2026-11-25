@@ -68,6 +68,14 @@ def test_render_transcript_skips_non_message_and_other_roles() -> None:
     assert app._render_opencode_transcript_text(items) == "User: hi"
 
 
+def test_render_transcript_names_collaborators_the_model_saw() -> None:
+    item = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+    named = {**item, "created_by": "bob@example.com", "sender_in_context": True}
+    assert app._render_opencode_transcript_text([item, named]) == (
+        'User: hi\n\nUser: [Message sender: "bob@example.com"]\nhi'
+    )
+
+
 # ── _rehydrate_opencode_session_from_transcript ─────────────────────────────
 
 

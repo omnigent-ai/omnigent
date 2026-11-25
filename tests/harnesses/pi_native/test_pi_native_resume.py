@@ -372,16 +372,21 @@ def test_records_build_parent_chain() -> None:
     assert entries[1]["message"]["role"] == "assistant"
 
 
-def test_user_message_content_blocks() -> None:
+@pytest.mark.parametrize("named", [False, True], ids=["owner", "collaborator"])
+def test_user_message_content_blocks(named: bool) -> None:
+    item = _user_item("remember BANANA42")
+    if named:
+        item.update(created_by="bob@example.com", sender_in_context=True)
     records = pi_session_records_from_session_items(
-        [_user_item("remember BANANA42")],
+        [item],
         session_id="conv_abc",
         external_session_id=_EXTERNAL_ID,
         cwd=Path("/repo"),
     )
     msg = records[1]["message"]
     assert msg["role"] == "user"
-    assert msg["content"] == [{"type": "text", "text": "remember BANANA42"}]
+    line = [{"type": "text", "text": '[Message sender: "bob@example.com"]'}] if named else []
+    assert msg["content"] == [*line, {"type": "text", "text": "remember BANANA42"}]
 
 
 def test_assistant_message_has_required_metadata() -> None:

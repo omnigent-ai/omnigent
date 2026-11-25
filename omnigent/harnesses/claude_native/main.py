@@ -26,6 +26,7 @@ import sys
 import uuid
 
 from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.runtime.message_sender import replayed_content
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
@@ -6283,7 +6284,7 @@ def _claude_transcript_record_from_session_item(
     if item_type == "message":
         role = item.get("role")
         if role == "user":
-            user_content = _claude_user_content_from_api_blocks(item.get("content"), bridge_dir)
+            user_content = _claude_user_content_from_api_blocks(replayed_content(item), bridge_dir)
             if user_content is None and allow_native_message_content:
                 user_content = _claude_native_message_content(item.get("content"), role="user")
             if user_content is None:

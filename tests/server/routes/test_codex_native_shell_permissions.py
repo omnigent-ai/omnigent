@@ -14,6 +14,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runtime import pending_inputs, set_runner_client, set_runner_router
+from omnigent.runtime.message_sender import with_message_sender
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_MANAGE,
@@ -22,6 +23,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.routes.sessions.routes_events import _harness_runs_input
 from tests.server.routes.test_session_resources import (
     _ConversationStore,
     _FakeRunnerClient,
@@ -75,14 +77,24 @@ class _ShellRunnerClient(_FakeRunnerClient):
 
 @pytest.fixture
 async def codex_client(
+    request: pytest.FixtureRequest,
     runner_globals_reset: None,  # noqa: F811 — imported fixture
 ) -> AsyncIterator[tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation]]:
     del runner_globals_reset
+    # Indirect parametrization adds release features and may keep the store's
+    # Claude Code pane, e.g. (frozenset({Feature.MESSAGE_SENDER_CONTEXT}), "claude-native").
+    extra_features, harness = getattr(request, "param", (frozenset(), "codex-native"))
     store = _ConversationStore()
     conv = store.get_conversation(_SESSION_ID)
     assert conv is not None
-    conv.harness_override = "codex-native"
-    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    if harness == "codex-native":
+        conv.harness_override = "codex-native"
+        conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    elif harness == "claude-sdk":
+        # An API session: no terminal wrapper, every message a prompt or SDK control.
+        conv.harness_override = "claude-sdk"
+        conv.labels.pop("omnigent.ui", None)
+        conv.labels.pop("omnigent.wrapper", None)
     permissions = _ShellPermissionStore()
     for user, level in (
         ("viewer", LEVEL_READ),
@@ -106,7 +118,7 @@ async def codex_client(
         permission_store=permissions,
     )
     app.state.feature_flags = FeatureFlags(
-        frozenset({Feature.SESSION_ORCHESTRATION, Feature.PEER_SESSION_MESSAGING})
+        frozenset({Feature.SESSION_ORCHESTRATION, Feature.PEER_SESSION_MESSAGING}) | extra_features
     )
     pending_inputs.reset_for_tests()
     try:
@@ -120,6 +132,14 @@ async def codex_client(
 
 def _message(content: list[dict[str, Any]]) -> dict[str, Any]:
     return {"type": "message", "data": {"role": "user", "content": content}}
+
+
+_NAMING = frozenset({Feature.MESSAGE_SENDER_CONTEXT})
+_FILE = {"type": "input_file", "filename": "note.txt", "file_data": "aGk="}
+
+
+def _typed(*texts: str) -> list[dict[str, Any]]:
+    return [{"type": "input_text", "text": text} for text in texts]
 
 
 @pytest.mark.parametrize("running", [False, True], ids=["initial", "live"])
@@ -154,20 +174,24 @@ async def test_codex_shell_requires_owner_before_dispatch(
 
 
 @pytest.mark.parametrize(
+    ("codex_client", "naming"),
+    [((frozenset(), "codex-native"), False), ((_NAMING, "codex-native"), True)],
+    ids=["naming-off", "naming-on"],
+    indirect=["codex_client"],
+)
+@pytest.mark.parametrize(
     "content",
     [
-        [{"type": "input_text", "text": "Explain this code"}],
-        [{"type": "input_text", "text": "!!literal bang"}],
-        [{"type": "input_text", "text": "!printf FIRST"}, {"type": "input_text", "text": "more"}],
-        [
-            {"type": "input_text", "text": "!inspect this file"},
-            {"type": "input_file", "filename": "note.txt", "file_data": "aGk="},
-        ],
+        _typed("Explain this code"),
+        _typed("!!literal bang"),
+        _typed("!printf FIRST", "more"),
+        [*_typed("!inspect this file"), _FILE],
     ],
     ids=["ordinary", "escaped-bang", "multiple-blocks", "attachment"],
 )
 async def test_codex_editor_model_input_keeps_edit_access(
     codex_client: tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation],
+    naming: bool,
     content: list[dict[str, Any]],
 ) -> None:
     client, runner, _conv = codex_client
@@ -179,8 +203,58 @@ async def test_codex_editor_model_input_keeps_edit_access(
     assert response.status_code == 202, response.text
     messages = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
     assert len(messages) == 1
-    assert messages[0]["content"] == content
+    # Model input stays model input; with naming on it carries the editor's name.
+    assert messages[0]["content"] == with_message_sender(
+        content, "editor@example.com" if naming else None
+    )
     assert dict(runner.post_headers)[_EVENT_PATH] == {}
+    assert [row["content"] for row in pending_inputs.snapshot_for(_SESSION_ID)] == [content]
+
+
+@pytest.mark.parametrize(
+    ("codex_client", "caller", "content", "named", "queued"),
+    [
+        ((_NAMING, "codex-native"), "owner", _typed("Explain this code"), False, True),
+        ((_NAMING, "codex-native"), "admin", _typed("Explain this code"), True, True),
+        ((_NAMING, "codex-native"), "admin", _typed("!printf authorized"), False, True),
+        ((_NAMING, "codex-native"), "editor", _typed("/goal ship the fix"), False, True),
+        ((_NAMING, "claude-native"), "editor", _typed("Explain this code"), True, True),
+        ((_NAMING, "claude-native"), "editor", _typed("/compact"), False, True),
+        ((_NAMING, "claude-sdk"), "editor", _typed("Explain this code"), True, False),
+        ((_NAMING, "claude-sdk"), "editor", _typed("/compact"), False, False),
+    ],
+    ids=[
+        "codex-owner",
+        "codex-admin",
+        "codex-shell-command",
+        "codex-goal",
+        "claude-editor",
+        "claude-command",
+        "sdk-prompt",
+        "sdk-compact",
+    ],
+    indirect=["codex_client"],
+)
+async def test_only_collaborators_model_input_names_them(
+    codex_client: tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation],
+    caller: str,
+    content: list[dict[str, Any]],
+    named: bool,
+    queued: bool,
+) -> None:
+    client, runner, _conv = codex_client
+    response = await client.post(
+        _EVENT_PATH,
+        json=_message(content),
+        headers={"X-Forwarded-Email": f"{caller}@example.com"},
+    )
+    assert response.status_code == 202, response.text
+    [message] = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
+    sender = f"{caller}@example.com" if named else None
+    assert message["content"] == with_message_sender(content, sender)
+    # A native terminal's queued bubble keeps what the person typed; an API session queues none.
+    expected = [content] if queued else []
+    assert [row["content"] for row in pending_inputs.snapshot_for(_SESSION_ID)] == expected
 
 
 @pytest.mark.parametrize(
@@ -267,3 +341,36 @@ async def test_codex_automated_message_requires_target_ownership_and_stays_model
     ]
     assert "authorized_native_shell_command" not in messages[0]
     assert dict(runner.post_headers)[_EVENT_PATH] == {}
+
+
+@pytest.mark.parametrize(
+    ("harness", "native_terminal", "content", "runs"),
+    [
+        ("openai-agents", False, _typed("/tmp/example.py: explain this file"), False),
+        ("codex", False, _typed("/goal ship the fix"), True),
+        ("codex", False, _typed("/tmp/example.py: explain"), False),
+        ("claude-sdk", False, _typed("/compact"), True),
+        ("claude-sdk", False, _typed("/compact the notes"), False),
+        ("auto", False, _typed("/goal ship the fix"), True),
+        ("auto", False, _typed("/compact"), True),
+        ("auto", False, _typed("/tmp/example.py: explain"), False),
+        (None, False, _typed("/goal ship the fix"), True),
+        (None, False, _typed("!important"), False),
+        ("codex-native", True, _typed("/goal ship the fix"), True),
+        ("codex-native", True, [*_typed("/goal ship the fix"), _FILE], False),
+        ("codex-native", True, _typed("!ls"), True),
+        ("codex-native", True, _typed("/compact"), False),
+        ("claude-native", True, _typed("/compact"), True),
+        ("claude-native", True, _typed("/help with tests"), False),
+        ("claude-native", True, [*_typed("/compact"), _FILE], False),
+        ("claude-native", True, _typed("!git status"), True),
+        ("claude-native", True, _typed("exit"), True),
+        ("goose-native", True, _typed("/clear"), True),
+        ("goose-native", True, _typed("!important"), False),
+    ],
+)
+def test_harness_runs_only_its_own_commands(
+    harness: str | None, native_terminal: bool, content: list[dict[str, Any]], runs: bool
+) -> None:
+    """Only input the harness acts on itself is sent as typed; everything else is a prompt."""
+    assert _harness_runs_input(content, harness, native_terminal=native_terminal) is runs

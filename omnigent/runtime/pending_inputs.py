@@ -116,12 +116,16 @@ from typing import Any, Literal
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
+from omnigent.runtime.message_sender import message_sender_line
 
 # A pending entry is evicted this many seconds after it was recorded
 # if it was never drained by a matching persisted message. Covers the
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
 # transcript round-trip on a busy session still drains normally.
 _TTL_S: float = 600.0
+# How long a named entry's typed content outlives its queue slot: past the runner's
+# default wait behind an unanswered prompt, which then reports the content it holds.
+_NAMED_CONTENT_TTL_S: float = 48 * 60 * 60
 
 # Hard cap on unheld queued entries per conversation, enforced by
 # :func:`record`: the oldest unheld entries are evicted when a new one would
@@ -141,6 +145,10 @@ _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
 
 # Words Claude Code's composer treats as /exit when sent on their own.
 _CLAUDE_EXIT_WORDS = frozenset({"exit", "quit", ":q", ":q!", ":wq", ":wq!"})
+
+# ``match_method`` of a text match that two queued entries fit equally, one with a
+# server-added sender line and one without: the drain cannot vouch for author or text.
+AMBIGUOUS_MATCH = "ambiguous_text"
 
 NativeInputCauseClass = Literal[
     "rejected_before_handoff",
@@ -233,12 +241,15 @@ class DrainedInput:
         hidden and settles quietly as an uncertain entry.
     :param uncertain: Whether a positional drain may already have mirrored
         this entry. Restore must preserve that evidence even after eviction.
+    :param named_sender: Identity the server typed ahead of this message for
+        the agent (see :mod:`omnigent.runtime.message_sender`), or ``None``.
     """
 
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    named_sender: str | None = None
     background_titles_enabled: bool = True
     interrupted: bool = False
     # Reconstructed entries without original delivery metadata must remain unknown.
@@ -307,12 +318,15 @@ class _Entry:
         pending, is left out of the snapshot, and a later match that jumps over
         it must not call it undelivered. A mirror of its own text still drains
         it normally: the agent did record it.
+    :param named_sender: Identity the server typed ahead of the message, so its
+        mirror carries that line before the content's own text.
     """
 
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    named_sender: str | None = None
     background_titles_enabled: bool = True
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
@@ -334,6 +348,12 @@ class _Entry:
 # relies on to drain the oldest matching message first. Empty inner
 # dicts are popped eagerly so the index doesn't accrete stale keys.
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
+# Typed content of named entries the TTL evicted, by conversation and pending id: the
+# runner's copy of such a message carries the sender line, so its last-resort report
+# cannot stand in for what was typed.
+_expired_named: WorkspaceScopedCache[str, dict[str, tuple[float, list[dict[str, Any]]]]] = (
+    WorkspaceScopedCache()
+)
 _lock = threading.Lock()
 
 
@@ -354,9 +374,37 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
         return
     stale = [pid for pid, entry in entries.items() if now - entry.created_at > _TTL_S]
     for pid in stale:
-        entries.pop(pid, None)
+        entry = entries.pop(pid, None)
+        if entry is not None and entry.named_sender is not None:
+            kept = _expired_named.setdefault(conversation_id, {})
+            kept[pid] = (now + _NAMED_CONTENT_TTL_S, entry.content)
+            while len(kept) > _MAX_ENTRIES_PER_CONVERSATION:
+                kept.pop(next(iter(kept)))
     if not entries:
         _pending.pop(conversation_id, None)
+
+
+def take_expired_named_content(
+    conversation_id: str, pending_id: str
+) -> list[dict[str, Any]] | None:
+    """
+    Return, once, the typed content of a named entry the TTL evicted.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The evicted entry's id, e.g. ``"pending_a1b2c3"``.
+    :returns: The content as typed, or ``None`` when none is kept for it.
+    """
+    with _lock:
+        kept = _expired_named.get(conversation_id)
+        if kept is None:
+            return None
+        now = _now()
+        for pid in [pid for pid, (expires_at, _) in kept.items() if expires_at < now]:
+            kept.pop(pid)
+        found = kept.pop(pending_id, None)
+        if not kept:
+            _expired_named.pop(conversation_id, None)
+        return copy.deepcopy(found[1]) if found is not None else None
 
 
 def make_pending_id(conversation_id: str, stable_id: str | None = None) -> str:
@@ -376,6 +424,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    named_sender: str | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -399,6 +448,8 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param named_sender: Identity the server types ahead of the message for
+        the agent, or ``None`` when it is delivered as typed.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -421,6 +472,7 @@ def record(
             content=copy.deepcopy(content),
             created_by=created_by,
             stable_id=stable_id,
+            named_sender=named_sender,
             background_titles_enabled=background_titles_enabled,
         )
         entries = _pending.setdefault(conversation_id, {})
@@ -783,6 +835,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         content=copy.deepcopy(drained.content),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
+        named_sender=drained.named_sender,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
         uncertain=drained.uncertain,
@@ -878,33 +931,36 @@ def resolve_matching_text(
         texts = [
             _shell_command_text(entry.content)
             if shell_command
-            else _collapse_whitespace(_content_text(entry.content))
+            else _collapse_whitespace(_delivered_text(entry))
             for _pid, entry in ordered
         ]
-        # Two passes. An exact (whitespace-collapsed) match first, so two
-        # messages that differ only in a marker-like phrase the person typed
-        # at the front stay distinct. Then, for entries carrying attachments:
-        # the executor pastes one generated marker line per file block ahead
-        # of the text, so drop exactly that many from the mirror and compare
-        # with the entry's own text — typed marker-like text still counts.
+        # Each entry is compared as delivered (behind its sender line, if any). Exact
+        # match first, so typed marker-like text stays distinct; then drop the
+        # executor's one marker line per file block and compare again.
         interrupted = [entry.interrupted for _pid, entry in ordered]
+        exact = [index for index, queued in enumerate(texts) if queued == exact_needle]
+        marked = []
+        for index, (_pid, entry) in enumerate(ordered):
+            attachments = 0 if shell_command else _attachment_count(entry.content)
+            if attachments == 0 or not texts[index]:
+                continue
+            if _collapse_whitespace(_strip_generated_markers(text, attachments)) == texts[index]:
+                marked.append(index)
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
         if match_index is None:
             match_method = "attachment_normalized_text"
-            marker_matches: list[int] = []
-            for index, (_pid, entry) in enumerate(ordered):
-                attachments = 0 if shell_command else _attachment_count(entry.content)
-                if attachments == 0 or not texts[index]:
-                    continue
-                if (
-                    _collapse_whitespace(_strip_generated_markers(text, attachments))
-                    == texts[index]
-                ):
-                    marker_matches.append(index)
-            match_index = _prefer_live(marker_matches, interrupted)
+            match_index = _prefer_live(marked, interrupted)
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
+        # Typed text can read exactly like what the server typed for a named entry, so
+        # a fit with both a named and an unnamed entry does not show whose echo this is.
+        tied = {*exact, *marked}
+        unproven_from = match_index
+        if len({ordered[index][1].named_sender is None for index in tied}) > 1:
+            match_method = AMBIGUOUS_MATCH
+            # From the earliest tied entry on, a jumped-over entry may still be waiting.
+            unproven_from = min(tied)
         # Bound one drain's work: report at most a cap's worth of skipped
         # entries (oldest first) and leave the rest queued for later drains, so
         # a queue that overflowed after a rolled-back append never yields an
@@ -920,14 +976,16 @@ def resolve_matching_text(
                 entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
-        # An entry a positional drain may have settled, or that the person
-        # cancelled with Stop, is drained without an undelivered record.
+        # An entry a positional drain may have settled, that the person cancelled
+        # with Stop, or that a tied match may have jumped over, is drained without
+        # an undelivered record.
         lost: list[DrainedInput] = []
         uncertain: list[DrainedInput] = []
-        for _pending_id, entry in skipped_entries:
+        for index, (_pending_id, entry) in enumerate(skipped_entries):
             if (
                 entry.uncertain
                 or entry.interrupted
+                or index >= unproven_from
                 or _is_command_entry(entry, claude_commands=claude_commands)
             ):
                 uncertain.append(_drained_input(entry))
@@ -1009,6 +1067,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,
         stable_id=entry.stable_id,
+        named_sender=entry.named_sender,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
         uncertain=entry.uncertain,
@@ -1034,6 +1093,13 @@ def _content_text(content: list[dict[str, Any]]) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def _delivered_text(entry: _Entry) -> str:
+    """Text the executor typed for *entry*: any sender line, then the entry's own text."""
+    text = _content_text(entry.content)
+    line = message_sender_line(entry.named_sender)
+    return f"{line}\n{text}" if line else text
 
 
 def _first_match(texts: list[str], needle: str, interrupted: list[bool]) -> int | None:
@@ -1099,7 +1165,19 @@ def _is_command_entry(entry: _Entry, *, claude_commands: bool) -> bool:
         exit words; ``/``-led text counts for every harness.
     :returns: Whether the entry is such a command.
     """
-    text = _collapse_whitespace(_content_text(entry.content))
+    return is_native_command(entry.content, claude_commands=claude_commands)
+
+
+def is_native_command(content: list[dict[str, Any]], *, claude_commands: bool) -> bool:
+    """
+    Whether a native terminal runs message *content* itself instead of prompting.
+
+    :param content: Message content blocks, e.g. ``[{"type": "input_text", "text": "/compact"}]``.
+    :param claude_commands: Also count Claude Code's ``!`` shell commands and
+        exit words; ``/``-led text counts for every harness.
+    :returns: Whether the content is such a command.
+    """
+    text = _collapse_whitespace(_content_text(content))
     if text.startswith("/"):
         return True
     return claude_commands and (text.startswith("!") or text.lower() in _CLAUDE_EXIT_WORDS)
@@ -1167,3 +1245,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _expired_named.clear()

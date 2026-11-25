@@ -6612,12 +6612,16 @@ async def test_claude_native_mirror_matches_pending_text_and_reports_lost_input(
         pending_inputs.reset_for_tests()
 
 
+@pytest.mark.parametrize("named", [False, True], ids=["typed", "named"])
 @pytest.mark.asyncio
-async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry() -> None:
+async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry(
+    named: bool,
+) -> None:
     """A mirror whose text the transcript reformatted still drains by position.
 
     Nothing is skipped and no undelivered pair is written: the oldest entry is
-    the message, exactly as before text matching existed.
+    the message, exactly as before text matching existed. A position guess is
+    no proof, so the mirror is stored as recorded even when the entry was named.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
@@ -6631,15 +6635,15 @@ async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry()
         sid,
         [{"type": "input_text", "text": "> quoted line\n\nwhat about this?"}],
         created_by="a@example.com",
+        named_sender="a@example.com" if named else None,
     )
+    literal = '[Message sender: "a@example.com"]\n' if named else ""
+    mirrored = [{"type": "input_text", "text": f"{literal}quoted line -- what about this?"}]
     body = SessionEventInput(
         type="external_conversation_item",
         data={
             "item_type": "message",
-            "item_data": {
-                "role": "user",
-                "content": [{"type": "input_text", "text": "quoted line -- what about this?"}],
-            },
+            "item_data": {"role": "user", "content": mirrored},
             "response_id": "resp_reformatted",
             "source_id": "claude:reformatted:0",
         },
@@ -6655,6 +6659,8 @@ async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry()
 
         assert [item.type for item in store.appended_items] == ["message"]
         assert store.appended_items[0].created_by is None
+        assert store.appended_items[0].data.content == mirrored
+        assert store.appended_items[0].data.sender_in_context is False
         assert pending_inputs.snapshot_for(sid) == []
         assert pending_id  # the drained entry was the reformatted message itself
     finally:
@@ -9102,12 +9108,14 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("named", [False, True], ids=["typed", "named"])
 @pytest.mark.parametrize("server_copy_expired", [True, False])
 @pytest.mark.parametrize("parked_response_id", [None, "resp_" + "c" * 32])
 async def test_relay_records_queued_native_messages_reported_after_a_long_prompt_wait(
     monkeypatch: pytest.MonkeyPatch,
     parked_response_id: str | None,
     server_copy_expired: bool,
+    named: bool,
 ) -> None:
     """Messages the runner reports as not sent after a long prompt wait stay visible.
 
@@ -9122,6 +9130,7 @@ async def test_relay_records_queued_native_messages_reported_after_a_long_prompt
     """
     from omnigent.runner.app import _prompt_wait_expired_failure
     from omnigent.runtime import pending_inputs
+    from omnigent.runtime.message_sender import with_message_sender
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import _relay_runner_stream
 
@@ -9138,10 +9147,16 @@ async def test_relay_records_queued_native_messages_reported_after_a_long_prompt
     ):
         content = [{"type": "input_text", "text": text}]
         pending_id = pending_inputs.record(
-            session_id, content, created_by="alice@example.com", stable_id=stable_id
+            session_id,
+            content,
+            created_by="alice@example.com",
+            stable_id=stable_id,
+            named_sender="alice@example.com" if named else None,
         )
         identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
-        bodies.append({"type": "message", "content": content, **identity})
+        # A named message reaches the runner behind the line, which it reports back as is.
+        sent = with_message_sender(content, "alice@example.com" if named else None)
+        bodies.append({"type": "message", "content": sent, **identity})
     if server_copy_expired:
         clock["t"] += pending_inputs._TTL_S + 1
         assert pending_inputs.snapshot_for(session_id) == []
@@ -12136,3 +12151,64 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
         )
     else:
         assert response.json()["error"]["code"] == "runner_unavailable"
+
+
+@pytest.mark.parametrize("workflow_run_id", [None, "a" * 32], ids=["chat", "workflow"])
+@pytest.mark.parametrize("first_named", [True, False], ids=["named-then-off", "off-then-named"])
+@pytest.mark.asyncio
+async def test_stable_id_retry_keeps_its_first_delivery(
+    db_uri: str,
+    runner_globals_reset: None,
+    monkeypatch: pytest.MonkeyPatch,
+    first_named: bool,
+    workflow_run_id: str | None,
+) -> None:
+    """A collaborator's send names them only to the runner; a retry is delivered as first sent."""
+    from omnigent.server.routes._sessions.orchestration import _forward_event_to_runner
+
+    async def current_run(*_args: object) -> None:
+        return None
+
+    # The run-currency guard has its own tests; here every run is current.
+    monkeypatch.setattr(
+        "omnigent.server.session_journal.require_current_workflow_run", current_run
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Review")
+    runner = _FakeRunnerClient(payload={})
+    typed = [{"type": "input_text", "text": "Review this"}]
+    # A client cannot set the flag; only the server's naming decision does.
+    body = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": typed,
+            "stable_id": "0" * 31 + "1",
+            "sender_in_context": True,
+        },
+        workflow_run_id=workflow_run_id,
+    )
+
+    item_ids = [
+        await _forward_event_to_runner(
+            conv.id,
+            conv,
+            body,
+            store,
+            runner,  # type: ignore[arg-type]
+            created_by="bob@example.com",
+            message_sender="bob@example.com" if named else None,
+        )
+        for named in (first_named, not first_named)
+    ]
+
+    [item] = store.list_items(conv.id, type="message").data
+    assert item_ids == [item.id, item.id]
+    assert item.data.content == typed
+    assert item.data.sender_in_context is first_named
+    line = [{"type": "input_text", "text": '[Message sender: "bob@example.com"]'}]
+    expected = [*line, *typed] if first_named else typed
+    forwarded = [
+        call[1]["content"] for call in runner.post_json_calls if call[0].endswith("/events")
+    ]
+    assert forwarded == [expected, expected]

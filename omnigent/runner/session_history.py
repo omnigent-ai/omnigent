@@ -18,6 +18,7 @@ from omnigent.runner.app_support import (
     _SpecEntry,
 )
 from omnigent.runner.native import _unwrap_resolved_spec
+from omnigent.runtime.message_sender import replayed_content
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -233,11 +234,12 @@ def build_session_history(
             ):
                 _skipped_types.append(str(item_type))
             if item_type == "message":
+                content = replayed_content(item) if "content" in item else []
                 result.append(
                     {
                         "type": "message",
                         "role": item.get("role", "user"),
-                        "content": item.get("content", []),
+                        "content": content,
                         "id": item.get("id"),
                     }
                 )

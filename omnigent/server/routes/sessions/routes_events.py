@@ -59,6 +59,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.inner.codex_goal_command import goal_objective_from_content
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
@@ -121,6 +122,7 @@ from omnigent.server.failed_status_diagnostics import (
     bound_runner_connection,
     failed_status_intake_attributes,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -1068,6 +1070,45 @@ def _legacy_side_chat_attachment(
         if text:
             texts.append(text)
     return len(texts) == 1 and side_chat_question_from_text(texts[0]) is not None
+
+
+def _harness_runs_input(
+    content: list[dict[str, Any]], harness: str | None, *, native_terminal: bool
+) -> bool:
+    """
+    Whether a session's harness acts on message *content* itself instead of prompting.
+
+    :param content: Message content blocks as posted.
+    :param harness: The session's resolved harness, e.g. ``"codex-native"`` or
+        ``"claude-sdk"``, or ``None`` when unknown.
+    :param native_terminal: Whether a native terminal drives the session's turns.
+    :returns: ``True`` for a standalone Codex ``/goal``, a Claude SDK ``/compact``,
+        or input a native terminal runs without prompting the model.
+    """
+    # Until routing picks a harness, any executor could get the message.
+    unresolved = harness in (None, "auto")
+    if (unresolved or harness in ("codex", "codex-native")) and goal_objective_from_content(
+        content
+    ) is not None:
+        return True
+    if not native_terminal:
+        # The Claude SDK executor compacts on a message that is exactly ``/compact``.
+        return (
+            (unresolved or harness == "claude-sdk")
+            and len(content) == 1
+            and isinstance(content[0], dict)
+            and content[0].get("type") in {"text", "input_text"}
+            and content[0].get("text") == "/compact"
+        )
+    if harness == "codex-native":
+        # Codex takes every other message as model input except a lone ``!command``.
+        return shell_command_from_input(content) is not None
+    if harness == "claude-native":
+        from omnigent.harnesses.claude_native.bridge import runs_as_terminal_command
+
+        return runs_as_terminal_command(content)
+    # Other terminals run their own ``/`` commands.
+    return pending_inputs.is_native_command(content, claude_commands=False)
 
 
 def register_events_routes(
@@ -4163,6 +4204,31 @@ def register_events_routes(
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
             return {"queued": True, "item_id": item_id}
+        # Name a collaborator to the agent. The owner's messages, and commands a
+        # native terminal runs itself, go as typed.
+        content = body.data.get("content")
+        message_sender = (
+            created_by
+            if created_by is not None
+            and getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
+                Feature.MESSAGE_SENDER_CONTEXT
+            )
+            and body.type == "message"
+            and body.data.get("role", "user") == "user"
+            and isinstance(content, list)
+            and bool(content)
+            and not _harness_runs_input(
+                content, native_harness, native_terminal=_is_native_terminal_session(conv)
+            )
+            and not await asyncio.to_thread(
+                _is_session_owner,
+                created_by,
+                conv,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            )
+            else None
+        )
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,
@@ -4174,6 +4240,7 @@ def register_events_routes(
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
             created_by=created_by,
+            message_sender=message_sender,
             native_shell_authorized=native_shell_authorized,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,

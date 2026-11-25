@@ -110,6 +110,7 @@ from omnigent.native.native_terminal import post_initial_prompt, request_with_42
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.runtime.message_sender import replayed_content
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -2797,7 +2798,7 @@ def _codex_message_payload_from_session_item(item: _JsonObject) -> _JsonObject |
         api_type = "output_text"
     else:
         return None
-    content = _codex_content_blocks_from_api_content(item.get("content"), api_type=api_type)
+    content = _codex_content_blocks_from_api_content(replayed_content(item), api_type=api_type)
     if not content:
         return None
     return {"type": "message", "role": role, "content": content}

@@ -8543,6 +8543,7 @@ def _build_new_item(
     created_by: str | None = None,
     *,
     adopt_stable_id: bool = False,
+    sender_in_context: bool = False,
 ) -> NewConversationItem:
     """
     Construct a :class:`NewConversationItem` from a POSTed event.
@@ -8571,6 +8572,8 @@ def _build_new_item(
         client-minted ``stable_id`` it carries (see
         :func:`_web_send_stable_id`). Off by default so seeded and
         replayed items keep store-assigned ids.
+    :param sender_in_context: The model receives this user message prefixed
+        with *created_by*; only the server decides this, never the client.
     :returns: A :class:`NewConversationItem` ready for delivery
         or persistence.
     :raises OmnigentError: When ``body.data`` does not satisfy the
@@ -8583,6 +8586,10 @@ def _build_new_item(
             f"invalid data for {body.type!r} item: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if isinstance(data, MessageData):
+        data = data.model_copy(
+            update={"sender_in_context": sender_in_context and data.role == "user"}
+        )
     if isinstance(data, MessageData) and data.role == "user" and not data.is_meta:
         data = data.model_copy(update={"user_authored": True})
     return NewConversationItem(
@@ -8641,8 +8648,12 @@ def _stable_id_reuse_is_exact_retry(
             f"stable_id {item.stable_id!r} already names another author's item in this session",
             code=ErrorCode.CONFLICT,
         )
-    persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
-    request_payload = item.data.model_dump(mode="json", by_alias=True)
+    # The server decides sender_in_context per delivery, so a retry may differ there.
+    server_derived = {"sender_in_context"}
+    persisted_payload = persisted.data.model_dump(
+        mode="json", by_alias=True, exclude=server_derived
+    )
+    request_payload = item.data.model_dump(mode="json", by_alias=True, exclude=server_derived)
     return persisted.type == item.type and persisted_payload == request_payload
 
 

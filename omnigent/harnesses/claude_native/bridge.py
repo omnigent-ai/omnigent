@@ -10749,6 +10749,38 @@ def _escape_unsupported_slash_command(content: str) -> str:
     return _escape_slash_command_text(content)
 
 
+def runs_as_terminal_command(content: list[dict[str, Any]]) -> bool:
+    """
+    Return whether Claude Code runs a web message itself instead of prompting.
+
+    Allowed commands and skills run, as do ``!`` shell input and bare exit words.
+    A built-in escaped by :func:`_escape_unsupported_slash_command` (``/help``) and
+    any message with attachments, whose reference lines lead the prompt, reach
+    the model as ordinary prompts.
+
+    :param content: Message content blocks as posted, e.g.
+        ``[{"type": "input_text", "text": "/compact"}]``.
+    :returns: Whether Claude Code handles the message without prompting.
+    """
+    from omnigent.runtime import pending_inputs
+
+    if any(
+        isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+        for block in content
+    ):
+        return False
+    text = "\n\n".join(
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "input_text"
+        and isinstance(block.get("text"), str)
+    )
+    if _first_slash_command_name(text) is not None:
+        return _escape_unsupported_slash_command(text) == text
+    return pending_inputs.is_native_command(content, claude_commands=True)
+
+
 def is_auth_slash_command(content: str) -> bool:
     """
     Return whether *content* is Claude Code's ``/login`` or ``/logout``.
