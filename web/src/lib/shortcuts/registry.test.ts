@@ -12,6 +12,7 @@ import {
   shortcutBinding,
   shortcutKeys,
   type ShortcutEnvironment,
+  type ShortcutId,
   type ShortcutPageContext,
   shortcutRowKeys,
 } from "./registry";
@@ -90,6 +91,17 @@ describe("shortcut registry", () => {
     ]);
     for (const binding of SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
     expect(shortcutBinding("settings.open").label).toBe("Open Settings");
+  });
+
+  it("draws each alternative and part on a binding's own row", () => {
+    const ids = new Set<string>(SHORTCUT_BINDINGS.map((binding) => binding.id));
+    for (const binding of SHORTCUT_BINDINGS) {
+      const row = binding.alternateOf ?? binding.partOf;
+      if (row === undefined) continue;
+      expect(ids.has(row), binding.id).toBe(true);
+      const target = shortcutBinding(row as ShortcutId);
+      expect(target.alternateOf ?? target.partOf, binding.id).toBeUndefined();
+    }
   });
 
   it("starts a new session with ⌘⇧O in a browser and ⌘N in a native shell", () => {

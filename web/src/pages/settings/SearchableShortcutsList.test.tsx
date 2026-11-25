@@ -10,7 +10,7 @@ import { useNavigate } from "@/lib/routing";
 import { SearchableShortcutsList } from "./SearchableShortcutsList";
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ sibling_sessions: false, features: {} }),
+  useServerInfo: () => ({ sibling_sessions: false, features: { quick_pick_palette: true } }),
 }));
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridge>()),
