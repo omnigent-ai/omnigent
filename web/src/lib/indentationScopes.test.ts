@@ -106,11 +106,22 @@ describe("IndentationScopes", () => {
     const body = Array.from({ length: 50_000 }, (_, index) => `    statement${index};`);
     const doc = docOf(["module {", "  section {", ...body, "  }", "}"]);
     const scopes = filledScopes(doc, 4);
+    // Count each line's indentation or parent the answers read.
+    let reads = 0;
+    const internals = scopes as unknown as Record<"indents" | "parents", number[]>;
+    for (const field of ["indents", "parents"] as const) {
+      const counted = new Proxy(internals[field], {
+        get(target, key, receiver) {
+          if (typeof key === "string" && /^\d+$/.test(key)) reads += 1;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      Object.defineProperty(scopes, field, { value: counted });
+    }
     expect(scopes.enclosing(40_000)).toEqual([1, 2]);
-    const started = performance.now();
-    for (let line = 40_000; line < 41_000; line += 1) scopes.enclosing(line);
-    // Each answer is two parent links once the lines above are known.
-    expect(performance.now() - started).toBeLessThan(50);
+    for (let line = 40_001; line < 41_000; line += 1) scopes.enclosing(line);
+    // Each answer is the line's own indentation and its two parent links, then the root.
+    expect(reads).toBeLessThanOrEqual(1_000 * 4);
   });
 });
 

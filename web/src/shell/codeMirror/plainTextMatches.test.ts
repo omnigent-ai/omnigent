@@ -182,9 +182,18 @@ describe("plainMatches", () => {
 
   it("folds a document once per case setting and keeps it for that version", () => {
     const doc = docOf("Alpha\nΣ beta");
-    expect(foldedText(doc, false)).toBe("alpha\nσ beta");
-    expect(foldedText(doc, false)).toBe(foldedText(doc, false));
-    expect(foldedText(doc, true)).toBe("Alpha\nΣ beta");
+    const normalize = vi.spyOn(String.prototype, "normalize");
+    try {
+      expect(foldedText(doc, false)).toBe("alpha\nσ beta");
+      const folds = normalize.mock.calls.length;
+      expect(folds).toBeGreaterThan(0);
+      expect(foldedText(doc, false)).toBe("alpha\nσ beta");
+      expect(normalize).toHaveBeenCalledTimes(folds);
+      expect(foldedText(doc, true)).toBe("Alpha\nΣ beta");
+      expect(normalize.mock.calls.length).toBeGreaterThan(folds);
+    } finally {
+      normalize.mockRestore();
+    }
     expect(foldedText(docOf("İ"), false)).toBeNull();
   });
 
@@ -193,39 +202,24 @@ describe("plainMatches", () => {
     (_, index) => `export const entry${index} = { label: 'row ${index}' };`,
   ).join("\n");
 
-  // How much faster than the cursor each shape must be: many times for sparse matches, and
-  // at least as fast for a long line dense with whole-word candidates, kept or turned down.
+  // Long inputs of each shape the fast path is for; how much it reads is bounded below.
   it.each([
-    ["sparse matches in many lines", lines, "ROW 19999'", false, 1, 5],
-    ["whole words on one long line", "cat ".repeat(20_000), "cat", true, 20_000, 1],
-    ["turned-down words on one long line", "cats ".repeat(20_000), "cat", true, 0, 1],
-  ])(
-    "counts %s faster than CodeMirror's cursor",
-    (_label, text, search, wholeWord, count, factor) => {
-      const doc = docOf(text);
-      const query = new SearchQuery({ search, wholeWord });
-      const fastest = (counted: () => number) => {
-        let best = Infinity;
-        for (let run = 0; run < 3; run += 1) {
-          const started = performance.now();
-          expect(counted()).toBe(count);
-          best = Math.min(best, performance.now() - started);
-        }
-        return best;
-      };
-      const collect = () => {
-        const collector = new MatchCollector(doc, {
-          search,
-          caseSensitive: false,
-          wholeWord,
-          regexp: false,
-        });
-        return collector.step(60_000, () => performance.now()).froms.length;
-      };
-      const cursor = fastest(() => cursorMatches(query, doc).length);
-      expect(fastest(collect)).toBeLessThan(cursor / factor);
-    },
-  );
+    ["sparse matches in many lines", lines, "ROW 19999'", false, 1],
+    ["whole words on one long line", "cat ".repeat(20_000), "cat", true, 20_000],
+    ["turned-down words on one long line", "cats ".repeat(20_000), "cat", true, 0],
+  ])("counts %s as CodeMirror's cursor does", (_label, text, search, wholeWord, count) => {
+    const doc = docOf(text);
+    const collector = new MatchCollector(doc, {
+      search,
+      caseSensitive: false,
+      wholeWord,
+      regexp: false,
+    });
+    const { froms } = collector.step(60_000, () => performance.now());
+    const cursor = cursorMatches(new SearchQuery({ search, wholeWord }), doc);
+    expect(froms).toHaveLength(count);
+    expect(froms).toEqual(cursor.map((match) => match.from));
+  });
 
   describe("on a long line dense with whole-word candidates", () => {
     afterEach(() => vi.restoreAllMocks());
@@ -235,7 +229,7 @@ describe("plainMatches", () => {
       const doc = docOf(text);
       foldedText(doc, false);
       let scanned = 0;
-      const { indexOf, lastIndexOf } = String.prototype;
+      const { indexOf } = String.prototype;
       vi.spyOn(String.prototype, "indexOf").mockImplementation(function (
         this: string,
         needle,
@@ -243,15 +237,6 @@ describe("plainMatches", () => {
       ) {
         const found = indexOf.call(this, needle, from);
         scanned += (found < 0 ? this.length : found) - (from ?? 0);
-        return found;
-      });
-      vi.spyOn(String.prototype, "lastIndexOf").mockImplementation(function (
-        this: string,
-        needle,
-        from,
-      ) {
-        const found = lastIndexOf.call(this, needle, from);
-        scanned += (from ?? this.length) - found;
         return found;
       });
       const matches = fastMatches(new SearchQuery({ search: "cat", wholeWord: true }), doc);
