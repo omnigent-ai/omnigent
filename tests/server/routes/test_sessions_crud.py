@@ -27,6 +27,7 @@ from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.spec.types import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -245,6 +246,88 @@ async def test_list_sessions_pagination(
     assert resp.status_code == 200
     body = resp.json()
     assert len(body["data"]) == 1
+
+
+_SIDEBAR_LIST_PARAMS = {"order": "desc", "sort_by": "updated_at", "visibility": "mine"}
+
+
+def _seed_sessions_behind_side_chats(
+    db_uri: str, *, visible_count: int, side_chat_count: int, labels: dict[str, str] | None = None
+) -> set[str]:
+    """Create visible sessions, then newer side chats; return the visible ids."""
+    agent_id = generate_agent_id()
+    SqlAlchemyAgentStore(db_uri).create(
+        agent_id, name="side-chat-agent", bundle_location="test:///bundle"
+    )
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    visible = {
+        conv_store.create_conversation(agent_id=agent_id, labels=labels).id
+        for _ in range(visible_count)
+    }
+    for _ in range(side_chat_count):
+        conv_store.create_conversation(
+            agent_id=agent_id, labels={**(labels or {}), SIDE_CHAT_LABEL_KEY: "1"}
+        )
+    return visible
+
+
+@pytest.mark.parametrize(
+    ("project", "limit", "visible_count", "side_chat_count"),
+    [
+        pytest.param(None, 30, 14, 17, id="sidebar"),
+        pytest.param("X", 20, 2, 20, id="project-folder"),
+    ],
+)
+async def test_list_sessions_side_chats_do_not_take_page_slots(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    project: str | None,
+    limit: int,
+    visible_count: int,
+    side_chat_count: int,
+) -> None:
+    """Newer hidden side chats leave a full page of visible sessions and accurate has_more."""
+    visible = _seed_sessions_behind_side_chats(
+        db_uri,
+        visible_count=visible_count,
+        side_chat_count=side_chat_count,
+        labels={"omni_project": project} if project else None,
+    )
+    params: dict[str, str | int] = {**_SIDEBAR_LIST_PARAMS, "limit": limit}
+    if project:
+        params["project"] = project
+
+    resp = await client.get("/v1/sessions", params=params)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert {row["id"] for row in body["data"]} == visible
+    assert body["has_more"] is False
+
+
+async def test_list_sessions_side_chat_refill_is_bounded(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Side chats beyond the refill budget give a short page that resumes from last_id."""
+    from omnigent.server.routes.sessions import routes_core
+
+    monkeypatch.setattr(routes_core, "_SIDE_CHAT_PAGE_REFILLS", 1)
+    visible = _seed_sessions_behind_side_chats(db_uri, visible_count=2, side_chat_count=6)
+
+    # Two reads of two rows each cover only four of the six side chats.
+    first = await client.get("/v1/sessions", params={**_SIDEBAR_LIST_PARAMS, "limit": 2})
+    assert first.status_code == 200, first.text
+    assert first.json()["data"] == []
+    assert first.json()["has_more"] is True
+
+    second = await client.get(
+        "/v1/sessions",
+        params={**_SIDEBAR_LIST_PARAMS, "limit": 2, "after": first.json()["last_id"]},
+    )
+    assert second.status_code == 200, second.text
+    assert {row["id"] for row in second.json()["data"]} == visible
+    assert second.json()["has_more"] is False
 
 
 # ── GET /v1/sessions/{id} (get snapshot) ────────────────────────────
