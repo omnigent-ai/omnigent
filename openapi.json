@@ -12507,6 +12507,53 @@
         "title": "SessionHeartbeatEvent",
         "type": "object"
       },
+      "SessionHostUpdate": {
+        "description": "Whether the viewer should update the computer hosting a session.",
+        "properties": {
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
+          "host_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Version"
+          },
+          "install_spec": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Install Spec"
+          },
+          "needed": {
+            "title": "Needed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "needed"
+        ],
+        "title": "SessionHostUpdate",
+        "type": "object"
+      },
       "SessionInputConsumedEvent": {
         "description": "A queued input item was materialized into conversation history.\n\nEmitted by `POST /v1/sessions/{id}/events` once per accepted\ninput item at the moment it is persisted into conversation\nhistory (either onto a steered active turn or as the seed item\nof a freshly-started one). Wire shape uses the NESTED envelope:\n`{\"type\": \"session.input.consumed\", \"data\": <SessionInputConsumedPayload>, \"sequence_number\": null}`.\n\nThe event name is **provisional** \u2014 it may be renamed in a\nfuture revision. Consumers should reference\n`SessionInputConsumedEvent` (or its `type` literal)\nrather than hardcoding the wire string.",
         "properties": {
@@ -30167,6 +30214,46 @@
         "tags": [
           "sessions"
         ]
+      }
+    },
+    "/v1/sessions/{session_id}/host-update": {
+      "get": {
+        "description": "Whether the viewer should update the computer hosting this session.\n\n`needed` is true only for the owner of the session's live host when\nthat host doesn't relay the project board tools and the session hasn't\nwritten to its board as itself in the last week. Any reader may ask.",
+        "operationId": "session_host_update_v1_sessions__session_id__host_update_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionHostUpdate"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Host Update"
       }
     },
     "/v1/sessions/{session_id}/items": {

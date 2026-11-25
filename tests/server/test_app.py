@@ -27,6 +27,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as server_app
+from omnigent.server.app import DEFAULT_HOST_INSTALL_SPEC
 from omnigent.server.proactive_agent import PROACTIVE_AGENT_NAME
 from omnigent.server.seeded_agents import SEEDED_AGENTS_ENV
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -454,7 +455,7 @@ async def test_health_reports_host_version_from_live_registry(
         "host_online": True,
         "host_version": "9.9.9-test",
         "host_project_tools": False,
-        "host_install_spec": "omnigent",
+        "host_install_spec": DEFAULT_HOST_INSTALL_SPEC,
     }
 
 
@@ -500,6 +501,48 @@ async def test_health_reports_whether_the_host_relays_project_tools(
         single = (await c.get(f"/health?session_id={current.id}")).json()["session"]
     assert single["host_project_tools"] is False
     assert single["host_install_spec"] == "git+https://git.example.com/omnigent.git@build"
+
+
+@pytest.mark.asyncio
+async def test_host_update_names_the_install_spec_only_when_needed(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """``/v1/sessions/{id}/host-update`` asks for an update only for a host without the tools."""
+    from omnigent.host.frames import CAP_PROJECT_TOOLS, HostHelloFrame
+
+    wired = _build_liveness_app(db_uri, tmp_path)
+    registry = wired.app.state.host_registry
+    conv = wired.conversation_store.create_conversation(
+        runner_id="rnr_a", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
+    )
+    transport = httpx.ASGITransport(app=wired.app)
+
+    def connect(capabilities: list[str]) -> None:
+        registry.register(
+            "2fd786c75c03cfbbec099a6820c08b62",
+            _StubWebSocket(),
+            HostHelloFrame(
+                version="0.24.0.dev0",
+                frame_protocol_version=1,
+                name="laptop",
+                capabilities=capabilities,
+            ),
+            None,
+        )
+
+    connect([])
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        old = (await c.get(f"/v1/sessions/{conv.id}/host-update")).json()
+    assert old == {
+        "needed": True,
+        "host_id": "2fd786c75c03cfbbec099a6820c08b62",
+        "host_version": "0.24.0.dev0",
+        "install_spec": DEFAULT_HOST_INSTALL_SPEC,
+    }
+    connect([CAP_PROJECT_TOOLS])
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        new = (await c.get(f"/v1/sessions/{conv.id}/host-update")).json()
+    assert new["needed"] is False and new["install_spec"] is None
 
 
 @pytest.mark.asyncio

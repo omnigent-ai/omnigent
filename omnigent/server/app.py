@@ -92,6 +92,7 @@ from omnigent.server import (
     workflows,
 )
 from omnigent.server.auth import (
+    LEVEL_READ,
     RESERVED_USER_LOCAL,
     AdminViewMiddleware,
     AuthProvider,
@@ -238,6 +239,16 @@ class _HostOfflineHold:
     outcome: str
     mid_turn_sessions: frozenset[str]
     session_owners: dict[str, tuple[object, int, str | None, str | None]]
+
+
+class SessionHostUpdate(BaseModel):
+    """Whether the viewer should update the computer hosting a session."""
+
+    needed: bool
+    host_id: str | None = None
+    host_version: str | None = None
+    #: What to ``uv tool install`` on that computer; set only when ``needed``.
+    install_spec: str | None = None
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -503,9 +514,14 @@ def _server_version() -> str:
 HOST_INSTALL_SPEC_ENV = "OMNIGENT_HOST_INSTALL_SPEC"
 
 
+#: The build with the project board tools, until they ship in a release; go back
+#: to plain "omnigent" once they do.
+DEFAULT_HOST_INSTALL_SPEC = "omnigent[databricks] @ git+https://github.com/omnigent-ai/omnigent.git@feat/project-ticket-board"
+
+
 def host_install_spec() -> str:
     """What ``uv tool install`` should install on a host to match this server."""
-    return os.environ.get(HOST_INSTALL_SPEC_ENV, "").strip() or "omnigent"
+    return os.environ.get(HOST_INSTALL_SPEC_ENV, "").strip() or DEFAULT_HOST_INSTALL_SPEC
 
 
 def _register_web_mimetypes() -> None:
@@ -3952,6 +3968,40 @@ def create_app(
                 for sid in batch_ids
             }
         return result
+
+    host_update_writes = None
+    if ticket_store is not None:
+        from omnigent.server.host_update import AttributedBoardWrites
+
+        host_update_writes = AttributedBoardWrites(project_store.storage_location)
+
+    @app.get("/v1/sessions/{session_id}/host-update", response_model=SessionHostUpdate)
+    async def session_host_update(request: Request, session_id: str) -> dict[str, Any]:
+        """Whether the viewer should update the computer hosting this session.
+
+        ``needed`` is true only for the owner of the session's live host when
+        that host doesn't relay the project board tools and the session hasn't
+        written to its board as itself in the last week. Any reader may ask.
+        """
+        from omnigent.server.host_update import host_update
+        from omnigent.server.routes._auth_helpers import require_access, require_user
+
+        user_id = require_user(request, auth_provider)
+        await require_access(user_id, session_id, LEVEL_READ, permission_store, conversation_store)
+
+        def resolve() -> dict[str, Any]:
+            conversation = conversation_store.get_conversation(session_id)
+            host_id = getattr(conversation, "host_id", None)
+            connection = host_registry.get(host_id) if host_id else None
+            found = host_update(conversation, connection, user_id, host_update_writes)
+            return {
+                "needed": found.needed,
+                "host_id": found.host_id,
+                "host_version": found.host_version,
+                "install_spec": host_install_spec() if found.needed else None,
+            }
+
+        return await asyncio.to_thread(resolve)
 
     @app.get("/api/version")
     async def version() -> dict[str, str]:
