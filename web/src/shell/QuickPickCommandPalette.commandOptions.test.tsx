@@ -13,6 +13,7 @@ import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands
 
 import { CommandContextProvider } from "./commandContext";
 import { OPTION_GONE_STATUS } from "./commandOptionsPage";
+import { openPaletteChildPage, rememberPaletteParent } from "./commandPaletteChildPage";
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 
 vi.mock("@/lib/routing", () => ({
@@ -191,5 +192,18 @@ describe("a command's options in ⌘K", () => {
     expect(document.querySelector('[role="option"][aria-selected="true"]')).toHaveTextContent(
       "Move Tab…",
     );
+  });
+
+  it("lists no other page's rows on a page kind nothing builds yet, and Back leaves it", async () => {
+    renderPalette();
+    await openMoveTab();
+    act(() => {
+      rememberPaletteParent({ query: "Move Tab", activeId: null });
+      openPaletteChildPage({ kind: "pick-session", command: "archive" });
+    });
+    expect(screen.queryAllByRole("option")).toEqual([]);
+    press("Escape");
+    await waitFor(() => expect(input()).toHaveValue("Move Tab"));
+    expect(screen.getByRole("option", { name: /Move Tab…/ })).toBeTruthy();
   });
 });

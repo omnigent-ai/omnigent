@@ -30,6 +30,7 @@ import {
 } from "./commandContext";
 import { useCommandOptionsPage } from "./commandOptionsPage";
 import {
+  leavePaletteChildPage,
   type PaletteParentPlace,
   paletteChildPageStore,
   resetPaletteToRoot,
@@ -214,8 +215,17 @@ export function QuickPickCommandPalette({
       : [];
 
   const { visibleSessions, contentSessions, searching } = search;
-  const activePage =
-    childPage?.kind === "setting-choices" ? settingPage : childPage ? optionsPage : null;
+  // Picked by kind, so a page kind nothing builds yet lists no rows instead of another page's.
+  const activePage = (() => {
+    switch (childPage?.kind) {
+      case "setting-choices":
+        return settingPage;
+      case "command-options":
+        return optionsPage;
+      default:
+        return null;
+    }
+  })();
   const pageItems = activePage?.items ?? null;
   const rootSegments: QuickPickSegment<PaletteRow>[] = [
     {
@@ -275,9 +285,12 @@ export function QuickPickCommandPalette({
             .map((item) => ({ ...item, matchHighlight: "underline" })),
     },
   ];
-  const segments: QuickPickSegment<PaletteRow>[] = pageItems
-    ? [{ sourceId: "page", ranking: "client", fuzzyMatching: "words", items: pageItems }]
-    : rootSegments;
+  // A page kind nothing builds yet lists nothing, rather than the root's rows.
+  const unbuiltPage = childPage !== null && activePage === null;
+  const segments: QuickPickSegment<PaletteRow>[] =
+    pageItems || unbuiltPage
+      ? [{ sourceId: "page", ranking: "client", fuzzyMatching: "words", items: pageItems ?? [] }]
+      : rootSegments;
 
   const accept = (item: QuickPickItem<PaletteRow>): QuickPickAcceptResult | QuickPickHandOff => {
     const row = item.value;
@@ -393,7 +406,7 @@ export function QuickPickCommandPalette({
     : optionsPage.open
       ? optionsPage.status
       : settingPage.notice;
-  const back = () => restoreParent(settingPage.open ? settingPage.back() : optionsPage.back());
+  const back = () => restoreParent(activePage ? activePage.back() : leavePaletteChildPage());
   const pageHeading = settingPage.heading ?? optionsPage.heading;
 
   return (
