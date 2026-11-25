@@ -1317,16 +1317,17 @@ describe("folder listings past one page", () => {
     expect(listingCutOff(await listFolder("conv_whole"))).toBe(false);
   });
 
-  it("trims a last page that overshoots the limit", async () => {
+  it("trims a last page that overshoots the limit, and marks the listing cut off", async () => {
     let calls = 0;
     const listing = await readListingPages(async () => {
       calls++;
-      // Pages bigger than the endpoint's own, from a server that ignores `limit`.
+      // Pages bigger than the endpoint's own, from a server that ignores `limit`: 51,000
+      // entries in all, the last page saying it's the end.
       const names = Array.from({ length: 3000 }, (_, i) => `d${calls}_${i}`);
       return {
         object: "list",
         data: names.map(entry),
-        has_more: true,
+        has_more: calls * 3000 < 51_000,
         last_id: `experimental/${names.at(-1)}`,
       };
     });
