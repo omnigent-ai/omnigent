@@ -1,4 +1,8 @@
-import { useLoadedConversations } from "@/hooks/useSidebarData";
+import {
+  useLoadedConversation,
+  useLoadedConversations,
+  useLoadedConversationsSelector,
+} from "@/hooks/useSidebarData";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { PaneLoading } from "@/components/PageLoading";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
@@ -796,39 +800,19 @@ function AppShellImpl() {
 
   const debugMode = useDebugMode();
   // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
-  const { data: conversationsData, isLoading: conversationsLoading } = useLoadedConversations();
+  // Only the rows the shell shows: reading the whole list re-rendered the shell on
+  // every row update, e.g. each background session's turn start and end.
+  const conversationsLoaded = useLoadedConversationsSelector((loaded) => loaded.rows !== undefined);
+  const conversationsLoading = useLoadedConversationsSelector((loaded) => loaded.isLoading);
   const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
-  // Mirror muted projects into the store that notifications and rows read.
-  useSyncMutedProjects();
-  // Surface sessions needing attention as OS notifications + a dock badge.
-  // Mounted here (inside the Router) so it can navigate on click and knows
-  // the active conversation id, which suppresses the notification/badge for
-  // the session the user is actively viewing.
-  useIdleNotifications(conversationId);
-  // Seed the per-user read-state (unread/seen) mirror from the conversation
-  // list, so the sidebar dots reflect what the user did on any device.
-  // `undefined` while the query is still loading (vs `[]` for a loaded-but-
-  // empty list) so the seed — and the `hydrated` gate it flips — waits for
-  // the real read-state, not the transient empty list on a deep-link/reload.
-  const allConversations = useMemo(
-    () => conversationsData?.pages.flatMap((p) => p.data),
-    [conversationsData],
-  );
-  useSeedReadState(allConversations);
-  const activeConv = useMemo(() => {
-    if (!serverConversationId) return null;
-    return allConversations?.find((c) => c.id === serverConversationId) ?? null;
-  }, [serverConversationId, allConversations]);
+  const activeConv = useLoadedConversation(serverConversationId) ?? null;
   // What ⌘K commands act on. The level is only authoritative once this route's snapshot loads.
   const commandSession = useCommandSession(serverConversationId, activeConv);
   const commandView = commandViewForPath(location.pathname, rebasePath);
   // A temporary row is display-only: it can supply optimistic breadcrumb
   // text, but must not participate in permissions, actions, or server hooks.
-  const provisionalConv = useMemo(() => {
-    if (!conversationId || !isTempConvId(conversationId)) return null;
-    const row = allConversations?.find((c) => c.id === conversationId);
-    return row?.provisional === true ? row : null;
-  }, [conversationId, allConversations]);
+  const temporaryRow = useLoadedConversation(isTempConvId(conversationId) ? conversationId : null);
+  const provisionalConv = temporaryRow?.provisional === true ? temporaryRow : null;
   // Single-conversation snapshot (shared cache with chatStore.bindStream).
   // For sub-agent (child) sessions the sidebar list omits the row, so this
   // is the only path through which the UI learns the user's permission
@@ -877,7 +861,7 @@ function AppShellImpl() {
     sessionLoading,
     activeConv,
     conversationId,
-    conversationsData !== undefined,
+    conversationsLoaded,
   );
   // Labels can come from the sidebar row (``activeConv``) for top-level
   // sessions OR the per-session snapshot (``activeSession``) for ALL
@@ -923,14 +907,8 @@ function AppShellImpl() {
   // the fork dialog into its no-directory mode. The parent's sidebar row backs
   // the child's missing values so promoting a child offers the same host +
   // directory choices as forking any other session.
-  const parentConv = useMemo(
-    () => allConversations?.find((c) => c.id === activeSession?.parentSessionId) ?? null,
-    [allConversations, activeSession?.parentSessionId],
-  );
-  const forkHostConv = useMemo(
-    () => allConversations?.find((c) => c.id === forkHostSessionId) ?? null,
-    [allConversations, forkHostSessionId],
-  );
+  const parentConv = useLoadedConversation(activeSession?.parentSessionId) ?? null;
+  const forkHostConv = useLoadedConversation(forkHostSessionId) ?? null;
   // ── Header breadcrumb ─────────────────────────────────────────────────
   // The chat header shows the conversation's title, prefixed by a folder icon
   // when the session is filed under a project, and with the sub-agent identity
@@ -3356,6 +3334,7 @@ function AppShellImpl() {
       }}
       fileViewer={fileViewerContextValue}
     >
+      <AppShellListObservers conversationId={conversationId} />
       {/* Covers the page until the user chooses to stay in the browser. */}
       {handedOverConversation && <DesktopAppHandoffPage conversationId={handedOverConversation} />}
       {/* One for the whole window, so a grid of sidebars runs each request once. */}
@@ -3978,7 +3957,6 @@ function AppShellImpl() {
             toggleRightPanel={toggleRightPanel}
             goToSession={handleGoToSession}
             gridRoute={gridRoute}
-            allConversations={allConversations}
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
           />
@@ -3986,6 +3964,32 @@ function AppShellImpl() {
       </TerminalFirstContextProvider>
     </AppShellRootProviders>
   );
+}
+
+/**
+ * The shell's effects that need every loaded row. A child, so a row update
+ * re-renders it instead of the whole shell.
+ */
+function AppShellListObservers({ conversationId }: { conversationId: string | undefined }) {
+  const { data: conversationsData } = useLoadedConversations();
+  // Mirror muted projects into the store that notifications and rows read.
+  useSyncMutedProjects();
+  // Surface sessions needing attention as OS notifications + a dock badge.
+  // Mounted here (inside the Router) so it can navigate on click and knows
+  // the active conversation id, which suppresses the notification/badge for
+  // the session the user is actively viewing.
+  useIdleNotifications(conversationId);
+  // Seed the per-user read-state (unread/seen) mirror from the conversation
+  // list, so the sidebar dots reflect what the user did on any device.
+  // `undefined` while the query is still loading (vs `[]` for a loaded-but-
+  // empty list) so the seed — and the `hydrated` gate it flips — waits for
+  // the real read-state, not the transient empty list on a deep-link/reload.
+  const allConversations = useMemo(
+    () => conversationsData?.pages.flatMap((p) => p.data),
+    [conversationsData],
+  );
+  useSeedReadState(allConversations);
+  return null;
 }
 
 /**

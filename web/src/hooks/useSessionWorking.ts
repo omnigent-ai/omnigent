@@ -1,5 +1,5 @@
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
-import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
+import { useLoadedConversation } from "@/hooks/useSidebarData";
 
 /**
  * Activity for task progress, including the sidebar's child/background rollup and,
@@ -14,10 +14,8 @@ export function useSessionWorking(sessionId: string | null, fallbackWorking = fa
       (state.backgroundTaskCount ?? 0) > 0 ||
       (state.sandboxStatus !== null && state.sandboxStatus.stage !== "failed"),
   );
-  const loaded = useOptionalLoadedConversations();
-  const row = loaded?.pages
-    .flatMap((page) => page.data)
-    .find((conversation) => conversation.id === sessionId);
+  // Only this session's row, so other sessions' turn edges skip the caller.
+  const row = useLoadedConversation(sessionId);
   // Live list updates arrive between run-list refreshes. An older snapshot
   // must not keep work spinning after the sidebar settles.
   const listedWorking = row

@@ -2,7 +2,7 @@ import { useMemo } from "react";
 
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { type Conversation, useSessionSearch } from "@/hooks/useConversations";
-import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
+import { useLoadedConversationsSelector } from "@/hooks/useSidebarData";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
   type MentionState,
@@ -17,7 +17,7 @@ export const MENTION_SEARCH_DEBOUNCE_MS = 300;
 const NO_SUBAGENTS: readonly ChildSessionInfo[] = [];
 
 function topLevelSessions(
-  rows: Conversation[] | undefined,
+  rows: readonly Conversation[] | undefined,
   currentSessionId: string | null,
 ): SessionMention[] {
   return (rows ?? [])
@@ -55,8 +55,11 @@ export function useSessionMentionEntries({
   subagents?: readonly ChildSessionInfo[];
 }): SessionMention[] {
   // Optional: surfaces rendered outside the app shell (stories, embeds) have no
-  // sidebar data, and then the menu lists subagents and search hits only.
-  const loadedSessions = useOptionalLoadedConversations();
+  // sidebar data, and then the menu lists subagents and search hits only. Read
+  // only while the menu is open, so other sessions' row updates skip the composer.
+  const loadedSessions = useLoadedConversationsSelector((loaded) =>
+    mention ? loaded.rows : undefined,
+  );
   const search = useSessionSearch(debouncedQuery, "title", {
     enabled: mention != null && !debouncedQuery.includes("/"),
     includeArchived: false,
@@ -69,10 +72,7 @@ export function useSessionMentionEntries({
         title: childPrimaryLabel(child),
         isSubagent: true,
       })),
-      ...topLevelSessions(
-        loadedSessions?.pages.flatMap((page) => page.data),
-        currentSessionId,
-      ),
+      ...topLevelSessions(loadedSessions, currentSessionId),
       ...topLevelSessions(
         search.data?.pages.flatMap((page) => page.data),
         currentSessionId,

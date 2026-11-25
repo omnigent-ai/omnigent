@@ -69,6 +69,9 @@ vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
     pages: [{ data: sessions.loaded }],
     pageParams: [undefined],
   }),
+  useLoadedConversationsSelector: (
+    select: Parameters<typeof UseSidebarDataModule.useLoadedConversationsSelector>[0],
+  ) => select({ rows: sessions.loaded as UseConversationsModule.Conversation[], isLoading: false }),
 }));
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),

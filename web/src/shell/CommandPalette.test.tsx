@@ -37,6 +37,13 @@ let sidebarSessions: { pages: { data: unknown[] }[] } | undefined;
 vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
   ...(await importOriginal<typeof SidebarDataModule>()),
   useOptionalLoadedConversations: () => sidebarSessions,
+  useLoadedConversationsSelector: (
+    select: Parameters<typeof SidebarDataModule.useLoadedConversationsSelector>[0],
+  ) =>
+    select({
+      rows: sidebarSessions?.pages.flatMap((page) => page.data) as Conversation[] | undefined,
+      isLoading: false,
+    }),
 }));
 
 function conv(

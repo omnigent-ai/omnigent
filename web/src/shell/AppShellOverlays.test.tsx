@@ -52,7 +52,6 @@ async function renderOverlays(
     toggleRightPanel: vi.fn(),
     goToSession: vi.fn(),
     gridRoute: false,
-    allConversations: undefined,
     serverConversationId: undefined,
     updateOverlayHeight: 0,
   };

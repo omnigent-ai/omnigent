@@ -6,7 +6,7 @@ import {
   useEditSentMessage,
   type SentMessage,
 } from "@/components/chat/editSentMessage";
-import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useLoadedConversation, useLoadedConversationsSelector } from "@/hooks/useSidebarData";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
@@ -466,19 +466,15 @@ export function ChatPage() {
     error: agentsError,
     refetch: refetchAgents,
   } = useAgents({ enabled: !urlConvId });
-  const { data: conversationsData } = useLoadedConversations();
-  const conversations = useMemo(
-    () => conversationsData?.pages.flatMap((p) => p.data),
-    [conversationsData],
-  );
+  // Only this session's row: reading the whole list re-renders the chat on every
+  // other session's update.
+  const conversationsLoaded = useLoadedConversationsSelector((loaded) => loaded.rows !== undefined);
 
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
   // (every 4 s) so messages arriving while viewing are marked seen.
-  useMarkConversationSeen(
-    sessionConvId,
-    conversations?.find((c) => c.id === sessionConvId)?.updated_at,
-  );
+  const sessionRow = useLoadedConversation(sessionConvId);
+  useMarkConversationSeen(sessionConvId, sessionRow?.updated_at);
 
   // Sync the store's active conversation to the URL. Single source of
   // truth: URL is what's "current"; store mirrors it. The effect is
@@ -676,7 +672,7 @@ export function ChatPage() {
   const subAgentLabel = subAgentComposerLabel(activeSession);
 
   // Hoisted above the early-return guards so the title-update effect can read them.
-  const activeConv = sessionConvId ? conversations?.find((c) => c.id === sessionConvId) : null;
+  const activeConv = sessionConvId ? sessionRow : null;
 
   // Keep the parent's Stop action live while its turn waits on an elicitation.
   // Child activity and display suppression belong to `showsWorking` below.
@@ -896,14 +892,14 @@ export function ChatPage() {
     sessionLoading,
     activeConv,
     urlConvId,
-    conversationsData !== undefined,
+    conversationsLoaded,
   );
   const permissionPending = isPermissionLevelPending(
     activeSession,
     sessionLoading,
     activeConv,
     urlConvId,
-    conversationsData !== undefined,
+    conversationsLoaded,
   );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
   const reconnectHostOnline = useSessionHostOnline(urlConvId ?? undefined);

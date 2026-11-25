@@ -7,6 +7,7 @@ import {
   useLayoutEffect,
   useMemo,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -365,6 +366,38 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
 
 export const SidebarDataContext = createContext<ReturnType<typeof useSidebarSources> | null>(null);
 
+/** The loaded rows (`undefined` until the first list loads) behind `useLoadedConversations`. */
+export interface LoadedRowsSnapshot {
+  rows: readonly Conversation[] | undefined;
+  isLoading: boolean;
+}
+
+interface LoadedRowsStore {
+  get: () => LoadedRowsSnapshot;
+  subscribe: (listener: () => void) => () => void;
+  publish: (next: LoadedRowsSnapshot) => void;
+}
+
+function createLoadedRowsStore(initial: LoadedRowsSnapshot): LoadedRowsStore {
+  let snapshot = initial;
+  const listeners = new Set<() => void>();
+  return {
+    get: () => snapshot,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    publish: (next) => {
+      if (next.rows === snapshot.rows && next.isLoading === snapshot.isLoading) return;
+      snapshot = next;
+      for (const listener of listeners) listener();
+    },
+  };
+}
+
+const NO_LOADED_ROWS = createLoadedRowsStore({ rows: undefined, isLoading: false });
+const LoadedRowsStoreContext = createContext<LoadedRowsStore>(NO_LOADED_ROWS);
+
 export function SidebarDataProvider({
   children,
   config = sidebarConfig,
@@ -375,17 +408,23 @@ export function SidebarDataProvider({
   identityReady?: boolean;
 }) {
   const data = useSidebarSources(config, identityReady);
+  const rows = data.loadedData === undefined ? undefined : data.loadedRows;
+  const isLoading = data.loadedData === undefined && data.all.isLoading;
+  const [rowsStore] = useState(() => createLoadedRowsStore({ rows, isLoading }));
+  useLayoutEffect(() => rowsStore.publish({ rows, isLoading }), [rowsStore, rows, isLoading]);
   return (
     <SidebarConfigContext.Provider value={config}>
-      <SidebarDataContext.Provider value={data}>
-        <PinCapacityContext.Provider
-          value={
-            (data.pinned.data?.conversations.filter(isPinOrderUnit).length ?? 0) >= config.pinCap
-          }
-        >
-          {children}
-        </PinCapacityContext.Provider>
-      </SidebarDataContext.Provider>
+      <LoadedRowsStoreContext.Provider value={rowsStore}>
+        <SidebarDataContext.Provider value={data}>
+          <PinCapacityContext.Provider
+            value={
+              (data.pinned.data?.conversations.filter(isPinOrderUnit).length ?? 0) >= config.pinCap
+            }
+          >
+            {children}
+          </PinCapacityContext.Provider>
+        </SidebarDataContext.Provider>
+      </LoadedRowsStoreContext.Provider>
     </SidebarConfigContext.Provider>
   );
 }
@@ -415,6 +454,23 @@ export function useSidebarData() {
 export function useLoadedConversations() {
   const { loadedData: data, serverLoadedRows: serverRows, all } = useSidebarData();
   return { data, serverRows, isLoading: data === undefined && all.isLoading };
+}
+
+/**
+ * Select from the loaded rows, re-rendering only when the selected value changes.
+ * Reading the whole list re-renders on every row update, e.g. any session's turn
+ * start or end. Without a SidebarDataProvider the rows are ``undefined``.
+ */
+export function useLoadedConversationsSelector<T>(select: (snapshot: LoadedRowsSnapshot) => T): T {
+  const store = useContext(LoadedRowsStoreContext);
+  return useSyncExternalStore(store.subscribe, () => select(store.get()));
+}
+
+/** One loaded row by id; re-renders only when that row changes. */
+export function useLoadedConversation(id: string | null | undefined): Conversation | undefined {
+  return useLoadedConversationsSelector((snapshot) =>
+    id ? snapshot.rows?.find((row) => row.id === id) : undefined,
+  );
 }
 
 /** Loaded rows when a SidebarDataProvider is mounted, else ``undefined``. */

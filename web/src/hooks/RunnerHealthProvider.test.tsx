@@ -207,6 +207,44 @@ describe("useSessionHostOnline (host tunnel, tri-state)", () => {
   });
 });
 
+describe("RunnerHealthProvider map identity", () => {
+  it("keeps the runner and host maps when rows change but no liveness does", () => {
+    const maps: Map<string, boolean>[] = [];
+    function MapProbe() {
+      maps.push(useRunnerHealthRegistration(NO_SESSIONS));
+      return null;
+    }
+    const rows = (status: string, runnerOnline = true) => ({
+      data: {
+        pages: [
+          { data: [{ id: "conv_a", status, runner_online: runnerOnline, host_online: true }] },
+        ],
+      },
+    });
+    useConvMock.mockReturnValue(rows("idle") as unknown as ReturnType<typeof useConversations>);
+    const view = renderInProvider(<MapProbe />);
+    const rerender = () =>
+      view.rerender(
+        <MemoryRouter initialEntries={["/"]}>
+          <RunnerHealthProvider>
+            <MapProbe />
+          </RunnerHealthProvider>
+        </MemoryRouter>,
+      );
+    // A turn edge changes the row but not its liveness: same map.
+    useConvMock.mockReturnValue(rows("running") as unknown as ReturnType<typeof useConversations>);
+    rerender();
+    expect(maps.at(-1)).toBe(maps[0]);
+    // A liveness change still publishes a new map.
+    useConvMock.mockReturnValue(
+      rows("running", false) as unknown as ReturnType<typeof useConversations>,
+    );
+    rerender();
+    expect(maps.at(-1)).not.toBe(maps[0]);
+    expect(maps.at(-1)?.get("conv_a")).toBe(false);
+  });
+});
+
 describe("RunnerHealthProvider deduplication", () => {
   it("invokes the underlying hooks once regardless of consumer count", () => {
     // The point of hoisting into a provider — a regression here means
