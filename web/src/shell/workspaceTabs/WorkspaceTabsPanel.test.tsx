@@ -23,6 +23,7 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type { PullRequest, PullRequestAssociation } from "@/hooks/usePullRequests";
 import type * as PanesViewGateModule from "../panesViewGate";
 import { resetPaneSplitsCache, updatePaneSplit } from "../paneSplitStore";
+import { useFileFinderStore } from "@/store/fileFinder";
 import type { TerminalGroup } from "@/lib/terminalGroups";
 import {
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
@@ -438,6 +439,23 @@ describe("the strip's Collapse right panel button", () => {
     expect(collapse().querySelector(".lucide-x")).not.toBeNull();
     expect(collapse().querySelector(".lucide-panel-right-close")).toBeNull();
     expect(collapse().className).toContain("@max-[240px]/rail:hidden");
+  });
+});
+
+describe("the New tab's Search text", () => {
+  afterEach(() => {
+    useFileFinderStore.setState({ availableSessionId: null, textSearchAvailable: false });
+  });
+
+  it("shows only where the session's files can be searched for text, not just found", async () => {
+    useFileFinderStore.setState({ availableSessionId: "s-files", textSearchAvailable: false });
+    renderPanels([{ conversationId: "s-files" }]);
+    act(() => void openWorkspaceNewTab("s-files"));
+    await screen.findByTestId("workspace-new-tab-page");
+    expect(screen.queryByRole("option", { name: /^Search text/ })).toBeNull();
+
+    act(() => useFileFinderStore.setState({ textSearchAvailable: true }));
+    expect(await screen.findByRole("option", { name: /^Search text/ })).toBeInTheDocument();
   });
 });
 
