@@ -58,7 +58,6 @@ def _as_one_account(action: _Action) -> _Action:
 _REVIEW_MUTATION = """mutation($input: AddPullRequestReviewInput!) {
   addPullRequestReview(input: $input) { pullRequestReview { id state } }
 }"""
-# The state GitHub reports for a submitted review, by its event.
 _SUBMITTED_STATES = {"COMMENT": "COMMENTED", **VERDICT_STATES}
 
 
