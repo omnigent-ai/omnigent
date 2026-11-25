@@ -27,7 +27,9 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ReadBaseFileRequest,
     ResolveWorkingCopyBaseRequest,
 )
+from omnigent.host.workspace_git import runner
 from omnigent.host.workspace_git.repository_folder import repository_folder
+from omnigent.host.workspace_git.runner import OUTSIDE_ANY_REPOSITORY
 from omnigent.host.workspace_service import WorkspaceService
 from omnigent.workspace_fs import WorkspaceReader
 from tests.host.test_workspace_git_runner import _git, _repository
@@ -188,7 +190,7 @@ async def test_a_folder_outside_any_repository_is_accepted_without_one(tmp_path:
     folder = await repository_folder(WorkspaceReader(workspace), "docs")
 
     assert folder.path == workspace / "docs"
-    assert folder.repository is None
+    assert folder.repository is OUTSIDE_ANY_REPOSITORY
 
 
 def _client(workspace: Path) -> WorkspaceServiceClient:
@@ -296,14 +298,23 @@ async def test_a_nested_repository_and_a_plain_folder_are_compared(tmp_path: Pat
 
 
 async def test_a_plain_folder_outside_any_repository_answers_not_a_repository(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Without Git, a confined folder is still answered with the comparison's own reason."""
+    """It fails closed: the check's answer stands, and no repository is looked up again."""
     workspace = tmp_path / "plain"
     (workspace / "docs").mkdir(parents=True)
+    looked_in: list[Path] = []
+    discover = runner.GitRepository.discover
+
+    async def counting(working_directory: Path, deadline: runner.Deadline) -> Any:
+        looked_in.append(working_directory)
+        return await discover(working_directory, deadline)
+
+    monkeypatch.setattr(runner.GitRepository, "discover", counting)
 
     changes = await _client(workspace).list_working_copy_changes(
         ListWorkingCopyChangesRequest(repository="docs")
     )
 
     assert changes.base.unavailable.problem == COMPARISON_PROBLEM_NOT_A_REPOSITORY
+    assert looked_in == [(workspace / "docs").resolve()]

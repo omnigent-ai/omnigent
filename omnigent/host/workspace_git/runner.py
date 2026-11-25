@@ -768,3 +768,26 @@ class GitRepository:
             stdout_sink=stdout_sink,
             literal_pathspecs=subcommand not in _MAGIC_PATHSPEC_SUBCOMMANDS,
         )
+
+
+@dataclass(frozen=True)
+class OutsideAnyRepository:
+    """A checked folder that lies outside any repository: no repository is looked up again."""
+
+
+OUTSIDE_ANY_REPOSITORY = OutsideAnyRepository()
+# What a folder check found: the repository, none at all, or ``None`` when nothing was checked.
+CheckedRepository = GitRepository | OutsideAnyRepository | None
+
+
+async def checked_or_discovered(
+    root: Path, deadline: Deadline, checked: CheckedRepository
+) -> GitRepository | None:
+    """The repository a folder check found at ``root``, else the one discovered there.
+
+    A folder the check found outside any repository stays outside one, so a repository
+    created there after the check isn't picked up.
+    """
+    if isinstance(checked, OutsideAnyRepository):
+        return None
+    return checked or await GitRepository.discover(root, deadline)

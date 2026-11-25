@@ -70,10 +70,12 @@ from omnigent.entities.environment_filesystem import InvalidPath
 from omnigent.host.workspace_git.files import is_inside
 from omnigent.host.workspace_git.runner import (
     LISTING_OUTPUT_BYTES,
+    CheckedRepository,
     Deadline,
     GitError,
     GitProblem,
     GitRepository,
+    checked_or_discovered,
     failure,
     is_object_name,
 )
@@ -376,7 +378,7 @@ async def resolve_comparison(
     root: Path,
     comparison: Comparison,
     deadline: Deadline,
-    checked: GitRepository | None = None,
+    checked: CheckedRepository = None,
 ) -> tuple[GitRepository, ComparisonBase]:
     """The repository of ``root`` and the base a comparison request names.
 
@@ -384,7 +386,7 @@ async def resolve_comparison(
     :raises ComparisonUnavailableError: NOT_A_REPOSITORY outside a repository, or any
         problem the base resolution reports.
     """
-    repository = checked or await GitRepository.discover(root, deadline)
+    repository = await checked_or_discovered(root, deadline, checked)
     if repository is None:
         raise ComparisonUnavailableError(COMPARISON_PROBLEM_NOT_A_REPOSITORY)
     if comparison.kind == COMPARISON_KIND_REVISIONS:
@@ -819,7 +821,7 @@ async def _blob_size_at(
 
 
 async def resolve_working_copy_base(
-    root: Path, request: ResolveWorkingCopyBaseRequest, checked: GitRepository | None = None
+    root: Path, request: ResolveWorkingCopyBaseRequest, checked: CheckedRepository = None
 ) -> ResolveWorkingCopyBaseResponse:
     """The base a working-copy comparison compares with, or why there is none.
 
@@ -836,7 +838,7 @@ async def resolve_working_copy_base(
 
 
 async def list_working_copy_changes(
-    root: Path, request: ListWorkingCopyChangesRequest, checked: GitRepository | None = None
+    root: Path, request: ListWorkingCopyChangesRequest, checked: CheckedRepository = None
 ) -> ListWorkingCopyChangesResponse:
     """The changes against the requested base, beneath ``root``.
 
@@ -866,7 +868,7 @@ async def list_working_copy_changes(
 
 
 async def read_base_file(
-    root: Path, request: ReadBaseFileRequest, checked: GitRepository | None = None
+    root: Path, request: ReadBaseFileRequest, checked: CheckedRepository = None
 ) -> AsyncGenerator[ReadBaseFileResponse]:
     """Stream one file's content at a commit, when its entry there is the blob requested.
 
@@ -883,7 +885,7 @@ async def read_base_file(
     content_type = guess_content_type(relative) or ""
     deadline = Deadline(READ_DEADLINE_S)
     try:
-        repository = checked or await GitRepository.discover(root, deadline)
+        repository = await checked_or_discovered(root, deadline, checked)
         if repository is None:
             raise ConnectError(Code.FAILED_PRECONDITION, "The workspace isn't in a Git repository")
         size = await _blob_size_at(repository, request, relative, deadline)

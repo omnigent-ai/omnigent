@@ -15,7 +15,13 @@ from pathlib import Path
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 
-from omnigent.host.workspace_git.runner import Deadline, GitError, GitRepository
+from omnigent.host.workspace_git.runner import (
+    OUTSIDE_ANY_REPOSITORY,
+    CheckedRepository,
+    Deadline,
+    GitError,
+    GitRepository,
+)
 from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
 # Two rev-parse calls at most; seconds means something is wrong.
@@ -28,12 +34,13 @@ class RepositoryFolder:
 
     :param path: The workspace root, or the resolved directory inside it.
     :param repository: The repository the checks passed for, which the Git calls reuse
-        rather than looking it up again; ``None`` for the workspace root, or a folder
-        outside any repository, which the calls discover as before.
+        rather than looking it up again; ``OUTSIDE_ANY_REPOSITORY`` for a folder outside
+        any, which they answer as not a repository; ``None`` for the workspace root, which
+        they discover as before.
     """
 
     path: Path
-    repository: GitRepository | None = None
+    repository: CheckedRepository = None
 
 
 def _refuse(repository: str, reason: str) -> ConnectError:
@@ -70,9 +77,11 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
     deadline = Deadline(_CHECK_DEADLINE_S)
     try:
         found = await GitRepository.discover(folder, deadline)
-        if found is None or folder == workspace:
-            # Outside any repository, the comparison itself answers NOT_A_REPOSITORY.
+        if folder == workspace:
             return RepositoryFolder(folder)
+        if found is None:
+            # Fails closed: the comparison answers NOT_A_REPOSITORY without looking again.
+            return RepositoryFolder(folder, OUTSIDE_ANY_REPOSITORY)
         common = found.common_directory.resolve()
         top_level = found.top_level.resolve()
         stored_inside = _is_within(common, workspace)
