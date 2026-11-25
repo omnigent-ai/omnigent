@@ -469,6 +469,9 @@ export function InboxPage() {
     visibleAutomations.length +
     unreadSuggestions.length +
     unloadedUnreadSuggestions;
+  // Tabs stay switchable while a click is still marking, but Awaiting response
+  // lists only approvals, so it never offers the action.
+  const showMarkAllRead = filter !== "awaiting" && (markAllReadCount > 0 || markingAll);
   const markSuggestionsRead = async () => {
     const targets = new Set(unreadSuggestions.map((item) => item.id));
     let listingFailed = false;
@@ -1171,7 +1174,7 @@ export function InboxPage() {
             <span className="sr-only">{summary}</span>
           </span>
         )}
-        {(markAllReadCount > 0 || markingAll) && (
+        {showMarkAllRead && (
           <Button
             variant="outline"
             size="xs"

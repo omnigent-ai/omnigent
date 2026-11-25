@@ -2342,4 +2342,29 @@ describe("InboxPage mark all as read", () => {
     selectTab("Awaiting response");
     expect(screen.queryByRole("button", { name: "Mark all as read" })).toBeNull();
   });
+
+  it("stays off Awaiting response while an earlier click is still marking", async () => {
+    // WHY: tabs stay switchable mid-run, and the pending run must not carry the button over.
+    let settle: (accepted: boolean) => void = () => {};
+    const update = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          settle = resolve;
+        }),
+    );
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({ items: [suggestionItem({})], unreadCount: 1, update }),
+    );
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+    expect(update).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Mark all as read" })).toBeDisabled();
+    selectTab("Awaiting response");
+    expect(screen.queryByRole("button", { name: "Mark all as read" })).toBeNull();
+
+    await act(async () => settle(true));
+    selectTab("All");
+    expect(screen.getByRole("button", { name: "Mark all as read" })).toBeEnabled();
+  });
 });
