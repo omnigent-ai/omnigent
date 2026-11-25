@@ -3688,7 +3688,9 @@ async def _persist_external_conversation_item_unlocked(
                 # The echo carries the sender line typed for the agent; store what was typed.
                 typed = {"content": drained.content, "sender_in_context": True}
                 item = item.model_copy(update={"data": item.data.model_copy(update=typed)})
-            item = _merge_pending_file_blocks(item, drained.content)
+            if match_method != pending_inputs.AMBIGUOUS_MATCH:
+                # A tie cannot show which entry's files the mirror's message carried.
+                item = _merge_pending_file_blocks(item, drained.content)
             # A text match preserves the sender recorded at POST time. FIFO
             # settlement alone does not establish authorship of the mirror.
             if drained.created_by is not None and item.created_by is None and proven:
@@ -8377,11 +8379,6 @@ async def _forward_event_to_runner(
 
     # Run controls wait for routing and a fresh guard before entering replayable history.
     persisted_items = await persist_input() if body.workflow_run_id is None else None
-    stored = persisted_items[0] if persisted_items else None
-    if stored is not None and stored.deduplicated and isinstance(stored.data, MessageData):
-        # A retry is delivered the way its first send was, whatever the feature says now.
-        sender_in_context = stored.data.sender_in_context
-        message_sender = stored.created_by if sender_in_context else None
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -8398,8 +8395,6 @@ async def _forward_event_to_runner(
     # harness don't have access to the server's file store — the
     # LLM endpoint needs the actual content, not an internal ID.
     forwarded_data = dict(body.data)
-    if sender_in_context and isinstance(forwarded_data.get("content"), list):
-        forwarded_data["content"] = with_message_sender(forwarded_data["content"], message_sender)
     if (
         file_store is not None
         and artifact_store is not None
@@ -8815,6 +8810,14 @@ async def _forward_event_to_runner(
         persisted_items = await persist_input()
     # A cold runner replaces this stored, unresolved input with the resolved body by ID.
     runner_body["persisted_item_id"] = persisted_items[0].id
+    stored = persisted_items[0]
+    # Deliver as stored, so a retry keeps its first send's naming whatever the feature says now.
+    if (
+        isinstance(stored.data, MessageData)
+        and stored.data.sender_in_context
+        and isinstance(runner_body.get("content"), list)
+    ):
+        runner_body["content"] = with_message_sender(runner_body["content"], stored.created_by)
 
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
@@ -9362,7 +9365,8 @@ async def _dispatch_session_event_to_runner_impl(
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
-        # the child thread echo, staying the single writer).
+        # the child thread echo, staying the single writer). It goes unnamed: with
+        # no queued entry, the echo could not drop a sender line again.
         side_result = await _forward_codex_side_chat_turn(conv, body, runner_client)
         if side_result is not None:
             return side_result

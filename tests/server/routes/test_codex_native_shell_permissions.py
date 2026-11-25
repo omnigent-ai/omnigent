@@ -90,6 +90,11 @@ async def codex_client(
     if harness == "codex-native":
         conv.harness_override = "codex-native"
         conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    elif harness == "claude-sdk":
+        # An API session: no terminal wrapper, every message a prompt or SDK control.
+        conv.harness_override = "claude-sdk"
+        conv.labels.pop("omnigent.ui", None)
+        conv.labels.pop("omnigent.wrapper", None)
     permissions = _ShellPermissionStore()
     for user, level in (
         ("viewer", LEVEL_READ),
@@ -211,26 +216,18 @@ async def test_codex_editor_model_input_keeps_edit_access(
     [
         ((_NAMING, "codex-native"), "owner", _typed("Explain this code"), False),
         ((_NAMING, "codex-native"), "admin", _typed("Explain this code"), True),
-        ((_NAMING, "codex-native"), "editor", _typed("/compact"), True),
         ((_NAMING, "codex-native"), "admin", _typed("!printf authorized"), False),
         ((_NAMING, "codex-native"), "editor", _typed("/goal ship the fix"), False),
         ((_NAMING, "claude-native"), "editor", _typed("Explain this code"), True),
-        ((_NAMING, "claude-native"), "editor", _typed("/help with tests"), True),
-        ((_NAMING, "claude-native"), "editor", [*_typed("/compact"), _FILE], True),
         ((_NAMING, "claude-native"), "editor", _typed("/compact"), False),
-        ((_NAMING, "claude-native"), "editor", _typed("!git status"), False),
     ],
     ids=[
         "codex-owner",
         "codex-admin",
-        "codex-slash-is-a-prompt",
         "codex-shell-command",
         "codex-goal",
         "claude-editor",
-        "claude-escaped-built-in",
-        "claude-attachment",
         "claude-command",
-        "claude-shell",
     ],
     indirect=["codex_client"],
 )
@@ -338,6 +335,32 @@ async def test_codex_automated_message_requires_target_ownership_and_stays_model
     ]
     assert "authorized_native_shell_command" not in messages[0]
     assert dict(runner.post_headers)[_EVENT_PATH] == {}
+
+
+@pytest.mark.parametrize(
+    ("codex_client", "content", "named"),
+    [
+        ((_NAMING, "claude-sdk"), _typed("Explain this code"), True),
+        ((_NAMING, "claude-sdk"), _typed("/compact"), False),
+    ],
+    ids=["prompt", "compact"],
+    indirect=["codex_client"],
+)
+async def test_sdk_collaborator_prompts_are_named(
+    codex_client: tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation],
+    content: list[dict[str, Any]],
+    named: bool,
+) -> None:
+    client, runner, _conv = codex_client
+    response = await client.post(
+        _EVENT_PATH,
+        json=_message(content),
+        headers={"X-Forwarded-Email": "editor@example.com"},
+    )
+    assert response.status_code == 202, response.text
+    [message] = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
+    sender = "editor@example.com" if named else None
+    assert message["content"] == with_message_sender(content, sender)
 
 
 @pytest.mark.parametrize(

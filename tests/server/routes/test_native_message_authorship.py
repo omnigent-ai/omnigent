@@ -153,7 +153,7 @@ async def test_native_echo_is_stored_as_typed(
 async def test_tied_echo_keeps_its_text_and_proves_no_author(
     db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After a collaborator's echo is lost, typed look-alike text is not taken for theirs."""
+    """After a collaborator's echo is lost, typed look-alike text keeps its own text and files."""
     line = '[Message sender: "bob@example.com"]'
     typed = [_text(f"{line}\nsame")]
     transcript = tmp_path / "session.jsonl"
@@ -168,7 +168,10 @@ async def test_tied_echo_keeps_its_text_and_proves_no_author(
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Review")
     pending_inputs.record(
-        conv.id, [_text("same")], created_by="bob@example.com", named_sender="bob@example.com"
+        conv.id,
+        [_IMAGE, _text("same")],
+        created_by="bob@example.com",
+        named_sender="bob@example.com",
     )
     pending_inputs.record(conv.id, typed, created_by="alice@example.com")
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())

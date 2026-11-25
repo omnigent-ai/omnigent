@@ -12143,14 +12143,26 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
         assert response.json()["error"]["code"] == "runner_unavailable"
 
 
+@pytest.mark.parametrize("workflow_run_id", [None, "a" * 32], ids=["chat", "workflow"])
 @pytest.mark.parametrize("first_named", [True, False], ids=["named-then-off", "off-then-named"])
 @pytest.mark.asyncio
 async def test_stable_id_retry_keeps_its_first_delivery(
-    db_uri: str, runner_globals_reset: None, first_named: bool
+    db_uri: str,
+    runner_globals_reset: None,
+    monkeypatch: pytest.MonkeyPatch,
+    first_named: bool,
+    workflow_run_id: str | None,
 ) -> None:
     """A collaborator's send names them only to the runner; a retry is delivered as first sent."""
     from omnigent.server.routes._sessions.orchestration import _forward_event_to_runner
 
+    async def current_run(*_args: object) -> None:
+        return None
+
+    # The run-currency guard has its own tests; here every run is current.
+    monkeypatch.setattr(
+        "omnigent.server.session_journal.require_current_workflow_run", current_run
+    )
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Review")
     runner = _FakeRunnerClient(payload={})
@@ -12164,6 +12176,7 @@ async def test_stable_id_retry_keeps_its_first_delivery(
             "stable_id": "0" * 31 + "1",
             "sender_in_context": True,
         },
+        workflow_run_id=workflow_run_id,
     )
 
     item_ids = [
