@@ -135,6 +135,7 @@ from omnigent.runtime.policies.builder import (
     load_session_usage_and_tree,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.project_instructions_notice import strip_instructions_update_content
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.scheduled_context import scheduled_run_scope
 from omnigent.server import session_live_state, shutdown_state
@@ -3498,6 +3499,14 @@ async def _persist_external_conversation_item_unlocked(
     if is_peer_wake_marker and isinstance(item.data, MessageData):
         # The wire marker is hidden so older servers also preserve pending uploads.
         item = item.model_copy(update={"data": item.data.model_copy(update={"is_meta": False})})
+    if isinstance(item.data, MessageData) and item.data.role == "user":
+        # The runner carries changed project instructions in a native prompt's text; the
+        # person's message is what follows them, for display and queue matching alike.
+        stripped = strip_instructions_update_content(item.data.content)
+        if stripped is not item.data.content:
+            item = item.model_copy(
+                update={"data": item.data.model_copy(update={"content": stripped})}
+            )
     if item.stable_id is not None and drains_pending_inputs:
         # A forwarder retry of a mirror already persisted under its source-derived
         # id: nothing to drain, persist or publish. Draining again could match a

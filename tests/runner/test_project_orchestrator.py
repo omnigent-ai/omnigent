@@ -311,6 +311,50 @@ async def test_a_running_session_gets_changed_project_text_once_on_its_next_turn
         assert await project_instructions_update(client, "running") is None  # delivered once
 
 
+async def test_a_session_this_runner_never_launched_gets_its_text_once_after_a_restart():
+    from omnigent.runner.project_orchestrator import (
+        PROJECT_INSTRUCTIONS_UPDATED_NOTICE,
+        project_instructions_update,
+    )
+
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=True))
+    snapshot = {"project_id": "project", "project_mandate": "Current rules."}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=snapshot)),
+        base_url="http://server.test",
+    ) as client:
+        # The runner restarted: no record of what this running session was given.
+        update = await project_instructions_update(client, "resumed", spec)
+        assert update is not None and update.startswith(PROJECT_INSTRUCTIONS_UPDATED_NOTICE)
+        assert "Current rules." in update
+        assert await project_instructions_update(client, "resumed", spec) is None
+        snapshot["project_mandate"] = "Newer rules."
+        later = await project_instructions_update(client, "resumed", spec)
+        assert later is not None and "Newer rules." in later
+
+
+async def test_only_native_launch_text_says_updates_may_arrive_in_a_prompt(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    from omnigent.runtime.project_instructions_notice import session_nonce
+    from omnigent.spec.types import ExecutorSpec
+
+    snapshot = {"project_id": "project", "project_mandate": "Rules."}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=snapshot)),
+        base_url="http://server.test",
+    ) as client:
+        native = AgentSpec(
+            spec_version=1,
+            tool_groups=ToolGroupsConfig(projects=True),
+            executor=ExecutorSpec(config={"harness": "codex-native"}),
+        )
+        sdk = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=True))
+        native_text = await append_project_instructions("Author", client, "native", native)
+        sdk_text = await append_project_instructions("Author", client, "sdk", sdk)
+    assert native_text is not None and f'nonce="{session_nonce("native")}"' in native_text
+    assert sdk_text is not None and "nonce=" not in sdk_text
+
+
 async def test_an_unreadable_snapshot_skips_the_update_notice_not_the_turn():
     from omnigent.runner.project_orchestrator import project_instructions_update
 

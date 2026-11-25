@@ -145,3 +145,31 @@ async def test_native_subagent_kickoff_appears_once(
     await _simulate_transcript_forwarder_echo(client, child["id"], KICKOFF)
 
     assert await _kickoff_message_count(client, child["id"], KICKOFF_MARKER) == 1
+
+
+async def test_changed_project_text_in_a_native_prompt_is_not_part_of_the_message(
+    client: httpx.AsyncClient,
+    bound_runner: None,
+) -> None:
+    """The runner's wrapped instructions update leaves the person's text and its queue match."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.project_instructions_notice import with_instructions_update
+
+    agent = await create_test_agent(client, name=CODEX_NATIVE_CODING_AGENT.agent_name)
+    session = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert session.status_code == 201, session.text
+    session_id = session.json()["id"]
+    typed = [{"type": "input_text", "text": "Please review the header."}]
+    pending_id = pending_inputs.record(session_id, typed)
+    [delivered] = with_instructions_update(
+        typed, "Omnigent: instructions changed.\n\nNew rules.", "0123456789abcdef0123456789abcdef"
+    )
+
+    await _simulate_transcript_forwarder_echo(client, session_id, delivered["text"])
+
+    assert pending_id not in {
+        entry.get("pending_id") for entry in pending_inputs.snapshot_for(session_id)
+    }
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    [message] = [item for item in items if item.get("type") == "message"]
+    assert message["content"] == typed

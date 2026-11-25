@@ -224,6 +224,11 @@ from omnigent.runner.subagent_work import (
     wrapper_label_from_labels,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.project_instructions_notice import (
+    neutralize_person_text,
+    session_nonce,
+    with_instructions_update,
+)
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
@@ -8136,12 +8141,30 @@ def create_runner_app(
                         session_id=conversation_id,
                         server_client=server_client,
                     )
-                if _session_harness_name(conversation_id) == "claude-native":
-                    # Claude reads project text only at launch; carry an edit to its next prompt.
+                if (
+                    _is_native_harness(conversation_id)
+                    and message_body.get("role", "user") == "user"
+                ):
+                    # Only Omnigent may send an instructions block: defuse any a person typed.
+                    message_body["content"] = neutralize_person_text(message_body.get("content"))
+                    # Native harnesses read project text only at launch; carry an edit to the
+                    # next prompt. Claude takes it as hidden context, the rest in the prompt.
                     _instructions_update = await project_instructions_update(
-                        server_client, conversation_id
+                        server_client,
+                        conversation_id,
+                        _unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
                     )
                     if _instructions_update:
+                        _logger.info(
+                            "post_session_events: carrying changed project instructions "
+                            "into the next prompt conv=%s harness=%s",
+                            conversation_id,
+                            _session_harness_name(conversation_id),
+                            extra={"session_id": conversation_id},
+                        )
+                    if _instructions_update and (
+                        _session_harness_name(conversation_id) == "claude-native"
+                    ):
                         from omnigent.harnesses.claude_native.bridge import (
                             write_instructions_update,
                         )
@@ -8150,6 +8173,12 @@ def create_runner_app(
                             write_instructions_update,
                             await _claude_prompt_bridge_dir(conversation_id),
                             _instructions_update,
+                        )
+                    elif _instructions_update:
+                        message_body["content"] = with_instructions_update(
+                            message_body.get("content"),
+                            _instructions_update,
+                            session_nonce(conversation_id),
                         )
 
                 if conversation_id in _active_turns:

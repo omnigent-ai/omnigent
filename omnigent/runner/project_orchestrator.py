@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import httpx
 
+from omnigent.harness_aliases import is_native_harness
 from omnigent.runner.side_chat_guard import record_session_snapshot
+from omnigent.runtime.project_instructions_notice import session_nonce, update_channel_note
 from omnigent.runtime.project_ticket_instructions import (
     PROJECT_CONVERSATION_INSTRUCTION,
     PROJECT_TICKET_WORK_INSTRUCTION,
@@ -167,16 +169,25 @@ def _remember_given_text(session_id: str, spec: AgentSpec, text: str | None) -> 
 
 
 async def project_instructions_update(
-    server_client: httpx.AsyncClient | None, session_id: str
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    spec: AgentSpec | None = None,
 ) -> str | None:
     """The current project text as a one-shot notice when it changed since it was last given.
 
     Native harnesses get project text only at launch, so a running session misses later
     edits. Called per forwarded turn; a failed read skips the notice rather than the turn.
+
+    :param spec: The session's spec, for a session given no text by this runner process
+        (it restarted since the launch): its current text is sent once, then recorded.
     """
     known = _GIVEN_PROJECT_TEXT.get(session_id)
-    if known is None or server_client is None:
+    if server_client is None:
         return None
+    if known is None:
+        if spec is None:
+            return None
+        known = (spec, None)
     spec, before = known
     try:
         current = await project_instructions(server_client, session_id, spec)
@@ -229,6 +240,11 @@ async def project_instructions(
     return text
 
 
+def with_update_channel_note(text: str | None, session_id: str) -> str | None:
+    """Launch-time project text plus the note that authorizes later in-prompt updates."""
+    return f"{text}\n\n{update_channel_note(session_nonce(session_id))}" if text else None
+
+
 async def append_project_instructions(
     instructions: str | None,
     server_client: httpx.AsyncClient | None,
@@ -237,4 +253,9 @@ async def append_project_instructions(
 ) -> str | None:
     """Use the shared composer for native startup and per-turn SDK instructions."""
     project = await project_instructions(server_client, session_id, spec)
+    if spec is not None and is_native_harness(
+        spec.executor.config.get("harness") or spec.executor.type
+    ):
+        # Native sessions keep their launch text; later edits arrive in a prompt.
+        project = with_update_channel_note(project, session_id)
     return append_framework_instructions(instructions, (project,) if project else ())
