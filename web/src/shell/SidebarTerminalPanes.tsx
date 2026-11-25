@@ -8,6 +8,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useTerminalPaneHotkeys } from "@/hooks/useTerminalPaneHotkeys";
 import { terminalDisplayLabel, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
 import { TERMINAL_PANE, TERMINAL_SURFACE } from "@/lib/paneSurfaces";
+import { cn } from "@/lib/utils";
 import {
   groupKeys,
   groupOfTerminal,
@@ -59,6 +60,8 @@ export interface SidebarTerminalPanesProps {
   onFocusShell?: (shellKey: string) => void;
   /** The shells of the main view's split where that view shows it; they never mount here. */
   mainSplitMembers?: ReadonlySet<string>;
+  /** Whether the shown panes are floating cards, so the host can drop its own card around them. */
+  onCardsChange?: (carded: boolean) => void;
 }
 
 /** The sidebar's shell groups as it shows them, and the shells the main view owns. */
@@ -94,6 +97,7 @@ export function SidebarTerminalPanes({
   autoFocusKey,
   onFocusShell,
   mainSplitMembers = NO_MAIN_SPLIT_MEMBERS,
+  onCardsChange,
 }: SidebarTerminalPanesProps) {
   const { terminals, listCompleteAt, isFetching } = useTerminals(conversationId);
   const listGeneration = useTerminalListGeneration(conversationId, terminals.length);
@@ -287,6 +291,13 @@ export function SidebarTerminalPanes({
           commands: () => paneCommands(paneKey),
         }
       : undefined;
+  // With floating panes a split's panes are cards on the backdrop, as in the main view; a lone
+  // shell stays flush in the sidebar's card. Told before paint, so the two cards never show together.
+  const carded = floatingPanes && shownPanesOf(split, shownKey).length > 1;
+  const latestCardsChange = useRef(onCardsChange);
+  latestCardsChange.current = onCardsChange;
+  useLayoutEffect(() => latestCardsChange.current?.(carded), [carded]);
+  useLayoutEffect(() => () => latestCardsChange.current?.(false), []);
   const mounted = [...new Set([...(shownKey ? [shownKey] : []), ...mountedKeys])].filter(
     (key) => key === shownKey || !mainOwned.has(key),
   );
@@ -295,7 +306,14 @@ export function SidebarTerminalPanes({
   return (
     <div
       ref={hostRef}
-      className="flex h-full min-h-0 flex-col"
+      data-pane-cards={carded ? "" : undefined}
+      className={cn(
+        "flex h-full min-h-0 flex-col",
+        // The cards float a small margin from the window's right and bottom edges, as the main
+        // view's split does; their own gap keeps them off the chat's card.
+        carded &&
+          "pr-[calc(var(--pane-gap)-var(--pane-cell-gap))] pb-[calc(var(--pane-gap)-var(--pane-cell-gap))]",
+      )}
       {...{ [TERMINAL_FOCUS_SURFACE_ATTRIBUTE]: terminalFocusSurfaceId(conversationId, "rail") }}
     >
       <SplitPanesLayout
@@ -313,6 +331,7 @@ export function SidebarTerminalPanes({
           )
         }
         panesRef={panesRef}
+        cards={carded}
         // With floating panes a tab dragged over the panes opens in the main view's split only.
         tabDropTarget={!floatingPanes}
         zoomedKey={zoomedKey}

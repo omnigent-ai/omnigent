@@ -116,6 +116,7 @@ function Sidebar({
   mainSplitsShown = true,
   readOnly = false,
   autoFocusKey = null,
+  onCardsChange,
 }: {
   conversationId: string;
   shownKey: string | null;
@@ -123,6 +124,7 @@ function Sidebar({
   mainSplitsShown?: boolean;
   readOnly?: boolean;
   autoFocusKey?: string | null;
+  onCardsChange?: (carded: boolean) => void;
 }) {
   const mainSplitMembers = useMainSplitMembers(conversationId, mainSplitsShown);
   return (
@@ -134,6 +136,7 @@ function Sidebar({
       visible
       autoFocusKey={autoFocusKey}
       mainSplitMembers={mainSplitMembers}
+      onCardsChange={onCardsChange}
     />
   );
 }
@@ -158,6 +161,29 @@ afterEach(() => {
 });
 
 describe("SidebarTerminalPanes", () => {
+  it.each([
+    { name: "a split with floating panes shown", floating: true, split: true, cards: true },
+    { name: "a lone shell with floating panes shown", floating: true, split: false, cards: false },
+    { name: "a split without floating panes shown", floating: false, split: true, cards: false },
+  ])("draws panes as floating cards only for $name", async ({ floating, split, cards }) => {
+    floatingPanes.shown = floating;
+    const id = nextSession();
+    if (split) updateTerminalGroups(id, () => [PAIR]);
+    const onCardsChange = vi.fn();
+    const { container, unmount } = render(
+      <Sidebar conversationId={id} shownKey="terminal:a" onCardsChange={onCardsChange} />,
+    );
+
+    const terminal = await screen.findByTestId("terminal-a");
+    // A split's panes float as rounded cards on the backdrop; a lone shell stays flush.
+    expect(terminal.closest(".rounded-lg") !== null).toBe(cards);
+    expect(container.querySelector("[data-pane-cards]") !== null).toBe(cards);
+    // The host hears it, so it drops its own card around them, and hears the end on unmount.
+    expect(onCardsChange).toHaveBeenLastCalledWith(cards);
+    unmount();
+    expect(onCardsChange).toHaveBeenLastCalledWith(false);
+  });
+
   it.each([
     { floating: false, target: true },
     { floating: true, target: false },
