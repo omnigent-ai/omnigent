@@ -344,6 +344,21 @@ describe("resolveIdentity base-path login redirect", () => {
 });
 
 describe("authenticatedFetch", () => {
+  it("reports a dropped connection as the server restarting", async () => {
+    const { authenticatedFetch } = await import("./identity");
+    const { SERVER_RESTART_EVENT, SERVER_RESTART_MESSAGE } = await import("./serverRestart");
+    const onRestart = vi.fn();
+    window.addEventListener(SERVER_RESTART_EVENT, onRestart);
+    fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    await expect(authenticatedFetch("/v1/sessions")).rejects.toThrow(SERVER_RESTART_MESSAGE);
+    expect(onRestart).toHaveBeenCalledTimes(1);
+    // Other failures pass through unchanged.
+    fetchMock.mockRejectedValueOnce(new DOMException("Aborted", "AbortError"));
+    await expect(authenticatedFetch("/v1/sessions")).rejects.toThrow("Aborted");
+    expect(onRestart).toHaveBeenCalledTimes(1);
+    window.removeEventListener(SERVER_RESTART_EVENT, onRestart);
+  });
+
   it("injects X-Forwarded-Email header once the identity is resolved", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice" }));
     const { resolveIdentity, authenticatedFetch } = await import("./identity");

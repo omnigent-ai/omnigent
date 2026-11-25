@@ -9,6 +9,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import type { Comment } from "./useComments";
+import { SERVER_RESTART_MESSAGE } from "@/lib/serverRestart";
 
 afterEach(() => {
   clearLocalReviewContexts("session");
@@ -437,7 +438,8 @@ it.each(["unsupported", "create failure", "legacy", "changed anchor", "cleanup f
       expect(result.current.draft.error).toContain("require a newer server");
     } else if (failure === "create failure") {
       expect(fetch).toHaveBeenCalledTimes(1);
-      expect(result.current.draft.error).toContain("Network error");
+      // A dropped connection reads as the server restarting.
+      expect(result.current.draft.error).toContain(SERVER_RESTART_MESSAGE);
     } else {
       expect(fetch).toHaveBeenCalledTimes(2);
       expect(fetch).toHaveBeenLastCalledWith(

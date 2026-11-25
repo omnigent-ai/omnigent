@@ -43,8 +43,15 @@ describe("installAgentBundle", () => {
   });
 
   it("falls back to the status line for a non-JSON failure", async () => {
+    mockFetch.mockResolvedValue(response(undefined, 500, "Internal Server Error"));
+    await expect(installAgentBundle(bundle)).rejects.toThrow("500 Internal Server Error");
+  });
+
+  it("explains a gateway error as a restart", async () => {
     mockFetch.mockResolvedValue(response(undefined, 502, "Bad Gateway"));
-    await expect(installAgentBundle(bundle)).rejects.toThrow("502 Bad Gateway");
+    await expect(installAgentBundle(bundle)).rejects.toThrow(
+      "Omnigent is restarting. Your session will resume shortly. (HTTP 502)",
+    );
   });
 
   it("rejects a success response without an id and name", async () => {

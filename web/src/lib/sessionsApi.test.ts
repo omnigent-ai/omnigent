@@ -123,6 +123,34 @@ describe("parseRetryAfterMs", () => {
 });
 
 describe("apiErrorFromResponse", () => {
+  it("explains a gateway error from a restarting app and keeps the app's own errors", async () => {
+    const errors = await Promise.all(
+      [502, 503, 504].map((status) =>
+        apiErrorFromResponse(
+          new Response("<html>Bad Gateway</html>", { status, statusText: "Bad Gateway" }),
+        ),
+      ),
+    );
+    for (const [index, status] of [502, 503, 504].entries()) {
+      expect(errors[index]!.message).toBe(
+        `Omnigent is restarting. Your session will resume shortly. (HTTP ${status})`,
+      );
+      expect(errors[index]!.code).toBeNull();
+    }
+    // The app answering 503 itself keeps its message and code.
+    const runner = await apiErrorFromResponse(
+      new Response(
+        JSON.stringify({ error: { code: "runner_unavailable", message: "Runner is starting" } }),
+        { status: 503 },
+      ),
+    );
+    expect(runner.message).toBe("Runner is starting");
+    const other = await apiErrorFromResponse(
+      new Response("oops", { status: 500, statusText: "Internal Server Error" }),
+    );
+    expect(other.message).toBe("500 Internal Server Error");
+  });
+
   it("records the response's Retry-After for the retry policy", async () => {
     const throttled = new Response(JSON.stringify({ error: { code: "rate_limited" } }), {
       status: 429,

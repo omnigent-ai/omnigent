@@ -22,6 +22,7 @@ import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitles
 import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
 import { timezoneRequestHeaders } from "./timezones";
 import { parseBackgroundTasks } from "./sse";
+import { isGatewayStatus, notifyServerRestart, serverRestartMessage } from "@/lib/serverRestart";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -504,6 +505,7 @@ export function parseRetryAfterMs(value: string | null, now: number = Date.now()
 export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`.trim();
   let code: string | null = null;
+  let appMessage = false;
   try {
     const body = (await res.json()) as {
       error?: { code?: string; message?: string };
@@ -516,10 +518,16 @@ export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
     if (body.error?.message) message = body.error.message;
     else if (typeof body.detail === "string" && body.detail) message = body.detail;
     else if (typeof body.message === "string" && body.message) message = body.message;
+    appMessage = message !== `${res.status} ${res.statusText}`.trim();
     if (body.error?.code) code = body.error.code;
     else if (typeof body.error_code === "string" && body.error_code) code = body.error_code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
+  }
+  // A gateway error with no message of the app's own means the app is restarting.
+  if (isGatewayStatus(res.status) && !appMessage && code === null) {
+    message = serverRestartMessage(res.status);
+    notifyServerRestart();
   }
   // `headers` is optional on hand-built Response stand-ins.
   const retryAfterMs = parseRetryAfterMs(res.headers?.get("Retry-After") ?? null);

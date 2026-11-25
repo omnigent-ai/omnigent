@@ -25,6 +25,7 @@ import {
   isHostRoutingEnabled,
 } from "./host";
 import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
+import { isNetworkFailure, notifyServerRestart, SERVER_RESTART_MESSAGE } from "@/lib/serverRestart";
 import {
   clearHostKeyless,
   getSessionHost,
@@ -668,15 +669,24 @@ export async function authenticatedFetch(
   // URL change. Without no-store the browser may serve a stale
   // cached response — e.g. one captured before an elicitation was
   // published — causing the ApprovalCard to vanish on navigate-back.
-  let res = await hostFetch(
-    url,
-    {
-      ...init,
-      headers,
-      cache: "no-store",
-    },
-    { unkeyed },
-  );
+  let res: Response;
+  try {
+    res = await hostFetch(
+      url,
+      {
+        ...init,
+        headers,
+        cache: "no-store",
+      },
+      { unkeyed },
+    );
+  } catch (error) {
+    // A dropped connection is most likely the server restarting; say so wherever
+    // the error is shown, and let the restart banner wait for the server.
+    if (!isNetworkFailure(error)) throw error;
+    notifyServerRestart();
+    throw new TypeError(SERVER_RESTART_MESSAGE, { cause: error });
+  }
 
   // Wrong-replica fallback: a keyed request that reached the wrong replica comes
   // back 400 wrong_replica. Re-address ONCE with the key removed so it routes by

@@ -40,6 +40,7 @@ import {
 } from "@/lib/askUserQuestionDrafts";
 import type { CommentInbox } from "@/hooks/useCommentInbox";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { SERVER_RESTART_MESSAGE } from "@/lib/serverRestart";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
@@ -1349,7 +1350,7 @@ describe("InboxPage replies", () => {
     await screen.findByTestId("inbox-unread");
     const item = expandUnread();
     const box = await typeAndSend(item, "Ship it");
-    expect(await within(item).findByRole("alert")).toHaveTextContent("Failed to fetch");
+    expect(await within(item).findByRole("alert")).toHaveTextContent(SERVER_RESTART_MESSAGE);
     fireEvent.click(within(item).getByRole("button", { name: "Send" }));
     expect(await within(item).findByRole("alert")).toHaveTextContent(
       "The runner didn't come online",

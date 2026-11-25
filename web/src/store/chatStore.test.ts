@@ -72,6 +72,7 @@ import {
 import { getCurrentAuthorId, getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { SERVER_RESTART_MESSAGE } from "@/lib/serverRestart";
 import {
   setOmnigentHostConfig,
   type OmnigentAnalyticsEvent,
@@ -7071,7 +7072,7 @@ describe("chatStore — delivered-but-unacked send", () => {
     const stableId = draft?.stableId;
     expect(stableId).toBeTruthy();
     expect(errorCards()).toEqual([
-      expect.objectContaining({ message: "Failed to fetch", unansweredSend: { stableId } }),
+      expect.objectContaining({ message: SERVER_RESTART_MESSAGE, unansweredSend: { stableId } }),
     ]);
 
     handleSessionEvent({
@@ -7123,7 +7124,7 @@ describe("chatStore — delivered-but-unacked send", () => {
     await useChatStore.getState().send("file a single PR", "agent_xyz");
     expect(errorCards()).toEqual([
       expect.objectContaining({
-        message: "Load failed",
+        message: SERVER_RESTART_MESSAGE,
         unansweredSend: { stableId: expect.any(String), text: "file a single PR" },
       }),
     ]);

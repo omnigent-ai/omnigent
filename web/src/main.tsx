@@ -37,6 +37,7 @@ import { initChatStore } from "./store/chatStore";
 import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 import "./index.css";
+import { ServerRestartBanner } from "@/components/ServerRestartBanner";
 
 // Start tracing before any request fires so fetch/XHR are patched in time
 // and a trace begins in the browser. No-op unless a collector endpoint is
@@ -167,6 +168,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
                       <RunnerHealthProvider>
                         <QueueFlushProvider>
                           <App />
+                          <ServerRestartBanner />
                         </QueueFlushProvider>
                       </RunnerHealthProvider>
                     </SessionUpdatesProvider>

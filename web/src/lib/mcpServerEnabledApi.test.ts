@@ -6,7 +6,7 @@ afterEach(() => vi.unstubAllGlobals());
 it.each([
   [{ detail: "Cannot update disabled MCP servers: io" }, "Cannot update disabled MCP servers: io"],
   [{ error: { code: "conflict", message: "host is offline" } }, "host is offline"],
-  [{}, "502 Bad Gateway"],
+  [{}, "Omnigent is restarting. Your session will resume shortly. (HTTP 502)"],
 ])("preserves server error details or the status fallback", async (body, message) => {
   vi.stubGlobal(
     "fetch",

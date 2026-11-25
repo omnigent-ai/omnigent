@@ -1,4 +1,5 @@
 import { ApiError } from "./sessionsApi";
+import { isNetworkFailure, notifyServerRestart, SERVER_RESTART_MESSAGE } from "@/lib/serverRestart";
 
 // Mirrors the server's ErrorCode.RUNNER_UNAVAILABLE (omnigent/errors.py) —
 // the 503 returned by POST /events when a host-bound runner never connects
@@ -26,6 +27,10 @@ export function describeSendFailure(err: unknown): { message: string; code: stri
   }
   if (err instanceof ApiError) {
     return { message: err.message, code: err.code ?? "" };
+  }
+  if (isNetworkFailure(err)) {
+    notifyServerRestart();
+    return { message: SERVER_RESTART_MESSAGE, code: "" };
   }
   return { message: err instanceof Error ? err.message : String(err), code: "" };
 }
