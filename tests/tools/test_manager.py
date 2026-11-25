@@ -1843,7 +1843,7 @@ def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 36
+    assert len(gated) == 38
     assert not (gated & names)
     assert {
         "sys_session_list",
