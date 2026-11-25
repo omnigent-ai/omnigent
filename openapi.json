@@ -28665,7 +28665,7 @@
     },
     "/v1/sessions/{session_id}/workspace/{service}/{method}": {
       "post": {
-        "description": "Serve the workspace API to any client, answered by the session's host.\n\nEach method has its gate (`omnigent.server.workspace_access`): the file\nmethods the file routes' read gate, the pull request reads their REST routes'\ngates, and an unknown method a 404. The API never takes absolute paths.\nSide chats and sub-agents use the host and workspace of the session that\nowns them. Unconfined sessions only, because the host applies no sandbox's\nhidden paths. A host on another replica gets the REST wrong-replica error,\nso the client's fetch re-addresses it; other refusals are Connect errors.",
+        "description": "Serve the workspace API to any client, answered by the session's host.\n\nEach method has its gate (`omnigent.server.workspace_access`): the file\nmethods the file routes' read gate, the pull request reads their REST routes'\ngates, the pull request changes the session owner's, and an unknown method a\n404. A change from an untrusted `Origin` is refused before any other work.\nThe API never takes absolute paths.\nSide chats and sub-agents use the host and workspace of the session that\nowns them. Unconfined sessions only, because the host applies no sandbox's\nhidden paths. A host on another replica gets the REST wrong-replica error,\nso the client's fetch re-addresses it; other refusals are Connect errors.",
         "operationId": "call_workspace_api_v1_sessions__session_id__workspace__service___method__post",
         "parameters": [
           {
