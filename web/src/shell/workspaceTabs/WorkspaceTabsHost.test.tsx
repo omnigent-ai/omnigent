@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type * as SharedDiffWorkersModule from "@/components/diff-review/sharedDiffWorkers";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as HotkeysModule from "@/lib/hotkeys";
 import type { TerminalInfo } from "@/lib/terminals";
@@ -16,6 +17,12 @@ const captured = vi.hoisted(() => ({
   panel: null as ComponentProps<typeof WorkspaceTabsPanel> | null,
   deleteTerminal: vi.fn(async (_id: string) => undefined),
   deleteOptions: undefined as { reportsFailure?: boolean } | undefined,
+  warmDiffWorkers: vi.fn(),
+}));
+// Who asks for the diff highlighting workers to start ahead of a review.
+vi.mock("@/components/diff-review/sharedDiffWorkers", async (importOriginal) => ({
+  ...(await importOriginal<typeof SharedDiffWorkersModule>()),
+  useWarmSharedDiffWorkers: () => captured.warmDiffWorkers(),
 }));
 vi.mock("./WorkspaceTabsPanel", () => ({
   WorkspaceTabsPanel: (props: ComponentProps<typeof WorkspaceTabsPanel>) => {
@@ -85,6 +92,12 @@ afterEach(() => {
 });
 
 describe("WorkspaceTabsHost", () => {
+  it("starts the diff highlighting workers with the sidebar, so Diffs finds them ready", () => {
+    captured.warmDiffWorkers.mockClear();
+    host();
+    expect(captured.warmDiffWorkers).toHaveBeenCalled();
+  });
+
   it("makes a collapsing rail inert a frame after the toggle, and an expanding one at once", async () => {
     const { rerender } = host({ open: true, inert: false });
     expect(captured.panel?.inert).toBe(false);

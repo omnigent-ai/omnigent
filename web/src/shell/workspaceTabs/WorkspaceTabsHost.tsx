@@ -4,6 +4,7 @@
 
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 
+import { useWarmSharedDiffWorkers } from "@/components/diff-review/sharedDiffWorkers";
 import {
   tabsSidebarForwardedShortcuts,
   useBrowserForwardedChords,
@@ -49,6 +50,8 @@ export function WorkspaceTabsHost({
   ...panelProps
 }: WorkspaceTabsHostProps) {
   const { conversationId, onReveal } = panelProps;
+  // Diffs finds the highlighting workers already started, rather than waiting for its own.
+  useWarmSharedDiffWorkers();
   // Going inert restyles everything in the rail, so a collapse takes it in a frame of its own,
   // after the toggle's. Leaving inert stays immediate, so what an expand focuses can take focus.
   const inertNow = panelProps.inert ?? false;
