@@ -762,6 +762,7 @@ export interface ConversationState {
     tempId?: string;
     pendingId?: string;
     contentKey?: string;
+    receiptItemId?: string;
   }[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
@@ -6349,9 +6350,8 @@ async function rehydrateWindowOnReconnect(
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const freshItemIds = new Set(fresh.items.map((it) => it.id));
-  const gapUserTexts = committedUserTextsOf(
-    freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
-  );
+  const gapBlocks = freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId));
+  const gapUserTexts = committedUserTextsOf(gapBlocks);
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
     const currentBlocks = withoutDeliveredSendFailureCards(
@@ -6375,10 +6375,9 @@ async function rehydrateWindowOnReconnect(
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
     const statusPatch = statusPatchFor(s);
-    const shellSettled = settleRecoveredShellInputs(
-      s,
-      freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
-    );
+    const unseen = gapBlocks.filter((b) => !tailIds.has(b.ctx.itemId!));
+    const shellSettled = settleRecoveredShellInputs(s, unseen);
+    const recovered = recoveredUserAcks(unseen, shellSettled.settledShellInputs);
     const blocks =
       reconcileElicitationBlocks(
         merged,
@@ -6394,6 +6393,7 @@ async function rehydrateWindowOnReconnect(
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
       ...(shellSettled === s ? {} : shellSettled),
+      settledShellInputs: recovered.settledShellInputs,
       blocks:
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
@@ -6568,10 +6568,12 @@ async function reconcileOnReconnect(
     // the durable equivalent of its FIFO acknowledgement. Shell inputs never
     // get one: settle their `!cmd` bubbles by command first.
     const shellSettled = settleRecoveredShellInputs(s, unseen);
-    if (shellSettled !== s) patch.settledShellInputs = shellSettled.settledShellInputs;
-    const recoveredUserInputs = recoveredUserAcks(unseen, shellSettled.settledShellInputs);
-    if (recoveredUserInputs > 0 || shellSettled.pendingUserMessages !== s.pendingUserMessages) {
-      patch.pendingUserMessages = shellSettled.pendingUserMessages.slice(recoveredUserInputs);
+    const recovered = recoveredUserAcks(unseen, shellSettled.settledShellInputs);
+    if (recovered.settledShellInputs !== s.settledShellInputs) {
+      patch.settledShellInputs = recovered.settledShellInputs;
+    }
+    if (recovered.count > 0 || shellSettled.pendingUserMessages !== s.pendingUserMessages) {
+      patch.pendingUserMessages = shellSettled.pendingUserMessages.slice(recovered.count);
     }
     let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
@@ -8664,19 +8666,53 @@ function settleRecoveredShellInputs(
   );
 }
 
-/** Exclude legacy receipts for shell bubbles already settled by their input items. */
+/** Match one legacy receipt per settled command, retaining identities for replay. */
+function settleShellReceipt(
+  settled: ShellInputSettlement["settledShellInputs"],
+  receipt: { itemId: string; contentKey?: string; pendingId?: string },
+): ShellInputSettlement["settledShellInputs"] | null {
+  const named = settled.findIndex(
+    (entry) =>
+      entry.receiptItemId === receipt.itemId ||
+      (receipt.pendingId !== undefined &&
+        (entry.pendingId === receipt.pendingId || entry.tempId === receipt.pendingId)),
+  );
+  const at =
+    named >= 0
+      ? named
+      : settled.findIndex(
+          (entry) =>
+            entry.receiptItemId === undefined &&
+            (!receipt.pendingId || !entry.pendingId) &&
+            receipt.contentKey !== undefined &&
+            entry.contentKey === receipt.contentKey,
+        );
+  if (at < 0) return null;
+  if (settled[at]!.receiptItemId !== undefined) return settled;
+  return settled.map((entry, index) =>
+    index === at ? { ...entry, receiptItemId: receipt.itemId } : entry,
+  );
+}
+
+/** Exclude legacy shell receipts and remember which settlements they used. */
 function recoveredUserAcks(
   recovered: AnyBlock[],
   settled: ShellInputSettlement["settledShellInputs"],
-): number {
-  const receipts = settled.flatMap((entry) => (entry.contentKey ? [entry.contentKey] : []));
-  return recovered.filter((block) => {
-    if (block.type !== "user_message" || isSystemUserContent(block.content)) return false;
-    const at = receipts.indexOf(contentKeyOf(block.content));
-    if (at === -1) return true;
-    receipts.splice(at, 1);
-    return false;
-  }).length;
+): { count: number; settledShellInputs: ShellInputSettlement["settledShellInputs"] } {
+  let count = 0;
+  let settledShellInputs = settled;
+  for (const block of recovered) {
+    if (block.type !== "user_message" || isSystemUserContent(block.content)) continue;
+    const matched = block.ctx.itemId
+      ? settleShellReceipt(settledShellInputs, {
+          itemId: block.ctx.itemId,
+          contentKey: contentKeyOf(block.content),
+        })
+      : null;
+    if (matched) settledShellInputs = matched;
+    else count += 1;
+  }
+  return { count, settledShellInputs };
 }
 
 /**
@@ -9449,16 +9485,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // An older server's skip receipt names a `!cmd` bubble its shell input already
         // cleared: it owns no bubble, and the FIFO head belongs to a later message.
         const named = event.clearedPendingId;
-        const settledShell =
-          !!named &&
-          s.settledShellInputs.some(
-            (entry) =>
-              entry.pendingId === named ||
-              entry.tempId === named ||
-              (!entry.pendingId &&
-                eventContent !== null &&
-                entry.contentKey === contentKeyOf(eventContent)),
-          );
+        const settledShell = settleShellReceipt(s.settledShellInputs, {
+          itemId: event.itemId,
+          pendingId: named ?? undefined,
+          contentKey: named && eventContent !== null ? contentKeyOf(eventContent) : undefined,
+        });
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
@@ -9480,7 +9511,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
             };
           }
-          if (settledShell) return {};
+          if (settledShell) return { settledShellInputs: settledShell };
           // FIFO-head fallback — same marker guard as the promote path below. A
           // mirrored system marker (the vendor CLI's own `[Request interrupted
           // by user]` record) is synthesized by the CLI, owns no pending entry,
@@ -9562,8 +9593,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
 
         // 3. Nothing pending (or a marker that owns no bubble) — render the
         //    event payload fresh.
-        if (eventContent === null) return {};
+        if (eventContent === null) {
+          return settledShell ? { settledShellInputs: settledShell } : {};
+        }
         return {
+          ...(settledShell ? { settledShellInputs: settledShell } : {}),
           blocks: [
             ...s.blocks,
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),

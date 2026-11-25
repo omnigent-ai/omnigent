@@ -10805,6 +10805,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent(shellEvent("input"));
 
       handleSessionEvent(receipt("item_skipped", "!ls", "pending_unacked"));
+      handleSessionEvent(receipt("item_skipped", "!ls", "pending_unacked"));
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([sent(2, "next")]);
     });
@@ -17465,15 +17466,24 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   );
 
   it.each([
-    { timing: "during the gap", shellCount: 1, receiptCount: 1 },
-    { timing: "before the gap", shellCount: 1, receiptCount: 1 },
-    { timing: "during the gap", shellCount: 2, receiptCount: 2 },
-    { timing: "before the gap", shellCount: 2, receiptCount: 2 },
-    { timing: "during the gap", shellCount: 1, receiptCount: 2 },
-    { timing: "before the gap", shellCount: 1, receiptCount: 2 },
+    ...[
+      { timing: "during the gap", shellCount: 1, receiptCount: 1 },
+      { timing: "before the gap", shellCount: 1, receiptCount: 1 },
+      { timing: "during the gap", shellCount: 2, receiptCount: 2 },
+      { timing: "before the gap", shellCount: 2, receiptCount: 2 },
+      { timing: "during the gap", shellCount: 1, receiptCount: 2 },
+      { timing: "before the gap", shellCount: 1, receiptCount: 2 },
+    ].map((scenario) => ({ ...scenario, previousReceipt: "none" })),
+    ...["live", "mirrored live", "backfill", "fresh window"].map((previousReceipt) => ({
+      timing: "during the gap",
+      shellCount: 0,
+      receiptCount: 1,
+      previousReceipt,
+    })),
+    { timing: "during the gap", shellCount: 1, receiptCount: 2, previousReceipt: "live" },
   ])(
-    "does not double-ack $receiptCount legacy receipts for $shellCount shell inputs settled $timing",
-    async ({ timing, shellCount, receiptCount }) => {
+    "does not double-ack $receiptCount legacy receipts for $shellCount shell inputs settled $timing (previous receipt: $previousReceipt)",
+    async ({ timing, shellCount, receiptCount, previousReceipt }) => {
       const id = "conv_shell_receipts";
       const before = userMessage("before", "hello");
       seedSession(id, [before]);
@@ -17484,30 +17494,80 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         content: [{ type: "input_text" as const, text }],
         posted: true,
       });
-      useChatStore.setState({
-        conversationId: id,
-        abortController: controller,
-        blocks: itemsToBlocks([before]),
-        pendingUserMessages: [
-          ...Array.from({ length: receiptCount }, (_, i) => queued(`shell_${i}`, "!echo hi")),
-          queued("thanks", "thanks"),
-          queued("more", "more"),
-        ],
-      });
-
-      const loop = startStreamPump(id, controller, setState, getState);
-      await drainAsync();
-      const shellInputs: ConversationItem[] = Array.from({ length: shellCount }, (_, i) => ({
-        id: `term_input_${i}`,
-        response_id: `resp_shell_${i}`,
+      const shellInput = (itemId: string): ConversationItem => ({
+        id: itemId,
+        response_id: `resp_${itemId}`,
         type: "terminal_command",
         status: "completed",
         kind: "input",
         input: "echo hi",
-      }));
+      });
+      const pending = [
+        ...Array.from({ length: receiptCount }, (_, i) => queued(`shell_${i}`, "!echo hi")),
+        queued("thanks", "thanks"),
+        queued("more", "more"),
+      ];
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: previousReceipt === "none" ? pending : [queued("old", "!echo hi")],
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      let history = [before];
+      let previousReceiptItemId: string | undefined;
+      if (previousReceipt !== "none") {
+        const oldShell = shellInput("old_shell");
+        const oldReceipt = userMessage("old_receipt", "!echo hi");
+        previousReceiptItemId = oldReceipt.id;
+        const receiptFrame = sse("session.input.consumed", {
+          data: {
+            item_id: oldReceipt.id,
+            type: "message",
+            cleared_pending_id: "old",
+            data: { role: "user", content: [{ type: "input_text", text: "!echo hi" }] },
+          },
+        });
+        sinks[0]!.push(sse("response.output_item.done", { item: oldShell }));
+        await drainAsync();
+        history = [
+          before,
+          oldShell,
+          ...Array.from({ length: previousReceipt === "fresh window" ? 100 : 0 }, (_, i) =>
+            assistantMessage(`old_filler_${i}`, "working"),
+          ),
+          oldReceipt,
+        ];
+        seedSessionItems(id, history);
+        if (previousReceipt === "live" || previousReceipt === "mirrored live") {
+          if (previousReceipt === "mirrored live") {
+            useChatStore.setState({ blocks: itemsToBlocks(history) });
+          }
+          sinks[0]!.push(receiptFrame);
+        } else {
+          sinks[0]!.error();
+        }
+        await drainAsync();
+        expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain(oldReceipt.id);
+        expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+        if (previousReceipt === "fresh window") {
+          expect(useChatStore.getState().historyGeneration).toBe(1);
+        }
+
+        // Receipt handling must retain the input item's replay protection.
+        useChatStore.setState({ pendingUserMessages: pending });
+        sinks.at(-1)!.push(sse("response.output_item.done", { item: oldShell }));
+        await drainAsync();
+        expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+      }
+      const shellInputs = Array.from({ length: shellCount }, (_, i) =>
+        shellInput(`term_input_${i}`),
+      );
       if (timing === "before the gap") {
         for (const item of shellInputs) {
-          sinks[0]!.push(sse("response.output_item.done", { item }));
+          sinks.at(-1)!.push(sse("response.output_item.done", { item }));
         }
         await drainAsync();
       }
@@ -17516,13 +17576,29 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const receipts = Array.from({ length: receiptCount }, (_, i) =>
         userMessage(`shell_receipt_${i}`, "!echo hi"),
       );
-      seedSessionItems(id, [before, ...shellInputs, ...receipts, userMessage("ack", "thanks")]);
-      sinks[0]!.error();
+      seedSessionItems(id, [...history, ...shellInputs, ...receipts, userMessage("ack", "thanks")]);
+      const streamCount = sinks.length;
+      sinks.at(-1)!.error();
       await drainAsync();
-      expect(sinks).toHaveLength(2);
+      expect(sinks).toHaveLength(streamCount + 1);
       expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["more"]);
 
-      const last = sinks[1]!;
+      // A late receipt must still be recognized after recovery, even without its pending id.
+      if (previousReceiptItemId) {
+        sinks.at(-1)!.push(
+          sse("session.input.consumed", {
+            data: {
+              item_id: previousReceiptItemId,
+              type: "message",
+              data: { role: "user", content: [{ type: "input_text", text: "!echo hi" }] },
+            },
+          }),
+        );
+        await drainAsync();
+        expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["more"]);
+      }
+
+      const last = sinks.at(-1)!;
       last.push("data: [DONE]\n\n");
       last.close();
       await drainAsync(2);
