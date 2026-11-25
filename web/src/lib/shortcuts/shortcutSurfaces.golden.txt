@@ -72,6 +72,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -232,6 +233,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -392,6 +394,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -552,6 +555,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -712,6 +716,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -872,6 +877,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1032,6 +1038,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1192,6 +1199,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1352,6 +1360,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1512,6 +1521,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1672,6 +1682,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1832,6 +1843,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1992,6 +2004,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -2152,6 +2165,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -2312,6 +2326,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -2472,6 +2487,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true

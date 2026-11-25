@@ -24,15 +24,19 @@ import {
   scrollPastEnd,
 } from "@codemirror/view";
 import { reestimateWrappedHeightsOnSettledWidth } from "./wrappedHeightEstimate";
-import { HashIcon, ReplaceIcon } from "lucide-react";
+import { HashIcon, ReplaceIcon, TextSelectIcon } from "lucide-react";
 import { type ReactNode, type RefObject, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { FindBar } from "@/components/FindBar";
 import { OWNS_COMMAND_ENTER_ATTRIBUTE } from "@/hooks/useApproveHotkey";
 import { GO_TO_LINE_LABEL, GoToLineBar } from "@/components/GoToLineBar";
-import { codeMirrorKeys } from "@/lib/shortcuts/registry";
+import { codeMirrorKeys, shortcutKeys } from "@/lib/shortcuts/registry";
 import { readCodeFont, subscribeCodeFont } from "@/lib/codeFontPreferences";
-import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands";
+import {
+  type PaletteCommand,
+  unavailableBecause,
+  usePaletteCommands,
+} from "@/store/paletteCommands";
 import type { FilePosition } from "../FileViewerContext";
 import { detectLang } from "../codeViewerHelpers";
 import { isFilePositionPending, stopFilePosition } from "../filePositionState";
@@ -86,6 +90,13 @@ import {
 } from "./useCodeMirrorCommentLayer";
 import { shikiDecorations } from "./shikiDecorations";
 import { viewportHighlighting } from "./viewportHighlighting";
+import {
+  canToggleFindInSelection,
+  FIND_IN_SELECTION_UNAVAILABLE,
+  findScope,
+  findScopeOf,
+  toggleFindInSelection,
+} from "./findScope";
 import { FIND_AND_REPLACE_LABEL, FIND_IN_FILE_LABEL } from "./editorContextMenuEntries";
 import { EditorContextMenu } from "./EditorContextMenu";
 import { columnSelection } from "./columnSelection";
@@ -206,6 +217,9 @@ export function CodeMirrorFileViewer({
   // Set by Find and replace before it opens find, for the open request to focus.
   const pendingFindFocusTargetRef = useRef<"query" | "replace" | null>(null);
   const [replaceOpen, setReplaceOpen] = useState(false);
+  const [preserveCase, setPreserveCase] = useState(false);
+  // Whether Find in selection can act now; shared by the find bar's toggle and ⌘K.
+  const [findInSelectionReady, setFindInSelectionReady] = useState(false);
   const [goToLineState, setGoToLineState] = useState<GoToLineState | null>(null);
   // Where Go to line returns to on Escape, kept in step with edits while it is open.
   const goToLineOriginRef = useRef<GoToLineOrigin | null>(null);
@@ -266,6 +280,20 @@ export function CodeMirrorFileViewer({
     setFindFocusTarget("query");
     setFindFocusRequest((request) => request + 1);
   };
+  // Find in selection: limits find to the reader's selection and opens the bar, or turns it off.
+  const findInSelection = (target: EditorView, on = findScopeOf(target.state) === null) => {
+    if (!toggleFindInSelection(target, on)) return false;
+    if (!searchPanelOpen(target.state)) openSearchPanel(target);
+    const start = findScopeOf(target.state)?.[0]?.from;
+    if (start !== undefined) {
+      // Move to the scope's first match, so the selected match is never outside it.
+      target.dispatch({ selection: { anchor: start }, userEvent: "select.search" });
+      pendingStepRef.current = { direction: 1, from: { from: start, to: start }, inclusive: true };
+    }
+    return true;
+  };
+  const findInSelectionRef = useRef(findInSelection);
+  findInSelectionRef.current = findInSelection;
   // The editor's keymap is built once, so it reaches the latest handlers through refs.
   const openGoToLineRef = useRef(openGoToLine);
   openGoToLineRef.current = openGoToLine;
@@ -317,6 +345,10 @@ export function CodeMirrorFileViewer({
           replacer.cancel();
           findIndex.reset();
           if (!tearingDown) onSearchHandledRef.current();
+          // Find in selection ends with find; the panel closes mid-update, so turn it off after.
+          queueMicrotask(() => {
+            if (!tearingDown && view) toggleFindInSelection(view, false);
+          });
         },
       };
     };
@@ -352,6 +384,10 @@ export function CodeMirrorFileViewer({
             createPanel: findPanel,
             scrollToMatch: (range) => EditorView.scrollIntoView(range, { y: "center" }),
           }),
+          findScope,
+          EditorView.updateListener.of((update) => {
+            setFindInSelectionReady(canToggleFindInSelection(update.state));
+          }),
           highlightSelectionMatches({ highlightWordAroundCursor: true, minSelectionLength: 1 }),
           EditorState.allowMultipleSelections.of(true),
           // Alt-click adds a cursor and Alt-drag selects a box, as in other code editors.
@@ -370,6 +406,11 @@ export function CodeMirrorFileViewer({
               run: (target: EditorView) => openFindAndReplaceRef.current(target),
               preventDefault: true,
             })),
+            ...codeMirrorKeys("file.findInSelection").map((key) => ({
+              key,
+              run: (target: EditorView) => findInSelectionRef.current(target),
+              preventDefault: true,
+            })),
             { key: "Mod-g", run: step(1), shift: step(-1), preventDefault: true },
             { key: "F3", run: step(1), shift: step(-1), preventDefault: true },
             ...VIEWER_SEARCH_KEYMAP,
@@ -383,9 +424,9 @@ export function CodeMirrorFileViewer({
           }),
           EditorView.updateListener.of((update) => {
             if (!searchPanelOpen(update.state)) return;
-            const queryChanged = !getSearchQuery(update.startState).eq(
-              getSearchQuery(update.state),
-            );
+            const queryChanged =
+              !getSearchQuery(update.startState).eq(getSearchQuery(update.state)) ||
+              findScopeOf(update.startState) !== findScopeOf(update.state);
             if (update.docChanged || queryChanged) {
               // Indexing may select the first match, which can't dispatch mid-update.
               queueMicrotask(() => {
@@ -408,6 +449,7 @@ export function CodeMirrorFileViewer({
     const mountedView = view;
     viewRef.current = mountedView;
     setEditorView(mountedView);
+    setFindInSelectionReady(canToggleFindInSelection(mountedView.state));
     const editorRef = editingRef.current?.editorRef;
     if (editorRef) editorRef.current = editorHandleFor(mountedView);
     const scrollKey = `codemirror:${conversationId}:${path}`;
@@ -522,7 +564,8 @@ export function CodeMirrorFileViewer({
       view.dom.querySelector(`.${FIND_PANEL_CLASS}`)?.contains(document.activeElement);
     openSearchPanel(view);
     const selection = view.state.selection.main;
-    if (!barHasFocus && !selection.empty) {
+    // With Find in selection on, the selection is where to search, not what to search for.
+    if (!barHasFocus && !selection.empty && findScopeOf(view.state) === null) {
       queueFirstMatch(
         applyFindQuery(
           view,
@@ -563,6 +606,19 @@ export function CodeMirrorFileViewer({
         run: () => openGoToLineRef.current(editorView),
       },
       {
+        id: "file.find-in-selection",
+        label: "Find in selection",
+        icon: TextSelectIcon,
+        keywords: ["search", "scope", "selection", "within"],
+        shortcut: "file.findInSelection" as const,
+        movesFocus: true,
+        availability: findInSelectionReady
+          ? undefined
+          : unavailableBecause(FIND_IN_SELECTION_UNAVAILABLE),
+        // A toggle, like the find bar's button and the shortcut, so it acts whenever it's offered.
+        run: () => findInSelectionRef.current(editorView),
+      },
+      {
         id: "file.find-and-replace",
         label: FIND_AND_REPLACE_LABEL,
         icon: ReplaceIcon,
@@ -589,7 +645,7 @@ export function CodeMirrorFileViewer({
         },
       })),
     ];
-  }, [onScreen, editorView, editAvailability]);
+  }, [onScreen, editorView, editAvailability, findInSelectionReady]);
   usePaletteCommands(paletteSource, "File", paletteCommands);
 
   const view = viewRef.current;
@@ -604,17 +660,21 @@ export function CodeMirrorFileViewer({
     if (view && origin && restore) returnToOrigin(view, origin);
   };
   const replaceSelected = (target: EditorView, index: FindMatchIndex) => {
-    replacerRef.current?.replaceSelected(target, (resumeFrom) => {
-      // Not a match to replace: select the next one, so a replacement lands only on a highlighted match.
-      if (resumeFrom === null) {
-        requestStep(target, index, 1);
-        return;
-      }
-      const from = { from: resumeFrom, to: resumeFrom };
-      // A replacement that changed nothing leaves the index current; otherwise wait for the new one.
-      if (index.belongsTo(target.state) && stepToMatch(target, index, 1, from)) return;
-      pendingStepRef.current = { direction: 1, from, inclusive: false };
-    });
+    replacerRef.current?.replaceSelected(
+      target,
+      (resumeFrom) => {
+        // Not a match to replace: select the next one, so a replacement lands only on a highlighted match.
+        if (resumeFrom === null) {
+          requestStep(target, index, 1);
+          return;
+        }
+        const from = { from: resumeFrom, to: resumeFrom };
+        // A replacement that changed nothing leaves the index current; otherwise wait for the new one.
+        if (index.belongsTo(target.state) && stepToMatch(target, index, 1, from)) return;
+        pendingStepRef.current = { direction: 1, from, inclusive: false };
+      },
+      { preserveCase },
+    );
   };
   return (
     <div className="flex h-full flex-col">
@@ -674,6 +734,13 @@ export function CodeMirrorFileViewer({
             onQueryChange={(query) => setQuery(query)}
             options={findStatus.options}
             onOptionsChange={(options) => setQuery(findStatus.query, options)}
+            inSelection={{
+              pressed: findStatus.inSelection === true,
+              available: findInSelectionReady,
+              unavailableReason: FIND_IN_SELECTION_UNAVAILABLE,
+              onToggle: () => findInSelection(view),
+              keys: shortcutKeys("file.findInSelection"),
+            }}
             status={findStatusLabel(findStatus)}
             hasMatches={findStatus.matchCount > 0}
             searching={!findStatus.complete || replacing}
@@ -694,7 +761,9 @@ export function CodeMirrorFileViewer({
                     open: replaceOpen,
                     onOpenChange: setReplaceOpen,
                     onReplace: () => replaceSelected(view, findIndex),
-                    onReplaceAll: () => replacerRef.current?.replaceAll(view),
+                    onReplaceAll: () => replacerRef.current?.replaceAll(view, { preserveCase }),
+                    preserveCase,
+                    onPreserveCaseChange: setPreserveCase,
                   }
                 : undefined
             }

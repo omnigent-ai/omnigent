@@ -11,6 +11,8 @@ export interface FindQuerySpec {
   caseSensitive: boolean;
   wholeWord: boolean;
   regexp: boolean;
+  /** Limits matches to these ranges, in document order, for Find in selection. */
+  scope?: readonly { from: number; to: number }[] | null;
 }
 
 /** Matches found since the previous step, in document order. */
@@ -24,22 +26,91 @@ export interface MatchBatch {
   restart?: boolean;
 }
 
-export function findQuerySpec(query: SearchQuery): FindQuerySpec {
+export function findQuerySpec(
+  query: SearchQuery,
+  scope: readonly { from: number; to: number }[] | null = null,
+): FindQuerySpec {
   return {
     search: query.search,
     caseSensitive: query.caseSensitive,
     wholeWord: query.wholeWord,
     regexp: query.regexp,
+    scope,
   };
 }
 
+interface CursorResult {
+  from: number;
+  to: number;
+  precise?: boolean;
+  match?: RegExpExecArray;
+}
+
+/** A match the scope left out: work done, nothing found. */
+export const OUTSIDE_SCOPE = null;
+
+/** CodeMirror's rule for a pattern that can span lines, which it matches across the document. */
+const MULTILINE_PATTERN = /\\[sWDnr]|\n|\r|\[\^/;
+
+/**
+ * What a match between `from` and `to` is read in, so it sees the same text a whole-file
+ * search does: its lines for a pattern matched line by line, or the whole document for a
+ * regular expression that can span lines.
+ */
+export function matchContext(
+  doc: Text,
+  query: SearchQuery,
+  from: number,
+  to: number,
+): { from: number; to: number } {
+  if (query.regexp && MULTILINE_PATTERN.test(query.search)) return { from: 0, to: doc.length };
+  return { from: doc.lineAt(from).from, to: doc.lineAt(to).to };
+}
+
+function cursorIn(query: SearchQuery, doc: Text, from: number, to: number) {
+  return query.getCursor(doc, from, to) as Iterator<CursorResult> & Iterable<CursorResult>;
+}
+
+/**
+ * Every match of `query` in `doc`, or only those wholly inside `scope`'s sorted ranges. A
+ * scoped search reads each range in its whole-file context, so `^`, `$` and lookaround
+ * answer as they would across the file, and a match that runs past the scope is left out.
+ * An empty scope has no matches. Each match left out yields `OUTSIDE_SCOPE`, so a caller
+ * working to a time budget can pause between them, however many there are.
+ */
+export function* matchesIn(
+  query: SearchQuery,
+  doc: Text,
+  scope: readonly { from: number; to: number }[] | null | undefined,
+): Generator<CursorResult | typeof OUTSIDE_SCOPE> {
+  if (!scope) {
+    yield* cursorIn(query, doc, 0, doc.length);
+    return;
+  }
+  const contexts: { from: number; to: number }[] = [];
+  for (const range of scope) {
+    const context = matchContext(doc, query, range.from, range.to);
+    const last = contexts.at(-1);
+    if (last && context.from <= last.to) last.to = Math.max(last.to, context.to);
+    else contexts.push({ ...context });
+  }
+  let rangeIndex = 0;
+  for (const context of contexts) {
+    for (const result of cursorIn(query, doc, context.from, context.to)) {
+      while (rangeIndex < scope.length && scope[rangeIndex]!.to < result.from) rangeIndex += 1;
+      const range = scope[rangeIndex];
+      yield range && result.from >= range.from && result.to <= range.to ? result : OUTSIDE_SCOPE;
+    }
+  }
+}
+
 export class MatchCollector {
-  private readonly cursor: Iterator<{ from: number; to: number; precise?: boolean }>;
+  private readonly cursor: Iterator<CursorResult | typeof OUTSIDE_SCOPE>;
   private done = false;
 
   constructor(doc: Text, spec: FindQuerySpec) {
     const query = new SearchQuery(spec);
-    this.cursor = query.getCursor(doc);
+    this.cursor = matchesIn(query, doc, spec.scope);
     this.done = !query.valid || !query.search;
   }
 
@@ -54,6 +125,7 @@ export class MatchCollector {
         this.done = true;
         break;
       }
+      if (result.value === OUTSIDE_SCOPE) continue;
       batch.froms.push(result.value.from);
       batch.tos.push(result.value.to);
       if (result.value.precise === false) batch.imprecise.push(result.value.from);

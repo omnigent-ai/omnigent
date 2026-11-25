@@ -855,6 +855,7 @@ describe("CodeMirrorFileViewer find and replace", () => {
     expect(screen.queryByRole("button", { name: "Replace" })).toBeNull();
     expect(fileCommands().map((command) => command.label)).toEqual([
       "Go to line…",
+      "Find in selection",
       ...FILE_EDITOR_COMMANDS.filter((command) => !command.edits).map(fileEditorCommandLabel),
     ]);
   });
@@ -867,7 +868,8 @@ describe("CodeMirrorFileViewer find and replace", () => {
       "file.find-and-replace",
       ...FILE_EDITOR_COMMANDS.filter((command) => command.edits).map((command) => command.id),
     ]);
-    for (const command of commands) {
+    // Find in selection waits for a selection instead; its own test covers that.
+    for (const command of commands.filter((entry) => entry.id !== "file.find-in-selection")) {
       expect(command.availability, command.id).toEqual(
         edits.has(command.id) ? { available: false, reason } : undefined,
       );
@@ -1109,6 +1111,7 @@ describe("CodeMirrorFileViewer go to line", () => {
     const labels = () => fileCommands().map((command) => command.label);
     expect(labels()).toEqual([
       "Go to line…",
+      "Find in selection",
       "Find and replace in file",
       ...FILE_EDITOR_COMMANDS.map(fileEditorCommandLabel),
     ]);
@@ -1119,6 +1122,46 @@ describe("CodeMirrorFileViewer go to line", () => {
 
     renderViewer({ commentOptions: { ...NO_COMMENT_OPTIONS, onScreen: false } });
     expect(labels()).toEqual([]);
+  });
+});
+
+describe("CodeMirrorFileViewer find in selection", () => {
+  it("greys out the palette command until there's a selection, saying why", async () => {
+    const { container } = renderViewer({ content: "alpha beta\nalpha", editing: editing() });
+    const command = () => fileCommands().find((entry) => entry.id === "file.find-in-selection")!;
+    expect(command().availability).toEqual({
+      available: false,
+      reason: "Select text to find in it.",
+    });
+    const view = editorViewOf(container);
+    act(() => view.dispatch({ selection: { anchor: 0, head: 5 }, userEvent: "select" }));
+    await waitFor(() => expect(command().availability).toBeUndefined());
+    act(() => command().run());
+    await screen.findByRole("textbox", { name: "Find in file" });
+    expect(screen.getByRole("button", { name: "Find in selection" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("keeps the palette command for turning an active scope off after the selection clears", async () => {
+    const { container } = renderViewer({ content: "alpha beta\nalpha", editing: editing() });
+    const command = () => fileCommands().find((entry) => entry.id === "file.find-in-selection")!;
+    const view = editorViewOf(container);
+    act(() => view.dispatch({ selection: { anchor: 0, head: 5 }, userEvent: "select" }));
+    await waitFor(() => expect(command().availability).toBeUndefined());
+    act(() => command().run());
+    const toggle = await screen.findByRole("button", { name: "Find in selection" });
+    act(() => view.dispatch({ selection: { anchor: 3 }, userEvent: "select.pointer" }));
+    expect(command().availability).toBeUndefined();
+    act(() => command().run());
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    await waitFor(() =>
+      expect(command().availability).toEqual({
+        available: false,
+        reason: "Select text to find in it.",
+      }),
+    );
   });
 });
 

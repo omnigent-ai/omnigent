@@ -10,7 +10,6 @@ import { ADD_COMMENT, ATTACH_TO_AGENT } from "../CommentSelectionActions";
 
 export const FIND_IN_FILE_LABEL = "Find in file";
 export const FIND_AND_REPLACE_LABEL = "Find and replace in file";
-export const PASTE_WITH_KEYS_DESCRIPTION = "Press ⌘V to paste here.";
 
 export type EditorMenuAction =
   | "search-workspace"
@@ -53,6 +52,12 @@ export interface EditorMenuContext {
 
 function clipboardKeys(letter: string, mac: boolean): readonly string[] {
   return mac ? ["⌘", letter] : ["Ctrl", letter];
+}
+
+/** Why Paste is disabled where the page can't read the clipboard, naming the row's own keys. */
+export function pasteWithKeysDescription(mac: boolean): string {
+  const keys = clipboardKeys("V", mac).join(mac ? "" : "+");
+  return `Press ${keys} to paste here.`;
 }
 
 function editorCommand(id: FileEditorCommandId): EditorMenuEntry {
@@ -118,7 +123,7 @@ export function editorMenuEntries(context: EditorMenuContext): EditorMenuEntry[]
       label: "Paste",
       keys: clipboardKeys("V", mac),
       enabled: context.canReadClipboard,
-      description: context.canReadClipboard ? undefined : PASTE_WITH_KEYS_DESCRIPTION,
+      description: context.canReadClipboard ? undefined : pasteWithKeysDescription(mac),
     });
   }
   const navigation: EditorMenuEntry[] = [

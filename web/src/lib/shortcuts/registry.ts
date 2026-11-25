@@ -650,6 +650,11 @@ const WORKSPACE_SIDEBAR_DEFINITIONS = {
       ...(environment.mac ? [] : [{ ctrl: true, code: "KeyH" }]),
     ],
   },
+  "file.findInSelection": {
+    group: "files",
+    label: "Find in selection",
+    chords: () => [modAlt({ code: "KeyL" })],
+  },
   "file.goToLine": {
     group: "files",
     label: "Go to line",

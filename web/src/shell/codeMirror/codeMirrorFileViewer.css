@@ -183,3 +183,12 @@
   display: inline-block;
   transform: translateX(var(--cm-sticky-text-offset));
 }
+
+/* The text Find in selection is limited to; matches outside it aren't highlighted. */
+.cm-find-scope {
+  background-color: color-mix(in oklch, var(--primary) 14%, transparent);
+}
+.cm-editor .cm-find-outside-scope .cm-searchMatch,
+.cm-editor .cm-find-outside-scope .cm-searchMatch.cm-searchMatch-selected {
+  background-color: transparent;
+}

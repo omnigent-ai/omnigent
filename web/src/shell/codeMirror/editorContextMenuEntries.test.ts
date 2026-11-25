@@ -3,7 +3,7 @@ import {
   type EditorMenuContext,
   type EditorMenuEntry,
   editorMenuEntries,
-  PASTE_WITH_KEYS_DESCRIPTION,
+  pasteWithKeysDescription,
 } from "./editorContextMenuEntries";
 
 const READ_ONLY: EditorMenuContext = {
@@ -91,7 +91,19 @@ describe("editorMenuEntries", () => {
       editorMenuEntries({ ...READ_ONLY, editable: true, canReadClipboard: false }),
       "paste",
     );
-    expect(paste).toMatchObject({ enabled: false, description: PASTE_WITH_KEYS_DESCRIPTION });
+    expect(paste).toMatchObject({ enabled: false, description: "Press ⌘V to paste here." });
+  });
+
+  it("names Ctrl+V in the Paste hint off macOS, as the row's keys do", () => {
+    const paste = item(
+      editorMenuEntries({ ...READ_ONLY, editable: true, canReadClipboard: false, mac: false }),
+      "paste",
+    );
+    expect(paste).toMatchObject({
+      keys: ["Ctrl", "V"],
+      description: "Press Ctrl+V to paste here.",
+    });
+    expect(pasteWithKeysDescription(false)).toBe("Press Ctrl+V to paste here.");
   });
 
   it("shows Ctrl for the clipboard keys off macOS", () => {
