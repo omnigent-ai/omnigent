@@ -77,8 +77,10 @@ export function useLazyFolderTree(
     });
   }, [model, listingVersion]);
 
-  // Expanding a folder that hasn't been listed yet asks for its contents.
+  // Expanding a folder that hasn't been listed yet asks for its contents; closing it, or a
+  // folder above it, before its listing arrives stops asking, so its paging stops.
   useEffect(() => {
+    const askedOnOpen = new Set<string>();
     const askForExpanded = () => {
       const unlisted: string[] = [];
       for (const row of model.getVisibleRows(0, model.getVisibleCount())) {
@@ -86,10 +88,18 @@ export function useLazyFolderTree(
         const folder = row.path.replace(/\/$/, "");
         if (!loadedFolders.current.has(folder)) unlisted.push(folder);
       }
-      if (unlisted.length === 0) return;
+      const closed = [...askedOnOpen].filter(
+        (folder) => !unlisted.includes(folder) && !loadedFolders.current.has(folder),
+      );
+      for (const folder of askedOnOpen) {
+        if (!unlisted.includes(folder)) askedOnOpen.delete(folder);
+      }
+      for (const folder of unlisted) askedOnOpen.add(folder);
+      if (unlisted.length === 0 && closed.length === 0) return;
       setWantedFolders((current) => {
-        const added = unlisted.filter((folder) => !current.includes(folder));
-        return added.length > 0 ? [...current, ...added] : current;
+        const kept = closed.length > 0 ? current.filter((path) => !closed.includes(path)) : current;
+        const added = unlisted.filter((folder) => !kept.includes(folder));
+        return kept.length === current.length && added.length === 0 ? current : [...kept, ...added];
       });
     };
     askForExpanded();

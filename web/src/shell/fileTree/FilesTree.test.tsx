@@ -277,6 +277,34 @@ describe("FilesTree", () => {
     expect(await screen.findByRole("status")).toHaveTextContent("of partial.");
   });
 
+  it("asks for no further page of a folder closed while its first page loads", async () => {
+    let releaseFirstPage: (() => void) | undefined;
+    const signals: (AbortSignal | null | undefined)[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        signals.push(init?.signal);
+        await new Promise<void>((resolve) => {
+          releaseFirstPage = resolve;
+        });
+        return Response.json({
+          object: "list",
+          data: [{ id: "closing/a.txt", ...file("closing/a.txt") }],
+          has_more: true,
+          last_id: "closing/a.txt",
+        });
+      },
+    );
+    // A folder no other case opens: the tree remembers open folders per session.
+    renderTree([folder("closing"), file("README.md")]);
+    fireEvent.click(await screen.findByRole("treeitem", { name: "closing" }));
+    await waitFor(() => expect(releaseFirstPage).toBeDefined());
+
+    fireEvent.click(screen.getByRole("treeitem", { name: "closing" }));
+    await waitFor(() => expect(signals[0]?.aborted).toBe(true));
+    await act(async () => releaseFirstPage?.());
+    expect(signals).toHaveLength(1);
+  });
+
   it("says nothing of a complete listing as long as the entry limit", async () => {
     // A host that ignores the page size can list a whole folder of this size in one go.
     const entries = Array.from({ length: LISTING_ENTRY_LIMIT }, (_, i) => file(`f${i}.txt`));
