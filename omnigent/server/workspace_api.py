@@ -51,6 +51,8 @@ _WRITE_REPLY_TIMEOUT_S = 20.0
 # The pull request methods that answer with its overview, which lists the session's PRs.
 _OVERVIEW_METHODS = frozenset({"GetPullRequest", "SetPullRequestAccount"})
 _COMMENT_WRITES = frozenset({"CreateComment", "CreateReviewThread", "ReplyToReviewThread"})
+# The codes that, once a change's frame is sent, don't say whether the change was made.
+_UNCONFIRMED_AFTER_SEND = frozenset({Code.UNAVAILABLE, Code.INTERNAL})
 # Served only while the workspace_content_search flag is on.
 _CONTENT_SEARCH_METHOD = "SearchText"
 
@@ -214,8 +216,8 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         :param session_id: The authorized session, sent on pull request calls only.
         :param vouch: The server's vouch for a pull request call's PR.
         :param unconfirmed: For a change, the message when it may have been made but its
-            answer was lost: once the frame is sent, a timeout is DEADLINE_EXCEEDED and an
-            UNAVAILABLE end, such as a dropped tunnel, is UNKNOWN, never UNAVAILABLE.
+            answer was lost: once the frame is sent, a timeout is DEADLINE_EXCEEDED, and an
+            UNAVAILABLE end, such as a dropped tunnel, or a host's INTERNAL is UNKNOWN.
         :param timeout: Seconds each reply may take.
         """
         target = self._target
@@ -251,8 +253,9 @@ class HostWorkspaceService(WorkspaceServiceMethods):
                     if not reply.error_code:
                         return
                     code = _code(reply.error_code)
-                    # A client retries UNAVAILABLE, which would repeat a change already made.
-                    if unconfirmed is not None and code is Code.UNAVAILABLE:
+                    # A client retries UNAVAILABLE, which would repeat a change already made,
+                    # and a host failure past the send may follow a change GitHub made.
+                    if unconfirmed is not None and code in _UNCONFIRMED_AFTER_SEND:
                         raise ConnectError(Code.UNKNOWN, unconfirmed)
                     raise ConnectError(code, reply.error_message or "")
         finally:
