@@ -1,8 +1,11 @@
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_FILE_VIEW_PREFERENCES,
   readFileViewPreferences,
+  useStickyScroll,
   writeFileViewPreferences,
+  writeStickyScroll,
 } from "./fileViewPreferences";
 
 const STORAGE_KEY = "omnigent:file-view-preferences";
@@ -71,5 +74,25 @@ describe("fileViewPreferences", () => {
       // A record saved before sticky scroll existed, or a bad value, keeps it on.
       stickyScroll: true,
     });
+  });
+});
+
+describe("useStickyScroll", () => {
+  it("follows a write on screen and keeps the other preferences", () => {
+    writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, wrapLines: true });
+    const { result } = renderHook(() => useStickyScroll());
+    expect(result.current).toBe(true);
+    act(() => writeStickyScroll(false));
+    expect(result.current).toBe(false);
+    expect(readFileViewPreferences()).toMatchObject({ wrapLines: true, stickyScroll: false });
+  });
+
+  it("follows another window's change", () => {
+    const { result } = renderHook(() => useStickyScroll());
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ stickyScroll: false }));
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: STORAGE_KEY }));
+    });
+    expect(result.current).toBe(false);
   });
 });

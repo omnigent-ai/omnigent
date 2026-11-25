@@ -12,6 +12,10 @@
 // a refresh (or a brand-new conversation) starts from the user's last
 // choice instead of the hardcoded defaults.
 
+import { useSyncExternalStore } from "react";
+
+import { isStorageEventFor } from "./storedChoicePreference";
+
 export interface FileViewPreferences {
   /** Whether the diff view is the preferred mode for changed files. */
   diffActive: boolean;
@@ -28,6 +32,7 @@ export interface FileViewPreferences {
 }
 
 const STORAGE_KEY = "omnigent:file-view-preferences";
+const CHANGE_EVENT = `${STORAGE_KEY}-change`;
 
 export const DEFAULT_FILE_VIEW_PREFERENCES: FileViewPreferences = {
   diffActive: false,
@@ -90,4 +95,31 @@ export function writeFileViewPreferences(prefs: FileViewPreferences): void {
   } catch {
     // localStorage quota or access errors shouldn't break the app.
   }
+  window.dispatchEvent(new Event(CHANGE_EVENT));
+}
+
+function subscribe(listener: () => void): () => void {
+  const onStorage = (event: StorageEvent) => {
+    if (isStorageEventFor(event, STORAGE_KEY)) listener();
+  };
+  window.addEventListener(CHANGE_EVENT, listener);
+  window.addEventListener("storage", onStorage);
+  return () => {
+    window.removeEventListener(CHANGE_EVENT, listener);
+    window.removeEventListener("storage", onStorage);
+  };
+}
+
+/** Live sticky scroll choice, including changes from ⌘K or another window. */
+export function useStickyScroll(): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    () => readFileViewPreferences().stickyScroll,
+    () => DEFAULT_FILE_VIEW_PREFERENCES.stickyScroll,
+  );
+}
+
+/** Turn sticky scroll on or off, keeping the other file-view preferences. */
+export function writeStickyScroll(enabled: boolean): void {
+  writeFileViewPreferences({ ...readFileViewPreferences(), stickyScroll: enabled });
 }

@@ -22,6 +22,7 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests.e2e_ui._quick_pick_palette import run_palette_command
 from tests.e2e_ui.files._files_page import (
     open_from_tree,
     open_workspace,
@@ -92,9 +93,11 @@ def code_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
         remove_seeded(workspace, [_LARGE_PATH])
 
 
-def _open_file(page: Page, base_url: str, session_id: str, path: str) -> Locator:
+def _open_file(
+    page: Page, base_url: str, session_id: str, path: str, *, quick_pick: bool = False
+) -> Locator:
     """Opens ``path`` from the Files page's tree and returns its editor."""
-    sidebar = open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id, quick_pick=quick_pick)
     _open_app(page, sidebar, "Files")
     open_from_tree(sidebar, path)
     editor = sidebar.locator('[data-testid="workspace-files-place"]:visible .cm-editor')
@@ -242,6 +245,24 @@ def test_sticky_scroll_follows_the_saved_choice(page: Page, code_session: tuple[
     )
     assert "self.count[item] +=" in top_line, top_line
     expect(editor.locator(".cm-stickyScroll-line")).to_have_count(0)
+
+
+def test_sticky_scroll_turns_off_from_the_palette_while_the_file_is_open(
+    page: Page, code_session: tuple[str, str]
+) -> None:
+    """⌘K's Sticky scroll setting unpins the scopes in the open file, and the choice is saved."""
+    base_url, session_id = code_session
+    editor = _open_file(page, base_url, session_id, _NESTED_PATH, quick_pick=True)
+    expect(editor.locator(".cm-line").first).to_have_text("class Inventory:", timeout=30_000)
+    pinned = editor.locator(".cm-stickyScroll-line")
+    editor.locator(".cm-scroller").evaluate("(node) => { node.scrollTop = 1500; }")
+    expect(pinned).to_have_count(3)
+
+    run_palette_command(page, "sticky scroll", "Sticky scroll")
+    page.get_by_role("dialog").get_by_role("option", name="Off").click()
+    expect(pinned).to_have_count(0)
+    saved = page.evaluate("localStorage.getItem('omnigent:file-view-preferences')")
+    assert '"stickyScroll":false' in saved, saved
 
 
 def test_right_click_lists_the_editors_commands(page: Page, code_session: tuple[str, str]) -> None:
