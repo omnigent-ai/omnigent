@@ -60,7 +60,15 @@ export function TicketLabels({
   // Nothing left to show (a card whose only label is its kind): no empty row to leave a gap.
   if (visible.length === 0) return null;
   return (
-    <div className={cn("flex min-w-0 gap-1.5", compact ? "items-center" : "flex-wrap")}>
+    <div
+      className={cn(
+        "flex min-w-0 gap-1.5",
+        // Cards keep one row: chips shrink and truncate so the row never leaves the card.
+        compact
+          ? "items-center [&>[data-slot=badge]]:min-w-11 [&>[data-slot=badge]]:shrink [&>[data-slot=badge]~[data-slot=badge]]:shrink-[2]"
+          : "flex-wrap",
+      )}
+    >
       {visible.map((label) =>
         label.key === "needs-human" ? (
           <NeedsWhomBadge key={label.key} whom={whom} question={label.value || undefined} />
@@ -341,7 +349,7 @@ function NeedsWhomBadge({ whom, question }: { whom: NeedsWhom; question?: string
         data-testid="needs-other"
         className="border-transparent bg-muted font-normal text-muted-foreground"
       >
-        {whom.label}
+        <span className="truncate">{whom.label}</span>
       </Badge>
     );
   return <NeedsResponseBadge title={question} />;

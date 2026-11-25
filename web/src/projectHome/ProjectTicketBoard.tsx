@@ -25,11 +25,12 @@ import { Link, useSearchParams } from "@/lib/routing";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { getCurrentUserId } from "@/lib/identity";
 import { requesterLabel, type ProjectTicket, type TicketStage } from "@/lib/projectTicketsApi";
+import { markdownPlainText } from "@/lib/markdownPlainText";
 import { cn } from "@/lib/utils";
 import { shownLoadError, TicketError, TicketLabels, TicketLoadError } from "./TicketControls";
 import { TicketShipBlocker } from "./TicketShipBlocker";
 import { TicketStageBadge } from "./TicketStageAppearance";
-import { TicketAgentIcons } from "./TicketAgentIcons";
+import { TicketAgentIcons, TicketAgentIconsSpace } from "./TicketAgentIcons";
 import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoardRequesterFilter";
 import { NEEDS_YOU_PARAM } from "./needsYouFilter";
 import { ticketPanelSearch } from "./projectHomeNavigation";
@@ -243,11 +244,11 @@ function TicketBoard({
         </div>
         <DragOverlay dropAnimation={null}>
           {dragged && (
-            <div>
+            <div className="relative">
               <div className="flex flex-col gap-3 rounded-xl border bg-card p-3.5 shadow-lg">
                 <TicketCardContent ticket={dragged} />
               </div>
-              <TicketAgentIcons ticket={dragged} />
+              <TicketAgentIcons ticket={dragged} className="absolute right-3.5 bottom-3" />
             </div>
           )}
         </DragOverlay>
@@ -463,7 +464,7 @@ function TicketCard({
     disabled,
   });
   return (
-    <div>
+    <div className="relative">
       <Link
         ref={setNodeRef}
         {...attributes}
@@ -492,7 +493,8 @@ function TicketCard({
       >
         <TicketCardContent ticket={ticket} />
       </Link>
-      <TicketAgentIcons ticket={ticket} />
+      {/* Over the card's footer corner, outside the link so each icon stays its own control. */}
+      <TicketAgentIcons ticket={ticket} className="absolute right-3.5 bottom-3" />
     </div>
   );
 }
@@ -536,7 +538,11 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           </time>
           <TicketRequester ticket={ticket} />
         </div>
-        <TicketCommentCount ticket={ticket} />
+        <div className="flex shrink-0 items-center gap-2">
+          <TicketCommentCount ticket={ticket} />
+          {/* Room for the agent icons drawn over this corner. */}
+          <TicketAgentIconsSpace ticket={ticket} />
+        </div>
       </div>
     </>
   );
@@ -549,11 +555,13 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
  */
 function TicketStatusLine({ ticket }: { ticket: ProjectTicket }) {
   const comment = ticket.latest_comment;
-  const text =
+  const source =
     comment?.text ||
     (ticket.latest_update && !isSystemUpdate(ticket.latest_update, ticket.comment_count)
       ? ticket.latest_update
       : null);
+  // A two-line preview: Markdown marks would show as literal characters.
+  const text = source ? markdownPlainText(source) : null;
   if (!text) return null;
   const author = comment
     ? comment.by_person
