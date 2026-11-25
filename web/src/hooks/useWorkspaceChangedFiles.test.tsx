@@ -2819,3 +2819,33 @@ describe("useTrailingInvalidate", () => {
     expect(invalidate).toHaveBeenCalledTimes(1);
   });
 });
+
+it("skips re-rendering for a grid session's streamed frames", () => {
+  stubChatStore(null, "idle");
+  const entry = conversationRegistry.acquire("grid-session");
+  let renders = 0;
+  const view = renderHook(
+    () => {
+      renders += 1;
+      return useSessionActive("grid-session");
+    },
+    {
+      wrapper: ({ children }) => (
+        <CapabilitiesProvider
+          info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: true } }}
+        >
+          {children}
+        </CapabilitiesProvider>
+      ),
+    },
+  );
+  act(() => entry.setState({ sessionStatus: "running" }));
+  expect(view.result.current).toBe(true);
+  const before = renders;
+  act(() => entry.setState({ blocks: [] }));
+  act(() => entry.setState({ blocks: [] }));
+  expect(renders).toBe(before);
+  expect(view.result.current).toBe(true);
+  view.unmount();
+  conversationRegistry.clear();
+});

@@ -25,7 +25,7 @@ import {
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
-import { useConversationEntryState } from "@/hooks/useConversationEntryState";
+import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
@@ -38,9 +38,12 @@ export function useSessionActive(conversationId: string | undefined): boolean {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const gridEnabled = isFeatureEnabled(useServerInfo(), "grid_sessions_display_ui");
-  const scoped = useConversationEntryState(gridEnabled ? (conversationId ?? null) : null);
-  const status =
-    conversationId === focusedId ? sessionStatus : gridEnabled ? scoped.sessionStatus : null;
+  // Select only the status: the whole entry state changes on every streamed frame.
+  const scopedStatus = useConversationEntryValue(
+    gridEnabled ? (conversationId ?? null) : null,
+    (state) => state.sessionStatus,
+  );
+  const status = conversationId === focusedId ? sessionStatus : gridEnabled ? scopedStatus : null;
   return !!conversationId && (status === "running" || status === "waiting");
 }
 
