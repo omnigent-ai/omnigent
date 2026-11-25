@@ -137,3 +137,31 @@ export function sortPullRequestsByStatus<T extends PullRequestStatusSummary>(
       PRESENTATION[getPullRequestStatus(right)].priority,
   );
 }
+
+/** Where a PR is in its lifecycle, independent of checks and mergeability. */
+export type PullRequestLifecycle = "open" | "draft" | "merged" | "closed";
+
+export const PULL_REQUEST_LIFECYCLES: readonly PullRequestLifecycle[] = [
+  "open",
+  "draft",
+  "merged",
+  "closed",
+];
+
+export const PULL_REQUEST_LIFECYCLE_LABELS: Record<PullRequestLifecycle, string> = {
+  open: "Open",
+  draft: "Draft",
+  merged: "Merged",
+  closed: "Closed",
+};
+
+/** `null` until the host has reported the PR's state. */
+export function getPullRequestLifecycle(
+  pr: Pick<PullRequestStatusSummary, "state" | "is_draft"> | null | undefined,
+): PullRequestLifecycle | null {
+  const state = pr?.state?.toUpperCase();
+  if (state === "MERGED") return "merged";
+  if (state === "CLOSED") return "closed";
+  if (state === "OPEN") return pr?.is_draft ? "draft" : "open";
+  return null;
+}
