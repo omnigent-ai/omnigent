@@ -41,6 +41,10 @@ import {
   type StreamdownProps,
 } from "streamdown";
 
+import { rehypeGitHubAlerts } from "@/lib/githubAlerts";
+import { rehypeGitHubEmoji } from "@/lib/githubEmojiShortcodes";
+import { rehypeMentions, rehypePullRequestReferences } from "@/lib/pullRequestReferences/rehype";
+
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
 import { mermaidOptionsForTheme } from "./MermaidError";
 import { FullscreenIcon, isMermaidPre, MermaidBlock, MERMAID_NO_FULLSCREEN } from "./MermaidBlock";
@@ -334,6 +338,11 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   markFileLinks?: boolean;
   /** Show GitHub attachment images and videos, e.g. in a PR description; others stay blocked. */
   allowGitHubAttachmentImages?: boolean;
+  /**
+   * Render GitHub's own Markdown, e.g. in PR comments: `:shortcode:` emoji, in raw HTML too, and
+   * `> [!NOTE]`-style alerts. Code stays as typed.
+   */
+  githubMarkdown?: boolean;
   /** Preserve workspace images for a session-aware, authenticated component override. */
   allowWorkspaceImages?: boolean;
   /** Allow shell drafts in assistant chat when a shell action is available. */
@@ -755,6 +764,23 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   );
 }
 
+// GitHub's alerts, emoji, PR references and mentions add their own markup, so they run once
+// sanitizing and hardening are done. Each stays as written where no PR view's components draw it.
+const GITHUB_MARKDOWN_REHYPE_PLUGINS = [
+  rehypeGitHubAlerts,
+  rehypeGitHubEmoji,
+  rehypePullRequestReferences,
+  rehypeMentions,
+];
+const GITHUB_SECURE_STREAMDOWN_REHYPE_PLUGINS = [
+  ...SECURE_STREAMDOWN_REHYPE_PLUGINS,
+  ...GITHUB_MARKDOWN_REHYPE_PLUGINS,
+];
+const GITHUB_ATTACHMENT_MARKDOWN_REHYPE_PLUGINS = [
+  ...GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS,
+  ...GITHUB_MARKDOWN_REHYPE_PLUGINS,
+];
+
 export const MessageResponse = memo(
   ({
     className,
@@ -762,6 +788,7 @@ export const MessageResponse = memo(
     controls,
     markFileLinks = false,
     allowGitHubAttachmentImages = false,
+    githubMarkdown = false,
     allowWorkspaceImages = false,
     allowShellCommands = false,
     isStreaming = false,
@@ -791,7 +818,10 @@ export const MessageResponse = memo(
     if (allowWorkspaceImages) rehypePlugins = WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS;
     else if (markFileLinks) rehypePlugins = FILE_LINK_STREAMDOWN_REHYPE_PLUGINS;
     else if (allowGitHubAttachmentImages)
-      rehypePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
+      rehypePlugins = githubMarkdown
+        ? GITHUB_ATTACHMENT_MARKDOWN_REHYPE_PLUGINS
+        : GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
+    else if (githubMarkdown) rehypePlugins = GITHUB_SECURE_STREAMDOWN_REHYPE_PLUGINS;
 
     return (
       <MarkdownErrorBoundary source={props.children}>

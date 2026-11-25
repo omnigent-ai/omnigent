@@ -126,6 +126,27 @@ describe("MessageResponse", () => {
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
   });
 
+  describe("githubMarkdown", () => {
+    const body = "> [!NOTE]\n> Ships today :tada:\n\n`:tada:` stays typed";
+
+    it("renders GitHub's alerts and emoji shortcodes, and leaves code as typed", async () => {
+      const { container } = render(
+        <MessageResponse githubMarkdown allowGitHubAttachmentImages>
+          {body}
+        </MessageResponse>,
+      );
+      expect(await screen.findByText("Note")).toHaveClass("markdown-alert-title");
+      expect(container.querySelector(".markdown-alert-note")).toHaveTextContent("Ships today 🎉");
+      expect(screen.getByText(":tada:", { selector: "code" })).toBeTruthy();
+    });
+
+    it("keeps plain Markdown without it", async () => {
+      const { container } = render(<MessageResponse>{body}</MessageResponse>);
+      expect(await screen.findByText(/Ships today :tada:/)).toBeTruthy();
+      expect(container.querySelector(".markdown-alert")).toBeNull();
+    });
+  });
+
   describe("allowGitHubAttachmentImages", () => {
     const asset = "https://github.com/user-attachments/assets/381e47c8-e3f1-4c3e-9b3d-aac5cfb3557b";
 
