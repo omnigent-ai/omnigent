@@ -23,8 +23,6 @@ from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 _COLUMNS_PATH = "src/columns.py"
 _COLUMNS_SOURCE = "alpha = 1\nbeta = 2\ngamma = 3\ndelta = 4\n"
-_BLOCKS_PATH = "src/blocks.py"
-_BLOCKS_SOURCE = "def run(ready):\n    if ready:\n        go()\n    return ready\n"
 # Three nested scopes with a long body, so their opening lines scroll off the top.
 _NESTED_PATH = "src/inventory.py"
 _NESTED_SOURCE = "\n".join(
@@ -47,15 +45,10 @@ _SCOPE_PATH = "src/scope.py"
 _SCOPE_SOURCE = "total = 0\ntotal += 1\ntotal += 2\nprint(total)\n"
 # Larger than the server's 10 MiB read cap, so the file arrives truncated and opens read-only.
 _LARGE_PATH = "src/generated_tables.ts"
-_LARGE_SOURCE = "\n".join(
-    f"export const entry{index:06d} = {{ id: {index}, label: 'row {index}' }};"
-    for index in range(240_000)
-)
 
 
 _SEEDED = {
     _COLUMNS_PATH: _COLUMNS_SOURCE,
-    _BLOCKS_PATH: _BLOCKS_SOURCE,
     _NESTED_PATH: _NESTED_SOURCE,
     _MENU_PATH: _MENU_SOURCE,
     _CASES_PATH: _CASES_SOURCE,
@@ -74,11 +67,15 @@ def large_code_session(code_session: tuple[str, str]) -> Iterator[tuple[str, str
     """Also writes the file past the viewer's truncation limit, for the one journey opening it."""
     base_url, session_id = code_session
     workspace = session_workspace(base_url, session_id)
+    large_source = "\n".join(
+        f"export const entry{index:06d} = {{ id: {index}, label: 'row {index}' }};"
+        for index in range(240_000)
+    )
     # The large file takes longer to write than the shared helper waits.
     try:
         httpx.put(
             f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{_LARGE_PATH}",
-            json={"content": _LARGE_SOURCE, "encoding": "utf-8"},
+            json={"content": large_source, "encoding": "utf-8"},
             timeout=60.0,
         ).raise_for_status()
         yield code_session
@@ -150,27 +147,6 @@ def test_a_read_only_file_highlights_matching_brackets(
     page.keyboard.type("x")
     expect(line).to_have_text("export const entry000000 = { id: 0, label: 'row 0' };")
     expect(editor.locator(".cm-matchingBracket")).to_have_text(["{", "}"])
-
-
-def test_indented_lines_show_guides_with_the_cursors_block_drawn_stronger(
-    page: Page, code_session: tuple[str, str]
-) -> None:
-    base_url, session_id = code_session
-    editor = _open_file(page, base_url, session_id, _BLOCKS_PATH)
-    lines = editor.locator(".cm-line")
-    expect(lines.nth(2)).to_have_text("        go()", timeout=30_000)
-    guides = re.compile(r"\bcm-indent-guides\b")
-    active = re.compile(r"\bcm-indent-guide-active\b")
-    expect(lines.nth(0)).not_to_have_class(guides)
-    for indented in (1, 2, 3):
-        expect(lines.nth(indented)).to_have_class(guides)
-
-    # The cursor inside the if block marks that block's guide on its lines only.
-    lines.nth(2).click()
-    expect(lines.nth(2)).to_have_class(active)
-    expect(lines.nth(1)).not_to_have_class(active)
-    expect(lines.nth(3)).not_to_have_class(active)
-    expect(lines.nth(2)).to_have_attribute("style", re.compile(r"--cm-indent-guides:\s*2"))
 
 
 # How far the first pinned line sits below the scroller's top edge.

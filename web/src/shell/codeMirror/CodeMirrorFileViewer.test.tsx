@@ -99,6 +99,16 @@ describe("CodeMirrorFileViewer", () => {
     expect(container.querySelector(".cm-lineNumbers")).toHaveTextContent("123");
   });
 
+  it("draws indent guides on the file's indented lines only", () => {
+    const { container } = renderViewer({
+      content: "if ready:\n    go()\n        deeper()\ndone()",
+    });
+    const counts = [...container.querySelectorAll<HTMLElement>(".cm-line")].map((line) =>
+      line.style.getPropertyValue("--cm-indent-guides"),
+    );
+    expect(counts).toEqual(["", "1", "2", ""]);
+  });
+
   it("highlights syntax with the GitHub themes' token colors in both modes", async () => {
     const { container } = renderViewer();
     await waitFor(() => expect(container.querySelector(".cm-shiki-token")).not.toBeNull());

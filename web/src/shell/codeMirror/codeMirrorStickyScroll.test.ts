@@ -43,7 +43,6 @@ describe("revealStickyLine", () => {
   });
 });
 
-/** Frames a test advances by hand: callbacks requested now run when the next frame starts. */
 describe("pinnedLineAt", () => {
   let view: EditorView | undefined;
   let other: EditorView | undefined;
