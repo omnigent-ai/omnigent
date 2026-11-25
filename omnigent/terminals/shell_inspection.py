@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import re
 import shutil
+import sys
 import time
 import unicodedata
 from collections.abc import Awaitable, Callable, Sequence
@@ -33,6 +35,12 @@ MAX_CONCURRENT_INSPECTIONS = 4
 # Largest output either subprocess may print before the answer is unknown.
 _MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
+
+# Interactive shells a terminal may run. Any other program, such as an editor or a REPL,
+# answers unknown, since only a shell's lack of children says nothing else is running.
+ELIGIBLE_SHELLS = frozenset({"bash", "zsh", "sh", "dash", "ksh", "mksh", "fish", "tcsh", "csh"})
+# Linux keeps this many characters of an executable's name in ``comm``.
+_LINUX_COMM_LENGTH = 15
 
 _ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
 
@@ -148,26 +156,66 @@ def _shell_name(command: str) -> str | None:
     return sanitize_command_name(command.rsplit("/", 1)[-1])
 
 
+# One launcher between the pane and the shell: the names its ``comm`` may show.
+LauncherStep = frozenset[str]
+
+
+def _launcher_python_names() -> LauncherStep:
+    """The names the sandbox's Python launcher, ``sys.executable``, shows in ``comm``."""
+    names: set[str] = set()
+    for path in (sys.executable, os.path.realpath(sys.executable)):
+        name = sanitize_command_name(os.path.basename(path))
+        if name:
+            names.update({name, name[:_LINUX_COMM_LENGTH]})
+    return frozenset(names)
+
+
+def sandbox_launchers(backend_type: str | None) -> tuple[LauncherStep, ...]:
+    """The processes the framework starts between a terminal's pane and its shell, in order.
+
+    Unsandboxed, the pane's process is the shell. Under bubblewrap it is ``bwrap``, then its
+    namespace init ``bwrap``, then the Python launcher. Under another backend the pane's
+    process is the Python launcher, since ``sandbox-exec`` execs into it.
+
+    :param backend_type: The terminal's active sandbox backend, e.g. ``"linux_bwrap"``, or
+        ``None`` when it isn't sandboxed.
+    :returns: One set of accepted names per launcher, outermost first.
+    """
+    if backend_type is None:
+        return ()
+    python = _launcher_python_names()
+    if backend_type == "linux_bwrap":
+        return (frozenset({"bwrap"}), frozenset({"bwrap"}), python)
+    return (python,)
+
+
 def inspect_shell(
     snapshot: str,
     *,
     tmux_server_pid: int,
     pane_pid: int,
     shell_command: str,
+    launchers: Sequence[LauncherStep] = (),
 ) -> ShellInspection:
     """Decide whether the pane's login shell is idle, from one ``ps`` snapshot.
 
     The pane's process must be a child of its own tmux server in this same snapshot, else its
-    pid may have been reused and the answer is unknown. The login shell is the first process
-    under the pane named for the terminal's command: the pane's own process, or one below a
-    sandbox launcher. It is idle when nothing runs under it, and nothing else runs anywhere
-    under the pane besides the launchers between the pane and the shell. A sandbox's namespace
-    init adopts work its shell left running, and closing the pane ends that work too.
+    pid may have been reused and the answer is unknown. The terminal's command must be an
+    :data:`ELIGIBLE_SHELLS` shell, and the pane must hold exactly the framework's
+    ``launchers`` and then that shell; any other layout, such as a program that replaced the
+    shell and started another, answers unknown. The shell is idle
+    when nothing runs under it and nothing else runs anywhere under the pane. A sandbox's
+    namespace init adopts work its shell left running, and closing the pane ends that too.
+
+    Idle means no other process, not that the shell waits at its prompt: a loop of shell
+    builtins, such as ``while :; do :; done``, starts no process and reads idle.
 
     :param snapshot: ``ps -e -o`` :data:`PS_COLUMNS` output.
     :param tmux_server_pid: The pane's tmux server, from tmux's ``#{pid}``.
     :param pane_pid: The pane's process, from tmux's ``#{pane_pid}``.
     :param shell_command: The terminal's configured command, e.g. ``"zsh"``.
+    :param launchers: The framework's launchers between the pane and the shell, from
+        :func:`sandbox_launchers`.
     :returns: The inspection; only names and counts, never a row.
     """
     rows = _parse(snapshot)
@@ -183,28 +231,23 @@ def inspect_shell(
         children.setdefault(row.ppid, []).append(row)
 
     wanted = _shell_name(shell_command)
-    shell: _Row | None = None
-    queue = [pane]
-    while queue and shell is None:
-        row = queue.pop(0)
-        if sanitize_command_name(row.comm) == wanted:
-            shell = row
-        else:
-            queue.extend(children.get(row.pid, []))
+    if wanted is None or wanted not in ELIGIBLE_SHELLS:
+        return UNKNOWN
+    shell = _shell_after_launchers(pane, launchers, wanted, children)
     if shell is None:
         return UNKNOWN
 
     jobs = _descendants(shell, children)
-    launchers: set[int] = set()
+    chain: set[int] = set()
     row = shell
     while row.pid != pane.pid:
         row = by_pid[row.ppid]
-        launchers.add(row.pid)
+        chain.add(row.pid)
     job_pids = {job.pid for job in jobs}
     strays = [
         row
         for row in _descendants(pane, children)
-        if row.pid not in launchers and row.pid != shell.pid and row.pid not in job_pids
+        if row.pid not in chain and row.pid != shell.pid and row.pid not in job_pids
     ]
     answer = _jobs_answer(shell, jobs, children)
     if not strays:
@@ -214,6 +257,34 @@ def inspect_shell(
         first = min(strays, key=lambda row: row.pid)
         return ShellInspection(ShellState.BUSY, sanitize_command_name(first.comm), None)
     return ShellInspection(ShellState.BUSY, answer.foreground, None)
+
+
+def _shell_after_launchers(
+    pane: _Row,
+    launchers: Sequence[LauncherStep],
+    shell_name: str,
+    children: dict[int, list[_Row]],
+) -> _Row | None:
+    """The shell at the end of exactly ``launchers`` from the pane, or ``None``.
+
+    The pane's process is the first launcher, or the shell when there are none. Each next
+    step must be the one child with an accepted name. A launcher's other children are work
+    the shell left running, which keeps the pane busy rather than hiding the shell.
+    """
+    steps = [*launchers, frozenset({shell_name})]
+    if sanitize_command_name(pane.comm) not in steps[0]:
+        return None
+    row = pane
+    for step in steps[1:]:
+        named = [
+            child
+            for child in children.get(row.pid, [])
+            if sanitize_command_name(child.comm) in step
+        ]
+        if len(named) != 1:
+            return None
+        row = named[0]
+    return row
 
 
 def _descendants(root: _Row, children: dict[int, list[_Row]]) -> list[_Row]:
@@ -289,6 +360,7 @@ async def read_pane_shell(
     tmux_command: Sequence[str],
     target: str,
     shell_command: str,
+    launchers: Sequence[LauncherStep] = (),
 ) -> ShellInspection:
     """Inspect one tmux pane's shell: tmux's server and pane pids, then one ``ps`` snapshot.
 
@@ -299,6 +371,8 @@ async def read_pane_shell(
         ``["/usr/bin/tmux", "-S", "/tmp/omnigent-terminal-x/tmux.sock", "-f", "/dev/null"]``.
     :param target: The pane's tmux target, e.g. ``"main"``.
     :param shell_command: The terminal's configured command, e.g. ``"zsh"``.
+    :param launchers: The framework's launchers between the pane and the shell, from
+        :func:`sandbox_launchers`.
     :returns: The inspection.
     """
     path = trusted_search_path()
@@ -319,6 +393,7 @@ async def read_pane_shell(
             tmux_server_pid=int(fields[0]),
             pane_pid=int(fields[1]),
             shell_command=shell_command,
+            launchers=launchers,
         )
 
     try:

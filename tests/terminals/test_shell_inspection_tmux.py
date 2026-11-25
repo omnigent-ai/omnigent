@@ -15,7 +15,7 @@ import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
-from omnigent.terminals.shell_inspection import ShellInspection, ShellState
+from omnigent.terminals.shell_inspection import UNKNOWN, ShellInspection, ShellState
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="needs a real tmux on PATH")
 
@@ -83,20 +83,39 @@ async def test_reads_a_real_shell_idle_then_busy_then_idle_again(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "bash_terminal", [pytest.param(None, id="plain"), _SANDBOXED], indirect=True
-)
+@pytest.mark.parametrize("bash_terminal", [_SANDBOXED], indirect=True)
 async def test_work_the_shell_left_running_keeps_a_sandboxed_shell_busy(
-    bash_terminal: TerminalInstance, request: pytest.FixtureRequest
+    bash_terminal: TerminalInstance,
 ) -> None:
-    sandboxed = "bubblewrap" in request.node.callspec.id
     await _settles_on(bash_terminal, _IDLE)
     # A subshell's background job outlives it: the shell is back at its prompt, but under a
     # sandbox the job stays beneath the pane, adopted by the namespace's init.
     await bash_terminal.send("(sleep 4 &)")
-    if sandboxed:
-        await _settles_on(bash_terminal, ShellInspection(ShellState.BUSY, "sleep", None))
+    await _settles_on(bash_terminal, ShellInspection(ShellState.BUSY, "sleep", None))
     await _settles_on(bash_terminal, _IDLE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bash_terminal", [pytest.param(None, id="plain")], indirect=True)
+async def test_a_program_that_replaced_the_shell_and_runs_another_bash_is_unknown(
+    bash_terminal: TerminalInstance, tmp_path: Path
+) -> None:
+    await _settles_on(bash_terminal, _IDLE)
+    # The inner bash marks that it runs with a builtin, then spins on builtins, so it has no
+    # children of its own to give it away.
+    marker = tmp_path / "inner-bash-runs"
+    inner = f": > {shlex.quote(str(marker))}; SECONDS=0; while ((SECONDS < 20)); do :; done"
+    program = f"import subprocess; subprocess.run(['bash', '-c', {inner!r}])"
+    await bash_terminal.send(f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}")
+
+    async def inner_bash_runs() -> None:
+        while not marker.exists():
+            await asyncio.sleep(0.05)
+
+    await asyncio.wait_for(inner_bash_runs(), timeout=30)
+    for _ in range(5):
+        assert await bash_terminal.inspect_shell() == UNKNOWN
+        await asyncio.sleep(0.1)
 
 
 @pytest.mark.asyncio

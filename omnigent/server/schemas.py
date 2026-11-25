@@ -849,8 +849,9 @@ class TerminalShellState(BaseModel):
     """
 
     state: Literal["idle", "busy", "unknown"] = Field(
-        description="`idle`: only the login shell runs. `busy`: something else does. "
-        "`unknown`: it couldn't be told in time; treat it as busy."
+        description="`idle`: only the login shell runs, with no other process; a loop of "
+        "shell builtins still reads idle. `busy`: something else does. `unknown`: it "
+        "couldn't be told in time, or the terminal doesn't run a shell; treat it as busy."
     )
     foreground: str | None = Field(
         default=None,

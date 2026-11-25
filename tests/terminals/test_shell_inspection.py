@@ -40,8 +40,20 @@ def snapshot(*rows: tuple[int, int, int, int, str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def inspect(text: str, *, shell: str = "bash", pane: int = PANE) -> ShellInspection:
-    return inspect_shell(text, tmux_server_pid=TMUX, pane_pid=pane, shell_command=shell)
+# The launchers a bubblewrap terminal shows, with the Python launcher named as probed.
+BWRAP_LAUNCHERS = (frozenset({"bwrap"}), frozenset({"bwrap"}), frozenset({"python"}))
+
+
+def inspect(
+    text: str,
+    *,
+    shell: str = "bash",
+    pane: int = PANE,
+    launchers: tuple[frozenset[str], ...] = (),
+) -> ShellInspection:
+    return inspect_shell(
+        text, tmux_server_pid=TMUX, pane_pid=pane, shell_command=shell, launchers=launchers
+    )
 
 
 # The layouts below are ones read from real panes, plain and sandboxed, renumbered.
@@ -68,17 +80,21 @@ SANDBOX_SLEEP_AND_ADOPTED = (
 
 
 @pytest.mark.parametrize(
-    ("text", "expected"),
+    ("text", "launchers", "expected"),
     [
-        (PLAIN_IDLE, ShellInspection(ShellState.IDLE)),
-        (PLAIN_SLEEP, ShellInspection(ShellState.BUSY, "sleep", 0)),
-        (SANDBOX_IDLE, ShellInspection(ShellState.IDLE)),
+        (PLAIN_IDLE, (), ShellInspection(ShellState.IDLE)),
+        (PLAIN_SLEEP, (), ShellInspection(ShellState.BUSY, "sleep", 0)),
+        (SANDBOX_IDLE, BWRAP_LAUNCHERS, ShellInspection(ShellState.IDLE)),
         # No job control under the sandbox: the shell's child is named, jobs aren't counted.
-        (SANDBOX_SLEEP, ShellInspection(ShellState.BUSY, "sleep", None)),
+        (SANDBOX_SLEEP, BWRAP_LAUNCHERS, ShellInspection(ShellState.BUSY, "sleep", None)),
         # Work beneath the pane but outside the shell's tree still ends with the pane.
-        (SANDBOX_ADOPTED, ShellInspection(ShellState.BUSY, "sleep", None)),
-        (SANDBOX_UNDER_LAUNCHER, ShellInspection(ShellState.BUSY, "node", None)),
-        (SANDBOX_SLEEP_AND_ADOPTED, ShellInspection(ShellState.BUSY, "sleep", None)),
+        (SANDBOX_ADOPTED, BWRAP_LAUNCHERS, ShellInspection(ShellState.BUSY, "sleep", None)),
+        (SANDBOX_UNDER_LAUNCHER, BWRAP_LAUNCHERS, ShellInspection(ShellState.BUSY, "node", None)),
+        (
+            SANDBOX_SLEEP_AND_ADOPTED,
+            BWRAP_LAUNCHERS,
+            ShellInspection(ShellState.BUSY, "sleep", None),
+        ),
     ],
     ids=[
         "plain idle",
@@ -90,8 +106,10 @@ SANDBOX_SLEEP_AND_ADOPTED = (
         "sandbox job and adopted work",
     ],
 )
-def test_reads_the_probed_pane_layouts(text: str, expected: ShellInspection) -> None:
-    assert inspect(text) == expected
+def test_reads_the_probed_pane_layouts(
+    text: str, launchers: tuple[frozenset[str], ...], expected: ShellInspection
+) -> None:
+    assert inspect(text, launchers=launchers) == expected
 
 
 def test_names_the_foreground_job_and_counts_background_jobs() -> None:
@@ -132,11 +150,72 @@ def test_a_login_shell_and_a_full_path_shell_command_match() -> None:
         (snapshot((PANE, TMUX, PANE, PANE, "Ss+", "fish")), PANE),
         # Garbage in.
         ("not a ps line\n1 2 3\n", PANE),
+        # The shell exec'd a program that runs another bash: the inner bash isn't the pane's.
+        (
+            snapshot(
+                (PANE, TMUX, PANE, PANE, "Ss+", "python3"),
+                (300, PANE, PANE, PANE, "R+", "bash"),
+            ),
+            PANE,
+        ),
     ],
-    ids=["pane gone", "pid reused", "no tmux row", "no shell", "garbage"],
+    ids=[
+        "pane gone",
+        "pid reused",
+        "no tmux row",
+        "no shell",
+        "garbage",
+        "program replaced the shell",
+    ],
 )
 def test_answers_unknown_when_the_pane_can_not_be_trusted(text: str, pane: int) -> None:
     assert inspect(text, pane=pane) == ShellInspection(ShellState.UNKNOWN)
+
+
+def test_a_shell_below_a_program_that_is_not_a_launcher_is_unknown() -> None:
+    # Inside the sandbox, a program between the launcher and the shell may be work of its own.
+    text = snapshot(
+        (PANE, TMUX, PANE, PANE, "Ss+", "bwrap"),
+        (201, PANE, 201, -1, "Ss", "bwrap"),
+        (202, 201, 201, -1, "S", "python"),
+        (203, 202, 201, -1, "S", "node"),
+        (204, 203, 201, -1, "R", "bash"),
+    )
+    assert inspect(text, launchers=BWRAP_LAUNCHERS) == UNKNOWN
+    # The sandbox's layout read without its launchers isn't trusted either.
+    assert inspect(SANDBOX_IDLE) == UNKNOWN
+
+
+@pytest.mark.parametrize("command", ["vim", "python3", "sleep", "/usr/bin/less", "bash -l"])
+def test_a_terminal_that_runs_another_program_is_unknown_even_when_childless(
+    command: str,
+) -> None:
+    name = command.rsplit("/", 1)[-1]
+    text = snapshot((PANE, TMUX, PANE, PANE, "Ss+", name))
+    assert inspect(text, shell=command) == UNKNOWN
+
+
+@pytest.mark.parametrize("command", ["bash", "/bin/zsh", "sh", "fish"])
+def test_a_childless_eligible_shell_is_idle(command: str) -> None:
+    name = command.rsplit("/", 1)[-1]
+    assert inspect(snapshot((PANE, TMUX, PANE, PANE, "Ss+", name)), shell=command) == (
+        ShellInspection(ShellState.IDLE)
+    )
+
+
+def test_a_loop_of_shell_builtins_starts_no_process_and_reads_idle() -> None:
+    # Idle means nothing else runs, not that the shell waits at its prompt.
+    running_a_builtin_loop = snapshot((PANE, TMUX, PANE, PANE, "Rs+", "bash"))
+    assert inspect(running_a_builtin_loop) == ShellInspection(ShellState.IDLE)
+
+
+def test_the_launchers_follow_the_terminals_sandbox() -> None:
+    assert shell_inspection.sandbox_launchers(None) == ()
+    bwrap = shell_inspection.sandbox_launchers("linux_bwrap")
+    assert bwrap[:2] == (frozenset({"bwrap"}), frozenset({"bwrap"}))
+    python = os.path.basename(sys.executable)
+    assert python in bwrap[2] or python[:15] in bwrap[2]
+    assert shell_inspection.sandbox_launchers("darwin_seatbelt") == (bwrap[2],)
 
 
 def test_processes_outside_the_pane_never_reach_the_answer() -> None:
@@ -240,13 +319,15 @@ def test_rebuilds_an_answer_from_the_expected_fields_only(
 
 @pytest.fixture
 async def pane_process() -> AsyncIterator[int]:
-    """A real ``sleep`` child of this process, standing in for a pane under its tmux server."""
-    process = subprocess.Popen(["sleep", "30"])
+    """A real ``sh`` child of this process waiting on its input, standing in for a pane's shell."""
+    process = subprocess.Popen(["sh"], stdin=subprocess.PIPE)
     try:
         yield process.pid
     finally:
         process.kill()
         process.wait()
+        assert process.stdin is not None
+        process.stdin.close()
 
 
 def _fake_tmux(pids: str) -> list[str]:
@@ -258,14 +339,16 @@ def _fake_tmux(pids: str) -> list[str]:
 async def test_reads_a_real_process_table_for_the_pane(pane_process: int) -> None:
     # The pane is this process's child, so this process plays its tmux server.
     tmux = _fake_tmux(f"{os.getpid()} {pane_process}")
-    assert await read_pane_shell(tmux, "main", "sleep") == ShellInspection(ShellState.IDLE)
+    assert await read_pane_shell(tmux, "main", "sh") == ShellInspection(ShellState.IDLE)
+    # The same childless process read as another configured program can't be called idle.
+    assert await read_pane_shell(tmux, "main", "vim") == UNKNOWN
 
 
 @pytest.mark.asyncio
 async def test_a_pane_that_is_not_the_tmux_servers_child_is_unknown(pane_process: int) -> None:
     # Same pane, but tmux claims another server: as if the pid had been reused.
     tmux = _fake_tmux(f"1 {pane_process}")
-    assert await read_pane_shell(tmux, "main", "sleep") == UNKNOWN
+    assert await read_pane_shell(tmux, "main", "sh") == UNKNOWN
 
 
 @pytest.mark.asyncio

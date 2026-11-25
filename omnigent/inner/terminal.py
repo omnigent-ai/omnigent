@@ -2928,9 +2928,13 @@ class TerminalInstance:
 
         :returns: The inspection, never a pid or another process's row.
         """
-        from omnigent.terminals.shell_inspection import read_pane_shell
+        from omnigent.terminals.shell_inspection import read_pane_shell, sandbox_launchers
 
-        return await read_pane_shell(self._tmux_base_cmd(), self.tmux_target, self.command)
+        policy = self.sandbox_policy
+        backend = policy.backend_type if policy is not None and policy.active else None
+        return await read_pane_shell(
+            self._tmux_base_cmd(), self.tmux_target, self.command, sandbox_launchers(backend)
+        )
 
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """
