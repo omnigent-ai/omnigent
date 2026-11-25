@@ -125,8 +125,16 @@ import {
   restoreReplyDraft,
   serializeReplyDraft,
   snapshotReplyDraft,
+  type ReplyDraft,
 } from "@/lib/replyDraft";
-import { hasReplyQuoteLines, unweaveReplyDraft, weaveReplyDraft } from "@/lib/replyDraftDocument";
+import {
+  appendQuoteToDocument,
+  hasReplyQuoteLines,
+  mapComposerSelection,
+  replaceTrailingText,
+  typedDocumentFor,
+  unweaveReplyDraft,
+} from "@/lib/replyDraftDocument";
 import {
   buildOutgoingMessage,
   carriesMessageContext,
@@ -214,19 +222,26 @@ function loadRecalledGridText(childId: string, text: string): void {
   setSessionMentions(childId, recalled.mentions);
 }
 
-/** The draft as an editor holds it: with the single document, its quotes are folded into the text. */
+/** The composer's draft with its pending seed quote first, as the editor shows it. */
+function seededDraftOf(composer: SideChatComposerDraft, seed: string | undefined): ReplyDraft {
+  const seeded =
+    seed === undefined ? [] : [{ id: "seed", before: composer.seedBefore ?? "", text: seed }];
+  return { quotes: [...seeded, ...(composer.quotes ?? [])], text: composer.text };
+}
+
+/** The document the single editor shows for `composer`: the typed one while it still describes the draft. */
+function documentOf(composer: SideChatComposerDraft, seed: string | undefined): string {
+  return typedDocumentFor(seededDraftOf(composer, seed), composer.document);
+}
+
+/** The draft as an editor holds it: with the single document, the whole document is its text. */
 function editorDraftOf(
   draft: SideChatComposerDraft,
   seed: string | undefined,
   singleDocument: boolean,
 ): SideChatComposerDraft {
   if (!singleDocument) return draft;
-  const seeded = seed === undefined ? [] : [{ id: "seed", before: "", text: seed }];
-  return {
-    ...draft,
-    quotes: [],
-    text: weaveReplyDraft({ quotes: [...seeded, ...(draft.quotes ?? [])], text: draft.text }),
-  };
+  return { ...draft, quotes: [], text: documentOf(draft, seed) };
 }
 
 /**
@@ -708,10 +723,17 @@ export function SideChatPane({
           <SelectionPopup
             containerRef={transcriptRef}
             onReply={(text) => {
-              useChatStore.getState().updateSideChatComposer(composerKey, (current) => ({
-                ...current,
-                ...appendReplyQuote(current, text),
-              }));
+              const seed = pending ? useChatStore.getState().sideChatDrafts[childId] : undefined;
+              useChatStore.getState().updateSideChatComposer(composerKey, (current) => {
+                // The document is kept whichever engine shows it, so a single-document switch finds it.
+                const next = appendReplyQuote(current, text);
+                const newest = next.quotes[next.quotes.length - 1]!;
+                return {
+                  ...current,
+                  ...next,
+                  document: appendQuoteToDocument(documentOf(current, seed), newest),
+                };
+              });
             }}
           />
         )}
@@ -1032,15 +1054,19 @@ function SideChatComposer({
   // The engine ChatComposer renders, which lags the request while a switch waits on the user.
   const [renderedEngine, setRenderedEngine] = useState(composerEngine);
   const singleDocument = renderedEngine === "codemirror";
-  const inputValue = singleDocument ? weaveReplyDraft({ quotes, text }) : text;
-  // The editor's whole document: its quote lines are the quotes, the seed among them.
+  const inputValue = singleDocument
+    ? documentOf(composer ?? EMPTY_SIDE_CHAT_COMPOSER, quote)
+    : text;
+  // The whole document is kept as typed, and a change from code edits it, so separators the user
+  // removed stay removed. Changes read the store as it is now, since several can land before a render.
   const applyDocument = useCallback(
     (document: string) => {
       const parsed = unweaveReplyDraft(document);
       const seedQuote = parsed.quotes.find((replyQuote) => replyQuote.id === "seed");
-      if (quote !== undefined && seedQuote === undefined) clearSideChatDraft(childId);
+      const pendingText = pending ? useChatStore.getState().sideChatDrafts[childId] : undefined;
+      if (pendingText !== undefined && seedQuote === undefined) clearSideChatDraft(childId);
       // An undo that brings the seed line back brings its pending text back too.
-      if (pending && quote === undefined && seedQuote !== undefined) {
+      if (pending && pendingText === undefined && seedQuote !== undefined) {
         useChatStore.setState((state) => ({
           sideChatDrafts: { ...state.sideChatDrafts, [childId]: seedQuote.text },
         }));
@@ -1049,35 +1075,47 @@ function SideChatComposer({
         ...current,
         quotes: parsed.quotes.filter((replyQuote) => replyQuote.id !== "seed"),
         text: parsed.text,
+        seedBefore: seedQuote?.before,
+        document,
       }));
     },
-    [childId, clearSideChatDraft, composerKey, pending, quote, updateComposer],
+    [childId, clearSideChatDraft, composerKey, pending, updateComposer],
   );
   const setText = useCallback(
     (next: string) => {
-      // Text with quote lines replaces the whole document; plain text only the trailing text.
-      if (singleDocument && hasReplyQuoteLines(next)) applyDocument(next);
-      else updateComposer(composerKey, (current) => ({ ...current, text: next }));
+      if (!singleDocument) {
+        updateComposer(composerKey, (current) => ({ ...current, text: next }));
+        return;
+      }
+      const current =
+        useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
+      const seed = pending ? useChatStore.getState().sideChatDrafts[childId] : undefined;
+      // Text with quote lines is the whole document; plain text replaces only the trailing text.
+      applyDocument(
+        hasReplyQuoteLines(next) ? next : replaceTrailingText(documentOf(current, seed), next),
+      );
     },
-    [applyDocument, composerKey, singleDocument, updateComposer],
+    [applyDocument, childId, composerKey, pending, singleDocument, updateComposer],
   );
   const [activeTextId, setActiveTextId] = useState<string | null>(null);
+  // A single document has no quote inputs, so no quote can be the active one.
+  const activeId = singleDocument ? null : activeTextId;
   const editText = useCallback(
     (id: string | null, next: string) => {
       if (id === null && singleDocument) {
         setText(next);
         return;
       }
-      updateComposer(composerKey, (current) =>
-        id === null
-          ? { ...current, text: next }
-          : {
-              ...current,
-              quotes: current.quotes?.map((replyQuote) =>
-                replyQuote.id === id ? { ...replyQuote, before: next } : replyQuote,
-              ),
-            },
-      );
+      updateComposer(composerKey, (current) => {
+        if (id === null) return { ...current, text: next };
+        if (id === "seed") return { ...current, seedBefore: next };
+        return {
+          ...current,
+          quotes: current.quotes?.map((replyQuote) =>
+            replyQuote.id === id ? { ...replyQuote, before: next } : replyQuote,
+          ),
+        };
+      });
     },
     [composerKey, setText, singleDocument, updateComposer],
   );
@@ -1118,7 +1156,7 @@ function SideChatComposer({
   }, [composer, quote, reconcileVoiceEdits, singleDocument]);
   const activeText = singleDocument
     ? inputValue
-    : (composer?.quotes?.find((replyQuote) => replyQuote.id === activeTextId)?.before ?? text);
+    : (composer?.quotes?.find((replyQuote) => replyQuote.id === activeId)?.before ?? text);
   const setActiveText = useCallback(
     (next: string) => {
       const current = editorDraftOf(
@@ -1128,19 +1166,19 @@ function SideChatComposer({
       );
       reconcileVoiceEdits(current);
       const before =
-        activeTextId === null
+        activeId === null
           ? current.text
-          : current.quotes?.find((item) => item.id === activeTextId)?.before;
+          : current.quotes?.find((item) => item.id === activeId)?.before;
       if (before === undefined) return;
-      const previous = voiceEditsRef.current.get(activeTextId);
-      voiceEditsRef.current.set(activeTextId, {
+      const previous = voiceEditsRef.current.get(activeId);
+      voiceEditsRef.current.set(activeId, {
         before: previous?.before ?? before,
         after: next,
         quoteIds: previous?.quoteIds ?? new Set(current.quotes?.map((item) => item.id)),
       });
-      editText(activeTextId, next);
+      editText(activeId, next);
     },
-    [activeTextId, composerKey, editText, quote, reconcileVoiceEdits, singleDocument],
+    [activeId, composerKey, editText, quote, reconcileVoiceEdits, singleDocument],
   );
   const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
   // An engine switch replaces every input; keep the active one current even without focus.
@@ -1613,9 +1651,17 @@ function SideChatComposer({
         engine={composerEngine}
         dictating={dictation.hasInterim}
         draftKey={childId}
-        activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
+        activeInputId={activeId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
         onRenderedEngineChange={setRenderedEngine}
+        mapSelection={(selection, from) =>
+          mapComposerSelection(
+            documentOf(composer ?? EMPTY_SIDE_CHAT_COMPOSER, quote),
+            selection,
+            from,
+            COMPOSER_TAIL_INPUT_ID,
+          )
+        }
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}

@@ -85,6 +85,7 @@ import { useCanStartSideChat, usePermissions, useSessionOwner } from "@/hooks/us
 import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
+import { mapComposerSelection } from "@/lib/replyDraftDocument";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
 import { useTypeToComposer } from "@/hooks/useTypeToComposer";
@@ -2390,6 +2391,7 @@ function ComposerImpl(
     replaceText,
     appendQuote,
     removeQuote,
+    document: composerDocument,
   } = useReplyDraft({ singleDocument });
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -3935,10 +3937,10 @@ function ComposerImpl(
     replyQuoteInsertedRef.current = false;
     const textarea = tailTextareaRef.current;
     if (!textarea) return;
-    if (!isMobileRef.current) textarea.focus({ preventScroll: true });
-    // The empty line after the new quote: the start of the tail, which the editor shows at the end.
+    // The tail is empty after a quote, so its end is the line right after the new quote.
     const tailEnd = textarea.value.length;
     textarea.setSelectionRange(tailEnd, tailEnd);
+    if (!isMobileRef.current) textarea.focus({ preventScroll: true });
     const inputArea = composerTargetElement(textarea).closest("[data-composer-input-area]");
     if (inputArea) inputArea.scrollTop = inputArea.scrollHeight;
     onGrowthRef.current?.();
@@ -4533,6 +4535,9 @@ function ComposerImpl(
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
         onRenderedEngineChange={setRenderedEngine}
+        mapSelection={(selection, from) =>
+          mapComposerSelection(composerDocument, selection, from, COMPOSER_TAIL_INPUT_ID)
+        }
         input={{
           ref: bindTailTextarea,
           value: singleDocument ? value : draft.text,

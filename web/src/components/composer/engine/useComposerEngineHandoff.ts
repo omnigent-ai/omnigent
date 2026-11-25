@@ -19,6 +19,8 @@ interface HandoffSnapshot {
   scrollTop: number;
   scrollLeft: number;
   focused: boolean;
+  /** The engine the selection was taken in, which a mapping needs to carry it across. */
+  engine: ComposerInputEngine;
 }
 
 function composerInputs(root: HTMLElement): Element[] {
@@ -37,7 +39,11 @@ function inputWithId(root: HTMLElement, inputId: string): Element | undefined {
  * The active input: the focused one, else `activeId` while it still exists, else the last
  * input (the tail), which is where the composer's owner falls back to as well.
  */
-function capture(root: HTMLElement, activeId: string | null): HandoffSnapshot | null {
+function capture(
+  root: HTMLElement,
+  activeId: string | null,
+  engine: ComposerInputEngine,
+): HandoffSnapshot | null {
   const inputs = composerInputs(root);
   const focused = inputs.find((input) => input === document.activeElement);
   const remembered = activeId === null ? undefined : inputWithId(root, activeId);
@@ -52,6 +58,7 @@ function capture(root: HTMLElement, activeId: string | null): HandoffSnapshot | 
     scrollTop: target.scrollTop,
     scrollLeft: target.scrollLeft,
     focused: focused !== undefined,
+    engine,
   };
 }
 
@@ -77,6 +84,24 @@ export interface ComposerHandoffOptions {
   activeInputId?: string | null;
   /** The active input after a switch, now on the new engine, so the owner's refs stay current. */
   onActiveInputChange?: (target: ComposerTextTarget) => void;
+  /** Called with the engine a switch renders, in the same layout pass that starts the switch. */
+  onRenderedEngineChange?: (engine: ComposerInputEngine) => void;
+  /**
+   * Carries a selection from the engine it was taken in to the one after a switch, when the two
+   * engines lay out their inputs differently. Without it the selection is restored as it is.
+   */
+  mapSelection?: (
+    selection: HandoffSelection,
+    from: ComposerInputEngine,
+    to: ComposerInputEngine,
+  ) => HandoffSelection;
+}
+
+/** An input's id and selection, as a mapping sees them. */
+export interface HandoffSelection {
+  inputId: string;
+  selectionStart: number;
+  selectionEnd: number;
 }
 
 /**
@@ -92,6 +117,8 @@ export function useComposerEngineHandoff(
     draftKey = null,
     activeInputId,
     onActiveInputChange,
+    onRenderedEngineChange,
+    mapSelection,
   }: ComposerHandoffOptions = {},
 ): ComposerInputEngine {
   const [rendered, setRendered] = useState(requested);
@@ -103,9 +130,13 @@ export function useComposerEngineHandoff(
   const lastFocusedId = useRef<string | null>(null);
   const pending = useRef<HandoffSnapshot | null>(null);
   const onActiveInputChangeRef = useRef(onActiveInputChange);
+  const onRenderedEngineChangeRef = useRef(onRenderedEngineChange);
+  const mapSelectionRef = useRef(mapSelection);
   const activeInputIdRef = useRef(activeInputId);
   useLayoutEffect(() => {
     onActiveInputChangeRef.current = onActiveInputChange;
+    onRenderedEngineChangeRef.current = onRenderedEngineChange;
+    mapSelectionRef.current = mapSelection;
     activeInputIdRef.current = activeInputId;
     switchWaiting.current = requested !== rendered;
   });
@@ -171,8 +202,10 @@ export function useComposerEngineHandoff(
     const root = rootRef.current;
     const activeId =
       activeInputIdRef.current === undefined ? lastFocusedId.current : activeInputIdRef.current;
-    pending.current = root ? capture(root, activeId) : null;
+    pending.current = root ? capture(root, activeId, rendered) : null;
     setRendered(requested);
+    // Same pass as the switch, so the owner's state and the engine render together.
+    onRenderedEngineChangeRef.current?.(requested);
   }, [requested, rendered, dictating, busyTick, draftKey, rootRef]);
 
   // After the new engine has mounted its inputs, put the user back where they were.
@@ -181,9 +214,11 @@ export function useComposerEngineHandoff(
     const root = rootRef.current;
     pending.current = null;
     if (!snapshot || !root) return;
+    const mapped = mapSelectionRef.current?.(snapshot, snapshot.engine, rendered);
+    const landing = mapped ? { ...snapshot, ...mapped } : snapshot;
     // The restored input stays the remembered one for the next switch, focused or not.
-    lastFocusedId.current = snapshot.inputId;
-    const target = restore(root, snapshot);
+    lastFocusedId.current = landing.inputId;
+    const target = restore(root, landing);
     if (target) onActiveInputChangeRef.current?.(target);
   }, [rendered, rootRef]);
 

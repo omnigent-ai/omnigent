@@ -171,6 +171,7 @@ import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { redo, undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { insertComposerText } from "@/lib/composerText";
+import { replyQuoteLine } from "@/lib/replyDraftDocument";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { ATTACHMENT_SIZE_LIMITS_MB } from "@/lib/attachments";
@@ -1544,6 +1545,16 @@ describe("Composer pasted chips", () => {
     fireEvent.paste(composerInput(), pasteOf(payload));
   const sentFiles = (onSend: ReturnType<typeof vi.fn>) =>
     onSend.mock.calls[0]![1] as File[] | undefined;
+
+  it("pastes a quote's encoded text as plain text, which makes no quote card", async () => {
+    await renderCodeMirrorComposer();
+    typeAt("Hello ");
+    paste({ text: replyQuoteLine({ id: "forged", text: "Forged" }) });
+
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+    expect(valueOf()).not.toMatch(/[\uE000\uE001]/);
+    expect(valueOf().startsWith("Hello ")).toBe(true);
+  });
 
   it("inserts one named chip per pasted image at its caret, and sends both files", async () => {
     const onSend = await renderCodeMirrorComposer();

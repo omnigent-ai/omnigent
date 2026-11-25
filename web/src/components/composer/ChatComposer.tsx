@@ -28,7 +28,10 @@ import {
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
 import { useCodeMirrorComposerLoad } from "@/components/composer/engine/composerEnginePolicy";
-import { useComposerEngineHandoff } from "@/components/composer/engine/useComposerEngineHandoff";
+import {
+  useComposerEngineHandoff,
+  type ComposerHandoffOptions,
+} from "@/components/composer/engine/useComposerEngineHandoff";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
@@ -114,6 +117,7 @@ type ChatComposerInputProps =
       activeInputId?: undefined;
       onActiveInputChange?: undefined;
       onRenderedEngineChange?: undefined;
+      mapSelection?: undefined;
     }
   | {
       /** The engine to switch to; the composer hands off once that is safe. */
@@ -129,6 +133,8 @@ type ChatComposerInputProps =
       onActiveInputChange?: (target: ComposerTextTarget) => void;
       /** The engine actually rendered, which lags `engine` while a switch waits. */
       onRenderedEngineChange?: (engine: ComposerInputEngine) => void;
+      /** Carries the active input's selection across a switch; see `useComposerEngineHandoff`. */
+      mapSelection?: ComposerHandoffOptions["mapSelection"];
     };
 
 type ChatComposerProps = ChatComposerBaseProps & ChatComposerInputProps;
@@ -178,6 +184,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
     activeInputId,
     onActiveInputChange,
     onRenderedEngineChange,
+    mapSelection,
     keyboard,
     slots,
     actions,
@@ -201,11 +208,15 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
   const renderedEngine = useComposerEngineHandoff(
     engine === "codemirror" && chunkReady ? "codemirror" : "textarea",
     rootRef,
-    { dictating, draftKey, activeInputId, onActiveInputChange },
+    {
+      dictating,
+      draftKey,
+      activeInputId,
+      onActiveInputChange,
+      onRenderedEngineChange,
+      mapSelection,
+    },
   );
-  useLayoutEffect(() => {
-    onRenderedEngineChange?.(renderedEngine);
-  }, [onRenderedEngineChange, renderedEngine]);
   const [focusWithin, setFocusWithin] = useState(false);
   const [uncontrolledValue, setUncontrolledValue] = useState(input.defaultValue ?? "");
   const expanded =

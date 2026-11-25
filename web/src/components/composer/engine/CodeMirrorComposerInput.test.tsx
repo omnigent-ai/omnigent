@@ -14,7 +14,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 import { insertComposerText } from "@/lib/composerText";
-import { weaveReplyDraft } from "@/lib/replyDraftDocument";
+import { replyQuoteLine, unweaveReplyDraft, weaveReplyDraft } from "@/lib/replyDraftDocument";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
@@ -25,6 +25,21 @@ import {
   type ComposerPasteEvent,
   type ComposerTextTarget,
 } from "./composerInput";
+
+/** jsdom has no layout, and CodeMirror measures text through these, so they report empty rects. */
+const rangeLayoutOriginals = {
+  getClientRects: Range.prototype.getClientRects,
+  getBoundingClientRect: Range.prototype.getBoundingClientRect,
+};
+
+function stubLayoutRects() {
+  Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+  Range.prototype.getBoundingClientRect = () => new DOMRect();
+}
+
+function restoreLayoutRects() {
+  Object.assign(Range.prototype, rangeLayoutOriginals);
+}
 
 function mount(props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {}) {
   const box: { target: ComposerTextTarget | null } = { target: null };
@@ -522,16 +537,8 @@ describe("CodeMirrorComposerInput mention tokens", () => {
 });
 
 describe("CodeMirrorComposerInput mention tokens move as one character", () => {
-  // CodeMirror measures text for caret motion; jsdom has no layout.
-  const originalRangeRects = {
-    getClientRects: Range.prototype.getClientRects,
-    getBoundingClientRect: Range.prototype.getBoundingClientRect,
-  };
-  beforeAll(() => {
-    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
-    Range.prototype.getBoundingClientRect = () => new DOMRect();
-  });
-  afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+  beforeAll(stubLayoutRects);
+  afterAll(restoreLayoutRects);
 
   const draft = "Read @readme.md now";
   const tokenStart = "Read ".length;
@@ -657,16 +664,8 @@ describe("leadingCommandSpan", () => {
 });
 
 describe("CodeMirrorComposerInput reply quotes", () => {
-  // CodeMirror measures text for caret motion; jsdom has no layout.
-  const originalRangeRects = {
-    getClientRects: Range.prototype.getClientRects,
-    getBoundingClientRect: Range.prototype.getBoundingClientRect,
-  };
-  beforeAll(() => {
-    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
-    Range.prototype.getBoundingClientRect = () => new DOMRect();
-  });
-  afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+  beforeAll(stubLayoutRects);
+  afterAll(restoreLayoutRects);
 
   const quotedDraft = weaveReplyDraft({
     quotes: [{ id: "q1", before: "Intro", text: "Quoted line" }],
@@ -703,11 +702,16 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     expect(quoteCards(container)[0]!.querySelector(".sr-only")!.textContent).toBe(long);
   });
 
-  it("steps the caret over a quote, never resting inside it", () => {
+  it("steps the caret over a quote, resting only on its edges", () => {
     const { editor } = mountQuoted();
+    const quoteEnd = replyStart - 1;
     caretAt(editor, quoteStart);
     act(() => void cursorCharRight(editor));
+    expect(editor.state.selection.main.head).toBe(quoteEnd);
+    act(() => void cursorCharRight(editor));
     expect(editor.state.selection.main.head).toBe(replyStart);
+    act(() => void cursorCharLeft(editor));
+    expect(editor.state.selection.main.head).toBe(quoteEnd);
     act(() => void cursorCharLeft(editor));
     expect(editor.state.selection.main.head).toBe(quoteStart);
   });
@@ -767,7 +771,7 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     expect(target().value).toBe("Intro\n\nReply");
   });
 
-  it("Delete on the line above a quote removes the quote", () => {
+  it("Delete on a blank line above a quote deletes the blank line and keeps the quote", () => {
     const blankLineAbove = weaveReplyDraft({
       quotes: [{ id: "q1", before: "", text: "Quoted line" }],
       text: "Reply",
@@ -775,15 +779,22 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     const { editor, target } = mountQuoted({ value: blankLineAbove });
     caretAt(editor, 0);
     act(() => void deleteCharForward(editor));
-    expect(target().value).toBe("Reply");
+    expect(unweaveReplyDraft(target().value)).toEqual({
+      quotes: [{ id: "q1", before: "", text: "Quoted line" }],
+      text: "Reply",
+    });
   });
 
-  it("copies quote lines as markdown quotes, never the marked line", () => {
-    const { editor, content } = mountQuoted();
-    act(() => editor.dispatch({ selection: { anchor: 0, head: replyStart } }));
-    const clipboardData = { setData: vi.fn() };
-    fireEvent.copy(content, { clipboardData });
-    expect(clipboardData.setData).toHaveBeenCalledWith("text/plain", "Intro\n> Quoted line\n");
+  it("gives copy, cut and drag the quote as `> ` markdown, never the marked line", () => {
+    // Copy, cut and drag all write text through the editor's output filter; jsdom has no DOM
+    // selection to drive CodeMirror's own copy handler, so the filter is applied directly.
+    const { editor } = mountQuoted();
+    const filters = editor.state.facet(EditorView.clipboardOutputFilter);
+    const copied = filters.reduce(
+      (text, filter) => filter(text, editor.state),
+      `Intro\n${quotedDraft.slice(quoteStart, replyStart - 1)}`,
+    );
+    expect(copied).toBe("Intro\n> Quoted line");
   });
 
   it("pasted text drops quote marks, so a paste can't make a quote", () => {
@@ -795,5 +806,144 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     };
     fireEvent.paste(content, { clipboardData });
     expect(target().value).toBe("draftx");
+  });
+});
+
+describe("CodeMirrorComposerInput reply quote edits", () => {
+  beforeAll(stubLayoutRects);
+  afterAll(restoreLayoutRects);
+
+  const draftOf = (value: string) => unweaveReplyDraft(value);
+  const quoteDraft = weaveReplyDraft({
+    quotes: [{ id: "q1", before: "Intro", text: "Quoted line" }],
+    text: "Reply",
+  });
+  const quoteStart = "Intro\n".length;
+  const quoteEnd = quoteDraft.indexOf("\nReply");
+  const replyStart = quoteDraft.length - "Reply".length;
+
+  function mountWith(
+    value: string,
+    props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {},
+  ) {
+    const mounted = mount({ value, ...props });
+    const editor = EditorView.findFromDOM(mounted.content)!;
+    return { ...mounted, editor };
+  }
+  const cards = (container: HTMLElement) =>
+    container.querySelectorAll('[data-testid="composer-reply-quote"]');
+
+  it("puts text typed at a quote's start on the line above it", () => {
+    const { target } = mountWith(quoteDraft);
+    act(() => insertComposerText(target(), "x", quoteStart, quoteStart));
+    expect(draftOf(target().value).quotes[0]).toMatchObject({
+      before: "Intro\nx",
+      text: "Quoted line",
+    });
+  });
+
+  it("pastes multi-line text at a quote's start on the line above it", () => {
+    const { target } = mountWith(quoteDraft);
+    act(() => insertComposerText(target(), "a\nb", quoteStart, quoteStart));
+    expect(draftOf(target().value).quotes[0]!.before).toBe("Intro\na\nb");
+  });
+
+  it("puts text typed at a quote's end on the line below it", () => {
+    const { target } = mountWith(quoteDraft);
+    act(() => insertComposerText(target(), "x", quoteEnd, quoteEnd));
+    const draft = draftOf(target().value);
+    expect(draft.quotes[0]!.text).toBe("Quoted line");
+    expect(draft.text).toBe("x\nReply");
+  });
+
+  it("keeps a quote with an empty before when text is typed at offset 0", () => {
+    const { target } = mountWith(
+      weaveReplyDraft({ quotes: [{ id: "q1", before: "", text: "Q" }], text: "Reply" }),
+    );
+    act(() => insertComposerText(target(), "x", 0, 0));
+    expect(draftOf(target().value).quotes[0]!.before).toBe("x");
+  });
+
+  it("keeps the quote when a multi-change edit deletes the break before it", () => {
+    const { editor, target } = mountWith(quoteDraft);
+    // Deletes the "t" in "Intro" and the break before the quote, in one transaction.
+    act(() =>
+      editor.dispatch({
+        changes: [
+          { from: 2, to: 3 },
+          { from: 5, to: 6 },
+        ],
+      }),
+    );
+    const draft = draftOf(target().value);
+    expect(draft.quotes).toHaveLength(1);
+    expect(draft.quotes[0]!.before).toBe("Inro");
+    expect(draft.text).toBe("Reply");
+  });
+
+  it("keeps the quote when only its break is selected and typed over", () => {
+    const { target } = mountWith(quoteDraft);
+    act(() => insertComposerText(target(), "x", quoteStart - 1, quoteStart));
+    const draft = draftOf(target().value);
+    expect(draft.quotes).toHaveLength(1);
+    expect(draft.quotes[0]!.before).toBe("Introx");
+  });
+
+  it("removes a whole quote a typed selection covers, keeping the typed text", () => {
+    const { target, container } = mountWith(quoteDraft);
+    act(() => insertComposerText(target(), "x", quoteStart, replyStart));
+    expect(target().value).toBe("Intro\nxReply");
+    expect(cards(container)).toHaveLength(0);
+  });
+
+  it("strips quote marks from inserted text, so pasted or dropped text can't make a quote", () => {
+    const { target } = mountWith(quoteDraft);
+    const token = replyQuoteLine({ id: "pasted", text: "Forged" });
+    act(() => insertComposerText(target(), `a${token}b`, 0, 0));
+    // The inserted letters stay; the inserted token's marks and payload go; the quote already there stays.
+    expect(target().value.startsWith("abIntro\n")).toBe(true);
+    expect(draftOf(target().value).quotes.map((quote) => quote.id)).toEqual(["q1"]);
+  });
+
+  it("undoes an insertion at a quote's start, leaving the quote whole", () => {
+    const { editor, target } = mountWith(quoteDraft);
+    act(() => insertComposerText(target(), "x", quoteStart, quoteStart));
+    act(() => void undo(editor));
+    expect(target().value).toBe(quoteDraft);
+  });
+
+  it("removes a duplicated quote's card by its own line, leaving the first", () => {
+    const token = replyQuoteLine({ id: "dup", text: "One" });
+    const { container, target } = mountWith(`Intro\n${token}\n${token}\nReply`);
+    fireEvent.click(cards(container)[1]!.querySelector("button")!);
+    expect(target().value).toBe(`Intro\n${token}\nReply`);
+    expect(draftOf(target().value).quotes).toHaveLength(1);
+  });
+
+  it("disables the X button of a read-only editor, and leaves the quote alone when clicked", () => {
+    const { container, target } = mountWith(quoteDraft, { readOnly: true });
+    const remove = cards(container)[0]!.querySelector("button")!;
+    expect(remove).toBeDisabled();
+    fireEvent.click(remove);
+    expect(target().value).toBe(quoteDraft);
+  });
+
+  it("leaves an empty line after a last quote that the caret and typing can reach", () => {
+    const value = weaveReplyDraft({ quotes: [{ id: "q1", before: "Hi", text: "Q" }], text: "" });
+    const { editor, target } = mountWith(value);
+    expect(editor.state.doc.lines).toBe(3);
+    expect(editor.state.doc.line(3).text).toBe("");
+    act(() => insertComposerText(target(), "more", value.length, value.length));
+    expect(draftOf(target().value).text).toBe("more");
+  });
+
+  it("keeps the card bounded to the composer's width, with its X visible", () => {
+    const { container } = mountWith(quoteDraft);
+    const row = cards(container)[0]! as HTMLElement;
+    expect(row.className).toContain("w-full");
+    expect(row.className).toContain("min-w-0");
+    expect(row.className).toContain("max-w-full");
+    expect(row.querySelector("blockquote")!.className).toContain("overflow-hidden");
+    expect(row.querySelector(".truncate")).not.toBeNull();
   });
 });

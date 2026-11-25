@@ -1265,6 +1265,10 @@ export interface SideChatComposerDraft {
   quotes?: ReplyQuote[];
   text: string;
   files: File[];
+  /** The text above the pending seed quote, which the seed keeps while it exists. */
+  seedBefore?: string;
+  /** The editor's document as the user left it, on the CodeMirror engine; see `typedDocumentFor`. */
+  document?: string;
 }
 
 /** The empty composer, shared so an absent entry keeps a stable identity (a

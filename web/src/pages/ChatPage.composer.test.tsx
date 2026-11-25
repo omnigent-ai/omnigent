@@ -7584,6 +7584,34 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
     );
   });
 
+  it("keeps the caret where the user had it when the editor replaces the textarea", async () => {
+    let finishLoad!: (module: typeof CodeMirrorModule) => void;
+    const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
+      finishLoad = resolve;
+    });
+    resetCodeMirrorComposerLoadForTests(() => loaded);
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...composerProps()} ref={ref} />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    act(() => ref.current?.appendReplyQuote("First point"));
+    fireEvent.change(textarea(), { target: { value: "My answer" } });
+    textarea().setSelectionRange(3, 3);
+
+    act(() => finishLoad(CodeMirrorModule));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = EditorView.findFromDOM(screen.getByLabelText("Message the agent"))!;
+    // The tail's offset 3 is the document's offset that the tail's start plus 3 names.
+    expect(editor.state.selection.main.head).toBe(editor.state.doc.length - "My answer".length + 3);
+  });
+
   it("keeps the textarea free of the editor's document while a composition holds the switch", async () => {
     let finishLoad!: (module: typeof CodeMirrorModule) => void;
     const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
@@ -7653,10 +7681,21 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
   });
 
-  it("keeps the textarea engine's quote blocks", () => {
+  it("shows the textarea and its quote blocks while the editor's chunk is still loading", () => {
+    resetCodeMirrorComposerLoadForTests(() => new Promise(() => {}));
     const ref = createRef<ComponentRef<typeof Composer>>();
-    render(<Composer {...composerProps()} ref={ref} />);
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...composerProps()} ref={ref} />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
     act(() => ref.current?.appendReplyQuote("First point"));
+    fireEvent.change(textarea(), { target: { value: "My reply" } });
+
+    expect(textarea().value).toBe("My reply");
+    expect(textarea().value).not.toContain(REPLY_QUOTE_MARK);
     expect(screen.getByTestId("composer-reply-blocks")).toBeInTheDocument();
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
   });

@@ -8,20 +8,29 @@ import {
   type ReplyDraft,
   type StoredReplyDraft,
 } from "@/lib/replyDraft";
-import { hasReplyQuoteLines, unweaveReplyDraft, weaveReplyDraft } from "@/lib/replyDraftDocument";
+import {
+  appendQuoteToDocument,
+  hasReplyQuoteLines,
+  removeReplyQuoteLine,
+  replaceTrailingText,
+  replyQuoteLineIndex,
+  typedDocumentFor,
+  unweaveReplyDraft,
+} from "@/lib/replyDraftDocument";
 
 interface DraftState {
   draft: ReplyDraft;
   /**
-   * The single editor's document as the user last left it. Kept as typed, since a document can
-   * hold blank lines that weaving the draft would not write. Null after a change made in code.
+   * The single editor's document as the user left it. It keeps what the user typed, such as blank
+   * lines weaving would not write. Null when only code has changed the draft.
    */
   document: string | null;
 }
 
 /**
  * The composer's draft. With `singleDocument` (the CodeMirror engine) the text and its quotes
- * are one document: `value` is that document, and `editText` takes the editor's edits.
+ * are one document: `value` is that document, and `editText` takes the editor's edits. Changes
+ * from code edit the document too, so what the user typed stays as it was.
  * Otherwise each quote is its own input, as the textarea engine shows them.
  */
 export function useReplyDraft({ singleDocument = false }: { singleDocument?: boolean } = {}) {
@@ -31,24 +40,33 @@ export function useReplyDraft({ singleDocument = false }: { singleDocument?: boo
   });
   const draft = state.draft;
   const [activeTextId, focusText] = useState<string | null>(null);
-  const documentValue = useMemo(
-    () => state.document ?? weaveReplyDraft(state.draft),
-    [state.document, state.draft],
-  );
+  const documentValue = typedDocumentFor(draft, state.document);
   const value = singleDocument
     ? documentValue
     : (draft.quotes.find((quote) => quote.id === activeTextId)?.before ?? draft.text);
 
-  const updateDraft = useCallback((update: (current: ReplyDraft) => ReplyDraft) => {
-    setState((current) => ({ draft: update(current.draft), document: null }));
-  }, []);
+  /** Applies `update`; in single-document mode, `updateDocument` applies the same change to the document. */
+  const updateDraft = useCallback(
+    (
+      update: (current: ReplyDraft) => ReplyDraft,
+      updateDocument?: (document: string, next: ReplyDraft) => string,
+    ) => {
+      setState((current) => {
+        const next = update(current.draft);
+        if (!singleDocument || !updateDocument) return { draft: next, document: null };
+        const document = updateDocument(typedDocumentFor(current.draft, current.document), next);
+        return { draft: unweaveReplyDraft(document), document };
+      });
+    },
+    [singleDocument],
+  );
 
   const editText = useCallback(
     (id: string | null, next: SetStateAction<string>) => {
       const update = (text: string) => (typeof next === "function" ? next(text) : next);
       if (singleDocument) {
         setState((current) => {
-          const document = update(current.document ?? weaveReplyDraft(current.draft));
+          const document = update(typedDocumentFor(current.draft, current.document));
           return { draft: unweaveReplyDraft(document), document };
         });
         return;
@@ -74,7 +92,10 @@ export function useReplyDraft({ singleDocument = false }: { singleDocument?: boo
       }
       // Text without quote lines replaces only the trailing text, so a clear keeps the quotes as the textarea does.
       if (typeof next === "string" && !hasReplyQuoteLines(next)) {
-        updateDraft((current) => ({ quotes: current.quotes, text: next }));
+        updateDraft(
+          (current) => ({ quotes: current.quotes, text: next }),
+          (document) => replaceTrailingText(document, next),
+        );
         return;
       }
       editText(null, next);
@@ -87,14 +108,20 @@ export function useReplyDraft({ singleDocument = false }: { singleDocument?: boo
   }, []);
   const appendQuote = useCallback(
     (text: string) => {
-      updateDraft((current) => appendReplyQuote(current, text));
+      updateDraft(
+        (current) => appendReplyQuote(current, text),
+        (document, next) => appendQuoteToDocument(document, next.quotes[next.quotes.length - 1]!),
+      );
       focusText(null);
     },
     [updateDraft],
   );
   const removeQuote = useCallback(
     (id: string) => {
-      updateDraft((current) => removeReplyQuote(current, id));
+      updateDraft(
+        (current) => removeReplyQuote(current, id),
+        (document) => removeReplyQuoteLine(document, replyQuoteLineIndex(document, id)),
+      );
       focusText(null);
     },
     [updateDraft],
@@ -104,6 +131,8 @@ export function useReplyDraft({ singleDocument = false }: { singleDocument?: boo
   return {
     draft,
     value,
+    /** The whole document, whichever engine shows it: the caret maps between engines through it. */
+    document: documentValue,
     setValue,
     fullText: serializeReplyDraft(draft),
     storedReplyDraft,

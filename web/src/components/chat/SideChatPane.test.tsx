@@ -48,6 +48,9 @@ import {
   resetCodeMirrorComposerLoadForTests,
 } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { EditorView } from "@codemirror/view";
+import { undo } from "@codemirror/commands";
+import { weaveReplyDraft } from "@/lib/replyDraftDocument";
 import { insertComposerText } from "@/lib/composerText";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import {
@@ -1148,7 +1151,7 @@ describe("side-chat selection reply", () => {
     selectText(screen.getByText("Ask a question here without affecting the main conversation."));
     fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
 
-    expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
+    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
       text: "",
       files: [],
       quotes: [
@@ -3692,6 +3695,92 @@ describe("side-chat composer engine", () => {
     expect(useChatStore.getState().sideChatComposers[pendingId]?.quotes).toEqual([
       { id: "reply", before: "Introduction", text: "second selection" },
     ]);
+  });
+
+  const pendingId = "pending:quoted";
+  const pendingPane = () =>
+    renderPane(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } }}
+      >
+        <SideChatPane childId={pendingId} />
+      </CapabilitiesProvider>,
+    );
+  const documentOfEditor = () =>
+    EditorView.findFromDOM(screen.getByTestId("side-chat-input"))!.state.doc.toString();
+
+  it("keeps text typed above the seed, as the seed's own text above it", async () => {
+    useChatStore.setState({
+      sideChatDrafts: { [pendingId]: "restore the row" },
+      sideChatComposers: { [pendingId]: { text: "why?", files: [], quotes: [] } },
+    });
+    pendingPane();
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("side-chat-input");
+    act(() => insertComposerText(composerTargetOf(editor)!, "above", 0, 0));
+    expect(useChatStore.getState().sideChatComposers[pendingId]?.seedBefore).toBe("above");
+    expect(useChatStore.getState().sideChatDrafts[pendingId]).toBe("restore the row");
+    expect(editor).toHaveTextContent("above");
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+  });
+
+  it("keeps a blank line deleted between two quotes, and undo brings back the deletion first", async () => {
+    const quotes = [
+      { id: "a", before: "A", text: "one" },
+      { id: "b", before: "", text: "two" },
+    ];
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "end", files: [], quotes } },
+    });
+    renderPane(withFlag(true));
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("side-chat-input");
+    const view = () => EditorView.findFromDOM(editor)!;
+    const [head, firstToken] = weaveReplyDraft({ quotes, text: "end" }).split("\n");
+    // The blank line sits after the first quote's line; it is the line a deletion removes.
+    const blankStart = head!.length + 1 + firstToken!.length + 1;
+    act(() =>
+      insertComposerText(
+        composerTargetOf(editor)!,
+        "!",
+        view().state.doc.length,
+        view().state.doc.length,
+      ),
+    );
+    const withBang = documentOfEditor();
+    act(() => view().dispatch({ changes: { from: blankStart, to: blankStart + 1 } }));
+    const [a, ta, , tb] = weaveReplyDraft({ quotes, text: "end!" }).split("\n");
+    expect(documentOfEditor()).toBe([a, ta, tb, "end!"].join("\n"));
+    act(() => void undo(view()));
+    expect(documentOfEditor()).toBe(withBang);
+    act(() => void undo(view()));
+    expect(documentOfEditor()).toBe(weaveReplyDraft({ quotes, text: "end" }));
+  });
+
+  it("undo brings a removed seed back, with its pending text", async () => {
+    useChatStore.setState({
+      sideChatDrafts: { [pendingId]: "restore the row" },
+      sideChatComposers: {
+        [pendingId]: {
+          text: "why?",
+          files: [],
+          quotes: [{ id: "reply", before: "Introduction", text: "second selection" }],
+        },
+      },
+    });
+    pendingPane();
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[0]!);
+    expect(useChatStore.getState().sideChatDrafts[pendingId]).toBeUndefined();
+    act(() => void undo(EditorView.findFromDOM(screen.getByTestId("side-chat-input"))!));
+    expect(useChatStore.getState().sideChatDrafts[pendingId]).toBe("restore the row");
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
   });
 
   it("writes in CodeMirror and sends a typed question when the flag is on", async () => {
