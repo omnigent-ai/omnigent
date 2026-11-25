@@ -949,8 +949,12 @@ def _live_cursor_model_options() -> list[CursorModelOption]:
 
 
 def _picker_highlighted_row(pane: str) -> str | None:
-    """Return the text of Cursor's currently highlighted picker row."""
-    for line in pane.splitlines():
+    """Return Cursor's highlighted picker row, skipping the ``→ /model <id>`` composer line."""
+    lines = pane.splitlines()
+    header_indexes = [index for index, line in enumerate(lines) if _PICKER_MATCH_MARKER in line]
+    if not header_indexes:
+        return None
+    for line in lines[header_indexes[-1] + 1 :]:
         stripped = line.strip()
         if stripped.startswith("→"):
             return stripped.removeprefix("→").strip()

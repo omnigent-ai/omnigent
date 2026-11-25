@@ -18,6 +18,11 @@ from omnigent.tools.builtins.session_projects import (
     MAX_PROJECT_NAME_LENGTH,
     MAX_SEARCH_LENGTH,
 )
+from omnigent.util.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
+    closed_title,
+)
 
 _DEFAULT_LISTED_SESSIONS = 50
 _SNAPSHOT_PARAMS = {"include_items": "false", "include_liveness": "false"}
@@ -35,6 +40,7 @@ _MAX_LOOKUP_PAGES = 20
 # organizing write (session title/pin/archive, project rename/icon/delete).
 _MOVE_SOURCE_CHECKS = "session_move_source_checks"
 _ORGANIZE_SOURCE_CHECKS = "session_organize_source_checks"
+_ARCHIVE_RUNNER_CHECKS = "session_archive_runner_checks"
 
 
 async def resolve_project_id(
@@ -344,9 +350,15 @@ def _refusal(response: httpx.Response) -> str:
 
 
 async def _updatable_snapshot(
-    client: httpx.AsyncClient, session_id: str, *, set_project: bool
+    client: httpx.AsyncClient, session_id: str, *, set_project: bool, archive_only: bool
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Return ``(snapshot, None)`` for a session this tool may update, else ``(None, error)``."""
+    """
+    Return ``(snapshot, None)`` for a session this tool may update, else ``(None, error)``.
+
+    A sub-agent session follows its parent for every field except archiving,
+    so it is updatable only when *archive_only* (the request is just
+    ``archived: true``).
+    """
     try:
         snapshot = await client.get(
             f"/v1/sessions/{session_id}", params=_SNAPSHOT_PARAMS, timeout=30.0
@@ -363,13 +375,16 @@ async def _updatable_snapshot(
             return None, "only the session's owner can change its project"
         return None, "only the session's owner can update it"
     parent = current.get("parent_session_id")
-    if parent:
+    if parent and not archive_only:
         if set_project:
             return (
                 None,
                 f"sub-agent sessions follow their parent's project; update {parent} instead",
             )
-        return None, f"sub-agent sessions follow their parent; update {parent} instead"
+        return None, (
+            "sub-agent sessions follow their parent; archived: true is the only change "
+            f"that applies to one, otherwise update {parent} instead"
+        )
     representative = (current.get("family") or {}).get("representative_id")
     if set_project and representative and representative != current.get("id"):
         return None, f"this session shares its family's project; update {representative} instead"
@@ -398,6 +413,28 @@ def _session_changes(
     if patch_labels:
         payload["labels"] = patch_labels
     return payload
+
+
+def _close_sub_agent(current: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Add the close markers to a sub-agent archive *payload*, as ``sys_session_close`` does.
+
+    An archived child keeps its title, which holds its parent's unique
+    ``(parent, title)`` slot, so the parent could neither resume nor recreate
+    it. Marking it closed and tombstoning the title frees that name.
+    """
+    # Snapshots hide title tombstones, and a closed label alone does not free the name.
+    closed = {
+        **payload,
+        # Repeated closes still need the server's archive guards and teardown.
+        "archived": True,
+        "labels": {**payload.get("labels", {}), CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+    }
+    title = current.get("title")
+    session_id = current.get("id")
+    if isinstance(title, str) and title and isinstance(session_id, str) and session_id:
+        closed["title"] = closed_title(title, session_id, USER_SESSION_TITLE_MAX_CHARS)
+    return closed
 
 
 async def _patch_session(
@@ -499,6 +536,8 @@ async def execute_session_update(
     so a running session keeps its turn; archiving stops its runner. The calling
     session may archive itself, which the server tears down only after this turn
     ends, but not another session whose teardown would stop its runner mid-turn.
+    A sub-agent session anywhere in the owner's trees can only be archived, which
+    also closes it like ``sys_session_close`` so its parent can reuse its name.
     The calling session is sent as the orchestration source on every write, so
     the server refuses both the update and any project creation from a session
     shared with edit access. A project is created only after the session is
@@ -509,7 +548,8 @@ async def execute_session_update(
     :param client: HTTP client pointed at the Omnigent server.
     :param source_id: The calling session.
     :returns: JSON with ``session_id``, ``status`` and each requested field
-        (``project`` adds ``project_created``), or ``session_id`` and ``error``.
+        (``project`` adds ``project_created``; a sub-agent archive adds
+        ``closed``), or ``session_id`` and ``error``.
     """
     session_id = args.get("session_id")
     if not isinstance(session_id, str) or not session_id:
@@ -549,12 +589,36 @@ async def execute_session_update(
     flag = _MOVE_SOURCE_CHECKS if requested == ["project"] else _ORGANIZE_SOURCE_CHECKS
     if not await _server_checks_source(client, flag):
         return _unchecked_server_error("sys_session_update", "a session")
-    current, error = await _updatable_snapshot(client, canonical, set_project=set_project)
+    current, error = await _updatable_snapshot(
+        client,
+        canonical,
+        set_project=set_project,
+        archive_only=not set_project and changes == {"archived": True},
+    )
     if current is None:
         return json.dumps({"session_id": session_id, "error": error})
+    sub_agent = bool(current.get("parent_session_id"))
+    if sub_agent and archives_itself:
+        return json.dumps(
+            {
+                "session_id": session_id,
+                "error": "a sub-agent session cannot archive itself; the session that "
+                "runs it closes it",
+            }
+        )
+    # Sub-agent archives need both runner ownership checks and inherited-host routing.
+    if sub_agent and not await _server_checks_source(client, _ARCHIVE_RUNNER_CHECKS):
+        return json.dumps(
+            {
+                "session_id": session_id,
+                "error": "this Omnigent server cannot safely archive sub-agent sessions; "
+                "upgrade the server",
+            }
+        )
     if (
         changes.get("archived") is True
         and not archives_itself
+        and not sub_agent
         and await _shares_runner(client, current, source_id)
     ):
         return json.dumps(
@@ -598,6 +662,8 @@ async def execute_session_update(
                     {"session_id": session_id, "error": f"sys_session_update: {exc}"}
                 )
     payload = _session_changes(current, changes, project_id)
+    if sub_agent:
+        payload = _close_sub_agent(current, payload)
     status, error = await _patch_session(client, canonical, payload, headers=headers)
     if error is not None:
         failed: dict[str, Any] = {"session_id": session_id, "error": error}
@@ -610,6 +676,8 @@ async def execute_session_update(
         result["project"] = name or None
         result["project_created"] = created
     result.update(changes)
+    if sub_agent:
+        result["closed"] = True
     if archives_itself and status == "updated":
         result["note"] = (
             "this session is archived; its runner stops once this turn ends, so finish "

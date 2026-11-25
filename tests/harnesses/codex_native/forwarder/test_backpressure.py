@@ -244,6 +244,67 @@ async def test_parent_turn_completion_is_not_delayed_by_subagent_flood(tmp_path:
         ]
 
 
+async def test_parent_snapshot_does_not_wait_for_a_stalled_child_post(tmp_path: Path) -> None:
+    _write_parent_bridge(tmp_path)
+    codex = _StreamingCodexClient()
+    child = _child_thread(0)
+    child_post_started = asyncio.Event()
+    release_child_post = asyncio.Event()
+    parent_idle_received = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if body.get("type") == "external_codex_subagent_start":
+            return _register_child_response(body, request)
+        if (
+            request.url.path == f"/v1/sessions/session_{child}/events"
+            and body.get("type") == "external_conversation_item"
+        ):
+            child_post_started.set()
+            await release_child_post.wait()
+        if _is_parent_idle_status(request.url.path, body):
+            parent_idle_received.set()
+        return httpx.Response(200, json={}, request=request)
+
+    forwarder = _start_forwarder(tmp_path, codex, handler)
+    try:
+        _spawn_children(codex, [child])
+        _emit_command(codex, child, 0)
+        async with asyncio.timeout(5):
+            await child_post_started.wait()
+            codex.emit(
+                _event(
+                    "item/completed",
+                    _PARENT_THREAD,
+                    _PARENT_TURN,
+                    item={
+                        "type": "collabAgentToolCall",
+                        "id": "spawn",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": _PARENT_THREAD,
+                        "receiverThreadIds": [child],
+                        "agentsStates": {child: {"status": "running"}},
+                    },
+                )
+            )
+            codex.emit(
+                _event(
+                    "turn/completed",
+                    _PARENT_THREAD,
+                    _PARENT_TURN,
+                    turn={"id": _PARENT_TURN, "status": "completed", "items": []},
+                )
+            )
+            await parent_idle_received.wait()
+            assert not release_child_post.is_set()
+    finally:
+        release_child_post.set()
+        codex.queue.put_nowait(None)
+        async with asyncio.timeout(5):
+            await forwarder
+
+
 async def test_shutdown_drains_child_questions_before_closing_the_hook_tracker(
     tmp_path: Path,
 ) -> None:

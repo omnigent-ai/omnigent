@@ -123,10 +123,15 @@ const NO_LOCAL_COMMENTS: Comment[] = [];
 export type DiffOptions = React.ComponentProps<typeof FileDiff<ReviewAnnotation>>["options"];
 
 /**
- * Files with more unified diff lines than this wait for "Show diff": FileDiff
+ * Files whose hunks render more unified lines than this wait for "Show diff": FileDiff
  * tokenizes on the main thread (disableWorkerPool), so a huge file freezes the app.
  */
 export const LARGE_DIFF_THRESHOLD = 2000;
+
+/** The unified lines a diff's hunks render; the file's own count also spans collapsed gaps. */
+function renderedLineCount(fileDiff: FileDiffMetadata): number {
+  return fileDiff.hunks.reduce((lines, hunk) => lines + hunk.unifiedLineCount, 0);
+}
 
 /** The active find match on one line, as character offsets into that line's text. */
 export interface FindHighlight {
@@ -337,11 +342,9 @@ export function PullRequestFileSection({
   const renamedFrom =
     fileDiff?.prevName && fileDiff.prevName !== file.path ? fileDiff.prevName : null;
   const pureRename = fileDiff?.type === "rename-pure";
-  const renderingDiff =
-    !!fileDiff &&
-    !pureRename &&
-    seen &&
-    (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
+  const diffLines = fileDiff ? renderedLineCount(fileDiff) : 0;
+  const largeDiffGated = diffLines > LARGE_DIFF_THRESHOLD && !showLargeDiff;
+  const renderingDiff = !!fileDiff && !pureRename && seen && !largeDiffGated;
   // With review off, a saved draft and the conversations stay in their stores, unshown here.
   const anchor = reviewable ? composer.draft.anchor : null;
   const shownThreads = reviewable ? threads : NO_THREADS;
@@ -625,9 +628,9 @@ export function PullRequestFileSection({
           <Loader2Icon className="size-4 animate-spin" />
           Loading diff…
         </div>
-      ) : fileDiff && fileDiff.unifiedLineCount > LARGE_DIFF_THRESHOLD && !showLargeDiff ? (
+      ) : fileDiff && largeDiffGated ? (
         <div className="flex items-center gap-3 p-4 text-ui text-muted-foreground">
-          Large diff — {fileDiff.unifiedLineCount.toLocaleString()} lines
+          Large diff — {diffLines.toLocaleString()} lines
           <button
             type="button"
             className="text-foreground underline-offset-2 hover:underline"

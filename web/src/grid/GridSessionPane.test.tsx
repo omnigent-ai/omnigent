@@ -64,6 +64,8 @@ const fixture = vi.hoisted(() => ({
   renderError: new Error("Grid surface render failed"),
   // Set while a cell's viewer holds unsaved edits and is asking to discard them.
   discardEdits: null as (() => void) | null,
+  // Kills the grid's shell close confirmation requested, by terminal id.
+  deleteTerminal: vi.fn((_terminalId: string) => Promise.resolve()),
   // Sessions the viewer can't edit, and each session's sandbox launch.
   readOnlySessions: [] as string[],
   launches: {} as Record<string, { stage: string; error: null }>,
@@ -166,7 +168,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof TerminalsModule>()),
   useTerminals: () => ({ terminals: fixture.terminals }),
-  useDeleteTerminal: () => ({}),
+  useDeleteTerminal: () => ({ mutateAsync: fixture.deleteTerminal }),
 }));
 vi.mock("./GridSessionsContext", async (original) => ({
   ...(await original<typeof GridSessionsModule>()),
@@ -233,6 +235,44 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     );
   },
 }));
+// The tabs sidebar's routing: off unless a test turns the flag on.
+const tabsRouting = vi.hoisted(() => ({
+  enabled: false,
+  routes: [] as [string, ...unknown[]][],
+  hosts: [] as {
+    conversationId: string;
+    bindsHistory?: boolean;
+    open?: boolean;
+    openTerminalTab?: (key: string) => void;
+  }[],
+}));
+vi.mock("@/shell/workspaceTabsRouting", () => ({
+  useTabsSidebar: () => tabsRouting.enabled,
+  LazyWorkspaceTabsHost: (props: {
+    conversationId: string;
+    bindsHistory?: boolean;
+    open?: boolean;
+    openTerminalTab?: (key: string) => void;
+  }) => {
+    tabsRouting.hosts.push(props);
+    return <aside aria-label="Workspace tabs" data-testid={`tabs-${props.conversationId}`} />;
+  },
+  routeToWorkspaceTabs: async (open: (tabs: Record<string, unknown>) => Promise<unknown>) => {
+    const record =
+      (name: string) =>
+      async (...args: unknown[]) => {
+        tabsRouting.routes.push([name, ...args]);
+        return { ok: true };
+      };
+    await open({
+      isWorkspacePage: (value: string | null) => value === "files" || value === "github",
+      openWorkspacePage: record("openWorkspacePage"),
+      openWorkspaceFileLink: record("openWorkspaceFileLink"),
+      openWorkspaceTerminal: record("openWorkspaceTerminal"),
+      showWorkspacePullRequests: record("showWorkspacePullRequests"),
+    });
+  },
+}));
 vi.mock("@/shell/WorkspacePanel", () => ({
   WorkspacePanel: (props: ComponentProps<typeof WorkspacePanel>) => {
     const [draft, setDraft] = useState("");
@@ -265,6 +305,12 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         <button type="button" onClick={props.onToggleMaximized}>
           Maximize
         </button>
+        <button
+          type="button"
+          onClick={() => props.onCloseTerminals(props.openTerminals, { onConfirmed: vi.fn() })}
+        >
+          Close shells
+        </button>
       </aside>
     );
   },
@@ -286,6 +332,7 @@ afterEach(() => {
   fixture.failedChat = "";
   fixture.failedTerminal = "";
   fixture.discardEdits = null;
+  fixture.deleteTerminal = vi.fn((_terminalId: string) => Promise.resolve());
   fixture.readOnlySessions = [];
   fixture.launches = {};
   fixture.inferenceConfigured = undefined;
@@ -435,6 +482,47 @@ it("asks each cell's viewer before the shell's Close leaves the grid", () => {
   // Discard changes: leaving goes ahead.
   act(() => fixture.discardEdits?.());
   expect(leave).toHaveBeenCalledOnce();
+});
+
+it("closes workspace tabs without asking the viewer again", () => {
+  // The workspace panel asks the file on screen before it closes, once per batch, so the
+  // grid's own close must not ask again and replace that viewer's pending action.
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "close-unguarded", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Open citation"));
+  const workspace = screen.getByTestId("workspace-first");
+  expect(workspace).toHaveTextContent("notes.md");
+  fireEvent.click(first.getByText("Edit file"));
+
+  fireEvent.click(within(workspace).getByText("Close file"));
+  expect(fixture.discardEdits).toBeNull();
+  expect(workspace).toHaveTextContent("No file");
+});
+
+it("asks once before a bulk shell close and kills nothing when cancelled", () => {
+  fixture.terminals = [
+    { id: "terminal_a", name: "a", session: "main", running: true },
+    { id: "terminal_b", name: "b", session: "main", running: true },
+  ];
+  render(twoCellGrid());
+  const workspace = screen.getByTestId("workspace-first");
+
+  fireEvent.click(within(workspace).getByText("Close shells"));
+  expect(screen.getByRole("dialog")).toHaveTextContent("Close 2 shells?");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(fixture.deleteTerminal).not.toHaveBeenCalled();
+
+  fireEvent.click(within(workspace).getByText("Close shells"));
+  fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+  expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
 });
 
 it("opens chat-linked folders and PRs in that pane's workspace", () => {
@@ -848,6 +936,9 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   fireEvent.click(within(first).getByText("Open citation"));
   let workspace = screen.getByRole("complementary", { name: "Workspace" });
   expect(workspace).toHaveAttribute("data-width", "480");
+  const flyoutBoundary = first.closest<HTMLElement>("[data-flyout-boundary]");
+  expect(flyoutBoundary).toBe(screen.getByTestId("session-grid"));
+  expect(flyoutBoundary).not.toContainElement(workspace);
   expect(workspace).toHaveTextContent("notes.md7agent-first");
   expect(workspace).toHaveAttribute("data-end-line", "9");
   fireEvent.change(within(workspace).getByRole("textbox", { name: "File draft" }), {
@@ -991,4 +1082,41 @@ it("keeps a Claude Code sub-agent child's picker disabled, with no PATCH, even w
   expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
   expect(updateSession).not.toHaveBeenCalled();
   view.unmount();
+});
+
+it("shows each cell's sidebar as tabs with the flag on, routing its links there", async () => {
+  tabsRouting.enabled = true;
+  tabsRouting.routes = [];
+  tabsRouting.hosts = [];
+  vi.mocked(selectPullRequestInPanel).mockClear();
+  onTestFinished(() => {
+    tabsRouting.enabled = false;
+    // Later cases assert this reveal was never asked for their cells.
+    vi.mocked(revealFolderInFilesPanel).mockClear();
+  });
+  render(twoCellGrid());
+
+  expect(screen.queryByTestId("workspace-first")).toBeNull();
+  expect(screen.getByTestId("tabs-first")).toBeInTheDocument();
+  // Only the selected cell binds Back and Forward.
+  const latest = (id: string) =>
+    tabsRouting.hosts.filter((host) => host.conversationId === id).at(-1);
+  expect(latest("first")?.bindsHistory).toBe(true);
+  expect(latest("second")?.bindsHistory).toBe(false);
+
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Open citation"));
+  fireEvent.click(first.getByText("Open PR"));
+  fireEvent.click(first.getByText("Open folder"));
+  // A shell the tabs ask for opens in the cell's own tabs.
+  act(() => latest("first")!.openTerminalTab!("terminal:t1"));
+  await waitFor(() =>
+    expect(tabsRouting.routes).toEqual([
+      ["openWorkspaceFileLink", "first", "notes.md", { line: 7, endLine: 9 }, "user"],
+      ["showWorkspacePullRequests", "first", { kind: "pull", url: LINKED_PR, overview: true }],
+      ["openWorkspacePage", "first", "files"],
+      ["openWorkspaceTerminal", "first", "terminal:t1"],
+    ]),
+  );
+  expect(selectPullRequestInPanel).not.toHaveBeenCalled();
 });

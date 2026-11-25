@@ -52,7 +52,11 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    SPAWN_TREE_READ_CAP,
+    ConversationStore,
+    DailyCostState,
+)
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -868,8 +872,43 @@ def build_policy_engine(
         harness = (
             conv.harness_override if conv is not None and conv.harness_override else spec_harness
         )
+        # Price sessions on non-default providers at their configured rate,
+        # not the harness default's. A sub-agent session runs the CHILD
+        # spec's executor, so its auth decides the provider identity.
+        from omnigent.spec.types import ProviderAuth
+
+        _executor = child_spec.executor if child_spec is not None else spec.executor
+        _provider_entry = None
+        if (
+            isinstance(_executor.auth, ProviderAuth)
+            and _executor.auth.name
+            and harness is not None
+        ):
+            try:
+                from omnigent.inference_config import load_runtime_inference_config
+                from omnigent.onboarding.detected import resolve_named_provider
+
+                _provider_entry = resolve_named_provider(
+                    _executor.auth.name, load_runtime_inference_config(provider_config)
+                )
+                if _provider_entry is None:
+                    # A declared provider absent from config silently reverts
+                    # to default-provider pricing; surface the misconfiguration.
+                    _logger.warning(
+                        "session executor names provider %r but it is not "
+                        "configured; pricing falls back to the default provider",
+                        _executor.auth.name,
+                    )
+            except Exception:
+                # Provider resolution must never break policy pricing; fall back
+                # to the default-provider lookup. Warn, not debug: this runs once
+                # per policy build, so a broken config is worth surfacing.
+                _logger.warning("named-provider lookup failed for pricing", exc_info=True)
         token_pricing = fetch_model_pricing_with_provider(
-            initial_model, provider_config=provider_config, harness=harness
+            initial_model,
+            provider_config=provider_config,
+            harness=harness,
+            provider_entry=_provider_entry,
         )
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to
@@ -1215,10 +1254,10 @@ def _load_session_state(
     return dict(conv.session_state)
 
 
-# Page size for walking a spawn tree when summing sub-agent usage.
-# Sub-agent trees are small in practice, but we still paginate so a
-# large tree is not silently truncated (see load_session_usage).
-_SUBTREE_USAGE_PAGE_SIZE = 100
+# Page size for summing a spawn tree's usage: the root plus the sub-agents one
+# bounded tree read covers, so nearly every policy check reads its tree once.
+# Bigger trees still page, so none is silently truncated.
+_SUBTREE_USAGE_PAGE_SIZE = SPAWN_TREE_READ_CAP + 1
 
 # Usage counters summed across a conversation subtree. Restricted to the
 # known numeric keys the PolicyEngine reads so an unexpected key in one

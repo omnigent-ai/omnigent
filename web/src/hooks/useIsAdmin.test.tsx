@@ -3,16 +3,27 @@ import { type PropsWithChildren, useEffect, useState } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import type * as IdentityApi from "@/lib/identity";
 import { useIsAdmin } from "./useIsAdmin";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 
-vi.mock("@/lib/identity", () => ({
+const identityUpdates = vi.hoisted(() => new Set<() => void>());
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityApi>()),
   getCurrentIsAdmin: vi.fn(),
   resolveIdentity: vi.fn(),
+  subscribeIdentity: (listener: () => void) => {
+    identityUpdates.add(listener);
+    return () => identityUpdates.delete(listener);
+  },
 }));
 
-beforeEach(() => vi.resetAllMocks());
+beforeEach(() => {
+  vi.resetAllMocks();
+  identityUpdates.clear();
+});
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -48,6 +59,33 @@ it.each([true, false])(
     expect(client.getQueryState(["identity-is-admin"])?.dataUpdatedAt).toBeGreaterThan(0);
   },
 );
+
+it.each([true, false])("follows a later identity update to admin=%s", async (isAdmin) => {
+  vi.mocked(getCurrentIsAdmin).mockReturnValue(!isAdmin);
+  vi.mocked(resolveIdentity).mockResolvedValue("viewer");
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { result, unmount } = renderHook(() => useIsAdmin(), {
+    wrapper: ({ children }) => (
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      </CapabilitiesProvider>
+    ),
+  });
+  await waitFor(() =>
+    expect(client.getQueryState(["identity-is-admin"])?.fetchStatus).toBe("idle"),
+  );
+  expect(result.current).toBe(!isAdmin);
+
+  vi.mocked(getCurrentIsAdmin).mockReturnValue(isAdmin);
+  act(() => {
+    for (const listener of identityUpdates) listener();
+  });
+
+  await waitFor(() => expect(result.current).toBe(isAdmin));
+  expect(client.getQueryData(["identity-is-admin"])).toBe(isAdmin);
+  unmount();
+  expect(identityUpdates.size).toBe(0);
+});
 
 it.each([true, undefined, "failed"])(
   "settles admin access after deferred capabilities advertise support=%s",

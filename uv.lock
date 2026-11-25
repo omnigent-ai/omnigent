@@ -1433,6 +1433,21 @@ wheels = [
 ]
 
 [[package]]
+name = "frizbee"
+version = "0.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/79/08/c3155a7cc678fef7c3dbf40e2a35b8caa3dc7ee5bfaf06caf0b84932402b/frizbee-0.13.0.tar.gz", hash = "sha256:342327ddbfa16ebe30dbecdd65ac3b05dd961ae951fc02f0bb4ad84a941cf356", size = 163097, upload-time = "2026-08-13T20:15:47.311Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/93/22847cd10886780375588f4763f584d100bd417e7ece88744a096318d148/frizbee-0.13.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:e166d4caa816ec6b4cd054228318718f0c8f4f6cc3f45d39be7eab5d1c59bc25", size = 2074548, upload-time = "2026-08-13T20:15:36.14Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/e1/f4a31745c7bc118c8066ba13a050b1591002234dd7aaa73709bbd7d906ec/frizbee-0.13.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:f2d6325358902642855de5ddeecde150783f33940e97d62ac1b80b578f1ae9da", size = 1487132, upload-time = "2026-08-13T20:15:37.827Z" },
+    { url = "https://files.pythonhosted.org/packages/18/3e/866f78cdb95b3ea379f07c8e5dad2771a78ad649d5a6f0b2ae0f1f7a8438/frizbee-0.13.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:403243e75690aec90b37116bb2e4270c241355ce4a4ef1303f592780df422356", size = 1655619, upload-time = "2026-08-13T20:15:39.418Z" },
+    { url = "https://files.pythonhosted.org/packages/45/e1/5d2345348ecdb8b8eddfa0ddac79370e349b6c5ecb658e58938dc01e9113/frizbee-0.13.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:133e329efa57912434c4de0f935158ea69b6c02a2157d5d772b3f8bb45cead76", size = 2158191, upload-time = "2026-08-13T20:15:40.871Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/13/b5ff5945d92d6de59aa6f8eb2aa19b1dbd0ad62e16a96a8c409937658efb/frizbee-0.13.0-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:04f89f50b2b9504cd551c1b5dc769c0c8f5ba3f45c4b28166e2acee07e25043c", size = 1833775, upload-time = "2026-08-13T20:15:42.504Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/4c/c615859c8ca6ce72a2d393a69e546289400e66ed5143131d79da0371d3c1/frizbee-0.13.0-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:3be81d4c9c8409955119795fc73d4d4fe431fc702645b60b33675344a62a315d", size = 2370195, upload-time = "2026-08-13T20:15:44.074Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/a7/2a7f28d0188a1c2d5b53cd09d2bf76b7e7fc68b46c9efca40c703e2dc254/frizbee-0.13.0-cp310-abi3-win_amd64.whl", hash = "sha256:74d1c9cf92eab79b5702afcb2baeaf11ae0ac48cdec7b008f2999ebd8c942eae", size = 2006008, upload-time = "2026-08-13T20:15:45.908Z" },
+]
+
+[[package]]
 name = "frozenlist"
 version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3297,6 +3312,7 @@ dependencies = [
     { name = "click" },
     { name = "fastapi" },
     { name = "filelock" },
+    { name = "frizbee" },
     { name = "ftfy" },
     { name = "httpx" },
     { name = "json5" },
@@ -3536,6 +3552,7 @@ requires-dist = [
     { name = "e2b", marker = "extra == 'e2b'", specifier = ">=2.26,<3" },
     { name = "fastapi", specifier = ">=0.100,<1" },
     { name = "filelock", specifier = ">=3.0" },
+    { name = "frizbee", specifier = ">=0.13,<1" },
     { name = "ftfy", specifier = ">=6.0" },
     { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1,<2" },
     { name = "google-antigravity", marker = "extra == 'antigravity'", specifier = ">=0.1,<1" },

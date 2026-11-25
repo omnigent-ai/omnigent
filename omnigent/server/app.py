@@ -330,17 +330,25 @@ class ServerInfoResponse(BaseModel):
     # PATCH stores the ``omnigent.muted`` label per viewer; older servers would
     # store it as an ordinary label every collaborator sees.
     session_mute: bool = True
+    # GET /v1/sessions/projects reports ``config.muted``; older servers drop it,
+    # so a saved project mute would never read back.
+    project_mute: bool = True
     # GET /v1/sessions applies ``include_archived`` to ``visibility=mine`` and
     # ``shared``; older servers drop archived rows there.
     session_list_scoped_archives: bool = True
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
+    # Explicit null timezone requests the owner's recorded default; omission stays UTC.
+    scheduled_task_default_timezone: bool = True
     # Scheduled tasks accept ``source_session_id``: each run starts from a copy
     # of a session. Older servers reject it.
     scheduled_task_source_sessions: bool = True
     # Scheduled tasks accept ``mcp_services``; older servers reject it.
     scheduled_task_mcp_services: bool = True
+    # Scheduled tasks accept ``workflow_id`` and ``workflow_details`` and write the prompt
+    # that runs the saved workflow; older servers reject them.
+    scheduled_task_workflow_id: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as
@@ -350,6 +358,9 @@ class ServerInfoResponse(BaseModel):
     # Scheduled-task runs drop a trigger prompt's ``<!-- omnigent-trigger ... -->`` header
     # before dispatch; older servers would send it to the model.
     scheduled_task_trigger_headers: bool = True
+    # ``POST /v1/sessions/{id}/timers`` saves sys_timer_set timers as scheduled tasks,
+    # which needs the database scheduler; absent on older servers.
+    session_timers: bool = False
     automation_trigger_poll_minutes: int = 10
     # Longest session message this server delivers; older servers omit it and
     # deliver at most 8,000 characters.
@@ -435,12 +446,18 @@ class ServerInfoResponse(BaseModel):
     # ``GET /v1/scheduled-tasks/{id}/run-pull-requests``, the PRs of each run, served
     # beside ``session_pull_requests``. Older servers that store session PRs lack it.
     scheduled_task_run_pull_requests: bool = False
+    # ``POST /v1/scheduled-tasks/{id}/clone`` copies an automation under a new ID, on
+    # the database scheduler (``automations_v2``) only; absent on older servers.
+    scheduled_task_clone: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
     # Every other agent-tool organizing write checks it too: session title, pin
     # and archive, and project rename, icon and delete.
     session_organize_source_checks: bool = False
+    # Sub-agent archives check runner ownership and route through inherited hosts;
+    # runner tools require this capability before archiving a sub-agent.
+    session_archive_runner_checks: bool = False
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
@@ -2780,6 +2797,14 @@ def create_app(
         app.state.memory_available() and memory_store is not None and memory_store.supports_search
     )
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
+    # Agent timers are scheduled tasks only the database scheduler fires. Creating them
+    # waits for the release feature, until every server on the database reads them.
+    app.state.session_timers_enabled = (
+        automations_enabled
+        and automations_v2_enabled
+        and scheduled_task_store is not None
+        and resolved_feature_flags.enabled(Feature.SESSION_TIMERS)
+    )
     # Separate from dispatch: schedulers accept one-time rules from this release on,
     # and creating them waits until every scheduler on the database does.
     app.state.one_time_automations_enabled = automations_v2_enabled and (
@@ -4167,6 +4192,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_mute": True,
+                "project_mute": True,
                 "session_list_scoped_archives": True,
                 "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
@@ -4206,8 +4232,12 @@ def create_app(
                 and bool(app.state.one_time_automations_enabled),
                 "scheduled_task_sharing": automation_sharing,
                 "scheduled_task_shared_with_me": automation_sharing,
+                "scheduled_task_clone": automations_enabled
+                and bool(app.state.scheduled_task_dispatch_enabled),
+                "session_timers": bool(app.state.session_timers_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
+                "session_archive_runner_checks": True,
                 "sibling_other_project_standalone": True,
                 "memory": app.state.memory_available(),
                 "automations_enabled": automations_enabled,
@@ -4486,6 +4516,7 @@ def create_app(
             conversation_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            scheduled_task_store=scheduled_task_store,
         ),
         prefix="/v1",
         tags=["workflows"],
@@ -5400,8 +5431,8 @@ def create_app(
                         else:
                             prefetch_session_routing_catalogs(conv.id, conv, routed.client)
                         # A crash can leave a persisted count absent from the live index.
-                        session_live_state.persist_pending_count(
-                            conv.id, pending_elicitations.count_for(conv.id)
+                        session_live_state.reconcile_pending_count(
+                            conv.id, conv.pending_elicitation_count, runner_id=runner_id
                         )
                         cached_sandbox = _session_sandbox_status_cache.get(conv.id)
                         # A reconnect proves readiness only for a launch already marked failed.

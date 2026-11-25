@@ -60,14 +60,24 @@ async function launchThisMachineDesktop({ backend, scratch, recordDir, preload =
   };
 }
 
-/** Open a session and add a Browser tab from the workspace rail's "Open new" menu. */
-async function openSessionBrowserTab(window, serverUrl, sessionId) {
+/** Open a session with its workspace rail expanded. */
+async function openSessionRail(window, serverUrl, sessionId) {
   await window.goto(`${serverUrl}/c/${sessionId}`);
   await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
   const expand = window.getByRole("button", { name: "Expand right panel", exact: true });
   if (await expand.isVisible()) await expand.click();
+}
+
+/** Open a session and add a Browser tab from the workspace rail's "Open new" menu. */
+async function openSessionBrowserTab(window, serverUrl, sessionId) {
+  await openSessionRail(window, serverUrl, sessionId);
   await window.getByRole("button", { name: "Open new", exact: true }).click();
   await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
 }
 
-module.exports = { THIS_MACHINE_HOST_ID, launchThisMachineDesktop, openSessionBrowserTab };
+module.exports = {
+  THIS_MACHINE_HOST_ID,
+  launchThisMachineDesktop,
+  openSessionBrowserTab,
+  openSessionRail,
+};

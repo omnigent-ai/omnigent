@@ -53,6 +53,14 @@ together in Comments.
   other subtabs, the PR list and the collapsed rail stop requesting them.
   A compact **Loading review threads** spinner beside the layout toggle indicates
   an in-flight read. Conversation navigation shares the diff toolbar.
+- `chat-references`: `#1234` and `owner/repo#12` in agent replies, user messages
+  and /btw answers link to the PR. A bare `#1234` links only to a PR the session
+  (or the side chat) links with that number, at its stored URL, on any host. It
+  stays text when no linked PR has it, when linked PRs in two repos share it, and
+  for providers where `#N` isn't a pull request (GitLab and Azure DevOps use `!N`).
+  `owner/repo#12` links to github.com in a github.com checkout. All of them stay
+  text in tool output, code, existing links and after an escaped `#`. Full PR URLs
+  link as before.
 - `render-recovery`: A panel render failure shows **Try again** while chat,
   Workspace tabs and mobile Close remain usable.
 
@@ -60,6 +68,16 @@ together in Comments.
 
 - `rail`: Open a session, expand Workspace, choose Pull Requests, then open Changes.
 - `composer-desktop`: Click the desktop composer's PR link, then open Changes.
+- `tabs-sidebar`: With `workspace_sidebar_v2` on, in a desktop app or desktop
+  browser (not a touch client), open a session and choose **New tab → Pull
+  Requests** in the workspace sidebar; in a window narrower than 1181px, choose
+  Pull Requests from the session-actions menu, which opens the Workspace drawer.
+  The list shows even when the session has one pull request; select one to open
+  it in that tab, then open Changes. The desktop composer's PR link opens a
+  session's only pull request in its own tab. ⌘K → **Show all pull requests**
+  selects the session's Pull Requests tab, or opens one, and shows a collapsed
+  workspace sidebar. A pull request's page has an **All pull requests** button
+  that does the same and leaves the pull request's own tab open.
 - `session-mobile`: Open the session-actions menu, choose Pull Requests, then open Changes in the drawer.
 - `canvas`: Open a conversation beside Canvas, click its composer PR link,
   then open Changes.
@@ -72,6 +90,9 @@ With a pointer, hovering the composer's PR link previews each PR's status. The
 icon beside each title opens that PR in a new browser tab without opening the
 panel. `tests/e2e_ui/github/test_composer_pr_status.py` covers the preview,
 its links and the touch and keyboard paths.
+
+- `chat-transcript`: In a session whose checkout is on github.com, an agent reply,
+  your own message, a side chat or a /btw answer that mentions a PR reference.
 
 On each surface, **Try again** retries failed panel content. Switching sessions
 also clears a failed panel. Healthy chat drafts stay mounted; content inside a
@@ -150,7 +171,20 @@ For an existing comment with a fenced `suggestion`, compare its red removal and
 green addition rows to GitHub, including a multiline replacement. Expand an
 outdated thread and confirm the suggestion uses its labeled original context.
 
+Chat references have component coverage in
+`web/src/components/blocks/ChatMarkdown.prRefs.test.tsx`,
+`web/src/pages/ChatPage.userBubble.test.tsx` and
+`web/src/components/ai-elements/pullRequestRefs.test.ts`; the runner's workspace
+repo choice is in `tests/runner/test_pr_resource.py`. Manually, in a github.com
+checkout, send `See #4242 and acme/lib#7` and have the agent repeat it; both link
+to github.com when the session links #4242. A number the session doesn't link
+stays text. Repeat in a side chat and through /btw.
+
 ## Gotchas
+
+- A bare chat reference follows the session's linked PRs, not the workspace's
+  repo, so a number the agent mentions without linking its PR stays text.
+  `owner/repo#N` links only to github.com.
 
 - Browser stubs prove UI behavior; runner/host tests prove provider transport.
   They do not constitute a live GitHub write test.

@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import { clearSessionMuteState, MUTED_LABEL_KEY, setMutedProjects } from "@/lib/sessionMute";
 import {
   buildElicitationMap,
   buildStatusMap,
@@ -8,6 +9,10 @@ import {
   detectNewElicitations,
   type ConversationStatus,
 } from "./idleTransitions";
+
+afterEach(() => {
+  clearSessionMuteState();
+});
 
 function conv(id: string, status?: Conversation["status"]): Conversation {
   return {
@@ -78,6 +83,25 @@ describe("detectIdleTransitions", () => {
     expect(detectIdleTransitions(prev, [{ ...conv("a", "idle"), archived: true }])).toEqual([]);
   });
 
+  it("ignores a muted conversation that just finished", () => {
+    const prev = statusMap({ a: "running" });
+    const muted = { ...conv("a", "idle"), labels: { [MUTED_LABEL_KEY]: "1" } };
+    expect(detectIdleTransitions(prev, [muted])).toEqual([]);
+  });
+
+  it("ignores a finished conversation in a muted project, but not one outside it", () => {
+    setMutedProjects([{ id: "factory", name: "Factory", muted: true }], null);
+    const prev = statusMap({ worker: "running", coordinator: "running" });
+    const worker = { ...conv("worker", "idle"), project_id: "factory" };
+    const coordinator = conv("coordinator", "idle");
+    expect(detectIdleTransitions(prev, [worker, coordinator]).map((c) => c.id)).toEqual([
+      "coordinator",
+    ]);
+    expect(computeUnreadBadgeIds([worker, coordinator], undefined, true, () => true)).toEqual(
+      new Set(["coordinator"]),
+    );
+  });
+
   it("returns only the newly-finished conversations from a mixed list", () => {
     const prev = statusMap({ a: "running", b: "running", c: "idle" });
     const result = detectIdleTransitions(prev, [
@@ -121,6 +145,11 @@ describe("detectNewElicitations", () => {
     // No previous entry -> a page load with already-pending prompts must not
     // fire, mirroring the idle fresh-load behavior.
     expect(detectNewElicitations(new Map(), [convE("a", 2)])).toEqual([]);
+  });
+
+  it("ignores a new prompt on a muted conversation", () => {
+    const muted = { ...convE("a", 1), labels: { [MUTED_LABEL_KEY]: "1" } };
+    expect(detectNewElicitations(new Map([["a", 0]]), [muted])).toEqual([]);
   });
 
   it("ignores a new prompt on an archived conversation", () => {
@@ -197,6 +226,11 @@ describe("computeUnreadBadgeIds", () => {
   it("counts a session the unseen predicate flags", () => {
     const next = computeUnreadBadgeIds([convB("a")], undefined, true, unseenIds("a"));
     expect([...next]).toEqual(["a"]);
+  });
+
+  it("never counts a muted session, even one awaiting input", () => {
+    const muted = { ...convB("a", { pending: 1 }), labels: { [MUTED_LABEL_KEY]: "1" } };
+    expect(computeUnreadBadgeIds([muted], undefined, true, unseenIds("a")).size).toBe(0);
   });
 
   it("counts a session awaiting input even when not unseen", () => {

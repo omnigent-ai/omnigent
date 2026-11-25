@@ -244,8 +244,8 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         interaction=InteractionConfig(conversational=False),
         tools=ToolsConfig(),
         # A headless one-shot fetcher: no browser pane, review comments,
-        # scheduling, policy editing, agent lookup, journal, project filing or user
-        # memory to drive.
+        # scheduling, policy editing, agent lookup, journal, project filing, user
+        # memory or file sharing to drive.
         tool_groups=ToolGroupsConfig(
             browser=False,
             scheduled_tasks=False,
@@ -256,6 +256,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
             projects=False,
             user_inbox=False,
             memory=False,
+            files=False,
         ),
         os_env=child_os_env,
         instructions=_RESEARCHER_INSTRUCTIONS,

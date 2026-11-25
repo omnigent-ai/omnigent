@@ -17,14 +17,11 @@ from omnigent_client import tool
 # add it here. Each module is imported individually to avoid the
 # transitive import chain from omnigent.tools.builtins.__init__.
 _TOOL_CLASSES: dict[str, tuple[str, str]] = {
-    "download_file": ("omnigent.tools.builtins.download_file", "DownloadFileTool"),
     "export_agent": ("omnigent.tools.builtins.export_agent", "ExportAgentTool"),
-    "list_files": ("omnigent.tools.builtins.list_files", "ListFilesTool"),
     "search_conversations": (
         "omnigent.tools.builtins.search_conversations",
         "SearchConversationsTool",
     ),
-    "upload_file": ("omnigent.tools.builtins.upload_file", "UploadFileTool"),
     "web_fetch": ("omnigent.tools.builtins.web_fetch", "WebFetchTool"),
     "web_read": ("omnigent.tools.builtins.web_read", "WebReadTool"),
     "web_search": ("omnigent.tools.builtins.web_search", "WebSearchTool"),

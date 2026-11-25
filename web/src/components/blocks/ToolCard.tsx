@@ -864,7 +864,13 @@ function EmptyOutputState({ state }: { state: "output-error" | "cancelled" | "no
   );
 }
 
-function useElapsedDuration(startedAt: number | null | undefined): number | undefined {
+/**
+ * Live seconds since *startedAt*, ticking twice a second, for a running tool's row.
+ *
+ * :param startedAt: Page-clock seconds the call started, e.g. ``12.5``; ``null`` stops the clock.
+ * :returns: Elapsed seconds, or ``undefined`` without a start.
+ */
+export function useElapsedDuration(startedAt: number | null | undefined): number | undefined {
   const [now, setNow] = useState(() => getNowSeconds());
 
   useEffect(() => {

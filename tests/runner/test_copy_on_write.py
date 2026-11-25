@@ -145,7 +145,7 @@ def test_unsupported_harness_rejected_before_spawn(spec, harness):
 @pytest.mark.parametrize(
     "name,args",
     [
-        ("upload_file", {"path": "original"}),
+        ("sys_files_upload", {"path": "original"}),
         ("sys_agent_download", {"session_id": "session"}),
         ("sys_agent_list", {}),
         ("load_skill", {"name": "example"}),
@@ -180,9 +180,10 @@ async def test_cached_cow_still_rejects_host_io_when_spec_unavailable(spec, tmp_
     shared = Mock(sandbox=SimpleNamespace(copy_on_write_roots=[tmp_path]))
     monkeypatch.setattr(registry, "_create_primary_env", Mock(return_value=shared))
     registry._resolve_primary("session", spec)
+    # Not sys_files_upload: without a spec, the grant gate refuses it first.
     result = await execute_tool(
-        tool_name="upload_file",
-        arguments='{"path":"original"}',
+        tool_name="sys_agent_list",
+        arguments="{}",
         agent_spec=None,
         resource_registry=registry,
         conversation_id="session",
@@ -195,7 +196,7 @@ async def test_tool_grant_probe_keeps_session_relative_cow_configuration(tmp_pat
     from unittest.mock import AsyncMock
 
     from omnigent.runner import tool_dispatch
-    from omnigent.spec.types import AgentSpec, BuiltinToolConfig, ExecutorSpec, ToolsConfig
+    from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 
     workspace = tmp_path / "workspace"
     (workspace / "dependencies").mkdir(parents=True)
@@ -211,8 +212,8 @@ async def test_tool_grant_probe_keeps_session_relative_cow_configuration(tmp_pat
     agent = AgentSpec(
         spec_version=1,
         os_env=os_spec,
-        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="upload_file")]),
         executor=ExecutorSpec(type="omnigent", config={"harness": "openai-agents"}),
+        tool_groups=ToolGroupsConfig(files=True),
     )
     execute = AsyncMock(return_value="session file")
     monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", execute)
@@ -228,7 +229,7 @@ async def test_tool_grant_probe_keeps_session_relative_cow_configuration(tmp_pat
     assert os_spec.sandbox is not None
     assert os_spec.sandbox.write_path_specs == [WritePathSpec("dependencies", True)]
     refused = await tool_dispatch.execute_tool(
-        tool_name="upload_file",
+        tool_name="sys_files_upload",
         arguments='{"path":"dependencies/original"}',
         agent_spec=agent,
         conversation_id="session",
@@ -260,6 +261,9 @@ async def test_stream_setup_errors_are_sanitized_before_spawn(
     environment = Mock(sandbox=object())
     environment.prepare_sandbox.side_effect = ValueError("private diagnostic sentinel")
     monkeypatch.setattr(registry, "_create_primary_env", Mock(return_value=environment))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_openai_agents_sdk_spawn_env", lambda spec: {}
+    )
     manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=manager,
@@ -279,10 +283,20 @@ async def test_stream_setup_errors_are_sanitized_before_spawn(
             },
         )
     assert response.status_code == 400, response.text
-    assert "openai-agents" in response.text
-    assert response.json()["error"] == "copy_on_write_setup_failed"
+    payload = response.json()
+    assert set(payload) == {"error", "detail", "hint"}
+    assert payload["error"] == "copy_on_write_setup_failed"
+    assert isinstance(payload["detail"], str) and payload["detail"]
+    assert payload["hint"] == (
+        "Use executor.harness=openai-agents; start a new session after "
+        "changing copy_on_write paths."
+    )
     assert "private diagnostic sentinel" not in response.text
     assert not manager.get_client_calls
+    if harness == "openai-agents":
+        environment.prepare_sandbox.assert_called_once()
+    else:
+        environment.prepare_sandbox.assert_not_called()
 
 
 @pytest.mark.asyncio

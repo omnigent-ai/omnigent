@@ -115,15 +115,6 @@ impl Pod {
     /// Profiles select their web directory and dependency manifests.
     pub fn needs_web_prepare(&self) -> bool {
         let web = self.web_dir();
-        let modules = web.join("node_modules");
-        if !modules.is_dir() {
-            return true;
-        }
-        let mtime = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        let Some(installed) = mtime(modules) else {
-            return true;
-        };
-        // Reinstall if either manifest is newer than node_modules.
         let manifests = self
             .profile
             .as_ref()
@@ -134,16 +125,8 @@ impl Pod {
                     .map(|path| web.join(path))
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_else(|| {
-                vec![
-                    self.repo_root.join("pnpm-lock.yaml"),
-                    web.join("package.json"),
-                ]
-            });
-        manifests
-            .into_iter()
-            .filter_map(mtime)
-            .any(|t| t > installed)
+            .unwrap_or_else(|| oss_web_manifests(&self.repo_root));
+        web_deps_stale(&web, manifests)
     }
 
     /// Directory to watch for backend source changes.
@@ -214,6 +197,30 @@ impl Pod {
         }
         Some(merged.join(","))
     }
+}
+
+/// The OSS checkout's web dependency manifests: the root lockfile and `web/package.json`.
+pub fn oss_web_manifests(repo_root: &Path) -> Vec<PathBuf> {
+    vec![
+        repo_root.join("pnpm-lock.yaml"),
+        repo_root.join("web").join("package.json"),
+    ]
+}
+
+/// Whether `<web>/node_modules` is missing or older than any manifest.
+pub fn web_deps_stale(web: &Path, manifests: Vec<PathBuf>) -> bool {
+    let modules = web.join("node_modules");
+    if !modules.is_dir() {
+        return true;
+    }
+    let mtime = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let Some(installed) = mtime(modules) else {
+        return true;
+    };
+    manifests
+        .into_iter()
+        .filter_map(mtime)
+        .any(|t| t > installed)
 }
 
 /// Remove a pod directory (for `--clean`). No-op if it does not exist.

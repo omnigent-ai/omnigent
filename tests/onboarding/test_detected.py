@@ -508,3 +508,90 @@ def test_detected_gemini_key_preserves_companion_gateway(monkeypatch) -> None:
     entries = synthesize_detected_entries([_gemini_key()])
     assert entries["gemini"]["gemini"]["base_url"] == "https://gateway.example/gemini"
     assert entries["gemini"]["gemini"]["api_key_ref"] == "env:GEMINI_API_KEY"
+
+
+def test_resolve_named_provider_prefers_explicit_entry_without_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly configured name resolves with no ambient probe at all.
+
+    Pricing calls this per usage event, so an explicit named provider must not
+    trigger an Ollama socket probe or CLI subprocess on every turn.
+    """
+    from omnigent.onboarding.detected import resolve_named_provider
+
+    def _no_probe() -> list[DetectedProvider]:
+        raise AssertionError("explicit named provider must not run ambient detection")
+
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", _no_probe)
+    config = {
+        "providers": {
+            "expensive-named": {
+                "kind": "key",
+                "anthropic": {
+                    "base_url": "https://expensive.example/v1",
+                    "api_key": "expensive-key",
+                    "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
+                },
+            }
+        }
+    }
+
+    entry = resolve_named_provider("expensive-named", config)
+
+    assert entry is not None
+    assert entry.name == "expensive-named"
+
+
+def test_resolve_named_provider_falls_back_to_detected_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name that only ambient detection provides still resolves, as at launch."""
+    from omnigent.onboarding.detected import resolve_named_provider
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.detected.detect_providers", lambda: [_anthropic_key()]
+    )
+
+    entry = resolve_named_provider("anthropic", {"providers": {}})
+
+    assert entry is not None
+    assert entry.name == "anthropic"
+
+
+def test_resolve_named_provider_returns_none_for_unknown_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.onboarding.detected import resolve_named_provider
+
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+
+    assert resolve_named_provider("no-such-provider", {"providers": {}}) is None
+
+
+def test_resolve_named_provider_uses_local_config_under_sandbox_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The managed-sandbox overlay replaces ``providers:``; the local entry must still resolve.
+
+    Mirrors the launch resolver's fallback so pricing and launch agree on the
+    provider a session was started with.
+    """
+    from omnigent.onboarding.detected import resolve_named_provider
+
+    monkeypatch.setenv("OMNIGENT_INFERENCE_CONFIG", "/nonexistent/overlay.json")
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    local = {
+        "providers": {
+            "local-named": {
+                "kind": "key",
+                "anthropic": {"base_url": "https://local.example/v1", "api_key": "k"},
+            }
+        }
+    }
+    monkeypatch.setattr("omnigent.onboarding.provider_config._load_config", lambda: local)
+
+    entry = resolve_named_provider("local-named", {"providers": {}})
+
+    assert entry is not None
+    assert entry.name == "local-named"

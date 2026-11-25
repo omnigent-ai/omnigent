@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import json
+import logging
 import shlex
 import sqlite3
 import sys
@@ -795,6 +798,103 @@ def test_inject_relay_into_policy_hook_returns_false_when_wrapper_absent(
     from omnigent.harnesses.hermes_native.bridge import inject_relay_into_policy_hook
 
     assert inject_relay_into_policy_hook(tmp_path, "http://x", "tok", "http://ap", "sid") is False
+
+
+# --- interpreter built without the _sqlite3 C extension ---------------------
+
+_BRIDGE_MODULE = "omnigent.harnesses.hermes_native.bridge"
+
+
+@contextlib.contextmanager
+def _sqlite3_blocked():
+    """Simulate an interpreter built without the ``_sqlite3`` C extension.
+
+    Evicts the cached ``sqlite3`` modules and blocks ``_sqlite3`` so any
+    ``import sqlite3`` inside the context fails, then restores the real
+    modules on exit.
+    """
+    saved = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name in ("_sqlite3", "sqlite3") or name.startswith("sqlite3.")
+    }
+    sys.modules["_sqlite3"] = None  # import _sqlite3 -> ModuleNotFoundError
+    try:
+        yield
+    finally:
+        sys.modules.pop("_sqlite3", None)
+        for name in list(sys.modules):
+            if name == "sqlite3" or name.startswith("sqlite3."):
+                del sys.modules[name]
+        sys.modules.update(saved)
+
+
+def test_orphan_sweep_imports_hermes_without_sqlite3(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The maintenance entry point must complete the Hermes import without SQLite."""
+    from omnigent import harness_plugins
+    from omnigent.native import native_bridge_common
+
+    parent = importlib.import_module("omnigent.harnesses.hermes_native")
+    original_import = importlib.import_module
+    loaded: list[str] = []
+    saved_bridge = sys.modules.pop(_BRIDGE_MODULE, None)
+
+    def import_bridge(name: str) -> SimpleNamespace:
+        assert name == _BRIDGE_MODULE
+        original_import(name)
+        loaded.append(name)
+        # The import boundary is under test; no real bridge directories are reaped.
+        return SimpleNamespace()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(parent, "bridge", b)
+        patch.setattr(harness_plugins, "native_agents", lambda: [SimpleNamespace(key="hermes")])
+        patch.setattr(
+            native_bridge_common, "importlib", SimpleNamespace(import_module=import_bridge)
+        )
+        try:
+            with _sqlite3_blocked():
+                assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 0
+                assert loaded == [_BRIDGE_MODULE]
+        finally:
+            sys.modules.pop(_BRIDGE_MODULE, None)
+            if saved_bridge is not None:
+                sys.modules[_BRIDGE_MODULE] = saved_bridge
+
+
+def test_max_message_id_zero_without_sqlite3(tmp_path: Path) -> None:
+    """Without sqlite3 the high-water mark degrades to 0 instead of raising."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(str(db))
+    con.executescript(b._MESSAGES_DDL)
+    con.executescript(b._SESSIONS_DDL)
+    con.execute(
+        "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?,?,?,?,?)",
+        (7, "s1", "user", "hi", 0.0),
+    )
+    con.commit()
+    con.close()
+    with _sqlite3_blocked():
+        assert b._max_message_id(db) == 0
+        assert b._await_session_ready(db, timeout_s=0) is False
+    assert b._max_message_id(db) == 7
+    assert b._await_session_ready(db, timeout_s=0) is True
+
+
+def test_clone_hermes_session_skips_without_sqlite3(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without sqlite3 the clone is skipped (warn + return 0), not a crash."""
+    source_db = tmp_path / "source" / "state.db"
+    source_db.parent.mkdir()
+    target_db = tmp_path / "target" / "state.db"
+    _create_source_db(source_db, "src-nosqlite")
+
+    with _sqlite3_blocked(), caplog.at_level(logging.WARNING, logger=b.__name__):
+        assert b.clone_hermes_session(source_db, target_db, "src-nosqlite", "tgt") == 0
+
+    assert not target_db.exists()
+    assert any("sqlite3 unavailable" in r.getMessage() for r in caplog.records)
 
 
 def test_input_ready_subprocess_uses_remaining_budget(monkeypatch):

@@ -249,6 +249,7 @@ describe("useWorkflowRuns runs below a run", () => {
             ...RUNNING_RUN,
             workflow_id: "workflow",
             started_by: null,
+            automation: { id: "automation", name: "Nightly triage" },
             workflow_name: "Workflow",
             descendant_runs: [
               {
@@ -276,6 +277,7 @@ describe("useWorkflowRuns runs below a run", () => {
       workflowId: "workflow",
       workflowName: "Workflow",
       startedBy: undefined,
+      automation: { id: "automation", name: "Nightly triage" },
       descendantRunCount: 3,
       descendantRunsCursor: "session_old",
       descendantRunsActive: true,
@@ -286,6 +288,7 @@ describe("useWorkflowRuns runs below a run", () => {
         workflowId: "called",
         workflowName: null,
         startedBy: { sessionId: "session_new", title: "New run" },
+        automation: undefined,
         descendantRuns: [],
         descendantRunsCursor: null,
         descendantRunsActive: false,

@@ -467,6 +467,8 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
     assert saved[0]["anchor_content"] == phrase
 
     page.get_by_role("button", name=f"Close {fixture}", exact=True).first.click()
+    # Closing the last open tab hides the rail; reopen it to pick the file again.
+    open_right_rail(page)
     file_button.click()
     expect(editor).to_be_visible()
     check_highlight()

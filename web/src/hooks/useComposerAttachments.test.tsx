@@ -23,8 +23,8 @@ function pngFile(name = "shot.png"): File {
 }
 
 /** An unsupported file — validation rejects it before any upload exists. */
-function videoFile(name = "clip.mp4"): File {
-  return new File([new Uint8Array(10)], name, { type: "video/mp4" });
+function videoFile(name = "clip.webm"): File {
+  return new File([new Uint8Array(10)], name, { type: "video/webm" });
 }
 
 /** Clipboard items as a real paste carries them: text and/or file entries. */
@@ -139,7 +139,7 @@ describe("useComposerAttachments", () => {
   it("keeps the supported files from a mixed batch and names every rejection", () => {
     const { result } = renderHook(() => useComposerAttachments());
 
-    act(() => result.current.addFiles([textFile(), videoFile(), videoFile("clip2.mp4")]));
+    act(() => result.current.addFiles([textFile(), videoFile(), videoFile("clip2.webm")]));
 
     expect(result.current.files.map((f) => f.name)).toEqual(["notes.txt"]);
     const error = result.current.attachmentError ?? "";
@@ -147,8 +147,8 @@ describe("useComposerAttachments", () => {
     // reads in the order the user picked the files.
     const lines = error.split("\n");
     expect(lines).toHaveLength(2);
-    expect(lines[0]).toContain("clip.mp4");
-    expect(lines[1]).toContain("clip2.mp4");
+    expect(lines[0]).toContain("clip.webm");
+    expect(lines[1]).toContain("clip2.webm");
   });
 
   it("clears a stale rejection when a clean batch arrives", () => {
@@ -183,7 +183,7 @@ describe("useComposerAttachments", () => {
     expect(onAccepted).toHaveBeenCalledWith([ok]);
 
     // A fully rejected batch appends nothing, so the side effect stays silent.
-    act(() => result.current.addFiles([videoFile("nope.mp4")]));
+    act(() => result.current.addFiles([videoFile("nope.webm")]));
     expect(onAccepted).toHaveBeenCalledTimes(1);
   });
 
@@ -242,7 +242,7 @@ describe("useComposerAttachments", () => {
 
     // The seeded file is gone; the rejected replacement never lands.
     expect(result.current.files.map((f) => f.name)).toEqual(["shot.png"]);
-    expect(result.current.attachmentError).toContain("clip.mp4");
+    expect(result.current.attachmentError).toContain("clip.webm");
   });
 
   it("replaceFiles with a clean batch clears a stale error", () => {
@@ -261,7 +261,7 @@ describe("useComposerAttachments", () => {
     // silently drop files the composer already accepted.
     const { result } = renderHook(() => useComposerAttachments({ initialFiles: [videoFile()] }));
 
-    expect(result.current.files.map((f) => f.name)).toEqual(["clip.mp4"]);
+    expect(result.current.files.map((f) => f.name)).toEqual(["clip.webm"]);
     expect(result.current.attachmentError).toBeNull();
   });
 
@@ -269,7 +269,7 @@ describe("useComposerAttachments", () => {
     const { result } = renderHook(() => useComposerAttachments());
     act(() => result.current.restoreFiles([videoFile()]));
 
-    expect(result.current.files.map((f) => f.name)).toEqual(["clip.mp4"]);
+    expect(result.current.files.map((f) => f.name)).toEqual(["clip.webm"]);
     expect(result.current.attachmentError).toBeNull();
   });
 
@@ -277,7 +277,7 @@ describe("useComposerAttachments", () => {
     const { result } = renderHook(() => useComposerAttachments());
     act(() => result.current.addFiles([textFile(), videoFile()]));
     const notice = result.current.attachmentError;
-    expect(notice).toContain("clip.mp4");
+    expect(notice).toContain("clip.webm");
 
     act(() => result.current.restoreFiles([textFile()]));
 
@@ -365,7 +365,7 @@ describe("useComposerAttachments", () => {
     const onAccepted = vi.fn();
     const { result } = renderHook(() => useComposerAttachments({ onAccepted }));
 
-    act(() => result.current.addFiles([videoFile(), videoFile("clip2.mp4")]));
+    act(() => result.current.addFiles([videoFile(), videoFile("clip2.webm")]));
 
     expect(result.current.files).toEqual([]);
     expect(result.current.attachmentError).not.toBeNull();
@@ -381,5 +381,16 @@ describe("useComposerAttachments", () => {
     rerender({ initial: [pngFile(), videoFile()] });
 
     expect(result.current.files.map((f) => f.name)).toEqual(["notes.txt"]);
+  });
+});
+
+describe("pasting into a textarea that is still mounted during an engine handoff", () => {
+  it("attaches the file to the tray even when chips are requested", () => {
+    const onPasteChips = vi.fn(() => []);
+    const { result } = renderHook(() => useComposerAttachments({ onPasteChips }));
+    const shot = pngFile();
+    act(() => result.current.onPaste(pasteEvent({ files: [shot] }).event));
+    expect(onPasteChips).not.toHaveBeenCalled();
+    expect(result.current.files).toEqual([shot]);
   });
 });
