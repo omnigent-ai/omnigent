@@ -475,6 +475,34 @@ def test_native_codex_resource_attributes_reach_server_and_terminal(
         }
 
 
+@pytest.mark.parametrize(
+    "declared,expect_token",
+    [((), False), (("GH_TOKEN",), True)],
+    ids=["undeclared", "declared"],
+)
+def test_build_codex_native_server_passes_only_declared_env_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    declared: tuple[str, ...],
+    expect_token: bool,
+) -> None:
+    monkeypatch.setenv("GH_TOKEN", "ghp_example")
+    monkeypatch.setenv("UNDECLARED_SECRET", "not-forwarded")
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path=sys.executable,
+        env_passthrough=declared,
+    )
+
+    assert ("GH_TOKEN" in app_server.env) is expect_token
+    assert "UNDECLARED_SECRET" not in app_server.env
+
+
 def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

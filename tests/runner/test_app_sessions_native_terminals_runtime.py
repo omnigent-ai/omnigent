@@ -1923,7 +1923,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     codex_os_env = OSEnvSpec(
         type="caller_process",
         cwd=".",
-        sandbox=OSEnvSandboxSpec(type="none"),
+        sandbox=OSEnvSandboxSpec(type="none", env_passthrough=["GH_TOKEN"]),
     )
     agent_spec = ResolvedSpec(
         spec=AgentSpec(
@@ -1973,6 +1973,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
+    # The app-server's env filter must honour the spec's passthrough names, as
+    # the session terminal already does through parent_os_env.
+    assert build_calls[0]["env_passthrough"] == ("GH_TOKEN",)
     assert build_calls[0]["developer_instructions"] == (
         f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
     )

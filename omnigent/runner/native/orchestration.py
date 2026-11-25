@@ -74,6 +74,7 @@ from omnigent.errors import (
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inference_config import ModelNotAllowedError
+from omnigent.inner.agent_env import declared_passthrough
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
@@ -5968,6 +5969,7 @@ async def _auto_create_codex_terminal(
         bypass_sandbox=launch_config.bypass_sandbox,
         developer_instructions=_codex_developer_instructions,
         terminal_launch_args=launch_config.terminal_launch_args or (),
+        env_passthrough=declared_passthrough(_agent_os_env_from_spec(agent_spec)),
         reasoning_effort=launch_config.reasoning_effort,
         model_catalog_rows=_fresh_codex_catalog,
         # Codex can show project-trust and legacy-model migration prompts before
