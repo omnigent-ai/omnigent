@@ -204,4 +204,35 @@ describe("useTabsShellClose with the runner's reading", () => {
       await expect(second).resolves.toBe(true);
     });
   });
+
+  it("keeps the shell when the sidebar moves to another session while checking", async () => {
+    floating.on = true;
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    const deleteTerminal = vi.fn(async () => undefined);
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useTabsShellClose({ sessionId, terminals: TERMINALS, deleteTerminal }),
+      { initialProps: { sessionId: "conv_a" } },
+    );
+    let closing!: Promise<boolean>;
+    act(() => {
+      closing = result.current.confirmCloseShell("terminal:t1");
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    rerender({ sessionId: "conv_b" });
+    await expect(closing).resolves.toBe(false);
+    expect(result.current.question).toBeNull();
+  });
+
+  it("asks when floating panes turn off while it's checking", async () => {
+    floating.on = true;
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    const { result, rerender } = closer(undefined, "conv_a");
+    act(() => {
+      void result.current.confirmCloseShell("terminal:t1");
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    floating.on = false;
+    rerender();
+    expect(result.current.question).toMatchObject({ label: "zsh · s1", busy: null });
+  });
 });

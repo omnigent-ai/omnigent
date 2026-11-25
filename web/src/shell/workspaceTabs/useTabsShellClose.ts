@@ -93,6 +93,8 @@ export function useTabsShellClose({
             if (check.close === "now") settle(resolve, true);
             else setQuestion({ label, count: labels.length, busy: check.busy, answer: resolve });
           },
+          // The sidebar moved to another session while checking: keep the shell.
+          () => settle(resolve, false),
         );
       });
     },

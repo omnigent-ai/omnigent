@@ -1,7 +1,5 @@
-// Whether closing session shells needs the user's confirmation: not for a shell sitting idle at
-// its prompt, as its runner read it just now. Anything else asks, naming the job when one runs:
-// a busy shell, an answer that's late, unknown or unavailable, or typing that began meanwhile.
-// Only floating panes skip the question; without them every close asks, as before.
+// Whether closing shells needs confirmation: with floating panes, a shell its runner just read
+// idle closes at once. Anything else asks, naming the job a busy shell runs.
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
@@ -67,11 +65,15 @@ export function recordShellCloseCheck(record: ShellCloseRecord): void {
   }
 }
 
+/** Control, zero-width and bidi characters, which could hide or reorder what the dialog shows. */
+const HIDDEN_CHARACTERS =
+  // eslint-disable-next-line no-control-regex -- stripping control characters is the point
+  /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+
 /** A command name from the server, kept only when it's short printable text. */
 function commandName(value: unknown): string | null {
   if (typeof value !== "string") return null;
-  // eslint-disable-next-line no-control-regex -- stripping control characters is the point
-  const name = value.replace(/[\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/g, "");
+  const name = value.replace(HIDDEN_CHARACTERS, "");
   return name.length > 0 && name.length <= MAX_COMMAND_NAME_LENGTH ? name : null;
 }
 
@@ -114,33 +116,42 @@ export async function readTerminalShell(
   }
 }
 
-function readingReason(reading: ShellReading): ShellCloseReason {
-  return reading.state;
-}
-
-/** Whether closing `terminalIds` in `sessionId` can go ahead without asking, and why. */
+/**
+ * Whether closing `terminalIds` in `sessionId` can go ahead without asking, and why. It answers
+ * within the budget even when a read ignores its signal; `signal` stops reads nobody will use.
+ */
 export async function checkShellClose(
   sessionId: string,
   terminalIds: readonly string[],
   started: number = performance.now(),
+  signal?: AbortSignal,
 ): Promise<{ check: ShellCloseCheck; reason: ShellCloseReason }> {
   if (terminalIds.length === 0) return { check: CONFIRM, reason: "unknown" };
   const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, SHELL_CLOSE_CHECK_MS);
-  let readings: ShellReading[];
+  const stop = () => controller.abort();
+  signal?.addEventListener("abort", stop);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), SHELL_CLOSE_CHECK_MS);
+  });
+  let readings: ShellReading[] | "timeout";
   try {
-    readings = await Promise.all(
-      terminalIds.map((terminalId) => readTerminalShell(sessionId, terminalId, controller.signal)),
-    );
+    readings = await Promise.race([
+      Promise.all(
+        terminalIds.map((terminalId) =>
+          readTerminalShell(sessionId, terminalId, controller.signal),
+        ),
+      ),
+      deadline,
+    ]);
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", stop);
+    // Reads still running past the deadline answer nobody.
+    controller.abort();
   }
   // A page that stalled may deliver an answer past its budget: too old to close on.
-  if (timedOut || performance.now() - started > SHELL_CLOSE_CHECK_MS) {
+  if (readings === "timeout" || performance.now() - started > SHELL_CLOSE_CHECK_MS) {
     return { check: CONFIRM, reason: "timeout" };
   }
   if (terminalIds.some((terminalId) => lastTerminalInputAt(sessionId, terminalId) >= started)) {
@@ -152,14 +163,20 @@ export async function checkShellClose(
   if (readings.length === 1 && only.state === "busy") {
     return { check: { close: "confirm", busy: only.busy }, reason: "busy" };
   }
-  return { check: CONFIRM, reason: readingReason(notIdle) };
+  return { check: CONFIRM, reason: notIdle.state };
+}
+
+/** The one check a surface has running, and how to answer or drop it. */
+interface RunningCheck {
+  decide: (check: ShellCloseCheck) => void;
+  dropped: (() => void) | undefined;
+  stop: AbortController;
 }
 
 /**
- * `checkShellClose` for one surface showing `sessionId`'s shells, recording each answer. A check
- * still running when the server or session changes, floating panes turn off, a newer one begins,
- * or the surface goes is dropped: it never answers. Without floating panes it asks at once,
- * reading nothing.
+ * `checkShellClose` for one surface showing `sessionId`'s shells, recording each answer. A newer
+ * check, or the surface going, drops a running one silently. Floating panes turning off makes it
+ * ask, as every close then does. A new server or session drops it and calls its `dropped`.
  */
 export function useShellCloseCheck(
   sessionId: string | null | undefined,
@@ -167,45 +184,67 @@ export function useShellCloseCheck(
   terminalIds: readonly string[],
   trigger: ShellCloseTrigger,
   decide: (check: ShellCloseCheck) => void,
+  dropped?: () => void,
 ) => void {
   const floatingPanes = useFloatingPanes();
-  // Floating panes are part of the scope, so turning them off drops a check still running.
-  const scope = JSON.stringify([getOmnigentServerIdentity(), sessionId ?? null, floatingPanes]);
-  const current = useRef({ scope, generation: 0 });
-  // A new server, session or gate drops what was asked before, before anything shows.
+  const place = JSON.stringify([getOmnigentServerIdentity(), sessionId ?? null]);
+  const current = useRef<{ place: string; floatingPanes: boolean; running: RunningCheck | null }>({
+    place,
+    floatingPanes,
+    running: null,
+  });
+  // Settle a running check for a new server, session or gate before anything shows.
   useLayoutEffect(() => {
-    if (current.current.scope !== scope) {
-      current.current.generation += 1;
-      current.current.scope = scope;
-    }
-  }, [scope]);
+    const state = current.current;
+    const running = state.running;
+    const moved = state.place !== place;
+    const gateClosed = state.floatingPanes && !floatingPanes;
+    state.place = place;
+    state.floatingPanes = floatingPanes;
+    if (!running || (!moved && !gateClosed)) return;
+    state.running = null;
+    running.stop.abort();
+    if (moved) running.dropped?.();
+    else running.decide(CONFIRM);
+  }, [place, floatingPanes]);
   useEffect(() => {
-    const pending = current.current;
+    const state = current.current;
     return () => {
-      pending.generation += 1;
+      state.running?.stop.abort();
+      state.running = null;
     };
   }, []);
   return useCallback(
-    (terminalIds, trigger, decide) => {
-      const pending = current.current;
-      pending.generation += 1;
-      const mine = pending.generation;
-      const asked = pending.scope;
+    (terminalIds, trigger, decide, dropped) => {
+      const state = current.current;
+      state.running?.stop.abort();
+      state.running = null;
       if (!floatingPanes || !sessionId || terminalIds.length === 0) {
         decide(CONFIRM);
         return;
       }
-      void checkShellClose(sessionId, terminalIds).then(({ check, reason }) => {
-        if (pending.generation !== mine || pending.scope !== asked) return;
-        recordShellCloseCheck({
-          event: "shell_close_check",
-          trigger,
-          decision: check.close === "now" ? "closed_without_asking" : "asked",
-          reason,
-          terminalIds,
-        });
-        decide(check);
-      });
+      const running: RunningCheck = { decide, dropped, stop: new AbortController() };
+      const askedPlace = state.place;
+      state.running = running;
+      void checkShellClose(sessionId, terminalIds, performance.now(), running.stop.signal).then(
+        ({ check, reason }) => {
+          if (state.running !== running) return;
+          state.running = null;
+          // Asked through a callback from before the server or session changed.
+          if (state.place !== askedPlace) {
+            dropped?.();
+            return;
+          }
+          recordShellCloseCheck({
+            event: "shell_close_check",
+            trigger,
+            decision: check.close === "now" ? "closed_without_asking" : "asked",
+            reason,
+            terminalIds,
+          });
+          decide(check);
+        },
+      );
     },
     [floatingPanes, sessionId],
   );

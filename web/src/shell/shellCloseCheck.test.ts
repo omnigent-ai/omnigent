@@ -99,7 +99,11 @@ describe("checkShellClose", () => {
 
   it("keeps only a short printable command name", async () => {
     runnerSays({
-      terminal_a: json({ state: "busy", foreground: "vi‮m\u0007", background_jobs: 0 }),
+      terminal_a: json({
+        state: "busy",
+        foreground: "\ufeffv\u200bi\u202em\u0007",
+        background_jobs: 0,
+      }),
       terminal_b: json({ state: "busy", foreground: "x".repeat(40), background_jobs: -2 }),
     });
     const named = await checkShellClose("conv_a", ["terminal_a"]);
@@ -138,6 +142,19 @@ describe("checkShellClose", () => {
       check: { close: "confirm", busy: null },
       reason: "timeout",
     });
+  });
+
+  it("asks within its budget even when a read ignores its signal", async () => {
+    vi.useFakeTimers();
+    // Stalled before the request goes out, as a slow host lookup would be.
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    const checking = checkShellClose("conv_a", ["terminal_zsh_s1"]);
+    await vi.advanceTimersByTimeAsync(SHELL_CLOSE_CHECK_MS + 1);
+    await expect(checking).resolves.toEqual({
+      check: { close: "confirm", busy: null },
+      reason: "timeout",
+    });
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
   });
 
   it("asks when the user typed into the shell while it was being read", async () => {
@@ -199,7 +216,7 @@ describe("useShellCloseCheck", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("drops a check that's still running when floating panes turn off, closing nothing", async () => {
+  it("asks instead when floating panes turn off while a check is still running", async () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
     const answers: ((response: Response) => void)[] = [];
     fetchMock.mockImplementation(
@@ -218,15 +235,17 @@ describe("useShellCloseCheck", () => {
     await new Promise((resolve) => {
       setTimeout(resolve, 0);
     });
-    // The idle answer came from before the gate closed: no close without asking, and no record.
-    expect(decide).not.toHaveBeenCalled();
+    // The close asks, as every close does with the gate off; the idle answer arrives too late.
+    expect(decide).toHaveBeenCalledExactlyOnceWith({ close: "confirm", busy: null });
     expect(info).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
     // The next close, with the gate off, asks at once.
     result.current(["terminal_zsh_s1"], "pane_close", decide);
-    expect(decide).toHaveBeenCalledExactlyOnceWith({ close: "confirm", busy: null });
+    expect(decide).toHaveBeenCalledTimes(2);
+    expect(decide).toHaveBeenLastCalledWith({ close: "confirm", busy: null });
   });
 
-  it("drops a check that's still running when the session changes or a newer one begins", async () => {
+  it("drops a check that's still running when a newer one begins or the session changes", async () => {
     vi.spyOn(console, "info").mockImplementation(() => {});
     const answers: ((response: Response) => void)[] = [];
     fetchMock.mockImplementation(
@@ -240,16 +259,21 @@ describe("useShellCloseCheck", () => {
     const { result, rerender } = renderHook(({ session }) => useShellCloseCheck(session), {
       initialProps: { session: "conv_a" },
     });
-    result.current(["terminal_zsh_s1"], "pane_close", stale);
+    const staleDropped = vi.fn();
+    result.current(["terminal_zsh_s1"], "pane_close", stale, staleDropped);
     result.current(["terminal_zsh_s1"], "pane_close", newer);
     await vi.waitFor(() => expect(answers).toHaveLength(2));
+    // The older read stops; a newer close answers for itself, so the older says nothing.
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
     answers[0](json({ state: "idle" }));
     answers[1](json({ state: "idle" }));
     await vi.waitFor(() => expect(newer).toHaveBeenCalled());
     expect(stale).not.toHaveBeenCalled();
+    expect(staleDropped).not.toHaveBeenCalled();
 
     const otherSession = vi.fn<(check: ShellCloseCheck) => void>();
-    result.current(["terminal_zsh_s1"], "pane_close", otherSession);
+    const otherSessionDropped = vi.fn();
+    result.current(["terminal_zsh_s1"], "pane_close", otherSession, otherSessionDropped);
     await vi.waitFor(() => expect(answers).toHaveLength(3));
     rerender({ session: "conv_b" });
     answers[2](json({ state: "idle" }));
@@ -257,6 +281,8 @@ describe("useShellCloseCheck", () => {
       setTimeout(resolve, 0);
     });
     expect(otherSession).not.toHaveBeenCalled();
+    // The surface now shows another session, so the close neither happens nor asks.
+    expect(otherSessionDropped).toHaveBeenCalledOnce();
   });
 });
 
