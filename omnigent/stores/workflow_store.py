@@ -57,6 +57,10 @@ class WorkflowNameTakenError(Exception):
     """The owner already has a workflow with this name."""
 
 
+class WorkflowStepsChangedError(Exception):
+    """The workflow's steps are no longer the ones the write expected."""
+
+
 def workflow_page_cursor(workflow: Workflow) -> str:
     """Retain the page boundary when its workflow is renamed or deleted."""
     return "name:" + base64.urlsafe_b64encode(workflow.name.encode()).decode("ascii")
@@ -416,6 +420,7 @@ class WorkflowStore:
         expected_description: str | None = None,
         description_source: str | None = None,
         steps: object = None,
+        expected_steps: object = None,
         planning_session_id: str | None = None,
     ) -> Workflow | None:
         """Change an owned workflow's metadata, steps or planning session.
@@ -430,10 +435,14 @@ class WorkflowStore:
             *description* was saved from or kept over; a description written without
             one clears it.
         :param steps: New steps replacing the old ones, or ``None`` to keep them.
+        :param expected_steps: Write only while the stored steps are still these, so a
+            change made from what a writer read can't undo steps saved since; ``None``
+            writes regardless.
         :param planning_session_id: An owner-checked planning session, or ``None`` to keep it.
         :returns: The updated workflow, or ``None`` if the owner has no such workflow.
         :raises InvalidWorkflowError: If a field is invalid or the steps are too large.
         :raises WorkflowNameTakenError: If another of the owner's workflows has the name.
+        :raises WorkflowStepsChangedError: If the stored steps aren't *expected_steps*.
         """
 
         def write(session: Session) -> Workflow | None:
@@ -450,6 +459,16 @@ class WorkflowStore:
             if row is None:
                 return None
             current = self._workflows([row])[0]
+            if expected_steps is not None:
+                # Both in stored form, so an equal plan compares equal however it was sent.
+                _, _, expected = normalize_workflow(
+                    name=row.name, description=current.description, steps=expected_steps
+                )
+                _, _, stored_steps = normalize_workflow(
+                    name=row.name, description=current.description, steps=current.steps
+                )
+                if expected != stored_steps:
+                    raise WorkflowStepsChangedError("the workflow's steps changed since read")
             stale = (
                 expected_description is not None and expected_description != current.description
             )

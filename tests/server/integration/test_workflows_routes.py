@@ -612,6 +612,18 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
     assert saved.json()["planning_session_id"] == planner
     # Saving the steps alone, as a time limit does, keeps the description's time.
     assert saved.json()["description_updated_at"] == described_at
+    # A write from steps read before another save is refused, and changes nothing.
+    read = saved.json()["steps"]
+    limited = [{**read[0], "goal": "**Time limit:** 2 hours"}, *read[1:]]
+    stale = await client.patch(
+        path, json={"steps": limited, "expected_steps": STEPS[:1]}, headers=_headers(ALICE)
+    )
+    assert stale.status_code == 409 and stale.json()["error"]["code"] == "conflict"
+    current = await client.patch(
+        path, json={"steps": limited, "expected_steps": read}, headers=_headers(ALICE)
+    )
+    assert current.status_code == 200, current.text
+    assert current.json()["steps"][0]["goal"] == "**Time limit:** 2 hours"
     assert (await client.get(path + "/runs", headers=_headers(ALICE))).json()["data"] == []
     listed = (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"][0]
     assert listed["id"] == draft["id"] and listed["is_draft"] is False

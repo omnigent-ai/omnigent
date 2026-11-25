@@ -466,11 +466,13 @@ it ran.
   `next_cursor`). A page can be short, even empty, while `next_cursor` is set.
 - `PATCH /v1/workflows/{id}`: any of `name`, `description` and `steps`; fields
   left out keep their values. With `expected_description`, the new description
-  applies only while the stored one is still that text. `description_source`
-  names the planning-chat proposal the description was saved from or kept
-  over; the workflow returns it until the description is written without one or
-  another planning chat is attached. The workflow's `description_updated_at` is
-  when the description was last written: a write that leaves it, such as a time
+  applies only while the stored one is still that text. With `expected_steps`,
+  the update applies only while the stored steps are still those, and is
+  otherwise refused as a `conflict` (409). `description_source` names the
+  planning-chat proposal the description was saved from or kept over; the
+  workflow returns it until the description is written without one or another
+  planning chat is attached. The workflow's `description_updated_at` is when
+  the description was last written: a write that leaves it, such as a time
   limit's change to the steps, keeps it.
 - `DELETE /v1/workflows/{id}`: deletes it, then who it was shared with.
 

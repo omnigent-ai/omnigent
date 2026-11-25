@@ -20,6 +20,7 @@ from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores import workflow_store
 from omnigent.stores.workflow_store import (
     WorkflowNameTakenError,
+    WorkflowStepsChangedError,
     WorkflowStore,
     workflow_page_cursor,
 )
@@ -291,6 +292,30 @@ def test_a_description_keeps_its_time_through_writes_that_leave_it(
     stored = store.update(saved.id, user_id=ALICE, steps=STEPS)
     assert stored is not None and stored.description_updated_at == 140
     assert store.get(saved.id, user_id=ALICE) == stored
+
+
+def test_a_write_from_steps_read_earlier_is_refused_once_they_change(
+    store: WorkflowStore,
+) -> None:
+    saved = _save(store, "deploy")
+    limited = [STEPS[0], {**STEPS[1], "goal": "Run the suite\n\n**Time limit:** 2 hours"}]
+    # The steps as read, in any equal form, let the write through.
+    written = store.update(saved.id, user_id=ALICE, steps=limited, expected_steps=saved.steps)
+    assert written is not None and written.steps[1]["goal"].endswith("2 hours")
+    again = store.update(saved.id, user_id=ALICE, steps=STEPS, expected_steps=limited)
+    assert again is not None and again.steps == saved.steps
+    # Steps saved since the read stay, and nothing else changes either.
+    elsewhere = store.update(saved.id, user_id=ALICE, steps=[{"id": "only", "name": "Only"}])
+    assert elsewhere is not None
+    with pytest.raises(WorkflowStepsChangedError):
+        store.update(
+            saved.id,
+            user_id=ALICE,
+            name="renamed",
+            steps=limited,
+            expected_steps=saved.steps,
+        )
+    assert store.get(saved.id, user_id=ALICE) == elsewhere
 
 
 def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> None:

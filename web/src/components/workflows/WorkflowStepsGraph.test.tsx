@@ -209,6 +209,7 @@ describe("a step's time limit", () => {
     const limit = within(fix!).getByTestId("workflow-step-time-limit");
     expect(limit).toHaveTextContent("2h");
     expect(limit).toHaveAttribute("title", "Time limit: 2 hours");
+    expect(within(limit).getByText("Time limit: 2 hours")).toHaveClass("sr-only");
     expect(within(fix!).queryByRole("button")).toBeNull();
   });
 

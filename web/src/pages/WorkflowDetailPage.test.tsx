@@ -306,15 +306,15 @@ function renderPage(client = new QueryClient()) {
 
 interface StorePatch {
   steps?: WorkflowStep[];
+  expected_steps?: WorkflowStep[];
   description?: string;
   expected_description?: string;
   description_source?: string | null;
 }
 
-// Answers PATCH like the workflow store: a description applies only while the stored one is
-// still `expected_description`, keeps the proposal it was saved with as its source, and keeps
-// its time through writes that leave it. With `hold` set, PATCHes wait for `release`; with
-// `fail` set, they're refused.
+// Answers like the workflow store: steps and a description apply only while still the expected
+// ones, keeping the description's source and time. `hold` delays PATCHes, `fail` refuses them,
+// `unknown` fields get an older server's 422, and `afterRead` runs once just after a read.
 function serveLikeTheStore(initial: WorkflowDetail) {
   const held: (() => void)[] = [];
   const server = {
@@ -322,6 +322,8 @@ function serveLikeTheStore(initial: WorkflowDetail) {
     patches: [] as StorePatch[],
     hold: false,
     fail: false,
+    unknown: [] as string[],
+    afterRead: undefined as (() => void) | undefined,
     release: () =>
       act(async () => {
         for (const resolve of held.splice(0)) resolve();
@@ -340,7 +342,20 @@ function serveLikeTheStore(initial: WorkflowDetail) {
           JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
           { status: 500 },
         );
+      const unknown = server.unknown.filter((field) => field in body);
+      if (unknown.length > 0) {
+        const detail = unknown.map((field) => ({ type: "extra_forbidden", loc: ["body", field] }));
+        return new Response(JSON.stringify({ detail }), { status: 422 });
+      }
       const { stored } = server;
+      if (
+        body.expected_steps !== undefined &&
+        JSON.stringify(body.expected_steps) !== JSON.stringify(stored.steps)
+      )
+        return new Response(
+          JSON.stringify({ error: { code: "conflict", message: "Steps changed" } }),
+          { status: 409 },
+        );
       const describes =
         body.description !== undefined &&
         (body.expected_description === undefined ||
@@ -358,8 +373,13 @@ function serveLikeTheStore(initial: WorkflowDetail) {
           : (stored.description_updated_at ?? stored.updated_at),
         updated_at: now,
       };
+      return new Response(JSON.stringify(server.stored));
     }
-    return new Response(JSON.stringify(server.stored));
+    const read = new Response(JSON.stringify(server.stored));
+    const afterRead = server.afterRead;
+    server.afterRead = undefined;
+    afterRead?.();
+    return read;
   });
   return server;
 }
@@ -510,10 +530,10 @@ describe("WorkflowDetailPage", () => {
     return { patches: server.patches, server, release: server.release };
   }
 
-  function mockJournal(entries: JournalEntry[]) {
+  function mockJournal(entries: JournalEntry[], { isLoading = false } = {}) {
     vi.mocked(useSessionJournal).mockReturnValue({
       entries,
-      isLoading: false,
+      isLoading,
       error: null,
       hasOlder: false,
       loadingOlder: false,
@@ -568,15 +588,7 @@ describe("WorkflowDetailPage", () => {
 
   it("pauses the time limit menus while the planning chat's journal loads", async () => {
     await workflowWithProposals(WORKFLOW.steps, [plan(5, WORKFLOW.steps)]);
-    vi.mocked(useSessionJournal).mockReturnValue({
-      entries: [],
-      isLoading: true,
-      error: null,
-      hasOlder: false,
-      loadingOlder: false,
-      loadOlder: vi.fn(),
-      retry: vi.fn(),
-    });
+    mockJournal([], { isLoading: true });
     const view = renderPage();
     expect(
       await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }),
@@ -820,6 +832,42 @@ describe("WorkflowDetailPage", () => {
     expect(patches).toHaveLength(1);
   });
 
+  it("redoes a time limit save over steps saved between its read and its write", async () => {
+    const { patches, server } = await workflowWithProposals(WORKFLOW.steps, []);
+    renderPage();
+    const limit = await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" });
+
+    // Another page saves a step just after this save reads the plan.
+    const report = { id: "report", name: "Report", goal: null, depends_on: ["fix"] };
+    server.afterRead = () => {
+      server.stored = { ...server.stored, steps: [...WORKFLOW.steps, report] };
+    };
+    fireEvent.click(limit);
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+        "Explore the failures, Fix the test, Report",
+      ),
+    );
+    // The first write named the steps it read, so it was refused; the second kept the new step.
+    expect(patches.map((patch) => patch.expected_steps?.length)).toEqual([2, 3]);
+    expect(server.stored.steps).toEqual([
+      WORKFLOW.steps[0],
+      { ...WORKFLOW.steps[1], goal: "The suite passes\n\n**Time limit:** 4 hours" },
+      report,
+    ]);
+  });
+
+  it("saves a time limit on a server too old to check the steps it read", async () => {
+    const { patches, server } = await workflowWithProposals(WORKFLOW.steps, []);
+    server.unknown = ["expected_steps"];
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    await waitFor(() =>
+      expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]),
+    );
+    expect(patches.map((patch) => "expected_steps" in patch)).toEqual([true, false]);
+  });
+
   it("offers time limits only to the owner, and not while a proposal is unsaved", () => {
     mockRuns([]);
     mockWorkflow({ data: { ...WORKFLOW, viewer_role: "viewer" } });
@@ -829,26 +877,7 @@ describe("WorkflowDetailPage", () => {
 
     cleanup();
     mockWorkflow({ data: { ...WORKFLOW, planning_session_id: "a".repeat(32) } });
-    vi.mocked(useSessionJournal).mockReturnValue({
-      entries: [
-        {
-          id: "proposal",
-          position: 1,
-          created_at: 1,
-          scheduled_task_run_id: null,
-          step: null,
-          author: { type: "agent" },
-          kind: "plan",
-          content: { steps: [WORKFLOW.steps[0]] },
-        },
-      ],
-      isLoading: false,
-      error: null,
-      hasOlder: false,
-      loadingOlder: false,
-      loadOlder: vi.fn(),
-      retry: vi.fn(),
-    });
+    mockJournal([plan(1, [WORKFLOW.steps[0]!])]);
     renderPage();
     expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeNull();

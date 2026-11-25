@@ -91,6 +91,7 @@ from omnigent.stores.session_journal_store import SessionJournalStore
 from omnigent.stores.workflow_store import (
     WORKFLOW_PAGE_MAX,
     WorkflowNameTakenError,
+    WorkflowStepsChangedError,
     WorkflowStore,
     workflow_page_cursor,
 )
@@ -508,7 +509,8 @@ def create_workflows_router(
 
         :raises OmnigentError: 401 if unauthenticated in multi-user mode, 400 for
             an invalid field, 404 if the caller has no such workflow, 409 if
-            another of the caller's workflows has the new name.
+            another of the caller's workflows has the new name, or ``conflict`` if
+            the steps are no longer ``expected_steps``.
         """
         user_id = await _writer(request)
         store = _store()
@@ -554,12 +556,15 @@ def create_workflows_router(
                 expected_description=body.expected_description,
                 description_source=description_source,
                 steps=_steps(body.steps),
+                expected_steps=_steps(body.expected_steps),
                 planning_session_id=planning_session_id,
             )
         except InvalidWorkflowError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         except WorkflowNameTakenError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.ALREADY_EXISTS) from exc
+        except WorkflowStepsChangedError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
         if workflow is None:
             raise _not_found()
         log_workflow_saved(

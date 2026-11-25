@@ -80,7 +80,9 @@ export function StepTimeLimit({
     return (
       <span className={CHIP} title={`Time limit: ${limit}`} data-testid="workflow-step-time-limit">
         {icon}
-        {short}
+        {/* The short form, or none for wording without a length, says too little read aloud. */}
+        <span aria-hidden>{short}</span>
+        <span className="sr-only">Time limit: {limit}</span>
       </span>
     );
   }

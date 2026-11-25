@@ -17,11 +17,13 @@ export const TIME_LIMIT_CHOICES = [
   "1 day",
 ] as const;
 
-// A line of its own, as a paragraph or a list item, e.g. "- **Time limit:** 2 hours".
-const LIMIT_LINE = /^([ \t]*(?:[-*+][ \t]+)?)\*\*Time limit:\*\*[ \t]*(.*?)[ \t]*$/i;
-const DETAILS_LINE = /^([ \t]*)([-*+][ \t]+)?\*\*Details:\*\*/i;
+// A line of its own, as a paragraph, a list item or a quote, with the colon in the bold or just
+// after it, e.g. "- **Time limit:** 2 hours" or "1. **Time limit**: 2 hours".
+const LIMIT_LINE =
+  /^([ \t]*(?:>[ \t]?)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?)\*\*Time limit(?::\*\*|\*\*[ \t]*:)[ \t]*(.*?)[ \t]*$/i;
+const DETAILS_LINE = /^([ \t]*)((?:[-*+]|\d{1,9}[.)])[ \t]+)?\*\*Details(?::\*\*|\*\*[ \t]*:)/i;
 // Most descriptions name no limit, and those need no parsing.
-const LIMIT_MARK = /\*\*Time limit:\*\*/i;
+const LIMIT_MARK = /\*\*Time limit(?::\*\*|\*\*[ \t]*:)/i;
 // One part of a length, e.g. "1 hour" in "1 hour 30 minutes" or "1h" in "1h30m", with what
 // separates it from the next.
 const LENGTH_PART =
@@ -137,7 +139,7 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
   // From the last, so the earlier lines keep their places.
   for (const at of [...found].reverse()) {
     if (at === kept) {
-      // A list item stays one.
+      // Its indent, quote and list marker stay, so the line stays in its list or quote.
       lines[at] = `${LIMIT_LINE.exec(lines[at]!)![1]}${limitLine}`;
       continue;
     }

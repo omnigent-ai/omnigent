@@ -118,6 +118,29 @@ describe("withStepTimeLimit", () => {
   });
 
   it.each([
+    ["the colon after the bold", "**Time limit**: 2 hours", "**Time limit:** 4 hours"],
+    [
+      "a numbered item",
+      "1. Fix it.\n2. **Time limit:** 2 hours",
+      "1. Fix it.\n2. **Time limit:** 4 hours",
+    ],
+    ["a quote", "> **Time limit:** 2 hours\n> Tell me.", "> **Time limit:** 4 hours\n> Tell me."],
+  ])("reads and edits a limit written with %s", (_, written, changed) => {
+    expect(stepTimeLimit(written)).toBe("2 hours");
+    expect(withStepTimeLimit(written, "4 hours")).toBe(changed);
+    expect(stepTimeLimit(withStepTimeLimit(written, null))).toBeNull();
+  });
+
+  it("puts a new limit before Details written another way", () => {
+    expect(withStepTimeLimit("Fix it.\n\n**Details**: rerun it.", "1 hour")).toBe(
+      "Fix it.\n\n**Time limit:** 1 hour\n\n**Details**: rerun it.",
+    );
+    expect(withStepTimeLimit("1. Fix it.\n2. **Details:** rerun it.", "1 hour")).toBe(
+      "1. Fix it.\n2. **Time limit:** 1 hour\n2. **Details:** rerun it.",
+    );
+  });
+
+  it.each([
     ["Fix it.\n\n```markdown\n**Time limit:** 1 day\n```"],
     // A shorter fence, or one with an info string, doesn't close a longer one.
     ["Fix it.\n\n````\n```\n**Time limit:** 1 day\n````"],
