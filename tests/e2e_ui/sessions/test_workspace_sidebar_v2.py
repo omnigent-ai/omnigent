@@ -703,7 +703,7 @@ def test_files_lists_a_folder_longer_than_one_listing_page_to_its_last_file(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default", timeout=10.0
     )
     environment.raise_for_status()
-    # The session's workspace exists once something is written to it.
+    # Nothing may have written to the workspace yet, so its root is made along with the folder.
     big = Path(environment.json()["metadata"]["root"]) / "big"
     big.mkdir(parents=True)
     try:

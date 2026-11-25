@@ -488,17 +488,17 @@ describe("readFileViaWorkspaceApi", () => {
 
   /** Answers ListDirectory with `pageFor(token)`, so a test can script the host's pages. */
   function scriptPages(pageFor: (token: string) => { paths: string[]; next: string }) {
-    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
-      if (methodOf(input) === "GetCapabilities") return unimplemented();
-      const request = fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array);
-      const { paths, next } = pageFor(request.pageToken);
-      const page = create(ListDirectoryResponseSchema, {
-        entries: paths.map((path) => ({ name: path.split("/").at(-1)!, path })),
-        nextPageToken: next,
-      });
-      return new Response(toBinary(ListDirectoryResponseSchema, page), {
-        headers: { "content-type": "application/proto" },
-      });
+    serveMethods({
+      ListDirectory: (body) => {
+        const { paths, next } = pageFor(fromBinary(ListDirectoryRequestSchema, body).pageToken);
+        const page = create(ListDirectoryResponseSchema, {
+          entries: paths.map((path) => ({ name: path.split("/").at(-1)!, path })),
+          nextPageToken: next,
+        });
+        return new Response(toBinary(ListDirectoryResponseSchema, page), {
+          headers: PROTO_HEADERS,
+        });
+      },
     });
   }
 

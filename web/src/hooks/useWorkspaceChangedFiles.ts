@@ -474,6 +474,14 @@ function listingEntries(json: FilesystemListResponse, target = "", prefix = ""):
  * aborts, no further page is asked for.
  */
 export async function readListingPages(
+  fetchPage: (after: string | null) => Promise<FilesystemListResponse>,
+  signal?: AbortSignal,
+): Promise<FilesystemListResponse>;
+export async function readListingPages(
+  fetchPage: (after: string | null) => Promise<FilesystemListResponse | null>,
+  signal?: AbortSignal,
+): Promise<FilesystemListResponse | null>;
+export async function readListingPages(
   fetchPage: (after: string | null) => Promise<FilesystemListResponse | null>,
   signal?: AbortSignal,
 ): Promise<FilesystemListResponse | null> {
@@ -912,7 +920,7 @@ async function fetchWorkspaceDirectory(
   }, signal);
   // The tree addresses children relative to the location it is rooted at, one
   // level shallower than the directory just listed.
-  return json === null ? [] : listingEntries(json, target, dirPath);
+  return listingEntries(json, target, dirPath);
 }
 
 // ── Path existence check (parent-directory listing) ──────────────────────────
