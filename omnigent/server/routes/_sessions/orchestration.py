@@ -5775,6 +5775,8 @@ async def _bind_and_launch_managed_runner(
                 tunnel_registry,
                 tracker,
                 settle_failure=False,
+                conversation_store=conversation_store,
+                host_id=managed.host_id,
             )
             if not connected:
                 reason = "managed runner did not connect after launch"

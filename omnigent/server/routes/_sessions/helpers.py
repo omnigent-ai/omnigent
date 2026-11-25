@@ -165,6 +165,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
     _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY,
     _ACP_SUBAGENT_ID_LABEL_KEY,
     _ANTIGRAVITY_NATIVE_HARNESS,
@@ -7512,9 +7513,17 @@ async def _wait_for_managed_runner_tunnel(
     tracker: ManagedLaunchTracker,
     *,
     settle_failure: bool = True,
+    conversation_store: ConversationStore | None = None,
+    host_id: str | None = None,
 ) -> bool:
     """
     Wait for a launched managed runner to connect, failing the launch on timeout.
+
+    A message that finds the runner slow to connect relaunches it on the same
+    host, and the host stops the runner it replaced. Given *conversation_store*
+    and *host_id*, the wait moves on to the runner the session is now bound to
+    on that host rather than failing on one that can no longer connect. It stops
+    following replacements after ``_MANAGED_RUNNER_REPLACEMENT_WAIT_S``.
 
     :param session_id: Session/conversation identifier.
     :param runner_id: Runner id returned by the host launch frame.
@@ -7522,16 +7531,54 @@ async def _wait_for_managed_runner_tunnel(
     :param tracker: Managed launch tracker to settle on failure.
     :param settle_failure: Publish and settle a timeout immediately. Callers
         with rollback work can defer settlement until cleanup finishes.
+    :param conversation_store: Store to re-read the session's runner binding
+        from after a timeout, or ``None`` to wait only for *runner_id*.
+    :param host_id: Host the runner was launched on. A binding to any other
+        host is not followed.
     :returns: ``True`` when the runner connected; ``False`` on timeout.
     """
+    from omnigent.server.managed_hosts import is_move_claim
     from omnigent.server.routes import sessions as _facade
 
-    runner = await tunnel_registry.wait_for_runner(
-        runner_id,
-        timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
-    )
-    if runner is not None:
-        return True
+    connect_timeout_s = _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+    follow_deadline = time.monotonic() + _facade._MANAGED_RUNNER_REPLACEMENT_WAIT_S
+    awaited_runner_ids: set[str] = set()
+    while True:
+        runner = await tunnel_registry.wait_for_runner(runner_id, timeout_s=connect_timeout_s)
+        if runner is not None:
+            return True
+        awaited_runner_ids.add(runner_id)
+        if conversation_store is None or host_id is None or time.monotonic() >= follow_deadline:
+            break
+        try:
+            bound = await asyncio.to_thread(
+                conversation_store.get_profile_host_binding, session_id
+            )
+        except ConversationNotFoundError:
+            break
+        remaining_s = follow_deadline - time.monotonic()
+        if (
+            remaining_s <= 0
+            or bound.host_id != host_id
+            or bound.runner_id is None
+            or bound.runner_id in awaited_runner_ids
+            or is_move_claim(bound.runner_id)
+        ):
+            break
+        _logger.info(
+            "Managed runner %s was replaced by %s for session %s; waiting for the replacement",
+            runner_id,
+            bound.runner_id,
+            session_id,
+            extra={"session_id": session_id},
+        )
+        runner_id = bound.runner_id
+        # The message that relaunched it waits this long for a confirmed spawn.
+        connect_timeout_s = min(
+            _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+            * _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
+            remaining_s,
+        )
     _logger.error(
         "Managed runner connection timed out",
         extra=debug_event(

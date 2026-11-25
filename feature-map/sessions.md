@@ -276,8 +276,10 @@ the header menu), and each place is a separate entry point.
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
-  (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. On phone layouts a submenu replaces the menu's list under a
+  (Updated / Created / Custom) and Show (Harness / Project / Updated / Environment / Repo /
+  Branch) submenus, saved per device. Show → Project names a row's project (its emoji, else a
+  folder glyph) under the title wherever the row isn't inside that project's folder: pins,
+  Shared with me, and every grouping but Default. On phone layouts a submenu replaces the menu's list under a
   back row with its name, and reopening the menu starts at the main list.
   Created ordering keeps sessions newest-created first as messages
   arrive;
