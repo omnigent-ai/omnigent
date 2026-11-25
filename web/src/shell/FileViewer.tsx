@@ -2068,7 +2068,14 @@ function FileViewerBody({
                   body,
                   anchor_content: activeSelection.anchor_content,
                 },
-                { onSuccess: () => setActiveSelection(null) },
+                {
+                  onSuccess: () => setActiveSelection(null),
+                  // Keep the selection so the person can retry; say why it didn't save.
+                  onError: (error) =>
+                    toast.error(
+                      `Couldn't save the comment: ${error instanceof Error ? error.message : "unknown error"}`,
+                    ),
+                },
               );
             }}
             canAddress={canEdit && sender !== null}
