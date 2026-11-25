@@ -1,6 +1,8 @@
 // What the Files tree's filters do right now, in words. A name searches the browsed
 // folder, narrowed by the include and exclude globs; globs alone filter the tree itself.
 
+import { splitGlobList } from "@/lib/globList";
+
 export interface TreeFilterValues {
   nameContains: string;
   include: string;
@@ -22,8 +24,9 @@ export function treeFilterSummary({
   exclude,
 }: TreeFilterValues): TreeFilterSummary {
   const name = nameContains.trim();
-  const included = include.trim();
-  const excluded = exclude.trim();
+  // Read as the filter parses them, so a list of only commas and blanks filters nothing.
+  const included = splitGlobList(include).join(", ");
+  const excluded = splitGlobList(exclude).join(", ");
   if (!name && !included && !excluded) return { active: false };
   if (!name) {
     const hiding = excluded && `hiding ${excluded}`;

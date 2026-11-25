@@ -9,6 +9,13 @@ describe("treeFilterSummary", () => {
     expect(treeFilterSummary({ nameContains: "  ", include: " ", exclude: "" })).toEqual({
       active: false,
     });
+    // A list of only separators parses to no globs, so it filters nothing either.
+    expect(treeFilterSummary({ nameContains: "", include: " , ", exclude: "," })).toEqual({
+      active: false,
+    });
+    expect(treeFilterSummary({ nameContains: "app", include: " , ", exclude: "" })).toMatchObject({
+      text: "Names containing “app”",
+    });
   });
 
   it.each([
