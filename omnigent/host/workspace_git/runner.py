@@ -227,13 +227,16 @@ def _environment(*, literal_pathspecs: bool = True) -> dict[str, str]:
     return environment
 
 
-# An absolute path in Git's message, POSIX or Windows, e.g. an outside Git directory.
-_ABSOLUTE_PATH = re.compile(r"(?<![\w.~-])/[^\s'\"`:,]+|\b[A-Za-z]:[\\/][^\s'\"`:,]+")
+# Absolute paths in Git's message, POSIX or Windows, e.g. an outside Git directory. A quoted
+# one is replaced whole, spaces included; an unquoted one runs to ": ", ", " or the end.
+_QUOTED_PATH = re.compile(r"""(['"`])(?:/|[A-Za-z]:[\\/])[^'"`]*\1""")
+_UNQUOTED_PATH = re.compile(r"(?<![\w.~-])(?:/|\b[A-Za-z]:[\\/])(?:(?!: |, ).)*")
 
 
 def _without_absolute_paths(message: str) -> str:
     """``message`` with each absolute path replaced, so a detail never names host paths."""
-    return _ABSOLUTE_PATH.sub("<path>", message)
+    quoted = _QUOTED_PATH.sub(lambda match: f"{match[1]}<path>{match[1]}", message)
+    return _UNQUOTED_PATH.sub("<path>", quoted)
 
 
 def failure(output: GitOutput, command: str) -> GitError:

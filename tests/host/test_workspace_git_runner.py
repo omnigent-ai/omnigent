@@ -715,10 +715,15 @@ async def test_partial_output_never_signals_a_reaped_git(
             "fatal: not a git repository: '<path>'",
         ),
         (
-            "fatal: cannot chdir to /srv/main/sub: No such file or directory",
+            "fatal: not a git repository: '/srv/my repo/.git/worktrees/work'",
+            "fatal: not a git repository: '<path>'",
+        ),
+        (
+            "fatal: cannot chdir to /srv/my repo/sub: No such file or directory",
             "fatal: cannot chdir to <path>: No such file or directory",
         ),
-        ("error: C:\\repo\\.git\\index is locked", "error: <path> is locked"),
+        # Unquoted, a path's end can't be told from the words after it, so they go too.
+        ("error: C:\\repo\\.git\\index is locked", "error: <path>"),
         ("fatal: bad revision 'origin/main'", "fatal: bad revision 'origin/main'"),
     ],
 )
