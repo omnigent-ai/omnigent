@@ -75,24 +75,13 @@ describe("treePathFilter", () => {
   const shows = (include: string, exclude: string, path: string, type: "file" | "directory") =>
     treePathFilter(true, { include, exclude })(path, type);
 
+  // Syntax lives in globMatches.json; these check the tree's wiring of it.
   it.each([
-    ["*.lock", "pnpm.lock", true],
     ["*.lock", "web/pnpm.lock", true],
     ["*.lock", "pnpm.lock.bak", false],
-    ["web/*.lock", "web/pnpm.lock", true],
-    ["web/*.lock", "web/sub/pnpm.lock", false],
-    ["web/**/*.lock", "web/sub/deep/pnpm.lock", true],
-    ["web/**/*.lock", "web/pnpm.lock", true],
-    ["file?.ts", "file1.ts", true],
-    ["file?.ts", "file10.ts", false],
     ["node_modules", "a/node_modules/x/index.js", true],
     ["build/", "build/out.js", true],
-    ["src/**", "src/a/b.ts", true],
-    ["./src/*.ts", "src/a.ts", false],
     ["*.{lock,log}", "out.log", true],
-    ["*.LOCK", "pnpm.lock", true],
-    ["**/**/**/*.lock", "a/b/pnpm.lock", true],
-    ["a.b", "axb", false],
   ])("exclude %j hides %j: %s", (exclude, path, hidden) => {
     expect(shows("", exclude, path, "file")).toBe(!hidden);
   });
