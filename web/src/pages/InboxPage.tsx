@@ -42,6 +42,7 @@
  * what clears an approval.
  */
 
+import { personFirstName } from "@/projectHome/TicketActor";
 import type { AutomationFailure } from "@/lib/scheduledTasksApi";
 import { describeRunFailure } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -797,7 +798,7 @@ export function InboxPage() {
     }
     if (entry.kind === "ticket" && entry.item.reason === "cc") {
       const { item } = entry;
-      const author = item.raised_by_user_id ?? "Someone";
+      const author = item.raised_by_user_id ? personFirstName(item.raised_by_user_id) : "Someone";
       return (
         <InboxCard
           key={entry.key}

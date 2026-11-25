@@ -562,7 +562,7 @@ describe("Project ticket board", () => {
     const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
     const line = within(card).getByTestId("ticket-status-line");
     expect(line).toHaveTextContent("Ship it Friday");
-    expect(line.title).toMatch(/^Latest comment by alice@example\.com, /);
+    expect(line.title).toMatch(/^Latest comment by Alice, /);
     expect(within(card).queryByText("Moved to Review")).toBeNull();
   });
 

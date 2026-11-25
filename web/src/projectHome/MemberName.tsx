@@ -1,7 +1,7 @@
 import { InfoIcon } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { userColor, userInitials } from "@/lib/userBadge";
 import { personDisplayName } from "./personaMentions";
+import { PersonAvatar } from "./TicketActor";
 
 /** What the pooled agents row covers, for people who don't know the internals. */
 export const OTHER_AGENTS_EXPLANATION =
@@ -27,13 +27,7 @@ export function MemberName({
   if (member.kind === "human" && member.user_id) {
     return (
       <span className="flex min-w-0 items-center gap-2" title={member.user_id}>
-        <span
-          aria-hidden
-          className="grid size-5 shrink-0 place-items-center rounded-full text-[9px] font-semibold text-white"
-          style={{ backgroundColor: userColor(member.user_id) }}
-        >
-          {userInitials(member.user_id)}
-        </span>
+        <PersonAvatar userId={member.user_id} className="size-5 text-[9px]" />
         <span className="wrap-anywhere">{personDisplayName(member.user_id)}</span>
       </span>
     );

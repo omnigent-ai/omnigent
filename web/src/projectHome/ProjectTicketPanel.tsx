@@ -53,7 +53,6 @@ import {
   getTicket,
   labelChanges,
   openProjectFile,
-  requesterLabel,
   ticketOutputs,
   ticketEventStage,
   type ProjectTicket,
@@ -89,6 +88,7 @@ import {
   TicketMarkdown,
   useTicketImageUpload,
 } from "./ticketImages";
+import { ActingFor, PersonAvatar, PersonName, RequesterName } from "./TicketActor";
 import { TicketSessionAvatar, TicketSessionLink } from "./TicketSessionLink";
 import {
   TicketError,
@@ -108,7 +108,6 @@ import {
   writeTicketDraft,
 } from "./ticketTextDrafts";
 import { useProjectAgentSession } from "./useProjectAgentSession";
-import { userColor, userInitials } from "@/lib/userBadge";
 import {
   useTicket,
   useTicketActions,
@@ -685,7 +684,8 @@ function TicketDetails({
             )}
             {ticket.requested_by && (
               <p className="text-sm text-muted-foreground" data-testid="ticket-panel-requester">
-                Requested by {requesterLabel(ticket.requested_by, getCurrentUserId())}
+                Requested by{" "}
+                <RequesterName requestedBy={ticket.requested_by} viewer={getCurrentUserId()} />
               </p>
             )}
             <TicketAssigneePicker
@@ -1555,20 +1555,6 @@ function TicketFinalUpdateSection({
   );
 }
 
-/** A person's initials circle, the same one the app shows for people elsewhere. */
-function TicketPersonAvatar({ userId }: { userId: string }) {
-  return (
-    <span
-      aria-hidden
-      data-testid="ticket-person-avatar"
-      className="grid size-6 shrink-0 place-items-center rounded-full text-[10px] font-semibold text-white"
-      style={{ backgroundColor: userColor(userId) }}
-    >
-      {userInitials(userId)}
-    </span>
-  );
-}
-
 function TicketActivityItem({
   event,
   personaLookup,
@@ -1594,19 +1580,26 @@ function TicketActivityItem({
       ? event.payload.involvement
       : null;
   const agent = !!(event.session_id || event.agent_id);
-  const author =
-    event.user_id && event.user_id === viewerId
-      ? "You"
-      : (event.user_id ?? (agent ? "Agent" : "System"));
   const personaName = usePersonaForSession(event.session_id, personaLookup);
+  // An agent reads as its role, "for" the person whose login it runs under.
   const actor = event.session_id ? (
-    <TicketSessionLink
-      sessionId={event.session_id}
-      showAgentName
-      label={personaName ?? undefined}
-    />
+    <>
+      <TicketSessionLink
+        sessionId={event.session_id}
+        showAgentName
+        label={personaName ?? undefined}
+      />
+      <ActingFor userId={event.user_id ?? null} viewer={viewerId} />
+    </>
+  ) : event.user_id && !agent ? (
+    <span className="text-foreground">
+      <PersonName userId={event.user_id} viewer={viewerId} capitalize />
+    </span>
   ) : (
-    <span className="text-foreground">{author}</span>
+    <span className="text-foreground">
+      {agent ? "Agent" : "System"}
+      {agent && <ActingFor userId={event.user_id ?? null} viewer={viewerId} />}
+    </span>
   );
   const stage = ticketEventStage(event);
   const age = relativeTime(event.created_at * 1000, nowMs);
@@ -1634,7 +1627,7 @@ function TicketActivityItem({
           agent ? (
             <BotIcon aria-hidden className="size-3.5" />
           ) : event.user_id ? (
-            <TicketPersonAvatar userId={event.user_id} />
+            <PersonAvatar userId={event.user_id} />
           ) : (
             <UserRoundIcon aria-hidden className="size-3.5" />
           )
@@ -1655,7 +1648,7 @@ function TicketActivityItem({
         ) : event.session_id ? (
           <TicketSessionAvatar sessionId={event.session_id} persona={personaName} />
         ) : event.user_id && !agent ? (
-          <TicketPersonAvatar userId={event.user_id} />
+          <PersonAvatar userId={event.user_id} />
         ) : (
           <span aria-hidden className="size-1.5 rounded-full bg-muted-foreground/50" />
         )}

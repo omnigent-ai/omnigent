@@ -24,7 +24,8 @@ import { useNow } from "@/hooks/useNow";
 import { Link, useSearchParams } from "@/lib/routing";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { getCurrentUserId } from "@/lib/identity";
-import { requesterLabel, type ProjectTicket, type TicketStage } from "@/lib/projectTicketsApi";
+import type { ProjectTicket, TicketStage } from "@/lib/projectTicketsApi";
+import { personLabel, RequesterName } from "./TicketActor";
 import { markdownPlainText } from "@/lib/markdownPlainText";
 import { cn } from "@/lib/utils";
 import { shownLoadError, TicketError, TicketLabels, TicketLoadError } from "./TicketControls";
@@ -602,8 +603,8 @@ function TicketStatusLine({ ticket }: { ticket: ProjectTicket }) {
   const text = source ? markdownPlainText(source) : null;
   if (!text) return null;
   const author = comment
-    ? comment.by_person
-      ? requesterLabel(comment.user_id, getCurrentUserId())
+    ? comment.by_person && comment.user_id
+      ? personLabel(comment.user_id, getCurrentUserId())
       : "an agent"
     : null;
   return (
@@ -625,14 +626,9 @@ function TicketStatusLine({ ticket }: { ticket: ProjectTicket }) {
 function TicketRequester({ ticket }: { ticket: ProjectTicket }) {
   const viewer = getCurrentUserId();
   if (!ticket.requested_by || ticket.requested_by === viewer) return null;
-  const label = requesterLabel(ticket.requested_by, viewer);
   return (
-    <span
-      className="min-w-0 truncate"
-      title={`Requested by ${label}`}
-      data-testid="ticket-requester"
-    >
-      by {label}
+    <span className="flex min-w-0 items-center" data-testid="ticket-requester">
+      <RequesterName requestedBy={ticket.requested_by} viewer={viewer} avatar />
     </span>
   );
 }
