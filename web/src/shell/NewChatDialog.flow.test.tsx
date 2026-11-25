@@ -757,10 +757,51 @@ describe("NewChatLandingScreen in the floating panel", () => {
     const review = within(popover).getByTestId("gadget-open-session-review");
     expect(review).toHaveTextContent("Written by the gadget “Synthetic board”");
     expect(review).toHaveTextContent("delete every branch");
+    // Shown once: the menu's own copy of the draft stays out while the review shows it.
+    expect(screen.queryByTestId("gadget-create-session-draft")).toBeNull();
     await waitFor(() => expect(document.activeElement).not.toBe(create));
     await waitFor(() => expect(create).toBeEnabled());
     fireEvent.click(create);
 
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "delete every branch" }),
+      ),
+    );
+  });
+
+  it("still shows what Create session sends after switching from the gadget that wrote it to another", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    // Gadget A wrote the message and its menu was dismissed; the viewer opened gadget B, whose
+    // menu shows no review of A's text.
+    renderLanding(
+      [],
+      {},
+      panel,
+      <GadgetOpenSessionButton sessionId={null} gadgetId="g2" onOpenSession={vi.fn()} />,
+    );
+    await waitForWorkspaceSeed();
+    typeMessage("delete every branch");
+    act(() => {
+      requestGadgetCreateSessionMenu({
+        prompt: "delete every branch",
+        gadgetId: "g1",
+        gadgetName: "Synthetic board",
+      });
+    });
+    const create = await screen.findByTestId("gadget-create-session");
+    expect(screen.queryByTestId("gadget-open-session-review")).toBeNull();
+    // New session's own copy shows it instead: Create session never sends unseen text.
+    expect(await screen.findByTestId("gadget-create-session-draft")).toHaveTextContent(
+      "delete every branch",
+    );
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
     await waitFor(() =>
       expect(panel.launch).toHaveBeenCalledWith(
         expect.objectContaining({ sessionId: "conv_new", text: "delete every branch" }),

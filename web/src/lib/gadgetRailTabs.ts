@@ -32,6 +32,12 @@ interface GadgetRailState {
    */
   createSessionReview: GadgetPromptReview | null;
   /**
+   * The gadget whose Create session menu is showing {@link createSessionReview} now. New
+   * session leaves out its own copy of the draft only for that menu, so switching to another
+   * gadget can't hide a message the first one wrote.
+   */
+  createSessionReviewShownFor: string | null;
+  /**
    * How many times a frame of each gadget has connected, and how many sessions started beside
    * each full screen gadget failed to show it. The gadget beside New session covers the session
    * it started until that session's own frame connects, or its start fails.
@@ -59,6 +65,7 @@ export const useGadgetRailRequest = create<GadgetRailState>(() => ({
   fullScreenGadgetId: null,
   createSessionMenuRequested: false,
   createSessionReview: null,
+  createSessionReviewShownFor: null,
   frameConnections: {},
   failedStarts: {},
   fullScreenUnavailable: null,
@@ -140,6 +147,18 @@ export function clearGadgetCreateSessionReview(): void {
   useGadgetRailRequest.setState({ createSessionReview: null });
 }
 
+/** Notes that *gadgetId*'s Create session menu shows the message gadget code wrote. */
+export function noteGadgetCreateSessionReviewShown(gadgetId: string): void {
+  if (useGadgetRailRequest.getState().createSessionReviewShownFor === gadgetId) return;
+  useGadgetRailRequest.setState({ createSessionReviewShownFor: gadgetId });
+}
+
+/** Notes that *gadgetId*'s menu no longer shows it; another gadget's note is left alone. */
+export function forgetGadgetCreateSessionReviewShown(gadgetId: string): void {
+  if (useGadgetRailRequest.getState().createSessionReviewShownFor !== gadgetId) return;
+  useGadgetRailRequest.setState({ createSessionReviewShownFor: null });
+}
+
 /** Takes a request to open the Create session menu; true when there was one. */
 export function takeGadgetCreateSessionMenuRequest(): boolean {
   if (!useGadgetRailRequest.getState().createSessionMenuRequested) return false;
@@ -213,6 +232,7 @@ export function resetGadgetRailRequests(): void {
     fullScreenGadgetId: null,
     createSessionMenuRequested: false,
     createSessionReview: null,
+    createSessionReviewShownFor: null,
     frameConnections: {},
     failedStarts: {},
     fullScreenUnavailable: null,

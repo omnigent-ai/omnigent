@@ -5013,12 +5013,17 @@ function NewChatLandingContent({
   );
   // What Create session in a full screen gadget's menu sends: the composer's own text, which
   // full screen hides, however it got there (typed, a prompt link, or the gadget). The menu
-  // shows it unless it already shows the same text as one the gadget wrote.
+  // shows it unless that same menu already shows the same text as one its gadget wrote.
   const gadgetWrittenReview = useGadgetRailRequest((state) => state.createSessionReview);
+  const gadgetReviewShownFor = useGadgetRailRequest((state) => state.createSessionReviewShownFor);
   const gadgetCreateDraft = message.trim();
   const gadgetCreateDraftShown =
     gadgetCreateDraft !== "" &&
-    (gadgetWrittenReview === null || gadgetWrittenReview.prompt.trim() !== gadgetCreateDraft);
+    !(
+      gadgetWrittenReview !== null &&
+      gadgetReviewShownFor === gadgetWrittenReview.gadgetId &&
+      gadgetWrittenReview.prompt.trim() === gadgetCreateDraft
+    );
   // New session only warns about a harness the host can't run (the host re-checks at launch),
   // but a full screen gadget's menu hides that warning: there Create session waits for one the
   // host can run, and says why.

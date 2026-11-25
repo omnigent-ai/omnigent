@@ -14,6 +14,8 @@ import type { Conversation } from "@/hooks/useConversations";
 import { getEmbedRoot } from "@/lib/host";
 import {
   clearGadgetCreateSessionReview,
+  forgetGadgetCreateSessionReviewShown,
+  noteGadgetCreateSessionReviewShown,
   takeGadgetCreateSessionMenuRequest,
   useGadgetRailRequest,
 } from "@/lib/gadgetRailTabs";
@@ -188,6 +190,13 @@ export function GadgetOpenSessionButton({
       ? storedReview
       : null;
   const reviewing = review !== null;
+  // New session drops its own copy of the draft only while this menu shows the gadget's.
+  const shownFor = review?.gadgetId ?? null;
+  useEffect(() => {
+    if (shownFor === null) return;
+    noteGadgetCreateSessionReviewShown(shownFor);
+    return () => forgetGadgetCreateSessionReviewShown(shownFor);
+  }, [shownFor]);
   useEffect(() => {
     if (sessionId !== null || !requested || !takeGadgetCreateSessionMenuRequest()) return;
     changeOpen(true);
