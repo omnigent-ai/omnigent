@@ -2121,6 +2121,11 @@ function ProjectFolder({
           grouped ? { agents: split.agents.length, sessions: split.sessions.length } : undefined
         }
         groupStorageKey={projectId ?? name}
+        sessionsAction={
+          placeholder || archived ? undefined : (
+            <ProjectNewSessionButton projectName={name} onNavigate={onRowClick} />
+          )
+        }
         emptyMessage={
           loadingFirstPage ? undefined : archived ? (
             "No archived sessions"
@@ -4802,7 +4807,7 @@ export function splitAgentRows(
 }
 
 /** A project's rows, as one list or as "Agents" and "Sessions" folders when it has both. */
-function SidebarRowGroups({
+export function SidebarRowGroups({
   rows,
   agentRow,
   storageKey,
@@ -4811,7 +4816,10 @@ function SidebarRowGroups({
   listRef,
   counts,
   activeConversationId,
+  sessionsAction,
 }: {
+  /** Shown at the end of the "Sessions" folder header, e.g. a new-session button. */
+  sessionsAction?: ReactNode;
   /** A collapsed folder keeps listing the open session, as a collapsed project does. */
   activeConversationId?: string | null;
   rows: Conversation[];
@@ -4843,23 +4851,37 @@ function SidebarRowGroups({
     setCollapsedGroups(next);
     writeCollapsedRowGroups(next);
   };
-  const group = (id: string, label: string, groupRows: Conversation[], last: boolean) => {
+  const group = (
+    id: string,
+    label: string,
+    groupRows: Conversation[],
+    last: boolean,
+    action?: ReactNode,
+  ) => {
     const collapsed = collapsedGroups.includes(groupKey(id));
     return (
       <div key={id} data-testid={`sidebar-row-group-${id}`}>
-        <button
-          type="button"
-          aria-expanded={!collapsed}
-          onClick={() => toggle(id)}
-          className="flex h-6 w-full items-center gap-1 rounded-[var(--radius-otto-button)] pl-6 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {collapsed ? (
-            <ChevronRightIcon aria-hidden className="size-3" />
-          ) : (
-            <ChevronDownIcon aria-hidden className="size-3" />
+        <div className="group/row-group relative flex items-center">
+          <button
+            type="button"
+            aria-expanded={!collapsed}
+            onClick={() => toggle(id)}
+            className="flex h-6 w-full items-center gap-1 rounded-[var(--radius-otto-button)] pl-6 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {collapsed ? (
+              <ChevronRightIcon aria-hidden className="size-3" />
+            ) : (
+              <ChevronDownIcon aria-hidden className="size-3" />
+            )}
+            <span>{label}</span>
+          </button>
+          {action && (
+            // Always shown on touch; on desktop it appears on hover or keyboard focus.
+            <div className="absolute top-1/2 right-1 flex -translate-y-1/2 items-center transition-opacity md:opacity-0 md:group-hover/row-group:opacity-100 md:has-[:focus-visible]:opacity-100">
+              {action}
+            </div>
           )}
-          <span>{label}</span>
-        </button>
+        </div>
         {collapsed
           ? groupRows.some((row) => row.id === activeConversationId) &&
             renderList(groupRows.filter((row) => row.id === activeConversationId))
@@ -4871,7 +4893,7 @@ function SidebarRowGroups({
   return (
     <div className="flex flex-col gap-1">
       {group("agents", "Agents", split.agents, false)}
-      {group("sessions", "Sessions", split.sessions, true)}
+      {group("sessions", "Sessions", split.sessions, true, sessionsAction)}
     </div>
   );
 }
@@ -4912,7 +4934,10 @@ function ConversationSection({
   agentRow,
   groupStorageKey,
   groupCounts,
+  sessionsAction,
 }: {
+  /** Shown on the "Sessions" folder header when the rows split into folders. */
+  sessionsAction?: ReactNode;
   /** Whole-folder counts for the group headers, when paging hides some sessions. */
   groupCounts?: { agents: number; sessions: number };
   /**
@@ -5125,6 +5150,7 @@ function ConversationSection({
               storageKey={groupStorageKey}
               counts={groupCounts}
               activeConversationId={activeConversationId}
+              sessionsAction={sessionsAction}
               footer={isCollapsed ? null : footer}
               renderList={(groupRows, ref) => {
                 const groupReorderRows = groupRows.filter((row) => !isNestedFamilyRow(row));
@@ -7182,6 +7208,41 @@ function PinnedProjectFlyoutContent({
       {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </HoverCardContent>
+  );
+}
+
+/** Starts a new session filed in the project, with its default agent. */
+export function ProjectNewSessionButton({
+  projectName,
+  onNavigate,
+}: {
+  projectName: string;
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          asChild
+          variant="ghost"
+          size="icon-xs"
+          aria-label={`New session in ${projectName}`}
+          data-testid="project-sessions-new-session"
+          className="size-5 text-muted-foreground"
+        >
+          <Link
+            to={`/?project=${encodeURIComponent(projectName)}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onNavigate(e);
+            }}
+          >
+            <PlusIcon className="size-3.5" data-icon-size="14" />
+          </Link>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">New session in project</TooltipContent>
+    </Tooltip>
   );
 }
 
