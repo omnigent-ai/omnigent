@@ -524,7 +524,6 @@ const BINDINGS = {
     group: "slash",
     label: "Navigate suggestions",
     chords: () => [SLASH_NEXT],
-    // Listed on Navigate suggestions' row, beside ↑.
     partOf: "slash.previous",
   },
   "slash.apply": {

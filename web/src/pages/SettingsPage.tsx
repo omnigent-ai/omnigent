@@ -2759,7 +2759,7 @@ function StepperButton({
 }
 
 function ShortcutsSection() {
-  // The search field comes with ⌘K's QuickPick; without it the page lists as it did.
+  // The page's search field is offered only with the quick_pick_palette flag.
   const quickPick = isFeatureEnabled(useServerInfo(), "quick_pick_palette");
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">

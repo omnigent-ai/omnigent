@@ -388,7 +388,7 @@ describe("Settings search without quick_pick_palette", () => {
   const keysFor = (query: string) =>
     searchSettings(query, targets, matchers).map((result) => result.target.entry.shortcutId);
 
-  it("finds the rows it found before the page named every row's binding", () => {
+  it("lists only the rows Settings search offers without quick_pick_palette", () => {
     expect(listed).toContain("palette.commands");
     expect(listed).toContain("session.new");
     for (const id of ["response.stop", "settings.open", "tab.close", "session.number"] as const) {

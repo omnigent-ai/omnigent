@@ -269,7 +269,8 @@ export interface ChordSearchScope {
 /**
  * The listed page rows a typed chord finds here: each row showing a binding whose searchable
  * chords it presses, an alternative's or a part's chord finding the row it's drawn on. Without
- * ⌘K's QuickPick, only an unflagged binding's own chords find its row, as before.
+ * ⌘K's QuickPick, a binding's own chords find only its own row, among the `listedRows` the caller
+ * limits to what search offers then.
  */
 export function rowsForChord(
   input: KeyChordInput,
