@@ -177,28 +177,24 @@ async function savePlan(workflowId: string, proposal: PlanSave): Promise<Workflo
 const STORED_STEPS_SAVE_TRIES = 3;
 
 /**
- * Save steps made by *edit* from the stored ones, read just before the write. The server takes
+ * Save what *edit* makes from the stored workflow, read just before the write. The server takes
  * the write only while its steps are still the ones read; after a save in between, the edit is
- * redone over the newer steps, a few times.
+ * redone over the newer workflow, a few times.
  */
 async function saveOverStoredSteps(
   workflowId: string,
-  edit: (stored: WorkflowStep[]) => WorkflowStep[],
-  description: DescriptionSave,
+  edit: (stored: WorkflowDetail) => DescriptionSave & { steps: WorkflowStep[] },
   tries = STORED_STEPS_SAVE_TRIES,
 ): Promise<WorkflowDetail> {
   const res = await authenticatedFetch(workflowPath(workflowId));
   if (!res.ok) throw await apiErrorFromResponse(res);
-  const { steps: stored = [] } = (await res.json()) as WorkflowDetail;
+  const read = (await res.json()) as WorkflowDetail;
+  const stored = { ...read, steps: read.steps ?? [] };
   try {
-    return await savePlan(workflowId, {
-      ...description,
-      steps: edit(stored),
-      expected_steps: stored,
-    });
+    return await savePlan(workflowId, { ...edit(stored), expected_steps: stored.steps });
   } catch (error) {
     if (!(error instanceof ApiError) || error.code !== "conflict") throw error;
-    if (tries > 1) return saveOverStoredSteps(workflowId, edit, description, tries - 1);
+    if (tries > 1) return saveOverStoredSteps(workflowId, edit, tries - 1);
     throw new Error("The plan kept changing while it saved. Try again.", { cause: error });
   }
 }
@@ -220,7 +216,10 @@ export function useSaveWorkflowPlan(workflowId: string) {
   const onError = useWorkflowReread(workflowId);
   return useMutation({
     mutationFn: ({ steps, ...description }: DescriptionSave & { steps: WorkflowStep[] }) =>
-      saveOverStoredSteps(workflowId, (stored) => withSavedTimeLimits(steps, stored), description),
+      saveOverStoredSteps(workflowId, (stored) => ({
+        ...description,
+        steps: withSavedTimeLimits(steps, stored.steps),
+      })),
     onSuccess,
     onError,
   });
@@ -228,8 +227,9 @@ export function useSaveWorkflowPlan(workflowId: string) {
 
 /**
  * Set a step's time limit, or clear it for null, from the step's menu. Only that step changes,
- * in the plan as saved when the write is made, so steps saved elsewhere stay; a description goes
- * as in {@link useSaveWorkflowPlan}.
+ * in the plan as saved when the write is made, so steps saved elsewhere stay. A description goes
+ * as in {@link useSaveWorkflowPlan}, but only while the stored description's source is still
+ * `sourceAsSeen`, the one the page went by.
  */
 export function useSaveStepTimeLimit(workflowId: string) {
   const onSuccess = useWorkflowSaved();
@@ -238,19 +238,21 @@ export function useSaveStepTimeLimit(workflowId: string) {
     mutationFn: ({
       stepId,
       limit,
+      sourceAsSeen = null,
       ...description
-    }: DescriptionSave & { stepId: string; limit: string | null }) =>
-      saveOverStoredSteps(
-        workflowId,
-        (stored) => {
-          if (!stored.some((step) => step.id === stepId))
-            throw new Error("The step is no longer in the saved plan.");
-          return stored.map((step) =>
+    }: DescriptionSave & { stepId: string; limit: string | null; sourceAsSeen?: string | null }) =>
+      saveOverStoredSteps(workflowId, (stored) => {
+        if (!stored.steps.some((step) => step.id === stepId))
+          throw new Error("The step is no longer in the saved plan.");
+        // A source recorded elsewhere since, such as a proposal kept over there, stays.
+        const sourceMoved = (stored.description_source ?? null) !== sourceAsSeen;
+        return {
+          ...(sourceMoved ? {} : description),
+          steps: stored.steps.map((step) =>
             step.id === stepId ? { ...step, goal: withChosenTimeLimit(step.goal, limit) } : step,
-          );
-        },
-        description,
-      ),
+          ),
+        };
+      }),
     onSuccess,
     onError,
   });

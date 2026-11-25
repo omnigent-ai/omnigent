@@ -71,6 +71,11 @@ describe("timeLimitMinutes and shortTimeLimit", () => {
     expect(timeLimitLength("an afternoon")).toBeNull();
   });
 
+  it("goes by whole minutes, and has no length under one", () => {
+    expect(timeLimitMinutes("1.333h")).toBe(80);
+    expect(timeLimitMinutes("0.001 minutes")).toBeNull();
+  });
+
   it("has no length for words it can't read, or for none at all", () => {
     expect(timeLimitMinutes("0 hours")).toBeNull();
     expect(timeLimitMinutes("an afternoon")).toBeNull();
@@ -122,7 +127,7 @@ describe("withStepTimeLimit", () => {
       withStepTimeLimit("- **Outputs:** passing CI.\n- **Details:** rerun it.", "1 hour"),
     ).toBe("- **Outputs:** passing CI.\n- **Time limit:** 1 hour\n- **Details:** rerun it.");
     expect(withStepTimeLimit("Fix it.\n\n  **Details:** rerun it.", "1 hour")).toBe(
-      "Fix it.\n\n**Time limit:** 1 hour\n\n  **Details:** rerun it.",
+      "Fix it.\n\n  **Time limit:** 1 hour\n\n  **Details:** rerun it.",
     );
   });
 
@@ -138,6 +143,15 @@ describe("withStepTimeLimit", () => {
     expect(stepTimeLimit(written)).toBe("2 hours");
     expect(withStepTimeLimit(written, "4 hours")).toBe(changed);
     expect(stepTimeLimit(withStepTimeLimit(written, null))).toBeNull();
+  });
+
+  it("puts a new limit in the list item or quote that holds Details", () => {
+    expect(withStepTimeLimit("- Fix it.\n\n  **Details:** rerun it.", "1 hour")).toBe(
+      "- Fix it.\n\n  **Time limit:** 1 hour\n\n  **Details:** rerun it.",
+    );
+    expect(withStepTimeLimit("> Fix it.\n>\n> **Details:** rerun it.", "1 hour")).toBe(
+      "> Fix it.\n>\n> **Time limit:** 1 hour\n>\n> **Details:** rerun it.",
+    );
   });
 
   it("puts a new limit before Details written another way", () => {
@@ -252,6 +266,10 @@ describe("withTimeLimitLength", () => {
       "**Time limit:** 1 hour",
     );
     expect(withTimeLimitLength("Fix it.", "2 hours")).toBe("Fix it.\n\n**Time limit:** 2 hours");
+    // A no-break space before the length goes, and the words after it stay whole.
+    expect(withTimeLimitLength("**Time limit:**\u00a02 hours. Tell me.", "8 hours")).toBe(
+      "**Time limit:** 8 hours. Tell me.",
+    );
   });
 
   it("sets the length a menu chose, and clears the line for no limit", () => {

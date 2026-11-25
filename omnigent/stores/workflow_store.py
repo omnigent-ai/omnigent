@@ -511,14 +511,22 @@ class WorkflowStore:
                 held = None if was_written_at == now else was_written_at
             else:
                 held = was_held
-            described_at = now if held is None else held
             # The plan keeps the description's source and time, so a new one rewrites it.
             rewrites_plan = (
                 steps is not None or source != current.description_source or held != was_held
             )
-            stored = self._stored_texts(
-                text, _plan_text(workflow_steps, source, held, text) if rewrites_plan else None
-            )
+            try:
+                stored = self._stored_texts(
+                    text, _plan_text(workflow_steps, source, held, text) if rewrites_plan else None
+                )
+            except InvalidWorkflowError:
+                if held is None or not rewrites_plan:
+                    raise
+                # A plan with no room left for the time still saves: the time is then this
+                # write's, as before the store kept one.
+                held = None
+                stored = self._stored_texts(text, _plan_text(workflow_steps, source, None, text))
+            described_at = now if held is None else held
             values: dict[str, Any] = {
                 "name": workflow_name,
                 "description": stored[0],

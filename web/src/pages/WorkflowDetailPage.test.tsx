@@ -1731,13 +1731,43 @@ describe("WorkflowDetailPage", () => {
             place = () => resolve(placed);
           }),
       );
-      renderPage();
+      const view = renderPage();
       await screen.findByTestId("workflow-detail-title");
       expectSaved();
       // Placed after the cached proposal, it keeps the saved description.
+      await waitFor(() =>
+        expect(
+          vi
+            .mocked(authenticatedFetch)
+            .mock.calls.some(([path]) => String(path).includes("after=p2")),
+        ).toBe(true),
+      );
       await act(async () => place());
-      await act(async () => {});
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeEnabled(),
+      );
       expectSaved();
+
+      // A time limit set now leaves "p2" as the source, so once the journal catches up, the
+      // wording kept over it there stays declined.
+      const server = serveLikeTheStore(stored);
+      fireEvent.click(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" }));
+      await waitFor(() => expect(server.patches).toHaveLength(1));
+      expect(server.patches[0]).not.toHaveProperty("description_source");
+      const declined: JournalEntry = {
+        ...saved,
+        id: "p2",
+        position: 2,
+        created_at: 400,
+        content: { steps: WORKFLOW.steps, description: "Finds and fixes flaky tests." },
+      };
+      mockJournal([saved, declined]);
+      view.rerender(<WorkflowDetailPage />);
+      await waitFor(() =>
+        expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]),
+      );
+      expectSaved();
+      expect(runButton()).toBeEnabled();
     });
   });
 

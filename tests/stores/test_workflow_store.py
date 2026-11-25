@@ -338,7 +338,7 @@ def _full_plan_steps(store: WorkflowStore) -> list[dict[str, object]]:
     return [{"id": "big", "name": "Big", "goal": noise[:low]}]
 
 
-def test_a_full_plan_can_still_be_renamed_and_planned_later(
+def test_a_full_plan_can_still_be_renamed_planned_and_saved_later(
     store: WorkflowStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = iter(range(100, 1000, 10))
@@ -352,6 +352,13 @@ def test_a_full_plan_can_still_be_renamed_and_planned_later(
     planned = store.update(saved.id, user_id=ALICE, planning_session_id="c" * 32)
     assert planned is not None and planned.planning_session_id == "c" * 32
     assert planned.description_updated_at == planned.updated_at == 120
+    # Steps that fit still save, the same ones or a little smaller, without room for the time.
+    again = store.update(saved.id, user_id=ALICE, steps=saved.steps)
+    assert again is not None and again.description_updated_at == again.updated_at == 130
+    smaller = [{**saved.steps[0], "goal": saved.steps[0]["goal"][:-1]}]
+    edited = store.update(saved.id, user_id=ALICE, steps=smaller)
+    assert edited is not None and edited.steps[0]["goal"] == smaller[0]["goal"]
+    assert store.get(saved.id, user_id=ALICE) == edited
 
 
 def test_a_write_from_steps_read_earlier_is_refused_once_they_change(

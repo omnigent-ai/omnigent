@@ -164,6 +164,35 @@ describe("useSaveWorkflowPlan", () => {
       .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
     expect(bodies).toEqual([{ ...proposal, expected_steps: steps }, { steps }]);
   });
+
+  it("keeps the description, without the steps check, for a server from before that check", async () => {
+    const steps = [{ id: "review", name: "Review", goal: null, depends_on: [] }];
+    const saved = { id: "workflow", name: "Review", description: "Review changes.", steps };
+    const proposal = {
+      steps,
+      description: "Reviews open changes.",
+      expected_description: "Review changes.",
+      description_source: "proposal",
+    };
+    const refusal = { detail: [{ type: "extra_forbidden", loc: ["body", "expected_steps"] }] };
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(Response.json(saved))
+      .mockResolvedValueOnce(Response.json(refusal, { status: 422 }))
+      .mockResolvedValueOnce(Response.json(saved));
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSaveWorkflowPlan("workflow"), { wrapper });
+
+    await act(async () => {
+      await expect(result.current.mutateAsync(proposal)).resolves.toEqual(saved);
+    });
+    const bodies = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(bodies).toEqual([{ ...proposal, expected_steps: steps }, proposal]);
+  });
 });
 
 describe("useSaveStepTimeLimit", () => {
@@ -195,14 +224,64 @@ describe("useSaveStepTimeLimit", () => {
   });
 
   it("gives up after a few writes refused because the steps kept changing", async () => {
-    vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) =>
-      init?.method === "PATCH" ? Response.json(conflict, { status: 409 }) : Response.json(saved),
-    );
+    // Each read finds steps saved since the last one.
+    let reads = 0;
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) => {
+      if (init?.method === "PATCH") return Response.json(conflict, { status: 409 });
+      reads += 1;
+      return Response.json({ ...saved, steps: [{ ...steps[0]!, goal: `Read ${reads}.` }] });
+    });
     const save = renderSave();
     await act(async () => {
       await expect(save()).rejects.toThrow("The plan kept changing while it saved. Try again.");
     });
-    expect(patchCount()).toBe(3);
+    // Each write names the steps read just before it.
+    const written = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(written.map((body) => body.expected_steps[0].goal)).toEqual([
+      "Read 1.",
+      "Read 2.",
+      "Read 3.",
+    ]);
+    expect(reads).toBe(3);
+  });
+
+  it("writes nothing for a step no longer in the saved plan", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(Response.json({ ...saved, steps: [] }));
+    const save = renderSave();
+    await act(async () => {
+      await expect(save()).rejects.toThrow("The step is no longer in the saved plan.");
+    });
+    expect(patchCount()).toBe(0);
+  });
+
+  it("leaves the description alone once its source moved since the page read it", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async () =>
+      Response.json({ ...saved, description_source: "kept-elsewhere" }),
+    );
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSaveStepTimeLimit("workflow"), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({
+        stepId: "review",
+        limit: "1 hour",
+        sourceAsSeen: null,
+        description: "Review changes.",
+        expected_description: "Review changes.",
+        description_source: "older",
+      });
+    });
+    const [body] = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(body).toEqual({
+      steps: [{ ...steps[0], goal: "Read it.\n\n**Time limit:** 1 hour" }],
+      expected_steps: steps,
+    });
   });
 });
 

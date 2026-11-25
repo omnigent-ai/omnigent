@@ -233,9 +233,11 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
       {
         stepId,
         limit,
+        sourceAsSeen: source ?? null,
         // Record the current proposal as the description's source (none is offered while the
-        // menu shows), unless the existing source can't be placed yet.
-        ...(proposal && (!source || sourceAt !== undefined)
+        // menu shows), unless the source recorded is as new or can't be placed yet.
+        ...(proposal &&
+        (!source || sourceAt === null || (sourceAt !== undefined && proposal.position > sourceAt))
           ? {
               description: workflow.description,
               expected_description: workflow.description,

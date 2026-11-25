@@ -22,7 +22,8 @@ export const TIME_LIMIT_CHOICES = [
 // can match only one way, so a long one doesn't make matching slow.
 const LIMIT_LINE =
   /^([ \t]*(?:>[ \t]*)*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?)\*\*Time limit(?::\*\*|\*\*[ \t]*:)[ \t]*(.*)$/i;
-const DETAILS_LINE = /^([ \t]*)((?:[-*+]|\d{1,9}[.)])[ \t]+)?\*\*Details(?::\*\*|\*\*[ \t]*:)/i;
+const DETAILS_LINE =
+  /^([ \t]*(?:>[ \t]*)*)((?:[-*+]|\d{1,9}[.)])[ \t]+)?\*\*Details(?::\*\*|\*\*[ \t]*:)/i;
 // Most descriptions name no limit, and those need no parsing.
 const LIMIT_MARK = /\*\*Time limit(?::\*\*|\*\*[ \t]*:)/i;
 // Minutes in a length's unit, by the unit's first letter.
@@ -123,8 +124,10 @@ function leadingLength(limit: string): { text: string; minutes: number } | null 
     minutes += Number(part[1]) * UNIT_MINUTES[part[2]![0]!.toLowerCase()]!;
     end = LENGTH_PART.lastIndex - part[3]!.length;
   }
-  if (end === 0 || minutes === 0) return null;
-  return { text: text.slice(0, end), minutes };
+  // In whole minutes, as the menu offers them and a timer counts.
+  const whole = Math.round(minutes);
+  if (end === 0 || whole < 1) return null;
+  return { text: text.slice(0, end), minutes: whole };
 }
 
 /** How long a limit allows in minutes, e.g. 90 for "1 hour 30 minutes"; null without a length. */
@@ -176,8 +179,12 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       // Details is a list item, so the limit joins the list just above it.
       lines.splice(details, 0, `${listMarker}${limitLine}`);
     } else if (details >= 0) {
-      const before = details > 0 && lines[details - 1]!.trim() !== "" ? [""] : [];
-      lines.splice(details, 0, ...before, limitLine, "");
+      // A paragraph of its own, indented or quoted as Details is, so it stays in Details' list
+      // item or quote; a quote's blank lines keep its marker.
+      const prefix = detailsMatch![1]!;
+      const blank = prefix.trimEnd();
+      const before = details > 0 && lines[details - 1]!.trim() !== blank.trim() ? [blank] : [];
+      lines.splice(details, 0, ...before, `${prefix}${limitLine}`, blank);
     } else {
       // Last, unless a code block left open at the end would take the line in, as Markdown
       // reads it: then just before that block.
@@ -209,7 +216,8 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
  * after the old length, e.g. "8 hours. Tell me after." from "4 hours. Tell me after.".
  */
 export function withTimeLimitLength(goal: string | null, length: string): string | null {
-  const limit = stepTimeLimit(goal);
+  // Trimmed as its length is measured, so the words after it start where that length ends.
+  const limit = stepTimeLimit(goal)?.trim() ?? null;
   const old = limit ? timeLimitLength(limit) : null;
   return withStepTimeLimit(goal, limit && old ? `${length}${limit.slice(old.length)}` : length);
 }
