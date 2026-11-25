@@ -24,7 +24,8 @@ class WorkspaceGate(StrEnum):
 
 
 # The pull request reads keep their REST routes' gates. GetPullRequest's overview carries
-# the host account's identities, so only the session's owner reads it here for now.
+# the host account's identities, so only the session's owner reads it here for now. The
+# changes, and the reads that feed their controls, act as the host's account: the owner's.
 METHOD_GATES: dict[str, WorkspaceGate] = {
     "GetCapabilities": WorkspaceGate.BROWSE,
     "ListDirectory": WorkspaceGate.BROWSE,
@@ -47,6 +48,19 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "ComparePullRequestRange": WorkspaceGate.BROWSE,
     "ListReviewThreads": WorkspaceGate.BROWSE,
     "ListReviewThreadComments": WorkspaceGate.READ,
+    "ListLabels": WorkspaceGate.SESSION_OWNER,
+    "ListReviewerCandidates": WorkspaceGate.SESSION_OWNER,
+    "GetMergeOptions": WorkspaceGate.SESSION_OWNER,
+    "CreateComment": WorkspaceGate.SESSION_OWNER,
+    "CreateReviewThread": WorkspaceGate.SESSION_OWNER,
+    "ReplyToReviewThread": WorkspaceGate.SESSION_OWNER,
+    "UpdatePullRequestDetails": WorkspaceGate.SESSION_OWNER,
+    "UpdateLabels": WorkspaceGate.SESSION_OWNER,
+    "UpdateReviewers": WorkspaceGate.SESSION_OWNER,
+    "SetPullRequestAccount": WorkspaceGate.SESSION_OWNER,
+    "MergePullRequest": WorkspaceGate.SESSION_OWNER,
+    "MergePullRequestAsAccount": WorkspaceGate.SESSION_OWNER,
+    "DisableAutoMerge": WorkspaceGate.SESSION_OWNER,
 }
 
 

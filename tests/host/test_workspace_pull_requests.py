@@ -360,8 +360,7 @@ _OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
 }
 
 
-@pytest.fixture
-def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+def record_owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
     """Each pr_resource call an owner method made: the function, its root and arguments."""
     calls: list[tuple[str, str, dict[str, Any]]] = []
     for function in {name for _request, name, _kwargs in _OWNER_CALLS.values()}:
@@ -372,6 +371,11 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
 
         monkeypatch.setattr(pr_resource, function, record)
     return calls
+
+
+@pytest.fixture
+def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    return record_owner_calls(monkeypatch)
 
 
 @pytest.fixture

@@ -56,17 +56,17 @@ def test_every_pull_request_method_is_a_reviewed_read_or_owner_method() -> None:
 
 
 def test_only_the_reads_have_no_side_effects() -> None:
-    """A write is never served over GET, and a client never retries one as a read."""
+    """A write is never served over GET, and the server never reports its lost answer as safe."""
     service = workspace_pb2.DESCRIPTOR.services_by_name["WorkspaceService"]
-    idempotency = {
-        name: service.methods_by_name[name].GetOptions().idempotency_level
-        for name, method in WORKSPACE_METHODS.items()
-        if method.pull_request
+    pull_requests = {name for name, method in WORKSPACE_METHODS.items() if method.pull_request}
+    marked = {
+        name
+        for name in pull_requests
+        if service.methods_by_name[name].GetOptions().idempotency_level
+        == MethodOptions.NO_SIDE_EFFECTS
     }
-    no_side_effects = {
-        name for name, level in idempotency.items() if level == MethodOptions.NO_SIDE_EFFECTS
-    }
-    assert no_side_effects == set(idempotency) - _PULL_REQUEST_WRITES
+    assert marked == pull_requests - _PULL_REQUEST_WRITES
+    assert {name for name in pull_requests if WORKSPACE_METHODS[name].no_side_effects} == marked
 
 
 def test_no_pull_request_method_streams() -> None:
