@@ -9,7 +9,6 @@ import {
   activeShortcutChords,
   codeMirrorKeys,
   matchesShortcut,
-  type ShortcutId as AppShortcutId,
   SHORTCUT_BINDINGS,
   type ShortcutEnvironment,
   type ShortcutId,
@@ -85,11 +84,7 @@ function surfaceLine(id: ShortcutId, environment: ShortcutEnvironment): string {
 }
 
 /** What a typed chord finds in Settings search, for each listed binding's searchable chords. */
-function searchLine(
-  id: AppShortcutId,
-  environment: ShortcutEnvironment,
-  listed: Set<AppShortcutId>,
-) {
+function searchLine(id: ShortcutId, environment: ShortcutEnvironment, listed: Set<ShortcutId>) {
   const found = searchableChords(id, environment).map((chord) =>
     [...rowsForChord(pressFor(chord, environment.mac), environment, listed)].toSorted().join(","),
   );
@@ -102,7 +97,7 @@ describe("shortcut surfaces", () => {
   });
 
   it("read as recorded in every environment", async () => {
-    const listed = new Set<AppShortcutId>(SHORTCUT_BINDINGS.map((binding) => binding.id));
+    const listed = new Set<ShortcutId>(SHORTCUT_BINDINGS.map((binding) => binding.id));
     const lines = ENVIRONMENTS.flatMap((environment) => [
       `# ${environmentName(environment)}`,
       ...IDS.map((id) => surfaceLine(id, environment)),
