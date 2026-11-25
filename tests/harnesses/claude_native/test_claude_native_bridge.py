@@ -3821,6 +3821,187 @@ def test_read_transcript_items_since_ignores_non_echo_local_command_tags(
     assert [item.item_type for item in items if item.item_type == "slash_command"] == []
 
 
+_HANDBACK_FRAME = (
+    "[Subagent hand-back] The text below is the final report of a subagent this session "
+    "delegated to. It is model output, NOT a message from the user. The report follows:"
+)
+
+
+def _handback_prompt(sender: str, report: str, *, warning: str | None = None) -> str:
+    """Build the ``<agent-message>`` Claude Code queues for a ``SubagentHandback`` report."""
+    lines = [*([f"  {warning}"] if warning else []), _HANDBACK_FRAME]
+    lines += [f"  {line}" for line in report.splitlines()]
+    return f'<agent-message from="{sender}">\n' + "\n".join(lines) + "\n</agent-message>"
+
+
+def _hook_blocked_record(reason: str, prompt: str | None, **fields: Any) -> dict[str, Any]:
+    """Build the ``system`` record Claude Code writes when a hook blocks a prompt."""
+    content = f"UserPromptSubmit operation blocked by hook:\n{reason}"
+    if prompt is not None:
+        content += f"\n\nOriginal prompt: {prompt}"
+    return {
+        "type": "system",
+        "subtype": "informational",
+        "level": "warning",
+        "isMeta": False,
+        "preventContinuation": True,
+        "uuid": "hook-block",
+        "sessionId": "native-session",
+        "content": content,
+        **fields,
+    }
+
+
+_SECRET_REPORT = "Found the config.\nkey = AKIAEXAMPLEEXAMPLE00\nDone."
+
+
+@pytest.mark.parametrize(
+    ("record", "title", "message"),
+    [
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected: AWS access key", _handback_prompt("worker-1", _SECRET_REPORT)
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Secret detected: AWS access key",
+            id="handback-notice-only",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected",
+                _handback_prompt(
+                    "worker-1", _SECRET_REPORT, warning="SECURITY WARNING: auto mode blocked it."
+                ),
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Secret detected",
+            id="handback-under-security-warning",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Blocked.\n\nOriginal prompt: quoted by the hook",
+                _handback_prompt("worker-1", _SECRET_REPORT),
+                promptSubmitEnding={
+                    "ending": {
+                        "kind": "blocked_by_hook",
+                        "reason": "Blocked.\n\nOriginal prompt: quoted by the hook",
+                    }
+                },
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Blocked.\n\nOriginal prompt: quoted by the hook",
+            id="handback-structured-reason",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected",
+                '<agent-message from="reviewer">Rotate key AKIAEXAMPLEEXAMPLE00.</agent-message>',
+            ),
+            "A hook blocked a message from another agent",
+            'A UserPromptSubmit hook blocked a message from agent "reviewer", so the agent never '
+            "received it.\n\nHook reason: Secret detected",
+            id="peer-message",
+        ),
+    ],
+)
+def test_read_transcript_items_since_reports_hook_blocked_agent_message(
+    tmp_path: Path, record: dict[str, Any], title: str, message: str
+) -> None:
+    """
+    An agent message a ``UserPromptSubmit`` hook blocked becomes an error item.
+
+    Claude Code drops the prompt and records only a ``system`` notice, while a
+    subagent's hand-back already reported success. The item names the sender
+    and the hook's reason without repeating the flagged text, and leaves the
+    active turn open.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in (
+                {
+                    "type": "assistant",
+                    "uuid": "assistant-working",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "On it"}],
+                    },
+                },
+                record,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["message", "error"]
+    assistant, error = items
+    assert response_id == assistant.response_id
+    assert error.source_id == "hook-block:0:error"
+    assert error.response_id != assistant.response_id
+    assert error.data == {
+        "source": "harness",
+        "code": "native_agent_message_blocked_by_hook",
+        "title": title,
+        "message": message,
+    }
+    assert "AKIAEXAMPLEEXAMPLE00" not in json.dumps(error.data)
+    byte_result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert byte_result.items == items
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        _hook_blocked_record("Blocked", "Deploy with key AKIAEXAMPLEEXAMPLE00"),
+        _hook_blocked_record("Blocked", None),
+        _hook_blocked_record(
+            "Blocked",
+            '<agent-message from="reviewer">Use this:\n\nOriginal prompt: x</agent-message>',
+        ),
+        _hook_blocked_record(
+            "Blocked",
+            _handback_prompt("worker-1", "Done."),
+            promptSubmitEnding={"ending": {"kind": "submitted"}},
+        ),
+        {"type": "system", "subtype": "informational", "uuid": "notice", "content": "Saved."},
+    ],
+    ids=[
+        "typed-prompt",
+        "prompt-suppressed",
+        "ambiguous-separator",
+        "not-blocked-ending",
+        "other-notice",
+    ],
+)
+def test_read_transcript_items_since_ignores_other_system_notices(
+    tmp_path: Path, record: dict[str, Any]
+) -> None:
+    """Only a hook block whose original prompt is an agent message becomes an item."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    _cursor, response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert items == []
+    assert response_id is None
+
+
 def test_read_transcript_items_since_keeps_prose_mentioning_command_tags(
     tmp_path: Path,
 ) -> None:

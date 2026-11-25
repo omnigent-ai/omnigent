@@ -83,6 +83,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
     capture_submit_boundary,
     has_matching_hook_refusal,
+    hook_blocked_prompt,
 )
 from omnigent.harnesses.diagnostics import (
     SIGN_IN_RESEND_STEP,
@@ -10350,6 +10351,11 @@ def _transcript_items_from_entry(
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+    if (blocked := hook_blocked_prompt(entry)) is not None:
+        # A blocked prompt neither starts nor ends a turn.
+        return current_response_id, _blocked_agent_message_items(
+            entry, *blocked, line_number=line_number, record_offset=record_offset
+        )
     # Only ``user``/``assistant`` records are conversation turns. Other typed
     # records can carry a ``message`` too, e.g. ``api-request-blob`` copies of
     # API requests that include injected ``<system-reminder>`` context.
@@ -10461,6 +10467,71 @@ def _attachment_transcript_items_from_entry(
         ),
     )
     return None, [item]
+
+
+# Claude Code writes this frame line at column zero and indents the report.
+_SUBAGENT_HANDBACK_HEADER_RE = re.compile(r"^\[Subagent hand-back\] ", re.MULTILINE)
+_AGENT_MESSAGE_SENDER_RE = re.compile(
+    r'\A<(?:agent-message\s[^>]*\bfrom|teammate-message\s[^>]*\bteammate_id)="([^"]+)"'
+)
+
+
+def _blocked_agent_message_items(
+    entry: _JsonObject,
+    reason: str,
+    prompt: str,
+    *,
+    line_number: int,
+    record_offset: int | None,
+) -> list[ClaudeTranscriptItem]:
+    """
+    Report another agent's message that a ``UserPromptSubmit`` hook blocked.
+
+    Claude Code records the block only as a ``system`` notice, and tells a
+    handing-back subagent its report was delivered, so nothing else shows the
+    loss. The blocked text is not repeated: the hook flagged it.
+
+    :param entry: Claude ``system`` record of the blocked prompt.
+    :param reason: The hook's reason, e.g. ``"Secret detected"``.
+    :param prompt: The original prompt, e.g. ``'<agent-message from="worker">…'``.
+    :param line_number: One-based transcript line number.
+    :param record_offset: Byte offset where the transcript record
+        starts, or ``None`` for legacy line-cursor reads.
+    :returns: One error item, or none when the prompt is not an agent message.
+    """
+    envelope = _TEAMMATE_MESSAGE_RE.search(prompt) if _is_agent_notification_text(prompt) else None
+    if envelope is None:
+        return []
+    sender = _AGENT_MESSAGE_SENDER_RE.match(envelope.group(0))
+    sender_name = f' "{sender.group(1)}"' if sender is not None else ""
+    if _SUBAGENT_HANDBACK_HEADER_RE.search(envelope.group(0)) is not None:
+        title = "A hook blocked a subagent's report"
+        message = (
+            f"A UserPromptSubmit hook blocked the report from subagent{sender_name}, so the "
+            "agent never received it, although Claude Code reported it as delivered."
+        )
+    else:
+        title = "A hook blocked a message from another agent"
+        message = (
+            f"A UserPromptSubmit hook blocked a message from agent{sender_name}, so the "
+            "agent never received it."
+        )
+    if reason.strip():
+        message = f"{message}\n\nHook reason: {reason.strip()}"
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    return [
+        ClaudeTranscriptItem(
+            source_id=_source_id(source_key, 0, "error"),
+            item_type="error",
+            data={
+                "source": "harness",
+                "code": "native_agent_message_blocked_by_hook",
+                "title": title,
+                "message": message,
+            },
+            response_id=_response_id_from_source(source_key),
+        )
+    ]
 
 
 # Slash-command marker handling. Claude Code's embedded TUI emits
