@@ -443,14 +443,12 @@ describe("workspace_sidebar_v2", () => {
     expectTabsUntouched();
   });
 
-  it("mounts Go to File for the session with the flag on, and lists the files it opens as recent", async () => {
+  it("mounts Go to File for the session with the flag on", async () => {
     setViewport(DESKTOP);
     renderShell(withFlag(true));
 
     expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
     expect(goToFile.props).toMatchObject({ sessionId: "conv_ws", textSearch: false });
-    fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
-    expect(readRecentWorkspaceFiles("conv_ws")).toEqual(["src/app.ts"]);
   });
 
   it("offers Go to File's text search when the session has content search", async () => {
@@ -472,7 +470,7 @@ describe("workspace_sidebar_v2", () => {
   it.each([
     ["off", withFlag(false)],
     ["omitted", WITHOUT_FLAG],
-  ])("leaves Go to File out, and records no recent files, when the flag is %s", async (_, info) => {
+  ])("leaves Go to File out, and lists no recent files, when the flag is %s", async (_, info) => {
     setViewport(DESKTOP);
     renderShell(info);
     await settleRoutes();

@@ -68,7 +68,6 @@ import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
-import { recordRecentWorkspaceFile } from "@/lib/recentWorkspaceFiles";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
@@ -1920,13 +1919,9 @@ function AppShellImpl() {
     (path: string, options?: OpenFileOptions) =>
       guardFileNavigation(path, options, () => {
         contentSearchFileRef.current = null;
-        // Go to File lists the files opened from anywhere, not only from itself.
-        if (tabsSidebar && serverConversationId) {
-          recordRecentWorkspaceFile(serverConversationId, path);
-        }
         commitFileNavigation(path, options);
       }),
-    [guardFileNavigation, commitFileNavigation, tabsSidebar, serverConversationId],
+    [guardFileNavigation, commitFileNavigation],
   );
   const openContentSearchResult = useCallback(
     (path: string, options?: OpenFileOptions) =>

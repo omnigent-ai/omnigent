@@ -36,6 +36,7 @@ import { resetTerminalPlacement, usePublishMainTerminalKeys } from "../terminalP
 import { MOUNTED_SHELL_TAB_LIMIT } from "./shellTabBudget";
 import { LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ } from "@/lib/permissionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
+import { readRecentWorkspaceFiles } from "@/lib/recentWorkspaceFiles";
 import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/ReconnectSessionDialog";
 import {
   isCommandAvailable,
@@ -46,6 +47,7 @@ import { usePullRequestListCounts } from "@/store/pullRequestListCounts";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import type { WorkspacePlaceViewProps } from "./placeViews/WorkspacePlaceView";
+import { treeFileChosen } from "./placeViews/placeViewActions";
 import type { RecentPullRequestFacts } from "./recentPullRequestRow";
 import { SHELL_LIST_LIMIT_MS } from "./terminalTabConnection";
 import { OWNER_RECONNECT_HINT, VIEWER_RESUME_HINT } from "./TerminalTabStatus";
@@ -723,6 +725,36 @@ describe("WorkspaceTabsPanel and the Workspace settings", () => {
     });
     await waitFor(() => expect(hasTasks()).toBe(true));
     expect(store.tabs()).toHaveLength(MAX_WORKSPACE_TABS);
+  });
+});
+
+describe("recently opened files, for Go to File", () => {
+  it("lists a file opened from the Files tree, and from a Search result", async () => {
+    renderPanels([{ conversationId: "s-recent-files", showContentSearch: true }]);
+    const { store } = workspaceTabsSession("s-recent-files");
+    await act(async () => {
+      await store.open({ place: { kind: "files" } }, { opener: "user" });
+    });
+    await waitFor(() => expect(placeViews.latest.get("files:")).toBeDefined());
+    const tree = treeFileChosen("src/tree.ts");
+    if (tree.type !== "open") throw new Error("the tree opens its file");
+    await act(async () => {
+      placeViews.latest.get("files:")?.onOpen(tree.link, tree.options);
+    });
+    await waitFor(() =>
+      expect(readRecentWorkspaceFiles("s-recent-files")).toEqual(["src/tree.ts"]),
+    );
+
+    await act(async () => {
+      await store.open({ place: { kind: "search" } }, { opener: "user" });
+    });
+    await waitFor(() => expect(contentSearch.onFileSelect).toBeDefined());
+    await act(async () => {
+      contentSearch.onFileSelect?.("src/found.py", { line: 7 });
+    });
+    await waitFor(() =>
+      expect(readRecentWorkspaceFiles("s-recent-files")).toEqual(["src/found.py", "src/tree.ts"]),
+    );
   });
 });
 
