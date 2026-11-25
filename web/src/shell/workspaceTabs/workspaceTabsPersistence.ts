@@ -153,6 +153,7 @@ export function parsePlace(value: unknown): WorkspacePlace | null | "unknown" {
         ...optional("commit", nonEmptyString(value.commit) ? value.commit : undefined),
         ...optional("path", path),
         ...(path === undefined ? {} : optional("line", parseLine(value.line))),
+        ...(value.list === true ? { list: true as const } : {}),
       };
     }
     case "terminal":

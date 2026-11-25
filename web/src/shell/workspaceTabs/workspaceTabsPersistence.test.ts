@@ -25,7 +25,7 @@ const state: WorkspaceTabsSessionState = {
     },
     {
       id: "p",
-      place: { kind: "pull", url: "https://github.com/o/r/pull/1", view: "changes" },
+      place: { kind: "pull", url: "https://github.com/o/r/pull/1", view: "changes", list: true },
       openedBy: "user",
     },
     { id: "k", place: { kind: "tasks" }, openedBy: "user" },
