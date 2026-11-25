@@ -5,6 +5,7 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
+import { databricksProfileForWorkspace } from "./vite.databricksProfile";
 import { shikiManualChunk } from "./vite.shiki";
 import { streamdownManualChunk } from "./vite.streamdown";
 import { workerBuildOptions } from "./vite.workerExports";
@@ -14,6 +15,8 @@ import { workerBuildOptions } from "./vite.workerExports";
 // WORKSPACE_API_PATH (omnigent/cli_auth.py) so both sides agree on the shape of
 // a workspace URL.
 const WORKSPACE_API_PATH = "/api/2.0/omnigent";
+// The workspace web-UI URL the CLI displays; mirrors WORKSPACE_UI_PATH in omnigent/util/server_url.py.
+const WORKSPACE_UI_PATH = "/omnigent";
 // Routes a request to one workspace on a host that fronts many; mirrors
 // DATABRICKS_ORG_ID_HEADER in omnigent/cli_auth.py.
 const DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id";
@@ -36,7 +39,9 @@ function resolveTarget(raw: string): { target: string; orgId: string | null } {
   }
   url.search = "";
   url.hash = "";
-  if (isWorkspaceHost(url.hostname) && (url.pathname === "" || url.pathname === "/")) {
+  // A pasted web-UI URL (`<ws>/omnigent`) means the same server as the bare origin.
+  const root = url.pathname.replace(/\/$/, "");
+  if (isWorkspaceHost(url.hostname) && (root === "" || root === WORKSPACE_UI_PATH)) {
     url.pathname = WORKSPACE_API_PATH;
   }
   return { target: url.toString().replace(/\/$/, ""), orgId };
@@ -72,7 +77,9 @@ function refreshToken(host: string): Promise<void> {
     return Promise.resolve();
   }
   refreshing ??= new Promise((resolve) => {
-    const selector = DATABRICKS_PROFILE ? ["--profile", DATABRICKS_PROFILE] : ["--host", host];
+    const profile =
+      DATABRICKS_PROFILE ?? (ORG_ID ? databricksProfileForWorkspace(host, ORG_ID) : undefined);
+    const selector = profile ? ["--profile", profile] : ["--host", host];
     const args = ["auth", "token", ...selector, "--output", "json"];
     // The CLI's own timeout allows for a browser login; the dev server shouldn't wait that long.
     const child = execFile(
@@ -97,7 +104,8 @@ function refreshToken(host: string): Promise<void> {
           reportRefreshFailure((failure as Error).message.trim());
         }
         clearTimeout(refreshTimer);
-        refreshTimer = setTimeout(() => resolveToken(host), refreshAt - now);
+        // setTimeout fires at once for delays past ~24.8 days; requests still refresh when due.
+        refreshTimer = setTimeout(() => resolveToken(host), Math.min(refreshAt - now, 2 ** 31 - 1));
         refreshTimer.unref();
         refreshing = undefined;
         resolve();
