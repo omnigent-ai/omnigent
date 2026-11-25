@@ -5,6 +5,8 @@ import { paneDividerDrag } from "@/shell/paneDividerDrag";
 import { PaneSplitDivider } from "@/shell/PaneSplitDivider";
 
 describe("PaneSplitDivider drags", () => {
+  // Each test's spies, such as the body's mocked bounds, end with it.
+  afterEach(() => vi.restoreAllMocks());
   const divider = {
     axis: "columns" as const,
     area: { left: 0, top: 0, width: 100, height: 100 },
@@ -45,7 +47,6 @@ describe("PaneSplitDivider drags", () => {
   it.each([
     ["pointerUp", "saves"],
     ["pointerCancel", "drops"],
-    ["lostPointerCapture", "drops"],
   ] as const)("is a window drag from pointer down until %s, which %s its sizes", (end, outcome) => {
     const { element, onCommit, onAbort } = renderDivider();
     fireEvent.pointerDown(element, { pointerId: 1 });
@@ -63,6 +64,104 @@ describe("PaneSplitDivider drags", () => {
     fireEvent.lostPointerCapture(element, { pointerId: 1 });
     expect(onCommit).toHaveBeenCalledOnce();
     expect(onAbort).not.toHaveBeenCalled();
+  });
+
+  // The window can lose focus either side of the handle losing its capture.
+  it.each([
+    ["before its capture ends", ["blur", "lostPointerCapture"]],
+    ["after its capture ends", ["lostPointerCapture", "blur"]],
+    ["while it holds its capture", ["blur"]],
+  ] as const)("drops its sizes once when the window blurs %s", (_case, steps) => {
+    const { element, onCommit, onAbort } = renderDivider();
+    fireEvent.pointerDown(element, { pointerId: 1 });
+    for (const step of steps) {
+      if (step === "blur") fireEvent.blur(window);
+      else fireEvent.lostPointerCapture(element, { pointerId: 1 });
+    }
+    fireEvent.pointerUp(document.body, { pointerId: 1 });
+    fireEvent.pointerUp(element, { pointerId: 1 });
+    fireEvent.blur(window);
+    expect(onAbort).toHaveBeenCalledExactlyOnceWith("window-blurred");
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(paneDividerDrag.dragging()).toBe(false);
+  });
+
+  describe("after its capture ends before the release, as the macOS app can end it", () => {
+    function pressAndLose() {
+      const rendered = renderDivider();
+      fireEvent.pointerDown(rendered.element, { pointerId: 1 });
+      fireEvent.lostPointerCapture(rendered.element, { pointerId: 1 });
+      return rendered;
+    }
+
+    it("follows the pointer and saves on its release, wherever it lands", () => {
+      const { onCommit, onAbort, rerender } = pressAndLose();
+      rerender(true);
+      expect(paneDividerDrag.dragging()).toBe(true);
+      expect(onAbort).not.toHaveBeenCalled();
+      fireEvent.pointerUp(document.body, { pointerId: 1 });
+      expect(onCommit).toHaveBeenCalledOnce();
+      expect(onAbort).not.toHaveBeenCalled();
+      expect(paneDividerDrag.dragging()).toBe(false);
+      // The window stops following: a later release elsewhere saves nothing more.
+      fireEvent.pointerUp(document.body, { pointerId: 1 });
+      expect(onCommit).toHaveBeenCalledOnce();
+    });
+
+    it("keeps moving the divider with the pointer's moves, and ignores another pointer", () => {
+      const onResize = vi.fn();
+      render(
+        <PaneSplitDivider
+          divider={divider}
+          containerRef={{ current: document.body }}
+          onResize={onResize}
+          onCommit={vi.fn()}
+          onAbort={vi.fn()}
+        />,
+      );
+      const element = screen.getAllByRole("separator").at(-1)!;
+      element.setPointerCapture = vi.fn();
+      element.hasPointerCapture = () => false;
+      vi.spyOn(document.body, "getBoundingClientRect").mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 1000,
+        height: 500,
+      } as DOMRect);
+      fireEvent.pointerDown(element, { pointerId: 1 });
+      fireEvent.lostPointerCapture(element, { pointerId: 1 });
+      fireEvent.pointerMove(document.body, { pointerId: 2, buttons: 1, clientX: 100 });
+      expect(onResize).not.toHaveBeenCalled();
+      fireEvent.pointerMove(document.body, { pointerId: 1, buttons: 1, clientX: 300 });
+      expect(onResize).toHaveBeenCalledWith([], 0.3, false);
+    });
+
+    it.each([
+      [
+        "a move with the button already up",
+        () => fireEvent.pointerMove(document.body, { pointerId: 1, buttons: 0 }),
+        "pointer-lost",
+      ],
+      [
+        "a cancel",
+        () => fireEvent.pointerCancel(document.body, { pointerId: 1 }),
+        "pointer-cancelled",
+      ],
+    ] as const)("drops its sizes on %s", (_case, end, reason) => {
+      const { onCommit, onAbort } = pressAndLose();
+      end();
+      expect(onAbort).toHaveBeenCalledExactlyOnceWith(reason);
+      expect(onCommit).not.toHaveBeenCalled();
+      expect(paneDividerDrag.dragging()).toBe(false);
+    });
+
+    it("stops following once it goes", () => {
+      const { onCommit, onAbort, unmount } = pressAndLose();
+      unmount();
+      fireEvent.pointerUp(document.body, { pointerId: 1 });
+      expect(onCommit).not.toHaveBeenCalled();
+      expect(onAbort).not.toHaveBeenCalled();
+    });
   });
 
   it("keeps its drag through another finger's press, lifting or cancelling", () => {
