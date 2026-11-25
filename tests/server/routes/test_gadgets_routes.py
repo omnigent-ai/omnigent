@@ -832,8 +832,12 @@ async def test_own_and_shared_lists_page_with_a_cursor(
     ] == sorted(made)
     shared = await _every_page(client, "/v1/gadgets/shared", BOB)
     assert sorted([item for page in shared for item in page]) == sorted(made)
-    bad = await client.get("/v1/gadgets", params={"limit": "nope"}, headers=_as(ALICE))
-    assert bad.status_code == 400
+    for path in ("/v1/gadgets", f"/v1/gadgets/{made[0]}/actions"):
+        # Not a number, a digit Python reads but isn't ASCII, and one too long to convert.
+        for limit in ("nope", "\u0663", "9" * 4301):
+            bad = await client.get(path, params={"limit": limit}, headers=_as(ALICE))
+            assert bad.status_code == 400, (path, limit[:8], bad.text)
+            assert bad.json()["error"]["code"] == "INVALID_ARGUMENT"
 
     # The pins and the gadgets shown beside a session page the same way, in their order.
     session = _own_session(stores, ALICE)

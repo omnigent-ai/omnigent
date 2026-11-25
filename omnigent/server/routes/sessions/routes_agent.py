@@ -296,17 +296,8 @@ def register_agent_routes(
                 bundle_bytes,
                 operator_authored=agent.operator_authored,
             )
-        # Only a caller that parses the spec gets the compatibility copy, and only when it
-        # names no accepted groups (it predates them):
-        # - a runner loading the spec, which has asked for the MCP selection since before
-        #   these groups existed;
-        # - a host reading the session's skills: an Omnigent process (the internal Origin)
-        #   that is not a runner's tool call (no runner tunnel token) and does not name
-        #   itself as a CLI, runner or harness, which current clients do in User-Agent.
-        # Every other caller (a browser or CLI export, sys_agent_download from a runner) gets
-        # the bundle as written, opt-outs included. A CLI from before clients named
-        # themselves is taken for a host, and its export loses an opt-out that the runners it
-        # predates could not read anyway.
+        # Strip unknown tool groups only for legacy spec readers (a runner loading the spec, or
+        # a host reading its skills); preserve original bundles for exports.
         runner_spec_fetch = request.headers.get(MCP_SELECTION_HEADER) == "1"
         host_skill_read = (
             request.headers.get("Origin") == OMNIGENT_INTERNAL_WS_ORIGIN

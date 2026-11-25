@@ -87,6 +87,13 @@ class HookedFiles(GadgetFiles):
             self.store.after_list(path, entries)
         return entries
 
+    def list_page(self, path: str, *, after: str | None, limit: int) -> tuple[list[str], bool]:
+        # The wrapped store's paged read, so service scenarios exercise it.
+        names, more = self.inner.list_page(path, after=after, limit=limit)
+        if self.store.after_list is not None:
+            self.store.after_list(path, names)
+        return names, more
+
     def mkdirs(self, path: str) -> None:
         self.inner.mkdirs(path)
 

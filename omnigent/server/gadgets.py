@@ -242,6 +242,15 @@ def viewer_can_read_session(
         return False
 
 
+def _limit(request: Request, default: int) -> int:
+    """The ``limit`` query parameter as an int; the service checks its range."""
+    raw = request.query_params.get("limit", str(default))
+    # ASCII digits only, and short: Python refuses to convert very long digit strings.
+    if not (raw.isascii() and raw.isdigit() and len(raw) <= 9):
+        raise InvalidInput("limit must be an integer")
+    return int(raw)
+
+
 def create_gadgets_router(
     gadget_store: GadgetStore,
     gadget_access: GadgetAccess,
@@ -326,10 +335,7 @@ def create_gadgets_router(
         return JSONResponse(value, status_code=status_code, headers=_NO_STORE)
 
     def _page(request: Request, default: int) -> tuple[int, str | None]:
-        limit = request.query_params.get("limit", str(default))
-        if not limit.isdecimal():
-            raise InvalidInput("limit must be an integer")
-        return int(limit), request.query_params.get("cursor")
+        return _limit(request, default), request.query_params.get("cursor")
 
     _PAGE_PARAMETERS = [
         {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}},
@@ -524,12 +530,10 @@ def create_gadgets_router(
     )
     async def list_actions(app_id: str, request: Request) -> Response:
         """A page of the action ledger: ``{"items", "next_cursor"}``."""
-        limit = request.query_params.get("limit", "50")
-        if not limit.isdecimal():
-            raise InvalidInput("limit must be an integer")
+        limit = _limit(request, 50)
         cursor = request.query_params.get("cursor")
         return _json(
-            await run(request, lambda service: service.list_actions(app_id, int(limit), cursor))
+            await run(request, lambda service: service.list_actions(app_id, limit, cursor))
         )
 
     @router.post(

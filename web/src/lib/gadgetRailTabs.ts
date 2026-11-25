@@ -19,11 +19,7 @@ interface GadgetRailState {
   newSessionMaximized: boolean;
   /** The gadget filling the screen now, in a session's side panel or beside New session. */
   fullScreenGadgetId: string | null;
-  /**
-   * Whether the full screen gadget's Create session menu should open: a request from the gadget
-   * before its session exists waits there for the viewer to create one. The menu takes it when it
-   * opens, which can be after the navigation that made the request.
-   */
+  /** Opens the Create session menu once it mounts, before a session exists. */
   createSessionMenuRequested: boolean;
   /**
    * Text gadget code put in New session's composer for that menu's Create session to send,
