@@ -429,18 +429,13 @@ async function listViaWorkspaceApi(
   location: string,
   maxEntries: number,
   hideIgnored = false,
+  signal?: AbortSignal,
 ): Promise<(FilesystemListResponse & { ignoredHidden?: true }) | null> {
   // The workspace API only lists inside the workspace.
   if (browseLocationBase(location)) return null;
-  const listed = await listDirectoryViaWorkspaceApi(
-    conversationId,
-    location,
-    maxEntries,
-    undefined,
-    {
-      hideIgnored,
-    },
-  );
+  const listed = await listDirectoryViaWorkspaceApi(conversationId, location, maxEntries, signal, {
+    hideIgnored,
+  });
   return (
     listed && {
       object: "list",
@@ -475,10 +470,12 @@ function listingEntries(json: FilesystemListResponse, target = "", prefix = ""):
  * A whole folder listing, read a page at a time through the `after` cursor, so a
  * folder of thousands of entries lists all of them, up to {@link LISTING_ENTRY_LIMIT}.
  * `fetchPage` returns null when the folder can't be listed at all, which fails the
- * listing on a later page; a listing that stops early keeps `has_more`.
+ * listing on a later page; a listing that stops early keeps `has_more`. Once `signal`
+ * aborts, no further page is asked for.
  */
 export async function readListingPages(
   fetchPage: (after: string | null) => Promise<FilesystemListResponse | null>,
+  signal?: AbortSignal,
 ): Promise<FilesystemListResponse | null> {
   const first = await fetchPage(null);
   if (first === null) return null;
@@ -494,6 +491,8 @@ export async function readListingPages(
     if (page.data.length === 0 || !page.last_id || requested.has(page.last_id)) break;
     const after = page.last_id;
     requested.add(after);
+    // Nobody waits for the listing any more, as when its folder closed.
+    signal?.throwIfAborted();
     const next = await fetchPage(after);
     // Half a folder would read as the whole of it.
     if (next === null) throw new Error("the folder was removed while it was being listed");
@@ -528,12 +527,14 @@ async function fetchWorkspaceAllFiles(
   conversationId: string,
   location = "",
   hideIgnored = false,
+  signal?: AbortSignal,
 ): Promise<WorkspaceAllFilesResult> {
   const viaApi = await listViaWorkspaceApi(
     conversationId,
     location,
     LISTING_ENTRY_LIMIT,
     hideIgnored,
+    signal,
   );
   if (viaApi) {
     const data = listingEntries(viaApi, location);
@@ -541,8 +542,12 @@ async function fetchWorkspaceAllFiles(
       ? { available: true, data, ignoredHidden: true }
       : { available: true, data };
   }
-  const json = await readListingPages(async (after) =>
-    readAllFilesPage(await authenticatedFetch(listingPageUrl(conversationId, location, after))),
+  const json = await readListingPages(
+    async (after) =>
+      readAllFilesPage(
+        await authenticatedFetch(listingPageUrl(conversationId, location, after), { signal }),
+      ),
+    signal,
   );
   if (json === null) return { available: false, data: [] };
   return { available: true, data: listingEntries(json, location) };
@@ -619,7 +624,7 @@ export function useWorkspaceAllFiles(
   useTrailingInvalidate(conversationId, sessionActive, "workspace-all-files");
   return useQuery({
     queryKey: ["workspace-all-files", conversationId, location, ...ignoredKey(hideIgnored)],
-    queryFn: () => fetchWorkspaceAllFiles(conversationId!, location, hideIgnored),
+    queryFn: ({ signal }) => fetchWorkspaceAllFiles(conversationId!, location, hideIgnored, signal),
     enabled:
       queryEnabled &&
       !!conversationId &&
@@ -884,6 +889,7 @@ async function fetchWorkspaceDirectory(
   dirPath: string,
   location = "",
   hideIgnored = false,
+  signal?: AbortSignal,
 ): Promise<WorkspaceFile[]> {
   const target = joinBrowseLocation(location, dirPath);
   const viaApi = await listViaWorkspaceApi(
@@ -891,14 +897,17 @@ async function fetchWorkspaceDirectory(
     target,
     LISTING_ENTRY_LIMIT,
     hideIgnored,
+    signal,
   );
   // The tree addresses children relative to the location it is rooted at.
   if (viaApi) return listingEntries(viaApi, target, dirPath);
   const json = await readListingPages(async (after) => {
-    const res = await authenticatedFetch(listingPageUrl(conversationId, target, after));
+    const res = await authenticatedFetch(listingPageUrl(conversationId, target, after), {
+      signal,
+    });
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     return (await res.json()) as FilesystemListResponse;
-  });
+  }, signal);
   // The tree addresses children relative to the location it is rooted at, one
   // level shallower than the directory just listed.
   return json === null ? [] : listingEntries(json, target, dirPath);
@@ -1320,7 +1329,8 @@ export function workspaceDirectoryQuery(
       ...(refreshToken === 0 ? [] : [refreshToken]),
       ...ignoredKey(hideIgnored),
     ],
-    queryFn: () => fetchWorkspaceDirectory(conversationId, dirPath, location, hideIgnored),
+    queryFn: ({ signal }: { signal: AbortSignal }) =>
+      fetchWorkspaceDirectory(conversationId, dirPath, location, hideIgnored, signal),
     staleTime: 5_000,
   };
 }

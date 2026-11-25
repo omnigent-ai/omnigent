@@ -931,7 +931,8 @@ describe("useWorkspaceDirectory gating", () => {
       "conv_api",
       "src/inner",
       LISTING_ENTRY_LIMIT,
-      undefined,
+      // The query's own signal, so closing the folder stops its pages.
+      expect.any(AbortSignal),
       {
         hideIgnored: false,
       },
@@ -1150,7 +1151,8 @@ describe("folder listings past one page", () => {
       has_more: hasMore,
       last_id: lastId === undefined ? null : `experimental/${lastId}`,
     });
-  const listFolder = (id: string) => workspaceDirectoryQuery(id, "experimental").queryFn();
+  const listFolder = (id: string, signal = new AbortController().signal) =>
+    workspaceDirectoryQuery(id, "experimental").queryFn({ signal });
 
   it("reads every page through the after cursor, so a late folder is listed", async () => {
     fetchMock
@@ -1168,6 +1170,19 @@ describe("folder listings past one page", () => {
       "experimental/d1999",
     ]);
     expect(urls.every((url) => url.searchParams.get("limit") === "1000")).toBe(true);
+  });
+
+  it("asks for no page past the first once nobody waits for the listing", async () => {
+    const controller = new AbortController();
+    fetchMock.mockImplementationOnce(async (_url, init?: RequestInit) => {
+      // The folder closes while its first page is on its way.
+      controller.abort();
+      expect(init?.signal).toBe(controller.signal);
+      return page(["d0000", "d0999"], true);
+    });
+
+    await expect(listFolder("conv_closed", controller.signal)).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("pages the browsed folder's own listing too", async () => {
@@ -2592,7 +2607,8 @@ describe("browse-location listings normalize to paths relative to the location",
       "conv_rel_api",
       "reports",
       LISTING_ENTRY_LIMIT,
-      undefined,
+      // The query's own signal, so closing the folder stops its pages.
+      expect.any(AbortSignal),
       {
         hideIgnored: false,
       },
