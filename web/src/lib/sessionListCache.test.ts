@@ -157,6 +157,26 @@ describe("mergeItemsIntoPages", () => {
     expect(after!.pages[0].data[0].pull_request?.state).toBe("MERGED");
   });
 
+  it("compares plan progress by value", () => {
+    const progress = {
+      total: 5,
+      done: 2,
+      started: 1,
+      step: { name: "Ship", state: "started" as const },
+    };
+    const before = data([conv("a", { plan_progress: progress })]);
+    const same = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", plan_progress: { ...progress, step: { ...progress.step } } }],
+    ]);
+    const advanced = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", plan_progress: { ...progress, done: 3 } }],
+    ]);
+
+    expect(mergeItemsIntoPages(before, same, DEFAULT_FILTERS).data).toBe(before);
+    const { data: after } = mergeItemsIntoPages(before, advanced, DEFAULT_FILTERS);
+    expect(after!.pages[0].data[0].plan_progress?.done).toBe(3);
+  });
+
   it("does not report ids absent from any page (structural additions)", () => {
     const before = data([conv("a")]);
     const items = new Map<string, SessionListWireItem>([

@@ -5837,7 +5837,7 @@ const PLAN_LEAD_TONES = {
 
 // A workflow run's card row: its finished steps, then the step it's on or how it
 // finished, with "+2" for more in progress. The step gets a line of its own, so a
-// long name wraps instead of truncating.
+// long name wraps to two lines before it's cut short.
 function SessionTasksDetail({ line }: { line: PlanProgressLine }) {
   return (
     <div data-testid="session-tooltip-tasks" className="flex flex-col gap-0.5 text-sm">
@@ -6030,12 +6030,14 @@ function LegacySessionTooltipContent({
   hasError,
   shared,
   familyDetail,
+  planLine,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   shared: SessionSharing | null;
   familyDetail?: ReactNode;
+  planLine: PlanProgressLine | null;
 }) {
   return (
     <TooltipContent
@@ -6070,7 +6072,12 @@ function LegacySessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
-      {familyDetail && <SessionTooltipDetailsBlock>{familyDetail}</SessionTooltipDetailsBlock>}
+      {(planLine || familyDetail) && (
+        <SessionTooltipDetailsBlock>
+          {planLine && <SessionTasksDetail line={planLine} />}
+          {familyDetail}
+        </SessionTooltipDetailsBlock>
+      )}
       {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
@@ -6104,6 +6111,7 @@ function SessionTooltipContent({
         hasError={hasError}
         shared={shared}
         familyDetail={familyDetail}
+        planLine={planLine}
       />
     );
   }
@@ -6445,7 +6453,7 @@ function ConversationRowImpl({
     metaEnvironment !== null || metaRepo !== null || metaBranch !== null
       ? "top-4 md:top-3.5"
       : "top-1/2";
-  // A workflow run's card names the step it's on.
+  // A waiting prompt keeps a finished plan's card from saying it's done while a step is still open.
   const planLine = conversation.plan_progress
     ? planProgressLine(conversation.plan_progress, sessionState?.kind === "awaiting")
     : null;

@@ -4125,6 +4125,41 @@ async def test_create_from_a_session_copies_it_for_the_runs(
     assert fetched.json()["source_session_id"] == source_copy_id
 
 
+async def test_an_automations_copy_records_the_step_its_copied_plan_is_on(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.server.journal_markers import record_plan_marker, record_status_marker
+    from omnigent.stores.session_journal_store import SessionJournalStore
+
+    source_id = _session_with_history(db_uri, finished=False)
+    store = SqlAlchemyConversationStore(db_uri)
+    journal = SessionJournalStore(db_uri)
+    steps = [{"id": "sort", "name": "Sort the alerts"}]
+    plan = journal.append(
+        source_id, "plan", {"name": "Triage", "steps": steps}, idempotency_key="k0"
+    ).entry
+    await record_plan_marker(store, source_id, plan, None)
+    status = journal.append(
+        source_id, "status", {"status": "started"}, idempotency_key="k1", step="sort"
+    ).entry
+    await record_status_marker(store, source_id, status, plan)
+    store.append(source_id, [_message("assistant", "resp_1", "sorting them now")])
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=source_id, prompt=""),
+        headers=_headers(),
+    )
+
+    assert resp.status_code == 200, resp.text
+    copy_id = resp.json()["source_session_id"]
+    # The copy's journal is copied, not appended, so the copy records its progress after.
+    assert journal.plan_progress_by_session([copy_id])[copy_id]["step"] == {
+        "name": "Sort the alerts",
+        "state": "started",
+    }
+
+
 @pytest.mark.parametrize(
     ("live_status", "last_copied"), [("idle", "all fixed"), ("running", "three alerts")]
 )

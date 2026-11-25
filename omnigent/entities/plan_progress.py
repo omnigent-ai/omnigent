@@ -86,7 +86,7 @@ def _is_complete(
 
     A step before a done final step that isn't done reopens the plan when its
     status is newer than the final step's, or when the graph changed after the
-    final step was done. Steps the agent never marked don't.
+    final step was done. Otherwise a step the agent never marked doesn't.
     """
     by_id = {step["id"]: step for step in steps}
     dependencies = {dependency for step in steps for dependency in step["depends_on"]}

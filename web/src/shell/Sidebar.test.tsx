@@ -620,6 +620,26 @@ describe("Sidebar session list", () => {
     expect(within(card).queryByTestId("session-tooltip-tasks")).toBeNull();
   });
 
+  it("names a workflow run's step on the card from before sidebar grouping", async () => {
+    mockConversations([
+      conv("legacy_run", "Claude Code", {
+        plan_progress: {
+          total: 2,
+          done: 1,
+          started: 1,
+          step: { name: "Ship it", state: "started" },
+        },
+      }),
+    ]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "legacy_run" }), {
+      pointerType: "mouse",
+    });
+    const card = await screen.findByTestId("session-tooltip-content");
+    expect(within(card).getByTestId("session-tooltip-tasks")).toHaveTextContent("1/2Ship it");
+  });
+
   it("names a pinned workflow run's step on its project card", async () => {
     projectsMock.push("Customer X");
     seedPins(["pinned_run"]);
