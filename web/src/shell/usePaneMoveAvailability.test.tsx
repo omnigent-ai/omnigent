@@ -112,11 +112,24 @@ describe("usePaneMoveAvailability", () => {
   it("settles when the panes' element is replaced on every render, and watches the new one", () => {
     let width = 800;
     const resize = installResizableWidth(width);
+    const observe = vi.spyOn(ResizeObserver.prototype, "observe");
+    const disconnect = vi.spyOn(ResizeObserver.prototype, "disconnect");
     const view = render(<RemountingPanes width={() => width} />);
     expect(latest).toEqual({ available: true });
     expect(renders).toBeLessThan(5);
 
     view.rerender(<RemountingPanes width={() => width} />);
+    const current = view.container.firstElementChild;
+    // The newest observer watches the element on screen; every one before it let go.
+    const watched = observe.mock.calls.map(([target]) => target);
+    expect(watched.at(-1)).toBe(current);
+    expect(watched.length).toBeGreaterThan(1);
+    const observers = observe.mock.contexts;
+    for (const stale of observers.slice(0, -1)) {
+      expect(disconnect.mock.contexts).toContain(stale);
+    }
+    expect(disconnect.mock.contexts).not.toContain(observers.at(-1));
+
     width = 200;
     resize(width);
     expect(latest).toEqual({ available: false, reason: NO_ROOM_TO_MOVE_REASON });
