@@ -717,7 +717,8 @@ describe("WorkflowDetailPage", () => {
       // A server from before the description's time was kept knows no steps check either.
       server.keepsDescriptionTime = keepsDescriptionTime;
       if (!keepsDescriptionTime) server.unknown = ["expected_steps"];
-      const view = renderPage();
+      const client = new QueryClient();
+      const view = renderPage(client);
       fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
       await waitFor(() => expect(patches).toHaveLength(1));
 
@@ -733,6 +734,9 @@ describe("WorkflowDetailPage", () => {
       expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
       expect(screen.getByText(newDescription)).toBeInTheDocument();
       expect(runButton()).toBeDisabled();
+      // Read again, the workflow is still at that write, so the offer stays.
+      await act(() => client.invalidateQueries({ queryKey: ["workflow", WORKFLOW.id] }));
+      expect(screen.getByText(newDescription)).toBeInTheDocument();
     },
   );
 
@@ -796,6 +800,38 @@ describe("WorkflowDetailPage", () => {
       { ...WORKFLOW.steps[1], goal: fourHours },
       report,
     ]);
+  });
+
+  it("asks for a new look at a proposal once the plan it was shown against changed", async () => {
+    const report = { id: "report", name: "Report", goal: null, depends_on: ["fix"] };
+    const { patches, server } = await workflowWithProposals(WORKFLOW.steps, [
+      plan(50, [...WORKFLOW.steps, report]),
+    ]);
+    renderPage();
+    const savePlanButton = await screen.findByRole("button", { name: "Save plan" });
+
+    // Another page renames a step meanwhile: the proposal isn't saved over it.
+    const renamed = [{ ...WORKFLOW.steps[0]!, name: "Look into the failures" }, WORKFLOW.steps[1]!];
+    server.stored = { ...server.stored, steps: renamed };
+    let reread = false;
+    server.afterRead = () => {
+      // The save's own read; the page's read of the plan as saved now comes next.
+      server.afterRead = () => {
+        reread = true;
+      };
+    };
+    fireEvent.click(savePlanButton);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn’t save the plan. The plan changed since this proposal was shown. Review it again.",
+    );
+    expect(patches).toEqual([]);
+
+    // Once the page has the plan as saved now, the proposal saves over it.
+    await waitFor(() => expect(reread).toBe(true));
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]!.expected_steps).toEqual(renamed);
   });
 
   it("redoes a time limit save over steps saved between its read and its write", async () => {

@@ -3,7 +3,11 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tansta
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { authenticatedFetch } from "@/lib/identity";
 import type { JournalEntry, JournalPlanStep } from "@/lib/sessionJournal";
-import { withChosenTimeLimit, withSavedTimeLimits } from "@/lib/stepTimeLimit";
+import {
+  sameStepsApartFromTimeLimits,
+  withChosenTimeLimit,
+  withSavedTimeLimits,
+} from "@/lib/stepTimeLimit";
 import type { WorkflowRun } from "@/lib/workflowRuns";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
@@ -186,15 +190,45 @@ async function savePlan(workflowId: string, proposal: PlanSave): Promise<Workflo
 }
 
 /**
- * *saved*, a write that left the description of *read* alone, with the time the description had
- * when read. A server that keeps no such time goes by this write's instead, which would hide a
- * description proposal that arrived meanwhile; one that keeps it reports it, so it stands.
+ * The time a page goes by for a workflow's description across its own write of the steps alone,
+ * from a server that keeps no such time and so would have it go by that write's: the time read
+ * before the write, while the workflow is still at that write (`after`) with that description.
  */
-function withDescriptionTimeKept(saved: WorkflowDetail, read: WorkflowDetail): WorkflowDetail {
-  const before = read.updated_at;
-  const keepsTime = saved.description_updated_at != null;
-  if (keepsTime || saved.description !== read.description || before === undefined) return saved;
-  return (saved.updated_at ?? 0) > before ? { ...saved, description_updated_at: before } : saved;
+export interface KeptDescriptionTime {
+  after: number;
+  describedAt: number;
+  description: string;
+}
+
+function keptDescriptionTimeKey(workflowId: string) {
+  return ["workflow-kept-description-time", workflowId];
+}
+
+/** The {@link KeptDescriptionTime} of a workflow, beside its data so a refetch keeps it. */
+export function useKeptDescriptionTime(workflowId: string): KeptDescriptionTime | undefined {
+  const { data } = useQuery<KeptDescriptionTime | null>({
+    queryKey: keptDescriptionTimeKey(workflowId),
+    queryFn: () => null,
+    enabled: false,
+    staleTime: Infinity,
+  });
+  return data ?? undefined;
+}
+
+/** Keep the description's time read before a steps-only write, when the server reports none. */
+function useKeepDescriptionTime(workflowId: string) {
+  const queryClient = useQueryClient();
+  return (saved: WorkflowDetail, read: WorkflowDetail) => {
+    const { updated_at: after, description_updated_at: reported } = saved;
+    if (reported != null || after === undefined || read.updated_at === undefined) return;
+    if (saved.description !== read.description || after <= read.updated_at) return;
+    const kept: KeptDescriptionTime = {
+      after,
+      describedAt: read.updated_at,
+      description: saved.description,
+    };
+    queryClient.setQueryData(keptDescriptionTimeKey(workflowId), kept);
+  };
 }
 
 /** Tries for a save whose steps change between its read and its write. */
@@ -208,6 +242,7 @@ const STORED_STEPS_SAVE_TRIES = 3;
 async function saveOverStoredSteps(
   workflowId: string,
   edit: (stored: WorkflowDetail) => DescriptionSave & { steps: WorkflowStep[] },
+  keepDescriptionTime: (saved: WorkflowDetail, read: WorkflowDetail) => void,
   tries = STORED_STEPS_SAVE_TRIES,
 ): Promise<WorkflowDetail> {
   const res = await authenticatedFetch(workflowPath(workflowId));
@@ -217,10 +252,11 @@ async function saveOverStoredSteps(
   try {
     const write = edit(stored);
     const saved = await savePlan(workflowId, { ...write, expected_steps: stored.steps });
-    return write.description === undefined ? withDescriptionTimeKept(saved, stored) : saved;
+    if (write.description === undefined) keepDescriptionTime(saved, stored);
+    return saved;
   } catch (error) {
     if (!(error instanceof ApiError) || error.code !== "conflict") throw error;
-    if (tries > 1) return saveOverStoredSteps(workflowId, edit, tries - 1);
+    if (tries > 1) return saveOverStoredSteps(workflowId, edit, keepDescriptionTime, tries - 1);
     throw new Error("The plan kept changing while it saved. Try again.", { cause: error });
   }
 }
@@ -233,19 +269,31 @@ function useWorkflowReread(workflowId: string) {
 
 /**
  * Apply the reviewed proposal, its steps and any new description, to the existing workflow.
- * Each step the workflow has keeps its time limit as saved when the write is made. The server
- * keeps a description that is no longer `expected_description`; a server too old to check that
- * gets the steps alone, so its description stays.
+ * Each step the workflow has keeps its time limit as saved when the write is made. With
+ * `baseSteps`, the steps the proposal was shown against, a plan saved elsewhere since, time
+ * limits aside, is left for the user to review again. The server keeps a description that is no
+ * longer `expected_description`; a server too old to check that gets the steps alone, so its
+ * description stays.
  */
 export function useSaveWorkflowPlan(workflowId: string) {
   const onSuccess = useWorkflowSaved();
   const onError = useWorkflowReread(workflowId);
+  const keepDescriptionTime = useKeepDescriptionTime(workflowId);
   return useMutation({
-    mutationFn: ({ steps, ...description }: DescriptionSave & { steps: WorkflowStep[] }) =>
-      saveOverStoredSteps(workflowId, (stored) => ({
-        ...description,
-        steps: withSavedTimeLimits(steps, stored.steps),
-      })),
+    mutationFn: ({
+      steps,
+      baseSteps,
+      ...description
+    }: DescriptionSave & { steps: WorkflowStep[]; baseSteps?: WorkflowStep[] }) =>
+      saveOverStoredSteps(
+        workflowId,
+        (stored) => {
+          if (baseSteps && !sameStepsApartFromTimeLimits(stored.steps, baseSteps))
+            throw new Error("The plan changed since this proposal was shown. Review it again.");
+          return { ...description, steps: withSavedTimeLimits(steps, stored.steps) };
+        },
+        keepDescriptionTime,
+      ),
     onSuccess,
     onError,
   });
@@ -259,17 +307,22 @@ export function useSaveWorkflowPlan(workflowId: string) {
 export function useSaveStepTimeLimit(workflowId: string) {
   const onSuccess = useWorkflowSaved();
   const onError = useWorkflowReread(workflowId);
+  const keepDescriptionTime = useKeepDescriptionTime(workflowId);
   return useMutation({
     mutationFn: ({ stepId, limit }: { stepId: string; limit: string | null }) =>
-      saveOverStoredSteps(workflowId, (stored) => {
-        if (!stored.steps.some((step) => step.id === stepId))
-          throw new Error("The step is no longer in the saved plan.");
-        return {
-          steps: stored.steps.map((step) =>
-            step.id === stepId ? { ...step, goal: withChosenTimeLimit(step.goal, limit) } : step,
-          ),
-        };
-      }),
+      saveOverStoredSteps(
+        workflowId,
+        (stored) => {
+          if (!stored.steps.some((step) => step.id === stepId))
+            throw new Error("The step is no longer in the saved plan.");
+          return {
+            steps: stored.steps.map((step) =>
+              step.id === stepId ? { ...step, goal: withChosenTimeLimit(step.goal, limit) } : step,
+            ),
+          };
+        },
+        keepDescriptionTime,
+      ),
     onSuccess,
     onError,
   });

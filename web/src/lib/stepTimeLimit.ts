@@ -242,7 +242,7 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       }
     }
   }
-  // Only blank lines at the ends go.
+  // Only the outer blank lines go; inner ones keep the paragraph and quote breaks as written.
   let first = 0;
   while (first < lines.length && isBlankLine(lines[first])) first += 1;
   let last = lines.length;
@@ -286,6 +286,23 @@ export function withSavedTimeLimits(
       ? step
       : { ...step, goal: withStepTimeLimit(step.goal, limit) };
   });
+}
+
+/** Whether two plans have the same steps but for their time limits. */
+export function sameStepsApartFromTimeLimits(
+  a: readonly WorkflowStep[],
+  b: readonly WorkflowStep[],
+): boolean {
+  const signature = (steps: readonly WorkflowStep[]) =>
+    JSON.stringify(
+      steps.map(({ id, name, goal, depends_on }) => [
+        id,
+        name,
+        withStepTimeLimit(goal, null),
+        depends_on,
+      ]),
+    );
+  return signature(a) === signature(b);
 }
 
 /** A step's description without its time limit, and the limit, to compare steps by. */
