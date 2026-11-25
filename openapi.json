@@ -18323,7 +18323,7 @@
         "description": "Create a private gadget from `{\"name\"}`; answers the gadget with 201.",
         "operationId": "create_gadget_v1_gadgets_post",
         "responses": {
-          "200": {
+          "201": {
             "content": {
               "application/json": {
                 "schema": {}
@@ -18787,7 +18787,10 @@
                     "type": "string"
                   },
                   "session_id": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "state": {
                     "enum": [
@@ -18800,7 +18803,10 @@
                     "type": "string"
                   },
                   "summary": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   }
                 },
                 "required": [
@@ -18988,7 +18994,7 @@
           }
         ],
         "responses": {
-          "200": {
+          "201": {
             "content": {
               "application/json": {
                 "schema": {}
@@ -19291,7 +19297,7 @@
           }
         ],
         "responses": {
-          "200": {
+          "201": {
             "content": {
               "application/json": {
                 "schema": {}

@@ -330,7 +330,7 @@ def create_gadgets_router(
         limit, cursor = _page(request, 100)
         return _json(await run(request, lambda service: service.list_owned(limit, cursor)))
 
-    @router.post("/gadgets")
+    @router.post("/gadgets", status_code=201)
     async def create_gadget(request: Request) -> Response:
         """Create a private gadget from ``{"name"}``; answers the gadget with 201."""
         body = await _body(request)
@@ -414,7 +414,7 @@ def create_gadgets_router(
         """Whether the caller's gadget session and the sessions it started are working."""
         return _json(await run(request, lambda service: service.gadget_session_status(app_id)))
 
-    @router.post("/gadgets/{app_id}/revisions")
+    @router.post("/gadgets/{app_id}/revisions", status_code=201)
     async def create_revision(app_id: str, request: Request) -> Response:
         """Upload an immutable revision; answers ``{"id"}`` with 201."""
         body = await _body(request)
@@ -464,7 +464,7 @@ def create_gadgets_router(
             )
         )
 
-    @router.post("/gadgets/{app_id}/comments")
+    @router.post("/gadgets/{app_id}/comments", status_code=201)
     async def create_comment(app_id: str, request: Request) -> Response:
         """Add ``{"body", "anchor", "operation_id"}``; answers the comment with 201."""
         body = await _body(request)
@@ -551,8 +551,9 @@ def create_gadgets_router(
                 "if_version": _STRING,
                 "operation_id": _STRING,
                 "state": {"type": "string", "enum": list(ACTION_STATES)},
-                "summary": _STRING,
-                "session_id": _STRING,
+                # ``null`` clears either.
+                "summary": {"type": ["string", "null"]},
+                "session_id": {"type": ["string", "null"]},
             },
             ["if_version", "operation_id"],
         ),

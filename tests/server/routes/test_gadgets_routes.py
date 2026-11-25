@@ -817,3 +817,16 @@ async def test_own_and_shared_lists_page_with_a_cursor(
         "/v1/gadgets/shelf", params={"cursor": "nope"}, headers=_as(ALICE)
     )
     assert bad_cursor.status_code == 400
+
+
+def test_the_published_api_states_the_statuses_and_nullable_fields_the_routes_use() -> None:
+    # The creates answer 201, and an action update clears ``summary``/``session_id`` with null.
+    spec = json.loads((Path(__file__).resolve().parents[3] / "openapi.json").read_text())
+    paths = spec["paths"]
+    for path in ("/v1/gadgets", "/v1/gadgets/{app_id}/revisions", "/v1/gadgets/{app_id}/comments"):
+        assert "201" in paths[path]["post"]["responses"], path
+        assert "200" not in paths[path]["post"]["responses"], path
+    update = paths["/v1/gadgets/{app_id}/actions/{action_id}"]["patch"]
+    fields = update["requestBody"]["content"]["application/json"]["schema"]["properties"]
+    assert fields["summary"]["type"] == ["string", "null"]
+    assert fields["session_id"]["type"] == ["string", "null"]

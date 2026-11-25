@@ -169,6 +169,9 @@ function GadgetRailPane({
   );
 }
 
+// The open New gadget panes' Cancel, by session, for closing the tab to share it.
+const draftCancels = new Map<string, () => void>();
+
 /** Builds a new gadget in this session from a description, or makes one from a template. */
 function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetTabView }) {
   const navigate = useGadgetNavigate();
@@ -229,6 +232,24 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
     unfinished.current = null;
     openGadgetTab(gadget);
   };
+  // Cancel leaves no half-made gadget behind, except one already being built.
+  const cancel = () => {
+    operation.current += 1;
+    if (!delivering.current) {
+      const abandoned = unfinished.current?.gadget;
+      unfinished.current = null;
+      if (abandoned) void deleteGadget(abandoned.id).catch(() => undefined);
+    }
+  };
+  const cancelRef = useRef(cancel);
+  cancelRef.current = cancel;
+  useEffect(() => {
+    const cancelThis = () => cancelRef.current();
+    draftCancels.set(sessionId, cancelThis);
+    return () => {
+      if (draftCancels.get(sessionId) === cancelThis) draftCancels.delete(sessionId);
+    };
+  }, [sessionId]);
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto p-4">
       {/* Full screen hides the tab strip, so the bar names the tab. */}
@@ -245,13 +266,7 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
         explanation="Say what it shows, what data it uses and what people do with it. This session builds it here, and its buttons send their work back to this session."
         onBuild={build}
         onCancel={() => {
-          operation.current += 1;
-          // Cancel leaves no half-made gadget behind, except one already being built.
-          if (!delivering.current) {
-            const abandoned = unfinished.current?.gadget;
-            unfinished.current = null;
-            if (abandoned) void deleteGadget(abandoned.id).catch(() => undefined);
-          }
+          cancel();
           setGadgetDraft(sessionId, false);
         }}
         errorTitle="Couldn’t start building the gadget"
@@ -598,6 +613,8 @@ export function useGadgetRailTabState(
         choose(next, mobileOpen && next !== null);
       }
       if (key === GADGET_DRAFT_KEY) {
+        // Closing the tab cancels its build, as Cancel does.
+        draftCancels.get(conversationId)?.();
         setGadgetDraft(conversationId, false);
         return;
       }
