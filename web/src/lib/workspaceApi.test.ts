@@ -15,6 +15,8 @@ import {
   ComparisonKind,
   FileSearchMode,
   SearchOrder,
+  ListBranchCommitsRequestSchema,
+  ListBranchCommitsResponseSchema,
   ListWorkingCopyChangesRequestSchema,
   ListWorkingCopyChangesResponseSchema,
   ReadBaseFileResponseSchema,
@@ -1381,6 +1383,62 @@ describe("Git comparisons through the workspace API", () => {
     expect(base).toMatchObject({ path: "src/a.ts", encoding: "utf-8", content: "hi", bytes: 2 });
   });
 
+  it("asks for a named head's commits only of a host that lists one", async () => {
+    enable("workspace_api_server_access");
+    const requests: { baseRevision: string; headRevision: string }[] = [];
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("ListBranchCommits", "branch_commits"), {
+          headers: PROTO_HEADERS,
+        }),
+      ListBranchCommits: (body) => {
+        const { baseRevision, headRevision } = fromBinary(ListBranchCommitsRequestSchema, body);
+        requests.push({ baseRevision, headRevision });
+        return new Response(
+          toBinary(ListBranchCommitsResponseSchema, create(ListBranchCommitsResponseSchema, {})),
+          { headers: PROTO_HEADERS },
+        );
+      },
+    });
+
+    // Without "branch_commits.head" it would list HEAD's commits, so a named head isn't asked.
+    expect(
+      await listBranchCommitsViaWorkspaceApi("s-git-head", { base: "main", head: "feature" }),
+    ).toBeNull();
+    expect(
+      await listBranchCommitsViaWorkspaceApi("s-git-head", { base: "main", head: "" }),
+    ).not.toBeNull();
+    expect(requests).toEqual([{ baseRevision: "main", headRevision: "" }]);
+  });
+
+  it("sends a named head to a host that lists one", async () => {
+    enable("workspace_api_server_access");
+    const requests: { baseRevision: string; headRevision: string }[] = [];
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(
+          capabilitiesBody("ListBranchCommits", "branch_commits", "branch_commits.head"),
+          { headers: PROTO_HEADERS },
+        ),
+      ListBranchCommits: (body) => {
+        const { baseRevision, headRevision } = fromBinary(ListBranchCommitsRequestSchema, body);
+        requests.push({ baseRevision, headRevision });
+        return new Response(
+          toBinary(ListBranchCommitsResponseSchema, create(ListBranchCommitsResponseSchema, {})),
+          { headers: PROTO_HEADERS },
+        );
+      },
+    });
+
+    expect(
+      await listBranchCommitsViaWorkspaceApi("s-git-head-served", {
+        base: "main",
+        head: "feature",
+      }),
+    ).not.toBeNull();
+    expect(requests).toEqual([{ baseRevision: "main", headRevision: "feature" }]);
+  });
+
   it("does not send REVISIONS when revision_comparison is absent", async () => {
     enable("workspace_api_server_access");
     const kinds: unknown[] = [];
@@ -1405,7 +1463,9 @@ describe("Git comparisons through the workspace API", () => {
 
     expect(await listWorkingCopyChangesViaWorkspaceApi("s-git-features", revisions)).toBeNull();
     expect(await resolveWorkingCopyBaseViaWorkspaceApi("s-git-features", revisions)).toBeNull();
-    expect(await listBranchCommitsViaWorkspaceApi("s-git-features", "main")).toBeNull();
+    expect(
+      await listBranchCommitsViaWorkspaceApi("s-git-features", { base: "main", head: "" }),
+    ).toBeNull();
     // The comparison the host does serve still goes through.
     const branchPoint = await listWorkingCopyChangesViaWorkspaceApi("s-git-features", {
       kind: ComparisonKind.BRANCH_POINT,
@@ -1477,7 +1537,7 @@ describe("Git comparisons through the workspace API", () => {
     });
     const file = { commit: "b".repeat(40), path: "src/a.ts", object: "c".repeat(40) };
 
-    const commits = listBranchCommitsViaWorkspaceApi("s-git-refused", "gone");
+    const commits = listBranchCommitsViaWorkspaceApi("s-git-refused", { base: "gone", head: "" });
     await expect(commits).rejects.toThrow("No revision 'gone'");
     await expect(commits).rejects.toMatchObject({ code: Code.NotFound });
     const base = readBaseFileViaWorkspaceApi("s-git-refused", file);

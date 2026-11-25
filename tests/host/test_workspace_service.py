@@ -962,6 +962,7 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
         "ListRepositoryRefs",
         "ListBranchCommits",
         "branch_commits",
+        "branch_commits.head",
         "ResolveRepositoryContext",
     }
 

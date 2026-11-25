@@ -1,7 +1,8 @@
-// The commits of a session's branch, which the Changes review lists so one can
-// be shown on its own. Only the session's host can list them, through the
+// The commits of the comparison on screen, or of the session's branch, which the Changes review
+// lists so one can be shown on its own. Only the session's host can list them, through the
 // workspace API; until it serves them the section says so.
 
+import { type RevisionSpec, shownCommit } from "@/lib/customComparison";
 import {
   type ComparisonProblem,
   comparisonProblemFrom,
@@ -14,7 +15,7 @@ import {
   workspaceSidebarSource,
 } from "@/lib/workspaceSidebarSource";
 
-/** The query key prefix of a session's branch commits, then its host and workspace root. */
+/** The query key prefix of a session's listed commits, then its host, workspace root and range. */
 export const BRANCH_COMMITS_KEY = "branch-commits";
 
 /** The most commits the host lists, newest first. */
@@ -31,7 +32,23 @@ export interface BranchCommit {
   root: boolean;
 }
 
-/** The commits HEAD has beyond its merge base with the default branch, newest first. */
+/**
+ * The base and head commits are listed between: an empty base is the default branch, an empty
+ * head is HEAD. The default listing is the session's branch.
+ */
+export const BRANCH_RANGE: RevisionSpec = { base: "", head: "" };
+
+/**
+ * The commits to list for the comparison on screen: its typed base and head, or the session's
+ * branch. A single commit shown on its own keeps the `previous` range, so the list stays put.
+ */
+export function commitsRange(custom: RevisionSpec | null, previous: RevisionSpec): RevisionSpec {
+  if (!custom) return BRANCH_RANGE;
+  if (shownCommit(custom)) return previous;
+  return { base: custom.base, head: custom.head };
+}
+
+/** The commits a head has beyond its merge base with a base, newest first. */
 export type BranchCommits =
   | {
       kind: "listed";
@@ -58,14 +75,16 @@ function branchCommit(commit: WireBranchCommit): BranchCommit | null {
 }
 
 /**
- * Lists the session's branch commits from its host. Rejects with
- * {@link WorkspaceMethodUnavailableError} while no route serves them.
+ * Lists `range`'s commits from the session's host. Rejects with
+ * {@link WorkspaceMethodUnavailableError} while no route serves them, or for a named head, while
+ * the host can't list one.
  */
 export async function fetchBranchCommits(
   sessionId: string,
+  range: RevisionSpec = BRANCH_RANGE,
   signal?: AbortSignal,
 ): Promise<BranchCommits> {
-  const response = await workspaceSidebarSource().listBranchCommits(sessionId, "", signal);
+  const response = await workspaceSidebarSource().listBranchCommits(sessionId, range, signal);
   const unavailable = response.base?.unavailable;
   if (unavailable) return { kind: "unavailable", problem: comparisonProblemFrom(unavailable) };
   return {

@@ -544,10 +544,12 @@ class ListRepositoryRefsResponse(_message.Message):
     def __init__(self, refs: _Optional[_Iterable[str]] = ..., truncated: _Optional[bool] = ..., default_branch_ref: _Optional[str] = ...) -> None: ...
 
 class ListBranchCommitsRequest(_message.Message):
-    __slots__ = ("base_revision",)
+    __slots__ = ("base_revision", "head_revision")
     BASE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    HEAD_REVISION_FIELD_NUMBER: _ClassVar[int]
     base_revision: str
-    def __init__(self, base_revision: _Optional[str] = ...) -> None: ...
+    head_revision: str
+    def __init__(self, base_revision: _Optional[str] = ..., head_revision: _Optional[str] = ...) -> None: ...
 
 class BranchCommit(_message.Message):
     __slots__ = ("object", "subject", "author_name", "author_time_unix", "root", "body")

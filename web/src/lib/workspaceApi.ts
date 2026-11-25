@@ -23,6 +23,7 @@ import {
 } from "@/gen/omnigent/api/workspace/v1alpha1/workspace_pb";
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type { ContentSearchResult } from "@/lib/contentSearch";
+import type { RevisionSpec } from "@/lib/customComparison";
 import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { splitGlobList } from "@/lib/globList";
@@ -910,17 +911,25 @@ export function listRepositoryRefsViaWorkspaceApi(
   );
 }
 
-/** The commits HEAD has beyond its merge base with `baseRevision`, newest first. */
+/**
+ * The commits `range.head` (HEAD when empty) has beyond its merge base with `range.base`, newest
+ * first. A named head is asked of a host that lists one; an older one would list HEAD's.
+ */
 export function listBranchCommitsViaWorkspaceApi(
   sessionId: string,
-  baseRevision: string,
+  range: RevisionSpec,
   signal?: AbortSignal,
 ): Promise<ListBranchCommitsResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listBranchCommits",
-    (client) => client.listBranchCommits({ baseRevision }, { signal }),
-    { ...GIT_OPTIONS, signal, features: ["branch_commits"] },
+    (client) =>
+      client.listBranchCommits({ baseRevision: range.base, headRevision: range.head }, { signal }),
+    {
+      ...GIT_OPTIONS,
+      signal,
+      features: range.head ? ["branch_commits", "branch_commits.head"] : ["branch_commits"],
+    },
   );
 }
 
