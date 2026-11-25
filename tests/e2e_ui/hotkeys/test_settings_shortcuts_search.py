@@ -6,8 +6,6 @@ shortcut row reveals it even while the field hides it.
 
 from __future__ import annotations
 
-import sys
-
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui._settings_search import expect_settings_row_revealed, settings_search_field
@@ -29,23 +27,8 @@ def test_keyboard_shortcuts_search_filters_the_table(page: Page, live_server: st
     expect(rows.first).to_contain_text("Open model picker")
     expect(general).to_have_count(0)
 
-    # A chord typed as keys finds the row it presses.
-    filter_field.fill("cmd+k" if sys.platform == "darwin" else "ctrl+k")
-    expect(rows).to_have_count(1)
-    expect(rows.first).to_contain_text("Open command palette")
-    # So does a chord only a browser tab shows.
-    filter_field.fill("cmd+shift+o" if sys.platform == "darwin" else "ctrl+shift+o")
-    expect(rows).to_have_count(1)
-    expect(rows.first).to_contain_text("Start a new session")
-
-    filter_field.fill("no such shortcut")
-    expect(main.get_by_role("status")).to_have_text("No shortcuts match “no such shortcut”")
-    filter_field.press("Escape")
-    expect(filter_field).to_have_value("")
-    expect(general).to_be_visible()
-
+    # Chords, no-match and Escape are covered by shortcutsFilter and SearchableShortcutsList tests.
     # A Settings search result for a row the filter hides still reveals it.
-    filter_field.fill("model")
     settings_search_field(page).fill("Open command palette")
     expect(page.get_by_role("option").first).to_contain_text("Open command palette")
     page.keyboard.press("Enter")
