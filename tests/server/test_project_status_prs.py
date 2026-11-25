@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy import update
 
 from omnigent.db.db_models import SqlProjectTicketEvent, current_workspace_id
@@ -21,7 +22,9 @@ from omnigent.entities.project_ticket import (
     UpdateTicketStages,
     default_ticket_stages,
 )
+from omnigent.server import project_status_prs
 from omnigent.server.project_status import LEAD_MEMBER_KEY, status_period, user_member_key
+from omnigent.server.project_status_cache import project_status_cache
 from omnigent.server.project_status_prs import (
     MergedTicket,
     SessionMergedPr,
@@ -173,3 +176,110 @@ def test_source_counts_session_prs_and_merged_tickets_per_member(setup) -> None:
     )
     every = source.prs_merged(project, status_period("all", NOW + 60))
     assert every.total == 3 and reviewed
+
+
+def _seed(setup):
+    """Session PRs and merged tickets across members, dates and an undated PR."""
+    project, tickets, conversations, _state, db_uri = setup
+    person, other = uuid4().hex, uuid4().hex
+    for session_id in (person, other):
+        conversations.create_conversation(conversation_id=session_id, project_id=project.id)
+    pull_requests = SessionPullRequestStore(db_uri)
+    for number, merged_at in ((7, NOW - DAY), (8, NOW - 20 * DAY), (9, None)):
+        url = f"https://github.com/example/repo/pull/{number}"
+        report = PullRequestReport(
+            url, "github", "github.com", "example/repo", number, "created", 1.0, 1.0
+        )
+        pull_requests.apply_report(
+            person, [report], fetched=FetchedState(url, number, "OPEN", False), requested_at=1.0
+        )
+        pull_requests.apply_report(
+            person,
+            [],
+            fetched=FetchedState(url, number, "MERGED", False),
+            requested_at=merged_at if merged_at is not None else NOW,
+        )
+    _merge_ticket(tickets, project, other, pr_url="https://github.com/example/repo/pull/9")
+    _merge_ticket(tickets, project, other)
+    old = _merge_ticket(tickets, project, other)
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            update(SqlProjectTicketEvent)
+            .where(
+                SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                SqlProjectTicketEvent.ticket_id == old,
+            )
+            .values(created_at=NOW - 40 * DAY)
+        )
+    return person, other
+
+
+def test_stored_rows_match_a_fresh_computation_in_every_window(setup) -> None:
+    project, _tickets, _conversations, state, _db_uri = setup
+    _seed(setup)
+    source = build_source(state)
+    computed = source.compute_items(project)
+    for window in ("7d", "30d", "all"):
+        period = status_period(window, NOW + 60)
+        assert source.prs_merged(project, period) == totals(computed, period), window
+    assert sorted(source.merged_items(project), key=lambda item: item.key) == sorted(
+        computed, key=lambda item: item.key
+    )
+    since = NOW - 7 * DAY
+    assert {item.key for item in source.merged_items(project, since)} == {
+        item.key for item in computed if item.merged_at is None or item.merged_at >= since
+    }
+
+
+def test_a_merge_after_a_read_shows_on_the_next_read(setup) -> None:
+    project, tickets, _conversations, state, _db_uri = setup
+    _person, other = _seed(setup)
+    source = build_source(state)
+    period = status_period("all", NOW + 60)
+    before = source.prs_merged(project, period).total
+    _merge_ticket(tickets, project, other)
+    assert source.prs_merged(project, period).total == before + 1
+
+
+def test_only_pr_and_ticket_invalidations_leave_rows_stale(setup) -> None:
+    project, _tickets, _conversations, state, _db_uri = setup
+    source = build_source(state)
+    source.prs_merged(project, status_period("all", NOW))
+    workspace = current_workspace_id()
+    project_status_cache.invalidate(project.id, ("spend",))
+    assert not project_status_prs._is_stale(workspace, project.id)
+    source.refresh(project)
+    assert not project_status_prs._is_stale(workspace, project.id)
+    project_status_cache.invalidate(project.id, ("tickets",))
+    assert project_status_prs._is_stale(workspace, project.id)
+    source.prs_merged(project, status_period("all", NOW))
+    assert not project_status_prs._is_stale(workspace, project.id)
+
+
+def test_the_background_refresher_recomputes_a_stale_project(setup, monkeypatch) -> None:
+    project, tickets, _conversations, state, db_uri = setup
+    monkeypatch.setattr(project_status_prs, "_REFRESH_COALESCE_S", 0.05)
+    source = build_source(state)
+    period = status_period("all", NOW + 60)
+    assert source.prs_merged(project, period).total == 0
+    other = uuid4().hex
+    _merge_ticket(tickets, project, other)
+    # Poll the table itself: the stale flag clears when a refresh starts, before it commits.
+    deadline = time.monotonic() + 10
+    while True:
+        with get_or_create_engine(db_uri).connect() as connection:
+            rows = connection.execute(
+                sa.text("SELECT COUNT(*) FROM project_merged_prs WHERE project_id = :id"),
+                {"id": bytes.fromhex(project.id.replace("-", ""))},
+            ).scalar_one()
+        if rows == 1:
+            break
+        assert time.monotonic() < deadline, "the refresher never ran"
+        time.sleep(0.05)
+
+
+def test_overlong_pr_keys_are_stored_hashed() -> None:
+    long_key = "https://git.example.com/" + "a" * 600
+    stored = project_status_prs._row_key(long_key)
+    assert stored.startswith("sha256:") and len(stored) <= 512
+    assert project_status_prs._row_key(PR) == PR

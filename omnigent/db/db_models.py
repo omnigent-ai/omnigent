@@ -1171,6 +1171,41 @@ class SqlProjectTicketRead(OmnigentBase):
     seen_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class SqlProjectMergedPr(OmnigentBase):
+    """One counted merge in a project's "PRs merged": a PR, or a PR-less Merged ticket.
+
+    Derived rows, recomputed per project from session PR panels and Merged-stage
+    tickets (``omnigent.server.project_status_prs``); safe to drop and rebuild.
+    """
+
+    __tablename__ = "project_merged_prs"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Canonical PR URL, or ``ticket:<id>``; longer keys are stored as ``sha256:<hex>``.
+    pr_key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    # NULL for a PR stored as merged before merge times were recorded.
+    merged_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    member_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Space-separated ids of the tickets and sessions that claim the merge.
+    claimed_by: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index("ix_project_merged_prs_merged_at", "workspace_id", "project_id", "merged_at"),
+    )
+
+
+class SqlProjectMergedPrRefresh(OmnigentBase):
+    """When a project's ``project_merged_prs`` rows were last computed; absent means never."""
+
+    __tablename__ = "project_merged_pr_refreshes"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    refreshed_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class SqlProjectKpiRevision(OmnigentBase):
     """One append-only revision of a project's KPI set; the highest revision is current."""
 

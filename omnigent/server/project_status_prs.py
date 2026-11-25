@@ -17,6 +17,14 @@ the strongest relationship (worked on, attached, inferred), earliest seen first.
 A ticket's PR that no session panel lists goes to the ticket's earliest-linked
 session that isn't the Lead. Anything else counts in the total but no member.
 
+**Storage:** the deduplicated, attributed items are kept per project in
+``project_merged_prs`` so a window's count is one indexed query. A project's rows
+are recomputed with the rules above: on its first read, after any write that
+clears its ``"prs"`` or ``"tickets"`` status inputs (in the background, coalesced
+per project; a read of a project with such a write pending recomputes first), and
+in the background once they are older than :data:`_STALE_AFTER_S`, which also
+catches writes on another server process.
+
 **Limits:** PRs merged outside Omnigent, or never linked to a project session or
 ticket, aren't counted. PRs stored as merged before merge times were recorded
 have no merge time and count only in the ``"all"`` window. A PR attached to a
@@ -26,22 +34,33 @@ only when its own metadata names the project.
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import logging
 import re
+import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, delete, func, or_, select
 
 from omnigent.db.db_models import (
     SqlConversationMetadata,
+    SqlProjectMergedPr,
+    SqlProjectMergedPrRefresh,
     SqlProjectTicket,
     SqlProjectTicketEvent,
     SqlProjectTicketSession,
     current_workspace_id,
+    workspace_scope,
 )
-from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
+from omnigent.db.utils import (
+    get_or_create_engine,
+    make_named_managed_session_maker,
+    run_write_transaction,
+)
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.project_status import (
     LEAD_MEMBER_KEY,
@@ -50,6 +69,10 @@ from omnigent.server.project_status import (
     MemberTotals,
     StatusPeriod,
     member_key_for_session,
+)
+from omnigent.server.project_status_cache import (
+    add_invalidation_listener,
+    invalidate_after_commit,
 )
 from omnigent.server.session_pull_requests import open_store
 from omnigent.stores.project_ticket_store import EVENT_CODES
@@ -68,6 +91,11 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 MERGED_STAGE = "merged"
+# Rows older than this are recomputed in the background on the next read.
+_STALE_AFTER_S = 900
+# A burst of writes to one project waits this long so it costs one recompute.
+_REFRESH_COALESCE_S = 2.0
+_PR_KEY_MAX_CHARS = 512
 _PR_PATH = re.compile(
     r"^/(?P<repo>[^/]+/[^/]+(?:/[^/]+)*?)/(?:pull|pulls|merge_requests|-/merge_requests)/(?P<number>\d+)"
 )
@@ -206,6 +234,7 @@ class ProjectPrsMergedSource:
         conversations: ConversationStore,
         pull_requests: SessionPullRequestStore,
         permissions: PermissionStore | None,
+        projects: Any = None,
     ) -> None:
         self._tickets = tickets
         self._conversations = conversations
@@ -214,29 +243,143 @@ class ProjectPrsMergedSource:
         self._ticket_db = make_named_managed_session_maker(
             get_or_create_engine(ticket_location), query_name_prefix="omnigent.project_status_prs"
         )
+        self._ticket_write_db = make_named_managed_session_maker(
+            get_or_create_engine(ticket_location),
+            query_name_prefix="omnigent.project_status_prs",
+            immediate=True,
+        )
         self._session_db = make_named_managed_session_maker(
             get_or_create_engine(pull_requests.storage_location),
             query_name_prefix="omnigent.project_status_prs",
         )
+        self.projects = projects
 
     def prs_merged(self, project: Project, period: StatusPeriod) -> MemberTotals:
-        return totals(self.merged_items(project, period.since_epoch), period)
+        """The window's merges per member, counted from the project's stored rows."""
+        self._ensure_fresh(project)
+        in_window = SqlProjectMergedPr.merged_at <= period.until_epoch
+        if period.since_epoch is not None:
+            in_window = and_(in_window, SqlProjectMergedPr.merged_at >= period.since_epoch)
+        else:
+            in_window = or_(in_window, SqlProjectMergedPr.merged_at.is_(None))
+        with self._ticket_db("count_project_merged_prs") as session:
+            rows = session.execute(
+                select(SqlProjectMergedPr.member_key, func.count())
+                .where(
+                    SqlProjectMergedPr.workspace_id == current_workspace_id(),
+                    SqlProjectMergedPr.project_id == _hex(project.id),
+                    in_window,
+                )
+                .group_by(SqlProjectMergedPr.member_key)
+            ).all()
+        return MemberTotals(
+            total=sum(count for _member, count in rows),
+            by_member={member: count for member, count in rows if member is not None},
+        )
 
     def merged_items(self, project: Project, since_epoch: int | None = None) -> list[MergedItem]:
         """Every counted merge with its date and member, for per-day series.
 
-        :param since_epoch: Skip Merged-stage tickets not moved since then; they can't
-            count in a range starting there. ``None`` reads every ticket.
+        :param since_epoch: Leave out merges dated before then; undated ones are kept.
         """
-        session_prs = self._session_prs(project)
-        if any(pr.merged_at is None for pr in session_prs):
-            # An undated session PR takes its date from its ticket's move, however old.
-            since_epoch = None
+        self._ensure_fresh(project)
+        dated = (
+            True
+            if since_epoch is None
+            else or_(
+                SqlProjectMergedPr.merged_at.is_(None),
+                SqlProjectMergedPr.merged_at >= since_epoch,
+            )
+        )
+        with self._ticket_db("list_project_merged_prs") as session:
+            rows = session.execute(
+                select(
+                    SqlProjectMergedPr.pr_key,
+                    SqlProjectMergedPr.merged_at,
+                    SqlProjectMergedPr.member_key,
+                    SqlProjectMergedPr.claimed_by,
+                ).where(
+                    SqlProjectMergedPr.workspace_id == current_workspace_id(),
+                    SqlProjectMergedPr.project_id == _hex(project.id),
+                    dated,
+                )
+            ).all()
+        return [
+            MergedItem(key, merged_at, member, tuple(claimed_by.split()))
+            for key, merged_at, member, claimed_by in rows
+        ]
+
+    def compute_items(self, project: Project) -> list[MergedItem]:
+        """Every counted merge, computed from the session panels and Merged-stage tickets."""
         return combine(
-            session_prs,
-            self._merged_tickets(project, since_epoch),
+            self._session_prs(project),
+            self._merged_tickets(project),
             self._member_resolver(project),
         )
+
+    def refresh(self, project: Project) -> None:
+        """Recompute *project*'s stored rows; a write during it leaves the project stale."""
+        workspace_id = current_workspace_id()
+        project_hex = _hex(project.id)
+        with _refresh_lock(workspace_id, project.id):
+            started = int(time.time())
+            _clear_stale(workspace_id, project.id)
+            items = self.compute_items(project)
+
+            def write(session: Any) -> None:
+                session.execute(
+                    delete(SqlProjectMergedPr).where(
+                        SqlProjectMergedPr.workspace_id == workspace_id,
+                        SqlProjectMergedPr.project_id == project_hex,
+                    )
+                )
+                rows: dict[str, MergedItem] = {}
+                for item in items:
+                    rows.setdefault(_row_key(item.key), item)
+                session.add_all(
+                    SqlProjectMergedPr(
+                        workspace_id=workspace_id,
+                        project_id=project_hex,
+                        pr_key=key,
+                        merged_at=None if item.merged_at is None else int(item.merged_at),
+                        member_key=item.member,
+                        claimed_by=" ".join(item.claimed_by),
+                        updated_at=started,
+                    )
+                    for key, item in rows.items()
+                )
+                marker = session.get(SqlProjectMergedPrRefresh, (workspace_id, project_hex))
+                if marker is None:
+                    session.add(
+                        SqlProjectMergedPrRefresh(
+                            workspace_id=workspace_id, project_id=project_hex, refreshed_at=started
+                        )
+                    )
+                else:
+                    marker.refreshed_at = started
+                # Cached Summary numbers were read from the rows just replaced.
+                invalidate_after_commit(session, project.id, ("prs",))
+
+            token = _refreshing.set(True)
+            try:
+                run_write_transaction(self._ticket_write_db, "refresh_project_merged_prs", write)
+            finally:
+                _refreshing.reset(token)
+
+    def _ensure_fresh(self, project: Project) -> None:
+        workspace_id = current_workspace_id()
+        _remember(self, workspace_id, project)
+        with self._ticket_db("read_project_merged_pr_refresh") as session:
+            refreshed_at = session.scalar(
+                select(SqlProjectMergedPrRefresh.refreshed_at).where(
+                    SqlProjectMergedPrRefresh.workspace_id == workspace_id,
+                    SqlProjectMergedPrRefresh.project_id == _hex(project.id),
+                )
+            )
+        if refreshed_at is None or _is_stale(workspace_id, project.id):
+            self.refresh(project)
+        elif time.time() - refreshed_at > _STALE_AFTER_S:
+            mark_stale(project.id, workspace_id=workspace_id)
 
     def _session_prs(self, project: Project) -> list[SessionMergedPr]:
         with self._session_db("list_project_session_ids_for_status") as session:
@@ -259,9 +402,7 @@ class ProjectPrsMergedSource:
                     )
         return merged
 
-    def _merged_tickets(
-        self, project: Project, since_epoch: int | None = None
-    ) -> list[MergedTicket]:
+    def _merged_tickets(self, project: Project) -> list[MergedTicket]:
         stages = self._tickets.stages(project.id, user_id=project.user_id)["stages"]
         completed = next((stage for stage in reversed(stages) if stage.get("is_complete")), None)
         if completed is None:
@@ -281,22 +422,6 @@ class ProjectPrsMergedSource:
                     )
                 ).all()
             )
-            if ticket_ids and since_epoch is not None:
-                # A ticket's latest move into the stage is an update; none since means
-                # it was moved there before the range.
-                ticket_ids = list(
-                    session.scalars(
-                        select(SqlProjectTicketEvent.ticket_id)
-                        .where(
-                            SqlProjectTicketEvent.workspace_id == current_workspace_id(),
-                            SqlProjectTicketEvent.project_id == project_hex,
-                            SqlProjectTicketEvent.ticket_id.in_(ticket_ids),
-                            SqlProjectTicketEvent.kind == EVENT_CODES["updated"],
-                            SqlProjectTicketEvent.created_at >= since_epoch,
-                        )
-                        .distinct()
-                    ).all()
-                )
             if not ticket_ids:
                 return []
             events = session.scalars(
@@ -392,10 +517,113 @@ def build_source(app_state: Any) -> ProjectPrsMergedSource | _Unavailable:
     if tickets is None or conversations is None or pull_requests is None or not location:
         _logger.info("PRs-merged status source is unavailable: no SQL ticket or session store")
         return _Unavailable()
-    return ProjectPrsMergedSource(
+    source = ProjectPrsMergedSource(
         tickets,
         location,
         conversations,
         pull_requests,
         getattr(app_state, "permission_store", None),
+        projects,
     )
+    add_invalidation_listener(_on_status_invalidated)
+    return source
+
+
+# ---- Keeping stored rows current -------------------------------------------
+# (workspace, project) -> when a write first left its rows stale.
+_stale: dict[tuple[int, str], float] = {}
+# (workspace, project) -> the source and owner last used to read it, for background refreshes.
+_known: dict[tuple[int, str], tuple[ProjectPrsMergedSource, str | None]] = {}
+_state_lock = threading.Lock()
+_wake = threading.Event()
+_refresh_locks: dict[tuple[int, str], threading.Lock] = {}
+_refresher: threading.Thread | None = None
+# Set while a refresh commits, so its own cache invalidation doesn't mark it stale again.
+_refreshing: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "project_merged_prs_refreshing", default=False
+)
+
+
+def _row_key(key: str) -> str:
+    if len(key) <= _PR_KEY_MAX_CHARS:
+        return key
+    return "sha256:" + hashlib.sha256(key.encode()).hexdigest()
+
+
+def _refresh_lock(workspace_id: int, project_id: str) -> threading.Lock:
+    with _state_lock:
+        return _refresh_locks.setdefault((workspace_id, str(project_id)), threading.Lock())
+
+
+def _is_stale(workspace_id: int, project_id: str) -> bool:
+    with _state_lock:
+        return (workspace_id, str(project_id)) in _stale
+
+
+def _clear_stale(workspace_id: int, project_id: str) -> None:
+    with _state_lock:
+        _stale.pop((workspace_id, str(project_id)), None)
+
+
+def _remember(source: ProjectPrsMergedSource, workspace_id: int, project: Project) -> None:
+    with _state_lock:
+        _known[(workspace_id, str(project.id))] = (source, project.user_id)
+
+
+def mark_stale(project_id: str, *, workspace_id: int | None = None) -> None:
+    """Have *project_id*'s rows recomputed: in the background, or by its next read."""
+    key = (current_workspace_id() if workspace_id is None else workspace_id, str(project_id))
+    with _state_lock:
+        _stale.setdefault(key, time.monotonic())
+        known = key in _known
+    if known:
+        _ensure_refresher()
+        _wake.set()
+
+
+def _on_status_invalidated(project_id: str, inputs: tuple[str, ...]) -> None:
+    if _refreshing.get() or not ({"prs", "tickets"} & set(inputs)):
+        return
+    mark_stale(project_id)
+
+
+def _ensure_refresher() -> None:
+    global _refresher
+    with _state_lock:
+        if _refresher is not None and _refresher.is_alive():
+            return
+        _refresher = threading.Thread(
+            target=_refresh_loop, name="project-merged-prs-refresher", daemon=True
+        )
+        _refresher.start()
+
+
+def _refresh_loop() -> None:
+    while True:
+        _wake.wait(timeout=_REFRESH_COALESCE_S * 5)
+        _wake.clear()
+        time.sleep(_REFRESH_COALESCE_S)
+        with _state_lock:
+            due = [
+                (key, _known[key])
+                for key, since in _stale.items()
+                if key in _known and time.monotonic() - since >= _REFRESH_COALESCE_S
+            ]
+            if any(key not in dict(due) for key in _stale if key in _known):
+                _wake.set()
+        for (workspace_id, project_id), (source, user_id) in due:
+            try:
+                with workspace_scope(workspace_id):
+                    project = (
+                        source.projects.get(project_id, user_id=user_id)
+                        if source.projects is not None
+                        else None
+                    )
+                    if project is None:
+                        _clear_stale(workspace_id, project_id)
+                        continue
+                    source.refresh(project)
+            except Exception:
+                _logger.warning(
+                    "Couldn't refresh merged PRs for project %s", project_id, exc_info=True
+                )

@@ -42,6 +42,25 @@ _PENDING_KEY = "project_status_cache_pending"
 
 _Key = tuple[int, str, StatusInput, Hashable]
 
+#: Called as ``listener(project_id, inputs)`` after each invalidation, e.g. to
+#: refresh derived rows. Runs in the invalidating thread, outside the cache lock.
+InvalidationListener = Callable[[str, tuple[StatusInput, ...]], None]
+_listeners: list[InvalidationListener] = []
+_listeners_lock = threading.Lock()
+
+
+def add_invalidation_listener(callback: InvalidationListener) -> None:
+    """Have *callback* hear every project invalidation; adding it twice is a no-op."""
+    with _listeners_lock:
+        if callback not in _listeners:
+            _listeners.append(callback)
+
+
+def remove_invalidation_listener(callback: InvalidationListener) -> None:
+    with _listeners_lock:
+        if callback in _listeners:
+            _listeners.remove(callback)
+
 
 class ProjectStatusCache:
     """An LRU of computed inputs with single-flight misses and per-project generations."""
@@ -114,6 +133,13 @@ class ProjectStatusCache:
                 if key[0] == workspace_id and key[1] == project_id and key[2] in inputs
             ]:
                 del self._entries[key]
+        with _listeners_lock:
+            listeners = list(_listeners)
+        for listener in listeners:
+            try:
+                listener(project_id, inputs)
+            except Exception:
+                logger.warning("A status cache listener failed for %s", project_id, exc_info=True)
 
     def clear(self) -> None:
         with self._lock:

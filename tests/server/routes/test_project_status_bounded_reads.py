@@ -118,20 +118,3 @@ async def test_bounded_reads_match_unbounded_for_every_metric_and_range(
             assert drilldown(bounded[metric], period, range_id) == drilldown(
                 unbounded[metric], period, range_id
             ), (range_id, metric)
-
-
-def test_an_undated_session_pr_reads_every_merged_ticket() -> None:
-    """Its date comes from a ticket's move, however old, so that read isn't bounded."""
-    source = object.__new__(project_status_prs.ProjectPrsMergedSource)
-    seen: list[int | None] = []
-    url = "https://git.example.com/o/r/pull/1"
-    source._session_prs = lambda project: [  # type: ignore[method-assign]
-        project_status_prs.SessionMergedPr("s", url, "created", 1.0, None)
-    ]
-    source._merged_tickets = lambda project, since: seen.append(since) or []  # type: ignore[method-assign]
-    source._member_resolver = lambda project: lambda session_id: None  # type: ignore[method-assign]
-    source.merged_items(object(), 1000)
-    assert seen == [None]
-    source._session_prs = lambda project: []  # type: ignore[method-assign]
-    source.merged_items(object(), 1000)
-    assert seen == [None, 1000]
