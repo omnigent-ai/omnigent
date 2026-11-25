@@ -396,6 +396,27 @@ def test_submit_pending_sends_the_pending_review(fake: FakeGitHub) -> None:
     assert sent["input"]["pullRequestReviewId"] == "R_1"
 
 
+@pytest.mark.parametrize("state", ["PENDING", "APPROVED", None])
+def test_a_pending_review_submitted_in_another_state_is_an_unknown_outcome(
+    fake: FakeGitHub, state: str | None
+) -> None:
+    """GitHub hasn't confirmed the review went out with the verdict the page asked for."""
+    fake.pending = [{"id": "R_1", "viewerDidAuthor": True, "commit": {"oid": HEAD}}]
+    review = {"id": "R_1", "state": state, "body": "Done", "commit": {"oid": HEAD}}
+    answer = {"data": {"submitPullRequestReview": {"pullRequestReview": review}}}
+    fake.graphql_failure = (0, json.dumps(answer), "")
+    with pytest.raises(UnknownOutcomeError):
+        pr_actions.submit_pending_review(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="COMMENT",
+            body="Done",
+            commit_oid=HEAD,
+            pending_review_id="R_1",
+        )
+
+
 def test_submit_pending_without_a_pending_review_is_refused(fake: FakeGitHub) -> None:
     with pytest.raises(PullRequestError, match="no pending review"):
         pr_actions.submit_pending_review(
@@ -832,6 +853,20 @@ def test_resolving_a_thread_names_the_thread(fake: FakeGitHub) -> None:
     )
     assert result["resolved"] is True
     assert fake.mutations("resolveReviewThread") == [{"input": {"threadId": "T_1"}}]
+
+
+@pytest.mark.parametrize(
+    "thread",
+    [None, {"id": "T_other", "isResolved": True}, {"id": "T_1", "isResolved": False}],
+    ids=["no-thread", "another-thread", "still-open"],
+)
+def test_a_resolve_github_did_not_confirm_is_an_unknown_outcome(
+    fake: FakeGitHub, thread: dict[str, Any] | None
+) -> None:
+    answer = {"data": {"resolveReviewThread": {"thread": thread}}}
+    fake.graphql_failure = (0, json.dumps(answer), "")
+    with pytest.raises(UnknownOutcomeError):
+        _resolve()
 
 
 def test_a_non_github_pull_request_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
