@@ -127,6 +127,9 @@ it("hides a find match on Diagram until find moves to another match", async () =
     fireEvent.click(screen.getByRole("button", { name: "Diagram" }));
   });
   expect(mermaidSource()).not.toBeVisible();
+  // Re-running find on the same match keeps it dismissed.
+  await rebuildSearch(instance);
+  expect(mermaidSource()).not.toBeVisible();
 
   searchState.current = { query: "alpha", currentIndex: 0 };
   await rebuildSearch(instance);

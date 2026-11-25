@@ -10,7 +10,7 @@
  * this stays a fast unit test of our own branching.
  */
 
-import { render, screen, fireEvent } from "@testing-library/react";
+import { act, render, screen, fireEvent } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReactNodeViewProps } from "@tiptap/react";
 import { DecorationSet } from "@tiptap/pm/view";
@@ -30,6 +30,16 @@ vi.mock("./MermaidPreview", () => ({
 }));
 
 afterEach(() => vi.clearAllMocks());
+
+function viewProps(textContent: string, selectionInside = false) {
+  return {
+    node: { attrs: { language: "mermaid" }, textContent },
+    getPos: () => 0,
+    editor: { isEditable: true, view: { state: {}, dispatch: vi.fn() } },
+    innerDecorations: DecorationSet.empty,
+    selectionInside,
+  } as unknown as ReactNodeViewProps;
+}
 
 function renderView(
   overrides: {
@@ -112,6 +122,22 @@ describe("TipTapCodeBlockView", () => {
     renderView({ language: "mermaid", textContent: "" });
     expect(screen.getByTestId("node-content")).toBeVisible();
     expect(screen.queryByRole("group", { name: "Mermaid view" })).toBeNull();
+  });
+
+  it("keeps new source visible until its diagram is ready to draw", () => {
+    vi.useFakeTimers();
+    try {
+      // Text arriving without the caret (undo, a remote edit) must not hide the
+      // source during the preview's debounce.
+      const { rerender } = render(<TipTapCodeBlockView {...viewProps("")} />);
+      rerender(<TipTapCodeBlockView {...viewProps("graph TD")} />);
+      expect(screen.getByTestId("node-content")).toBeVisible();
+      act(() => vi.advanceTimersByTime(300));
+      expect(screen.getByTestId("node-content")).not.toBeVisible();
+      expect(screen.getByTestId("mermaid-preview").textContent).toBe("graph TD");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows the source while the caret is inside the block", () => {

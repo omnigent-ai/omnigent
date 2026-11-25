@@ -39,7 +39,9 @@ export function TipTapCodeBlockView({
   }, [source]);
 
   const [mermaidView, setMermaidView] = useState<MermaidView>("diagram");
-  const canShowDiagram = isMermaid && source.trim() !== "";
+  // Wait for the debounced preview, or text that arrives without the caret (undo,
+  // a remote edit) would hide the source before its diagram draws.
+  const canShowDiagram = isMermaid && source.trim() !== "" && previewSource.trim() !== "";
   // Choosing Diagram hides the current find match or active comment until it moves.
   const revealKey = revealDecorationKey(innerDecorations);
   const [dismissedRevealKey, setDismissedRevealKey] = useState("");
@@ -179,7 +181,7 @@ export function TipTapCodeBlockView({
       <pre hidden={!showSource}>
         <NodeViewContent<"code"> as="code" />
       </pre>
-      {canShowDiagram && previewSource.trim() && (
+      {canShowDiagram && (
         // The diagram stays under the source as a live preview while editing.
         <div contentEditable={false} className="tiptap-mermaid-preview">
           <MermaidPreview source={previewSource} />
