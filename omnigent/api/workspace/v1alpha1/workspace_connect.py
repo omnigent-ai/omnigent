@@ -121,7 +121,8 @@ class WorkspaceService(Protocol):
 
     async def get_pull_request(self, request: GetPullRequestRequest, ctx: RequestContext[GetPullRequestRequest, GetPullRequestResponse], /) -> GetPullRequestResponse:
         """
-        The pull request's overview, checks, reviews, labels and merge state.
+        The pull request's overview, checks, reviews, labels and merge state. Only
+        the session's owner may call it, since it lists the host account's identities.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -781,7 +782,8 @@ class WorkspaceServiceClient(ConnectClient):
         use_get: bool = False,
     ) -> GetPullRequestResponse:
         """
-        The pull request's overview, checks, reviews, labels and merge state.
+        The pull request's overview, checks, reviews, labels and merge state. Only
+        the session's owner may call it, since it lists the host account's identities.
         """
         return await self.execute_unary(
             request=request,
@@ -1057,7 +1059,8 @@ class WorkspaceServiceSync(Protocol):
 
     def get_pull_request(self, request: GetPullRequestRequest, ctx: RequestContext[GetPullRequestRequest, GetPullRequestResponse], /) -> GetPullRequestResponse:
         """
-        The pull request's overview, checks, reviews, labels and merge state.
+        The pull request's overview, checks, reviews, labels and merge state. Only
+        the session's owner may call it, since it lists the host account's identities.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -1715,7 +1718,8 @@ class WorkspaceServiceClientSync(ConnectClientSync):
         use_get: bool = False,
     ) -> GetPullRequestResponse:
         """
-        The pull request's overview, checks, reviews, labels and merge state.
+        The pull request's overview, checks, reviews, labels and merge state. Only
+        the session's owner may call it, since it lists the host account's identities.
         """
         return self.execute_unary(
             request=request,

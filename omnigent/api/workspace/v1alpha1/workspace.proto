@@ -89,10 +89,13 @@ service WorkspaceService {
   // through the host's `gh`. Each answers with the payload the REST route under
   // /v1/sessions/{id}/resources/github returns, so a client reads both alike.
   // Only the server's route serves them, for a pull request the session links;
-  // another one answers FAILED_PRECONDITION. With `pr_url` empty, they read the
-  // session's first pull request, or the workspace branch's.
+  // another one answers FAILED_PRECONDITION. GetPullRequest, ListPullRequestFiles
+  // and GetPullRequestDiff read the session's first pull request, or the
+  // workspace branch's, when `pr_url` is empty; the others need it set, as their
+  // REST routes do.
 
-  // The pull request's overview, checks, reviews, labels and merge state.
+  // The pull request's overview, checks, reviews, labels and merge state. Only
+  // the session's owner may call it, since it lists the host account's identities.
   rpc GetPullRequest(GetPullRequestRequest) returns (GetPullRequestResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }

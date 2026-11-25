@@ -2440,7 +2440,8 @@ export declare const WorkspaceService: GenService<{
     output: typeof ResolveRepositoryContextResponseSchema;
   },
   /**
-   * The pull request's overview, checks, reviews, labels and merge state.
+   * The pull request's overview, checks, reviews, labels and merge state. Only
+   * the session's owner may call it, since it lists the host account's identities.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetPullRequest
    */
