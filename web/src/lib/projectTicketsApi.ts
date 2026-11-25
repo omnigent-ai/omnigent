@@ -98,6 +98,14 @@ export interface ProjectTicket {
   needs_final_update?: boolean;
   /** Sign-off labels the open ask waits on that the viewer may add; single-ticket reads. */
   sign_offs?: TicketLabel[];
+  /** Who the open needs-human ask waits on, routed as in the Inbox; null once answered. */
+  waiting_on?: TicketWaitingOn | null;
+}
+export interface TicketWaitingOn {
+  reason: string;
+  responders: string[];
+  /** The person who raised the ask, when a person did; it isn't waiting on them. */
+  raised_by_user_id: string | null;
 }
 export interface TicketFinalUpdate {
   event_id: string;

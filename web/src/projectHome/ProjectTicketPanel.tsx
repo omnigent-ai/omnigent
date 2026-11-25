@@ -574,7 +574,9 @@ function TicketDetails({
                 </Button>
               )}
               <TicketCostBadge projectId={projectId} ticketId={ticketId} />
-              {ticket.labels.length > 0 && <TicketLabels labels={ticket.labels} />}
+              {ticket.labels.length > 0 && (
+                <TicketLabels labels={ticket.labels} waitingOn={ticket.waiting_on} />
+              )}
               <LabelEditor
                 labels={ticket.labels}
                 disabled={update.isPending}

@@ -3,18 +3,27 @@ import { BadgeCheckIcon, CircleCheckIcon, UserRoundIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
-import type { TicketLabel } from "@/lib/projectTicketsApi";
+import { getCurrentUserId } from "@/lib/identity";
+import type { TicketLabel, TicketWaitingOn } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
+
+import { needsWhom, type NeedsWhom } from "./ticketWaitingOn";
 
 export { TicketStageIcon } from "./TicketStageAppearance";
 
 export function TicketLabels({
-  labels,
+  labels: allLabels,
   compact = false,
+  waitingOn,
 }: {
   labels: TicketLabel[];
   compact?: boolean;
+  /** Who the ask waits on; null hides an answered ask's tag, undefined keeps the generic one. */
+  waitingOn?: TicketWaitingOn | null;
 }) {
+  const whom = needsWhom(waitingOn, getCurrentUserId());
+  const labels =
+    whom === null ? allLabels.filter((label) => label.key !== "needs-human") : allLabels;
   const leading = (key: string) => key === "needs-human" || key === ASSIGNEE_LABEL_KEY;
   const hasVerified = labels.some(
     (label) => label.key === VERIFIED_LABEL_KEY && isGateLabel(label),
@@ -38,7 +47,7 @@ export function TicketLabels({
     <div className={cn("flex min-w-0 gap-1.5", compact ? "items-center" : "flex-wrap")}>
       {visible.map((label) =>
         label.key === "needs-human" ? (
-          <NeedsResponseBadge key={label.key} title={label.value || undefined} />
+          <NeedsWhomBadge key={label.key} whom={whom} question={label.value || undefined} />
         ) : label.key === ASSIGNEE_LABEL_KEY && label.value ? (
           <AssigneeBadge key={label.key} name={label.value} />
         ) : isGateLabel(label) ? (
@@ -183,4 +192,29 @@ export function TicketError({ error }: { error: Error | null }) {
       {error.message}
     </p>
   ) : null;
+}
+
+/** "Needs you" in the strong accent, someone else's ask in quiet grey. */
+function NeedsWhomBadge({ whom, question }: { whom: NeedsWhom; question?: string }) {
+  if (whom?.kind === "you")
+    return (
+      <NeedsResponseBadge
+        title={question}
+        data-testid="needs-you"
+        className="bg-brand-accent text-white dark:text-white"
+      >
+        Needs you
+      </NeedsResponseBadge>
+    );
+  if (whom?.kind === "other")
+    return (
+      <Badge
+        title={question ? `${whom.title}: ${question}` : whom.title}
+        data-testid="needs-other"
+        className="border-transparent bg-muted font-normal text-muted-foreground"
+      >
+        {whom.label}
+      </Badge>
+    );
+  return <NeedsResponseBadge title={question} />;
 }

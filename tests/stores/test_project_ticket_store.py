@@ -1228,3 +1228,18 @@ def test_label_changes_are_validated():
     with pytest.raises(ValueError, match="at most 20"):
         UpdateTicket(add_labels=[{"key": "one-more"}]).labels_after(full)
     assert UpdateTicket(title="t").labels_after(full) is None
+
+
+def test_a_ticket_says_who_its_open_ask_waits_on_until_it_is_answered(board):
+    tickets, _, project = board
+    worker = TicketActor("alice", uuid4().hex, uuid4().hex)
+    ticket = tickets.create(project.id, CreateTicket(title="Decide"), worker)
+    assert tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"] is None
+    tickets.update(project.id, ticket["id"], UpdateTicket(labels=[{"key": "needs-human"}]), worker)
+    waiting = {"reason": "owner", "responders": ["alice"], "raised_by_user_id": None}
+    assert tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"] == waiting
+    assert tickets.list(project.id, user_id="alice")["data"][0]["waiting_on"] == waiting
+
+    tickets.comment(project.id, ticket["id"], CommentOnTicket(text="B"), TicketActor("alice"))
+
+    assert tickets.list(project.id, user_id="alice")["data"][0]["waiting_on"] is None

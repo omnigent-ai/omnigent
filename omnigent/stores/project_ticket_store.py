@@ -717,7 +717,7 @@ class ProjectTicketStore:
                 "created",
                 {**body.model_dump(exclude_none=True), "stage": _stage_snapshot(stage)},
             )
-            return _ticket(row)
+            return {**_ticket(row), "waiting_on": self._waiting_on(session, project, row)}
 
         return run_write_transaction(self._write, "create_ticket", write)
 
@@ -729,6 +729,7 @@ class ProjectTicketStore:
             final_update = self._final_update(session, row) if complete else None
             return {
                 **_ticket(row),
+                "waiting_on": self._waiting_on(session, project, row),
                 "final_update": final_update,
                 "needs_final_update": complete and final_update is None,
             }
@@ -788,7 +789,10 @@ class ProjectTicketStore:
             )
             page: dict[str, Any] = {
                 **configuration.model_dump(),
-                "data": [_ticket(row) for row in rows[:limit]],
+                "data": [
+                    {**_ticket(row), "waiting_on": self._waiting_on(session, project, row)}
+                    for row in rows[:limit]
+                ],
                 "has_more": len(rows) > limit,
                 "last_id": rows[min(limit, len(rows)) - 1].id if rows else None,
             }
@@ -926,16 +930,6 @@ class ProjectTicketStore:
         label is removed or any of its routed people acts on the ticket (a comment
         or an edit), which clears it for all of them.
         """
-        from omnigent.server.product_approval import (
-            FEATURE_KIND,
-            RISK_OK_LABEL,
-            human_request_routing,
-            owner_sign_off_pending,
-            pending_sign_offs,
-            product_approvers,
-            ticket_kind,
-        )
-
         with self._session("list_viewer_human_requests") as session:
             projects = session.scalars(
                 select(SqlProject).where(
@@ -964,28 +958,8 @@ class ProjectTicketStore:
                 for ticket in rows[:TICKET_SUMMARY_SCAN_MAX]:
                     if not _has_needs_human(ticket.labels):
                         continue
-                    reason, responders = human_request_routing(
-                        routing_project, ticket.labels, ticket.requested_by
-                    )
-                    if user_id not in responders:
-                        continue
-                    # Only the owner can clear an ask still waiting on their own sign-off;
-                    # otherwise an approver adding product-ok answers a feature's ask.
-                    owner_pending = owner_sign_off_pending(ticket.labels, ticket.requested_by)
-                    answerers = {project.user_id} if owner_pending else responders
-                    # An approver's product-ok answers the ask only when no risk-ok is also owed.
-                    risk_owed = RISK_OK_LABEL in pending_sign_offs(
-                        routing_project, ticket.labels, ticket.requested_by
-                    )
-                    product_ok_from = (
-                        product_approvers(routing_project)
-                        if not owner_pending
-                        and not risk_owed
-                        and ticket_kind(ticket.labels) == FEATURE_KIND
-                        else set()
-                    )
-                    request = self._open_human_request(
-                        session, ticket, answerers, user_id, product_ok_from=product_ok_from
+                    reason, responders, request = self._routed_ask(
+                        session, routing_project, ticket, user_id, only_for_viewer=True
                     )
                     if request is None:
                         continue
@@ -1084,6 +1058,72 @@ class ProjectTicketStore:
                         "question": (row.payload.get("text") or "")[:500],
                     }
         return builtins.list(entries.values())
+
+    def _routed_ask(
+        self,
+        session: Session,
+        routing_project: Any,
+        ticket: SqlProjectTicket,
+        viewer: str | None,
+        *,
+        only_for_viewer: bool = False,
+    ) -> tuple[str, set[str | None], dict[str, Any] | None]:
+        """A ``needs-human`` ticket's routing reason, responders and open ask, or ``None``
+        for the ask once it was answered (or, with *only_for_viewer*, when it isn't the viewer's).
+        """
+        from omnigent.server.product_approval import (
+            FEATURE_KIND,
+            RISK_OK_LABEL,
+            human_request_routing,
+            owner_sign_off_pending,
+            pending_sign_offs,
+            product_approvers,
+            ticket_kind,
+        )
+
+        reason, responders = human_request_routing(
+            routing_project, ticket.labels, ticket.requested_by
+        )
+        if only_for_viewer and viewer not in responders:
+            return reason, responders, None
+        # Only the owner can clear an ask still waiting on their own sign-off;
+        # otherwise an approver adding product-ok answers a feature's ask.
+        owner_pending = owner_sign_off_pending(ticket.labels, ticket.requested_by)
+        answerers = {routing_project.user_id} if owner_pending else responders
+        # An approver's product-ok answers the ask only when no risk-ok is also owed.
+        risk_owed = RISK_OK_LABEL in pending_sign_offs(
+            routing_project, ticket.labels, ticket.requested_by
+        )
+        product_ok_from = (
+            product_approvers(routing_project)
+            if not owner_pending and not risk_owed and ticket_kind(ticket.labels) == FEATURE_KIND
+            else set()
+        )
+        request = self._open_human_request(
+            session, ticket, answerers, viewer, product_ok_from=product_ok_from
+        )
+        return reason, responders, request
+
+    def _waiting_on(
+        self, session: Session, project: SqlProject, ticket: SqlProjectTicket
+    ) -> dict[str, Any] | None:
+        """Who a ticket's open ``needs-human`` ask waits on, routed as in the Inbox.
+
+        ``None`` when there is no ask or anyone it was routed to has answered it.
+        """
+        if not _has_needs_human(ticket.labels):
+            return None
+        routing_project = SimpleNamespace(
+            user_id=project.user_id, config=_decode_config(project.config)
+        )
+        reason, responders, request = self._routed_ask(session, routing_project, ticket, None)
+        if request is None:
+            return None
+        return {
+            "reason": reason,
+            "responders": sorted(r for r in responders if r is not None),
+            "raised_by_user_id": request["raised_by_user_id"],
+        }
 
     def _open_human_request(
         self,
@@ -1610,7 +1650,7 @@ class ProjectTicketStore:
                 row.comment_count += 1
                 if audience == "human":
                     row.latest_update = body.comment[:300]
-            return _ticket(row)
+            return {**_ticket(row), "waiting_on": self._waiting_on(session, project, row)}
 
         return run_write_transaction(self._write, "update_ticket", write)
 
@@ -1658,7 +1698,7 @@ class ProjectTicketStore:
             # The card previews what the human should read, not the latest agent note.
             if audience == "human":
                 row.latest_update = body.text[:300]
-            return _ticket(row)
+            return {**_ticket(row), "waiting_on": self._waiting_on(session, project, row)}
 
         return run_write_transaction(self._write, "comment_on_ticket", write)
 

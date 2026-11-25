@@ -32,6 +32,7 @@ import { TicketStageBadge } from "./TicketStageAppearance";
 import { TicketAgentIcons } from "./TicketAgentIcons";
 import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoardRequesterFilter";
 import { ticketPanelSearch } from "./projectHomeNavigation";
+import { needsWhom } from "./ticketWaitingOn";
 import {
   useRelatedTickets,
   useTicketActions,
@@ -476,6 +477,9 @@ function TicketCard({
         className={cn(
           "flex min-w-0 flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
           related && "border-muted-foreground/50",
+          // Cards waiting on the viewer stand out in a lane, until they answer.
+          needsWhom(ticket.waiting_on, getCurrentUserId())?.kind === "you" &&
+            "border-l-4 border-l-brand-accent",
           selected && "border-primary ring-1 ring-primary/20",
           isDragging && "opacity-40",
         )}
@@ -512,7 +516,9 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
         )}
       </div>
       <TicketShipBlocker projectId={ticket.project_id} ticketId={ticket.id} variant="card" />
-      {ticket.labels.length > 0 && <TicketLabels labels={ticket.labels} compact />}
+      {ticket.labels.length > 0 && (
+        <TicketLabels labels={ticket.labels} compact waitingOn={ticket.waiting_on} />
+      )}
       {ticket.latest_update &&
         (ticket.latest_update !== "Created the ticket" || ticket.comment_count > 0) && (
           <p className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere">
