@@ -275,8 +275,6 @@ export function GridSessionPane({
     "grid_close",
     ({ keys, callbacks }) => {
       callbacks?.onConfirmed?.();
-      // The shell selected when the close went ahead, as the dialog's confirm always read it.
-      const selectedAtClose = workspace.selectedTerminalKey;
       for (const terminal of terminals.filter((each) => keys.includes(terminalTabKey(each)))) {
         const key = terminalTabKey(terminal);
         setKillingTerminalIds((ids) => [...ids, terminal.id]);
@@ -284,9 +282,13 @@ export function GridSessionPane({
         deleteTerminal
           .mutateAsync(terminal.id)
           .then(
-            () => {
-              if (selectedAtClose === key) updateWorkspace({ selectedTerminalKey: null });
-            },
+            // Read the selection when the delete lands, so a shell selected meanwhile stays selected.
+            () =>
+              setWorkspace((previous) =>
+                previous.selectedTerminalKey === key
+                  ? { ...previous, selectedTerminalKey: null }
+                  : previous,
+              ),
             () => callbacks?.onFailed?.(key),
           )
           .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== terminal.id)));

@@ -340,6 +340,17 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         >
           Close shells
         </button>
+        <button type="button" onClick={() => props.openTerminalTab("terminal:terminal_b")}>
+          Select shell b
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            props.onCloseTerminal(props.selectedTerminalKey!, { onConfirmed: vi.fn() })
+          }
+        >
+          Close selected shell
+        </button>
       </aside>
     );
   },
@@ -555,6 +566,32 @@ it("asks once before a bulk shell close and kills nothing when cancelled", () =>
   fireEvent.click(within(workspace).getByText("Close shells"));
   fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
   expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
+});
+
+it("keeps a shell selected while an earlier close is still deleting", async () => {
+  fixture.terminals = [
+    { id: "terminal_a", name: "a", session: "main", running: true },
+    { id: "terminal_b", name: "b", session: "main", running: true },
+  ];
+  let finishDelete = () => {};
+  fixture.deleteTerminal = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        finishDelete = resolve;
+      }),
+  );
+  writeSessionWorkspaceState("first", { selectedTerminalKey: "terminal:terminal_a" });
+  render(twoCellGrid());
+  const workspace = screen.getByTestId("workspace-first");
+
+  fireEvent.click(within(workspace).getByText("Close selected shell"));
+  fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+  expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"]]);
+  fireEvent.click(within(workspace).getByText("Select shell b"));
+  expect(workspace).toHaveAttribute("data-terminal", "terminal:terminal_b");
+
+  await act(async () => finishDelete());
+  expect(workspace).toHaveAttribute("data-terminal", "terminal:terminal_b");
 });
 
 it("asks about a bulk shell close without reading the runner when floating panes are off", () => {
