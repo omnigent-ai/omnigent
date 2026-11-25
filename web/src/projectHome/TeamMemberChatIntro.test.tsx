@@ -12,6 +12,8 @@ vi.mock("@/components/chat/FullSessionChat", () => ({
   ),
 }));
 vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: () => ({ data: undefined }) }));
+// The host-update banner reads /health through React Query; it isn't what these tests check.
+vi.mock("./OutdatedHostBanner", () => ({ OutdatedHostBanner: () => null }));
 
 afterEach(() => {
   cleanup();
