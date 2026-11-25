@@ -9,7 +9,10 @@ export function MovableTabPanel({
   target,
   children,
 }: {
-  /** Where the tab shows now: the sidebar's content, or its app pane; null waits. */
+  /**
+   * Where the tab shows now: the sidebar's content, or its app pane. Null before the first place
+   * waits; null later takes the content off the page, keeping its state for the next place.
+   */
   target: HTMLElement | null;
   children: ReactNode;
 }) {
@@ -20,7 +23,10 @@ export function MovableTabPanel({
   });
   const [placed, setPlaced] = useState(false);
   useLayoutEffect(() => {
-    if (target === null) return;
+    if (target === null) {
+      host.remove();
+      return;
+    }
     if (host.parentElement !== target) target.appendChild(host);
     setPlaced(true);
   }, [host, target]);
