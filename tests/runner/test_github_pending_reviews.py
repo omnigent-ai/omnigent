@@ -8,7 +8,6 @@ per review until something says the review moved, or a pending-review write is m
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
 import pytest
@@ -129,6 +128,7 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeGitHub:
 @pytest.fixture(autouse=True)
 def _no_kept_answers() -> None:
     pending_reviews._cache.clear()
+    pending_reviews._generations.clear()
 
 
 def _use(fake: FakeGitHub, other: FakeGitHub) -> FakeGitHub:
@@ -222,18 +222,27 @@ def test_an_answer_past_its_cap_drops_its_last_drafts(
     assert listed == [f"PRRC_{index}" for index in range(len(listed))]
 
 
-def test_a_large_answer_is_cut_to_its_cap_in_one_pass(fake: FakeGitHub) -> None:
-    """3,000 long drafts, about 7 MB: each is measured once, so the cut takes moments."""
+def test_a_large_answer_is_cut_to_its_cap_in_one_pass(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3,000 long drafts, about 7 MB: each thread and draft is measured at most once."""
     github = _use(fake, FakeGitHub(3000))
     for thread in github.threads:
         for comment in thread["comments"]["nodes"]:
             comment["body"] = "é" * 1200
+    measured = 0
+    measure = pending_reviews._json_bytes
 
-    started = time.monotonic()
+    def counted(value: Any) -> int:
+        nonlocal measured
+        measured += 1
+        return measure(value)
+
+    monkeypatch.setattr(pending_reviews, "_json_bytes", counted)
     answer = _read()
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 5, elapsed
+    # The frame, then one measure per thread shell and per draft.
+    assert measured <= 1 + len(github.threads) + 3000
     size = len(json.dumps(answer).encode("utf-8"))
     # Short of the cap by less than one more thread of about 7 KB.
     assert pending_reviews.MAX_ANSWER_BYTES - 16_384 < size <= pending_reviews.MAX_ANSWER_BYTES
@@ -346,3 +355,51 @@ def test_a_pending_write_drops_the_kept_answer_even_when_it_fails(
         github_reviews.discard_pending_review("/workspace", PR, pending_review_id=REVIEW)
 
     assert pending_reviews._cache == {}
+
+
+def test_a_read_that_overlapped_a_change_is_not_kept(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A draft edit during a read would leave the old text kept for the whole cache window."""
+    _use(fake, FakeGitHub(3))
+    read_threads = fake.graphql
+
+    def edit_mid_read(*args: Any, **kwargs: Any) -> Any:
+        pending_reviews.forget_pending_review(PR)
+        return read_threads(*args, **kwargs)
+
+    monkeypatch.setattr(pending_reviews, "_graphql", edit_mid_read)
+    _read()
+
+    assert pending_reviews._cache == {}
+
+
+def test_a_read_after_a_change_is_kept_again(fake: FakeGitHub) -> None:
+    _use(fake, FakeGitHub(3))
+    pending_reviews.forget_pending_review(PR)
+    _read()
+    assert list(pending_reviews._cache) == [(PR.url, REVIEW)]
+
+
+def test_expired_answers_for_other_pull_requests_are_dropped(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pending_reviews._cache[("https://github.com/example-org/example-repo/pull/9", "PRR_old")] = (
+        (),
+        pending_reviews.time.monotonic() - pending_reviews.CACHE_SECONDS - 1,
+        {},
+    )
+    _use(fake, FakeGitHub(1))
+    _read()
+    assert list(pending_reviews._cache) == [(PR.url, REVIEW)]
+
+
+def test_a_null_comment_in_a_thread_is_skipped(fake: FakeGitHub) -> None:
+    github = _use(fake, FakeGitHub(1))
+    github.threads[0]["comments"]["nodes"].insert(0, None)
+
+    answer = _read()
+
+    [thread] = answer["threads"]
+    assert [draft["id"] for draft in thread["comments"]["data"]] == ["PRRC_0"]
+    assert thread["diff_hunk"] == "@@ -1 +1 @@"

@@ -215,7 +215,14 @@ def _draft_thread(
     drafts = [draft for node in nodes if (draft := _draft(node, review_id, reply_to))]
     if not drafts:
         return None
-    hunk = next((node["diffHunk"] for node in nodes if _text(node.get("diffHunk"))), "")
+    hunk = next(
+        (
+            node["diffHunk"]
+            for node in nodes
+            if isinstance(node, dict) and _text(node.get("diffHunk"))
+        ),
+        "",
+    )
     diff_hunk, truncated = _capped_hunk(hunk)
     return {
         "id": thread_id,
@@ -375,18 +382,33 @@ def _within_answer_cap(answer: dict[str, Any]) -> dict[str, Any]:
 
 # Answers kept per review: (pr url, review id) → (what says it moved, when read, answer).
 _cache: dict[tuple[str, str], tuple[tuple[Any, ...], float, dict[str, Any]]] = {}
+# Bumped by every change to a PR's pending review, so a read that overlapped one isn't kept.
+_generations: dict[str, int] = {}
 _cache_lock = threading.Lock()
 
 
 def forget_pending_review(reference: PullRequestRef) -> None:
     """Drop the kept answers for ``reference``'s pending review, after a change to it."""
     with _cache_lock:
+        _generations[reference.url] = _generations.get(reference.url, 0) + 1
         for key in [key for key in _cache if key[0] == reference.url]:
             del _cache[key]
 
 
+def _keep(key: tuple[str, str], generation: int, entry: tuple[Any, ...]) -> None:
+    """Keep a read's answer unless a change began since it started; drop expired answers."""
+    now = time.monotonic()
+    with _cache_lock:
+        for expired in [old for old, kept in _cache.items() if now - kept[1] >= CACHE_SECONDS]:
+            del _cache[expired]
+        if _generations.get(key[0], 0) == generation:
+            _cache[key] = entry  # type: ignore[assignment]
+
+
 def get_pending_review(root: str, reference: PullRequestRef) -> dict[str, Any]:
     """The viewer's pending review on the PR with its drafts, as the page reads it."""
+    with _cache_lock:
+        generation = _generations.get(reference.url, 0)
     pull_request = pull_request_node(root, reference, OWN_PENDING_REVIEW)
     heads = (_text(pull_request.get("headRefOid")), _text(pull_request.get("baseRefOid")))
     answer: dict[str, Any] = {
@@ -425,6 +447,5 @@ def get_pending_review(root: str, reference: PullRequestRef) -> dict[str, Any]:
             "complete": complete and all_pages,
         }
     )
-    with _cache_lock:
-        _cache[(reference.url, review_id)] = (moved, time.monotonic(), result)
+    _keep((reference.url, review_id), generation, (moved, time.monotonic(), result))
     return result
