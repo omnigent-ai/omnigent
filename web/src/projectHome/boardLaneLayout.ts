@@ -5,6 +5,8 @@ import type { TicketStage } from "@/lib/projectTicketsApi";
 export const LANE_MIN_PX = 208;
 export const LANE_STRIP_PX = 48;
 export const LANE_GAP_PX = 16;
+/** Below this the board doesn't fit lanes to its width; two open lanes need at least this. */
+export const MIN_FIT_WIDTH_PX = 2 * LANE_MIN_PX + LANE_GAP_PX;
 
 /** A person's choice per lane: true collapsed, false open; a lane they never toggled is absent. */
 export type LanePreferences = Readonly<Record<string, boolean>>;
@@ -24,7 +26,8 @@ export function collapsedLanes(
   const collapsed = new Set(
     stages.filter((stage) => preferences[stage.id] ?? stage.is_complete).map((stage) => stage.id),
   );
-  if (width === null) return collapsed;
+  // Too narrow for two open lanes (a phone): lanes stay full width and the board scrolls sideways.
+  if (width === null || width < MIN_FIT_WIDTH_PX) return collapsed;
   const fits = () => {
     const strips = collapsed.size;
     const open = stages.length - strips;

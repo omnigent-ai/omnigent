@@ -24,7 +24,7 @@ describe("collapsedLanes", () => {
     expect([...collapsedLanes(STAGES, {}, "pending", widthFor(3, 3))].sort()).toEqual(
       ["implemented", "merged", "verified"].sort(),
     );
-    const narrow = collapsedLanes(STAGES, {}, "pending", 100);
+    const narrow = collapsedLanes(STAGES, {}, "pending", 440);
     expect(narrow.has("pending")).toBe(false);
     expect(narrow.size).toBe(5);
   });
@@ -39,6 +39,10 @@ describe("collapsedLanes", () => {
     expect(layout.has("verified")).toBe(false);
     expect(layout.has("merged")).toBe(false);
     expect(layout.has("working")).toBe(true);
+  });
+
+  it("leaves a phone-width board to scroll instead of folding its active lanes", () => {
+    expect([...collapsedLanes(STAGES, {}, "pending", 358)]).toEqual(["merged"]);
   });
 
   it("uses only stored choices before the board has been measured", () => {
