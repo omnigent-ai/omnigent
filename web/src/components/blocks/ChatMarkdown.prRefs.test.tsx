@@ -145,20 +145,20 @@ describe("pull request references in chat markdown", () => {
     expect(unlinked.textContent).toBe("#9999");
   });
 
-  it("links a bare number to the linked PR's own repo, not the workspace's", () => {
-    seed(githubInfo({ prs: [linkedPullRequest("other/lib", 14971)] }));
-    renderMarkdown("Opened #14971 upstream.");
-    expect(hrefs()).toEqual(["https://github.com/other/lib/pull/14971"]);
-  });
-
-  it("leaves a number two linked repos share as text, and links each written with its repo", () => {
+  it("links a bare number to its linked PR's repo, unless two linked repos share it", () => {
     seed(
       githubInfo({
-        prs: [linkedPullRequest("acme/app", 3700), linkedPullRequest("other/lib", 3700)],
+        prs: [
+          linkedPullRequest("other/lib", 14971),
+          linkedPullRequest("acme/app", 3700),
+          linkedPullRequest("other/lib", 3700),
+        ],
       }),
     );
-    renderMarkdown("Both have #3700: acme/app#3700 and other/lib#3700.");
+    renderMarkdown("Opened #14971 upstream. Both have #3700: acme/app#3700 and other/lib#3700.");
+    // Not the workspace's repo: the link names where the PR is.
     expect(hrefs()).toEqual([
+      "https://github.com/other/lib/pull/14971",
       "https://github.com/acme/app/pull/3700",
       "https://github.com/other/lib/pull/3700",
     ]);
@@ -185,7 +185,9 @@ describe("pull request references in chat markdown", () => {
   });
 
   it("leaves code, existing links, URL fragments and non-references alone", () => {
-    seed(githubInfo());
+    // The session links every number here, so only the context can keep one as text.
+    const numbers = [1234, 5678, 4321, 2468, 1357, 3579, 9753, 8642];
+    seed(githubInfo({ prs: numbers.map((number) => linkedPullRequest("acme/app", number)) }));
     renderMarkdown(
       [
         "Inline `#1234` and [#5678](https://example.com/x) and https://example.com/page#4321.",
