@@ -884,7 +884,8 @@ export function codeMirrorKey(chord: Chord): string {
   if (chord.ctrl) parts.push("Ctrl");
   if (chord.alt) parts.push("Alt");
   if (chord.shift) parts.push("Shift");
-  const key = chord.code !== undefined ? chordKeyLabel(chord).toLowerCase() : (chord.key ?? "");
+  // A named key keeps its case, as CodeMirror's names need; a character is lowercased.
+  const key = chord.code !== undefined ? chordKeyLabel(chord) : (chord.key ?? "");
   parts.push(CODE_MIRROR_KEY_NAMES[key] ?? (key.length === 1 ? key.toLowerCase() : key));
   return parts.join("-");
 }
