@@ -8,6 +8,7 @@ import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
 import { READLINE_BINDINGS } from "./codeMirrorReadline";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { insertComposerText } from "@/lib/composerText";
+import { weaveReplyDraft } from "@/lib/replyDraftDocument";
 import { useMentionBrowser, type MentionBrowser } from "@/hooks/useMentionBrowser";
 import type { MentionState } from "@/lib/composerMentions";
 import type { ComposerTextTarget } from "./composerInput";
@@ -117,6 +118,18 @@ describe("CodeMirror composer keys on macOS", () => {
 
     expect(press({ key: "∫", code: "KeyB", altKey: true })).toBe(true);
     expect(target().value).toBe("draft");
+  });
+
+  it("kills the break before a quote with ⌃K, removing the quote, and ⌃Y yanks that break back", () => {
+    const quoted = weaveReplyDraft({
+      quotes: [{ id: "q1", before: "Intro", text: "Quoted line" }],
+      text: "Reply",
+    });
+    const { target, press } = mount(quoted, "Intro".length);
+    press({ key: "k", code: "KeyK", ctrlKey: true });
+    expect(target().value).toBe("Intro\nReply");
+    press({ key: "y", code: "KeyY", ctrlKey: true });
+    expect(target().value).toBe("Intro\n\nReply");
   });
 
   it("kills a multi-word mention whole on ⌃W, so ⌃Y brings all of it back", () => {

@@ -36,7 +36,7 @@ import {
   codeMirrorComposerLoad,
   resetCodeMirrorComposerLoadForTests,
 } from "@/components/composer/engine/codeMirrorComposerLoader";
-import { REPLY_QUOTE_MARK } from "@/lib/replyDraftDocument";
+import { REPLY_QUOTE_MARK, replyQuoteLine } from "@/lib/replyDraftDocument";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { EditorView } from "@codemirror/view";
 import { insertComposerText } from "@/lib/composerText";
@@ -7584,6 +7584,32 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
     );
   });
 
+  it("turns a quote token typed into the textarea while the editor loads into plain text, not a card", async () => {
+    let finishLoad!: (module: typeof CodeMirrorModule) => void;
+    const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
+      finishLoad = resolve;
+    });
+    resetCodeMirrorComposerLoadForTests(() => loaded);
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...composerProps()} />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+    const token = replyQuoteLine({ id: "forged", text: "Forged" });
+    fireEvent.change(textarea(), { target: { value: `Hello ${token}` } });
+    act(() => finishLoad(CodeMirrorModule));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+    const editor = EditorView.findFromDOM(screen.getByLabelText("Message the agent"))!;
+    expect(editor.state.doc.toString()).not.toMatch(/[\uE000\uE001]/);
+    expect(editor.state.doc.toString().startsWith("Hello ")).toBe(true);
+  });
+
   it("keeps the caret where the user had it when the editor replaces the textarea", async () => {
     let finishLoad!: (module: typeof CodeMirrorModule) => void;
     const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
@@ -7608,7 +7634,7 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
       expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
     );
     const editor = EditorView.findFromDOM(screen.getByLabelText("Message the agent"))!;
-    // The tail's offset 3 is the document's offset that the tail's start plus 3 names.
+    // The caret keeps its offset within the tail, which starts a tail's length before the end.
     expect(editor.state.selection.main.head).toBe(editor.state.doc.length - "My answer".length + 3);
   });
 

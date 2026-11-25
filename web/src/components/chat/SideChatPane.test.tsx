@@ -3698,14 +3698,16 @@ describe("side-chat composer engine", () => {
   });
 
   const pendingId = "pending:quoted";
-  const pendingPane = () =>
+  const pendingPane = (onStart = vi.fn().mockResolvedValue(undefined)) => {
     renderPane(
       <CapabilitiesProvider
         info={{ ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } }}
       >
-        <SideChatPane childId={pendingId} />
+        <SideChatPane childId={pendingId} onStart={onStart} />
       </CapabilitiesProvider>,
     );
+    return onStart;
+  };
   const documentOfEditor = () =>
     EditorView.findFromDOM(screen.getByTestId("side-chat-input"))!.state.doc.toString();
 
@@ -3724,6 +3726,52 @@ describe("side-chat composer engine", () => {
     expect(useChatStore.getState().sideChatDrafts[pendingId]).toBe("restore the row");
     expect(editor).toHaveTextContent("above");
     expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+  });
+
+  it("keeps the text typed above the seed through an engine switch", async () => {
+    useChatStore.setState({
+      sideChatDrafts: { [pendingId]: "restore the row" },
+      sideChatComposers: { [pendingId]: { text: "why?", files: [], quotes: [] } },
+    });
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    const flaggedPane = (enabled: boolean) => (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: enabled } }}
+      >
+        <SideChatPane childId={pendingId} onStart={onStart} />
+      </CapabilitiesProvider>
+    );
+    const { rerender } = renderPane(flaggedPane(true));
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    act(() =>
+      insertComposerText(composerTargetOf(screen.getByTestId("side-chat-input"))!, "above", 0, 0),
+    );
+    // Turning the flag off moves the composer to the textarea, where the text above the seed is its own input.
+    rerender(flaggedPane(false));
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue(
+        "above",
+      ),
+    );
+    expect(useChatStore.getState().sideChatComposers[pendingId]?.seedBefore).toBe("above");
+  });
+
+  it("sends the text typed above the seed, before the seed's quote", async () => {
+    useChatStore.setState({
+      sideChatDrafts: { [pendingId]: "restore the row" },
+      sideChatComposers: { [pendingId]: { text: "why?", files: [], quotes: [] } },
+    });
+    const onStart = pendingPane();
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("side-chat-input");
+    act(() => insertComposerText(composerTargetOf(editor)!, "above", 0, 0));
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("above\n\n> restore the row\n\nwhy?");
   });
 
   it("keeps a blank line deleted between two quotes, and undo brings back the deletion first", async () => {

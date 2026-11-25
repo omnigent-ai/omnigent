@@ -2,23 +2,23 @@
 // the caret steps over it, a change can't reach into it, and any edit leaves it on its own line.
 // Lazily loaded with the editor; it imports only CodeMirror and the pure document mapping.
 
-import { isolateHistory } from "@codemirror/commands";
 import {
   ChangeSet,
   EditorSelection,
   Prec,
   StateField,
-  Transaction,
   type Annotation,
   type ChangeSpec,
   type EditorState,
   type Extension,
   type Text,
+  type Transaction,
   type TransactionSpec,
 } from "@codemirror/state";
 import { Decoration, EditorView, keymap, WidgetType, type DecorationSet } from "@codemirror/view";
 import {
   parseReplyQuoteLine,
+  quoteRemovalSpan,
   REPLY_QUOTE_END,
   REPLY_QUOTE_MARK,
   replyQuoteClipboardText,
@@ -60,22 +60,38 @@ function tokenSpans(doc: Text): Span[] {
   return spans;
 }
 
-/**
- * The change that removes the quote on line `lineNumber`: its line and the break after it, so the
- * lines around it stay as they were. The blank line above it goes too when it only separates the
- * quote from the document's start or from another quote. A last line has no break after it, so
- * the break before goes.
- */
+/** The change that removes the quote on line `lineNumber`, by the lib's `quoteRemovalSpan`. */
 function lineRemoval(doc: Text, lineNumber: number): Edit {
-  const line = doc.line(lineNumber);
-  const above = lineNumber > 1 ? doc.line(lineNumber - 1) : null;
-  const separator =
-    above !== null &&
-    above.text === "" &&
-    (lineNumber === 2 || parseReplyQuoteLine(doc.line(lineNumber - 2).text) !== null);
-  const first = separator ? above : line;
-  if (lineNumber < doc.lines) return { from: first.from, to: line.to + 1, insert: "" };
-  return { from: Math.max(0, first.from - 1), to: line.to, insert: "" };
+  const lines = Array.from({ length: doc.lines }, (_, index) => doc.line(index + 1).text);
+  const { first, last } = quoteRemovalSpan(lines, lineNumber - 1);
+  const firstLine = doc.line(first + 1);
+  const lastLine = doc.line(last + 1);
+  if (last + 1 < doc.lines) return { from: firstLine.from, to: lastLine.to + 1, insert: "" };
+  // A last line has no break after it, so the break before the first line goes.
+  return { from: Math.max(0, firstLine.from - 1), to: lastLine.to, insert: "" };
+}
+
+/** Whether the document holds any quote token, from the decorations the field keeps. */
+function hasQuotes(state: EditorState): boolean {
+  return state.field(replyQuoteField).size > 0;
+}
+
+/** Whether `transaction` inserts a mark, which can only come in as text. */
+function insertsMarks(transaction: Transaction): boolean {
+  let marks = false;
+  transaction.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+    const text = inserted.toString();
+    if (text.includes(REPLY_QUOTE_MARK) || text.includes(REPLY_QUOTE_END)) marks = true;
+  });
+  return marks;
+}
+
+/**
+ * Every annotation of `transaction`. CodeMirror keeps them all at runtime; its typings list only
+ * some, so the rest (a kill ring's `killed`, for one) are read directly.
+ */
+function allAnnotations(transaction: Transaction): readonly Annotation<unknown>[] {
+  return (transaction as unknown as { annotations: readonly Annotation<unknown>[] }).annotations;
 }
 
 /**
@@ -101,33 +117,13 @@ function markRanges(text: string, offset: number): Edit[] {
   return ranges;
 }
 
-/** The annotations history and the user-event listeners read, from `transaction`. */
-function carriedAnnotations(transaction: Transaction): Annotation<unknown>[] {
-  const carried: Annotation<unknown>[] = [];
-  const userEvent = transaction.annotation(Transaction.userEvent);
-  if (userEvent !== undefined) carried.push(Transaction.userEvent.of(userEvent));
-  const addToHistory = transaction.annotation(Transaction.addToHistory);
-  if (addToHistory !== undefined) carried.push(Transaction.addToHistory.of(addToHistory));
-  const isolation = transaction.annotation(isolateHistory);
-  if (isolation !== undefined) carried.push(isolateHistory.of(isolation));
-  return carried;
-}
-
-function removalSpec(transaction: Transaction, edit: Edit): TransactionSpec {
-  return {
-    changes: edit,
-    selection: EditorSelection.cursor(edit.from + edit.insert.length),
-    annotations: carriedAnnotations(transaction),
-    scrollIntoView: transaction.scrollIntoView,
-  };
-}
-
 /**
- * The one edit of `transaction`, when it takes a whole quote: the quote's own text with its line,
- * or the break beside it when the line on the other side has text. A blank line beside a quote
- * is just a line, so deleting it leaves the quote alone.
+ * The removal of a whole quote, when `transaction` takes one: the quote's own text with its line,
+ * or the break beside it when the line on the other side has text. A blank line beside a quote is
+ * just a line, so deleting it leaves the quote alone. The original transaction keeps its
+ * annotations and effects; the removal follows it as a sequential spec.
  */
-function quoteRemovalOf(transaction: Transaction): TransactionSpec | null {
+function quoteRemovalOf(transaction: Transaction): TransactionSpec[] | null {
   const edits: Edit[] = [];
   transaction.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
     edits.push({ from: fromA, to: toA, insert: inserted.toString() });
@@ -147,40 +143,58 @@ function quoteRemovalOf(transaction: Transaction): TransactionSpec | null {
     if (!takesQuote) continue;
     const line = doc.lineAt(span.from);
     if (line.from !== span.from || line.to !== span.to) return null;
-    return removalSpec(transaction, lineRemoval(doc, line.number));
+    const removal = lineRemoval(doc, line.number);
+    return [
+      // The original keeps its annotations and effects, and its change is dropped for the removal.
+      {
+        changes: [],
+        effects: transaction.effects,
+        annotations: allAnnotations(transaction),
+        scrollIntoView: transaction.scrollIntoView,
+      },
+      {
+        changes: removal,
+        selection: EditorSelection.cursor(removal.from + removal.insert.length),
+        sequential: true,
+      },
+    ];
   }
   return null;
 }
 
 /**
- * The change filter. A change may cover a whole token or stay clear of it, never reach into it;
- * CodeMirror filters a transaction's changes whole, so one such change drops the transaction's.
+ * The change filter. A change may cover a whole token or stay clear of it. One that reaches into a
+ * token keeps the parts outside it: CodeMirror's filter returns the ranges to keep, so only the
+ * part that touches the token is dropped. Without a quote or a mark in play, nothing is scanned.
  */
-export function keepsReplyQuotesWhole(transaction: Transaction): boolean {
+export function keepsReplyQuotesWhole(transaction: Transaction): boolean | readonly number[] {
   if (
     !transaction.docChanged ||
     transaction.isUserEvent("undo") ||
-    transaction.isUserEvent("redo")
+    transaction.isUserEvent("redo") ||
+    (!hasQuotes(transaction.startState) && !insertsMarks(transaction))
   ) {
     return true;
   }
   const spans = tokenSpans(transaction.startState.doc);
-  let whole = true;
+  let partial = false;
   transaction.changes.iterChangedRanges((fromA, toA) => {
     for (const span of spans) {
       const overlaps = fromA < span.to && toA > span.from;
       const covers = fromA <= span.from && toA >= span.to;
-      if (overlaps && !covers) whole = false;
+      if (overlaps && !covers) partial = true;
     }
   });
-  return whole;
+  if (!partial) return true;
+  // CodeMirror drops the changes inside the ranges it's given: the token spans, flattened.
+  return spans.flatMap((span) => [span.from, span.to]);
 }
 
 /**
  * The transaction filter. A deletion of a whole quote removes it, joining the text around it.
- * Otherwise inserted text loses its marks, and each token that has text on its line is set on
- * a line of its own. Those edits follow the original transaction as sequential specs, so its
- * selection, effects, annotations and history grouping carry over.
+ * Otherwise inserted text loses its marks, and each token that has text on its line is set on a
+ * line of its own. The original transaction keeps its annotations, effects and selection; those
+ * edits follow it as sequential specs.
  */
 export function normalizeReplyQuoteTransaction(
   transaction: Transaction,
@@ -188,7 +202,8 @@ export function normalizeReplyQuoteTransaction(
   if (
     !transaction.docChanged ||
     transaction.isUserEvent("undo") ||
-    transaction.isUserEvent("redo")
+    transaction.isUserEvent("redo") ||
+    (!hasQuotes(transaction.startState) && !insertsMarks(transaction))
   ) {
     return transaction;
   }
@@ -199,8 +214,7 @@ export function normalizeReplyQuoteTransaction(
   transaction.changes.iterChanges((_fromA, _toA, fromB, _toB, inserted) => {
     strips.push(...markRanges(inserted.toString(), fromB));
   });
-  const stripChanges = ChangeSet.of(strips, transaction.newDoc.length);
-  const afterStrip = stripChanges.apply(transaction.newDoc);
+  const afterStrip = ChangeSet.of(strips, transaction.newDoc.length).apply(transaction.newDoc);
 
   const breaks = new Set<number>();
   for (const span of tokenSpans(afterStrip)) {
@@ -208,24 +222,22 @@ export function normalizeReplyQuoteTransaction(
     if (span.from > line.from) breaks.add(span.from);
     if (span.to < line.to) breaks.add(span.to);
   }
-  const breakEdits: ChangeSpec = [...breaks]
-    .sort((a, b) => a - b)
-    .map((position) => ({ from: position, to: position, insert: "\n" }));
-
   if (strips.length === 0 && breaks.size === 0) return transaction;
+
   const specs: TransactionSpec[] = [
     {
       changes: transaction.changes,
       selection: transaction.selection,
       effects: transaction.effects,
-      annotations: carriedAnnotations(transaction),
+      annotations: allAnnotations(transaction),
       scrollIntoView: transaction.scrollIntoView,
     },
   ];
-  if (strips.length > 0) {
-    specs.push({ changes: strips, sequential: true });
-  }
+  if (strips.length > 0) specs.push({ changes: strips, sequential: true });
   if (breaks.size > 0) {
+    const breakEdits: ChangeSpec = [...breaks]
+      .sort((a, b) => a - b)
+      .map((position) => ({ from: position, to: position, insert: "\n" }));
     specs.push({ changes: breakEdits, sequential: true });
   }
   return specs;
@@ -309,10 +321,17 @@ function quoteDecorations(state: EditorState): DecorationSet {
 /** Paints each quote line as a card and makes it atomic, so the caret steps over it whole. */
 const replyQuoteField = StateField.define<DecorationSet>({
   create: quoteDecorations,
-  update: (decorations, transaction) =>
-    transaction.docChanged || transaction.startState.readOnly !== transaction.state.readOnly
-      ? quoteDecorations(transaction.state)
-      : decorations,
+  update: (decorations, transaction) => {
+    if (transaction.startState.readOnly !== transaction.state.readOnly) {
+      return quoteDecorations(transaction.state);
+    }
+    if (!transaction.docChanged) return decorations;
+    // Without a quote before or after the change, the decorations only move with the text.
+    if (decorations.size === 0 && !insertsMarks(transaction)) {
+      return decorations.map(transaction.changes);
+    }
+    return quoteDecorations(transaction.state);
+  },
   provide: (field) => [
     EditorView.decorations.from(field),
     EditorView.atomicRanges.of((view) => view.state.field(field)),

@@ -40,7 +40,10 @@ export function useReplyDraft({ singleDocument = false }: { singleDocument?: boo
   });
   const draft = state.draft;
   const [activeTextId, focusText] = useState<string | null>(null);
-  const documentValue = typedDocumentFor(draft, state.document);
+  const documentValue = useMemo(
+    () => typedDocumentFor(draft, state.document),
+    [draft, state.document],
+  );
   const value = singleDocument
     ? documentValue
     : (draft.quotes.find((quote) => quote.id === activeTextId)?.before ?? draft.text);

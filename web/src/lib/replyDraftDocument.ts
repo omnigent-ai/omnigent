@@ -1,17 +1,19 @@
-// A reply draft as one editor document. Each quote is one line, a token that carries its id and
-// text between two private-use marks, so the document alone holds the quote: undo brings a
-// removed quote back with its text, and nothing is parsed back out of the markdown, where a
-// typed `>` would look like a quote. The document is editor-only and never persisted.
+// A reply draft as one editor document: each quote is a token line, so undo restores a quote
+// with its text. The document is editor-only and never persisted.
 
-import { nanoid } from "nanoid";
 import type { ReplyDraft, ReplyQuote } from "./replyDraft";
 
 /** Opens a quote's token: a private-use character that typed text does not carry. */
-export const REPLY_QUOTE_MARK = "";
+export const REPLY_QUOTE_MARK = "\uE000";
 /** Closes a quote's token. */
-export const REPLY_QUOTE_END = "";
+export const REPLY_QUOTE_END = "\uE001";
 
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/;
+/** A whole token, or a stray mark: what plain text must not carry. */
+const TOKEN_OR_MARK = new RegExp(
+  `${REPLY_QUOTE_MARK}[A-Za-z0-9_-]*${REPLY_QUOTE_END}|${REPLY_QUOTE_MARK}|${REPLY_QUOTE_END}`,
+  "g",
+);
 
 function encodePayload(payload: string): string {
   const bytes = new TextEncoder().encode(payload);
@@ -67,21 +69,36 @@ export function parseReplyQuoteLine(line: string): QuoteFields | null {
  * line that a typed document lacks, so a typed document is kept as typed (see `typedDocumentFor`).
  */
 export function weaveReplyDraft(draft: ReplyDraft): string {
+  // Plain text never becomes a quote: a token in it, pasted into the textarea, loses its marks here.
   return [
-    ...draft.quotes.flatMap((quote) => [quote.before, replyQuoteLine(quote)]),
-    draft.text,
+    ...draft.quotes.flatMap((quote) => [
+      withoutReplyQuoteMarks(quote.before),
+      replyQuoteLine(quote),
+    ]),
+    withoutReplyQuoteMarks(draft.text),
   ].join("\n");
 }
 
-/** The draft a document holds. A repeated quote id gets a fresh id, so each card stays its own. */
+/**
+ * The draft a document holds. A repeated quote id becomes `${id}-${n}` for the first free `n`, so
+ * parsing the same document twice gives the same draft.
+ */
 export function unweaveReplyDraft(document: string): ReplyDraft {
-  const quotes: ReplyQuote[] = [];
+  const lines = document.split("\n");
+  const used = new Set(lines.flatMap((line) => parseReplyQuoteLine(line)?.id ?? []));
   const seen = new Set<string>();
+  const quotes: ReplyQuote[] = [];
   let pending: string[] = [];
-  for (const line of document.split("\n")) {
+  for (const line of lines) {
     const quote = parseReplyQuoteLine(line);
     if (quote) {
-      const id = seen.has(quote.id) ? nanoid() : quote.id;
+      let id = quote.id;
+      if (seen.has(id)) {
+        let n = 2;
+        while (used.has(`${quote.id}-${n}`)) n += 1;
+        id = `${quote.id}-${n}`;
+        used.add(id);
+      }
       seen.add(id);
       quotes.push({ id, before: pending.join("\n"), text: quote.text });
       pending = [];
@@ -120,7 +137,7 @@ export function hasReplyQuoteLines(document: string): boolean {
 
 /** `text` without quote marks, so inserted text can't pose as a quote. */
 export function withoutReplyQuoteMarks(text: string): string {
-  return text.split(REPLY_QUOTE_MARK).join("").split(REPLY_QUOTE_END).join("");
+  return text.replace(TOKEN_OR_MARK, "");
 }
 
 /** A document's text as the clipboard gets it: each quote line becomes its `> ` markdown. */
@@ -141,36 +158,37 @@ export function appendQuoteToDocument(document: string, quote: QuoteFields): str
 
 /** The document with its trailing text replaced, keeping every line up to the last quote line. */
 export function replaceTrailingText(document: string, text: string): string {
+  const plain = withoutReplyQuoteMarks(text);
   const lines = document.split("\n");
   let last = -1;
   lines.forEach((line, index) => {
     if (parseReplyQuoteLine(line) !== null) last = index;
   });
-  return last < 0 ? text : [...lines.slice(0, last + 1), text].join("\n");
+  return last < 0 ? plain : [...lines.slice(0, last + 1), plain].join("\n");
 }
 
 /**
- * The document without the quote line at `lineIndex`, as `removeReplyQuote` leaves the draft. Text
- * above and below a removed quote joins with a blank line between them, unless a blank line sits
- * on either side, which the join absorbs.
+ * The lines a quote's removal takes, as `first` to `last` line indices. The quote's own line goes,
+ * and the blank line above it too when that blank only separates the quote from the document's
+ * start or from another quote. Every other line stays.
  */
+export function quoteRemovalSpan(
+  lines: readonly string[],
+  index: number,
+): { first: number; last: number } {
+  const separator =
+    index >= 1 &&
+    lines[index - 1] === "" &&
+    (index === 1 || parseReplyQuoteLine(lines[index - 2]!) !== null);
+  return { first: separator ? index - 1 : index, last: index };
+}
+
+/** The document without the quote line at `lineIndex`, by `quoteRemovalSpan`. */
 export function removeReplyQuoteLine(document: string, lineIndex: number): string {
   const lines = document.split("\n");
-  const isQuote = (index: number) =>
-    index >= 0 && index < lines.length && parseReplyQuoteLine(lines[index]!) !== null;
-  if (!isQuote(lineIndex)) return document;
-  const above = lines[lineIndex - 1];
-  const below = lines[lineIndex + 1];
-  const beforeIsBlank = above === "" && (lineIndex < 2 || isQuote(lineIndex - 2));
-  const textAbove =
-    !beforeIsBlank && above !== undefined && above !== "" && !isQuote(lineIndex - 1);
-  if (textAbove && below === "") {
-    lines.splice(lineIndex, 2);
-  } else if (textAbove && below !== undefined && below !== "" && !isQuote(lineIndex + 1)) {
-    lines.splice(lineIndex, 1, "");
-  } else {
-    lines.splice(beforeIsBlank ? lineIndex - 1 : lineIndex, beforeIsBlank ? 2 : 1);
-  }
+  if (parseReplyQuoteLine(lines[lineIndex] ?? "") === null) return document;
+  const { first, last } = quoteRemovalSpan(lines, lineIndex);
+  lines.splice(first, last - first + 1);
   return lines.join("\n");
 }
 

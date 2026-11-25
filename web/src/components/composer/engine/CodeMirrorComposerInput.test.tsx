@@ -26,6 +26,15 @@ import {
   type ComposerTextTarget,
 } from "./composerInput";
 
+/** Mounts the composer on `value`, with its editor. */
+function mountValue(
+  value: string,
+  props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {},
+) {
+  const mounted = mount({ value, ...props });
+  return { ...mounted, editor: EditorView.findFromDOM(mounted.content)! };
+}
+
 /** jsdom has no layout, and CodeMirror measures text through these, so they report empty rects. */
 const rangeLayoutOriginals = {
   getClientRects: Range.prototype.getClientRects,
@@ -674,10 +683,8 @@ describe("CodeMirrorComposerInput reply quotes", () => {
   const quoteStart = "Intro\n".length;
   const replyStart = quotedDraft.length - "Reply".length;
 
-  function mountQuoted(props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {}) {
-    const mounted = mount({ value: quotedDraft, ...props });
-    return { ...mounted, editor: EditorView.findFromDOM(mounted.content)! };
-  }
+  const mountQuoted = (props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {}) =>
+    mountValue(quotedDraft, props);
   const caretAt = (editor: EditorView, offset: number) =>
     act(() => editor.dispatch({ selection: { anchor: offset } }));
   const quoteCards = (container: HTMLElement) =>
@@ -749,15 +756,6 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     expect(editor.state.selection.main.head).toBe(3);
   });
 
-  it("paints the card row and its text inside the editor's width, truncating the preview", () => {
-    const { container } = mountQuoted();
-    const row = quoteCards(container)[0]!;
-    expect(row.className).toContain("min-w-0");
-    expect(row.className).toContain("w-full");
-    expect(row.querySelector("blockquote")!.className).toContain("min-w-0");
-    expect(row.querySelector('[aria-hidden="true"]')!.className).toContain("truncate");
-  });
-
   it("Delete at the end of the line before a quote removes the quote", () => {
     const { editor, target } = mountQuoted();
     caretAt(editor, "Intro".length);
@@ -812,10 +810,8 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     const { editor, target } = mountQuoted({ value: blankLineAbove });
     caretAt(editor, 0);
     act(() => void deleteCharForward(editor));
-    expect(unweaveReplyDraft(target().value)).toEqual({
-      quotes: [{ id: "q1", before: "", text: "Quoted line" }],
-      text: "Reply",
-    });
+    const card = replyQuoteLine({ id: "q1", text: "Quoted line" });
+    expect(target().value).toBe(`${card}\nReply`);
   });
 
   it("gives copy, cut and drag the quote as `> ` markdown, never the marked line", () => {
@@ -855,14 +851,7 @@ describe("CodeMirrorComposerInput reply quote edits", () => {
   const quoteEnd = quoteDraft.indexOf("\nReply");
   const replyStart = quoteDraft.length - "Reply".length;
 
-  function mountWith(
-    value: string,
-    props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {},
-  ) {
-    const mounted = mount({ value, ...props });
-    const editor = EditorView.findFromDOM(mounted.content)!;
-    return { ...mounted, editor };
-  }
+  const mountWith = mountValue;
   const cards = (container: HTMLElement) =>
     container.querySelectorAll('[data-testid="composer-reply-quote"]');
 
@@ -945,6 +934,15 @@ describe("CodeMirrorComposerInput reply quote edits", () => {
     expect(target().value).toBe(quoteDraft);
   });
 
+  it("keeps the text of a change whose range ends inside a quote's token", () => {
+    const { target } = mountWith(quoteDraft);
+    // Replaces "ntro\nTO" (the range ends inside the token); the token itself is left whole.
+    act(() => insertComposerText(target(), "X", 1, quoteStart + 2));
+    const draft = draftOf(target().value);
+    expect(draft.quotes).toHaveLength(1);
+    expect(draft.quotes[0]).toMatchObject({ before: "IX", text: "Quoted line" });
+  });
+
   it("removes a duplicated quote's card by its own line, leaving the first", () => {
     const token = replyQuoteLine({ id: "dup", text: "One" });
     const { container, target } = mountWith(`Intro\n${token}\n${token}\nReply`);
@@ -970,13 +968,32 @@ describe("CodeMirrorComposerInput reply quote edits", () => {
     expect(draftOf(target().value).text).toBe("more");
   });
 
-  it("keeps the card bounded to the composer's width, with its X visible", () => {
+  it("keeps the card bounded to the composer's width, with its X visible and the preview truncated", () => {
     const { container } = mountWith(quoteDraft);
     const row = cards(container)[0]! as HTMLElement;
     expect(row.className).toContain("w-full");
     expect(row.className).toContain("min-w-0");
     expect(row.className).toContain("max-w-full");
+    expect(row.querySelector("blockquote")!.className).toContain("min-w-0");
     expect(row.querySelector("blockquote")!.className).toContain("overflow-hidden");
+    expect(row.querySelector('[aria-hidden="true"]')!.className).toContain("truncate");
     expect(row.querySelector(".truncate")).not.toBeNull();
+  });
+
+  it("keeps the text of a change that reaches into a token, when an ordinary edit comes with it", () => {
+    // One change reaches into the token, the other deletes the "R" of "Reply", in one transaction.
+    const { editor, target } = mountWith(quoteDraft);
+    act(() =>
+      editor.dispatch({
+        changes: [
+          { from: 1, to: quoteStart + 2, insert: "X" },
+          { from: replyStart, to: replyStart + 1 },
+        ],
+      }),
+    );
+    const draft = draftOf(target().value);
+    expect(draft.quotes).toHaveLength(1);
+    expect(draft.quotes[0]).toMatchObject({ before: "IX", text: "Quoted line" });
+    expect(draft.text).toBe("eply");
   });
 });

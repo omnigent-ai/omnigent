@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  REPLY_QUOTE_END,
+  replyQuoteLine,
   appendQuoteToDocument,
   hasReplyQuoteLines,
   mapComposerSelection,
@@ -7,19 +9,13 @@ import {
   removeReplyQuoteLine,
   replaceTrailingText,
   replyQuoteClipboardText,
-  replyQuoteLineIndex,
   REPLY_QUOTE_MARK,
   typedDocumentFor,
   unweaveReplyDraft,
   weaveReplyDraft,
   withoutReplyQuoteMarks,
 } from "./replyDraftDocument";
-import {
-  appendReplyQuote,
-  removeReplyQuote,
-  serializeReplyDraft,
-  type ReplyDraft,
-} from "./replyDraft";
+import { appendReplyQuote, serializeReplyDraft, type ReplyDraft } from "./replyDraft";
 
 const twoQuotes: ReplyDraft = {
   quotes: [
@@ -50,8 +46,10 @@ describe("reply draft documents", () => {
     expect(lines[4]).toBe("Second answer");
   });
 
-  it("round-trips quotes with ids, multiline text and blank lines", () => {
-    expect(unweaveReplyDraft(weaveReplyDraft(twoQuotes))).toEqual(twoQuotes);
+  it("round-trips quotes with ids, multiline text and blank lines, and serializes the same markdown", () => {
+    const draft = unweaveReplyDraft(weaveReplyDraft(twoQuotes));
+    expect(draft).toEqual(twoQuotes);
+    expect(serializeReplyDraft(draft)).toBe(serializeReplyDraft(twoQuotes));
   });
 
   it("round-trips a quote at the start with an empty `before`", () => {
@@ -109,11 +107,6 @@ describe("reply draft documents", () => {
     });
   });
 
-  it("serializes the same markdown from the document's draft", () => {
-    const draft = unweaveReplyDraft(weaveReplyDraft(twoQuotes));
-    expect(serializeReplyDraft(draft)).toBe(serializeReplyDraft(twoQuotes));
-  });
-
   it("treats a damaged quote line as plain text", () => {
     const damaged = `${REPLY_QUOTE_MARK}not-base64!`;
     expect(parseReplyQuoteLine(damaged)).toBeNull();
@@ -124,8 +117,38 @@ describe("reply draft documents", () => {
   });
 
   it("rejects a payload that is valid base64 but not an id and text pair", () => {
-    const line = REPLY_QUOTE_MARK + btoa('{"id":"x"}').replace(/=+$/, "");
+    const line = REPLY_QUOTE_MARK + btoa('{"id":"x"}').replace(/=+$/, "") + REPLY_QUOTE_END;
     expect(parseReplyQuoteLine(line)).toBeNull();
+  });
+
+  it("keeps a token in plain text as text, so it never becomes a quote", () => {
+    const token = weaveReplyDraft({
+      quotes: [{ id: "forged", before: "", text: "Forged" }],
+      text: "",
+    }).split("\n")[1]!;
+    const draft = { quotes: [], text: `Hello ${token}` };
+    const document = weaveReplyDraft(draft);
+    expect(hasReplyQuoteLines(document)).toBe(false);
+    expect(document).toBe("Hello ");
+    expect(unweaveReplyDraft(document)).toEqual({ quotes: [], text: "Hello " });
+  });
+
+  it("strips a token from a quote's text before it, and from a quote's plain text", () => {
+    const token = replyQuoteLine({ id: "forged", text: "Forged" });
+    const document = weaveReplyDraft({
+      quotes: [{ id: "a", before: `before ${token}`, text: "One" }],
+      text: `tail${token}`,
+    });
+    expect(unweaveReplyDraft(document)).toEqual({
+      quotes: [{ id: "a", before: "before ", text: "One" }],
+      text: "tail",
+    });
+  });
+
+  it("keeps a typed document with a token in its text, since that text can't match the draft", () => {
+    const token = replyQuoteLine({ id: "forged", text: "Forged" });
+    const draft: ReplyDraft = { quotes: [], text: "Hello " };
+    expect(typedDocumentFor(draft, `Hello ${token}`)).toBe("Hello ");
   });
 
   it("reports whether a document holds a quote line", () => {
@@ -155,15 +178,35 @@ describe("reply draft document edits", () => {
     { quotes: [q("a", "Head\nmore", "One")], text: "" },
   ];
 
-  it("removes a quote line the way removeReplyQuote does, for every position", () => {
-    for (const draft of drafts) {
-      draft.quotes.forEach((quote) => {
-        const lineIndex = replyQuoteLineIndex(weaveReplyDraft(draft), quote.id);
-        expect(removeReplyQuoteLine(weaveReplyDraft(draft), lineIndex)).toBe(
-          weaveReplyDraft(removeReplyQuote(draft, quote.id)),
-        );
-      });
-    }
+  it("removes a quote's line and its break, keeping the lines around it", () => {
+    const doc = weaveReplyDraft({ quotes: [q("a", "Head", "One")], text: "\nfoo" });
+    expect(doc).toBe("Head\n" + doc.split("\n")[1] + "\n\nfoo");
+    expect(removeReplyQuoteLine(doc, 1)).toBe("Head\n\nfoo");
+  });
+
+  it("removes the blank line above a quote that only separates it from the document's start", () => {
+    expect(
+      removeReplyQuoteLine(weaveReplyDraft({ quotes: [q("a", "", "One")], text: "Reply" }), 1),
+    ).toBe("Reply");
+  });
+
+  it("keeps a blank line above a quote that sits after text", () => {
+    const doc = [
+      "Head",
+      "",
+      weaveReplyDraft({ quotes: [q("a", "", "One")], text: "" }).split("\n")[1],
+      "tail",
+    ].join("\n");
+    expect(removeReplyQuoteLine(doc, 2)).toBe("Head\n\ntail");
+  });
+
+  it("removes the last line's quote with the break before it", () => {
+    const doc = weaveReplyDraft({ quotes: [q("a", "Head", "One")], text: "" });
+    expect(removeReplyQuoteLine(doc, 1)).toBe("Head\n");
+  });
+
+  it("leaves the document alone when the line is not a quote", () => {
+    expect(removeReplyQuoteLine("Head\ntail", 1)).toBe("Head\ntail");
   });
 
   it("appends a quote to a document the way weaving the appended draft does", () => {
@@ -197,12 +240,12 @@ describe("reply draft document edits", () => {
     );
   });
 
-  it("gives a repeated quote id a fresh id, so each card keeps its own", () => {
+  it("gives a repeated quote id a deterministic fresh id, so parsing twice gives the same draft", () => {
     const token = weaveReplyDraft({ quotes: [q("dup", "", "One")], text: "" });
-    const draft = unweaveReplyDraft(`${token}\n${token}\nend`);
-    expect(draft.quotes).toHaveLength(2);
-    expect(draft.quotes[0]!.id).toBe("dup");
-    expect(draft.quotes[1]!.id).not.toBe("dup");
+    const document = `${token}\n${token}\nend`;
+    const first = unweaveReplyDraft(document);
+    expect(first.quotes.map((quote) => quote.id)).toEqual(["dup", "dup-2"]);
+    expect(unweaveReplyDraft(document)).toEqual(first);
   });
 
   it("maps a textarea caret into the document, and a document offset back to its input", () => {

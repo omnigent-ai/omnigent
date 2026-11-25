@@ -1046,7 +1046,9 @@ function SideChatComposer({
   const draft = useChatStore((s) => s.sideChatDrafts[childId]);
   const quote = pending ? draft : undefined;
   const quotes = [
-    ...(quote === undefined ? [] : [{ id: "seed", before: "", text: quote }]),
+    ...(quote === undefined
+      ? []
+      : [{ id: "seed", before: composer?.seedBefore ?? "", text: quote }]),
     ...(composer?.quotes ?? []),
   ];
   // The CodeMirror engine holds the quotes and the text in one document.
@@ -1057,8 +1059,7 @@ function SideChatComposer({
   const inputValue = singleDocument
     ? documentOf(composer ?? EMPTY_SIDE_CHAT_COMPOSER, quote)
     : text;
-  // The whole document is kept as typed, and a change from code edits it, so separators the user
-  // removed stay removed. Changes read the store as it is now, since several can land before a render.
+  // Reads the store as it is now: several changes can land before one render.
   const applyDocument = useCallback(
     (document: string) => {
       const parsed = unweaveReplyDraft(document);
