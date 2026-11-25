@@ -120,6 +120,13 @@ async def execute_ticket_tool(
             )
         if name in ("sys_project_kpis_get", "sys_project_kpis_set"):
             path = f"/v1/projects/{project_id}/kpis"
+            role = body.pop("role", None)
+            if role is not None:
+                base = f"/v1/projects/{project_id}/identities"
+                identity, error = await _resolve_identity(role, base, request)
+                if identity is None:
+                    return error
+                path = f"{base}/{identity['id']}/kpis"
             if name == "sys_project_kpis_get":
                 result = await request("GET", path, params=body)
             else:

@@ -875,3 +875,28 @@ def test_members_edit_the_leads_session_defaults_but_only_the_owner_its_charter(
     with pytest.raises(OmnigentError) as denied:
         store.set_lead_charter(_uid("lead"), user_id="bob@example.com", charter="Mine.")
     assert denied.value.code == ErrorCode.FORBIDDEN
+
+
+def test_deleting_a_role_or_its_project_removes_its_kpi_revisions(db_uri: str) -> None:
+    """Role KPI revisions go with their role and with their project."""
+    from omnigent.entities.project_kpi import ProjectKpi
+    from omnigent.stores.project_kpi_store import ProjectKpiStore
+
+    store = SqlAlchemyProjectStore(db_uri)
+    kpis = ProjectKpiStore(db_uri)
+    owner = "alice@example.com"
+    project = store.create(_uid("p1"), "Roles", owner)
+    kpi = ProjectKpi(name="N", metric="none", why="w", not_measured_reason="Survey.")
+    roles = [
+        store.create_identity(project.id, uuid.uuid4().hex, user_id=owner, name=name)
+        for name in ("PM", "Designer")
+    ]
+    for role in roles:
+        kpis.append(project.id, [kpi], user_id=owner, identity_id=role.id)
+
+    assert store.delete_identity(project.id, roles[0].id, user_id=owner)
+    assert kpis.current(project.id, user_id=owner, identity_id=roles[0].id) is None
+    assert kpis.current(project.id, user_id=owner, identity_id=roles[1].id) is not None
+    assert store.delete(project.id, user_id=owner)
+    recreated = store.create(project.id, "Roles", owner)
+    assert kpis.current(recreated.id, user_id=owner, identity_id=roles[1].id) is None

@@ -20,8 +20,8 @@ import itertools
 import logging
 import math
 import statistics
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Collection, Iterable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -85,6 +85,8 @@ class SeriesItem:
     day_utc: str | None = None
     member: MemberKey | None = None
     detail: dict[str, Any] = field(default_factory=dict)
+    #: Tickets and sessions behind a merge, so a role can claim it.
+    claimed_by: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -354,6 +356,7 @@ def load_series(
                     merge.key,
                     "ticket" if merge.key.startswith("ticket:") else "pull_request",
                     member=getattr(merge, "member", None),
+                    claimed_by=tuple(getattr(merge, "claimed_by", ())),
                 )
                 for merge in merged
             ]
@@ -518,3 +521,36 @@ def kpi_rows(
             }
         )
     return rows
+
+
+def role_series(
+    series: dict[str, MetricSeries],
+    ticket_ids: Collection[str],
+    session_ids: Collection[str],
+) -> dict[str, MetricSeries]:
+    """Narrow each metric's series to one role's work.
+
+    Ticket items count when the ticket is the role's (``assignee`` is the role),
+    a merge when one of those tickets or the role's sessions claims it, and spend
+    when it is one of the role's sessions. A metric known only as a project total
+    can't be split, so a role sees it as unavailable.
+    """
+
+    def ours(item: SeriesItem) -> bool:
+        if item.kind == "session":
+            return item.key in session_ids
+        if item.kind == "ticket" and item.key.removeprefix("ticket:") in ticket_ids:
+            return True
+        return any(owner in ticket_ids or owner in session_ids for owner in item.claimed_by)
+
+    narrowed: dict[str, MetricSeries] = {}
+    for metric_id, metric in series.items():
+        if not metric.dated or not metric.available:
+            narrowed[metric_id] = UNAVAILABLE_SERIES
+            continue
+        narrowed[metric_id] = replace(
+            metric,
+            items=[item for item in metric.items if ours(item)],
+            excluded=[excluded for excluded in metric.excluded if ours(excluded.item)],
+        )
+    return narrowed

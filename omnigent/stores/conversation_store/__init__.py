@@ -2253,6 +2253,12 @@ class ConversationStore(ABC):
         """Read host metadata and canonical profile labels by their complete unique keys."""
         raise NotImplementedError
 
+    def get_labels(
+        self, conversation_ids: list[str], keys: tuple[str, ...]
+    ) -> dict[str, dict[str, str]]:
+        """Read many sessions' labels with *keys* in one query; unlabeled ones are absent."""
+        raise NotImplementedError
+
     def get_profile_labels(self, conversation_ids: list[str]) -> dict[str, dict[str, str]]:
         """Read many sessions' canonical profile labels in one query; unlabeled ones are absent."""
         raise NotImplementedError

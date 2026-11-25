@@ -9,7 +9,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
-from omnigent.db.db_models import SqlProject, SqlProjectKpiRevision, current_workspace_id
+from omnigent.db.db_models import (
+    SqlProject,
+    SqlProjectKpiRevision,
+    SqlProjectRoleKpiRevision,
+    current_workspace_id,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -20,8 +25,10 @@ from omnigent.entities.project_kpi import ProjectKpi, ProjectKpiRevision
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_store.access import project_role
 
+_Revision = SqlProjectKpiRevision | SqlProjectRoleKpiRevision
 
-def _revision(row: SqlProjectKpiRevision) -> ProjectKpiRevision:
+
+def _revision(row: _Revision) -> ProjectKpiRevision:
     return ProjectKpiRevision(
         revision=row.revision,
         kpis=[ProjectKpi.model_validate(kpi) for kpi in row.kpis or []],
@@ -32,7 +39,11 @@ def _revision(row: SqlProjectKpiRevision) -> ProjectKpiRevision:
 
 
 class ProjectKpiStore:
-    """Reads and appends KPI revisions; any member reads, only the owner writes."""
+    """Reads and appends KPI revisions; any member reads, only the owner writes.
+
+    Every method serves the project's own set, or a role's set when given its
+    ``identity_id``; the two are versioned separately.
+    """
 
     def __init__(self, storage_location: str) -> None:
         engine = get_or_create_engine(storage_location)
@@ -52,23 +63,36 @@ class ProjectKpiStore:
         return row, role
 
     @staticmethod
-    def _scope(project_id: str) -> tuple[Any, ...]:
+    def _table(identity_id: str | None) -> type[_Revision]:
+        return SqlProjectKpiRevision if identity_id is None else SqlProjectRoleKpiRevision
+
+    @staticmethod
+    def _scope(project_id: str, identity_id: str | None = None) -> tuple[Any, ...]:
+        if identity_id is None:
+            return (
+                SqlProjectKpiRevision.workspace_id == current_workspace_id(),
+                SqlProjectKpiRevision.project_id == project_id,
+            )
         return (
-            SqlProjectKpiRevision.workspace_id == current_workspace_id(),
-            SqlProjectKpiRevision.project_id == project_id,
+            SqlProjectRoleKpiRevision.workspace_id == current_workspace_id(),
+            SqlProjectRoleKpiRevision.project_id == project_id,
+            SqlProjectRoleKpiRevision.identity_id == identity_id,
         )
 
-    def current(self, project_id: str, *, user_id: str | None) -> ProjectKpiRevision | None:
+    def current(
+        self, project_id: str, *, user_id: str | None, identity_id: str | None = None
+    ) -> ProjectKpiRevision | None:
         """The newest revision, or ``None`` when KPIs were never set.
 
         :raises OmnigentError: ``NOT_FOUND`` without access to the project.
         """
         with self._session("get_current_project_kpis") as session:
             self._project(session, project_id, user_id)
+            table = self._table(identity_id)
             row = session.scalar(
-                select(SqlProjectKpiRevision)
-                .where(*self._scope(project_id))
-                .order_by(SqlProjectKpiRevision.revision.desc())
+                select(table)
+                .where(*self._scope(project_id, identity_id))
+                .order_by(table.revision.desc())
                 .limit(1)
             )
             return None if row is None else _revision(row)
@@ -80,16 +104,16 @@ class ProjectKpiStore:
         user_id: str | None,
         limit: int,
         before: int | None = None,
+        identity_id: str | None = None,
     ) -> list[ProjectKpiRevision]:
         """Revisions newest first, optionally only those older than *before*."""
         with self._session("list_project_kpi_revisions") as session:
             self._project(session, project_id, user_id)
-            stmt = select(SqlProjectKpiRevision).where(*self._scope(project_id))
+            table = self._table(identity_id)
+            stmt = select(table).where(*self._scope(project_id, identity_id))
             if before is not None:
-                stmt = stmt.where(SqlProjectKpiRevision.revision < before)
-            rows = session.scalars(
-                stmt.order_by(SqlProjectKpiRevision.revision.desc()).limit(limit)
-            ).all()
+                stmt = stmt.where(table.revision < before)
+            rows = session.scalars(stmt.order_by(table.revision.desc()).limit(limit)).all()
             return [_revision(row) for row in rows]
 
     def append(
@@ -100,6 +124,7 @@ class ProjectKpiStore:
         user_id: str | None,
         session_id: str | None = None,
         base_revision: int | None = None,
+        identity_id: str | None = None,
     ) -> ProjectKpiRevision:
         """Store *kpis* as the next revision and return it.
 
@@ -119,8 +144,9 @@ class ProjectKpiStore:
                     code=ErrorCode.FORBIDDEN,
                 )
             require_active_account(session, user_id)
+            table = self._table(identity_id)
             latest = session.scalar(
-                select(func.max(SqlProjectKpiRevision.revision)).where(*self._scope(project_id))
+                select(func.max(table.revision)).where(*self._scope(project_id, identity_id))
             )
             latest = latest or 0
             if base_revision is not None and base_revision != latest:
@@ -129,9 +155,11 @@ class ProjectKpiStore:
                     f"is {latest}. Re-read them and apply your change again.",
                     code=ErrorCode.CONFLICT,
                 )
-            row = SqlProjectKpiRevision(
+            scope_columns = {} if identity_id is None else {"identity_id": identity_id}
+            row = table(
                 workspace_id=current_workspace_id(),
                 project_id=project_id,
+                **scope_columns,
                 revision=latest + 1,
                 kpis=stored,
                 created_by_user_id=user_id,

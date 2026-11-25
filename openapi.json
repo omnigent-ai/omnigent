@@ -7487,6 +7487,18 @@
             "title": "Generated At",
             "type": "integer"
           },
+          "identity_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The role these KPIs belong to; null for the project's own.",
+            "title": "Identity Id"
+          },
           "kpis": {
             "items": {
               "$ref": "#/components/schemas/ProjectKpiValue"
@@ -24342,6 +24354,152 @@
           }
         },
         "summary": "Update Identity",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/identities/{identity_id}/kpis": {
+      "get": {
+        "description": "A role's current KPIs, measured over its own tickets and sessions.\n\nAny project member may read them.",
+        "operationId": "get_role_kpis_v1_projects__project_id__identities__identity_id__kpis_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "identity_id",
+            "required": true,
+            "schema": {
+              "title": "Identity Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+              "enum": [
+                "7d",
+                "30d",
+                "all"
+              ],
+              "title": "Window",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectKpis"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Role Kpis",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Replace a role's KPI set by appending a revision. The owner or the Lead only.",
+        "operationId": "set_role_kpis_v1_projects__project_id__identities__identity_id__kpis_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "identity_id",
+            "required": true,
+            "schema": {
+              "title": "Identity Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+              "enum": [
+                "7d",
+                "30d",
+                "all"
+              ],
+              "title": "Window",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProjectKpis"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectKpis"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Role Kpis",
         "tags": [
           "projects"
         ]

@@ -455,3 +455,95 @@ async def test_status_items_endpoint_lists_tickets_with_titles(
         f"{path}/status/items", params={"metric": "tickets_shipped"}, headers=stranger
     )
     assert hidden.status_code == 404
+
+
+def test_role_series_keeps_only_the_roles_tickets_and_sessions() -> None:
+    from omnigent.server.project_kpis import UNAVAILABLE_SERIES, SeriesItem, role_series
+
+    shipped = MetricSeries(
+        "distinct",
+        items=[SeriesItem(1, "t-mine", "ticket"), SeriesItem(1, "t-other", "ticket")],
+    )
+    merged = MetricSeries(
+        "distinct",
+        items=[
+            SeriesItem(1, "ticket:t-mine", "ticket"),
+            SeriesItem(
+                1, "https://example.com/o/r/pull/7", "pull_request", claimed_by=("t-mine",)
+            ),
+            SeriesItem(
+                1, "https://example.com/o/r/pull/8", "pull_request", claimed_by=("s-mine",)
+            ),
+            SeriesItem(
+                1, "https://example.com/o/r/pull/9", "pull_request", claimed_by=("t-other",)
+            ),
+        ],
+    )
+    spend = MetricSeries(
+        "daily_sum",
+        items=[
+            SeriesItem(None, "s-mine", "session", value=5, day_utc="2026-11-24"),
+            SeriesItem(None, "s-other", "session", value=9, day_utc="2026-11-24"),
+        ],
+    )
+    total_only = MetricSeries("distinct", dated=False, window_value=MetricValue(3))
+    narrowed = role_series(
+        {"tickets_shipped": shipped, "merged_prs": merged, "spend_usd": spend, "x": total_only},
+        {"t-mine"},
+        {"s-mine"},
+    )
+    assert [item.key for item in narrowed["tickets_shipped"].items] == ["t-mine"]
+    assert [item.key for item in narrowed["merged_prs"].items] == [
+        "ticket:t-mine",
+        "https://example.com/o/r/pull/7",
+        "https://example.com/o/r/pull/8",
+    ]
+    assert [item.key for item in narrowed["spend_usd"].items] == ["s-mine"]
+    assert narrowed["x"] is UNAVAILABLE_SERIES
+
+
+async def test_a_role_has_its_own_kpis_set_by_the_owner_or_lead(
+    project_client: httpx.AsyncClient,  # noqa: F811 - imported fixture
+    db_uri: str,
+) -> None:
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    path = f"/v1/projects/{created['id']}"
+    pm = (
+        await project_client.post(f"{path}/identities", json={"name": "PM", "instructions": "y"})
+    ).json()
+    role_path = f"{path}/identities/{pm['id']}/kpis"
+    empty = (await project_client.get(role_path)).json()
+    assert (empty["revision"], empty["identity_id"], empty["kpis"]) == (0, pm["id"], [])
+
+    lead = _bind_runner(db_uri, created["main_session_id"], "lead-secret")
+    written = await project_client.put(role_path, json={"kpis": [SPEND]}, headers=lead)
+    assert written.status_code == 200, written.text
+    assert written.json()["revision"] == 1
+    worker = _bind_runner(db_uri, pm["active_session_id"], "worker-secret")
+    refused = await project_client.put(role_path, json={"kpis": []}, headers=worker)
+    assert refused.status_code == 403
+    # Role and project sets are versioned separately.
+    assert (await project_client.get(f"{path}/kpis")).json()["revision"] == 0
+    missing = await project_client.get(f"{path}/identities/{'0' * 32}/kpis")
+    assert missing.status_code == 404
+
+    shipped_kpi = {
+        "name": "Shipped",
+        "metric": "tickets_shipped",
+        "why": "Throughput.",
+        "target": 1,
+        "direction": "at_least",
+    }
+    for title, labels in (("Mine", [{"key": "assignee", "value": "pm"}]), ("Other", [])):
+        ticket = (
+            await project_client.post(f"{path}/tickets", json={"title": title, "labels": labels})
+        ).json()
+        moved = await project_client.patch(
+            f"{path}/tickets/{ticket['id']}", json={"stage_id": "done"}
+        )
+        assert moved.status_code == 200, moved.text
+    await project_client.put(role_path, json={"kpis": [shipped_kpi]})
+    await project_client.put(f"{path}/kpis", json={"kpis": [shipped_kpi]})
+    role_value = (await project_client.get(role_path)).json()["kpis"][0]["value"]
+    project_value = (await project_client.get(f"{path}/kpis")).json()["kpis"][0]["value"]
+    assert (role_value, project_value) == (1, 2)

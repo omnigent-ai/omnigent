@@ -21,6 +21,7 @@ from omnigent.db.db_models import (
     SqlProject,
     SqlProjectIdentity,
     SqlProjectKpiRevision,
+    SqlProjectRoleKpiRevision,
     SqlProjectShare,
     SqlProjectTicket,
     SqlProjectTicketEvent,
@@ -770,7 +771,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 )
             for identity in self._identity_rows(session, project_id):
                 session.delete(identity)
-            for model in (SqlProjectShare, SqlProjectKpiRevision):
+            for model in (SqlProjectShare, SqlProjectKpiRevision, SqlProjectRoleKpiRevision):
                 session.execute(
                     delete(model).where(
                         model.workspace_id == current_workspace_id(),
@@ -1408,6 +1409,13 @@ class SqlAlchemyProjectStore(ProjectStore):
             if row is None:
                 return False
             session.delete(row)
+            session.execute(
+                delete(SqlProjectRoleKpiRevision).where(
+                    SqlProjectRoleKpiRevision.workspace_id == current_workspace_id(),
+                    SqlProjectRoleKpiRevision.project_id == project_id,
+                    SqlProjectRoleKpiRevision.identity_id == identity_id,
+                )
+            )
             invalidate_after_commit(session, project_id)
             return True
 

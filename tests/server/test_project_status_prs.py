@@ -61,6 +61,8 @@ def test_one_pr_in_both_sources_counts_once_for_its_creator() -> None:
         members.get,
     )
     assert [(item.key, item.merged_at, item.member) for item in items] == [(PR, 50.0, "user:a")]
+    # Both sessions and the ticket claim it, so any of them can count it as theirs.
+    assert items[0].claimed_by == ("attacher", "creator", "t1")
 
 
 def test_tickets_credit_their_first_non_lead_session_or_nobody() -> None:

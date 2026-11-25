@@ -576,18 +576,36 @@ class SysProjectFileViewTool(_TicketTool):
     arguments = ViewProjectFile
 
 
+_KPI_ROLE = Field(
+    default=None,
+    min_length=1,
+    max_length=64,
+    description=(
+        "A role's name or ID to use that role's own KPIs, measured over its tickets "
+        "and sessions; omit for the project's."
+    ),
+)
+
+
 class GetProjectKpis(BaseModel):
     model_config = ConfigDict(extra="forbid")
     window: Literal["7d", "30d", "all"] = Field(
         default="7d", description="The UTC window values are measured over, as on the Summary."
     )
+    role: str | None = _KPI_ROLE
+
+
+class SetKpis(SetProjectKpis):
+    role: str | None = _KPI_ROLE
 
 
 class SysProjectKpisGetTool(_TicketTool):
     tool_name = "sys_project_kpis_get"
     read_only = True
     help_text = (
-        "Read this project's KPIs: each one's name, metric, why it matters, target and "
+        "Read this project's KPIs, or one role's with role (counted over tickets assigned to "
+        "the role's current name and its sessions): each one's name, metric, why it matters, "
+        "target and "
         "direction, with its current value and whether it meets the target over the window. "
         "Also returns the current revision, who set it, and the metrics a KPI may track."
     )
@@ -597,12 +615,13 @@ class SysProjectKpisGetTool(_TicketTool):
 class SysProjectKpisSetTool(_TicketTool):
     tool_name = "sys_project_kpis_set"
     help_text = (
-        "Replace this project's KPIs with a complete new set (3-4 is typical), stored as a "
+        "Replace this project's KPIs, or one role's with role, with a complete new set "
+        "(3-4 is typical), stored as a "
         "new revision; earlier revisions are kept. Only the project's Lead may call it, and "
         "only when the owner asked for the change. Read the KPIs first and pass their "
         "revision as base_revision so a concurrent edit isn't overwritten."
     )
-    arguments = SetProjectKpis
+    arguments = SetKpis
 
 
 class FileTicketInProject(FileIntakeTicket):

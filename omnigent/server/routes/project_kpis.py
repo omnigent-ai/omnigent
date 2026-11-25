@@ -10,6 +10,7 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
 from omnigent.db.utils import now_epoch
+from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.entities.project_kpi import (
     KPI_METRICS,
     KPI_METRICS_BY_ID,
@@ -30,6 +31,7 @@ from omnigent.server.project_kpis import (
     kpi_history_since,
     kpi_rows,
     load_series,
+    role_series,
 )
 from omnigent.server.project_status import (
     StatusPeriod,
@@ -48,6 +50,7 @@ from omnigent.server.routes.projects import refuse_unless_owner_or_lead
 
 if TYPE_CHECKING:
     from omnigent.entities import Project
+    from omnigent.entities.project import ProjectIdentity
     from omnigent.server.auth import AuthProvider
     from omnigent.stores import ConversationStore, ProjectStore
     from omnigent.stores.project_kpi_store import ProjectKpiStore
@@ -112,6 +115,9 @@ class ProjectKpis(BaseModel):
 
     object: Literal["project.kpis"]
     project_id: str
+    identity_id: str | None = Field(
+        default=None, description="The role these KPIs belong to; null for the project's own."
+    )
     window: StatusWindow
     today_utc: str
     since_day_utc: str | None
@@ -269,14 +275,22 @@ def create_project_kpis_router(
         window: StatusWindow,
         current: ProjectKpiRevision | None,
         user_id: str | None,
+        identity: ProjectIdentity | None = None,
     ) -> dict[str, Any]:
         period = status_period(window, now_epoch())
         kpis = current.kpis if current else []
         inputs = inputs_for(request, project, period, user_id, kpi_history_since(period))
         series = load_series((kpi.metric for kpi in kpis), inputs)
+        if identity is not None:
+            series = role_series(
+                series,
+                ticket_store.assigned_ticket_ids(project.id, identity.name, user_id=user_id),
+                role_sessions(series, identity.id),
+            )
         return {
             "object": "project.kpis",
             "project_id": project.id,
+            "identity_id": identity.id if identity is not None else None,
             "window": window,
             "today_utc": period.today_utc,
             "since_day_utc": period.since_day_utc,
@@ -289,6 +303,101 @@ def create_project_kpis_router(
             "kpis": kpi_rows(kpis, series, period),
             "metrics": [metric.model_dump() for metric in KPI_METRICS],
         }
+
+    def role_sessions(series: dict[str, Any], identity_id: str) -> set[str]:
+        """Which sessions behind *series* (spend roots, merge claimers) are the role's.
+
+        Decided by each session's identity label; ticket IDs among the merge
+        claimers simply have no label.
+        """
+        candidates: set[str] = set()
+        spend = series.get("spend_usd")
+        if spend is not None:
+            candidates.update(item.key for item in spend.items)
+        merged = series.get("merged_prs")
+        if merged is not None:
+            candidates.update(owner for item in merged.items for owner in item.claimed_by)
+        roots = sorted(candidates)
+        if not roots or conversation_store is None:
+            return set()
+        labels = conversation_store.get_labels(roots, (PROJECT_IDENTITY_LABEL_KEY,))
+        return {
+            root
+            for root, found in labels.items()
+            if found.get(PROJECT_IDENTITY_LABEL_KEY) == identity_id
+        }
+
+    async def load_identity(project: Project, identity_id: str, user_id: str | None) -> Any:
+        identity = await asyncio.to_thread(
+            project_store.get_identity, project.id, identity_id, user_id=user_id
+        )
+        if identity is None:
+            raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+        return identity
+
+    @router.get("/projects/{project_id}/identities/{identity_id}/kpis", response_model=ProjectKpis)
+    async def get_role_kpis(
+        request: Request,
+        project_id: str,
+        identity_id: str,
+        window: WindowParam = "7d",
+    ) -> dict[str, Any]:
+        """A role's current KPIs, measured over its own tickets and sessions.
+
+        Any project member may read them.
+        """
+        user_id = require_user(request, auth_provider)
+        project = await load_project(project_id, user_id)
+        identity = await load_identity(project, identity_id, user_id)
+        current = await asyncio.to_thread(
+            kpi_store.current, project.id, user_id=user_id, identity_id=identity.id
+        )
+        return await asyncio.to_thread(build, request, project, window, current, user_id, identity)
+
+    @router.put("/projects/{project_id}/identities/{identity_id}/kpis", response_model=ProjectKpis)
+    async def set_role_kpis(
+        request: Request,
+        project_id: str,
+        identity_id: str,
+        body: SetProjectKpis,
+        window: WindowParam = "7d",
+    ) -> dict[str, Any]:
+        """Replace a role's KPI set by appending a revision. The owner or the Lead only."""
+        user_id = require_user(request, auth_provider)
+        if conversation_store is not None:
+            await asyncio.to_thread(
+                refuse_role_side_chat,
+                request,
+                action="Changing a role's KPIs",
+                user_id=user_id,
+                conversations=conversation_store,
+                projects=project_store,
+            )
+        project = await load_project(project_id, user_id)
+        identity = await load_identity(project, identity_id, user_id)
+        session_id = await asyncio.to_thread(
+            refuse_unless_owner_or_lead,
+            request,
+            project,
+            OmnigentError(
+                "Only the project owner or its Lead can change a role's KPIs",
+                code=ErrorCode.FORBIDDEN,
+            ),
+            user_id=user_id,
+            conversation_store=conversation_store,
+        )
+        revision = await asyncio.to_thread(
+            kpi_store.append,
+            project.id,
+            body.kpis,
+            user_id=user_id,
+            session_id=session_id,
+            base_revision=body.base_revision,
+            identity_id=identity.id,
+        )
+        return await asyncio.to_thread(
+            build, request, project, window, revision, user_id, identity
+        )
 
     @router.get("/projects/{project_id}/kpis", response_model=ProjectKpis)
     async def get_project_kpis(

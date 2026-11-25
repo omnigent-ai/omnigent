@@ -6227,6 +6227,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
             return self._profile_host_binding(meta, snapshot)
 
+    def get_labels(
+        self, conversation_ids: list[str], keys: tuple[str, ...]
+    ) -> dict[str, dict[str, str]]:
+        with self._conv_session("read_session_labels") as labels:
+            return _fetch_labels_bulk(labels, conversation_ids, keys=keys)
+
     def get_profile_labels(self, conversation_ids: list[str]) -> dict[str, dict[str, str]]:
         with self._conv_session("read_host_session_profiles") as labels:
             return _fetch_labels_bulk(labels, conversation_ids, keys=PROFILE_LABEL_KEYS)

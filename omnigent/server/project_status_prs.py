@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
@@ -116,6 +116,8 @@ class MergedItem:
     key: str
     merged_at: float | None
     member: MemberKey | None
+    #: The tickets and sessions that claim this merge, for counting it per role.
+    claimed_by: tuple[str, ...] = ()
 
 
 def _session_claim(pr: SessionMergedPr) -> tuple[int, float, str]:
@@ -139,7 +141,10 @@ def combine(
         best = min(prs, key=_session_claim)
         dated = [pr.merged_at for pr in prs if pr.merged_at is not None]
         items[key] = MergedItem(
-            key, min(dated) if dated else None, member_of_session(best.session_id)
+            key,
+            min(dated) if dated else None,
+            member_of_session(best.session_id),
+            tuple(sorted({pr.session_id for pr in prs})),
         )
     for ticket in tickets:
         worker = next(
@@ -156,10 +161,14 @@ def combine(
         for key in keys:
             known = items.get(key)
             if known is None:
-                items[key] = MergedItem(key, ticket.merged_at, worker)
-            elif known.merged_at is None:
+                items[key] = MergedItem(key, ticket.merged_at, worker, (ticket.ticket_id,))
+                continue
+            claimed_by = tuple(sorted({*known.claimed_by, ticket.ticket_id}))
+            if known.merged_at is None:
                 # A session saw it merged but didn't date it; the ticket's move does.
-                items[key] = MergedItem(key, ticket.merged_at, known.member or worker)
+                items[key] = MergedItem(key, ticket.merged_at, known.member or worker, claimed_by)
+            else:
+                items[key] = replace(known, claimed_by=claimed_by)
     return list(items.values())
 
 

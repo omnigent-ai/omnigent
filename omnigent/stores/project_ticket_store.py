@@ -607,6 +607,29 @@ class ProjectTicketStore:
             ).all()
             return [(ticket_id, stage_id, updated_at) for ticket_id, stage_id, updated_at in rows]
 
+    def assigned_ticket_ids(
+        self, project_id: str, assignee: str, *, user_id: str | None
+    ) -> builtins.set[str]:
+        """IDs of the project's tickets labeled ``assignee: <assignee>`` (case-insensitive)."""
+        wanted = assignee.strip().casefold()
+        with self._session("list_assigned_ticket_ids") as session:
+            self._project(session, project_id, user_id)
+            rows = session.execute(
+                select(SqlProjectTicket.id, SqlProjectTicket.labels).where(
+                    SqlProjectTicket.workspace_id == current_workspace_id(),
+                    SqlProjectTicket.project_id == _identifier(project_id),
+                )
+            )
+            return {
+                ticket_id
+                for ticket_id, labels in rows
+                if any(
+                    label.get("key") == "assignee"
+                    and str(label.get("value") or "").strip().casefold() == wanted
+                    for label in labels or ()
+                )
+            }
+
     def ticket_titles(
         self, project_id: str, ticket_ids: builtins.list[str], *, user_id: str | None
     ) -> dict[str, str]:
