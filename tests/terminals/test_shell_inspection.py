@@ -57,6 +57,14 @@ SANDBOX_IDLE = snapshot(
     (203, 202, 201, -1, "S", "bash"),
 )
 SANDBOX_SLEEP = SANDBOX_IDLE + snapshot((300, 203, 201, -1, "S", "sleep")).split("\n", 1)[1]
+# Work the shell left running, adopted by the sandbox's namespace init or left under its launcher.
+SANDBOX_ADOPTED = SANDBOX_IDLE + snapshot((300, 201, 300, -1, "S", "sleep")).split("\n", 1)[1]
+SANDBOX_UNDER_LAUNCHER = (
+    SANDBOX_IDLE + snapshot((301, 202, 301, -1, "S", "node")).split("\n", 1)[1]
+)
+SANDBOX_SLEEP_AND_ADOPTED = (
+    SANDBOX_SLEEP + snapshot((400, 201, 400, -1, "S", "make")).split("\n", 1)[1]
+)
 
 
 @pytest.mark.parametrize(
@@ -67,8 +75,20 @@ SANDBOX_SLEEP = SANDBOX_IDLE + snapshot((300, 203, 201, -1, "S", "sleep")).split
         (SANDBOX_IDLE, ShellInspection(ShellState.IDLE)),
         # No job control under the sandbox: the shell's child is named, jobs aren't counted.
         (SANDBOX_SLEEP, ShellInspection(ShellState.BUSY, "sleep", None)),
+        # Work beneath the pane but outside the shell's tree still ends with the pane.
+        (SANDBOX_ADOPTED, ShellInspection(ShellState.BUSY, "sleep", None)),
+        (SANDBOX_UNDER_LAUNCHER, ShellInspection(ShellState.BUSY, "node", None)),
+        (SANDBOX_SLEEP_AND_ADOPTED, ShellInspection(ShellState.BUSY, "sleep", None)),
     ],
-    ids=["plain idle", "plain sleep", "sandbox idle", "sandbox sleep"],
+    ids=[
+        "plain idle",
+        "plain sleep",
+        "sandbox idle",
+        "sandbox sleep",
+        "sandbox work adopted by its init",
+        "sandbox work under its launcher",
+        "sandbox job and adopted work",
+    ],
 )
 def test_reads_the_probed_pane_layouts(text: str, expected: ShellInspection) -> None:
     assert inspect(text) == expected

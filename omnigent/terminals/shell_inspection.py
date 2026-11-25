@@ -159,7 +159,9 @@ def inspect_shell(
     The pane's process must be a child of its own tmux server in this same snapshot, else its
     pid may have been reused and the answer is unknown. The login shell is the first process
     under the pane named for the terminal's command: the pane's own process, or one below a
-    sandbox launcher. It is idle when nothing runs under it.
+    sandbox launcher. It is idle when nothing runs under it, and nothing else runs anywhere
+    under the pane besides the launchers between the pane and the shell. A sandbox's namespace
+    init adopts work its shell left running, and closing the pane ends that work too.
 
     :param snapshot: ``ps -e -o`` :data:`PS_COLUMNS` output.
     :param tmux_server_pid: The pane's tmux server, from tmux's ``#{pid}``.
@@ -191,12 +193,47 @@ def inspect_shell(
     if shell is None:
         return UNKNOWN
 
-    jobs: list[_Row] = []
-    stack = list(children.get(shell.pid, []))
+    jobs = _descendants(shell, children)
+    launchers: set[int] = set()
+    row = shell
+    while row.pid != pane.pid:
+        row = by_pid[row.ppid]
+        launchers.add(row.pid)
+    job_pids = {job.pid for job in jobs}
+    strays = [
+        row
+        for row in _descendants(pane, children)
+        if row.pid not in launchers and row.pid != shell.pid and row.pid not in job_pids
+    ]
+    answer = _jobs_answer(shell, jobs, children)
+    if not strays:
+        return answer
+    # Work outside the shell's own tree has no job control to count it by.
+    if answer.state is ShellState.IDLE:
+        first = min(strays, key=lambda row: row.pid)
+        return ShellInspection(ShellState.BUSY, sanitize_command_name(first.comm), None)
+    return ShellInspection(ShellState.BUSY, answer.foreground, None)
+
+
+def _descendants(root: _Row, children: dict[int, list[_Row]]) -> list[_Row]:
+    """Every process below ``root``, each once even if forged rows make a cycle."""
+    found: list[_Row] = []
+    seen = {root.pid}
+    stack = list(children.get(root.pid, []))
     while stack:
         row = stack.pop()
-        jobs.append(row)
+        if row.pid in seen:
+            continue
+        seen.add(row.pid)
+        found.append(row)
         stack.extend(children.get(row.pid, []))
+    return found
+
+
+def _jobs_answer(
+    shell: _Row, jobs: list[_Row], children: dict[int, list[_Row]]
+) -> ShellInspection:
+    """The answer from the shell's own descendants, ``jobs``."""
     if not jobs:
         return ShellInspection(ShellState.IDLE)
 
