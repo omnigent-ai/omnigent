@@ -27039,6 +27039,17 @@
               ],
               "title": "Pr Url"
             }
+          },
+          {
+            "description": "Set by a client that polls again soon: the answer may come from the runner's previous read, at most a minute old.",
+            "in": "query",
+            "name": "allow_cached",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Allow Cached",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

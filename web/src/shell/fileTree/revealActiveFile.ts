@@ -31,6 +31,19 @@ function isHiddenPath(path: string): boolean {
 }
 
 /**
+ * What a Reveal says when the tree's listings left the file out, for its toast.
+ *
+ * :param file: The file asked about, e.g. ``"logs/artifact.log"``.
+ * :param showIgnored: Whether the tree lists what Git ignores.
+ */
+export function missedRevealMessage(file: string, showIgnored: boolean): string {
+  const name = file.split("/").filter(Boolean).at(-1) ?? file;
+  return showIgnored
+    ? `${name} isn’t in the Files tree. It may have moved or been deleted.`
+    : `${name} isn’t in the Files tree. Git may ignore it, and ignored files are hidden.`;
+}
+
+/**
  * How to reveal `activePath` in a tree browsing `location` (the panel's wire form:
  * "" for the workspace root): in place, or from the workspace root when the
  * browsed folder doesn't hold it. A file the tree can't show isn't offered.

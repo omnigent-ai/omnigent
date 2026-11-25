@@ -30,6 +30,9 @@ export const WORKSPACE_SIDEBAR_LAYOUT = {
   content: "col-start-2 row-start-2 min-w-0",
 } as const;
 
+/** Marks a control inside a sidebar that handles Escape itself, so the popover stays open. */
+export const SIDEBAR_HANDLES_ESCAPE = "data-sidebar-handles-escape";
+
 /** The compact toolbar row workspace pages share, matching the Changes review. */
 export const WORKSPACE_TOOLBAR_CLASS =
   "flex min-h-9 shrink-0 items-center gap-1 border-b border-border px-2 py-0.5 text-ui";
@@ -172,6 +175,11 @@ export function WorkspaceSidebarLayout({
           collisionPadding={8}
           className="flex h-96 w-72 flex-col overflow-hidden p-0"
           aria-label={sidebarLabel}
+          // A field that uses Escape itself, such as the tree's name filter, keeps the popover.
+          onEscapeKeyDown={(event) => {
+            const target = event.target instanceof Element ? event.target : null;
+            if (target?.closest(`[${SIDEBAR_HANDLES_ESCAPE}]`)) event.preventDefault();
+          }}
           // A sidebar marks the control to start on with data-sidebar-initial-focus, such as
           // the tree's Go to File; without one the popover starts on its first control.
           onOpenAutoFocus={(event) => {

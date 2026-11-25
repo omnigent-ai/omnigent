@@ -15,13 +15,14 @@ import os
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import pytest
 from PIL import Image
 from playwright.sync_api import Locator, Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
 from tests.e2e_ui.desktop._mac_shell import MAC_SHELL_INIT_SCRIPT, WINDOW_CONTROLS_STRIP
 
 _VIEWPORT = {"width": 1440, "height": 900}
@@ -68,9 +69,11 @@ def _settle(page: Page) -> None:
     page.evaluate(_SETTLE_JS)
 
 
-def _set_features(page: Page, floating: bool, *, tabs_sidebar: bool = True) -> None:
-    """Answer ``/v1/info`` with floating panes set to ``floating``, and the tabs sidebar on
-    unless ``tabs_sidebar`` turns it off for the classic one."""
+def _set_features(
+    page: Page, floating: bool, *, tabs_sidebar: bool = True, extra: dict[str, bool] | None = None
+) -> None:
+    """Answer ``/v1/info`` with floating panes set to ``floating``, the tabs sidebar on unless
+    ``tabs_sidebar`` turns it off for the classic one, and any ``extra`` features."""
 
     def answer(route: Route) -> None:
         response = route.fetch()
@@ -79,10 +82,33 @@ def _set_features(page: Page, floating: bool, *, tabs_sidebar: bool = True) -> N
             **(info.get("features") or {}),
             "workspace_sidebar_v2": tabs_sidebar,
             "floating_panes": floating,
+            **(extra or {}),
         }
         route.fulfill(response=response, json=info)
 
     page.route("**/v1/info", answer)
+
+
+def _list_only(page: Page, session_id: str) -> None:
+    """Answer the sidebar's session list with this test's session alone.
+
+    The shard shares one server, so sessions other tests created would otherwise fill the
+    sidebar, and the pixel checks would compare rows a layout change moved, not its surface.
+    """
+
+    def answer(route: Route) -> None:
+        # Only the list endpoint, not /v1/sessions/{id} or its sub-resources.
+        if route.request.method != "GET" or urlparse(route.request.url).path != "/v1/sessions":
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        payload = response.json()
+        payload["data"] = [
+            session for session in payload.get("data", []) if session.get("id") == session_id
+        ]
+        route.fulfill(response=response, json=payload)
+
+    page.route("**/v1/sessions?*", answer)
 
 
 def _open(
@@ -94,10 +120,11 @@ def _open(
     floating: bool,
     viewport: dict[str, int] = _VIEWPORT,
     tabs_sidebar: bool = True,
+    extra_features: dict[str, bool] | None = None,
 ) -> None:
     page.set_viewport_size(viewport)
     page.emulate_media(color_scheme=scheme)
-    _set_features(page, floating, tabs_sidebar=tabs_sidebar)
+    _set_features(page, floating, tabs_sidebar=tabs_sidebar, extra=extra_features)
     page.goto(f"{base_url}/c/{session_id}")
     expect(message_composer(page)).to_be_visible(timeout=30_000)
     expect(page.locator(".app-shell[data-floating-panes]")).to_have_count(1 if floating else 0)
@@ -174,6 +201,8 @@ def test_without_floating_panes_the_layout_stays_edge_to_edge_and_the_sidebar_pa
     """With the flag off the chat has no card and the dark sidebar keeps its edge; the
     sidebar's own surface is the same either way, so its rows keep their contrast."""
     base_url, session_id = seeded_session
+    # The region compared below must be the sidebar's empty surface in both layouts.
+    _list_only(page, session_id)
     regions: list[Image.Image] = []
     for floating in (True, False):
         _open(page, base_url, session_id, scheme=scheme, floating=floating)
@@ -194,6 +223,56 @@ def test_without_floating_panes_the_layout_stays_edge_to_edge_and_the_sidebar_pa
         for left, right in zip(floating_region.getdata(), flat_region.getdata(), strict=True)
     )
     assert worst <= _MAX_STEP, f"the sidebar paints up to {worst} differently"
+
+
+def _choose_pane_corners(page: Page, query: str, choice: str | None = None) -> None:
+    """Open ⌘K, find Pane corners by ``query``, and accept ``choice`` (or the one it names)."""
+    page.keyboard.press("ControlOrMeta+k")
+    palette = page.get_by_test_id("command-palette-input")
+    expect(palette).to_be_focused(timeout=10_000)
+    palette.fill(query)
+    # Enter acts on the active row, so wait for the search to settle on Pane corners.
+    row = page.get_by_role("option", name=re.compile("^Pane corners"))
+    expect(row).to_have_attribute("aria-selected", "true")
+    page.keyboard.press("Enter")
+    if choice is not None:
+        page.get_by_role("option", name=re.compile(f"^{re.escape(choice)}")).click()
+    else:
+        page.keyboard.press("Enter")
+    # A setting's choice applies and goes back to the palette's list, which stays open.
+    expect(page.get_by_role("option", name=re.compile("^Pane corners"))).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(palette).to_have_count(0)
+
+
+def test_cmd_k_switches_to_sharp_corners_and_back_to_automatic_across_a_reload(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Typing "sharp corners" in ⌘K turns floating panes off on this device, a reload keeps the
+    choice, and Automatic follows the server's floating panes again."""
+    base_url, session_id = seeded_session
+    # The Pane corners row is a setting the QuickPick ⌘K offers.
+    _open(
+        page,
+        base_url,
+        session_id,
+        scheme="light",
+        floating=True,
+        extra_features={"quick_pick_palette": True},
+    )
+    floating_shell = page.locator(".app-shell[data-floating-panes]")
+
+    _choose_pane_corners(page, "sharp corners", "Sharp corners")
+    expect(floating_shell).to_have_count(0)
+    page.reload()
+    expect(message_composer(page)).to_be_visible(timeout=30_000)
+    expect(floating_shell).to_have_count(0)
+
+    _choose_pane_corners(page, "pane corners", "Automatic (Floating panes)")
+    expect(floating_shell).to_have_count(1)
+    page.reload()
+    expect(message_composer(page)).to_be_visible(timeout=30_000)
+    expect(floating_shell).to_have_count(1)
 
 
 def test_the_chat_card_stays_rounded_after_switching_sessions(

@@ -5,7 +5,8 @@ one pane, ⌘D splits it with a shell, the pane keys move between panes, ⌘K li
 commands, and a pane's title strip has a menu that closes it. With a split shown, Chat keeps
 the panes on screen and the web chat is the agent's pane. A shell tab in the workspace sidebar
 splits the same way, and its split shows as one strip entry that closes whole. With the flag
-off, the same session keeps the classic Terminal view.
+off, the same session keeps the classic Terminal view. A divider drag saves its size on
+release, also when the macOS app drops the divider's pointer capture just before it.
 
 The session is terminal-first (``omnigent.ui = terminal``), so the runner starts the agent's
 own terminal, and its agent declares a ``zsh`` shell, running ``bash``, for splits. The flag is
@@ -17,6 +18,7 @@ are in the component tests (``useTerminalPaneHotkeys``, ``terminalPaneActions``,
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterator
 
@@ -134,6 +136,10 @@ def _split_from(page: Page, panes: Locator, keyboard: Locator) -> Locator:
     """Split with ⌘D from ``keyboard``, and return the new pane's terminal input once it has it."""
     before = panes.get_by_test_id("terminal-view").count()
     keyboard.focus()
+    # ⌘D splits once the pane has the keyboard and its agent's shells have loaded; its row's
+    # Split Right shows then.
+    expect(keyboard).to_be_focused()
+    expect(panes.get_by_test_id("pane-strip-split-right").first).to_be_attached(timeout=60_000)
     page.keyboard.press("Meta+d")
     terminals = panes.get_by_test_id("terminal-view")
     expect(terminals).to_have_count(before + 1, timeout=60_000)
@@ -251,3 +257,86 @@ def test_flag_off_keeps_the_classic_terminal_view(
     _connected(page.locator(".main-terminal-view").get_by_test_id("terminal-view").first)
     expect(page.get_by_test_id("split-panes-main-view")).to_have_count(0)
     expect(page.locator("[data-pane-strip]")).to_have_count(0)
+
+
+# Records the page's pointer releases and each pointer capture it loses, in order.
+_WATCH_CAPTURE = """
+window.__pointerEnds = [];
+for (const type of ["lostpointercapture", "pointerup", "pointercancel"]) {
+  document.addEventListener(type, (event) => {
+    const target = event.target;
+    const name = target instanceof Element ? target.getAttribute("aria-label") : null;
+    window.__pointerEnds.push(`${type}:${name ?? "other"}`);
+  }, true);
+}
+"""
+
+
+@pytest.mark.parametrize("view", ["chat", "terminal"])
+@pytest.mark.parametrize("capture", ["kept", "dropped"])
+def test_a_split_resizes_through_a_whole_drag(
+    page: Page, panes_session: tuple[str, str], view: str, capture: str
+) -> None:
+    """Dragging the divider beside a shell that has the keyboard saves the new size on release.
+    That holds when the macOS app drops the divider's pointer capture just before the release,
+    which then lands on the pane under the pointer."""
+    base_url, session_id = panes_session
+    page.add_init_script(_WATCH_CAPTURE)
+    unsaved: list[str] = []
+    page.on(
+        "console",
+        lambda message: (
+            unsaved.append(message.text) if "drag ended unsaved" in message.text else None
+        ),
+    )
+    _open(page, base_url, session_id)
+    _select_view(page, "terminal")
+    panes = _main_panes(page)
+    agent = _connected(panes.locator(_AGENT_PANE).get_by_test_id("terminal-view"))
+    _split_from(page, panes, agent)
+    if view == "chat":
+        _select_view(page, "chat")
+        expect(panes.locator("[data-chat-pane-body]")).to_be_visible(timeout=30_000)
+    shell = _connected(panes.get_by_test_id("terminal-view").last)
+    shell.focus()
+    expect(shell).to_be_focused()
+
+    divider = panes.get_by_test_id("terminal-split-divider")
+    expect(divider).to_have_attribute("aria-valuenow", "50")
+    box = divider.bounding_box()
+    assert box is not None
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    page.mouse.move(x, y)
+    page.evaluate("window.__pointerEnds = []")
+    page.mouse.down()
+    # A person's drag: small moves across most of a second, past the panes' resize settling.
+    for step in range(1, 21):
+        page.mouse.move(x - step * 8, y)
+        page.wait_for_timeout(40)  # custom-lint: disable=sleep-then-assert -- paces the drag
+    if capture == "dropped":
+        # As the macOS app does: the capture ends as the release comes, not before.
+        divider.evaluate("el => el.releasePointerCapture(1)")
+    page.mouse.up()
+
+    page.wait_for_function("window.__pointerEnds.some(end => end.startsWith('lost'))")
+    ends = page.evaluate("window.__pointerEnds")
+    if capture == "kept":
+        # The divider keeps the pointer until its release, which then lets it go.
+        assert ends[0] == "pointerup:Resize terminal panes", ends
+    else:
+        assert ends[0] == "lostpointercapture:Resize terminal panes", ends
+        assert ends[1] != "pointerup:Resize terminal panes", ends
+    expect(divider).not_to_have_attribute("aria-valuenow", "50")
+    assert unsaved == []
+    # The release saved the size, rather than leaving a preview: the session's stored split
+    # holds the ratio the divider shows.
+    saved = page.wait_for_function(
+        """id => {
+            const stored = JSON.parse(localStorage.getItem("omnigent:pane-splits") ?? "{}");
+            const ratio = stored.sessions?.[id]?.layout?.ratio;
+            return typeof ratio === "number" && ratio !== 0.5 ? ratio : null;
+        }""",
+        arg=session_id,
+    ).json_value()
+    # As the divider rounds it: Math.round, halves up.
+    expect(divider).to_have_attribute("aria-valuenow", str(math.floor(saved * 100 + 0.5)))

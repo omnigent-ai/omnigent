@@ -206,6 +206,13 @@ function FilesPlaceView({
       {tree.wide && tree.shown ? <FilesTreeOptionsMenu {...treeOptions} /> : null}
     </>
   );
+  // A file picked in the tree or the breadcrumbs: a file tab steps to it, the Files tab opens it.
+  const openPickedFile = (path: string, options?: { newTab?: boolean }) =>
+    run(
+      filesTab || options?.newTab
+        ? treeFileChosen(path, { newTab: options?.newTab })
+        : fileTabFileChosen(place, path),
+    );
   return (
     <WorkspaceSidebarLayout
       data-testid="workspace-files-place"
@@ -215,6 +222,8 @@ function FilesPlaceView({
       sidebar={
         <FilesPageTree
           conversationId={conversationId}
+          active={active}
+          commandsActive={commandsActive}
           activePath={place.path}
           sort={files.sort}
           showHidden={files.showHidden}
@@ -223,12 +232,7 @@ function FilesPlaceView({
           onShowIgnored={() => writeShowIgnoredFiles(true)}
           onFileSelect={(path, options) => {
             tree.dismissPopover();
-            // A file tab's tree steps that tab; the Files tab's opens there as before.
-            run(
-              filesTab || options?.newTab
-                ? treeFileChosen(path, { newTab: options?.newTab })
-                : fileTabFileChosen(place, path),
-            );
+            openPickedFile(path, options);
           }}
         />
       }
@@ -273,6 +277,7 @@ function FilesPlaceView({
           registerLeaveGuard={registerLeaveGuard}
           permissionLevel={files.permissionLevel}
           commentId={place.comment}
+          onOpenFile={(path) => openPickedFile(path)}
           // The Files tab closes its file back to the tree; another file tab goes to the Files tab.
           onClose={() =>
             filesTab

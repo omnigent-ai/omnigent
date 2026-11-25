@@ -193,6 +193,11 @@ _POST_TIMEOUT_S = 10.0
 # A child-history POST carries up to 100 items and can outlast the live lane's
 # budget; that lane runs off the latency-sensitive path, so it gets more room.
 _SUBAGENT_POST_TIMEOUT_S = 30.0
+# A failed external_session_id mirror PATCH backs off (doubling, capped): the
+# mirror runs inline before transcript forwarding, so retrying every poll would
+# stall live output behind each timed-out PATCH.
+_EXTERNAL_SESSION_ID_RETRY_BASE_S = 5.0
+_EXTERNAL_SESSION_ID_RETRY_MAX_S = 120.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
 # A batch gets a bounded number of attempts before it is split into
@@ -1436,6 +1441,10 @@ async def forward_claude_transcript_to_session(
     # lifetime of the forwarder task; the server's idempotence handles
     # the rare case where two forwarder processes race the same conv.
     external_session_id_mirrored = False
+    # Backoff for transient mirror failures: consecutive failures and the
+    # monotonic time before which the mirror is not attempted again.
+    external_session_id_failures = 0
+    external_session_id_retry_at = 0.0
     # Native task system state: maps and ordered list accumulated from
     # TaskCreated / TaskCompleted / PostToolUse/TaskUpdate hook events.
     # Reset on /clear and /fork rotations alongside other session state.
@@ -1540,6 +1549,8 @@ async def forward_claude_transcript_to_session(
                         subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
                         external_session_id_mirrored = False
+                        external_session_id_failures = 0
+                        external_session_id_retry_at = 0.0
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
@@ -1582,6 +1593,8 @@ async def forward_claude_transcript_to_session(
                         subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
                         external_session_id_mirrored = False
+                        external_session_id_failures = 0
+                        external_session_id_retry_at = 0.0
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
@@ -1598,12 +1611,24 @@ async def forward_claude_transcript_to_session(
                         cost_cache = {}
                         await asyncio.sleep(poll_interval_s)
                         continue
-                    if not external_session_id_mirrored:
-                        external_session_id_mirrored = await _maybe_mirror_external_session_id(
+                    if (
+                        not external_session_id_mirrored
+                        and time.monotonic() >= external_session_id_retry_at
+                    ):
+                        mirror_outcome = await _maybe_mirror_external_session_id(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
                         )
+                        if mirror_outcome is True:
+                            external_session_id_mirrored = True
+                        elif mirror_outcome is False:
+                            external_session_id_failures += 1
+                            external_session_id_retry_at = time.monotonic() + min(
+                                _EXTERNAL_SESSION_ID_RETRY_BASE_S
+                                * 2 ** min(external_session_id_failures - 1, 16),
+                                _EXTERNAL_SESSION_ID_RETRY_MAX_S,
+                            )
                     # Normalize the statusLine shim's raw capture into
                     # context.json (one stat when nothing changed).
                     status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
@@ -4411,7 +4436,7 @@ async def _maybe_mirror_external_session_id(
     client: httpx.AsyncClient,
     session_id: str,
     bridge_dir: Path,
-) -> bool:
+) -> bool | None:
     """
     Mirror Claude's native session id onto the Omnigent conversation row.
 
@@ -4419,7 +4444,7 @@ async def _maybe_mirror_external_session_id(
     bridge state file and, if present, PATCHes
     ``external_session_id`` on the Omnigent conversation. Best-effort: a
     transient HTTP failure logs a warning and returns ``False`` so
-    the caller retries on the next poll. Once the PATCH succeeds we
+    the caller retries after a backoff. Once the PATCH succeeds we
     return ``True`` and the caller latches off — the value is
     durable server-side from that point on.
 
@@ -4432,12 +4457,13 @@ async def _maybe_mirror_external_session_id(
     :param bridge_dir: Native Claude bridge directory; the source of
         the captured Claude session id.
     :returns: ``True`` once mirroring is finished (or has been
-        determined to be unrecoverable); ``False`` to retry next
-        poll.
+        determined to be unrecoverable); ``False`` after a transient
+        failure, to retry after a backoff; ``None`` when no Claude
+        session id has been captured yet, to check again next poll.
     """
     claude_sid = read_claude_session_id(bridge_dir)
     if claude_sid is None:
-        return False
+        return None
     try:
         await _patch_external_session_id(
             client,
@@ -7434,8 +7460,11 @@ async def _patch_external_session_id(
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    # Skip the response's spawn-tree usage aggregate: nothing reads it here,
+    # and on a large tree it can outlast the client timeout.
     resp = await client.patch(
         f"/v1/sessions/{session_id}",
+        params={"include_usage": "false"},
         json={"external_session_id": external_session_id},
     )
     resp.raise_for_status()

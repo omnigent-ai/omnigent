@@ -4,6 +4,7 @@
 
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { FolderListing } from "../folderTreeSync";
+import { activeFileTreePath } from "./activeFileTreePath";
 import type { TreeEntryMeta } from "./treeSort";
 
 const isHidden = (name: string) => name.startsWith(".");
@@ -76,6 +77,22 @@ export interface TreeChange {
   status: "created" | "modified" | "deleted";
   bytes: number | null;
   modified_at: number | null;
+}
+
+/**
+ * The workspace's changes (workspace-relative paths) as a tree browsing `location`
+ * sees them: only those inside it, with paths relative to it.
+ */
+export function changesWithinFolder(
+  changes: readonly TreeChange[],
+  location: string,
+  workspaceRoot: string | null,
+): readonly TreeChange[] {
+  if (location === "") return changes;
+  return changes.flatMap((change) => {
+    const path = activeFileTreePath(change.path, location, workspaceRoot);
+    return path === null ? [] : [{ ...change, path }];
+  });
 }
 
 const parentOf = (path: string) => {

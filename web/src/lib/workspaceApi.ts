@@ -610,6 +610,8 @@ export interface FileSearchOptions {
   exclude: string;
   /** Maximum entries, 1 to 500. */
   limit: number;
+  /** Search what Git ignores too, as REST does; otherwise only what Git lists. */
+  includeGitIgnored?: boolean;
 }
 
 /**
@@ -623,7 +625,7 @@ export interface FileSearchOptions {
 export function searchFilesViaWorkspaceApi(
   sessionId: string,
   query: string,
-  { path, include, exclude, limit }: FileSearchOptions,
+  { path, include, exclude, limit, includeGitIgnored = true }: FileSearchOptions,
   signal?: AbortSignal,
 ): Promise<FoundEntries | null> {
   return viaWorkspaceApi(
@@ -638,8 +640,8 @@ export function searchFilesViaWorkspaceApi(
           path,
           include: splitGlobList(include),
           exclude: splitGlobList(exclude),
-          // The REST search walks ignored files too, so they stay findable.
-          includeGitIgnored: true,
+          // The REST search walks ignored files too, so by default they stay findable.
+          includeGitIgnored,
         },
         { signal },
       );

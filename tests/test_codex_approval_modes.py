@@ -133,49 +133,69 @@ def test_preset_from_thread_settings_maps_each_popup_choice(settings: dict, expe
     assert codex_permission_preset_from_thread_settings(settings) == expected
 
 
-def test_preset_from_thread_settings_none_for_unmapped() -> None:
-    """A non-mapping / custom payload resolves to None rather than guessing."""
-    assert codex_permission_preset_from_thread_settings(None) is None
-    assert codex_permission_preset_from_thread_settings({}) is None
+# Sandbox policies captured from codex-cli 0.158.0. ``thread/resume`` reports
+# them as ``sandbox``; ``thread/settings/updated`` as ``sandboxPolicy``.
+_WORKSPACE_WRITE_SANDBOX = {
+    "type": "workspaceWrite",
+    "writableRoots": [],
+    "networkAccess": False,
+    "excludeTmpdirEnvVar": False,
+    "excludeSlashTmp": False,
+}
+_READ_ONLY_SANDBOX = {"type": "readOnly", "networkAccess": False}
 
 
-@pytest.mark.parametrize("reviewer", ["user", "auto_review"])
 @pytest.mark.parametrize("sandbox_key", ["sandboxPolicy", "sandbox"])
 @pytest.mark.parametrize(
-    ("sandbox", "expected"),
+    ("approval_policy", "reviewer", "sandbox", "expected"),
     [
-        # What Codex reports for `--ask-for-approval never` (or a config
-        # `approval_policy = "never"`) without a full-access sandbox: no prompts,
-        # but `.git` stays read-only and the network is blocked.
-        ({"type": "workspaceWrite", "networkAccess": False}, None),
-        ({"type": "workspace-write"}, None),
-        ({"type": "externalSandbox"}, None),
-        ({"type": "readOnly"}, "read-only"),
-        ({"type": "dangerFullAccess"}, "full-access"),
+        ("never", "user", _WORKSPACE_WRITE_SANDBOX, None),
+        ("never", "auto_review", _WORKSPACE_WRITE_SANDBOX, None),
+        ("untrusted", "auto_review", _WORKSPACE_WRITE_SANDBOX, None),
+        ("never", "user", _READ_ONLY_SANDBOX, "read-only"),
+        ("never", "user", {"type": "dangerFullAccess"}, "full-access"),
+        ("on-request", "user", _READ_ONLY_SANDBOX, "read-only"),
     ],
 )
-def test_preset_from_thread_settings_never_follows_the_reported_sandbox(
-    reviewer: str, sandbox_key: str, sandbox: dict, expected: str | None
+def test_preset_from_thread_settings_follows_the_sandbox(
+    sandbox_key: str,
+    approval_policy: str,
+    reviewer: str,
+    sandbox: dict,
+    expected: str | None,
 ) -> None:
-    """Approval ``never`` reads back as Full Access only on a full-access sandbox.
-
-    Settings notifications carry ``sandboxPolicy``; thread/resume results carry
-    ``sandbox``. The reviewer never makes it Approve for me: nothing is asked.
-    """
+    """Full Access follows the sandbox; only an on-request policy maps to an approval preset."""
     settings = {
-        "approvalPolicy": "never",
+        "approvalPolicy": approval_policy,
         "approvalsReviewer": reviewer,
         sandbox_key: sandbox,
         "activePermissionProfile": None,
     }
+
     assert codex_permission_preset_from_thread_settings(settings) == expected
 
 
-def test_preset_from_thread_settings_never_without_sandbox_is_full_access() -> None:
-    """A ``never`` policy with no reported sandbox keeps reading as Full Access."""
-    assert codex_permission_preset_from_thread_settings({"approvalPolicy": "never"}) == (
-        "full-access"
-    )
+@pytest.mark.parametrize(
+    ("profile_id", "expected"),
+    [(":danger-full-access", "full-access"), (":read-only", "read-only"), (":workspace", None)],
+)
+def test_preset_from_thread_settings_reads_the_profile_without_a_sandbox(
+    profile_id: str, expected: str | None
+) -> None:
+    """Without a sandbox field, the permission profile decides a ``never`` policy's preset."""
+    settings = {
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "activePermissionProfile": {"id": profile_id, "extends": None},
+    }
+
+    assert codex_permission_preset_from_thread_settings(settings) == expected
+
+
+def test_preset_from_thread_settings_none_for_unmapped() -> None:
+    """A non-mapping / custom payload resolves to None rather than guessing."""
+    assert codex_permission_preset_from_thread_settings(None) is None
+    assert codex_permission_preset_from_thread_settings({}) is None
 
 
 @pytest.mark.parametrize("sandbox_type", [{}, []])
