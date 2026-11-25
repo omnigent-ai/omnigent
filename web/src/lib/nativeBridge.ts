@@ -20,6 +20,27 @@
 //   * This module never throws: a broken/old shell must not take down
 //     notifications in the browser path.
 
+import type {
+  CodeHostQueryRequest,
+  CodeHostRunAsRequest,
+  CodeHostRunRequest,
+  CodeHostWriteAsRequest,
+  CodeHostWriteRequest,
+  DesktopCodeHost,
+  DesktopFeatureFlagBridge,
+  GitHubFastTrackAccount,
+  GitHubFastTrackResult,
+  GitHubSignInBridge,
+  LocalPullRequestLinksRequest,
+  MacAccountIntent,
+  PullRequestCommentWritesReport,
+  PullRequestDialogReport,
+  WorkspaceContentSearchRequest,
+  WorkspaceFastTrackRequest,
+  WorkspaceFastTrackResult,
+} from "./nativeBridgeCodeHost";
+import type { PullRequestTimingReport } from "./pullRequestTiming";
+
 /**
  * Phase of a native sidebar-drag gesture (see `onSidebarDrag`). `begin` and
  * `move` are live drag frames carrying an open fraction; `open` and `close`
@@ -382,6 +403,81 @@ interface ElectronDesktopApi extends NativeShellApi {
   rightSidebarWindow?: RightSidebarWindowBridge;
   /** The floating New Agent panel; absent on shells predating it. */
   floatingComposer?: FloatingComposerBridge;
+  /**
+   * Record how long the Pull Requests panel took to answer in the desktop
+   * diagnostics log: durations and codes only. One-way; absent on older shells.
+   */
+  reportPullRequestTiming?: (report: PullRequestTimingReport) => void;
+  /**
+   * Record that one of the panel's pull request dialogs showed, and how it ended, in the
+   * desktop diagnostics log: its name and outcome only. One-way; absent on older shells.
+   */
+  reportPullRequestDialog?: (report: PullRequestDialogReport) => void;
+  /**
+   * Record why a pull request's comment box couldn't post, and what the user did about it, in
+   * the desktop diagnostics log: closed names only. One-way; absent on older shells.
+   */
+  reportPullRequestCommentWrites?: (report: PullRequestCommentWritesReport) => void;
+  /** Whether this Mac is a Databricks laptop; absent on older shells. */
+  isDatabricksLaptop?: () => Promise<boolean>;
+  /** GitHub fast track: one allowlisted `gh` read as an account; absent on older shells. */
+  githubQuery?: (
+    operation: string,
+    account: GitHubFastTrackAccount,
+    params?: unknown,
+  ) => Promise<GitHubFastTrackResult<unknown>>;
+  /** One allowlisted read from a code host's provider; absent on older shells. */
+  codeHostQuery?: (request: CodeHostQueryRequest) => Promise<GitHubFastTrackResult<unknown>>;
+  /** Let go of a read named by `readId` that hasn't run yet (`readPriority`); newer shells. */
+  codeHostQueryCancel?: (request: { readId: string }) => Promise<unknown>;
+  /** One allowlisted pull request change as this Mac's account; absent on older shells. */
+  codeHostWrite?: (request: CodeHostWriteRequest) => Promise<unknown>;
+  /** The same change as a login the page reads as by name (`macLogin`); absent on older shells. */
+  codeHostWriteAs?: (request: CodeHostWriteAsRequest) => Promise<unknown>;
+  /** Stop one of this page's writes before its remaining steps; one-way, no gesture needed. */
+  codeHostWriteCancel?: (requestId: string) => void;
+  /** Authorize a bulk run's writes from the click that started it; newer shells. */
+  codeHostWriteAuthorizeRun?: (request: CodeHostRunRequest) => Promise<unknown>;
+  /** The same, as a login the page reads as by name (`macLogin`); newer shells. */
+  codeHostWriteAuthorizeRunAs?: (request: CodeHostRunAsRequest) => Promise<unknown>;
+  /** End a run this page authorized, so its grant can't be used again; one-way. */
+  codeHostWriteEndRun?: (requestId: string) => void;
+  /** The GitHub account this Mac reads each host as; absent on older shells. */
+  codeHostAccounts?: {
+    get?: (host: string) => Promise<unknown>;
+    set?: (host: string, intent: MacAccountIntent) => Promise<unknown>;
+    onChanged?: (callback: (change: unknown) => void) => () => void;
+    /** A login a page read as by name signed out, expired or signed in again; newer shells. */
+    onNamedChanged?: (callback: (change: unknown) => void) => () => void;
+  };
+  /** GitSpoke links kept on this Mac for one session; absent on older shells. */
+  localPullRequestLinks?: (request: LocalPullRequestLinksRequest) => Promise<unknown>;
+  /** Remotely configured flags, by name; absent on older shells. */
+  featureFlags?: Partial<DesktopFeatureFlagBridge>;
+  /** Sign in to GitHub on this Mac; absent on older shells. */
+  codeHostSignIn?: Partial<GitHubSignInBridge>;
+  /** Local file fast track: answers a workspace file request on this Mac; absent on older shells. */
+  workspaceRequest?: (request: WorkspaceFastTrackRequest) => Promise<WorkspaceFastTrackResult>;
+  /** A content search whose matches stream to `onMatches`; absent on older shells. */
+  workspaceContentSearch?: (
+    request: WorkspaceContentSearchRequest,
+    onMatches: (matches: unknown[]) => void,
+  ) => Promise<unknown>;
+  /** Cancels a workspace request this page started with a `requestId`; absent on older shells. */
+  cancelWorkspaceRequest?: (request: { requestId: string }) => Promise<unknown>;
+  /** Which route this app would answer a session's file requests by; absent on older shells. */
+  workspaceSessionRoute?: (request: { sessionId: string; status?: boolean }) => Promise<unknown>;
+  /** Try a remote session's fast track again now; absent on older shells. */
+  workspaceFastTrackRetry?: (request: { sessionId: string }) => Promise<unknown>;
+  workspaceHostKeyStatus?: (request: { sessionId: string }) => Promise<unknown>;
+  workspaceHostKeyReview?: (request: { sessionId: string }) => Promise<unknown>;
+  workspaceTrustHostKey?: (request: {
+    sessionId: string;
+    token: string;
+    fingerprint: string;
+  }) => Promise<unknown>;
+  /** Subscribe to sessions the fast track can now answer; absent on older shells. */
+  onWorkspaceAccessReady?: (callback: (sessionId: string) => void) => () => void;
 }
 
 /** The shell's setting that widens the window for the right sidebar, and the page's reports. */
@@ -650,6 +746,30 @@ export interface DesktopFeatures {
   floatingComposer?: boolean;
   /** This shell's shortcut calls take the "floatingComposer" id (macOS). */
   floatingComposerShortcut?: boolean;
+  /** This shell runs a bundled `gh` for GitHub fast-track reads (macOS on Apple silicon). */
+  githubFastTrack?: boolean;
+  /**
+   * The fast-track operations this shell runs. Absent on the first fast-track
+   * shells, which run only `account_status`.
+   */
+  githubFastTrackOperations?: string[];
+  /** Code hosts this shell reads through `codeHostQuery`; absent on older shells. */
+  codeHosts?: DesktopCodeHost[];
+  /** This shell keeps GitSpoke links on this Mac through `localPullRequestLinks`. */
+  localPullRequestLinks?: boolean;
+  /** The local link store also remembers branch PR choices, at this version; absent on older shells. */
+  localPullRequestBranchChoices?: number;
+  /** `localPullRequestLinks` answers `list_user`; absent on older shells. */
+  localPullRequestLinksByUser?: boolean;
+  /** This shell answers local sessions' file requests from its workspace helper. */
+  workspaceFastTrack?: boolean;
+  /** What the file fast track can do beyond answering, such as `ignored_files`. */
+  workspaceFastTrackCapabilities?: string[];
+  /**
+   * Flags this shell delivers through `featureFlags.subscribe`; absent on older shells.
+   * `overrides` is true where pages may set them through `featureFlags.settings` and `choose`.
+   */
+  featureFlags?: { names?: string[]; overrides?: boolean };
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -889,7 +1009,7 @@ export function serverManifestOf(info: ServerPickerInfo | null): ServerManifest 
 }
 
 /** The Electron preload bridge, or undefined outside the Electron shell. */
-function electronApi(): ElectronDesktopApi | undefined {
+export function electronApi(): ElectronDesktopApi | undefined {
   if (typeof window === "undefined") return undefined;
   const api = (window as unknown as { omnigentDesktop?: ElectronDesktopApi }).omnigentDesktop;
   return api?.kind === "electron" ? api : undefined;
@@ -1970,3 +2090,5 @@ export async function droppedFilePath(file: File): Promise<string | null> {
     return null;
   }
 }
+
+export * from "./nativeBridgeCodeHost";
