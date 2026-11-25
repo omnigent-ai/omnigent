@@ -3661,6 +3661,39 @@ describe("side-chat composer engine", () => {
   beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
   afterEach(() => resetCodeMirrorComposerLoadForTests());
 
+  it("keeps the seeded and reply quotes in the one editor, and removes the seed with its card", async () => {
+    const pendingId = "pending:quoted";
+    useChatStore.setState({
+      sideChatDrafts: { [pendingId]: "restore the row" },
+      sideChatComposers: {
+        [pendingId]: {
+          text: "why?",
+          files: [],
+          quotes: [{ id: "reply", before: "Introduction", text: "second selection" }],
+        },
+      },
+    });
+    renderPane(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } }}
+      >
+        <SideChatPane childId={pendingId} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+
+    expect(screen.queryByTestId("composer-reply-blocks")).toBeNull();
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[0]!);
+    expect(useChatStore.getState().sideChatDrafts[pendingId]).toBeUndefined();
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+    expect(useChatStore.getState().sideChatComposers[pendingId]?.quotes).toEqual([
+      { id: "reply", before: "Introduction", text: "second selection" },
+    ]);
+  });
+
   it("writes in CodeMirror and sends a typed question when the flag is on", async () => {
     renderPane(withFlag(true));
     await waitFor(() =>

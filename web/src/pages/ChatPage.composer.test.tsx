@@ -34,6 +34,7 @@ import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
 import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { EditorView } from "@codemirror/view";
 import { insertComposerText } from "@/lib/composerText";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -7436,6 +7437,155 @@ describe("Composer reply quotes", () => {
       quotes: [{ before: "", text: "Explain /help" }],
       text: "/help",
     });
+  });
+});
+
+describe("Composer reply quotes on the CodeMirror engine", () => {
+  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  beforeEach(() => {
+    clearSessionDrafts();
+    localStorage.clear();
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      restoredSendDraft: null,
+      pendingRetryStableId: null,
+      queuedMessages: [],
+    });
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+  });
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    resetCodeMirrorComposerLoadForTests();
+    vi.restoreAllMocks();
+  });
+
+  /** Types the reply flow on one engine, then sends it; returns what `onSend` received. */
+  async function sendReplyFlow(codeMirror: boolean) {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    const composer = (
+      <TooltipProvider>
+        <Composer {...props} ref={ref} />
+      </TooltipProvider>
+    );
+    render(
+      codeMirror ? (
+        <CapabilitiesProvider info={codeMirrorInfo}>{composer}</CapabilitiesProvider>
+      ) : (
+        composer
+      ),
+    );
+    if (codeMirror) {
+      await waitFor(() =>
+        expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+      );
+    }
+    const input = () => screen.getByLabelText("Message the agent");
+    // Types at the end of the composer's own text, on either engine.
+    const type = (text: string) => {
+      if (!codeMirror) {
+        fireEvent.change(textarea(), { target: { value: textarea().value + text } });
+        return;
+      }
+      const target = composerTargetOf(input())!;
+      act(() => insertComposerText(target, text, target.value.length, target.value.length));
+    };
+    type("My introduction");
+    act(() => ref.current?.appendReplyQuote("First point"));
+    type("My first answer");
+    act(() => ref.current?.appendReplyQuote("Second point\nMore detail"));
+    type("My second answer");
+    fireEvent.submit(input().closest("form")!);
+    return vi.mocked(props.onSend).mock.calls[0];
+  }
+
+  it("holds the draft and its quotes in one editor, with the caret on the line after a quote", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...composerProps()} ref={ref} />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    act(() => ref.current?.appendReplyQuote("First point"));
+
+    expect(screen.queryByTestId("composer-reply-blocks")).toBeNull();
+    expect(screen.queryByLabelText(/Reply text before quote/)).toBeNull();
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
+    expect(screen.getByRole("button", { name: "Remove quote" })).toBeEnabled();
+    const editor = EditorView.findFromDOM(screen.getByLabelText("Message the agent"))!;
+    expect(editor.state.selection.main.head).toBe(editor.state.doc.length);
+  });
+
+  it("sends the same text and quotes as the textarea engine", async () => {
+    const textareaSent = await sendReplyFlow(false);
+    cleanup();
+    clearSessionDrafts();
+    const codeMirrorSent = await sendReplyFlow(true);
+
+    expect(textareaSent).toEqual([
+      "My introduction\n\n> First point\n\nMy first answer\n\n> Second point\n> More detail\n\nMy second answer",
+      undefined,
+      {
+        version: 1,
+        quotes: [
+          { before: "My introduction", text: "First point" },
+          { before: "My first answer", text: "Second point\nMore detail" },
+        ],
+        text: "My second answer",
+      },
+    ]);
+    expect(codeMirrorSent).toEqual(textareaSent);
+  });
+
+  it("keeps the quotes when the editor replaces the textarea mid-draft", async () => {
+    // The editor's chunk loads after the quote is added, so the draft moves across engines.
+    let finishLoad!: (module: typeof CodeMirrorModule) => void;
+    const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
+      finishLoad = resolve;
+    });
+    resetCodeMirrorComposerLoadForTests(() => loaded);
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...props} ref={ref} />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    act(() => ref.current?.appendReplyQuote("First point"));
+    expect(screen.getByTestId("composer-reply-blocks")).toBeInTheDocument();
+
+    act(() => finishLoad(CodeMirrorModule));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    expect(screen.queryByTestId("composer-reply-blocks")).toBeNull();
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
+    const editor = composerTargetOf(screen.getByLabelText("Message the agent"))!;
+    act(() => insertComposerText(editor, "My answer", editor.value.length, editor.value.length));
+    fireEvent.submit(screen.getByLabelText("Message the agent").closest("form")!);
+    expect(vi.mocked(props.onSend).mock.calls[0]![0]).toBe(
+      "My introduction\n\n> First point\n\nMy answer",
+    );
+  });
+
+  it("keeps the textarea engine's quote blocks", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("First point"));
+    expect(screen.getByTestId("composer-reply-blocks")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
   });
 });
 

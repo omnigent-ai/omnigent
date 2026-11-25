@@ -1366,12 +1366,13 @@ describe.each(["textarea", "codemirror"] as const)(
         fireEvent.click(screen.getByTitle("Attach readme.md"));
         act(() => ref.current?.appendReplyQuote("Quoted text"));
 
-        const before = composerTargetOf(screen.getByLabelText("Reply text before quote 1"))!;
-        expect(before.value).toBe("Read @readme.md ");
+        // The quote is a line of the same editor, so the text before it is the first line.
+        expect(valueOf().split("\n")[0]).toBe("Read @readme.md ");
+        const editor = composerTargetOf(composerInput())!;
         act(() =>
-          insertComposerText(before, "x", "Read @readme.md".length, "Read @readme.md".length),
+          insertComposerText(editor, "x", "Read @readme.md".length, "Read @readme.md".length),
         );
-        expect(before.value).toBe("Read @readme.mdx ");
+        expect(valueOf().split("\n")[0]).toBe("Read @readme.mdx ");
       },
     );
 

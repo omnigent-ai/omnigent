@@ -2373,6 +2373,9 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
+  // The CodeMirror engine holds the whole draft, quotes included, in one editor.
+  const composerEngine = useRequestedComposerEngine();
+  const singleDocument = composerEngine === "codemirror";
   const {
     draft,
     value,
@@ -2385,7 +2388,7 @@ function ComposerImpl(
     replaceText,
     appendQuote,
     removeQuote,
-  } = useReplyDraft();
+  } = useReplyDraft({ singleDocument });
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
   useDismissOnEscape(commandError !== null, () => setCommandError(null));
@@ -2467,7 +2470,6 @@ function ComposerImpl(
     setTailTextareaNode(element);
     if (element && !textareaRef.current?.isConnected) textareaRef.current = element;
   }, []);
-  const composerEngine = useRequestedComposerEngine();
   // An engine switch replaces every input; keep the active one current even without focus.
   const rebindActiveInput = useCallback((target: ComposerTextTarget) => {
     textareaRef.current = target;
@@ -3932,7 +3934,9 @@ function ComposerImpl(
     const textarea = tailTextareaRef.current;
     if (!textarea) return;
     if (!isMobileRef.current) textarea.focus({ preventScroll: true });
-    textarea.setSelectionRange(0, 0);
+    // The empty line after the new quote: the start of the tail, which the editor shows at the end.
+    const tailEnd = textarea.value.length;
+    textarea.setSelectionRange(tailEnd, tailEnd);
     const inputArea = composerTargetElement(textarea).closest("[data-composer-input-area]");
     if (inputArea) inputArea.scrollTop = inputArea.scrollHeight;
     onGrowthRef.current?.();
@@ -4528,7 +4532,7 @@ function ComposerImpl(
         onActiveInputChange={rebindActiveInput}
         input={{
           ref: bindTailTextarea,
-          value: draft.text,
+          value: singleDocument ? value : draft.text,
           // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
           commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
@@ -4577,7 +4581,7 @@ function ComposerImpl(
         }}
         slots={{
           inputPrefix:
-            draft.quotes.length > 0 ? (
+            draft.quotes.length > 0 && !singleDocument ? (
               <ReplyDraftBlocks
                 quotes={draft.quotes}
                 activeTextId={activeTextId}

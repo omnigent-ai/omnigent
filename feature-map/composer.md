@@ -28,6 +28,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that leaves the editor (switching sessions, a new-session handoff, a recovered
   send) keeps each chip's file as a tray attachment with its `@name` text
   unchanged.
+  Reply quotes are lines of the same editor, not separate boxes: each is a card
+  the caret steps over, Backspace or Delete at its edge removes it (as its X
+  does, joining the text around it into paragraphs), and a selection covering it
+  removes it with the text. Undo brings it back with its text. A slash menu
+  typed after a quote lists only skills, since the text before a quote is part of
+  the same document.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
