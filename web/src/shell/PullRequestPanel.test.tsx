@@ -56,12 +56,12 @@ const state = vi.hoisted(() => ({
     isFetching: boolean;
   } | null,
   // Per-file diffs the stubbed parsePatchFiles yields (name + optional
-  // rename fields), so tests can exercise renamed/pure-rename rendering.
+  // rename fields and hunk sizes), so tests can exercise renamed/pure-rename rendering.
   parsedFiles: [] as {
     name: string;
     prevName?: string;
     type?: string;
-    unifiedLineCount?: number;
+    hunks?: { unifiedLineCount: number; hunkContent: unknown[] }[];
   }[],
   // The whole-PR diff response; the panel parses its patch into per-file diffs.
   diff: null as PullRequestDiffResponse | null,
@@ -197,7 +197,9 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 // stubbed to yield the files configured on `state` (name + optional rename
 // metadata), matching the whole-PR patch.
 vi.mock("@pierre/diffs", () => ({
-  parsePatchFiles: vi.fn(() => [{ files: state.parsedFiles }]),
+  parsePatchFiles: vi.fn(() => [
+    { files: state.parsedFiles.map((parsed) => ({ hunks: [], ...parsed })) },
+  ]),
 }));
 vi.mock("@pierre/diffs/react", () => ({
   FileDiff: ({
@@ -260,6 +262,11 @@ const OTHER_PR: PullRequestAssociation = {
   number: 6001,
   relationship: "attached",
 };
+
+/** A parsed hunk stub that renders `unifiedLineCount` lines. */
+function hunk(unifiedLineCount: number) {
+  return { unifiedLineCount, hunkContent: [] };
+}
 
 function file(
   path: string,
@@ -2661,8 +2668,8 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
   });
 
-  it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {
-    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD }];
+  it("shows the diff immediately when its hunks render the threshold's lines", async () => {
+    state.parsedFiles = [{ name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD)] }];
     state.changes = {
       data: { available: true, data: [file("hello.py", "modified")] },
       isLoading: false,
@@ -2675,9 +2682,9 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText(/Large diff/)).toBeNull();
   });
 
-  it("replaces a file's diff with a large-diff affordance when unifiedLineCount exceeds the threshold", async () => {
+  it("replaces a file's diff with a large-diff affordance when its hunks exceed the threshold", async () => {
     state.parsedFiles = [
-      { name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 },
+      { name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD), hunk(1)] },
       { name: "src/app.ts" },
     ];
     renderChanges();
@@ -2693,7 +2700,7 @@ describe("PullRequestPanel", () => {
   });
 
   it("reveals the diff after clicking Show diff", async () => {
-    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 }];
+    state.parsedFiles = [{ name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD + 1)] }];
     state.changes = {
       data: { available: true, data: [file("hello.py", "modified")] },
       isLoading: false,
