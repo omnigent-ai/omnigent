@@ -26,6 +26,7 @@ from omnigent.entities.project_ticket import (
     UpdateTicketStages,
 )
 from omnigent.tools.base import Tool
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 
 
 class ListTickets(BaseModel):
@@ -663,6 +664,54 @@ class SysProjectTicketFileTool(_TicketTool):
         return cls.help_text
 
 
+class MessageOtherLead(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        description="The other project's name or ID, as it appears in your project list. "
+        "Omit when replying.",
+    )
+    reply_to: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="The message ID shown in a message another project's Lead sent you; "
+        "your reply goes back to that project's Lead.",
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=SESSION_MESSAGE_MAX_CHARS,
+        description="Self-contained text; the other Lead sees nothing else of your project.",
+    )
+
+    @model_validator(mode="after")
+    def one_target(self) -> "MessageOtherLead":
+        if (self.project is None) == (self.reply_to is None):
+            raise ValueError("Pass either project, to start a conversation, or reply_to")
+        return self
+
+
+class SysProjectLeadMessageTool(_TicketTool):
+    tool_name = "sys_project_lead_message"
+    help_text = (
+        "As your project's Lead, message another project's Lead: one shared with the person "
+        "you work for (they own it or are a member). Use it for questions, such as how that "
+        "project handles something, and file an intake ticket with sys_project_ticket_file "
+        "for work you want done. The message is marked as coming from your project's Lead; "
+        "its reply arrives in your chat with a message ID. Pass reply_to with that ID to "
+        "answer a message another project's Lead sent you. Gives no access to the other "
+        "project's board or sessions. Up to 10 per hour into one project."
+    )
+    arguments = MessageOtherLead
+
+    @classmethod
+    def description(cls) -> str:
+        return cls.help_text
+
+
 TICKET_TOOL_CLASSES = (
     SysTicketListTool,
     SysTicketGetTool,
@@ -687,6 +736,7 @@ TICKET_TOOL_CLASSES = (
     SysProjectKpisSetTool,
     SysProjectTicketFileTool,
     SysProjectTelemetryGetTool,
+    SysProjectLeadMessageTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}
 READ_ONLY_TICKET_TOOLS: tuple[str, ...] = tuple(

@@ -18,13 +18,14 @@ from omnigent.tools.builtins.upload_file import safe_resolve
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 
-async def _file_in_other_project(
-    body: dict[str, Any],
+async def _other_project_id(
+    wanted: str,
     own_project_id: str,
     request: Callable[..., Awaitable[dict[str, Any]]],
-) -> str:
-    """File an intake ticket on another project's board, found by name or ID."""
-    wanted = body.pop("project").strip()
+    own_hint: str,
+) -> str | dict[str, Any]:
+    """The ID of another project shared with the caller's person, or an error to return."""
+    wanted = wanted.strip()
     listed = (await request("GET", "/v1/projects")).get("data", [])
     try:
         wanted_id = uuid_to_bytes(wanted).hex()
@@ -37,22 +38,63 @@ async def _file_in_other_project(
         or str(project.get("name", "")).casefold() == wanted.casefold()
     ]
     if not matches:
-        return json.dumps(
-            {"error": f"No project named {wanted!r} is shared with the person you work for"}
-        )
+        return {"error": f"No project named {wanted!r} is shared with the person you work for"}
     if len(matches) > 1:
-        return json.dumps(
-            {
-                "error": f"Several projects are named {wanted!r}; pass one ID instead",
-                "project_ids": [project.get("id") for project in matches],
-            }
-        )
-    target_id = matches[0]["id"]
-    if target_id == own_project_id:
-        return json.dumps({"error": "That's this session's own project; use sys_ticket_create"})
+        return {
+            "error": f"Several projects are named {wanted!r}; pass one ID instead",
+            "project_ids": [project.get("id") for project in matches],
+        }
+    if matches[0]["id"] == own_project_id:
+        return {"error": f"That's this session's own project; {own_hint}"}
+    return matches[0]["id"]
+
+
+async def _file_in_other_project(
+    body: dict[str, Any],
+    own_project_id: str,
+    request: Callable[..., Awaitable[dict[str, Any]]],
+) -> str:
+    """File an intake ticket on another project's board, found by name or ID."""
+    target_id = await _other_project_id(
+        body.pop("project"), own_project_id, request, "use sys_ticket_create"
+    )
+    if isinstance(target_id, dict):
+        return json.dumps(target_id)
     created = await request("POST", f"/v1/projects/{target_id}/tickets/intake", json=body)
     return json.dumps(
         {**created, "note": "Filed. That project's Lead triages it under its own rules."},
+        ensure_ascii=False,
+    )
+
+
+async def _message_other_lead(
+    body: dict[str, Any],
+    own_project_id: str,
+    request: Callable[..., Awaitable[dict[str, Any]]],
+) -> str:
+    """Message another project's Lead, or reply to a message one sent this project."""
+    message = {"message": body["message"]}
+    reply_to = body.get("reply_to")
+    if reply_to is not None:
+        try:
+            thread_id = uuid_to_bytes(reply_to).hex()
+        except InvalidUuidError:
+            return json.dumps({"error": "reply_to must be the message ID you were sent"})
+        path = f"/v1/projects/{own_project_id}/lead-messages/{thread_id}"
+        sent = await request("POST", f"{path}/reply", json=message)
+    else:
+        target_id = await _other_project_id(
+            body["project"], own_project_id, request, "use sys_session_message"
+        )
+        if isinstance(target_id, dict):
+            return json.dumps(target_id)
+        sent = await request("POST", f"/v1/projects/{target_id}/lead-messages", json=message)
+    return json.dumps(
+        {
+            **sent,
+            "note": "Sent. Its reply arrives in this chat as a new message; don't resend "
+            "while waiting.",
+        },
         ensure_ascii=False,
     )
 
@@ -148,6 +190,8 @@ async def execute_ticket_tool(
             return await _open_identity_session(body, project_id, request, client, source_id)
         if name == "sys_project_ticket_file":
             return await _file_in_other_project(body, project_id, request)
+        if name == "sys_project_lead_message":
+            return await _message_other_lead(body, project_id, request)
         path = f"/v1/projects/{project_id}/tickets"
         if ticket_id is not None:
             path += f"/{ticket_id}"

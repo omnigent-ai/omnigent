@@ -4955,6 +4955,23 @@
         "title": "LaunchRunnerRequest",
         "type": "object"
       },
+      "LeadMessage": {
+        "additionalProperties": false,
+        "description": "A message from one project's Lead to another's, or a reply to one.",
+        "properties": {
+          "message": {
+            "maxLength": 32000,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "LeadMessage",
+        "type": "object"
+      },
       "LinkRelatedTicket": {
         "additionalProperties": false,
         "properties": {
@@ -24908,6 +24925,125 @@
           }
         },
         "summary": "List Project Kpi Revisions",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/lead-messages": {
+      "post": {
+        "description": "Send a message from the calling project's Lead to this project's Lead.\n\nFor a project owned by or shared with the person whose Lead calls. The\nmessage is delivered to this project's router marked with the sending\nproject, and the response returns only its ID, for matching a reply. Each\nproject may send `LEAD_MESSAGES_PER_HOUR` per hour to one project.",
+        "operationId": "send_lead_message_v1_projects__project_id__lead_messages_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeadMessage"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Send Lead Message V1 Projects  Project Id  Lead Messages Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Send Lead Message",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/lead-messages/{message_id}/reply": {
+      "post": {
+        "description": "Reply, as this project's Lead, to a message another project's Lead sent it.\n\nThe reply goes to the sending project's current Lead, whether or not that\nproject is shared with this caller. Each message takes one reply, which can\nitself be replied to.",
+        "operationId": "reply_to_lead_message_v1_projects__project_id__lead_messages__message_id__reply_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "title": "Message Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeadMessage"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Reply To Lead Message V1 Projects  Project Id  Lead Messages  Message Id  Reply Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reply To Lead Message",
         "tags": [
           "projects"
         ]

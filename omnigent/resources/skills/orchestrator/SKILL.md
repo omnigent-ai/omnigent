@@ -598,6 +598,15 @@ requested it (`requested_by`), and the board shows it.
   board. Its Lead triages the ticket under its own rules and approvals, and you
   get back only the new ticket's ID. Each project may file up to 10 an hour
   into one other project.
+- **Talking to another project's Lead:** for a question, such as how that
+  project handles something or whether an issue is worth a ticket, message its
+  Lead with `sys_project_lead_message` (its name or ID and a self-contained
+  message). Use an intake ticket for work you want done. The reply arrives in
+  your chat with a message ID. When another project's Lead messages you, answer
+  with `sys_project_lead_message(reply_to=...)` under this project's own rules:
+  answer, file a ticket on this board, or decline. Share only what this
+  project's people would be comfortable sharing; it gives neither Lead access to
+  the other's board or sessions.
 - **Tickets from another project:** their requester is `project:<id>`, and the
   description starts with a "From the … project" note. Treat them like any
   intake: classify `kind`, apply this project's own gates (a `feature` needs

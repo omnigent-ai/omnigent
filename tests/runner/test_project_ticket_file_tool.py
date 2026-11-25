@@ -1,8 +1,12 @@
-"""sys_project_ticket_file finds the other project by name or ID before filing."""
+"""sys_project_ticket_file and sys_project_lead_message find the other project first."""
 
 import json
 
-from omnigent.runner.project_tickets import _file_in_other_project
+import pytest
+from pydantic import ValidationError
+
+from omnigent.runner.project_tickets import _file_in_other_project, _message_other_lead
+from omnigent.tools.builtins.project_tickets import MessageOtherLead
 
 OWN, OTHER, TWIN = "a" * 32, "b" * 32, "c" * 32
 
@@ -50,3 +54,33 @@ async def test_refuses_unknown_ambiguous_and_own_projects_without_filing():
         )
         assert error in result["error"]
         assert all(method == "GET" for method, _, _ in calls)
+
+
+async def test_lead_message_goes_to_the_named_project_and_a_reply_to_its_thread():
+    request, calls = _requester([{"id": OWN, "name": "Mine"}, {"id": OTHER, "name": "Hers"}])
+    await _message_other_lead({"project": "Hers", "message": "How?"}, OWN, request)
+    assert calls[-1] == ("POST", f"/v1/projects/{OTHER}/lead-messages", {"message": "How?"})
+
+    request, calls = _requester([])
+    await _message_other_lead({"reply_to": "d" * 32, "message": "Like this."}, OWN, request)
+    assert calls == [
+        (
+            "POST",
+            f"/v1/projects/{OWN}/lead-messages/{'d' * 32}/reply",
+            {"message": "Like this."},
+        )
+    ]
+
+
+async def test_a_malformed_reply_to_is_an_error_not_a_crash():
+    request, calls = _requester([])
+    result = json.loads(
+        await _message_other_lead({"reply_to": "not-an-id", "message": "x"}, OWN, request)
+    )
+    assert "reply_to" in result["error"] and calls == []
+
+
+def test_lead_message_takes_exactly_one_of_project_or_reply_to():
+    for args in ({"message": "x"}, {"project": "Hers", "reply_to": "d" * 32, "message": "x"}):
+        with pytest.raises(ValidationError):
+            MessageOtherLead.model_validate(args)
