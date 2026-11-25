@@ -2931,19 +2931,16 @@ def register_resources_routes(
         else:
             conv = await _validate_session(session_id, request, LEVEL_READ)
         # The owner grant itself, with no admin pass: only the owner acts as the host's account.
-        # Only an owner-gated method, GetCapabilities, which lists them, and the thread reads,
-        # which show the host account's rights to the owner alone, need it.
-        session_owner = (
-            gate is WorkspaceGate.SESSION_OWNER
-            or method == "GetCapabilities"
-            or method in VIEWER_SHAPED_METHODS
-        ) and await asyncio.to_thread(
-            _is_session_owner,
-            _get_user_id(request, auth_provider),
-            conv,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-        )
+        # Only an owner-gated method and GetCapabilities, which lists them, need it.
+        if gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities":
+            session_owner = await _caller_is_session_owner(conv, request)
+        elif method in VIEWER_SHAPED_METHODS:
+            # The thread reads show the host account's rights to the owner alone; as on REST,
+            # a failed lookup reads them as anyone else would rather than failing the read.
+            viewer = await _pull_request_viewer(conv, request)
+            session_owner = viewer is PullRequestViewer.OWNER
+        else:
+            session_owner = False
         if gate is WorkspaceGate.SESSION_OWNER and not session_owner:
             raise OmnigentError(
                 "Only the session's owner can use this through the workspace API",
