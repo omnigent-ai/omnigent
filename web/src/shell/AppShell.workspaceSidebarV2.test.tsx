@@ -524,6 +524,17 @@ describe("workspace_sidebar_v2", () => {
     expect(column()).toHaveAttribute("data-main-view", "chat");
   });
 
+  it("keeps the column the chat's card when a split shows beside the chat without floating panes", () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    const column = () => document.querySelector("[data-main-view]");
+    expect(column()).toHaveAttribute("data-main-view", "chat");
+
+    act(() => setSplitBesideChat("conv_ws", true));
+    expect(column()).toHaveAttribute("data-main-view", "chat");
+    act(() => setSplitBesideChat("conv_ws", false));
+  });
+
   it("reserves the header's room for the rail only while the rail sits inline", async () => {
     setViewport(1000);
     renderShell({
