@@ -59,6 +59,9 @@ _REPLY_TIMEOUT_S = 30.0
 _FEATURE_NAME = re.compile(r"[a-z0-9_.]+")
 # A pull request change's answer must arrive within this, as long as REST waits for one.
 _WRITE_REPLY_TIMEOUT_S = 20.0
+# An upload's answer may take as long as REST's attachment route waits for it.
+_UPLOAD_REPLY_TIMEOUT_S = 120.0
+_UPLOAD_METHOD = "UploadAttachment"
 # The pull request methods that answer with its overview, which lists the session's PRs.
 _OVERVIEW_METHODS = frozenset({"GetPullRequest", "SetPullRequestAccount"})
 _COMMENT_WRITES = frozenset({"CreateComment", "CreateReviewThread", "ReplyToReviewThread"})
@@ -211,7 +214,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
             # The host sends its account's rights in a review read only when asked.
             account_rights=shape is not None and owner,
             unconfirmed=_unconfirmed_change(method.name) if changes else None,
-            timeout=_WRITE_REPLY_TIMEOUT_S if changes else _REPLY_TIMEOUT_S,
+            timeout=_reply_timeout(method.name, changes=changes),
         )
         # Every pull request response is one ``payload`` Struct, the REST route's JSON.
         response: Any = method.response_type.FromString(message)
@@ -359,8 +362,18 @@ for _method in WORKSPACE_METHODS.values():
         setattr(HostWorkspaceService, _method.python_name, _host_forwarder(_method))
 
 
+def _reply_timeout(method: str, *, changes: bool) -> float:
+    """How long each reply of a pull request call may take."""
+    if method == _UPLOAD_METHOD:
+        return _UPLOAD_REPLY_TIMEOUT_S
+    return _WRITE_REPLY_TIMEOUT_S if changes else _REPLY_TIMEOUT_S
+
+
 def _unconfirmed_change(method: str) -> str:
     """What a client is told when a change may have been made but its answer was lost."""
+    if method == _UPLOAD_METHOD:
+        # GitHub keeps an unlinked file and nothing else, so attaching again is safe.
+        return "Could not confirm the upload. Try attaching the file again."
     if method in _COMMENT_WRITES:
         return "Could not confirm comment posting. Check GitHub before retrying."
     if method in _REVIEW_WRITES:

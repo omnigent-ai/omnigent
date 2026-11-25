@@ -65,7 +65,6 @@ DECLARED_NOT_SERVED: frozenset[str] = frozenset(
         "SendReviewerPing",
         "SetPullRequestDraft",
         "SetPullRequestState",
-        "UploadAttachment",
     }
 )
 

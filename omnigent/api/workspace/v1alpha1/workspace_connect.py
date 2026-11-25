@@ -431,7 +431,8 @@ class WorkspaceService(Protocol):
 
     async def upload_attachment(self, request: UploadAttachmentRequest, ctx: RequestContext[UploadAttachmentRequest, UploadAttachmentResponse], /) -> UploadAttachmentResponse:
         """
-        Uploads a file to link from a comment.
+        Uploads a file to link from a comment, up to 70 MiB. Send it with the binary protobuf
+        encoding: JSON's base64 makes the body a third larger, past the request limit.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -2749,7 +2750,8 @@ class WorkspaceServiceClient(ConnectClient):
         timeout_ms: int | None = None,
     ) -> UploadAttachmentResponse:
         """
-        Uploads a file to link from a comment.
+        Uploads a file to link from a comment, up to 70 MiB. Send it with the binary protobuf
+        encoding: JSON's base64 makes the body a third larger, past the request limit.
         """
         return await self.execute_unary(
             request=request,
@@ -3159,7 +3161,8 @@ class WorkspaceServiceSync(Protocol):
 
     def upload_attachment(self, request: UploadAttachmentRequest, ctx: RequestContext[UploadAttachmentRequest, UploadAttachmentResponse], /) -> UploadAttachmentResponse:
         """
-        Uploads a file to link from a comment.
+        Uploads a file to link from a comment, up to 70 MiB. Send it with the binary protobuf
+        encoding: JSON's base64 makes the body a third larger, past the request limit.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -5475,7 +5478,8 @@ class WorkspaceServiceClientSync(ConnectClientSync):
         timeout_ms: int | None = None,
     ) -> UploadAttachmentResponse:
         """
-        Uploads a file to link from a comment.
+        Uploads a file to link from a comment, up to 70 MiB. Send it with the binary protobuf
+        encoding: JSON's base64 makes the body a third larger, past the request limit.
         """
         return self.execute_unary(
             request=request,

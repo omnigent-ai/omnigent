@@ -288,6 +288,14 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
         _root(reader), session_id=call.session_id, pr_url=_url(request)
     ),
     **_REVIEW_OPS,
+    # The runner takes the media type from the bytes, as on the REST route.
+    "UploadAttachment": lambda reader, call, request: pr_resource.upload_pr_attachment(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        name=request.name,
+        content=request.content,
+    ),
 }
 
 

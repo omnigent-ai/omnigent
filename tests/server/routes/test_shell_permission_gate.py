@@ -1370,6 +1370,8 @@ _PR_OWNER_METHODS = {
     "DeleteComment": {"kind": "review", "commentId": "5"},
     "AddReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
     "RemoveReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
+    # JSON carries the bytes base64-encoded.
+    "UploadAttachment": {"name": "shot.png", "content": "iVBORw0KGgo="},
 }
 
 
