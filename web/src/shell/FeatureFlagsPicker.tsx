@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { type QuickPickItem, QuickPickDialog, useQuickPickPages } from "@/components/ui/quick-pick";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
+import { type FeatureKey, isFeatureEnabled } from "@/lib/capabilities";
 import {
   canOverrideUiFeatures,
   OVERRIDABLE_UI_FEATURES,
@@ -15,18 +15,15 @@ import { currentChoiceLabel, type PaletteSetting } from "@/store/paletteSettings
 
 import type { PaletteTarget } from "./paletteTarget";
 import { settingFailedStatus } from "./settingChoiceStatus";
-import { choiceItemId, settingChoiceItems } from "./settingChoicesPage";
+import { choiceItemId, pageStatusSummary, settingChoiceItems } from "./settingChoicesPage";
 
 type PickerValue = { kind: "flag"; settingId: string } | PaletteTarget;
 
-function statusSummary(status: string) {
-  return function PageStatus() {
-    return (
-      <span role="status" data-slot="palette-page-status">
-        {status}
-      </span>
-    );
-  };
+type FeatureFlagSetting = PaletteSetting & { id: FeatureKey };
+
+function featureChoice(override: boolean | undefined): string {
+  if (override === undefined) return "automatic";
+  return override ? "on" : "off";
 }
 
 export function FeatureFlagsPicker() {
@@ -47,7 +44,7 @@ export function FeatureFlagsPicker() {
     reset();
   }, [open, available, reset]);
 
-  const settings = useMemo<PaletteSetting[]>(() => {
+  const settings = useMemo<FeatureFlagSetting[]>(() => {
     if (!available) return [];
     const overrides = readUiFeatureOverrides();
     return OVERRIDABLE_UI_FEATURES.filter(({ feature }) =>
@@ -61,7 +58,7 @@ export function FeatureFlagsPicker() {
         label: entry.label,
         icon: FlagIcon,
         keywords: ["feature flag", entry.feature],
-        current: override === undefined ? "automatic" : override ? "on" : "off",
+        current: featureChoice(override),
         choices: [
           { value: "automatic", label: `Automatic (${automatic})`, description: entry.description },
           { value: "on", label: "On" },
@@ -82,19 +79,20 @@ export function FeatureFlagsPicker() {
     }
   }, [onChoices, setting, pop]);
 
-  const items: QuickPickItem<PickerValue>[] = onChoices
-    ? setting
-      ? settingChoiceItems(setting.id, setting)
-      : []
-    : settings.map((entry) => ({
-        id: entry.id,
-        label: entry.label,
-        detail: currentChoiceLabel(entry),
-        keywords: entry.keywords,
-        icon: <FlagIcon aria-hidden className="size-4 text-muted-foreground" />,
-        opensPage: true,
-        value: { kind: "flag", settingId: entry.id },
-      }));
+  let items: QuickPickItem<PickerValue>[];
+  if (onChoices) {
+    items = setting ? settingChoiceItems(setting.id, setting) : [];
+  } else {
+    items = settings.map((entry): QuickPickItem<PickerValue> => ({
+      id: entry.id,
+      label: entry.label,
+      detail: currentChoiceLabel(entry),
+      keywords: entry.keywords,
+      icon: <FlagIcon aria-hidden className="size-4 text-muted-foreground" />,
+      opensPage: true,
+      value: { kind: "flag", settingId: entry.id },
+    }));
+  }
 
   const handleAccept = (item: QuickPickItem<PickerValue>) => {
     const value = item.value;
@@ -106,11 +104,9 @@ export function FeatureFlagsPicker() {
         pages.push("choices", choiceItemId(chosen.id, chosen.current));
       }
     } else if (value.kind === "setting-choice" && setting) {
-      const chosen = OVERRIDABLE_UI_FEATURES.find((entry) => entry.feature === setting.id);
-      if (!chosen) return "keepOpen" as const;
       const choice = value.value;
       if (choice !== "automatic" && choice !== "on" && choice !== "off") return "keepOpen" as const;
-      if (writeUiFeatureOverride(chosen.feature, choice === "automatic" ? null : choice === "on")) {
+      if (writeUiFeatureOverride(setting.id, choice === "automatic" ? null : choice === "on")) {
         window.location.reload();
       } else {
         setStatus(settingFailedStatus(setting));
@@ -144,7 +140,7 @@ export function FeatureFlagsPicker() {
             }
           : undefined
       }
-      summary={status ? statusSummary(status) : undefined}
+      summary={status ? pageStatusSummary(status) : undefined}
       emptyMessage={onChoices ? "No matching values." : "No matching features."}
       acceptLabel={onChoices ? "Choose" : "Open"}
       onAccept={handleAccept}

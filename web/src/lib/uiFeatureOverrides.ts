@@ -98,17 +98,7 @@ export function canOverrideUiFeatures(): boolean {
   return storageKey() !== null;
 }
 
-export function readUiFeatureOverrides(): UiFeatureOverrides {
-  const key = storageKey();
-  if (key === null) return {};
-  if (cache.has(key)) return cache.get(key) ?? {};
-  let stored: string | null;
-  try {
-    stored = window.localStorage.getItem(key);
-  } catch {
-    cache.set(key, null);
-    return {};
-  }
+function parseUiFeatureOverrides(stored: string | null): UiFeatureOverrides {
   const overrides: Partial<Record<FeatureKey, boolean>> = {};
   try {
     const raw: unknown = JSON.parse(stored ?? "null");
@@ -122,27 +112,39 @@ export function readUiFeatureOverrides(): UiFeatureOverrides {
   } catch {
     // Ignore malformed storage.
   }
-  cache.set(key, overrides);
   return overrides;
+}
+
+export function readUiFeatureOverrides(): UiFeatureOverrides {
+  const key = storageKey();
+  if (key === null) return {};
+  if (cache.has(key)) return cache.get(key) ?? {};
+  try {
+    const overrides = parseUiFeatureOverrides(window.localStorage.getItem(key));
+    cache.set(key, overrides);
+    return overrides;
+  } catch {
+    cache.set(key, null);
+    return {};
+  }
 }
 
 export function writeUiFeatureOverride(feature: FeatureKey, value: boolean | null): boolean {
   const key = storageKey();
   if (key === null || !OVERRIDABLE.has(feature)) return false;
-  const previous = readUiFeatureOverrides();
-  if (cache.get(key) === null) return false;
-  const overrides =
-    value === null
-      ? Object.fromEntries(Object.entries(previous).filter(([name]) => name !== feature))
-      : { ...previous, [feature]: value };
   try {
+    const previous = parseUiFeatureOverrides(window.localStorage.getItem(key));
+    const overrides =
+      value === null
+        ? Object.fromEntries(Object.entries(previous).filter(([name]) => name !== feature))
+        : { ...previous, [feature]: value };
     if (Object.keys(overrides).length === 0) window.localStorage.removeItem(key);
     else window.localStorage.setItem(key, JSON.stringify(overrides));
+    cache.set(key, overrides);
+    return true;
   } catch {
     return false;
   }
-  cache.set(key, overrides);
-  return true;
 }
 
 export function effectiveQuickPickEnabled(
@@ -152,6 +154,16 @@ export function effectiveQuickPickEnabled(
   if (info === "loading" || !info.features || !Object.hasOwn(info.features, "quick_pick_palette"))
     return false;
   return overrides.quick_pick_palette ?? info.features.quick_pick_palette === true;
+}
+
+export function canBootstrapQuickPick(info: ServerInfo | "loading"): boolean {
+  return (
+    info !== "loading" &&
+    !!info.features &&
+    Object.hasOwn(info.features, "quick_pick_palette") &&
+    !effectiveQuickPickEnabled(info, readUiFeatureOverrides()) &&
+    canOverrideUiFeatures()
+  );
 }
 
 export function activeUiFeatureOverrides(info: ServerInfo | "loading") {

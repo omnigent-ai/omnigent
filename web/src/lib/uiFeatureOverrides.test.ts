@@ -5,6 +5,7 @@ import { isFeatureEnabled } from "./capabilities";
 import { getOmnigentServerIdentity } from "./host";
 import {
   activeUiFeatureOverrides,
+  canBootstrapQuickPick,
   canOverrideUiFeatures,
   readUiFeatureOverrides,
   resetUiFeatureOverridesForTests,
@@ -62,6 +63,37 @@ describe("UI feature overrides", () => {
     expect(readUiFeatureOverrides()).toEqual({ canvas: false });
   });
 
+  it.each([
+    { choice: false, expected: { canvas: false, session_overview: false } },
+    { choice: null, expected: { session_overview: false } },
+  ])("preserves another tab's changes when saving $choice", ({ choice, expected }) => {
+    localStorage.setItem(key, '{"canvas":true}');
+    expect(readUiFeatureOverrides()).toEqual({ canvas: true });
+    localStorage.setItem(
+      key,
+      JSON.stringify({
+        canvas: true,
+        session_overview: false,
+        usage_page: true,
+        sidebar_saved_views: "invalid",
+      }),
+    );
+    expect(readUiFeatureOverrides()).toEqual({ canvas: true });
+    expect(writeUiFeatureOverride("canvas", choice)).toBe(true);
+    expect(JSON.parse(localStorage.getItem(key)!)).toEqual(expected);
+  });
+
+  it("does not overwrite saved choices when a fresh read fails", () => {
+    localStorage.setItem(key, '{"canvas":true,"session_overview":false}');
+    expect(readUiFeatureOverrides()).toEqual({ canvas: true, session_overview: false });
+    const read = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    expect(writeUiFeatureOverride("canvas", null)).toBe(false);
+    read.mockRestore();
+    expect(localStorage.getItem(key)).toBe('{"canvas":true,"session_overview":false}');
+  });
+
   it("does not read or write without a server identity", () => {
     localStorage.setItem(key, '{"canvas":true}');
     vi.mocked(getOmnigentServerIdentity).mockReturnValue(null);
@@ -72,18 +104,33 @@ describe("UI feature overrides", () => {
   });
 
   it("handles storage failures and preserves the prior choice on failed writes", () => {
-    vi.spyOn(Storage.prototype, "getItem").mockImplementationOnce(() => {
+    const read = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new Error("denied");
     });
     expect(readUiFeatureOverrides()).toEqual({});
     expect(writeUiFeatureOverride("canvas", true)).toBe(false);
-    resetUiFeatureOverridesForTests();
+    read.mockRestore();
     expect(writeUiFeatureOverride("canvas", true)).toBe(true);
     vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
       throw new Error("denied");
     });
     expect(writeUiFeatureOverride("canvas", null)).toBe(false);
     expect(readUiFeatureOverrides()).toEqual({ canvas: true });
+  });
+
+  it("offers bootstrap only when QuickPick is reported, effectively off, and scoped", () => {
+    const off = info({ quick_pick_palette: false });
+    const on = info({ quick_pick_palette: true });
+    expect(canBootstrapQuickPick("loading")).toBe(false);
+    expect(canBootstrapQuickPick(info({}))).toBe(false);
+    expect(canBootstrapQuickPick(off)).toBe(true);
+    expect(canBootstrapQuickPick(on)).toBe(false);
+    expect(writeUiFeatureOverride("quick_pick_palette", true)).toBe(true);
+    expect(canBootstrapQuickPick(off)).toBe(false);
+    expect(writeUiFeatureOverride("quick_pick_palette", false)).toBe(true);
+    expect(canBootstrapQuickPick(on)).toBe(true);
+    vi.mocked(getOmnigentServerIdentity).mockReturnValue(null);
+    expect(canBootstrapQuickPick(off)).toBe(false);
   });
 
   it("gates other overrides on the effective reported QuickPick value", () => {

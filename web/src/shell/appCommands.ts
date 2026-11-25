@@ -2,6 +2,7 @@
 // typed query filters them.
 
 import { useMemo } from "react";
+import { toast } from "sonner";
 import {
   CalendarClockIcon,
   InboxIcon,
@@ -22,8 +23,7 @@ import {
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useLocation, useNavigate } from "@/lib/routing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
-import { canOverrideUiFeatures, writeUiFeatureOverride } from "@/lib/uiFeatureOverrides";
+import { canBootstrapQuickPick, writeUiFeatureOverride } from "@/lib/uiFeatureOverrides";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { settingsSearchCommand } from "@/shell/settingsSearch/settingsSearchCommand";
 
@@ -37,7 +37,7 @@ export interface ActionCommand {
   run: () => void;
   /** Chord shown beside the row when the same action has a shortcut. */
   shortcut?: readonly string[];
-  /** Only show this command when the user types a matching query. */
+  /** Only the old palette's filter honors this; QuickPick lists every command. */
   searchOnly?: boolean;
 }
 
@@ -61,12 +61,7 @@ export function useAppCommands({
   const { pathname, search } = useLocation();
   const mobile = useIsMobileViewport();
   const info = useServerInfo();
-  const canEnableQuickPick =
-    info !== "loading" &&
-    !!info.features &&
-    Object.hasOwn(info.features, "quick_pick_palette") &&
-    !isFeatureEnabled(info, "quick_pick_palette") &&
-    canOverrideUiFeatures();
+  const canEnableQuickPick = canBootstrapQuickPick(info);
   return useMemo<ActionCommand[]>(
     () => [
       {
@@ -138,6 +133,7 @@ export function useAppCommands({
               searchOnly: true,
               run: () => {
                 if (writeUiFeatureOverride("quick_pick_palette", true)) window.location.reload();
+                else toast.error("Couldn't save the feature preview on this device.");
               },
             },
           ]
@@ -157,7 +153,7 @@ export function useAppCommands({
   );
 }
 
-/** The commands whose label or a keyword contains `query`, ignoring case. */
+/** Match labels or keywords ignoring case; blank queries omit search-only commands. */
 export function filterAppCommands<
   Command extends { label: string; keywords: readonly string[]; searchOnly?: boolean },
 >(commands: readonly Command[], query: string): readonly Command[] {

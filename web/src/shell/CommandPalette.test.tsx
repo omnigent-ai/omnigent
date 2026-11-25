@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import type { Conversation } from "@/hooks/useConversations";
 import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import { type ComponentProps, type ReactNode, useState } from "react";
+import { toast } from "sonner";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import * as host from "@/lib/host";
@@ -1258,7 +1259,7 @@ describe("CommandPalette — actions", () => {
 describe("CommandPalette — QuickPick preview bootstrap", () => {
   const label = "Enable feature preview: new QuickPick command palette";
   const key = `omnigent:ui-feature-overrides:v1:${JSON.stringify(window.location.origin)}`;
-  const legacyOnly = "QUICK_PICK_PALETTE" in commandPaletteModule;
+  const isQuickPick = "QUICK_PICK_PALETTE" in commandPaletteModule;
 
   function searchPreview() {
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "preview" } });
@@ -1283,7 +1284,7 @@ describe("CommandPalette — QuickPick preview bootstrap", () => {
     return reload;
   }
 
-  it.skipIf(legacyOnly)(
+  it.skipIf(isQuickPick)(
     "offers the command only in search and saves the opt-in before reloading",
     () => {
       serverInfo.mockReturnValue({
@@ -1301,7 +1302,7 @@ describe("CommandPalette — QuickPick preview bootstrap", () => {
     },
   );
 
-  it.skipIf(legacyOnly)("offers the command when an override turns QuickPick off", () => {
+  it.skipIf(isQuickPick)("offers the command when an override turns QuickPick off", () => {
     localStorage.setItem(key, '{"quick_pick_palette":false}');
     serverInfo.mockReturnValue({
       session_search_scope: true,
@@ -1312,7 +1313,7 @@ describe("CommandPalette — QuickPick preview bootstrap", () => {
     expect(screen.getByRole("option", { name: label })).toBeVisible();
   });
 
-  it.skipIf(legacyOnly)("does not reload if storage refuses the opt-in", () => {
+  it.skipIf(isQuickPick)("does not reload if storage refuses the opt-in", () => {
     serverInfo.mockReturnValue({
       session_search_scope: true,
       features: { quick_pick_palette: false },
@@ -1323,12 +1324,17 @@ describe("CommandPalette — QuickPick preview bootstrap", () => {
     const storage = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("denied");
     });
-    onTestFinished(() => storage.mockRestore());
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "");
+    onTestFinished(() => {
+      storage.mockRestore();
+      errorToast.mockRestore();
+    });
     fireEvent.click(screen.getByRole("option", { name: label }));
+    expect(errorToast).toHaveBeenCalledWith("Couldn't save the feature preview on this device.");
     expect(reload).not.toHaveBeenCalled();
   });
 
-  it.skipIf(legacyOnly).each(["server-on", "override-on", "unreported", "no-identity"])(
+  it.skipIf(isQuickPick).each(["server-on", "override-on", "unreported", "no-identity"])(
     "does not offer the bootstrap for %s",
     (scenario) => {
       if (scenario === "override-on") localStorage.setItem(key, '{"quick_pick_palette":true}');
