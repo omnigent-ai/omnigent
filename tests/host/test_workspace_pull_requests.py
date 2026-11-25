@@ -19,6 +19,7 @@ from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host.frames import HostWorkspaceCallFrame, PullRequestVouch
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_dict
+from omnigent.host.workspace_pull_requests import PULL_REQUEST_OPS
 from omnigent.host.workspace_service import serve_tunnel_call, start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.runner import pr_resource
@@ -102,7 +103,9 @@ async def test_capabilities_list_pull_requests_only_for_a_call_with_a_session(
     with_session, _, _ = await _answer(_frame(tmp_path, "GetCapabilities"))
     without, _, _ = await _answer(_frame(tmp_path, "GetCapabilities", session_id=None))
 
-    assert set(_PULL_REQUEST_METHODS) <= _capabilities(with_session)
+    assert set(PULL_REQUEST_OPS) <= _capabilities(with_session)
+    # A method in the schema that this host doesn't serve yet isn't listed.
+    assert not (set(_PULL_REQUEST_METHODS) - set(PULL_REQUEST_OPS)) & _capabilities(with_session)
     assert not set(_PULL_REQUEST_METHODS) & _capabilities(without)
 
 

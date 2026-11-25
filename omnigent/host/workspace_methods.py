@@ -25,8 +25,8 @@ class WorkspaceMethod:
     :param request_type: Its request message class.
     :param response_type: Its response message class.
     :param streaming: Whether it streams responses.
-    :param pull_request: Whether it reads one of the session's pull requests: its request
-        names one in ``pr_url``, and only the server's route serves it.
+    :param pull_request: Whether it reads or changes one of the session's pull requests:
+        its request names one in ``pr_url``, and only the server's route serves it.
     """
 
     name: str

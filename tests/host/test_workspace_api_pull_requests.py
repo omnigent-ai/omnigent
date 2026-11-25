@@ -37,11 +37,11 @@ from omnigent.server.workspace_access import METHOD_GATES, WorkspaceGate, callab
 from omnigent.stores.session_pull_request_store import SessionPullRequests
 from omnigent.workspace_fs import WorkspaceReader
 from tests.host import test_workspace_service as service_tests
+from tests.host.test_workspace_methods import _PULL_REQUEST_OWNER_METHODS, _PULL_REQUEST_READS
 
 _SESSION = service_tests._SESSION
 _PR = "https://github.com/example/app/pull/7"
 _OTHER_PR = "https://github.com/example/app/pull/8"
-_PULL_REQUEST_METHODS = {name for name, m in WORKSPACE_METHODS.items() if m.pull_request}
 
 
 @dataclass
@@ -104,8 +104,9 @@ def _client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: _Store | Non
 
 
 def test_every_method_has_a_gate_and_the_pull_request_reads_keep_their_rest_gates() -> None:
-    assert set(METHOD_GATES) == set(WORKSPACE_METHODS)
-    assert {name: METHOD_GATES[name] for name in _PULL_REQUEST_METHODS} == {
+    # The owner methods have no gate until the server serves them, so they're a 404.
+    assert set(METHOD_GATES) == set(WORKSPACE_METHODS) - _PULL_REQUEST_OWNER_METHODS
+    assert {name: METHOD_GATES[name] for name in _PULL_REQUEST_READS} == {
         "GetPullRequest": WorkspaceGate.SESSION_OWNER,
         "ListPullRequestFiles": WorkspaceGate.BROWSE,
         "GetPullRequestDiff": WorkspaceGate.BROWSE,
@@ -248,7 +249,8 @@ async def test_capabilities_through_the_server_list_the_pull_request_reads(
 
     response = await client.get_capabilities(pb.GetCapabilitiesRequest())
 
-    assert set(response.capabilities) >= _PULL_REQUEST_METHODS
+    assert set(response.capabilities) >= _PULL_REQUEST_READS
+    assert not set(response.capabilities) & _PULL_REQUEST_OWNER_METHODS
     assert [(call.session_id, call.vouch) for call in host_calls] == [(_SESSION, None)]
 
 

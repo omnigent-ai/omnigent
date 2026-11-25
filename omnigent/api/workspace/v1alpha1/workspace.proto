@@ -85,9 +85,9 @@ service WorkspaceService {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
 
-  // Pull requests: one of the session's pull requests on its code host, read
-  // through the host's `gh`. Each answers with the payload the REST route under
-  // /v1/sessions/{id}/resources/github returns, so a client reads both alike.
+  // Pull requests: one of the session's pull requests on its code host, read or
+  // changed through the host's `gh`. Each answers with the payload the REST route
+  // under /v1/sessions/{id}/resources/github returns, so a client reads both alike.
   // Only the server's route serves them, for a pull request the session links;
   // another one answers FAILED_PRECONDITION. GetPullRequest, ListPullRequestFiles
   // and GetPullRequestDiff read the session's first pull request, or the
@@ -134,6 +134,56 @@ service WorkspaceService {
   rpc ListReviewThreadComments(ListReviewThreadCommentsRequest) returns (ListReviewThreadCommentsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
+
+  // The rest change the pull request, or read what its edit controls offer. Only
+  // the session's owner may call them. A change that the host may have made
+  // before its answer was lost answers UNKNOWN or DEADLINE_EXCEEDED, never
+  // UNAVAILABLE, so a client checks the code host before it retries.
+
+  // The labels the pull request's repository offers, or those matching `text`.
+  rpc ListLabels(ListLabelsRequest) returns (ListLabelsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The people and teams who can be asked to review.
+  rpc ListReviewerCandidates(ListReviewerCandidatesRequest) returns (ListReviewerCandidatesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The merge methods allowed, and the pull request's auto-merge state.
+  rpc GetMergeOptions(GetMergeOptionsRequest) returns (GetMergeOptionsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Posts a comment on the pull request.
+  rpc CreateComment(CreateCommentRequest) returns (CreateCommentResponse);
+
+  // Starts a review thread on a line or range of the diff.
+  rpc CreateReviewThread(CreateReviewThreadRequest) returns (CreateReviewThreadResponse);
+
+  // Replies in a review thread.
+  rpc ReplyToReviewThread(ReplyToReviewThreadRequest) returns (ReplyToReviewThreadResponse);
+
+  // Changes the pull request's title or description.
+  rpc UpdatePullRequestDetails(UpdatePullRequestDetailsRequest) returns (UpdatePullRequestDetailsResponse);
+
+  // Adds and removes labels.
+  rpc UpdateLabels(UpdateLabelsRequest) returns (UpdateLabelsResponse);
+
+  // Requests and removes reviewers.
+  rpc UpdateReviewers(UpdateReviewersRequest) returns (UpdateReviewersResponse);
+
+  // Chooses the code-host account the pull request uses, saved for its repository.
+  rpc SetPullRequestAccount(SetPullRequestAccountRequest) returns (SetPullRequestAccountResponse);
+
+  // Merges the pull request, only while its head is still the expected commit.
+  rpc MergePullRequest(MergePullRequestRequest) returns (MergePullRequestResponse);
+
+  // Merges like MergePullRequest, as a chosen account, which becomes the pull request's account.
+  rpc MergePullRequestAsAccount(MergePullRequestAsAccountRequest) returns (MergePullRequestAsAccountResponse);
+
+  // Turns off the pull request's auto-merge.
+  rpc DisableAutoMerge(DisableAutoMergeRequest) returns (DisableAutoMergeResponse);
 }
 
 message GetCapabilitiesRequest {}
@@ -845,5 +895,157 @@ message ListReviewThreadCommentsRequest {
 }
 
 message ListReviewThreadCommentsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListLabelsRequest {
+  string pr_url = 1;
+  // Labels whose name matches; unset lists the repository's labels. A host
+  // without label search answers INVALID_ARGUMENT when it's set.
+  string text = 2;
+}
+
+message ListLabelsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListReviewerCandidatesRequest {
+  string pr_url = 1;
+}
+
+message ListReviewerCandidatesResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetMergeOptionsRequest {
+  string pr_url = 1;
+}
+
+message GetMergeOptionsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message CreateCommentRequest {
+  string pr_url = 1;
+  // Markdown.
+  string body = 2;
+}
+
+message CreateCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ReviewThreadAnchor {
+  // Relative to the repository root.
+  string path = 1;
+  // "LEFT" for the base, "RIGHT" for the head.
+  string side = 2;
+  int32 line = 3;
+  // The range's first line, before `line`; unset for one line.
+  optional int32 start_line = 4;
+  string head_sha = 5;
+  string base_sha = 6;
+}
+
+message CreateReviewThreadRequest {
+  string pr_url = 1;
+  string body = 2;
+  ReviewThreadAnchor anchor = 3;
+}
+
+message CreateReviewThreadResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ReplyToReviewThreadRequest {
+  string pr_url = 1;
+  string thread_id = 2;
+  string body = 3;
+}
+
+message ReplyToReviewThreadResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message UpdatePullRequestDetailsRequest {
+  string pr_url = 1;
+  // Unset fields stay as they are.
+  optional string title = 2;
+  optional string body = 3;
+}
+
+message UpdatePullRequestDetailsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message UpdateLabelsRequest {
+  string pr_url = 1;
+  repeated string add = 2;
+  repeated string remove = 3;
+}
+
+message UpdateLabelsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message Reviewer {
+  string login = 1;
+  // "user" or "team".
+  string kind = 2;
+}
+
+message UpdateReviewersRequest {
+  string pr_url = 1;
+  repeated Reviewer add = 2;
+  repeated Reviewer remove = 3;
+}
+
+message UpdateReviewersResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SetPullRequestAccountRequest {
+  // Required: the account is saved for this pull request's repository.
+  string pr_url = 1;
+  // An account login; empty keeps the current one.
+  string account = 2;
+  // A remote name. The server's route changes no remote, and answers
+  // INVALID_ARGUMENT when it's set.
+  string remote = 3;
+}
+
+message SetPullRequestAccountResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message MergePullRequestRequest {
+  string pr_url = 1;
+  // "merge", "squash" or "rebase".
+  string merge_method = 2;
+  // The full head commit SHA the user reviewed.
+  string expected_head_oid = 3;
+}
+
+message MergePullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message MergePullRequestAsAccountRequest {
+  string pr_url = 1;
+  string merge_method = 2;
+  string expected_head_oid = 3;
+  // The account login the user confirmed; required.
+  string account = 4;
+}
+
+message MergePullRequestAsAccountResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DisableAutoMergeRequest {
+  string pr_url = 1;
+}
+
+message DisableAutoMergeResponse {
   google.protobuf.Struct payload = 1;
 }
