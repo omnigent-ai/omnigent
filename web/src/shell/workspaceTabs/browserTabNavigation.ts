@@ -107,8 +107,10 @@ export class BrowserTabNavigation {
   private disposed = false;
   /** Moves on every event and action, so a view probe taken before one of them is stale. */
   private generation = 0;
-  /** The typed address the user last submitted, and the generation it started at. */
-  private submission: { id: number; generation: number } | null = null;
+  /** Moves on every landing the workspace starts, so an older typed load is stale. */
+  private landings = 0;
+  /** The typed address the user last submitted, and the landings there were by then. */
+  private submission: { id: number; landings: number } | null = null;
 
   constructor(
     tabId: TabId,
@@ -146,6 +148,7 @@ export class BrowserTabNavigation {
   land(visit: Visit): Promise<LandResult> {
     if (this.disposed) return Promise.resolve("stale");
     this.generation += 1;
+    this.landings += 1;
     this.submission = null;
     this.host.landingStarted?.();
     const url = visit.place.kind === "web" ? visit.place.url : undefined;
@@ -190,20 +193,21 @@ export class BrowserTabNavigation {
     if (this.pending) this.finish(this.pending, "superseded");
     this.untrackedLoad = null;
     if (abandoned) this.reconcileWithLivePage();
-    this.submission =
-      submission === undefined ? null : { id: submission, generation: this.generation };
+    // A control after a typed load leaves it: the shell may have issued it already.
+    if (submission !== undefined) this.submission = { id: submission, landings: this.landings };
   }
 
   /**
    * The shell accepted the load of a typed address. Shells that report navigations
    * will say where it went; one that reports nothing has only this address, so the
    * tab goes by it, as for its own landings. It isn't a URL event.
-   * Only the latest submission counts, and only if nothing happened since it: a
-   * later landing, page event or control makes it stale, and then it changes nothing.
+   * Only the latest submission counts, and only if the workspace hasn't moved the page
+   * since: a later landing makes it stale, and then it changes nothing. A reload or an
+   * address edit doesn't, as the shell had issued the load and the page shows it.
    */
   submissionAccepted(submission: number, url: string): void {
     const current = this.submission;
-    if (this.disposed || current?.id !== submission || current.generation !== this.generation) {
+    if (this.disposed || current?.id !== submission || current.landings !== this.landings) {
       return;
     }
     this.submission = null;

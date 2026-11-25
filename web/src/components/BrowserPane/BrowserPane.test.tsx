@@ -795,6 +795,34 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
       detach();
     });
 
+    it("records a load the shell issued and loaded, even if its result arrives after a reload", async () => {
+      const { store, bridge, bar, detach } = await submitWithTabs();
+      let finishLoad!: (result: unknown) => void;
+      bridge.browserOpenOrNavigate.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishLoad = resolve;
+          }),
+      );
+      fireEvent.change(bar, { target: { value: "x.test/c" } });
+      fireEvent.keyDown(bar, { key: "Enter" });
+      await waitFor(() =>
+        expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+          W_VIEW,
+          C,
+          undefined,
+          expect.anything(),
+        ),
+      );
+      // The reload reloads the page the shell is loading, so the tab goes by it.
+      fireEvent.click(screen.getByRole("button", { name: /reload/i }));
+      await act(async () => {
+        finishLoad({ ok: true });
+      });
+      expect(store.findTab("W")!.place).toEqual({ kind: "web", url: C });
+      detach();
+    });
+
     it("still applies a load the user didn't overtake", async () => {
       const { store, bar, detach } = await submitWithTabs();
       fireEvent.change(bar, { target: { value: "x.test/c" } });

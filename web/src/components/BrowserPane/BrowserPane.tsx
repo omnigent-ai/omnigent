@@ -441,12 +441,15 @@ export function BrowserPane({
         );
       })
       .then((result) => {
-        if (!result || !stillWanted()) return;
+        // No result: the load was never issued. A newer submission owns the address bar.
+        if (!result || sequence !== submitSequenceRef.current) return;
+        const wanted = stillWanted();
         if (result.ok) {
-          setCurrentUrl(navUrl);
-          // A tab's page history that hears no URL events goes by the accepted address.
+          if (wanted) setCurrentUrl(navUrl);
+          // The page loaded it even if the user acted since, so a tab's page history that hears
+          // no URL events still goes by it; a workspace step since makes the tab ignore it.
           if (submission !== null) acceptBrowserPageSubmission(conversationId, submission, navUrl);
-        } else setNavigationError(result.error ?? "Unable to open this page.");
+        } else if (wanted) setNavigationError(result.error ?? "Unable to open this page.");
       })
       .catch(() => {
         if (stillWanted()) setNavigationError("Unable to open this page.");

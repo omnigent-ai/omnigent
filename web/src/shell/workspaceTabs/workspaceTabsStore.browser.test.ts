@@ -174,14 +174,25 @@ describe("an address typed in a browser tab's own URL bar", () => {
     expect(incoherent).toEqual([]);
   });
 
-  it("an acceptance after the user used the page's controls again, or for an older submission, changes nothing", async () => {
-    const { store, shell } = untrackedOnB();
+  it("an acceptance after a reload or an address edit still becomes the page the shell loaded", async () => {
+    const { store, shell, incoherent } = untrackedOnB();
     await tick();
-    const reloaded = beginBrowserPageSubmission(W_VIEW)!;
+    const submission = beginBrowserPageSubmission(W_VIEW)!;
+    // The shell issued the typed load; the user reloads before its result arrives.
     shell.usePageControl(W_VIEW);
-    acceptBrowserPageSubmission(W_VIEW, reloaded, C);
-    expect(placeOf(store)).toEqual(web(B));
+    acceptBrowserPageSubmission(W_VIEW, submission, C);
+    expect(placeOf(store)).toEqual(web(C));
+    expect(timelineOf(store.history.state.visits)).toEqual([
+      "W:https://x.test/a",
+      "W:https://x.test/b",
+      "W:https://x.test/c",
+    ]);
+    expect(incoherent).toEqual([]);
+  });
 
+  it("an acceptance for an older submission changes nothing", async () => {
+    const { store } = untrackedOnB();
+    await tick();
     const older = beginBrowserPageSubmission(W_VIEW)!;
     const newer = beginBrowserPageSubmission(W_VIEW)!;
     acceptBrowserPageSubmission(W_VIEW, older, C);
