@@ -104,6 +104,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_project_identity_session",
         "sys_project_artifact_save",
         "sys_project_file_view",
+        "sys_project_file_comments",
         "sys_project_kpis_get",
         "sys_project_kpis_set",
         "sys_project_ticket_file",

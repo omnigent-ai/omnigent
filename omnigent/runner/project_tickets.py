@@ -145,6 +145,8 @@ async def execute_ticket_tool(
             return await _save_artifact(
                 body, ticket_id, project_id, workspace, request, client, source_id
             )
+        if name == "sys_project_file_comments":
+            return await _file_comments(body, project_id, request)
         if name == "sys_project_file_view":
             return await _view_project_file(body, project_id, workspace, client, source_id)
         if name == "sys_project_mandate_propose":
@@ -495,6 +497,51 @@ async def _save_artifact(
             json={"text": text, "outputs": [{"type": "artifact", "url": artifact["url"]}]},
         )
     return json.dumps(result, ensure_ascii=False)
+
+
+_COMMENT_FIELDS = ("id", "created_by", "anchor_content", "body", "status", "created_at")
+
+
+async def _file_comments(
+    body: dict[str, Any],
+    project_id: str,
+    request: Callable[..., Awaitable[dict[str, Any]]],
+) -> str:
+    """List, reply to, resolve or reopen comments on one of the project's files."""
+    file_id = uuid_to_bytes(body["file_id"]).hex()
+    base = f"/v1/projects/{project_id}/files/{file_id}/comments"
+    action = body["action"]
+    listed = (await request("GET", base))["comments"]
+    if action == "list":
+        rows = [
+            {key: row.get(key) for key in _COMMENT_FIELDS}
+            for row in listed
+            if body.get("include_resolved") or row.get("status") == "draft"
+        ]
+        return json.dumps({"comments": rows}, ensure_ascii=False)
+    comment = next((row for row in listed if row["id"] == body.get("comment_id")), None)
+    if comment is None:
+        return json.dumps({"error": "No such comment on this file; list them first"})
+    if action == "reply":
+        if not body.get("text"):
+            return json.dumps({"error": "reply needs text"})
+        reply = await request(
+            "POST",
+            base,
+            json={
+                "path": comment["path"],
+                "body": body["text"],
+                "start_index": comment["start_index"],
+                "end_index": comment["end_index"],
+                "anchor_content": comment.get("anchor_content"),
+            },
+        )
+        # A reply answers the thread; it isn't new work for the person or the next agent.
+        reply = await request("PATCH", f"{base}/{reply['id']}", json={"status": "addressed"})
+        return json.dumps({key: reply.get(key) for key in _COMMENT_FIELDS}, ensure_ascii=False)
+    status = "addressed" if action == "resolve" else "draft"
+    updated = await request("PATCH", f"{base}/{comment['id']}", json={"status": status})
+    return json.dumps({key: updated.get(key) for key in _COMMENT_FIELDS}, ensure_ascii=False)
 
 
 # Project file content paths agents meet in ticket text and outputs.

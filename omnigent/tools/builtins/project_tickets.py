@@ -578,6 +578,44 @@ class SysProjectFileViewTool(_TicketTool):
     arguments = ViewProjectFile
 
 
+class ProjectFileComments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["list", "reply", "resolve", "reopen"] = Field(
+        description=(
+            "list: a file's comments, open ones by default. reply: answer a comment, "
+            "anchored to the same text. resolve: mark a comment addressed. reopen: undo that."
+        )
+    )
+    file_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description=(
+            "The project file's ID, from its /v1/projects/<project>/files/<id>/content path."
+        ),
+    )
+    comment_id: str | None = Field(
+        default=None, max_length=64, description="The comment to reply to, resolve or reopen."
+    )
+    text: str | None = Field(
+        default=None, min_length=1, max_length=10_000, description="Your reply (reply only)."
+    )
+    include_resolved: bool = Field(
+        default=False, description="list: also return comments already resolved."
+    )
+
+
+class SysProjectFileCommentsTool(_TicketTool):
+    tool_name = "sys_project_file_comments"
+    help_text = (
+        "Read and answer the review comments people leave on one of this project's files "
+        "(Files tab or a /v1/projects/<project>/files/<id>/content link). list shows each "
+        "comment's author, the text it's anchored to and its body. reply posts your answer "
+        "next to it, signed as you; resolve marks it addressed once you've acted on it, so "
+        "the person sees it's done. You can't edit or delete other people's comments."
+    )
+    arguments = ProjectFileComments
+
+
 _KPI_ROLE = Field(
     default=None,
     min_length=1,
@@ -732,6 +770,7 @@ TICKET_TOOL_CLASSES = (
     SysProjectIdentitySessionTool,
     SysProjectArtifactSaveTool,
     SysProjectFileViewTool,
+    SysProjectFileCommentsTool,
     SysProjectKpisGetTool,
     SysProjectKpisSetTool,
     SysProjectTicketFileTool,

@@ -16,16 +16,20 @@ from typing import Any
 from fastapi import APIRouter, Form, Request, Response, UploadFile
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
-from omnigent.entities import StoredFile
+from omnigent.entities import Conversation, StoredFile
+from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import attribution_user, require_user
 from omnigent.server.routes.comments import AddCommentRequest, UpdateCommentRequest
 from omnigent.server.routes.project_ticket_attachments import PROJECT_METADATA_KEY
+from omnigent.server.session_orchestration import require_private_bound_source
+from omnigent.stores import ConversationStore, ProjectStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.file_store import FileStore
+from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
@@ -93,6 +97,9 @@ def create_project_files_router(
     *,
     comment_store: CommentStore | None = None,
     auth_provider: AuthProvider | None = None,
+    conversation_store: ConversationStore | None = None,
+    permission_store: PermissionStore | None = None,
+    project_store: ProjectStore | None = None,
 ) -> APIRouter:
     """Project file routes. A file's review comments use the file ID as their conversation key."""
     router = APIRouter(prefix="/projects/{project_id}/files")
@@ -198,8 +205,71 @@ def create_project_files_router(
         return Response(status_code=204)
 
     if comment_store is not None:
-        _add_comment_routes(router, comment_store, require_project, project_file, auth_provider)
+        agents = _CommentAgents(auth_provider, conversation_store, permission_store, project_store)
+        _add_comment_routes(
+            router, comment_store, require_project, project_file, auth_provider, agents
+        )
     return router
+
+
+class _CommentAgents:
+    """Who an agent's file-comment call acts as: its own session, in the file's project."""
+
+    def __init__(
+        self,
+        auth_provider: AuthProvider | None,
+        conversations: ConversationStore | None,
+        permissions: PermissionStore | None,
+        projects: ProjectStore | None,
+    ) -> None:
+        self.auth_provider = auth_provider
+        self.conversations = conversations
+        self.permissions = permissions
+        self.projects = projects
+
+    async def source(self, request: Request, project: str) -> Conversation | None:
+        """The calling agent's session, or ``None`` for a person.
+
+        An agent call must come from its own bound runner, in this file's project;
+        otherwise it's refused rather than treated as the person it runs for.
+        """
+        if ORCHESTRATION_SOURCE_HEADER not in request.headers:
+            return None
+        if self.conversations is None or self.permissions is None:
+            raise OmnigentError(
+                "Agents can't use project file comments here", code=ErrorCode.FORBIDDEN
+            )
+        user_id = require_user(request, self.auth_provider)
+        source = await asyncio.to_thread(
+            require_private_bound_source, request, user_id, self.conversations, self.permissions
+        )
+        if source.archived or source.project_id != project:
+            raise OmnigentError(
+                "Agents can only use comments on their own project's files",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return source
+
+    async def author(self, source: Conversation, user_id: str | None) -> str:
+        """How an agent's comment is signed: its role, marked as an agent."""
+        name = "Agent"
+        project = (
+            await asyncio.to_thread(self.projects.get, source.project_id, user_id=user_id)
+            if self.projects is not None and source.project_id
+            else None
+        )
+        identity_id = (source.labels or {}).get(PROJECT_IDENTITY_LABEL_KEY)
+        if project is not None and identity_id and self.projects is not None:
+            identity = await asyncio.to_thread(
+                self.projects.get_identity, project.id, identity_id, user_id=user_id
+            )
+            name = identity.name if identity is not None else name
+        elif project is not None and source.id in {
+            project.main_session_id,
+            *project.retired_main_session_ids,
+        }:
+            name = "Lead"
+        return f"{name} (agent)"
 
 
 def _add_comment_routes(
@@ -208,12 +278,23 @@ def _add_comment_routes(
     require_project: Any,
     project_file: Any,
     auth_provider: AuthProvider | None,
+    agents: _CommentAgents,
 ) -> None:
-    """Review comments on a project file, in the session comments wire format."""
+    """Review comments on a project file, in the session comments wire format.
+
+    Agents may read, add and resolve comments, signed as themselves; only people
+    may rewrite or delete one.
+    """
+
+    async def file_and_agent(
+        request: Request, project_id: str, file_id: str
+    ) -> tuple[str, Conversation | None]:
+        project = await require_project(request, project_id)
+        source = await agents.source(request, project)
+        return (await project_file(project, file_id)).id, source
 
     async def owned_file(request: Request, project_id: str, file_id: str) -> str:
-        project = await require_project(request, project_id)
-        return (await project_file(project, file_id)).id
+        return (await file_and_agent(request, project_id, file_id))[0]
 
     @router.get("/{file_id}/comments")
     async def list_project_file_comments(
@@ -227,11 +308,17 @@ def _add_comment_routes(
     async def add_project_file_comment(
         request: Request, project_id: str, file_id: str, body: AddCommentRequest
     ) -> dict[str, Any]:
-        key = await owned_file(request, project_id, file_id)
+        key, source = await file_and_agent(request, project_id, file_id)
         if body.anchor_metadata is not None:
             raise OmnigentError(
                 "Project files take text comments only", code=ErrorCode.INVALID_INPUT
             )
+        user_id = require_user(request, auth_provider)
+        author = (
+            await agents.author(source, user_id)
+            if source is not None
+            else attribution_user(user_id)
+        )
         comment = await asyncio.to_thread(
             comments.add,
             conversation_id=key,
@@ -240,7 +327,7 @@ def _add_comment_routes(
             start_index=body.start_index,
             end_index=body.end_index,
             anchor_content=body.anchor_content,
-            created_by=attribution_user(require_user(request, auth_provider)),
+            created_by=author,
         )
         return asdict(comment)
 
@@ -252,7 +339,12 @@ def _add_comment_routes(
         comment_id: str,
         body: UpdateCommentRequest,
     ) -> dict[str, Any]:
-        key = await owned_file(request, project_id, file_id)
+        key, source = await file_and_agent(request, project_id, file_id)
+        if source is not None and body.body is not None:
+            raise OmnigentError(
+                "Agents can resolve or reopen a comment but not rewrite it; reply instead",
+                code=ErrorCode.FORBIDDEN,
+            )
         if body.status is not None and body.status not in COMMENT_STATUS:
             raise OmnigentError(
                 f"status must be one of {sorted(COMMENT_STATUS)}", code=ErrorCode.INVALID_INPUT
@@ -268,7 +360,12 @@ def _add_comment_routes(
     async def delete_project_file_comment(
         request: Request, project_id: str, file_id: str, comment_id: str
     ) -> Response:
-        key = await owned_file(request, project_id, file_id)
+        key, source = await file_and_agent(request, project_id, file_id)
+        if source is not None:
+            raise OmnigentError(
+                "Only a person can delete a comment; resolve it instead",
+                code=ErrorCode.FORBIDDEN,
+            )
         if await asyncio.to_thread(comments.delete, comment_id, key) is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
         return Response(status_code=204)
