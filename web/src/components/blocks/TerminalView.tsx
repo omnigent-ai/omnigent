@@ -369,11 +369,7 @@ export function TerminalView({
     onActivityRef.current?.();
   }, []);
 
-  const inputTerminalRef = useRef({ sessionId, terminalId });
-  inputTerminalRef.current = { sessionId, terminalId };
   const notifyInput = useCallback(() => {
-    // Typing makes an earlier "is this shell idle?" reading out of date.
-    noteTerminalInput(inputTerminalRef.current.sessionId, inputTerminalRef.current.terminalId);
     onInputRef.current?.();
   }, []);
 
@@ -661,7 +657,11 @@ export function TerminalView({
           },
           isDarkRef.current,
           notifyActivity,
-          notifyInput,
+          // Typing makes an earlier "is this shell idle?" reading of this shell out of date.
+          () => {
+            noteTerminalInput(sessionId, terminalId);
+            notifyInput();
+          },
           !readOnly && activeRef.current,
           notifyClipboardRequest,
           focusOnConnectRef.current,

@@ -336,12 +336,16 @@ describe("control-mode terminal", () => {
       <TerminalView sessionId="conv_abc" terminalId="terminal_zsh_s1" onInput={first} />,
     );
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    const typed = () => act(() => terminalSessionMock.instances.at(-1)!.onInput?.());
+    // Types into a session's own input callback, the latest by default; returns when it typed.
+    const typed = (instance = terminalSessionMock.instances.at(-1)!) => {
+      const at = performance.now();
+      act(() => instance.onInput?.());
+      return at;
+    };
 
     // The session's own input callback notes the time and calls the caller's handler.
-    const before = performance.now();
-    typed();
-    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThanOrEqual(before);
+    let at = typed();
+    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThanOrEqual(at);
     expect(first).toHaveBeenCalledOnce();
 
     // A new handler takes over without a new attach, and the note still happens.
@@ -349,29 +353,34 @@ describe("control-mode terminal", () => {
     rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_s1" onInput={second} />);
     expect(terminalSessionMock.instances).toHaveLength(1);
     resetTerminalInputTimes();
-    typed();
+    at = typed();
     expect(second).toHaveBeenCalledOnce();
     expect(first).toHaveBeenCalledOnce();
-    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThan(-Infinity);
+    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThanOrEqual(at);
 
     // Without a handler, typing is still noted.
     rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_s1" />);
     resetTerminalInputTimes();
-    typed();
-    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThan(-Infinity);
+    at = typed();
+    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThanOrEqual(at);
 
     // Another terminal, then another session: typing is noted for the one shown, not the old.
     rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s2" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
     resetTerminalInputTimes();
-    typed();
-    expect(lastTerminalInputAt("conv_abc", "terminal_bash_s2")).toBeGreaterThan(-Infinity);
+    at = typed();
+    expect(lastTerminalInputAt("conv_abc", "terminal_bash_s2")).toBeGreaterThanOrEqual(at);
     expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBe(-Infinity);
+    // Input the old session still delivers is noted for its own shell.
+    resetTerminalInputTimes();
+    at = typed(terminalSessionMock.instances[0]);
+    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThanOrEqual(at);
+    expect(lastTerminalInputAt("conv_abc", "terminal_bash_s2")).toBe(-Infinity);
     rerender(<TerminalView sessionId="conv_other" terminalId="terminal_bash_s2" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(3));
     resetTerminalInputTimes();
-    typed();
-    expect(lastTerminalInputAt("conv_other", "terminal_bash_s2")).toBeGreaterThan(-Infinity);
+    at = typed();
+    expect(lastTerminalInputAt("conv_other", "terminal_bash_s2")).toBeGreaterThanOrEqual(at);
     expect(lastTerminalInputAt("conv_abc", "terminal_bash_s2")).toBe(-Infinity);
   });
 
