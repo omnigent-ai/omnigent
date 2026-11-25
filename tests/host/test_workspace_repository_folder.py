@@ -78,6 +78,11 @@ def _layout(tmp_path: Path) -> Path:
     # A `.git` file aimed at the workspace's own Git directory, which no worktree uses.
     (workspace / "main-git").mkdir()
     (workspace / "main-git" / ".git").write_text(f"gitdir: {workspace / '.git'}\n")
+    # A `.git` file aimed at the metadata Git registered for a worktree outside the workspace.
+    _git(workspace, "worktree", "add", "-q", "-b", "outside", str(tmp_path / "outside-worktree"))
+    (workspace / "forged-registration").mkdir()
+    registered = workspace / ".git" / "worktrees" / "outside-worktree"
+    (workspace / "forged-registration" / ".git").write_text(f"gitdir: {registered}\n")
     # A `.git` file aimed at worktree metadata outside, whose `commondir` leads back inside.
     _worktree_metadata(tmp_path / "outside-metadata", workspace / ".git")
     (workspace / "metadata-back").mkdir()
@@ -115,6 +120,17 @@ def _inside_larger_layout(tmp_path: Path) -> Path:
     _worktree_metadata(workspace / "metadata", outer / ".git")
     (workspace / "inner-metadata").mkdir()
     (workspace / "inner-metadata" / ".git").write_text(f"gitdir: {workspace / 'metadata'}\n")
+    # A plain folder, and a real worktree of the larger repository checked out inside.
+    (workspace / "src").mkdir()
+    _git(
+        outer,
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature",
+        str(workspace / ".worktrees" / "outer-feature"),
+    )
     return workspace
 
 
@@ -169,8 +185,17 @@ async def _refusal(workspace: Path, repository: str) -> str:
         ("http-borrowed", "isn't a worktree of the workspace's repository"),
         ("linked-objects", "isn't a worktree of the workspace's repository"),
         ("linked-refs", "isn't a worktree of the workspace's repository"),
-        ("INSIDE_LARGER:outer-git", "isn't a worktree of the workspace's repository"),
-        ("INSIDE_LARGER:inner-metadata", "isn't a worktree of the workspace's repository"),
+        ("forged-registration", "isn't a worktree of the workspace's repository"),
+        ("INSIDE_LARGER:outer-git", "can't be compared in a workspace inside a larger repository"),
+        (
+            "INSIDE_LARGER:inner-metadata",
+            "can't be compared in a workspace inside a larger repository",
+        ),
+        ("INSIDE_LARGER:src", "can't be compared in a workspace inside a larger repository"),
+        (
+            "INSIDE_LARGER:.worktrees/outer-feature",
+            "can't be compared in a workspace inside a larger repository",
+        ),
     ],
 )
 async def test_a_folder_outside_the_workspace_or_in_a_git_directory_is_refused(
@@ -201,7 +226,7 @@ async def test_a_nested_git_directory_aimed_at_the_repository_around_the_workspa
 
     message = await _refusal(workspace, "sub")
 
-    assert message.endswith("isn't a worktree of the workspace's repository")
+    assert message.endswith("can't be compared in a workspace inside a larger repository")
 
 
 async def test_a_worktree_whose_working_tree_is_outside_the_workspace_is_refused(
@@ -319,6 +344,7 @@ _CALLS: dict[str, Callable[[WorkspaceServiceClient, str], Awaitable[Any]]] = {
         "into-git",
         "vendor/lib",
         "main-git",
+        "forged-registration",
         "forged",
         "elsewhere",
         "metadata-back",

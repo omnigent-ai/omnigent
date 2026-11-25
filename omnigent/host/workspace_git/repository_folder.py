@@ -3,10 +3,11 @@
 A request may name a directory relative to the workspace root, such as a worktree
 checked out inside it. It is confined the way file reads are, and its repository must be
 the workspace's own, or a linked worktree of it whose working tree is inside the
-workspace. Such a worktree shares the workspace repository's objects and refs, so naming it
-reads nothing the workspace root doesn't. A nested, independent repository is refused, so
-a crafted link, ``.git`` file, ``commondir``, ``core.worktree``, symlinked store or
-alternates file can't point a comparison at another place on the host.
+workspace and is the one Git registered for it. Such a worktree shares the workspace
+repository's objects and refs, so naming it reads nothing the workspace root doesn't. A
+nested, independent repository is refused, so a crafted link, ``.git`` file, ``commondir``,
+``core.worktree``, symlinked store or alternates file can't point a comparison at another
+place on the host. A workspace inside a larger repository compares only its root.
 """
 
 from __future__ import annotations
@@ -54,6 +55,19 @@ def _is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _registered_at(git_directory: Path, top_level: Path) -> bool:
+    """Whether Git's own record of a linked worktree, its ``gitdir`` file, names ``top_level``.
+
+    A `.git` file can point at any registered worktree's metadata; only the worktree the
+    record names may use it, so one elsewhere can't be compared through another folder.
+    """
+    try:
+        recorded = (git_directory / "gitdir").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return bool(recorded) and (git_directory / recorded).resolve() == top_level / ".git"
+
+
 def _places(repository: GitRepository) -> tuple[Path, Path, Path]:
     """Its Git directory, common directory and working tree, resolved."""
     return (
@@ -71,8 +85,9 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
     :returns: The workspace root, or the resolved directory inside it with its repository.
     :raises ConnectError: INVALID_ARGUMENT when it escapes the workspace, even through a
         symlink, isn't a folder, lies in a Git directory, belongs to a repository that is
-        neither the workspace's own nor a linked worktree of it, or is such a worktree with
-        its working tree outside the workspace.
+        neither the workspace's own nor a linked worktree of it registered at that folder,
+        is such a worktree with its working tree outside the workspace, or the workspace
+        is a folder inside a larger repository.
     """
     workspace = reader.root
     if not repository:
@@ -98,6 +113,9 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
         # Fails closed as well: the comparison reports Git's problem, as for the workspace.
         return RepositoryFolder(folder, UnreadableRepository(error))
     places = _places(found)
+    # A worktree of a repository larger than the workspace could read all its history.
+    if own is not None and own.top_level.resolve() != workspace.resolve():
+        raise _refuse(repository, "can't be compared in a workspace inside a larger repository")
     if own is not None and _places(own) == places:
         return RepositoryFolder(folder, found)
     git_directory, common_directory, top_level = places
@@ -112,4 +130,6 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
         raise _refuse(repository, "isn't a worktree of the workspace's repository")
     if not _is_within(top_level, workspace):
         raise _refuse(repository, "has its working tree outside the workspace")
+    if not _registered_at(git_directory, top_level):
+        raise _refuse(repository, "isn't a worktree of the workspace's repository")
     return RepositoryFolder(folder, found)
