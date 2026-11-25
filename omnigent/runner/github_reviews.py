@@ -393,7 +393,7 @@ def submit_pending_review(
         input={"pullRequestReviewId": review_id, "event": event, "body": body},
     )
     review = payload.get("pullRequestReview") or {}
-    if review.get("id") != review_id or not isinstance(review.get("state"), str):
+    if review.get("id") != review_id or review.get("state") != _SUBMITTED_STATES.get(event):
         raise github_failures.unknown_outcome()
     return {
         "object": "session.github.pr_review",
@@ -490,12 +490,17 @@ def set_thread_resolved(
         action="change this conversation",
         input={"threadId": thread_id},
     )
-    thread = payload.get("thread") or {}
+    thread = payload.get("thread")
+    # Without the thread in the state asked for, GitHub hasn't confirmed the change.
+    if not isinstance(thread, dict) or thread.get("id") != thread_id:
+        raise github_failures.unknown_outcome()
+    if thread.get("isResolved") is not resolved:
+        raise github_failures.unknown_outcome()
     return {
         "object": "session.github.review_thread_resolution",
         "pr_url": reference.url,
         "thread_id": thread_id,
-        "resolved": bool(thread.get("isResolved")),
+        "resolved": resolved,
     }
 
 
