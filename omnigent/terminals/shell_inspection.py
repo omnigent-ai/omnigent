@@ -32,6 +32,7 @@ CACHE_SECONDS = 0.25
 MAX_CONCURRENT_INSPECTIONS = 4
 # Largest output either subprocess may print before the answer is unknown.
 _MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
 
 _ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
 
@@ -264,16 +265,24 @@ async def _run(argv: Sequence[str], path: str) -> str:
         stderr=asyncio.subprocess.DEVNULL,
         env={"PATH": path, "LC_ALL": "C"},
     )
+    stdout = process.stdout
+    assert stdout is not None
+    output = bytearray()
     try:
-        stdout, _ = await process.communicate()
+        # Read as it arrives, so a flood stops at the cap instead of filling memory first.
+        while chunk := await stdout.read(_READ_CHUNK_BYTES):
+            output += chunk
+            if len(output) > _MAX_OUTPUT_BYTES:
+                raise _CommandFailed
+        await process.wait()
     finally:
         if process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
             await process.wait()
-    if process.returncode != 0 or len(stdout) > _MAX_OUTPUT_BYTES:
+    if process.returncode != 0:
         raise _CommandFailed
-    return stdout.decode("utf-8", errors="replace")
+    return output.decode("utf-8", errors="replace")
 
 
 async def read_pane_shell(

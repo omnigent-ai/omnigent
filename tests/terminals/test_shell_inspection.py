@@ -295,6 +295,19 @@ async def test_a_slow_tmux_is_unknown_within_the_budget() -> None:
     assert time.monotonic() - started < INSPECTION_TIMEOUT_SECONDS + 1
 
 
+@pytest.mark.asyncio
+async def test_output_past_the_cap_stops_the_read_without_waiting_for_the_rest() -> None:
+    # 12 MiB, then a pause: the read gives up at the cap instead of buffering all of it.
+    flood = [
+        sys.executable,
+        "-I",
+        "-c",
+        "import sys, time; sys.stdout.write('x' * (12 << 20)); sys.stdout.flush(); time.sleep(30)",
+    ]
+    with pytest.raises(shell_inspection._CommandFailed):
+        await asyncio.wait_for(shell_inspection._run(flood, os.environ["PATH"]), 10)
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -317,8 +330,12 @@ async def test_concurrent_requests_for_one_terminal_share_one_read() -> None:
     inspector = ShellInspector()
     waiting = [asyncio.create_task(inspector.inspect("terminal-a", read)) for _ in range(3)]
     await asyncio.sleep(0)
+    # One caller giving up leaves the read the others wait on running.
+    waiting[0].cancel()
+    await asyncio.sleep(0)
     release.set()
-    assert await asyncio.gather(*waiting) == [ShellInspection(ShellState.IDLE)] * 3
+    assert await asyncio.gather(*waiting[1:]) == [ShellInspection(ShellState.IDLE)] * 2
+    assert waiting[0].cancelled()
     assert reads == 1
 
 
@@ -431,12 +448,11 @@ def test_a_pid_listed_twice_is_unknown() -> None:
     assert inspect(forged) == UNKNOWN
 
 
-def test_ps_is_never_asked_for_arguments_or_the_environment() -> None:
-    assert PS_COLUMNS == "pid=,ppid=,pgid=,tpgid=,stat=,comm="
-
-
 @pytest.mark.asyncio
-async def test_reads_ps_with_the_fixed_columns_only(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_ps_is_never_asked_for_arguments_or_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert PS_COLUMNS == "pid=,ppid=,pgid=,tpgid=,stat=,comm="
     calls: list[list[str]] = []
 
     async def fake_run(argv: list[str], path: str) -> str:
