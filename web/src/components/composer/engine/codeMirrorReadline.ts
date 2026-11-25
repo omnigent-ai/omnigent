@@ -15,7 +15,8 @@ import {
   type KillRing,
 } from "@/lib/textEditing/readline";
 
-const killed = Annotation.define<{ text: string; backward: boolean }>();
+/** Marks the text a kill removed, so the kill ring can yank it back. */
+export const killed = Annotation.define<{ text: string; backward: boolean }>();
 
 const killRingField = StateField.define<KillRing>({
   create: () => EMPTY_KILL_RING,
